@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package rally_point.wire;
+
+// One QUIC datagram's worth on a single leg (client <-> relay or relay <-> relay).
+// Carries redundant payloads plus the ack state for the peer's packets on this
+// leg. Recovery is app-level, not QUIC's (build plan §4): unacked payloads are
+// repacked into later packets until a packet carrying them is acked.
+//
+// netcode v2 replaces Storm's UDP transport wholesale (Seq1/Seq2/resend/checksum
+// are gone, not tunneled): the game hooks at the turn/command layer, so these
+// fields + QUIC take over sequencing, acks, integrity, and recovery. Datagrams
+// carry the command stream — both lobby and in-game commands behave the same way
+// (sequence-ordered, lockstep). Truly reliable side-channels (chat, resync, and
+// possibly lobby setup) ride reliable QUIC streams with their own schema.
+message Packet {
+  // This packet's sequence number on this leg. Resets each QUIC connection
+  // (which is per-game), so the magnitude stays small.
+  uint32 seq = 1;
+
+  // The seq of the most recent packet seen from the peer on this leg. Absent
+  // until at least one packet has been received from the peer.
+  optional uint32 ack = 2;
+
+  // Bitfield of older acked packets: if bit N is set, packet (ack - N - 1) has
+  // been received. Only meaningful when `ack` is present.
+  fixed32 ack_bits = 3;
+
+  // The freshly-produced payload plus redundant still-unacked ones. Empty for an
+  // ack-only packet (one sent purely to carry acks).
+  repeated Payload payloads = 4;
+}
+
+// One command packet from one slot — a unit of the lockstep command stream,
+// mirroring Storm's native model (a per-peer sequence that ticks upward; a peer
+// missing a seq stops and waits for it, which our redundancy/ack accelerates).
+//
+// `seq`, not a game-frame number, is the dedup/retirement identity: Storm itself
+// keys on a seq, frames don't advance during a pause, lobby commands have no
+// frame at all, and a fan-out leg muxes multiple slots.
+message Payload {
+  // Monotonic per-leg payload seq — the transport identity, independent of game
+  // state. Stays below 2^63 (the sequence buffer reserves the top bit).
+  uint64 seq = 1;
+
+  // The slot these commands belong to. The relay binds it to the sender's token
+  // slot on ingress (D10) and does not trust a client-sent value; a
+  // relay -> client fan-out packet may mux several slots.
+  uint32 slot = 2;
+
+  // Native SC:R command-stream bytes (lobby or in-game). The relay parses and
+  // bounds-checks these against the command-length table (D10) but forwards the
+  // bytes verbatim.
+  bytes commands = 3;
+}

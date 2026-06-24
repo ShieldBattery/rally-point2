@@ -1,8 +1,8 @@
 # CLAUDE.md
 
 `rally-point2` is the all-Rust netcode v2 platform for ShieldBattery: the portable
-client transport, the validating relay + mesh, and the multi-tenant coordinator.
-It replaces the Node.js `rally-point`.
+client, the shared per-leg transport layer, the validating relay + mesh, and the
+multi-tenant coordinator. It replaces the Node.js `rally-point`.
 
 ## Where the design lives
 
@@ -18,7 +18,11 @@ the plan in the same change). SC:R glue and UI live in `../shieldbattery/`
 - `proto` — the frozen contracts: wire framing, control-plane messages, tokens,
   protocol version + negotiation, SC:R command table. Anything that crosses a
   component boundary is defined here *first*.
-- `client` — portable QUIC client transport, linked into `shieldbattery/game/`.
+- `transport` — per-leg reliable delivery over unreliable QUIC datagrams (ack +
+  redundancy + sequence buffer), shared by `client` and `relay` (one per leg).
+  Ported from `shieldbattery/game/src/netcode/`.
+- `client` — portable client endpoint linked into `shieldbattery/game/`; runs
+  `transport` for its home-relay leg.
 - `relay`, `coordinator` — `lib.rs` (logic) + thin `main.rs` (arg parsing + wiring).
 - `infra/` — Fargate / region-beacon IaC (Phase 5). Not a crate; excluded from the workspace.
 
@@ -47,6 +51,10 @@ cargo run -p rally-point-relay -- --help                # relay/coordinator are 
 - `unsafe` is denied workspace-wide; the hot-path FFI and the BW-thread ⇄
   Tokio-thread handoff (`D1`) live in `shieldbattery/game/`, not here.
 - `Cargo.lock` is committed and CI builds `--locked` — commit it when deps change.
+- The datagram wire format is **protobuf**, generated from `proto/proto/wire.proto`
+  by `protox` (pure-Rust, no `protoc` needed) in `proto/build.rs`. Edit the
+  `.proto` and rebuild; never edit generated code. Protobuf is only the envelope
+  — the SC:R command bytes inside a payload are still hand-validated (`D10`).
 
 ## Architectural invariants (not visible from the types)
 
@@ -61,3 +69,10 @@ Full detail in build plan §0 + §4. The ones easy to break by accident:
   unreliable datagrams, one QUIC connection per relay-pair, no 0-RTT.
 - Failover / partition / coordinator-outage responses are coordinated, never
   per-client (`D11`).
+- We **replace** Storm's UDP transport, we don't tunnel it. The game hooks at the
+  turn/command layer (`send_turn_message` / `storm_receive_turns`), so Storm's
+  12-byte UDP header (Seq1/Seq2/CLS/PlayerID/resend/checksum) sits *below* our seam
+  and is removed — `Packet` + QUIC own sequencing, acks, integrity, and recovery.
+  Don't reintroduce Storm framing on the wire (that was the old double-reliability
+  overhead). Transport identity is a per-leg `seq` (Storm's own model), not a game
+  frame; the D9 consensus coordinate is a separate, later concern.

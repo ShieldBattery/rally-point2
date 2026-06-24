@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     control::TenantId,
-    wire::{SessionId, SlotId},
+    ids::{SessionId, SlotId},
 };
 
 /// Identifies which tenant signing key signed a token — the `kid` claim (**D6**).

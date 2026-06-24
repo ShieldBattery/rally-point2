@@ -20,3 +20,7 @@
 /// `rally_point_client` surface rather than pulling in `rally-point-proto`
 /// separately.
 pub use rally_point_proto as proto;
+
+/// Re-export of the shared per-leg transport machinery (ack/redundancy +
+/// sequence buffer) — the client runs one instance for its home-relay leg.
+pub use rally_point_transport as transport;
