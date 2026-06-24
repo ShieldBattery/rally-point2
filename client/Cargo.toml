@@ -1,0 +1,16 @@
+[package]
+name = "rally-point-client"
+description = "Portable netcode v2 client transport (quinn datagrams + reliable control + forward recovery), consumed by the ShieldBattery game DLL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rally-point-proto = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "rally-point-coordinator"
+description = "Multi-tenant netcode v2 control plane: relay registry, session setup, per-tenant tokens/quotas, and consensus policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rally-point-proto = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

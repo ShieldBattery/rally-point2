@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["proto", "client", "relay", "coordinator"]
+# `infra/` (Fargate / beacon IaC, Phase 5) is intentionally NOT a workspace
+# member — its tooling (CDK vs Terraform vs Pulumi) is undecided and is not Rust.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["ShieldBattery"]
+repository = "https://github.com/ShieldBattery/rally-point2"
+
+[workspace.dependencies]
+# --- Internal crates ---
+rally-point-proto = { path = "proto" }
+rally-point-client = { path = "client" }
+
+# --- Async runtime & QUIC transport ---
+tokio = { version = "1.46", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "sync",
+  "time",
+] }
+# QUIC via quinn. Pinned to the rustls + ring backend rather than the default
+# aws-lc-rs to avoid the C/NASM toolchain requirement on Windows MSVC — the
+# `client` crate must also build for `i686-pc-windows-msvc` inside the game DLL.
+# Declared here as the frozen choice; wired into client/relay in Phase 1, at
+# which point these feature names must be confirmed against the resolved quinn.
+quinn = { version = "0.11", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-ring",
+  "log",
+] }
+bytes = "1.10"
+byteorder = "1.5"
+
+# --- Serialization ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- Errors ---
+thiserror = "2.0"
+color-eyre = "0.6"
+
+# --- Observability ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- CLI ---
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+# The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not
+# here — these crates stay `unsafe`-free. A crate that genuinely needs FFI can
+# override this locally with `#![allow(unsafe_code)]`.
+unsafe_code = "deny"
+
+[profile.release]
+# Keep line tables in release builds for usable prod stack traces / flight
+# recorder symbolication (matches `shieldbattery/game` + `server-rs`).
+debug = 1

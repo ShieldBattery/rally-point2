@@ -1,0 +1,22 @@
+//! `rally-point-client` — the portable netcode v2 client transport.
+//!
+//! This crate owns the wire side of the game seam: a quinn QUIC client that
+//! sends SC:R turns as datagrams and carries chat/control/resync over reliable
+//! streams, with app-level forward recovery and a "home relay unreachable →
+//! reconnect + resync from turn X" path (**D11**).
+//!
+//! It is consumed by the ShieldBattery game DLL (`shieldbattery/game/`, WS-A),
+//! which owns the BW-thread ⇄ Tokio-thread handoff (**D1**). This crate stays
+//! portable, `unsafe`-free, and target-agnostic so it also builds for
+//! `i686-pc-windows-msvc` inside the 32-bit DLL — CI enforces that target.
+//!
+//! TODO(phase-1): quinn client; datagram turn I/O numbered on the
+//! `game_frame_count` coordinate; reliable control streams; forward recovery
+//! that treats `send_datagram` refusal as a loss event and sizes bundles to the
+//! live `max_datagram_size()`; reconnect + resync-from-cursor (build plan WS-B,
+//! Phases 1–2).
+
+/// Re-export of the shared protocol contracts, so consumers depend on a single
+/// `rally_point_client` surface rather than pulling in `rally-point-proto`
+/// separately.
+pub use rally_point_proto as proto;

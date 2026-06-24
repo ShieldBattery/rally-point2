@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# rustfmt backups
+**/*.rs.bk
+
+# Debug symbols
+*.pdb
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Local env / secrets (relay bootstrap secrets, tenant keys, etc.)
+.env
+*.local.toml
+
+# Agent scratch space
+.claude-scratch/
+.claude/settings.local.json
+AGENTS.local.md
+CLAUDE.local.md
