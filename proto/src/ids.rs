@@ -25,6 +25,6 @@ pub struct SlotId(pub u8);
 /// Identifies one game session, assigned by the coordinator at session setup.
 ///
 /// One axis of the `tenant/session/slot/turn` observability correlation key.
-// TODO: pin the width/representation alongside the token layout.
+/// Carried in the authorization token as a little-endian u64 (8 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u64);

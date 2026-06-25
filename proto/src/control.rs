@@ -9,11 +9,11 @@
 //!   handoff, per-tenant quotas.
 //!
 //! Consensus *decisions* are deliberately **not** here: the relay/mesh executes
-//! per-turn latency/leave consensus keyed on [`crate::wire::GameFrameCount`], so
+//! per-turn latency/leave consensus keyed on [`crate::ids::GameFrameCount`], so
 //! a coordinator outage never stalls a running game.
 //!
-//! TODO: define the concrete message set + transport/codec. These types only
-//! freeze the module boundary for now.
+//! TODO(phase-3): define the concrete message set + transport/codec. These
+//! types only freeze the module boundary for now.
 
 use serde::{Deserialize, Serialize};
 
