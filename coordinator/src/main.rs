@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point coordinator starting");
-    tracing::warn!("coordinator control plane is not implemented yet (Phase 3)");
+    tracing::warn!("coordinator control plane is not implemented yet");
 
     Ok(())
 }

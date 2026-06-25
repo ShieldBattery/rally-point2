@@ -6,7 +6,7 @@
 //! both the [`client`](../rally_point_client) and the [`relay`](../rally_point_relay)
 //! rather than in either one. Each endpoint runs one instance per leg.
 //!
-//! Recovery is **ours, not QUIC's** (build plan §4): payloads ride unreliable
+//! Recovery is **ours, not QUIC's**: payloads ride unreliable
 //! QUIC datagrams, and this layer adds the redundancy + acknowledgement on top —
 //! unacked payloads are repacked into later packets until a packet carrying them
 //! is acked. QUIC supplies encryption, congestion control, MTU sizing, migration,
@@ -18,12 +18,12 @@
 //! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
 //! verbatim, while the ack manager is *re-derived* for our message shapes. It
 //! keeps the original's independent per-payload `seq` as the dedup/ack key —
-//! `game_frame_count` rides inside payloads as the consensus coordinate (D9), not
-//! as the transport key — and the relay validates payload contents (D10).
+//! `game_frame_count` rides inside payloads as the consensus coordinate, not
+//! as the transport key — and the relay validates payload contents.
 
 pub mod sequence_buffer;
 
-// TODO(phase-1): pub mod ack_manager;
+// TODO: pub mod ack_manager;
 // Adapted from `shieldbattery/game/src/netcode/ack_manager.rs`: same
 // repack-unacked-until-acked + transitive-`ack_bits` algorithm, keyed on the
 // per-payload `seq`, sized to the live `max_datagram_size()` (turns at 24/sec).

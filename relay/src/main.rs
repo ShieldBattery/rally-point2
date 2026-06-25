@@ -11,7 +11,7 @@ use rally_point_relay::DEFAULT_PORT;
 #[command(name = "rally-point-relay", version, about)]
 struct Cli {
     /// Address to listen on for client + mesh QUIC connections (dual-stack by
-    /// default — IPv6-primary ingress, see D3).
+    /// default — IPv6-primary ingress).
     #[arg(long, default_value_t = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT))]
     listen: SocketAddr,
 }
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point relay starting");
-    tracing::warn!("relay transport is not implemented yet (Phase 1)");
+    tracing::warn!("relay transport is not implemented yet");
 
     Ok(())
 }

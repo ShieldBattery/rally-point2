@@ -1,37 +1,17 @@
 //! SC:R turn-command table: `command_lengths` + variable-length rules.
 //!
-//! The validating relay (**D10**) parses native SC:R command bytes to:
+//! The validating relay parses native SC:R command bytes to:
 //! bounds-check every command against the length table + var-length rules, bind
 //! it to the sender's slot, allowlist live command ids, and strip
 //! client-originated control commands (`0x55` / `0x66` / `0x5f` / `0x57` /
 //! replay cmds). The client crate needs the same table to frame turns, so it
 //! lives here and is shared.
 //!
-//! # Provenance
-//!
-//! Lengths come from the **live command dispatcher** in `StarCraft.exe`
-//! **1.23.10.12409** (32-bit): `process_commands` @ `0x747cf0`, which maps each
-//! opcode through `command_dispatch_index_table` @ `0x748790` (indexed by
-//! `opcode - 5`) to a handler that consumes a fixed or count-prefixed number of
-//! bytes; opcodes routed to the reject case are not valid live commands.
-//! **Lengths include the leading opcode byte.** Cross-checked against the `screp`
-//! and `broodrep` replay parsers, which agree on every live command's length
-//! (e.g. `0x14` RightClick = 10, `0x15` TargetedOrder = 11, `0x0c` Build = 8,
-//! `0x37` Sync = 7, the `0x60`/`0x61` extended variants = 12/13).
-//!
-//! Do **not** use `get_command_length` @ `0x737860` (table `command_length_table`
-//! @ `0xd7fa50`) as the source: that is the *replay-skip* resolver, used only to
-//! skip replay-restricted commands during playback, and it diverges from live
-//! traffic — it reports `0x37` (Sync) as 1 byte and save/load (`0x06`/`0x07`) as
-//! a fixed 33, where the live dispatcher uses 7 and a variable string form. (An
-//! earlier revision of this table was mistakenly sourced from it.)
-//!
-//! [`command_name`]s come from the `broodrep` replay parser (`../broodrep`); the
+//! [`command_name`]s come from the `broodrep` replay parser; the
 //! `0x37` `Sync` name is from `screp`. Save/load (`0x06`/`0x07`) are valid in the
 //! binary as variable-length single-player string commands but are rejected here
 //! (`None`): they never appear in a live multiplayer turn stream, and modeling
-//! their string form would only add attacker-facing parse surface. The parser is
-//! attacker-facing and must be fuzzed (**D10**, Phase 6).
+//! their string form would only add attacker-facing parse surface.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,9 +67,9 @@ pub fn classify(id: CommandId) -> Option<CommandLength> {
 /// to determine the length of a variable-length command.
 ///
 /// This never reads past what it returns and never panics, so it is safe to run
-/// directly on attacker-controlled bytes on the relay (**D10**). The caller is
-/// still responsible for checking the returned length against the bytes that
-/// actually remain in the turn.
+/// directly on attacker-controlled bytes on the relay. The caller is still
+/// responsible for checking the returned length against the bytes that actually
+/// remain in the turn.
 pub fn command_length(buf: &[u8]) -> Option<usize> {
     let id = CommandId(*buf.first()?);
     match classify(id)? {
@@ -101,7 +81,7 @@ pub fn command_length(buf: &[u8]) -> Option<usize> {
     }
 }
 
-/// Human-readable name for an opcode, for logging/correlation (**D8**), or
+/// Human-readable name for an opcode, for logging/correlation, or
 /// `None` for invalid opcodes and a few unnamed control/rare commands (`0x08`
 /// restart, `0x56`, `0x5d`, `0x5f`, `0x66`).
 ///

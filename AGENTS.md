@@ -41,6 +41,10 @@ cargo run -p rally-point-relay -- --help                # relay/coordinator are 
 - **Errors:** `thiserror` for library error types; `color-eyre` for binary `main`s.
 - **Logging/metrics:** `tracing`, correlated by `tenant / session / slot / turn` (`D8`).
 - **Deps:** declare once in `[workspace.dependencies]`, reference `{ workspace = true }`.
+- **Code comments stand alone:** don't cite the build plan, phases, decision IDs
+  (`D1`–`D11`), or doc sections (`§N`) in code or doc comments. State the *what*
+  and *why* directly so the comment is self-contained for a reader who has never
+  seen the plan. Such cross-references belong in the plan, not the source.
 
 ## Gotchas (will bite you)
 

@@ -2,8 +2,7 @@
 //!
 //! netcode v2 components are deployed independently — the game DLL, the relay
 //! fleet, and the coordinator each ship on their own cadence — so every
-//! connection negotiates a protocol version before exchanging turns. See build
-//! plan WS-K ("protocol/schema versioning + negotiation") and Phase 6.
+//! connection negotiates a protocol version before exchanging turns.
 
 use serde::{Deserialize, Serialize};
 

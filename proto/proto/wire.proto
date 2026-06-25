@@ -4,8 +4,8 @@ package rally_point.wire;
 
 // One QUIC datagram's worth on a single leg (client <-> relay or relay <-> relay).
 // Carries redundant payloads plus the ack state for the peer's packets on this
-// leg. Recovery is app-level, not QUIC's (build plan §4): unacked payloads are
-// repacked into later packets until a packet carrying them is acked.
+// leg. Recovery is app-level, not QUIC's: unacked payloads are repacked into
+// later packets until a packet carrying them is acked.
 //
 // netcode v2 replaces Storm's UDP transport wholesale (Seq1/Seq2/resend/checksum
 // are gone, not tunneled): the game hooks at the turn/command layer, so these
@@ -44,12 +44,12 @@ message Payload {
   uint64 seq = 1;
 
   // The slot these commands belong to. The relay binds it to the sender's token
-  // slot on ingress (D10) and does not trust a client-sent value; a
-  // relay -> client fan-out packet may mux several slots.
+  // slot on ingress and does not trust a client-sent value; a relay -> client
+  // fan-out packet may mux several slots.
   uint32 slot = 2;
 
   // Native SC:R command-stream bytes (lobby or in-game). The relay parses and
-  // bounds-checks these against the command-length table (D10) but forwards the
+  // bounds-checks these against the command-length table but forwards the
   // bytes verbatim.
   bytes commands = 3;
 }
