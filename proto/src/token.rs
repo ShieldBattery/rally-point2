@@ -33,14 +33,25 @@
 //! sign/verify operations use a crypto library in the consuming crate
 //! (coordinator signs, relay verifies — see [`SignedToken::signed_message`]).
 //!
+//! ## kid → tenant binding (verifier obligation)
+//!
+//! A valid signature proves only that "the key identified by `kid` signed these
+//! claims" — it does **not** prove that `claims.tenant` is the tenant that key
+//! belongs to. The relay must treat its registry's `kid → tenant` mapping as
+//! authoritative: either verify `claims.tenant` equals the registered tenant
+//! for that `kid`, or derive the tenant from `kid` and ignore the claim field.
+//! Trusting `claims.tenant` on its own lets a tenant mint a token asserting
+//! another tenant's id.
+//!
 //! ## Connection binding
 //!
 //! The token embeds the client's Ed25519 public key ([`ClientPublicKey`]). After
 //! the QUIC connection is established, the relay sends a random 32-byte
-//! challenge; the client signs it with the matching private key and returns the
-//! signature. The relay verifies the proof against the public key from the token
-//! claims. A stolen bearer token is therefore useless without the client's
-//! private key, which never leaves the game process.
+//! [`ConnectionChallenge`]; the client signs it with the matching private key
+//! and returns a [`ChallengeResponse`]. The relay verifies the proof against
+//! the public key from the token claims. A stolen bearer token is therefore
+//! useless without the client's private key, which never leaves the trusted
+//! local process pair (app + game DLL).
 //!
 //! This is a *key-confirmed channel*: the binding is independent of QUIC's own
 //! TLS identity layer, so it works with any QUIC configuration and doesn't
@@ -59,8 +70,8 @@
 //!  3. coordinator signs token {kid, tenant, session, slot, expires_at, client_pubkey}
 //!  4. app → game DLL (launch handoff): {token, private_key, relay_addr}
 //!  5. game DLL → relay: QUIC connect + present token
-//!  6. relay → game DLL: 32-byte challenge
-//!  7. game DLL → relay: Ed25519 signature over challenge (proves private key)
+//!  6. relay → game DLL: ConnectionChallenge (32 random bytes)
+//!  7. game DLL → relay: ChallengeResponse (Ed25519 signature over challenge)
 //!  8. relay verifies signature against client_pubkey from token claims
 //! ```
 //!
@@ -89,13 +100,50 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Ed25519 signature length in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// Maximum length of a `kid` or tenant string in the wire format (one length
-/// byte, so the hard limit is 255; this is a sanity bound, not a protocol limit).
-pub const MAX_STRING_LEN: usize = 255;
+/// Length of the relay's connection-binding challenge nonce, in bytes.
+pub const CHALLENGE_LEN: usize = 32;
+
+/// Maximum length of a `kid` or tenant string in the wire format. The length
+/// prefix is a single `u8`, so 255 is the hard protocol limit — strings longer
+/// than this cannot be encoded and are rejected at construction time.
+pub const MAX_STRING_LEN: usize = u8::MAX as usize;
+
+/// A 1-byte domain tag prepended to every challenge the client signs, so the
+/// ephemeral client key can never be confused with the tenant signing key (which
+/// signs tokens, not challenges). Cheap insurance against cross-context
+/// signature reuse if the client key is ever repurposed.
+pub const CHALLENGE_DOMAIN_TAG: u8 = 0x01;
 
 /// Identifies which tenant signing key signed a token — the `kid` header.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyId(pub String);
+
+impl KeyId {
+    /// Construct a `kid`, rejecting strings longer than [`MAX_STRING_LEN`].
+    ///
+    /// The wire format uses a `u8` length prefix, so a `kid` longer than 255
+    /// bytes cannot be encoded. Validating at construction prevents a silent
+    /// truncation in [`SignedToken::encode`].
+    pub fn new(s: impl Into<String>) -> Result<Self, TokenError> {
+        let s = s.into();
+        if s.len() > MAX_STRING_LEN {
+            return Err(TokenError::StringTooLong);
+        }
+        Ok(Self(s))
+    }
+}
+
+impl From<KeyId> for String {
+    fn from(kid: KeyId) -> String {
+        kid.0
+    }
+}
+
+impl AsRef<str> for KeyId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// The client's Ed25519 public key, embedded in the token to bind it to the
 /// client's QUIC connection.
@@ -153,6 +201,12 @@ pub struct ExpiresAt(pub u64);
 /// they are tamper-evident. The relay checks every submitted turn against
 /// `slot` and `session` to prevent slot-spoofing and cross-session replay.
 ///
+/// **kid → tenant:** a valid signature proves only that key `kid` signed these
+/// claims; it does **not** prove that `tenant` is the tenant that key belongs
+/// to. The relay must cross-check `tenant` against its registry's `kid → tenant`
+/// mapping (or derive the tenant from `kid` and ignore this field). See the
+/// module-level "kid → tenant binding" docs.
+///
 /// Serialized via the custom binary format in [`SignedToken`], not serde: the
 /// signature must cover a canonical byte sequence, and serde's encoding is not
 /// guaranteed canonical across encoders.
@@ -195,15 +249,15 @@ impl TokenClaims {
 ///
 /// The token is presented by the client to the relay once, at QUIC connection
 /// setup — never per-turn. The relay verifies the signature (using the tenant's
-/// public key, looked up by [`kid`]) and then runs the connection-binding
+/// public key, looked up by `kid`) and then runs the connection-binding
 /// challenge-response (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedToken {
-    /// Which tenant signing key produced [`signature`].
+    /// Which tenant signing key produced `signature`.
     pub kid: KeyId,
     /// The signed authorization claims.
     pub claims: TokenClaims,
-    /// The Ed25519 signature over [`signed_message`].
+    /// The Ed25519 signature over the signed-message range.
     pub signature: Signature,
 }
 
@@ -216,17 +270,22 @@ pub enum TokenError {
     /// The token's version byte is not recognized by this build.
     #[error("unsupported token version: {0}")]
     UnsupportedVersion(u8),
-    /// The `kid` or tenant string exceeds [`MAX_STRING_LEN`].
+    /// The `kid` or tenant string exceeds [`MAX_STRING_LEN`] bytes.
     #[error("string field exceeds {MAX_STRING_LEN} bytes")]
     StringTooLong,
+    /// The trailing bytes after the signature are not empty — the token has
+    /// unexpected trailing data.
+    #[error("unexpected trailing bytes after signature")]
+    TrailingBytes,
 }
 
 impl SignedToken {
     /// Assemble a token from pre-computed parts.
     ///
-    /// The coordinator calls this after signing [`TokenClaims::signed_message`]
-    /// with the tenant's private key. This crate does not perform the signing —
-    /// the consuming crate supplies the signature.
+    /// The coordinator calls this after signing
+    /// [`SignedToken::signed_message`] with the tenant's private key. This
+    /// crate does not perform the signing — the consuming crate supplies the
+    /// signature.
     pub fn from_parts(kid: KeyId, claims: TokenClaims, signature: Signature) -> Self {
         Self {
             kid,
@@ -242,44 +301,68 @@ impl SignedToken {
     /// [client_pubkey]`. The coordinator signs these exact bytes; the relay
     /// verifies the signature against them.
     ///
-    /// Returns the bytes appended to `out`; the caller owns the buffer.
-    pub fn signed_message(&self, out: &mut Vec<u8>) {
-        encode_signed_range(out, TOKEN_VERSION, &self.kid, &self.claims);
+    /// Returns an error if the `kid` or tenant string exceeds [`MAX_STRING_LEN`]
+    /// (which can only happen if the token was built via [`KeyId`] or
+    /// [`TenantId`](crate::control::TenantId) without the checked constructors).
+    /// Appends the bytes to `out`; the caller owns the buffer.
+    pub fn signed_message(&self, out: &mut Vec<u8>) -> Result<(), TokenError> {
+        encode_signed_range(out, TOKEN_VERSION, &self.kid, &self.claims)
     }
 
     /// Encode the full token (signed range + signature) to a byte vector.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.encoded_len());
-        self.encode_to(&mut buf);
-        buf
+    ///
+    /// Returns an error if the `kid` or tenant string exceeds [`MAX_STRING_LEN`]
+    /// — the `u8` length prefix cannot represent a longer string, and silent
+    /// truncation would corrupt the signed range.
+    pub fn encode(&self) -> Result<Vec<u8>, TokenError> {
+        let cap = self.encoded_len().unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
+        self.encode_to(&mut buf)?;
+        Ok(buf)
     }
 
     /// Append the full token encoding to `out`.
-    pub fn encode_to(&self, out: &mut Vec<u8>) {
-        encode_signed_range(out, TOKEN_VERSION, &self.kid, &self.claims);
+    ///
+    /// Returns an error if the `kid` or tenant string exceeds [`MAX_STRING_LEN`].
+    pub fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), TokenError> {
+        encode_signed_range(out, TOKEN_VERSION, &self.kid, &self.claims)?;
         out.extend_from_slice(&self.signature.0);
+        Ok(())
     }
 
-    /// The exact byte length of this token's wire encoding.
-    pub fn encoded_len(&self) -> usize {
-        signed_range_len(&self.kid, &self.claims) + SIGNATURE_LEN
+    /// The exact byte length of this token's wire encoding, or `None` if a
+    /// string field exceeds [`MAX_STRING_LEN`] (in which case the token cannot
+    /// be encoded).
+    pub fn encoded_len(&self) -> Option<usize> {
+        checked_signed_range_len(&self.kid, &self.claims).map(|n| n + SIGNATURE_LEN)
     }
 
     /// Decode a token from its wire encoding.
     ///
-    /// Verifies the version byte and structural validity but does **not**
+    /// Peeks the version byte first, so a future-format token reports
+    /// [`TokenError::UnsupportedVersion`] rather than a misleading
+    /// [`TokenError::Malformed`]. Verifies structural validity but does **not**
     /// verify the Ed25519 signature — that requires a crypto library and is the
-    /// relay's job. Use [`signed_message`] to obtain the bytes the signature
-    /// covers, then verify against the tenant's public key.
+    /// relay's job. Use [`SignedToken::signed_message`] to obtain the bytes the
+    /// signature covers, then verify against the tenant's public key.
     pub fn decode(bytes: &[u8]) -> Result<Self, TokenError> {
-        let (version, kid, claims, rest) = decode_signed_range(bytes)?;
-
+        let version = *bytes.first().ok_or(TokenError::Malformed("empty token"))?;
         if version != TOKEN_VERSION {
             return Err(TokenError::UnsupportedVersion(version));
         }
 
-        let signature =
-            Signature::from_slice(rest).ok_or(TokenError::Malformed("signature too short"))?;
+        let (kid, claims, rest) = decode_signed_range_v1(bytes)?;
+
+        let signature_bytes: &[u8; SIGNATURE_LEN] = rest
+            .get(..SIGNATURE_LEN)
+            .ok_or(TokenError::Malformed("signature too short"))?
+            .try_into()
+            .unwrap();
+        let trailing = &rest[SIGNATURE_LEN..];
+        if !trailing.is_empty() {
+            return Err(TokenError::TrailingBytes);
+        }
+        let signature = Signature(*signature_bytes);
 
         Ok(Self {
             kid,
@@ -290,23 +373,107 @@ impl SignedToken {
 }
 
 // ---------------------------------------------------------------------------
+// Connection-binding challenge / response
+// ---------------------------------------------------------------------------
+
+/// The relay's challenge nonce, sent to the client after it presents a token.
+///
+/// The client signs [`signed_message`] with the private key matching the token's
+/// [`ClientPublicKey`] and returns a [`ChallengeResponse`]. This proves the
+/// client possesses the private key, completing the key-confirmed channel — a
+/// stolen bearer token is useless without it.
+///
+/// [`signed_message`]: ConnectionChallenge::signed_message
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionChallenge(pub [u8; CHALLENGE_LEN]);
+
+impl ConnectionChallenge {
+    /// Construct from a byte slice. Returns `None` if the slice is not exactly
+    /// [`CHALLENGE_LEN`] bytes.
+    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+        let arr: &[u8; CHALLENGE_LEN] = slice.try_into().ok()?;
+        Some(Self(*arr))
+    }
+
+    /// The raw challenge bytes.
+    pub fn as_bytes(&self) -> &[u8; CHALLENGE_LEN] {
+        &self.0
+    }
+
+    /// The canonical bytes the client signs with its Ed25519 private key.
+    ///
+    /// A 1-byte [`CHALLENGE_DOMAIN_TAG`] is prepended so this signature is
+    /// never confused with the tenant key's token signature (which covers a
+    /// different byte range with no domain tag). The client and relay both
+    /// use this method to derive the signed bytes, so they cannot disagree on
+    /// the wire shape.
+    pub fn signed_message(&self) -> [u8; 1 + CHALLENGE_LEN] {
+        let mut out = [0u8; 1 + CHALLENGE_LEN];
+        out[0] = CHALLENGE_DOMAIN_TAG;
+        out[1..].copy_from_slice(&self.0);
+        out
+    }
+}
+
+/// The client's proof-of-possession: an Ed25519 signature over the relay's
+/// [`ConnectionChallenge`].
+///
+/// The relay verifies this against the [`ClientPublicKey`] from the token's
+/// claims. Like [`Signature`], this is a plain byte array — this crate does not
+/// perform the verification; the consuming crate (relay) supplies the crypto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChallengeResponse(pub [u8; SIGNATURE_LEN]);
+
+impl ChallengeResponse {
+    /// Construct from a byte slice. Returns `None` if the slice is not exactly
+    /// [`SIGNATURE_LEN`] bytes.
+    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+        let arr: &[u8; SIGNATURE_LEN] = slice.try_into().ok()?;
+        Some(Self(*arr))
+    }
+
+    /// The raw signature bytes.
+    pub fn as_bytes(&self) -> &[u8; SIGNATURE_LEN] {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal encode/decode helpers
 // ---------------------------------------------------------------------------
 
 /// Append the signed byte range (version through client_pubkey) to `out`.
-fn encode_signed_range(out: &mut Vec<u8>, version: u8, kid: &KeyId, claims: &TokenClaims) {
+///
+/// Returns an error if the `kid` or tenant string exceeds [`MAX_STRING_LEN`].
+fn encode_signed_range(
+    out: &mut Vec<u8>,
+    version: u8,
+    kid: &KeyId,
+    claims: &TokenClaims,
+) -> Result<(), TokenError> {
     out.push(version);
 
-    push_string(out, &kid.0);
-    push_string(out, &claims.tenant.0);
+    push_string(out, &kid.0)?;
+    push_string(out, &claims.tenant.0)?;
 
     out.extend_from_slice(&claims.session.0.to_le_bytes());
     out.push(claims.slot.0);
     out.extend_from_slice(&claims.expires_at.0.to_le_bytes());
     out.extend_from_slice(&claims.client_pubkey.0);
+    Ok(())
 }
 
-/// Byte length of the signed range for the given kid + claims.
+/// Byte length of the signed range for the given kid + claims, or `None` if a
+/// string exceeds [`MAX_STRING_LEN`].
+fn checked_signed_range_len(kid: &KeyId, claims: &TokenClaims) -> Option<usize> {
+    if kid.0.len() > MAX_STRING_LEN || claims.tenant.0.len() > MAX_STRING_LEN {
+        return None;
+    }
+    Some(signed_range_len(kid, claims))
+}
+
+/// Byte length of the signed range. Caller must ensure both strings are
+/// `<= MAX_STRING_LEN` (checked by [`checked_signed_range_len`]).
 fn signed_range_len(kid: &KeyId, claims: &TokenClaims) -> usize {
     1 // version
     + 1 + kid.0.len() // kid_len + kid
@@ -317,21 +484,25 @@ fn signed_range_len(kid: &KeyId, claims: &TokenClaims) -> usize {
     + PUBLIC_KEY_LEN // client_pubkey
 }
 
-/// Append a length-prefixed UTF-8 string. Caller must ensure `len <= MAX_STRING_LEN`.
-fn push_string(out: &mut Vec<u8>, s: &str) {
+/// Append a length-prefixed UTF-8 string. Returns an error if the string
+/// exceeds [`MAX_STRING_LEN`] — the `u8` length prefix cannot represent a
+/// longer value, and silent truncation would corrupt the signed range.
+fn push_string(out: &mut Vec<u8>, s: &str) -> Result<(), TokenError> {
     let len = s.len();
-    debug_assert!(len <= MAX_STRING_LEN);
+    if len > MAX_STRING_LEN {
+        return Err(TokenError::StringTooLong);
+    }
     out.push(len as u8);
     out.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
-/// Decode the signed range (version through client_pubkey), returning the
+/// Decode the v1 signed range (version through client_pubkey), returning the
 /// remaining bytes (the signature).
-fn decode_signed_range(bytes: &[u8]) -> Result<(u8, KeyId, TokenClaims, &[u8]), TokenError> {
-    let mut pos = 0;
-
-    let version = *bytes.first().ok_or(TokenError::Malformed("empty token"))?;
-    pos += 1;
+///
+/// The version byte is assumed to have already been validated by the caller.
+fn decode_signed_range_v1(bytes: &[u8]) -> Result<(KeyId, TokenClaims, &[u8]), TokenError> {
+    let mut pos = 1; // skip version (validated by caller)
 
     let (kid, kid_bytes) = read_string(&bytes[pos..])?;
     pos += kid_bytes;
@@ -367,7 +538,7 @@ fn decode_signed_range(bytes: &[u8]) -> Result<(u8, KeyId, TokenClaims, &[u8]), 
         client_pubkey,
     };
 
-    Ok((version, KeyId(kid), claims, rest))
+    Ok((KeyId(kid), claims, rest))
 }
 
 /// Read a length-prefixed UTF-8 string, returning (string, bytes_consumed).
@@ -418,7 +589,7 @@ mod tests {
     #[test]
     fn round_trip_encode_decode() {
         let token = sample_token();
-        let encoded = token.encode();
+        let encoded = token.encode().unwrap();
         let decoded = SignedToken::decode(&encoded).unwrap();
 
         assert_eq!(decoded, token);
@@ -427,17 +598,17 @@ mod tests {
     #[test]
     fn encoded_len_is_exact() {
         let token = sample_token();
-        let encoded = token.encode();
-        assert_eq!(encoded.len(), token.encoded_len());
+        let encoded = token.encode().unwrap();
+        assert_eq!(encoded.len(), token.encoded_len().unwrap());
     }
 
     #[test]
     fn signed_message_excludes_signature() {
         let token = sample_token();
-        let encoded = token.encode();
+        let encoded = token.encode().unwrap();
 
         let mut signed_msg = Vec::new();
-        token.signed_message(&mut signed_msg);
+        token.signed_message(&mut signed_msg).unwrap();
 
         // The signed message is the encoding minus the trailing signature.
         assert_eq!(signed_msg.len(), encoded.len() - SIGNATURE_LEN);
@@ -451,8 +622,8 @@ mod tests {
 
         let mut a = Vec::new();
         let mut b = Vec::new();
-        token.signed_message(&mut a);
-        token.signed_message(&mut b);
+        token.signed_message(&mut a).unwrap();
+        token.signed_message(&mut b).unwrap();
 
         assert_eq!(a, b);
     }
@@ -468,7 +639,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_signature() {
         let token = sample_token();
-        let mut encoded = token.encode();
+        let mut encoded = token.encode().unwrap();
         encoded.truncate(encoded.len() - 1); // drop one signature byte
 
         assert_eq!(
@@ -480,7 +651,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_claims() {
         let token = sample_token();
-        let encoded = token.encode();
+        let encoded = token.encode().unwrap();
         // Cut off everything after the version + kid.
         let truncated = &encoded[..1 + 1 + token.kid.0.len()];
 
@@ -493,11 +664,22 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_version() {
         let token = sample_token();
-        let mut encoded = token.encode();
+        let mut encoded = token.encode().unwrap();
         encoded[0] = 99; // bogus version
 
         assert_eq!(
             SignedToken::decode(&encoded).unwrap_err(),
+            TokenError::UnsupportedVersion(99)
+        );
+    }
+
+    #[test]
+    fn decode_unknown_version_before_structural_parse() {
+        // A token whose version byte is unknown must report UnsupportedVersion,
+        // not Malformed — even if the body is too short to parse as v1.
+        let bytes = &[99u8]; // version only, no body
+        assert_eq!(
+            SignedToken::decode(bytes).unwrap_err(),
             TokenError::UnsupportedVersion(99)
         );
     }
@@ -524,6 +706,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_trailing_bytes() {
+        let token = sample_token();
+        let mut encoded = token.encode().unwrap();
+        encoded.push(0x00); // extra byte after signature
+
+        assert_eq!(
+            SignedToken::decode(&encoded).unwrap_err(),
+            TokenError::TrailingBytes
+        );
+    }
+
+    #[test]
     fn minimal_token_round_trips() {
         // Smallest valid token: empty kid and tenant strings.
         let token = SignedToken::from_parts(
@@ -538,7 +732,7 @@ mod tests {
             Signature([0; SIGNATURE_LEN]),
         );
 
-        let encoded = token.encode();
+        let encoded = token.encode().unwrap();
         // version(1) + kid_len(1) + tenant_len(1) + session(8) + slot(1)
         // + expires(8) + pubkey(32) + sig(64) = 116
         assert_eq!(encoded.len(), 116);
@@ -551,12 +745,12 @@ mod tests {
     fn encode_to_appends_without_clearing() {
         let token = sample_token();
         let mut buf = vec![0xFF, 0xEE];
-        token.encode_to(&mut buf);
+        token.encode_to(&mut buf).unwrap();
 
         // The prefix is preserved.
         assert_eq!(&buf[..2], &[0xFF, 0xEE]);
         // The rest is the token.
-        assert_eq!(buf.len(), 2 + token.encoded_len());
+        assert_eq!(buf.len(), 2 + token.encoded_len().unwrap());
     }
 
     #[test]
@@ -572,5 +766,83 @@ mod tests {
         assert!(Signature::from_slice(&[0; 63]).is_none());
         assert!(Signature::from_slice(&[0; 65]).is_none());
         assert!(Signature::from_slice(&[0; SIGNATURE_LEN]).is_some());
+    }
+
+    #[test]
+    fn key_id_new_rejects_oversized() {
+        assert!(KeyId::new(String::new()).is_ok());
+        assert!(KeyId::new("a".repeat(MAX_STRING_LEN)).is_ok());
+        assert_eq!(
+            KeyId::new("a".repeat(MAX_STRING_LEN + 1)).unwrap_err(),
+            TokenError::StringTooLong
+        );
+    }
+
+    #[test]
+    fn encode_rejects_oversized_kid() {
+        let token = SignedToken::from_parts(
+            KeyId("a".repeat(MAX_STRING_LEN + 1)),
+            sample_claims(),
+            Signature([0; SIGNATURE_LEN]),
+        );
+
+        assert_eq!(token.encode().unwrap_err(), TokenError::StringTooLong);
+        assert!(token.encoded_len().is_none());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_tenant() {
+        let token = SignedToken::from_parts(
+            KeyId("ok".to_owned()),
+            TokenClaims::new(
+                TenantId("b".repeat(MAX_STRING_LEN + 1)),
+                SessionId(0),
+                SlotId(0),
+                ExpiresAt(0),
+                ClientPublicKey([0; PUBLIC_KEY_LEN]),
+            ),
+            Signature([0; SIGNATURE_LEN]),
+        );
+
+        assert_eq!(token.encode().unwrap_err(), TokenError::StringTooLong);
+    }
+
+    // --- Challenge / response tests ---
+
+    #[test]
+    fn challenge_signed_message_has_domain_tag() {
+        let challenge = ConnectionChallenge([0x42; CHALLENGE_LEN]);
+        let signed = challenge.signed_message();
+
+        assert_eq!(signed[0], CHALLENGE_DOMAIN_TAG);
+        assert_eq!(&signed[1..], challenge.as_bytes());
+    }
+
+    #[test]
+    fn challenge_signed_message_is_deterministic() {
+        let challenge = ConnectionChallenge([0x99; CHALLENGE_LEN]);
+        assert_eq!(challenge.signed_message(), challenge.signed_message());
+    }
+
+    #[test]
+    fn challenge_signed_messages_differ_for_different_challenges() {
+        let a = ConnectionChallenge([0x11; CHALLENGE_LEN]);
+        let b = ConnectionChallenge([0x22; CHALLENGE_LEN]);
+        assert_ne!(a.signed_message(), b.signed_message());
+    }
+
+    #[test]
+    fn challenge_from_slice_rejects_wrong_length() {
+        assert!(ConnectionChallenge::from_slice(&[]).is_none());
+        assert!(ConnectionChallenge::from_slice(&[0; 31]).is_none());
+        assert!(ConnectionChallenge::from_slice(&[0; 33]).is_none());
+        assert!(ConnectionChallenge::from_slice(&[0; CHALLENGE_LEN]).is_some());
+    }
+
+    #[test]
+    fn challenge_response_from_slice_rejects_wrong_length() {
+        assert!(ChallengeResponse::from_slice(&[0; 63]).is_none());
+        assert!(ChallengeResponse::from_slice(&[0; 65]).is_none());
+        assert!(ChallengeResponse::from_slice(&[0; SIGNATURE_LEN]).is_some());
     }
 }

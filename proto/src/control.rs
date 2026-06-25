@@ -27,6 +27,31 @@ use crate::version::ProtocolVersion;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TenantId(pub String);
 
+impl TenantId {
+    /// Construct a tenant id, rejecting strings longer than
+    /// [`crate::token::MAX_STRING_LEN`]. The token's wire format uses a `u8`
+    /// length prefix, so a tenant id longer than 255 bytes cannot be encoded.
+    pub fn new(s: impl Into<String>) -> Result<Self, crate::token::TokenError> {
+        let s = s.into();
+        if s.len() > crate::token::MAX_STRING_LEN {
+            return Err(crate::token::TokenError::StringTooLong);
+        }
+        Ok(Self(s))
+    }
+}
+
+impl From<TenantId> for String {
+    fn from(tid: TenantId) -> String {
+        tid.0
+    }
+}
+
+impl AsRef<str> for TenantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The first message a relay sends when it phones home to its coordinator.
 ///
 /// Authenticated via a coordinator-injected bootstrap secret so a rogue
