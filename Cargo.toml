@@ -7,7 +7,7 @@ members = ["proto", "transport", "client", "relay", "coordinator"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["ShieldBattery"]
 repository = "https://github.com/ShieldBattery/rally-point2"
@@ -38,6 +38,12 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 bytes = "1.12"
 byteorder = "1.5"
+# TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the quinn
+# backend and keep the 32-bit client build free of a C/NASM toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Self-signed certs for transport loopback tests (dev-only). Uses ring, not the
+# default aws-lc-rs, so `cargo test` needs no NASM toolchain either.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 
 # --- Serialization ---
 serde = { version = "1.0", features = ["derive"] }

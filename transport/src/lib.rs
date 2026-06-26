@@ -14,14 +14,23 @@
 //! receipt (and would ack packets, not our redundantly-packed payloads), so the
 //! payload-level ack/redundancy is genuinely ours to own.
 //!
-//! The design is ported from the proven implementation in
+//! The redundancy/ack logic is ported from the proven implementation in
 //! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
 //! verbatim, while [`ack_manager`] is *re-derived* for our message shapes. It
 //! keeps the original's independent per-payload `seq` as the dedup/ack key —
 //! `game_frame_count` rides inside payloads as the consensus coordinate, not
 //! as the transport key — and the relay validates payload contents.
+//!
+//! [`quic`] holds the shared QUIC/TLS setup the leg runs on: the client and
+//! relay build their endpoints from the same crypto config so they stay in
+//! lockstep on protocol version, ALPN, and crypto provider.
 
 pub mod ack_manager;
+pub mod quic;
 pub mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager};
+
+/// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
+/// the versions this crate was built against rather than declaring its own.
+pub use {quinn, rustls};

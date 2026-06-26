@@ -18,3 +18,13 @@ rally-point-proto = { workspace = true }
 # redundancy bundle, and for the `Message` trait on the generated types.
 prost = { workspace = true }
 thiserror = { workspace = true }
+# The QUIC stack the per-leg transport runs on, plus its TLS config. Pinned to
+# the ring crypto provider so this (and the client that links it) builds for the
+# 32-bit game DLL without a C/NASM toolchain.
+quinn = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+# Test runtime + self-signed certs for the loopback QUIC tests.
+tokio = { workspace = true }
+rcgen = { workspace = true }
