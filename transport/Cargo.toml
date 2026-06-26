@@ -14,3 +14,7 @@ workspace = true
 
 [dependencies]
 rally-point-proto = { workspace = true }
+# Used to measure the encoded size of wire messages when sizing a datagram's
+# redundancy bundle, and for the `Message` trait on the generated types.
+prost = { workspace = true }
+thiserror = { workspace = true }

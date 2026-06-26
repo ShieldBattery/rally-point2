@@ -16,14 +16,12 @@
 //!
 //! The design is ported from the proven implementation in
 //! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
-//! verbatim, while the ack manager is *re-derived* for our message shapes. It
+//! verbatim, while [`ack_manager`] is *re-derived* for our message shapes. It
 //! keeps the original's independent per-payload `seq` as the dedup/ack key —
 //! `game_frame_count` rides inside payloads as the consensus coordinate, not
 //! as the transport key — and the relay validates payload contents.
 
+pub mod ack_manager;
 pub mod sequence_buffer;
 
-// TODO: pub mod ack_manager;
-// Adapted from `shieldbattery/game/src/netcode/ack_manager.rs`: same
-// repack-unacked-until-acked + transitive-`ack_bits` algorithm, keyed on the
-// per-payload `seq`, sized to the live `max_datagram_size()` (turns at 24/sec).
+pub use ack_manager::{AckError, AckManager};

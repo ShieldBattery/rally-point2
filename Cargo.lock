@@ -681,7 +681,9 @@ dependencies = [
 name = "rally-point-transport"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "rally-point-proto",
+ "thiserror",
 ]
 
 [[package]]
