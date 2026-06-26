@@ -12,9 +12,10 @@
 //! in several packets, so [`recv`](Link::recv) returns each payload exactly once.
 //! It tracks the contiguous run of delivered seqs plus a bounded set of
 //! out-of-order ones above it, so a fresh high seq never masks an older
-//! redundant one that simply hasn't arrived yet. Delivery is in arrival order —
-//! in-order reassembly (holding a seq until the gap below it fills, as Storm
-//! did) is a layer above this.
+//! redundant one that simply hasn't arrived yet. Each call returns a packet's
+//! new payloads in seq order, but successive calls follow packet arrival, so the
+//! delivered stream isn't globally ordered — true in-order reassembly (holding a
+//! seq until the gap below it fills, as Storm did) is a layer above this.
 
 use std::collections::BTreeSet;
 
@@ -110,8 +111,8 @@ impl Link {
     }
 
     /// Awaits the next datagram, folds its acks into the manager, and returns the
-    /// payloads not delivered before (redundant copies dropped), in arrival
-    /// order.
+    /// payloads not delivered before (redundant copies dropped), in ascending
+    /// seq order.
     pub async fn recv(&mut self) -> Result<Vec<Payload>, LinkError> {
         let datagram = self.connection.read_datagram().await?;
         let packet = Packet::decode(datagram)?;
