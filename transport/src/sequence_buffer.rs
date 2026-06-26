@@ -4,16 +4,6 @@
 
 const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
 
-/// The largest sequence number a [`SequenceBuffer`] accepts. The top bit is
-/// reserved to mark empty slots, and inserting advances one past the newest
-/// sequence, so one more value below `2^63` is reserved as well. Code that feeds
-/// the buffer untrusted sequences must reject anything greater first — [`exists`]
-/// and [`insert`] panic above it.
-///
-/// [`exists`]: SequenceBuffer::exists
-/// [`insert`]: SequenceBuffer::insert
-pub const MAX_SEQUENCE: u64 = (i64::MAX as u64) - 1;
-
 /// A ring buffer designed for storing information about packets that have been sent and received.
 /// This is similar to the data structure described here:
 /// <https://gafferongames.com/post/reliable_ordered_messages/>

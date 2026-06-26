@@ -9,22 +9,26 @@
 //!
 //! Dedup is the link's job. netcode v2 removes Storm's transport layer, which
 //! used to drop the redundant copies; redundancy means the same payload arrives
-//! in several packets, so [`recv`](Link::recv) tracks delivered payload seqs and
-//! returns each exactly once. Delivery is in arrival order — in-order
-//! reassembly (waiting on a missing seq, as Storm did) is a layer above this.
+//! in several packets, so [`recv`](Link::recv) returns each payload exactly once.
+//! It tracks the contiguous run of delivered seqs plus a bounded set of
+//! out-of-order ones above it, so a fresh high seq never masks an older
+//! redundant one that simply hasn't arrived yet. Delivery is in arrival order —
+//! in-order reassembly (holding a seq until the gap below it fills, as Storm
+//! did) is a layer above this.
+
+use std::collections::BTreeSet;
 
 use prost::Message;
 use rally_point_proto::messages::{Packet, Payload};
 
 use crate::ack_manager::{AckError, AckManager};
-use crate::sequence_buffer::{MAX_SEQUENCE, SequenceBuffer};
 
-/// How many recently-delivered payload seqs to remember for dedup. A payload is
-/// re-sent only until it's acked, and receiving it is what produces that ack, so
-/// a window this far behind the newest delivered seq always covers anything the
-/// peer could still be re-sending — well beyond its redundancy reach even under
-/// heavy loss.
-const DELIVERED_WINDOW: usize = 4096;
+/// How far ahead of the contiguous delivered prefix a peer's payload seq may be
+/// before the link is treated as broken. The redundancy stream keeps that prefix
+/// advancing, so legitimately reaching this bound means the low seqs have been
+/// lost for a long run (minutes at the turn rate) — a dead link, not reorder. It
+/// also bounds the out-of-order set to at most this many entries.
+const RECEIVE_WINDOW: u64 = 4096;
 
 /// A single transport link over one QUIC connection.
 pub struct Link {
@@ -49,10 +53,11 @@ pub enum LinkError {
     /// A received datagram was not a well-formed packet.
     #[error("decoding incoming packet failed: {0}")]
     Decode(#[from] prost::DecodeError),
-    /// A received payload carried a seq outside the trackable range (its top bit
-    /// is reserved). Only a malformed or malicious peer sends these.
-    #[error("payload seq {seq} is out of range")]
-    InvalidPayloadSeq { seq: u64 },
+    /// A payload's seq was further ahead of our contiguous delivered prefix than
+    /// the receive window allows — the peer is racing too far ahead (a dead link
+    /// or a malicious one). The caller should drop it.
+    #[error("payload seq {seq} is beyond the receive window")]
+    PayloadOutOfWindow { seq: u64 },
     /// A received packet's acks were internally inconsistent. Attacker-facing
     /// callers (the relay) typically drop the peer on this.
     #[error(transparent)]
@@ -115,58 +120,92 @@ impl Link {
 
     /// Folds a decoded packet's acks into the manager and returns its
     /// not-yet-delivered payloads. Split out from [`recv`](Link::recv) so the
-    /// validation and dedup are exercised without a live connection.
-    fn process_incoming(&mut self, packet: Packet) -> Result<Vec<Payload>, LinkError> {
-        // Reject out-of-range payload seqs before any state is touched: they are
-        // attacker-controlled, and the dedup buffer reserves the top sequence bit
-        // (feeding it a larger value would panic).
-        for payload in &packet.payloads {
-            if payload.seq > MAX_SEQUENCE {
-                return Err(LinkError::InvalidPayloadSeq { seq: payload.seq });
-            }
-        }
-
+    /// dedup is exercised without a live connection.
+    fn process_incoming(&mut self, mut packet: Packet) -> Result<Vec<Payload>, LinkError> {
         self.acks.handle_incoming(&packet)?;
+
+        // Process payloads low-seq first. A packet leads with its fresh (highest)
+        // seq, so without this a deep-loss packet's high seq could shut the window
+        // on the older redundant seqs it carries alongside.
+        packet.payloads.sort_by_key(|p| p.seq);
 
         let mut fresh = Vec::new();
         for payload in packet.payloads {
-            if self.dedup.accept(payload.seq) {
-                fresh.push(payload);
+            match self.dedup.accept(payload.seq) {
+                Delivery::New => fresh.push(payload),
+                Delivery::Duplicate => {}
+                Delivery::OutOfWindow => {
+                    return Err(LinkError::PayloadOutOfWindow { seq: payload.seq });
+                }
             }
         }
         Ok(fresh)
     }
 }
 
-/// Receive-side payload dedup: remembers recently delivered payload seqs so the
-/// redundant copies that ride later packets are dropped.
+/// The outcome of offering a received payload seq to the dedup state.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    /// First time this seq has been delivered — hand it to the caller.
+    New,
+    /// Already delivered (at/below the contiguous prefix, or seen out of order).
+    Duplicate,
+    /// Beyond the receive window — the peer is racing too far ahead.
+    OutOfWindow,
+}
+
+/// Receive-side payload dedup.
+///
+/// Tracks `delivered_through`, the top of the contiguous run of delivered seqs,
+/// plus `ahead`, the delivered seqs above it that are waiting for the gaps below
+/// them to fill. A seq is a duplicate only if it's within that known-delivered
+/// state — never merely because a higher seq arrived first — so a redundant low
+/// seq is never mistaken for one that aged out.
 struct Dedup {
-    delivered: SequenceBuffer<()>,
+    /// Top of the contiguous delivered prefix; `None` until seq 0 is delivered.
+    delivered_through: Option<u64>,
+    /// Delivered seqs above the prefix, kept until the gaps below them fill.
+    ahead: BTreeSet<u64>,
+    /// How far above the prefix a seq may sit before it's rejected.
+    window: u64,
 }
 
 impl Dedup {
     fn new() -> Self {
-        Self::with_window(DELIVERED_WINDOW)
+        Self::with_window(RECEIVE_WINDOW)
     }
 
-    fn with_window(capacity: usize) -> Self {
+    fn with_window(window: u64) -> Self {
         Self {
-            delivered: SequenceBuffer::with_capacity(capacity),
+            delivered_through: None,
+            ahead: BTreeSet::new(),
+            window,
         }
     }
 
-    /// Records `seq` as delivered, returning whether this is the first time it's
-    /// been seen. Returns `false` for any seq already delivered — whether it's
-    /// still inside the dedup window or has fallen out of it. The caller must
-    /// ensure `seq <= MAX_SEQUENCE`.
-    fn accept(&mut self, seq: u64) -> bool {
-        if self.delivered.exists(seq) {
-            return false;
+    /// Records `seq` as delivered and reports whether it's new, a duplicate, or
+    /// out of the receive window.
+    fn accept(&mut self, seq: u64) -> Delivery {
+        // The lowest seq not yet part of the contiguous delivered prefix.
+        let base = self.delivered_through.map_or(0, |t| t + 1);
+
+        if seq < base {
+            return Delivery::Duplicate;
         }
-        // `insert` returns `None` when `seq` is too old to track — meaning it was
-        // delivered before falling out of the window — so that is a duplicate
-        // too, not a new delivery.
-        self.delivered.insert(seq, ()).is_some()
+        if seq - base >= self.window {
+            return Delivery::OutOfWindow;
+        }
+        if !self.ahead.insert(seq) {
+            return Delivery::Duplicate;
+        }
+
+        // Absorb any now-contiguous run into the delivered prefix.
+        let mut next = base;
+        while self.ahead.remove(&next) {
+            self.delivered_through = Some(next);
+            next += 1;
+        }
+        Delivery::New
     }
 }
 
@@ -181,22 +220,39 @@ mod tests {
 
     #[test]
     fn dedup_returns_each_seq_once() {
-        let mut dedup = Dedup::with_window(4);
-        assert!(dedup.accept(0));
-        assert!(!dedup.accept(0)); // duplicate still inside the window
-        assert!(dedup.accept(1));
-        assert!(!dedup.accept(1));
+        let mut dedup = Dedup::with_window(8);
+        assert_eq!(dedup.accept(0), Delivery::New);
+        assert_eq!(dedup.accept(0), Delivery::Duplicate);
+        assert_eq!(dedup.accept(1), Delivery::New);
+        assert_eq!(dedup.accept(1), Delivery::Duplicate);
     }
 
     #[test]
-    fn dedup_does_not_redeliver_evicted_seqs() {
-        let mut dedup = Dedup::with_window(4);
-        for seq in 0..=4 {
-            assert!(dedup.accept(seq));
-        }
-        // Seq 0 has been pushed out of the 4-slot window; a redundant copy of it
-        // must still count as a duplicate, not a fresh delivery.
-        assert!(!dedup.accept(0));
+    fn dedup_handles_out_of_order_within_window() {
+        let mut dedup = Dedup::with_window(8);
+        assert_eq!(dedup.accept(0), Delivery::New);
+        assert_eq!(dedup.accept(3), Delivery::New); // gap at 1, 2
+        assert_eq!(dedup.accept(3), Delivery::Duplicate);
+        assert_eq!(dedup.accept(1), Delivery::New);
+        assert_eq!(dedup.accept(2), Delivery::New); // closes the gap; 3 folds in
+        assert_eq!(dedup.accept(0), Delivery::Duplicate); // below the prefix now
+    }
+
+    #[test]
+    fn dedup_does_not_drop_a_low_seq_after_a_high_one() {
+        // The regression: a high seq arriving first must not push an older, not
+        // yet delivered seq out as "too old". Both are new deliveries.
+        let mut dedup = Dedup::with_window(8);
+        assert_eq!(dedup.accept(7), Delivery::New);
+        assert_eq!(dedup.accept(0), Delivery::New);
+    }
+
+    #[test]
+    fn dedup_rejects_seq_beyond_window() {
+        let mut dedup = Dedup::with_window(8);
+        assert_eq!(dedup.accept(0), Delivery::New); // prefix top = 0, base = 1
+        assert_eq!(dedup.accept(9), Delivery::OutOfWindow); // 9 - 1 >= 8
+        assert_eq!(dedup.accept(8), Delivery::New); // 8 - 1 < 8, still in window
     }
 
     fn self_signed() -> (
@@ -280,11 +336,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_out_of_range_payload_seq() {
+    async fn delivers_a_redundant_low_seq_carried_after_a_high_fresh_one() {
         let (client, mut server, _client_ep, _server_ep) = connected_links().await;
 
-        // Inject a packet whose payload seq sets the reserved top bit, bypassing
-        // the sending link's ack manager. The receiver must reject it, not panic.
+        // A deep-loss packet leads with a high fresh seq and re-carries an older
+        // unacked one. Both must be delivered — the low seq is not dropped.
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                Payload {
+                    seq: RECEIVE_WINDOW,
+                    slot: 0,
+                    commands: vec![0xAA].into(),
+                },
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xBB].into(),
+                },
+            ],
+        };
+        client
+            .connection()
+            .send_datagram(packet.encode_to_vec().into())
+            .unwrap();
+
+        let delivered = server.recv().await.unwrap();
+        let seqs: Vec<u64> = delivered.iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![0, RECEIVE_WINDOW]);
+    }
+
+    #[tokio::test]
+    async fn rejects_payload_seq_beyond_the_window() {
+        let (client, mut server, _client_ep, _server_ep) = connected_links().await;
+
+        // A seq racing far past our contiguous progress must be rejected, not
+        // panic the receiver.
         let malformed = Packet {
             seq: 0,
             ack: None,
@@ -301,8 +390,8 @@ mod tests {
             .unwrap();
 
         match server.recv().await {
-            Err(LinkError::InvalidPayloadSeq { seq }) => assert_eq!(seq, u64::MAX),
-            other => panic!("expected InvalidPayloadSeq, got {other:?}"),
+            Err(LinkError::PayloadOutOfWindow { seq }) => assert_eq!(seq, u64::MAX),
+            other => panic!("expected PayloadOutOfWindow, got {other:?}"),
         }
     }
 }
