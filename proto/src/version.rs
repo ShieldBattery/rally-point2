@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// A netcode v2 wire-protocol version.
 ///
-/// Bumped on any breaking change to [`crate::wire`], [`crate::control`], or
+/// Bumped on any breaking change to [`crate::messages`], [`crate::control`], or
 /// [`crate::token`] framing. Negotiation always selects the highest version
 /// both peers support (see [`negotiate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
