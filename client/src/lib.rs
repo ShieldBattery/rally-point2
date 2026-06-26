@@ -20,6 +20,6 @@
 /// separately.
 pub use rally_point_proto as proto;
 
-/// Re-export of the shared per-leg transport machinery (ack/redundancy +
-/// sequence buffer) — the client runs one instance for its home-relay leg.
+/// Re-export of the shared per-link transport machinery (ack/redundancy +
+/// sequence buffer) — the client runs one instance for its home-relay link.
 pub use rally_point_transport as transport;

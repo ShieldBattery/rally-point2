@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `rally-point2` is the all-Rust netcode v2 platform for ShieldBattery: the portable
-client, the shared per-leg transport layer, the validating relay + mesh, and the
+client, the shared per-link transport layer, the validating relay + mesh, and the
 multi-tenant coordinator. It replaces the Node.js `rally-point`.
 
 ## Where the design lives
@@ -18,11 +18,11 @@ the plan in the same change). SC:R glue and UI live in `../shieldbattery/`
 - `proto` — the frozen contracts: wire framing, control-plane messages, tokens,
   protocol version + negotiation, SC:R command table. Anything that crosses a
   component boundary is defined here *first*.
-- `transport` — per-leg reliable delivery over unreliable QUIC datagrams (ack +
-  redundancy + sequence buffer), shared by `client` and `relay` (one per leg).
+- `transport` — per-link reliable delivery over unreliable QUIC datagrams (ack +
+  redundancy + sequence buffer), shared by `client` and `relay` (one per link).
   Ported from `shieldbattery/game/src/netcode/`.
 - `client` — portable client endpoint linked into `shieldbattery/game/`; runs
-  `transport` for its home-relay leg.
+  `transport` for its home-relay link.
 - `relay`, `coordinator` — `lib.rs` (logic) + thin `main.rs` (arg parsing + wiring).
 - `infra/` — Fargate / region-beacon IaC (Phase 5). Not a crate; excluded from the workspace.
 
@@ -78,5 +78,5 @@ Full detail in build plan §0 + §4. The ones easy to break by accident:
   12-byte UDP header (Seq1/Seq2/CLS/PlayerID/resend/checksum) sits *below* our seam
   and is removed — `Packet` + QUIC own sequencing, acks, integrity, and recovery.
   Don't reintroduce Storm framing on the wire (that was the old double-reliability
-  overhead). Transport identity is a per-leg `seq` (Storm's own model), not a game
+  overhead). Transport identity is a per-link `seq` (Storm's own model), not a game
   frame; the D9 consensus coordinate is a separate, later concern.

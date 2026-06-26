@@ -1,6 +1,6 @@
 [package]
 name = "rally-point-transport"
-description = "Per-leg reliable delivery over unreliable QUIC datagrams (ack manager + sequence buffer), shared by the client and relay."
+description = "Per-link reliable delivery over unreliable QUIC datagrams (ack manager + sequence buffer), shared by the client and relay."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,7 +18,7 @@ rally-point-proto = { workspace = true }
 # redundancy bundle, and for the `Message` trait on the generated types.
 prost = { workspace = true }
 thiserror = { workspace = true }
-# The QUIC stack the per-leg transport runs on, plus its TLS config. Pinned to
+# The QUIC stack the per-link transport runs on, plus its TLS config. Pinned to
 # the ring crypto provider so this (and the client that links it) builds for the
 # 32-bit game DLL without a C/NASM toolchain.
 quinn = { workspace = true }

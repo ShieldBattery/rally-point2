@@ -11,7 +11,7 @@
 //!   `game_frame_count`; the coordinator only sets *policy*.
 //! - **turn log** — persist + replicate the per-game turn log; the same
 //!   "replay from cursor X" primitive serves failover and (future) observers.
-//! - **flight recorder** — per-game turn stream + per-leg health + events,
+//! - **flight recorder** — per-game turn stream + per-link health + events,
 //!   flushed to a durable store *before* scale-to-zero teardown.
 //!
 //! The modules for these are not built yet; this half currently exposes only

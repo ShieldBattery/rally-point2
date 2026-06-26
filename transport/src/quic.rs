@@ -1,6 +1,6 @@
-//! Shared QUIC setup for a netcode v2 leg.
+//! Shared QUIC setup for a netcode v2 link.
 //!
-//! Both endpoints of a leg use the same crypto configuration: the client dials
+//! Both endpoints of a link use the same crypto configuration: the client dials
 //! its home relay, and the relay accepts both clients and mesh peers. Building
 //! that config once here keeps the two roles in lockstep on protocol version,
 //! ALPN, and crypto provider.
@@ -9,7 +9,7 @@
 //! the client links this crate into the 32-bit game DLL, and ring builds for
 //! `i686-pc-windows-msvc` without a C/NASM toolchain. Selecting it explicitly
 //! (rather than relying on a process-wide default provider) means a host that
-//! happens to have aws-lc-rs linked elsewhere can't change which provider a leg
+//! happens to have aws-lc-rs linked elsewhere can't change which provider a link
 //! uses.
 //!
 //! TLS here secures the channel and proves the relay's server identity; it does
@@ -100,7 +100,7 @@ mod tests {
 
     /// Proves the pinned quinn + rustls + ring stack actually completes a
     /// handshake and carries a datagram over loopback — the foundation every
-    /// leg is built on.
+    /// link is built on.
     #[tokio::test]
     async fn loopback_connects_and_exchanges_a_datagram() {
         let (chain, key, ca) = self_signed();

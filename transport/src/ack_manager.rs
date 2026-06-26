@@ -1,7 +1,7 @@
-//! Per-leg send/ack bookkeeping: the redundancy + acknowledgement layer that
+//! Per-link send/ack bookkeeping: the redundancy + acknowledgement layer that
 //! makes recovery *ours* rather than QUIC's.
 //!
-//! A leg's payloads ride unreliable QUIC datagrams, each one carried in a
+//! A link's payloads ride unreliable QUIC datagrams, each one carried in a
 //! [`Packet`]. Every packet carries a fresh payload plus copies of still-unacked
 //! older payloads, up to the datagram's size budget, so a single dropped packet
 //! rarely loses a payload outright — the next packet re-carries it. Each packet
@@ -16,7 +16,7 @@
 //! - **payload seq** ([`Payload::seq`], a `u64`) is the transport identity of a
 //!   command unit — the dedup/retirement key, independent of game state.
 //!
-//! One [`AckManager`] runs per leg at each endpoint (client ↔ home relay, and
+//! One [`AckManager`] runs per link at each endpoint (client ↔ home relay, and
 //! relay ↔ relay across the mesh). It owns no I/O: the driver pulls a built
 //! [`Packet`] from [`build_outgoing`](AckManager::build_outgoing) and sends it,
 //! and feeds every received [`Packet`] to
@@ -40,7 +40,7 @@ const RECEIVED_PACKETS_SIZE: usize = 32 + 1;
 /// lost (its payloads are still re-sent until separately acked).
 const SENT_PACKETS_SIZE: usize = 256;
 
-/// Manages sending packets and processing acknowledgements for one leg.
+/// Manages sending packets and processing acknowledgements for one link.
 ///
 /// Packets contain one or more payloads, each with its own sequence number. When
 /// an ack for a packet arrives, every payload that packet carried is considered
