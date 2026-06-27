@@ -3,8 +3,9 @@
 //! The relay is the transport *below* the game's OUT/IN hooks and the
 //! server-side vantage point for everything stateful in netcode v2:
 //!
-//! - **validation** — bind each turn to the token's slot, bounds-check every
-//!   command, allowlist live ids, strip client-originated control commands.
+//! - **validation** ([`validation`]) — bind each turn to the token's slot,
+//!   bounds-check every command, allowlist live ids, strip client-originated
+//!   control commands.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
 //!   topological dedup, degrade-to-single-relay (`C–S–C`).
 //! - **consensus** — execute per-turn latency/leave consensus keyed on
@@ -14,11 +15,11 @@
 //! - **flight recorder** — per-game turn stream + per-link health + events,
 //!   flushed to a durable store *before* scale-to-zero teardown.
 //!
-//! The modules for these are not built yet; this half currently exposes only
-//! shared constants. The binary half ([`main`](../main.rs)) wires up the
-//! process.
+//! Most of these are not built yet; the validation gate is. The binary half
+//! ([`main`](../main.rs)) wires up the process.
 
-// TODO: pub mod validation;       // attacker-facing, fuzzed
+pub mod validation;
+
 // TODO: pub mod mesh;             // one conn per relay-pair
 // TODO: pub mod consensus;        // keyed on game_frame_count
 // TODO: pub mod turn_log;         // replicated, bounded + flushed

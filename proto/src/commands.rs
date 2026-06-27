@@ -8,10 +8,14 @@
 //! lives here and is shared.
 //!
 //! [`command_name`]s come from the `broodrep` replay parser; the
-//! `0x37` `Sync` name is from `screp`. Save/load (`0x06`/`0x07`) are valid in the
-//! binary as variable-length single-player string commands but are rejected here
-//! (`None`): they never appear in a live multiplayer turn stream, and modeling
-//! their string form would only add attacker-facing parse surface.
+//! `0x37` `Sync` name is from `screp`. Save/load (`0x06`/`0x07`) are
+//! variable-length, null-terminated-string commands that *can* appear in a live
+//! multiplayer game, but ShieldBattery deliberately does not support saving or
+//! loading games right now — there is no load path through SB, and in-game save
+//! is effectively unused (and likely already broken) — so they are rejected here
+//! (`None`) rather than parsed. Bringing them back means modeling their
+//! null-terminated string form, which adds attacker-facing parse surface; make
+//! that trade only if SB restores save/load.
 
 use serde::{Deserialize, Serialize};
 

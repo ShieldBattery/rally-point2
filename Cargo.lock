@@ -1019,6 +1019,7 @@ dependencies = [
  "color-eyre",
  "rally-point-proto",
  "rally-point-transport",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
