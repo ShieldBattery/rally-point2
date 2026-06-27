@@ -9,7 +9,8 @@
 //! - **coordinator ⇄ relay** and **coordinator ⇄ app server** — the control
 //!   plane ([`control`]). Note: consensus *decisions* are **not** here — those
 //!   run on the relay/mesh keyed on [`ids::GameFrameCount`].
-//! - **authorization** — connection-bound, per-tenant tokens ([`token`]).
+//! - **authorization** — connection-bound, per-tenant tokens ([`token`]) and the
+//!   sans-I/O codec for the connection handshake that presents them ([`handshake`]).
 //! - **SC:R command parsing** — `command_lengths` + var-length rules ([`commands`]).
 //! - **protocol versioning + negotiation** ([`version`]).
 //! - **typed turn coordinates / ids** shared across the logic layers ([`ids`]).
@@ -23,6 +24,7 @@
 
 pub mod commands;
 pub mod control;
+pub mod handshake;
 pub mod ids;
 pub mod token;
 pub mod version;

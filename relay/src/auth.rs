@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 
 use rally_point_proto::control::TenantId;
+use rally_point_proto::handshake::{self, HandshakeError};
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
     CHALLENGE_LEN, ChallengeResponse, ClientPublicKey, ConnectionChallenge, KeyId, PUBLIC_KEY_LEN,
@@ -57,21 +58,10 @@ use rally_point_transport::quinn;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 
-/// Upper bound on the length-prefixed token a client may present, in bytes.
-///
-/// A well-formed token tops out near 626 bytes (a 255-byte `kid`, a 255-byte
-/// tenant, the fixed claim fields, and the 64-byte signature); this leaves
-/// headroom while capping the buffer the relay allocates for an attacker-supplied
-/// length prefix.
-const MAX_TOKEN_LEN: usize = 1024;
-
-/// Byte the relay writes once a connection is fully authorized and its slot is
-/// routable: the relay will now carry this client's turns to its peers and peers'
-/// turns to it. This is a transport-readiness signal, not a game-start one — when
-/// the session actually begins exchanging turns is decided a layer up (lobby /
-/// ready, over a reliable channel) once every expected player is connected, so a
-/// compliant client has no turns to send until then.
-pub const HANDSHAKE_OK: u8 = 0x01;
+/// The byte the relay writes to acknowledge an authorized, routable connection.
+/// Re-exported from the shared handshake codec so callers reading the relay's
+/// edge see it here, while the wire framing stays defined in one place.
+pub use rally_point_proto::handshake::HANDSHAKE_OK;
 
 /// What a tenant signing key (`kid`) resolves to: the tenant that owns it and the
 /// Ed25519 public key that verifies tokens it signed.
@@ -162,10 +152,10 @@ pub enum AuthError {
     /// The presented token was structurally malformed.
     #[error("malformed token: {0}")]
     Token(#[from] TokenError),
-    /// The token length prefix exceeded [`MAX_TOKEN_LEN`]; refused without
-    /// allocating the claimed size.
-    #[error("presented token length {len} exceeds the maximum of {MAX_TOKEN_LEN}")]
-    TokenTooLong { len: usize },
+    /// The handshake framing was rejected — most often a token length prefix
+    /// beyond the allowed maximum, refused without allocating the claimed size.
+    #[error("handshake framing error: {0}")]
+    Handshake(#[from] HandshakeError),
     /// The secure RNG failed to produce a challenge nonce.
     #[error("generating a challenge nonce failed")]
     Rng,
@@ -249,12 +239,9 @@ pub async fn authenticate(
 ) -> Result<(AuthorizedClient, quinn::SendStream), AuthError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
-    let mut len_buf = [0u8; 2];
+    let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
     recv.read_exact(&mut len_buf).await?;
-    let token_len = usize::from(u16::from_le_bytes(len_buf));
-    if token_len > MAX_TOKEN_LEN {
-        return Err(AuthError::TokenTooLong { len: token_len });
-    }
+    let token_len = handshake::decode_token_len(len_buf)?;
     let mut token_bytes = vec![0u8; token_len];
     recv.read_exact(&mut token_bytes).await?;
     let token = SignedToken::decode(&token_bytes)?;

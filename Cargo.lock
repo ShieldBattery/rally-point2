@@ -984,7 +984,13 @@ name = "rally-point-client"
 version = "0.1.0"
 dependencies = [
  "rally-point-proto",
+ "rally-point-relay",
  "rally-point-transport",
+ "rcgen",
+ "ring",
+ "socket2",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

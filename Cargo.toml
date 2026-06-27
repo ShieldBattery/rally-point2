@@ -17,6 +17,7 @@ repository = "https://github.com/ShieldBattery/rally-point2"
 rally-point-proto = { path = "proto" }
 rally-point-transport = { path = "transport" }
 rally-point-client = { path = "client" }
+rally-point-relay = { path = "relay" }
 
 # --- Async runtime & QUIC transport ---
 tokio = { version = "1.52", features = [
@@ -38,6 +39,10 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 bytes = "1.12"
 byteorder = "1.5"
+# Dual-stack UDP socket construction for the client endpoint: std's UdpSocket
+# can't clear IPV6_V6ONLY, which a v6 socket needs to also reach IPv4 relays.
+# Already in the tree transitively via quinn; pinned to the same major.
+socket2 = "0.6"
 # TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the quinn
 # backend and keep the 32-bit client build free of a C/NASM toolchain.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

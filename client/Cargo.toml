@@ -15,3 +15,19 @@ workspace = true
 [dependencies]
 rally-point-proto = { workspace = true }
 rally-point-transport = { workspace = true }
+# Ed25519 signing of the relay's connection-binding challenge. Reuses ring — the
+# pinned QUIC crypto provider — so the 32-bit client build pulls in no second
+# curve25519 backend and still needs no C/NASM toolchain.
+ring = { workspace = true }
+# Builds the dual-stack UDP socket the default client endpoint dials relays from.
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+# Bounds the dial with a deadline so a stalled relay can't hang the launch path.
+# The game DLL already drives this crate's futures on a tokio runtime.
+tokio = { workspace = true }
+
+[dev-dependencies]
+# The C–S–C loopback test drives real clients against a real relay.
+rally-point-relay = { workspace = true }
+# Self-signed relay cert for the loopback test (dev-only; uses ring, not aws-lc-rs).
+rcgen = { workspace = true }
