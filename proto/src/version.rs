@@ -16,13 +16,18 @@ pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
     /// The version implemented by this build.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(1);
+    ///
+    /// `2` folds a TLS channel binding into the connection-binding challenge
+    /// proof, which a v1 peer can neither produce nor verify.
+    pub const CURRENT: ProtocolVersion = ProtocolVersion(2);
 
     /// The oldest version this build can still interoperate with.
     ///
-    /// Held equal to [`Self::CURRENT`] until we ship a second wire version and
-    /// commit to backward compatibility; it then drops to the oldest supported.
-    pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(1);
+    /// Held equal to [`Self::CURRENT`]: v2's proof change is a security fix —
+    /// v1's challenge proof was replayable — so v1 is intentionally not
+    /// interoperable. This drops below `CURRENT` only once we ship a wire version
+    /// we *do* commit to interoperating with.
+    pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(2);
 }
 
 impl std::fmt::Display for ProtocolVersion {

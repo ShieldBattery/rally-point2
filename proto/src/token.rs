@@ -47,15 +47,21 @@
 //!
 //! The token embeds the client's Ed25519 public key ([`ClientPublicKey`]). After
 //! the QUIC connection is established, the relay sends a random 32-byte
-//! [`ConnectionChallenge`]; the client signs it with the matching private key
-//! and returns a [`ChallengeResponse`]. The relay verifies the proof against
-//! the public key from the token claims. A stolen bearer token is therefore
-//! useless without the client's private key, which never leaves the trusted
-//! local process pair (app + game DLL).
+//! [`ConnectionChallenge`]; the client signs it — together with a channel binding
+//! derived from the connection — with the matching private key and returns a
+//! [`ChallengeResponse`]. The relay verifies the proof against the public key from
+//! the token claims. A stolen bearer token is therefore useless without the
+//! client's private key, which never leaves the trusted local process pair (app +
+//! game DLL).
 //!
-//! This is a *key-confirmed channel*: the binding is independent of QUIC's own
-//! TLS identity layer, so it works with any QUIC configuration and doesn't
-//! require client TLS certificates.
+//! The signed message folds in a TLS channel binding (an RFC 5705 keying-material
+//! exporter, [`CHANNEL_BINDING_EXPORTER_LABEL`]) so the proof is tied to the one
+//! QUIC/TLS session it was made on. Were it over the nonce alone, a relay the
+//! client trusts but that is malicious or mis-selected could forward the real
+//! relay's challenge to the client and replay the resulting signature onto its own
+//! session to impersonate the client; because the two sessions export different
+//! bindings, that replay no longer verifies. This rides the server-authenticated
+//! TLS session the client already has, so it still needs no *client* certificate.
 //!
 //! ## Operational flow (who generates what, when)
 //!
@@ -102,6 +108,17 @@ pub const SIGNATURE_LEN: usize = 64;
 
 /// Length of the relay's connection-binding challenge nonce, in bytes.
 pub const CHALLENGE_LEN: usize = 32;
+
+/// Length of the channel-binding value folded into the signed challenge, in bytes.
+pub const CHANNEL_BINDING_LEN: usize = 32;
+
+/// RFC 5705 TLS exporter label the client and relay both use to derive the
+/// channel binding from their shared QUIC connection. Exporting with the same
+/// label, context, and length on each end of one TLS session yields identical
+/// bytes, while a different session — such as one a relay-in-the-middle holds —
+/// yields different bytes; that difference is what ties the connection proof to
+/// its own channel.
+pub const CHANNEL_BINDING_EXPORTER_LABEL: &[u8] = b"rally-point2/connection-binding/v1";
 
 /// Maximum length of a `kid` or tenant string in the wire format. The length
 /// prefix is a single `u8`, so 255 is the hard protocol limit — strings longer
@@ -402,15 +419,24 @@ impl ConnectionChallenge {
 
     /// The canonical bytes the client signs with its Ed25519 private key.
     ///
-    /// A 1-byte [`CHALLENGE_DOMAIN_TAG`] is prepended so this signature is
-    /// never confused with the tenant key's token signature (which covers a
-    /// different byte range with no domain tag). The client and relay both
-    /// use this method to derive the signed bytes, so they cannot disagree on
-    /// the wire shape.
-    pub fn signed_message(&self) -> [u8; 1 + CHALLENGE_LEN] {
-        let mut out = [0u8; 1 + CHALLENGE_LEN];
+    /// The message is a 1-byte [`CHALLENGE_DOMAIN_TAG`], then the connection's
+    /// `channel_binding`, then this nonce. The domain tag keeps the signature from
+    /// ever being confused with the tenant key's token signature (a different byte
+    /// range, no tag). The channel binding ties the proof to the one QUIC/TLS
+    /// session it was produced on, so a relay that forwards a client's token cannot
+    /// relay the client's signature onto a *different* session it holds — the two
+    /// sessions derive different bindings. The client and relay both derive the
+    /// bytes through this method, so they cannot disagree on the shape, and both
+    /// must pass the same `channel_binding`, exported from their shared connection
+    /// with [`CHANNEL_BINDING_EXPORTER_LABEL`].
+    pub fn signed_message(
+        &self,
+        channel_binding: &[u8; CHANNEL_BINDING_LEN],
+    ) -> [u8; 1 + CHANNEL_BINDING_LEN + CHALLENGE_LEN] {
+        let mut out = [0u8; 1 + CHANNEL_BINDING_LEN + CHALLENGE_LEN];
         out[0] = CHALLENGE_DOMAIN_TAG;
-        out[1..].copy_from_slice(&self.0);
+        out[1..1 + CHANNEL_BINDING_LEN].copy_from_slice(channel_binding);
+        out[1 + CHANNEL_BINDING_LEN..].copy_from_slice(&self.0);
         out
     }
 }
@@ -810,25 +836,45 @@ mod tests {
     // --- Challenge / response tests ---
 
     #[test]
-    fn challenge_signed_message_has_domain_tag() {
+    fn challenge_signed_message_has_tag_binding_and_nonce() {
         let challenge = ConnectionChallenge([0x42; CHALLENGE_LEN]);
-        let signed = challenge.signed_message();
+        let binding = [0x7C; CHANNEL_BINDING_LEN];
+        let signed = challenge.signed_message(&binding);
 
         assert_eq!(signed[0], CHALLENGE_DOMAIN_TAG);
-        assert_eq!(&signed[1..], challenge.as_bytes());
+        assert_eq!(&signed[1..1 + CHANNEL_BINDING_LEN], &binding);
+        assert_eq!(&signed[1 + CHANNEL_BINDING_LEN..], challenge.as_bytes());
     }
 
     #[test]
     fn challenge_signed_message_is_deterministic() {
         let challenge = ConnectionChallenge([0x99; CHALLENGE_LEN]);
-        assert_eq!(challenge.signed_message(), challenge.signed_message());
+        let binding = [0x33; CHANNEL_BINDING_LEN];
+        assert_eq!(
+            challenge.signed_message(&binding),
+            challenge.signed_message(&binding)
+        );
     }
 
     #[test]
     fn challenge_signed_messages_differ_for_different_challenges() {
+        let binding = [0x33; CHANNEL_BINDING_LEN];
         let a = ConnectionChallenge([0x11; CHALLENGE_LEN]);
         let b = ConnectionChallenge([0x22; CHALLENGE_LEN]);
-        assert_ne!(a.signed_message(), b.signed_message());
+        assert_ne!(a.signed_message(&binding), b.signed_message(&binding));
+    }
+
+    #[test]
+    fn challenge_signed_messages_differ_for_different_channel_bindings() {
+        // The same challenge bound to two channels signs differently — the property
+        // that stops a proof from being replayed across connections.
+        let challenge = ConnectionChallenge([0x55; CHALLENGE_LEN]);
+        let cb_a = [0xA1; CHANNEL_BINDING_LEN];
+        let cb_b = [0xB2; CHANNEL_BINDING_LEN];
+        assert_ne!(
+            challenge.signed_message(&cb_a),
+            challenge.signed_message(&cb_b)
+        );
     }
 
     #[test]

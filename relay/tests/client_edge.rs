@@ -16,8 +16,9 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_proto::token::{
-    CHALLENGE_LEN, ClientPublicKey, ConnectionChallenge, ExpiresAt, KeyId, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN, Signature, SignedToken, TokenClaims,
+    CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ClientPublicKey,
+    ConnectionChallenge, ExpiresAt, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, Signature, SignedToken,
+    TokenClaims,
 };
 use rally_point_relay::auth::{HANDSHAKE_OK, Registry};
 use rally_point_relay::server;
@@ -163,7 +164,12 @@ async fn handshake(
 
     let mut challenge = [0u8; CHALLENGE_LEN];
     recv.read_exact(&mut challenge).await?;
-    let response = signing_key.sign(&ConnectionChallenge(challenge).signed_message());
+    let mut channel_binding = [0u8; CHANNEL_BINDING_LEN];
+    connection
+        .export_keying_material(&mut channel_binding, CHANNEL_BINDING_EXPORTER_LABEL, &[])
+        .map_err(|_| "deriving channel binding failed")?;
+    let response =
+        signing_key.sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(&response).await?;
 
     let mut ack = [0u8; 1];
@@ -239,6 +245,48 @@ async fn rejects_a_bad_connection_binding_proof() {
     let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
     assert!(handshake(&connection, &token, &wrong_key).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_a_challenge_proof_bound_to_another_connection() {
+    // Simulates a relay-in-the-middle: a proof the client produced for one TLS
+    // session must not authorize a different session. The signature is over the
+    // right challenge with the right key, but bound to a second connection's
+    // channel — exactly what a forwarding relay would hold — so the relay, checking
+    // against this connection's binding, must reject it.
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let client_key = keypair();
+
+    // Victim connection: present a valid token and read the challenge, then pause.
+    let victim = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut send, mut recv) = victim.open_bi().await.unwrap();
+    let token = mint_token(&tenant, SessionId(9), SlotId(0), client_key.public);
+    let encoded = token.encode().unwrap();
+    let len = u16::try_from(encoded.len()).unwrap();
+    send.write_all(&len.to_le_bytes()).await.unwrap();
+    send.write_all(&encoded).await.unwrap();
+    let mut challenge = [0u8; CHALLENGE_LEN];
+    recv.read_exact(&mut challenge).await.unwrap();
+
+    // A second, independent connection: a different TLS session, hence a different
+    // channel binding — the separate session a forwarding relay would have.
+    let other = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let mut other_binding = [0u8; CHANNEL_BINDING_LEN];
+    other
+        .export_keying_material(&mut other_binding, CHANNEL_BINDING_EXPORTER_LABEL, &[])
+        .unwrap();
+
+    // Answer the victim's challenge bound to the wrong connection's channel.
+    let response = client_key.sign(&ConnectionChallenge(challenge).signed_message(&other_binding));
+    send.write_all(&response).await.unwrap();
+
+    let mut ack = [0u8; 1];
+    assert!(
+        recv.read_exact(&mut ack).await.is_err(),
+        "relay accepted a proof bound to a different connection",
+    );
 }
 
 #[tokio::test]

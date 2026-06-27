@@ -21,7 +21,9 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_proto::handshake::{self, HandshakeError};
-use rally_point_proto::token::{CHALLENGE_LEN, ConnectionChallenge};
+use rally_point_proto::token::{
+    CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
+};
 use rally_point_transport::{Link, quic, quinn, rustls};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::time::{Instant, timeout_at};
@@ -90,6 +92,10 @@ pub enum DialError {
     /// or closes the connection — so this guards against a misbehaving peer.
     #[error("relay sent an unexpected handshake acknowledgement")]
     UnexpectedAck,
+    /// The connection's TLS channel binding could not be derived, so the
+    /// connection-binding proof can't be produced.
+    #[error("deriving the connection's channel binding failed")]
+    ChannelBinding,
     /// The dial did not finish within its deadline: the relay accepted the
     /// connection but stalled during the handshake instead of completing or
     /// rejecting it. The connection has been closed.
@@ -212,13 +218,19 @@ async fn authorize(connection: &quinn::Connection, identity: &Identity) -> Resul
     let frame = handshake::encode_token_frame(&identity.token)?;
     send.write_all(&frame).await?;
 
-    // Answer the relay's connection-binding challenge by signing it with the
-    // private key the token's embedded public key commits to.
+    // Answer the relay's connection-binding challenge by signing it — bound to
+    // this connection's TLS channel — with the private key the token's embedded
+    // public key commits to. The channel binding ties the proof to this session,
+    // so a relay that forwards our token can't replay our signature elsewhere.
     let mut challenge = [0u8; CHALLENGE_LEN];
     recv.read_exact(&mut challenge).await?;
+    let mut channel_binding = [0u8; CHANNEL_BINDING_LEN];
+    connection
+        .export_keying_material(&mut channel_binding, CHANNEL_BINDING_EXPORTER_LABEL, &[])
+        .map_err(|_| DialError::ChannelBinding)?;
     let response = identity
         .signing_key
-        .sign(&ConnectionChallenge(challenge).signed_message());
+        .sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(response.as_ref()).await?;
 
     // The relay acknowledges only once our slot is routable.

@@ -24,10 +24,15 @@ use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerCo
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// ALPN protocol id negotiated on every netcode v2 QUIC connection. The trailing
-/// number is bumped if the wire framing changes incompatibly, so a peer speaking
-/// a different framing is rejected at the TLS handshake rather than on the first
-/// malformed datagram.
-pub const ALPN: &[u8] = b"rp2/1";
+/// number is bumped on any change an older peer can't interoperate with — the
+/// datagram wire framing or the connection-binding handshake — so a peer on the
+/// old protocol is rejected at the TLS handshake rather than later, as a malformed
+/// datagram or a puzzling credential failure.
+///
+/// `2`: the connection-binding challenge is signed together with a TLS channel
+/// binding, not the nonce alone, so a `1` peer's proof no longer verifies and is
+/// deliberately not accepted — the old proof was replayable.
+pub const ALPN: &[u8] = b"rp2/2";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -132,5 +137,59 @@ mod tests {
 
         let received = server_task.await.unwrap();
         assert_eq!(&received[..], b"hello");
+    }
+
+    /// A peer on an older protocol — here, advertising the previous ALPN — is
+    /// rejected at the TLS handshake instead of connecting and then failing later.
+    /// This is the rollout gate for an incompatible change like the channel-bound
+    /// auth proof: old and new builds simply can't form a connection.
+    ///
+    /// The server task drives its end of the handshake to completion and the test
+    /// asserts *both* ends fail, so the client can't pass by failing on a dropped
+    /// server instead of on ALPN. The matching-ALPN success case is the positive
+    /// control in [`loopback_connects_and_exchanges_a_datagram`].
+    #[tokio::test]
+    async fn rejects_a_peer_with_a_stale_alpn() {
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Keep the endpoint and the incoming connection alive and drive the
+        // server-side handshake to its result, so any client failure is the ALPN
+        // rejection, not a server that went away mid-handshake.
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("a connection arrived");
+            incoming.await
+        });
+
+        // A client identical to the real one except it advertises the prior ALPN.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"rp2/1".to_vec()];
+        let stale_cfg =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(stale_cfg);
+
+        let client_result = client.connect(server_addr, "localhost").unwrap().await;
+        let server_result = server_task.await.unwrap();
+
+        assert!(
+            client_result.is_err(),
+            "a stale-ALPN client must fail the handshake"
+        );
+        assert!(
+            server_result.is_err(),
+            "the server must reject a stale-ALPN handshake"
+        );
     }
 }

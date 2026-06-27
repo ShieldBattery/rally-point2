@@ -18,9 +18,11 @@
 //! - **The presenter holds the client private key.** The token embeds the
 //!   client's Ed25519 *public* key. A stolen bearer token would otherwise be
 //!   replayable, so the relay sends a fresh random challenge and requires a
-//!   signature over it with the matching private key before accepting anything.
-//!   The private key never leaves the trusted local process pair, so a token
-//!   lifted off the wire is useless without it.
+//!   signature over it — bound to this connection's TLS channel — with the
+//!   matching private key before accepting anything. The private key never leaves
+//!   the trusted local process pair, so a token lifted off the wire is useless
+//!   without it, and the channel binding means a relay that forwards the token
+//!   can't relay the resulting signature onto a different session it holds.
 //!
 //! The handshake rides one client-opened bidirectional QUIC stream — reliable,
 //! off the turn-datagram path — with this shape, all on that one stream:
@@ -51,8 +53,9 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::handshake::{self, HandshakeError};
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
-    CHALLENGE_LEN, ChallengeResponse, ClientPublicKey, ConnectionChallenge, KeyId, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN, SignedToken, TokenError,
+    CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ChallengeResponse,
+    ClientPublicKey, ConnectionChallenge, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, SignedToken,
+    TokenError,
 };
 use rally_point_transport::quinn;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -149,6 +152,10 @@ pub enum AuthError {
     /// token's embedded public key.
     #[error("connection-binding challenge response is invalid")]
     ChallengeFailed,
+    /// The connection's TLS channel binding could not be derived, so the
+    /// connection-binding proof cannot be checked.
+    #[error("deriving the connection's channel binding failed")]
+    ChannelBinding,
     /// The presented token was structurally malformed.
     #[error("malformed token: {0}")]
     Token(#[from] TokenError),
@@ -212,15 +219,19 @@ pub fn verify_token(
 }
 
 /// Verifies the client's proof that it holds the private key for `client_pubkey`:
-/// an Ed25519 signature over the challenge's domain-tagged bytes.
+/// an Ed25519 signature over the challenge's domain-tagged bytes, bound to
+/// `channel_binding` — the keying material exported from this connection. The
+/// relay derives `channel_binding` from its own end of the connection, so a
+/// signature made against a different session's binding fails here.
 pub fn verify_challenge(
     client_pubkey: &ClientPublicKey,
     challenge: &ConnectionChallenge,
+    channel_binding: &[u8; CHANNEL_BINDING_LEN],
     response: &ChallengeResponse,
 ) -> Result<(), AuthError> {
     verify_ed25519(
         client_pubkey.as_bytes(),
-        &challenge.signed_message(),
+        &challenge.signed_message(channel_binding),
         response.as_bytes(),
     )
     .map_err(|()| AuthError::ChallengeFailed)
@@ -257,9 +268,18 @@ pub async fn authenticate(
 
     let mut response = [0u8; SIGNATURE_LEN];
     recv.read_exact(&mut response).await?;
+
+    // The proof is bound to this connection's TLS channel, so derive the same
+    // keying material the client signed over from our end of the connection.
+    let mut channel_binding = [0u8; CHANNEL_BINDING_LEN];
+    connection
+        .export_keying_material(&mut channel_binding, CHANNEL_BINDING_EXPORTER_LABEL, &[])
+        .map_err(|_| AuthError::ChannelBinding)?;
+
     verify_challenge(
         &authorized.client_pubkey,
         &challenge,
+        &channel_binding,
         &ChallengeResponse(response),
     )?;
 
@@ -439,15 +459,18 @@ mod tests {
         ));
     }
 
+    const CHANNEL_BINDING: [u8; CHANNEL_BINDING_LEN] = [0x6B; CHANNEL_BINDING_LEN];
+
     #[test]
     fn verifies_a_genuine_challenge_response() {
         let client = test_key();
         let challenge = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
-        let signature = client.sign(&challenge.signed_message());
+        let signature = client.sign(&challenge.signed_message(&CHANNEL_BINDING));
 
         verify_challenge(
             &ClientPublicKey(client.public),
             &challenge,
+            &CHANNEL_BINDING,
             &ChallengeResponse(signature),
         )
         .unwrap();
@@ -458,12 +481,13 @@ mod tests {
         let client = test_key();
         let impostor = test_key();
         let challenge = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
-        let signature = impostor.sign(&challenge.signed_message());
+        let signature = impostor.sign(&challenge.signed_message(&CHANNEL_BINDING));
 
         assert!(matches!(
             verify_challenge(
                 &ClientPublicKey(client.public),
                 &challenge,
+                &CHANNEL_BINDING,
                 &ChallengeResponse(signature),
             ),
             Err(AuthError::ChallengeFailed)
@@ -476,12 +500,34 @@ mod tests {
         let issued = ConnectionChallenge([0x11; CHALLENGE_LEN]);
         let other = ConnectionChallenge([0x22; CHALLENGE_LEN]);
         // The client signs a challenge the relay never issued.
-        let signature = client.sign(&other.signed_message());
+        let signature = client.sign(&other.signed_message(&CHANNEL_BINDING));
 
         assert!(matches!(
             verify_challenge(
                 &ClientPublicKey(client.public),
                 &issued,
+                &CHANNEL_BINDING,
+                &ChallengeResponse(signature),
+            ),
+            Err(AuthError::ChallengeFailed)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_response_bound_to_a_different_channel() {
+        // The client signs the right challenge with the right key, but bound to a
+        // different connection's channel — the relay-in-the-middle replay. Verified
+        // against this connection's binding, it must fail.
+        let client = test_key();
+        let challenge = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
+        let other_channel = [0xC4; CHANNEL_BINDING_LEN];
+        let signature = client.sign(&challenge.signed_message(&other_channel));
+
+        assert!(matches!(
+            verify_challenge(
+                &ClientPublicKey(client.public),
+                &challenge,
+                &CHANNEL_BINDING,
                 &ChallengeResponse(signature),
             ),
             Err(AuthError::ChallengeFailed)
