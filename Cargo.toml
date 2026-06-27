@@ -44,6 +44,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Self-signed certs for transport loopback tests (dev-only). Uses ring, not the
 # default aws-lc-rs, so `cargo test` needs no NASM toolchain either.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+# Ed25519 verification (token signatures + the connection-binding challenge) and
+# the secure RNG for challenge nonces on the relay. Reuses ring — already the
+# pinned QUIC crypto provider — so there's no second curve25519 backend to audit
+# and nothing new to make build for the 32-bit client target.
+ring = "0.17"
 
 # --- Serialization ---
 serde = { version = "1.0", features = ["derive"] }

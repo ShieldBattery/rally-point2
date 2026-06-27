@@ -1019,6 +1019,8 @@ dependencies = [
  "color-eyre",
  "rally-point-proto",
  "rally-point-transport",
+ "rcgen",
+ "ring",
  "thiserror",
  "tokio",
  "tracing",

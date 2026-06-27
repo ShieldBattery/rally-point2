@@ -23,7 +23,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point relay starting");
-    tracing::warn!("relay transport is not implemented yet");
+    // The client-facing edge (accept loop, token auth, per-session routing) lives
+    // in the library; wiring this process to a server certificate and a seeded
+    // token registry lands with the coordinator/infra work.
+    tracing::warn!("relay process is not wired to a certificate or token registry yet");
 
     Ok(())
 }

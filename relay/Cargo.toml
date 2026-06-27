@@ -17,7 +17,14 @@ rally-point-proto = { workspace = true }
 rally-point-transport = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Self-signed relay cert for the loopback client-edge test. The QUIC + Ed25519
+# crypto in the test itself comes from the transport re-exports (quinn/rustls)
+# and the `ring` dependency above.
+rcgen = { workspace = true }
