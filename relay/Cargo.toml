@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 rally-point-proto = { workspace = true }
 rally-point-transport = { workspace = true }
+parking_lot = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 ring = { workspace = true }

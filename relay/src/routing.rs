@@ -50,8 +50,9 @@
 //! authorized and removed when its task ends, so fan-out always sees exactly the
 //! slots currently able to receive.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
@@ -197,7 +198,7 @@ pub fn register(
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     {
-        let mut roster = sessions.lock().expect("sessions roster lock poisoned");
+        let mut roster = sessions.lock();
         let slots = roster.entry(key.clone()).or_default();
         if slots.contains_key(&slot) {
             return None;
@@ -227,7 +228,7 @@ pub fn register(
 /// once its last slot leaves. Idempotent: removing an absent slot is a no-op, so a
 /// guard and a link task can both run it without double-free hazard.
 fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
-    let mut roster = sessions.lock().expect("sessions roster lock poisoned");
+    let mut roster = sessions.lock();
     if let Some(slots) = roster.get_mut(key) {
         slots.remove(&slot);
         if slots.is_empty() {
@@ -252,7 +253,7 @@ fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
 /// turn is therefore never silently dropped for a keeping-up peer.
 pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, payload: Payload) {
     let targets: Vec<(SlotId, ForwardTx, Arc<Notify>)> = {
-        let roster = sessions.lock().expect("sessions roster lock poisoned");
+        let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => slots
                 .iter()
@@ -669,7 +670,7 @@ mod tests {
 
         // ...but fan_out left it in the roster: the slot stays occupied until its own
         // task exits, so no replacement can register a second sender for it.
-        let roster = sessions.lock().expect("lock");
+        let roster = sessions.lock();
         let slots = roster.get(&k).expect("group present");
         assert!(slots.contains_key(&SlotId(1)));
         assert!(slots.contains_key(&SlotId(2)));

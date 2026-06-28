@@ -228,19 +228,15 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     let mesh_a = MeshLink::new(conn_a);
     let mesh_b = MeshLink::new(conn_b);
 
-    let inbox_a = mesh::register_mesh_link(&relay_a.mesh.links, key.clone());
-    let inbox_b = mesh::register_mesh_link(&relay_b.mesh.links, key.clone());
-    tokio::spawn(mesh::run_mesh_link_session(
+    tokio::spawn(mesh::run_mesh_link(
         mesh_a,
-        key.clone(),
-        inbox_a,
+        vec![key.clone()],
         Arc::clone(&relay_a.sessions),
         relay_a.mesh.clone(),
     ));
-    tokio::spawn(mesh::run_mesh_link_session(
+    tokio::spawn(mesh::run_mesh_link(
         mesh_b,
-        key.clone(),
-        inbox_b,
+        vec![key.clone()],
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
     ));

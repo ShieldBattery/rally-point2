@@ -72,6 +72,12 @@ protox = "0.9"
 thiserror = "2.0"
 color-eyre = "0.6"
 
+# Synchronization primitives for short, await-free critical sections (relay
+# session/mesh rosters). `parking_lot::Mutex` returns a guard directly — no
+# poisoning error to unwrap — so a roster edit reads as a lock, not error
+# handling. Guards held across `.await` stay on `tokio::sync`.
+parking_lot = "0.12"
+
 # --- Observability ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
