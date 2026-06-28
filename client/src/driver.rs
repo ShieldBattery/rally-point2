@@ -32,9 +32,10 @@
 //! re-dial and resume from the last delivered turn — or when the game stalls (stops
 //! draining, so the inbound buffer fills) or hands over an undeliverable turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::{Link, LinkError};
@@ -172,9 +173,9 @@ impl LinkDriver {
     /// side-channel that keeps the unacked window bounded under loss. The beacon
     /// is two uni-streams — one each direction — and its read half runs in a
     /// dedicated task so a partial stream read is never dropped mid-frame inside a
-    /// `select!` branch (which would desync the framing and hand a garbage cursor
-    /// to `retire_through`); the task forwards each complete cursor over a
-    /// `watch` channel, whose `recv` *is* cancel-safe.
+    /// `select!` branch (which would desync the framing and hand a garbage
+    /// `(slot, cursor)` to `retire_through`); the task forwards each complete
+    /// `(slot, cursor)` over an mpsc channel, whose `recv` *is* cancel-safe.
     pub async fn run(self) -> Result<(), DriverError> {
         let Self {
             mut link,
@@ -186,23 +187,23 @@ impl LinkDriver {
         // (open_uni completes locally, no peer round-trip); the peer's stream is
         // accepted lazily inside the reader task, so a one-way-traffic link that
         // never sends a beacon doesn't block the dial on an accept that never
-        // completes. The reader decodes complete 8-byte frames and forwards the
-        // latest cursor over a watch channel — non-blocking, so the reader never
-        // stalls on a full channel, and the driver drains it in one
-        // `borrow_and_update` since monotonic cursors subsume their predecessors.
+        // completes. The reader decodes complete frames and forwards each
+        // `(slot, cursor)` over an mpsc channel — cursors are per-slot, so they
+        // don't subsume each other across slots and can't collapse to one latest.
         let mut beacon_send = link
             .connection()
             .open_uni()
             .await
             .map_err(|error| DriverError::Link(LinkError::from(error)))?;
         let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
-        // The highest cursor the client has pushed to the peer. Push only on
-        // advance so a healthy link with a static receive prefix sends nothing.
-        let mut last_beacon_sent: Option<u64> = None;
+        // The highest cursor the client has pushed to the peer, per slot. Push
+        // only on advance so a healthy link with a static receive prefix sends
+        // nothing.
+        let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
         // Whether the inbound beacon reader task is still feeding cursors. Once it
-        // ends (the peer's beacon uni-stream closed or errored), `changed()` returns
-        // `Err` immediately on every poll — an always-ready future that would spin
-        // the loop at 100% CPU. Disabling this branch on the first `Err` keeps the
+        // ends (the peer's beacon uni-stream closed or errored), `recv()` returns
+        // `None` immediately on every poll — an always-ready future that would spin
+        // the loop at 100% CPU. Disabling this branch on the first `None` keeps the
         // driver asleep; the real link failure surfaces separately via `link.recv()`.
         let mut beacon_alive = true;
 
@@ -215,15 +216,21 @@ impl LinkDriver {
         // fire when a send carries no redundancy or the link is idle, so a turn the
         // fresh packets can't re-carry is still retransmitted.
         let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
+        // The client's own outbound payload seq counter. Under the origin-identity
+        // model the client assigns the seq for its own slot's turn stream — it alone
+        // knows production order — and every hop honors it untouched. Monotonic from
+        // 0, one counter since the client sends a single slot.
+        let mut next_outbound_seq: u64 = 0;
 
-        // The relay assigns a gapless transport seq to every forwarded turn, but the
-        // datagrams carrying them can arrive out of order. `pending` holds turns that
-        // arrived ahead of `next_seq` until the gaps below them fill, so the game is
-        // handed a strictly in-order stream — the lockstep contract — rather than raw
-        // arrival order. The receive window bounds how far ahead a seq can be, so this
-        // stays small.
-        let mut next_seq: u64 = 0;
-        let mut pending: BTreeMap<u64, Payload> = BTreeMap::new();
+        // Each peer slot carries its own monotonic seq space starting at 0, so
+        // the per-slot reorder buffer restores game order independently per slot.
+        // `next_seq[slot]` is the lowest seq not yet handed to the game for that
+        // slot; `pending[slot]` holds turns that arrived ahead of it until the gaps
+        // below them fill, so the game is handed a strictly in-order stream per slot
+        // — the lockstep contract — rather than raw arrival order. The receive
+        // window bounds how far ahead a seq can be, so each stays small.
+        let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
+        let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -235,34 +242,60 @@ impl LinkDriver {
                     if received.carried_payloads {
                         acks_owed = true;
                     }
+                    // Track which slots advanced so we can push their cursors after.
+                    let mut advanced: Vec<SlotId> = Vec::new();
                     for payload in received.fresh {
-                        if payload.seq >= next_seq {
-                            pending.insert(payload.seq, payload);
+                        let slot = SlotId(payload.slot as u8);
+                        let slot_next = next_seq.entry(slot).or_insert(0);
+                        if payload.seq >= *slot_next {
+                            pending
+                                .entry(slot)
+                                .or_default()
+                                .insert(payload.seq, payload);
                         }
                     }
-                    // Release the contiguous run starting at `next_seq`, holding the
-                    // rest. Hand off without ever awaiting: blocking on a full channel
-                    // would park the whole driver — no acks, no outbound turns, no
-                    // link-failure detection — behind a stalled consumer.
-                    while let Some(payload) = pending.remove(&next_seq) {
-                        match inbound.try_send(payload) {
-                            Ok(()) => next_seq += 1,
-                            // The game stopped draining and the buffer filled: it is
-                            // hopelessly behind. Keep the turn and surface the stall
-                            // rather than block on it.
-                            Err(mpsc::error::TrySendError::Full(payload)) => {
-                                pending.insert(next_seq, payload);
-                                return Err(DriverError::GameStalled);
+                    // Release the contiguous run per slot, holding the rest. Hand off
+                    // without ever awaiting: blocking on a full channel would park the
+                    // whole driver — no acks, no outbound turns, no link-failure
+                    // detection — behind a stalled consumer.
+                    let mut stall: Option<(SlotId, Payload)> = None;
+                    for (slot, slot_next) in next_seq.iter_mut() {
+                        let Some(slot_pending) = pending.get_mut(slot) else {
+                            continue;
+                        };
+                        while let Some(payload) = slot_pending.remove(slot_next) {
+                            match inbound.try_send(payload) {
+                                Ok(()) => *slot_next += 1,
+                                Err(mpsc::error::TrySendError::Full(payload)) => {
+                                    stall = Some((*slot, payload));
+                                    break;
+                                }
+                                // The game dropped its receiver: a clean stop.
+                                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                             }
-                            // The game dropped its receiver: a clean stop.
-                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        }
+                        // Record this slot as having advanced for the beacon push.
+                        if let Some(cursor) = link.delivered_through(*slot) {
+                            advanced.push(*slot);
+                            let _ = cursor; // delivered_through already reflects the advance
                         }
                     }
-                    // Push the advanced delivered-through cursor to the peer so it can
+                    if let Some((slot, payload)) = stall {
+                        // Put the held turn back before surfacing.
+                        pending.entry(slot).or_default().insert(*next_seq.get(&slot).unwrap(), payload);
+                        return Err(DriverError::GameStalled);
+                    }
+                    // Push the advanced delivered-through cursors to the peer so it can
                     // force-advance its unacked window past turns it now knows we
                     // received. Push only on advance; a static cursor (genuine forward
                     // gap) sends nothing — the cap handles that.
-                    flush_beacon(&mut beacon_send, &mut last_beacon_sent, link.delivered_through()).await;
+                    if !advanced.is_empty() {
+                        let cursors: HashMap<SlotId, u64> = advanced
+                            .iter()
+                            .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c)))
+                            .collect();
+                        flush_beacon(&mut beacon_send, &mut last_beacon_sent, cursors).await;
+                    }
                     if check_cap(link.payloads_in_flight()) {
                         return Err(DriverError::UnackedWindowExhausted {
                             in_flight: link.payloads_in_flight(),
@@ -276,7 +309,11 @@ impl LinkDriver {
                         // also re-carried unacked turns, recovery is riding the stream,
                         // so push the flush out. If it carried none (a near-MTU turn that
                         // filled the datagram), leave the timer so the flush retransmits.
-                        Some(payload) => {
+                        Some(mut payload) => {
+                            // Assign this turn its origin seq — the client is the
+                            // sole authority for its own slot's production order.
+                            payload.seq = next_outbound_seq;
+                            next_outbound_seq += 1;
                             let carried_redundancy = send_packet(&mut link, Some(payload))?;
                             acks_owed = false;
                             if carried_redundancy {
@@ -293,22 +330,18 @@ impl LinkDriver {
                         None => return Ok(()),
                     }
                 }
-                // The peer pushed a delivered-through cursor over the beacon stream.
-                // The reader task already assembled the complete frame off a
+                // The peer pushed a per-slot delivered-through cursor over the beacon
+                // stream. The reader task already assembled the complete frame off a
                 // cancel-safe path, so receiving here can never be a partial read.
-                // `watch::Receiver::changed` is cancel-safe in select!. The
+                // `mpsc::Receiver::recv` is cancel-safe in select!. The
                 // `if beacon_alive` precondition disables this branch once the reader
-                // task ends — otherwise `changed()` returns `Err` on every poll, an
+                // task ends — otherwise `recv()` returns `None` on every poll, an
                 // always-ready future that would spin the loop at 100% CPU (the
                 // connection may still be up, so `link.recv()` wouldn't surface it).
-                result = beacon_rx.changed(), if beacon_alive => {
-                    match result {
-                        Ok(()) => {
-                            // `borrow_and_update` fetches the latest cursor and marks
-                            // it seen, so a burst of cursors collapses to one retire.
-                            if let Some(cursor) = *beacon_rx.borrow_and_update() {
-                                link.retire_through(cursor);
-                            }
+                received = beacon_rx.recv(), if beacon_alive => {
+                    match received {
+                        Some((slot, cursor)) => {
+                            link.retire_through(slot, cursor);
                             if check_cap(link.payloads_in_flight()) {
                                 return Err(DriverError::UnackedWindowExhausted {
                                     in_flight: link.payloads_in_flight(),
@@ -321,7 +354,7 @@ impl LinkDriver {
                         // surfaces via `link.recv()`; a beacon-only stream reset must
                         // not spin the loop. The cap still bounds the window without
                         // beacons — the driver just stops force-advancing.
-                        Err(_) => beacon_alive = false,
+                        None => beacon_alive = false,
                     }
                 }
                 // The game dropped its receiver. This is its own branch so the stop
@@ -430,10 +463,13 @@ mod tests {
         )
     }
 
-    fn turn(bytes: &[u8]) -> Payload {
+    fn turn(seq: u64, bytes: &[u8]) -> Payload {
         Payload {
-            seq: 0,  // assigned by the sending link
-            slot: 0, // rebound by the relay; irrelevant on a bare link
+            // The sending client assigns the origin seq; a raw link send honors
+            // it verbatim, while the driver stamps its own counter (so the value
+            // here is ignored on the driver-send path).
+            seq,
+            slot: 0,
             commands: bytes.to_vec().into(),
         }
     }
@@ -448,7 +484,7 @@ mod tests {
 
         // Three turns pushed into A's seam arrive in order, bytes intact, on B's.
         for i in 0..3u8 {
-            chan_a.outbound.send(turn(&[i])).await.unwrap();
+            chan_a.outbound.send(turn(0, &[i])).await.unwrap();
         }
         let mut inbound_b = chan_b.inbound;
         let mut got = Vec::new();
@@ -474,7 +510,7 @@ mod tests {
         // A turn far larger than any datagram can never be delivered. The driver
         // must surface that as a hard error rather than silently drop it from the
         // lockstep stream — or treat it as a loss it could never actually recover.
-        chan_a.outbound.send(turn(&[0u8; 4096])).await.unwrap();
+        chan_a.outbound.send(turn(0, &[0u8; 4096])).await.unwrap();
 
         match tokio::time::timeout(Duration::from_secs(5), task).await {
             Ok(joined) => assert!(matches!(
@@ -540,7 +576,7 @@ mod tests {
 
         // One turn, then silence: the game produces nothing more and the peer never
         // acks. The driver still has it in flight.
-        chan_a.outbound.send(turn(&[0x42])).await.unwrap();
+        chan_a.outbound.send(turn(0, &[0x42])).await.unwrap();
 
         // Drop the first datagram carrying it, simulating loss on the wire, so the
         // peer's dedup never sees the original.
@@ -577,7 +613,7 @@ mod tests {
 
         // Near-MTU turns: each fresh turn nearly fills a datagram, so a packet has no
         // room to also re-carry an older unacked turn as redundancy.
-        let big = move || turn(&vec![0x7u8; budget * 3 / 4]);
+        let big = move || turn(0, &vec![0x7u8; budget * 3 / 4]);
 
         // Turn 0 goes out, but its datagram is dropped on the wire.
         chan_a.outbound.send(big()).await.unwrap();
@@ -632,7 +668,7 @@ mod tests {
         let task = tokio::spawn(driver_a.run());
 
         // A sends one turn; the peer receives and acks it.
-        chan_a.outbound.send(turn(&[0x55])).await.unwrap();
+        chan_a.outbound.send(turn(0, &[0x55])).await.unwrap();
         let got = link_b.recv().await.unwrap();
         assert_eq!(got.fresh[0].commands[0], 0x55);
         link_b.send(None).unwrap();
@@ -673,7 +709,7 @@ mod tests {
         // Several turns from the peer: with a depth-1 buffer and no draining, the
         // driver fills it and then has nowhere to put the next one.
         for i in 0..4u8 {
-            link_b.send(Some(turn(&[i]))).unwrap();
+            link_b.send(Some(turn(i as u64, &[i]))).unwrap();
         }
 
         match tokio::time::timeout(Duration::from_secs(5), task).await {
@@ -750,11 +786,11 @@ mod tests {
             let mut last_pushed: Option<u64> = None;
             while let Ok(r) = link_b.recv().await {
                 // The peer received these turns: its delivered_through advanced.
-                // Push the new cursor to the driver.
-                if let Some(cursor) = link_b.delivered_through()
+                // Push the new cursor to the driver. All turns here are slot 0.
+                if let Some(cursor) = link_b.delivered_through(SlotId(0))
                     && !matches!(last_pushed, Some(p) if p >= cursor)
                 {
-                    let frame = beacon::encode_frame(cursor);
+                    let frame = beacon::encode_frame(SlotId(0), cursor);
                     if peer_beacon.write_all(&frame).await.is_ok() {
                         last_pushed = Some(cursor);
                     }
@@ -778,7 +814,7 @@ mod tests {
             tokio::spawn(async move {
                 let mut sent = 0u32;
                 for i in 0..total {
-                    if outbound.send(turn(&[(i & 0xFF) as u8])).await.is_err() {
+                    if outbound.send(turn(0, &[(i & 0xFF) as u8])).await.is_err() {
                         break; // Driver tripped or closed.
                     }
                     sent += 1;
@@ -871,7 +907,7 @@ mod tests {
             let outbound = chan_a.outbound.clone();
             tokio::spawn(async move {
                 for i in 0..(UNACKED_WINDOW_CAP + 64) as u16 {
-                    if outbound.send(turn(&[(i & 0xFF) as u8])).await.is_err() {
+                    if outbound.send(turn(0, &[(i & 0xFF) as u8])).await.is_err() {
                         break;
                     }
                     // Don't pace: the goal is to outrun the peer, which never

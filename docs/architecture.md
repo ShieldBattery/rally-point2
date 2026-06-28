@@ -37,9 +37,9 @@ transport machinery runs at both ends of every link.
 
 Two units, often conflated — keeping them straight is the key to the whole design.
 
-- A **payload** is the unit of meaning: one slot's command bytes for one turn, plus a per-link `seq`
-  (its transport identity, used for dedup and retirement) and the source `slot`. Payloads are what the
-  game produces and consumes.
+- A **payload** is the unit of meaning: one slot's command bytes for one turn, plus an origin `seq`
+  (its transport identity, assigned by the sending client and preserved end-to-end, used for dedup
+  and retirement) and the source `slot`. Payloads are what the game produces and consumes.
 - A **packet** is a transport envelope — exactly one per QUIC datagram. It carries a packet `seq`, the
   ack state for the peer's packets (`ack` + a 32-bit `ack_bits` history), and a list of payloads.
 
@@ -81,8 +81,10 @@ redundantly-packed payloads.
 
   - The **ack-beacon** side-channel handles *reverse*-path loss — the peer received the turns (redundancy
     kept up) but the acks riding the datagrams back were lost. Each side opens one outbound reliable
-    uni-stream and pushes its monotonic `delivered_through` cursor whenever it advances; the peer reads
-    it and force-retires (`retire_through`) everything up to that cursor. The cursor advances exactly
+    uni-stream and pushes its monotonic `delivered_through` cursor for a slot whenever it advances; the
+    peer reads it and force-retires (`retire_through`) everything up to that cursor **for that slot**.
+    The cursor is per-slot because each slot carries its own monotonic seq space starting at 0 — a
+    single global cursor would retire one slot's seqs against another's. The cursor advances exactly
     when the peer is keeping up, so the beacon retires the turns the peer confirmed it got — never the
     ones it didn't. Push-on-advance, not a timer: a healthy link with a static receive prefix sends
     nothing.
@@ -94,10 +96,11 @@ redundantly-packed payloads.
     is the buildable half; the resync it triggers (reconnect + replay-from-cursor) is gated on the open
     failover design (see [Failover](#failover-and-reconnect-open)).
 
-  The beacon's read half runs in a dedicated task that assembles complete frames over a `watch` channel
-  — a `read_exact` dropped mid-frame inside a `select!` would desync the framing and hand a garbage
-  cursor to `retire_through`, so it never crosses the `select!` boundary. `retire_through` is guarded
-  monotonically as a second line of defense. The datagram path itself stays best-effort-fast by design.
+  The beacon's read half runs in a dedicated task that assembles complete `(slot, cursor)` frames over
+  an `mpsc` channel — a `read_exact` dropped mid-frame inside a `select!` would desync the framing and
+  hand a garbage cursor to `retire_through`, so it never crosses the `select!` boundary. `retire_through`
+  is guarded monotonically per slot as a second line of defense. The datagram path itself stays
+  best-effort-fast by design.
 
 ## The link transport
 
@@ -124,20 +127,19 @@ The relay is a **validating** relay, not a dumb forwarder. For each turn a clien
    control commands a live turn may not carry.
 2. **Forward immediately, with no inbound reordering.** A validated turn is fanned out to the session's
    other slots the moment it arrives — a peer must hold a turn *before* it simulates that game step, so
-   buffering turns to put them back in order first would add exactly the latency the relay exists to
-   remove. Fan-out is a non-blocking message to each peer's link task, so one slow client never stalls
-   the others.
 3. **Re-package.** Each peer's link buffers that peer's unacked payloads and builds its **own** packets
-   re-carrying them — its own packet seqs, multiple payloads each. The sender's transport seq is
-   discarded at the seam; the payload keeps its source slot so the receiver knows whose commands these
-   are. (The per-client send buffer is bounded so a stuck client can't grow it without limit.)
+   re-carrying them — its own packet seqs, multiple payloads each. The payload's `(slot, seq)` origin
+   identity is preserved verbatim across the seam (assigned by the sending client and honored by every
+   hop); the receiver knows whose commands these are from `slot` and dedups by `(slot, seq)`. (The
+   per-client send buffer is bounded so a stuck client can't grow it without limit.)
 
-Because the relay forwards in arrival order and stamps its own outbound seqs, the order a peer receives
-turns in is the relay's forward order — which matches the original order in the common case (redundancy
-plus per-packet sorting keep the relay receiving each slot's turns in order). The rare reordering that
-slips through (a client at near-MTU whose datagrams reorder past what redundancy covers) is a known
-edge: the common case is correct, and a higher-layer resync would also recover it (see
-[Failover](#failover-and-reconnect-open)) — the per-hop transport doesn't try to guarantee order.
+Because the relay forwards in arrival order and preserves each payload's origin seq, the order a peer
+receives turns in per slot is the relay's forward order for that slot — which matches the original
+order in the common case (redundancy plus per-packet sorting keep the relay receiving each slot's
+turns in order). The rare reordering that slips through (a client at near-MTU whose datagrams reorder
+past what redundancy covers) is a known edge: the common case is correct, and a higher-layer resync
+would also recover it (see [Failover](#failover-and-reconnect-open)) — the per-hop transport doesn't
+try to guarantee order.
 
 ## The client
 
@@ -149,10 +151,12 @@ target-agnostic across the targets the DLL ships for).
 - A **link driver** owns that link on a Tokio task: it sends the turns the game produces, delivers the
   peers' turns the relay forwards, and runs the forward recovery above. It is the Tokio half of the game
   seam; the game DLL bridges its lock-free BW-thread ⇄ Tokio-thread handoff onto the driver's channels.
-- **Ordering is restored here.** The relay→client stream is gapless but can arrive out of order across
-  packets, so the driver buffers received turns by seq and hands the game only the contiguous prefix —
-  the game never sees a later turn before an earlier one. This is the "client restores game order"
-  the rest of the system relies on.
+- **Ordering is restored here, per slot.** The relay→client stream is gapless but can arrive out of
+  order across packets, so the driver buffers received turns by `(slot, seq)` and hands the game only
+  the contiguous prefix *per slot* — the game never sees a later turn before an earlier one for the
+  same slot. Each slot's seq space is independent (the sending client assigns its own slot's seqs), so
+  one slot's gap never head-of-line-blocks another. This is the "client restores game order" the rest
+  of the system relies on.
 
 ## Why not a standard reliable-ordered protocol
 
@@ -190,7 +194,8 @@ a local client is fanned out both to its own local clients and to its peer relay
 forwards it on to *its* local clients. There is **one QUIC connection per relay-pair** (separate streams
 don't isolate datagram congestion). Because a turn can reach a relay by more than one mesh path, the
 relay **dedups topologically** — it forwards each turn to a given client exactly once, on whichever copy
-arrives first, reusing the same payload-seq dedup the per-link transport already does.
+arrives first, reusing the same `(slot, seq)` dedup the per-link transport already does — the origin
+identity is stable across the mesh because no hop restamps it.
 
 ### Failover and reconnect (open)
 

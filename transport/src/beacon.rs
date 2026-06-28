@@ -10,11 +10,14 @@
 //!
 //! See `proto::beacon` for the wire frame these helpers read and write.
 
+use std::collections::HashMap;
+
 use rally_point_proto::beacon;
-use tokio::sync::watch;
+use rally_point_proto::ids::SlotId;
+use tokio::sync::mpsc;
 
 /// Spawns a dedicated task that reads the peer's beacon uni-stream and forwards
-/// each complete delivered-through cursor over a `watch` channel.
+/// each complete `(slot, delivered-through)` cursor over an `mpsc` channel.
 ///
 /// The stream is accepted lazily *inside* the task: `open_uni` completes locally
 /// (no peer round-trip), but the peer's outbound stream isn't visible to
@@ -25,26 +28,29 @@ use tokio::sync::watch;
 ///
 /// Reading the stream here — not in the driver's `select!` — is what makes the
 /// beacon cancel-safe: a `read_exact` dropped mid-frame inside a `select!` branch
-/// would lose the consumed bytes and desync the framing, handing a garbage `u64`
-/// to `retire_through`. This task assembles complete 8-byte frames and forwards
-/// them; `watch::Receiver::changed` in the driver's `select!` is cancel-safe.
+/// would lose the consumed bytes and desync the framing, handing a garbage
+/// `(slot, cursor)` to `retire_through`. This task assembles complete frames and
+/// forwards them; `mpsc::Receiver::recv` in the driver's `select!` is
+/// cancel-safe.
 ///
-/// `watch` (not `mpsc`) because monotonic cursors subsume their predecessors: the
-/// latest always suffices, so a non-blocking overwrite that drops intermediates
-/// loses nothing and never back-pressures the reader. The channel is initialized
-/// to `None` (seq 0 is a valid cursor, so 0 is not the sentinel).
-pub fn spawn_beacon_reader(connection: quinn::Connection) -> watch::Receiver<Option<u64>> {
-    let (tx, rx) = watch::channel(None);
+/// `mpsc` (not `watch`) because each slot carries its own cursor and cursors do
+/// not subsume each other across slots — a slot-0 advance and a slot-1 advance
+/// are independent, so latest-wins would drop one. Within a slot the cursor is
+/// monotonic, so a burst collapses to a prefix the driver drains in order.
+pub fn spawn_beacon_reader(connection: quinn::Connection) -> mpsc::Receiver<(SlotId, u64)> {
+    // Generous depth: cursors are tiny and a healthy link sends one per delivered
+    // turn. A burst under loss is bounded by the number of slots, which is small.
+    let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
         // Lazy accept: waits for the peer to open its beacon stream. A link that
         // never sends a beacon (one-way traffic, or the peer has nothing to retire)
-        // parks here forever, which is harmless — the driver's `changed()` never
+        // parks here forever, which is harmless — the driver's `recv()` never
         // fires and `retire_through` is simply never called.
         let mut recv = match connection.accept_uni().await {
             Ok(recv) => recv,
             // The connection closed before the peer opened a beacon stream. Drop the
-            // sender so the driver's `changed()` returns an error, surfacing the
-            // closed link (the driver disables the branch on Err rather than spin).
+            // sender so the driver's `recv()` returns None, surfacing the closed
+            // link.
             Err(_) => return,
         };
 
@@ -54,10 +60,28 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> watch::Receiver<Opt
             // dropped (task cancelled, stream closed), no partial frame escapes.
             match recv.read_exact(&mut buf).await {
                 Ok(()) => {
-                    let cursor = beacon::decode_frame(&buf);
-                    // Non-blocking: overwrites the held value. A stuck consumer
-                    // (the driver not draining) can't stall the reader.
-                    let _ = tx.send(Some(cursor));
+                    match beacon::decode_frame(&buf) {
+                        Ok(frame) => {
+                            // Non-blocking offer: a stuck driver (not draining)
+                            // can't stall the reader. If the channel fills, the
+                            // cursor is monotonic per slot so the latest survives
+                            // via the channel's later entries; an dropped
+                            // intermediate is harmless.
+                            if tx.try_send(frame).is_err() {
+                                // Channel closed (driver dropped its receiver) or
+                                // full (driver fell behind on beacons). Either way
+                                // stop reading — a full channel means the driver
+                                // isn't keeping up and beacons aren't the priority.
+                                return;
+                            }
+                        }
+                        // A malformed slot (out of SlotId range). Drop the frame
+                        // rather than forward garbage to retire_through; the stream
+                        // stays framed, so the next read resyncs cleanly.
+                        Err(error) => {
+                            tracing::debug!(%error, "dropping malformed beacon frame");
+                        }
+                    }
                 }
                 // Stream ended (peer closed) or errored. Drop the sender so the
                 // driver learns the beacon is gone.
@@ -68,30 +92,29 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> watch::Receiver<Opt
     rx
 }
 
-/// Pushes the local delivered-through cursor to the peer over the beacon stream,
-/// but only when it advanced past the last value sent. A healthy link with a
-/// static receive prefix (the peer hasn't delivered anything new) sends nothing —
-/// the beacon is push-on-advance, not on a timer.
+/// Pushes the per-slot delivered-through cursor to the peer over the beacon
+/// stream, but only when it advanced past the last value sent for that slot. A
+/// healthy link with a static receive prefix (the peer hasn't delivered anything
+/// new) sends nothing — the beacon is push-on-advance, not on a timer.
 ///
-/// `last_sent` tracks the highest cursor pushed so the caller can coalesce: pass
-/// the same `&mut` each call. A write failure (broken stream) is swallowed — a
-/// lost beacon push is recoverable: the cursor advances again on the next
-/// delivery, and the hard cap still bounds the window if the peer is truly stuck.
+/// `last_sent` tracks the highest cursor pushed per slot so the caller can
+/// coalesce: pass the same `&mut` each call. A write failure (broken stream) is
+/// swallowed — a lost beacon push is recoverable: the cursor advances again on
+/// the next delivery, and the hard cap still bounds the window if the peer is
+/// truly stuck.
 pub async fn flush_beacon(
     beacon_send: &mut quinn::SendStream,
-    last_sent: &mut Option<u64>,
-    delivered_through: Option<u64>,
+    last_sent: &mut HashMap<SlotId, u64>,
+    delivered_through: HashMap<SlotId, u64>,
 ) {
-    let Some(cursor) = delivered_through else {
-        // Nothing delivered yet; nothing to push.
-        return;
-    };
-    if matches!(last_sent, Some(prev) if *prev >= cursor) {
-        // Already pushed this or a later cursor; no-op.
-        return;
-    }
-    let frame = beacon::encode_frame(cursor);
-    if beacon_send.write_all(&frame).await.is_ok() {
-        *last_sent = Some(cursor);
+    for (slot, cursor) in delivered_through {
+        if matches!(last_sent.get(&slot), Some(prev) if *prev >= cursor) {
+            // Already pushed this or a later cursor for this slot; no-op.
+            continue;
+        }
+        let frame = beacon::encode_frame(slot, cursor);
+        if beacon_send.write_all(&frame).await.is_ok() {
+            last_sent.insert(slot, cursor);
+        }
     }
 }

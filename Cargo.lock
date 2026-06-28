@@ -1045,6 +1045,7 @@ dependencies = [
  "rustls",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

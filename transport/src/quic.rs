@@ -29,6 +29,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// stream shape — so a peer on the old protocol is rejected at the TLS handshake
 /// rather than later, as a malformed datagram or a puzzling credential failure.
 ///
+/// `4`: the payload `seq` is now the turn's origin identity — assigned by the
+/// sending client and preserved end-to-end, never restamped per hop — and each
+/// slot carries its own seq space. The ack-beacon frame correspondingly carries
+/// a `(slot, cursor)` pair, not a bare cursor. A `3` peer restamps seq per link
+/// and sends a bare beacon cursor, so its dedup, retirement, and ordering are
+/// incompatible.
+///
 /// `3`: the connection now opens an ack-beacon unidirectional stream after the
 /// authorization handshake, so each side can force-advance the peer's unacked
 /// window. A `2` peer opens no such stream and never sends beacons, so its
@@ -37,7 +44,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// `2`: the connection-binding challenge is signed together with a TLS channel
 /// binding, not the nonce alone, so a `1` peer's proof no longer verifies and is
 /// deliberately not accepted — the old proof was replayable.
-pub const ALPN: &[u8] = b"rp2/3";
+pub const ALPN: &[u8] = b"rp2/4";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]

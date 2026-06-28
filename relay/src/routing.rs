@@ -301,9 +301,9 @@ pub async fn run_slot_link(
     // its outbound uni-stream (open_uni completes locally); the client's stream
     // is accepted lazily inside the reader task so a one-way-traffic client that
     // never sends a beacon doesn't block on an accept that never completes. The
-    // reader assembles complete 8-byte frames off a cancel-safe path and forwards
-    // the latest cursor over a watch channel — the driver drains it in one
-    // `borrow_and_update` since monotonic cursors subsume their predecessors.
+    // reader assembles complete frames off a cancel-safe path and forwards each
+    // `(slot, cursor)` over an mpsc channel — cursors are per-slot, so they
+    // don't subsume each other across slots and can't collapse to one latest.
     let mut beacon_send = match link.connection().open_uni().await {
         Ok(send) => send,
         Err(error) => {
@@ -313,13 +313,14 @@ pub async fn run_slot_link(
         }
     };
     let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
-    // The highest cursor the relay has pushed to the client. Push only on advance.
-    let mut last_beacon_sent: Option<u64> = None;
+    // The highest cursor the relay has pushed to the client, per slot. Push only
+    // on advance.
+    let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
     // Whether the inbound beacon reader task is still feeding cursors. Once it
-    // ends (the client's beacon uni-stream closed or errored), `changed()`
-    // returns `Err` on every poll — an always-ready future that would spin the
-    // loop at 100% CPU. Disabling this branch on the first `Err` keeps the task
-    // asleep; the real link failure surfaces via `link.recv()`.
+    // ends (the client's beacon uni-stream closed or errored), `recv()` returns
+    // `None` — an always-ready future that would spin the loop at 100% CPU.
+    // Disabling this branch on the first `None` keeps the task asleep; the real
+    // link failure surfaces via `link.recv()`.
     let mut beacon_alive = true;
 
     // Whether we've received from this client since we last sent it a packet. Every
@@ -349,7 +350,7 @@ pub async fn run_slot_link(
                     acks_owed = true;
                 }
                 for payload in received.fresh {
-                    match validate_turn(slot, &payload.commands) {
+                    match validate_turn(slot, payload.seq, &payload.commands) {
                         Ok(turn) => fan_out(&sessions, &key, slot, turn.payload),
                         Err(error) => {
                             tracing::warn!(
@@ -366,8 +367,17 @@ pub async fn run_slot_link(
                     }
                 }
                 // Push the advanced delivered-through cursor to the client so it can
-                // force-advance its unacked window. Push only on advance.
-                flush_beacon(&mut beacon_send, &mut last_beacon_sent, link.delivered_through()).await;
+                // force-advance its unacked window. The relay receives only this
+                // client's own slot, so one per-slot cursor suffices. Push only on
+                // advance.
+                if let Some(cursor) = link.delivered_through(slot) {
+                    flush_beacon(
+                        &mut beacon_send,
+                        &mut last_beacon_sent,
+                        [(slot, cursor)].into(),
+                    )
+                    .await;
+                }
                 if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
                     tracing::warn!(
                         tenant = key.tenant.as_ref(),
@@ -417,16 +427,14 @@ pub async fn run_slot_link(
             }
             // The client pushed a delivered-through cursor over the beacon stream.
             // The reader task assembled the complete frame off a cancel-safe path;
-            // `watch::Receiver::changed` is cancel-safe in select!. The
+            // `mpsc::Receiver::recv` is cancel-safe in select!. The
             // `if beacon_alive` precondition disables this branch once the reader
-            // task ends — otherwise `changed()` returns `Err` on every poll, an
+            // task ends — otherwise `recv()` returns `None` on every poll, an
             // always-ready future that would spin the loop at 100% CPU.
-            result = beacon_rx.changed(), if beacon_alive => {
-                match result {
-                    Ok(()) => {
-                        if let Some(cursor) = *beacon_rx.borrow_and_update() {
-                            link.retire_through(cursor);
-                        }
+            received = beacon_rx.recv(), if beacon_alive => {
+                match received {
+                    Some((beacon_slot, cursor)) => {
+                        link.retire_through(beacon_slot, cursor);
                         if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
                             tracing::warn!(
                                 tenant = key.tenant.as_ref(),
@@ -440,9 +448,10 @@ pub async fn run_slot_link(
                             break 'serve;
                         }
                     }
-                    // The reader task ended. Stop polling it; the real link failure,
-                    // if any, surfaces via `link.recv()`.
-                    Err(_) => beacon_alive = false,
+                    // The reader task ended (client's beacon stream closed or
+                    // errored). Stop polling it: the real link failure, if any,
+                    // surfaces via `link.recv()`.
+                    None => beacon_alive = false,
                 }
             }
             _ = sleep_until(flush_deadline) => {

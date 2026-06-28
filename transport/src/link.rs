@@ -10,25 +10,28 @@
 //! Dedup is the link's job. netcode v2 removes Storm's transport layer, which
 //! used to drop the redundant copies; redundancy means the same payload arrives
 //! in several packets, so [`recv`](Link::recv) returns each payload exactly once.
-//! It tracks the contiguous run of delivered seqs plus a bounded set of
-//! out-of-order ones above it, so a fresh high seq never masks an older
-//! redundant one that simply hasn't arrived yet. Each call returns a packet's
-//! new payloads in seq order, but successive calls follow packet arrival, so
-//! the delivered stream isn't globally ordered — true in-order reassembly (holding
-//! a seq until the gap below it fills, as Storm did) is a layer above this.
+//! A payload's identity is `(slot, seq)` — its origin identity, assigned by the
+//! sending client and preserved end-to-end — so dedup tracks the contiguous run
+//! of delivered seqs *per slot* plus a bounded set of out-of-order ones above
+//! it, so a fresh high seq never masks an older redundant one that simply hasn't
+//! arrived yet. Each call returns a packet's new payloads in seq order, but
+//! successive calls follow packet arrival, so the delivered stream isn't
+//! globally ordered — true in-order reassembly (holding a seq until the gap below
+//! it fills, as Storm did) is a layer above this.
 //!
 //! The link also exposes the two halves of the ack-beacon side-channel the
-//! driver wires: [`delivered_through`](Link::delivered_through) is the cursor
-//! the driver pushes to the peer over a reliable uni-stream, and
-//! [`retire_through`](Link::retire_through) force-advances the unacked window
-//! when the peer's cursor arrives. The link owns no stream I/O — the driver
-//! opens the streams and runs the cancel-safe read loop — but it does guard
-//! `retire_through` monotonically so a desynced cursor can't retire turns the
-//! peer never confirmed.
+//! driver wires: [`delivered_through`](Link::delivered_through) is the per-slot
+//! cursor the driver pushes to the peer over a reliable uni-stream, and
+//! [`retire_through`](Link::retire_through) force-advances one slot's unacked
+//! window when the peer's cursor arrives. The link owns no stream I/O — the
+//! driver opens the streams and runs the cancel-safe read loop — but it does
+//! guard `retire_through` monotonically (per slot) so a desynced cursor can't
+//! retire turns the peer never confirmed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use prost::Message;
+use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{Packet, Payload};
 
 use crate::ack_manager::{AckError, AckManager};
@@ -37,7 +40,7 @@ use crate::ack_manager::{AckError, AckManager};
 /// before the link is treated as broken. The redundancy stream keeps that prefix
 /// advancing, so legitimately reaching this bound means the low seqs have been
 /// lost for a long run (minutes at the turn rate) — a dead link, not reorder. It
-/// also bounds the out-of-order set to at most this many entries.
+/// also bounds the out-of-order set to at most this many entries per slot.
 const RECEIVE_WINDOW: u64 = 4096;
 
 /// A single transport link over one QUIC connection.
@@ -45,13 +48,6 @@ pub struct Link {
     connection: quinn::Connection,
     acks: AckManager,
     dedup: Dedup,
-    /// The highest payload seq the beacon side-channel has force-retired through,
-    /// so a desynced or replayed cursor can't retire turns the peer never
-    /// confirmed. Inbound cursors are applied only when strictly greater than
-    /// this; anything else is a no-op. Without it, a stream framing desync
-    /// handing a garbage `u64` to `retire_through` could retire turns the peer
-    /// never received — silent lockstep desync, worse than a crash.
-    last_retired_through: Option<u64>,
 }
 
 /// A send or receive on a link failed.
@@ -78,9 +74,8 @@ pub enum LinkError {
     Decode(#[from] prost::DecodeError),
     /// A payload's seq was further ahead of our contiguous delivered prefix than
     /// the receive window allows — the peer is racing too far ahead (a dead link
-    /// or a malicious one). The caller should drop it.
-    #[error("payload seq {seq} is beyond the receive window")]
-    PayloadOutOfWindow { seq: u64 },
+    #[error("payload (slot {}, seq {seq}) is beyond the receive window", slot.0)]
+    PayloadOutOfWindow { slot: SlotId, seq: u64 },
     /// A received packet's acks were internally inconsistent. Attacker-facing
     /// callers (the relay) typically drop the peer on this.
     #[error(transparent)]
@@ -94,7 +89,6 @@ impl Link {
             connection,
             acks: AckManager::new(),
             dedup: Dedup::new(),
-            last_retired_through: None,
         }
     }
 
@@ -110,29 +104,30 @@ impl Link {
     }
 
     /// The top of the contiguous run of payloads this link has delivered to its
-    /// consumer (the highest seq such that every seq up to it has been delivered),
-    /// or `None` before the first payload arrives. This is the cursor the beacon
-    /// side-channel pushes to the peer so it can force-advance its unacked window
-    /// past turns it now knows were received.
-    pub fn delivered_through(&self) -> Option<u64> {
-        self.dedup.delivered_through
+    /// consumer for `slot` (the highest seq such that every seq up to it has been
+    /// delivered for that slot), or `None` before the first payload for that slot
+    /// arrives. This is the per-slot cursor the beacon side-channel pushes to the
+    /// peer so it can force-advance its unacked window past turns it now knows
+    /// were received.
+    pub fn delivered_through(&self, slot: SlotId) -> Option<u64> {
+        self.dedup.delivered_through(slot)
     }
 
-    /// Force-retires every unacked payload up to `through_seq`, returning how many
-    /// were dropped, *unless* `through_seq` is not strictly greater than the last
-    /// cursor applied. A monotonic guard: the beacon stream is reliable-ordered,
-    /// so cursors arrive in order, but a stream framing desync (partial read handed
-    /// to the codec) could produce a garbage `u64` — retiring turns the peer never
-    /// confirmed would desync lockstep silently. Rejecting anything not strictly
-    /// advancing turns such a desync into a harmless no-op rather than a desync.
+    /// Force-retires every unacked payload in `slot` up to `through_seq`,
+    /// returning how many were dropped, *unless* `through_seq` is not strictly
+    /// greater than the last cursor applied for that slot. A monotonic guard:
+    /// the beacon stream is reliable-ordered, so cursors arrive in order, but a
+    /// stream framing desync (partial read handed to the codec) could produce a
+    /// garbage `u64` — retiring turns the peer never confirmed would desync
+    /// lockstep silently. Rejecting anything not strictly advancing turns such a
+    /// desync into a harmless no-op rather than a desync.
     ///
     /// For the guard to hold, the reader must assemble complete frames off a
     /// cancel-safe path (a dedicated read-loop task forwarding over a channel),
     /// never a `read_exact` dropped mid-frame inside a `select!`.
-    pub fn retire_through(&mut self, through_seq: u64) -> usize {
-        if !matches!(self.last_retired_through, Some(prev) if prev >= through_seq) {
-            self.last_retired_through = Some(through_seq);
-            self.acks.retire_payloads_through(through_seq)
+    pub fn retire_through(&mut self, slot: SlotId, through_seq: u64) -> usize {
+        if self.dedup.advance_retired_through(slot, through_seq) {
+            self.acks.retire_payloads_through(slot, through_seq)
         } else {
             0
         }
@@ -176,7 +171,8 @@ impl Link {
 
     /// Awaits the next datagram, folds its acks into the manager, and returns what
     /// it delivered: the payloads not seen before (redundant copies dropped, in
-    /// ascending seq order) plus whether the packet carried any payloads at all.
+    /// ascending seq order within each slot) plus whether the packet carried any
+    /// payloads at all.
     pub async fn recv(&mut self) -> Result<Received, LinkError> {
         let datagram = self.connection.read_datagram().await?;
         let packet = Packet::decode(datagram)?;
@@ -195,18 +191,23 @@ impl Link {
         // provoke another ack-only packet in return, forever.
         let carried_payloads = !packet.payloads.is_empty();
 
-        // Process payloads low-seq first. A packet leads with its fresh (highest)
-        // seq, so without this a deep-loss packet's high seq could shut the window
-        // on the older redundant seqs it carries alongside.
-        packet.payloads.sort_by_key(|p| p.seq);
+        // Process payloads low-seq first within each slot. A packet leads with its
+        // fresh (highest) seq per slot, so without this a deep-loss packet's high
+        // seq could shut the window on the older redundant seqs it carries
+        // alongside.
+        packet.payloads.sort_by_key(|p| (p.slot, p.seq));
 
         let mut fresh = Vec::new();
         for payload in packet.payloads {
-            match self.dedup.accept(payload.seq) {
+            let slot = SlotId(payload.slot as u8);
+            match self.dedup.accept(slot, payload.seq) {
                 Delivery::New => fresh.push(payload),
                 Delivery::Duplicate => {}
                 Delivery::OutOfWindow => {
-                    return Err(LinkError::PayloadOutOfWindow { seq: payload.seq });
+                    return Err(LinkError::PayloadOutOfWindow {
+                        slot,
+                        seq: payload.seq,
+                    });
                 }
             }
         }
@@ -220,8 +221,8 @@ impl Link {
 /// What one [`recv`](Link::recv) delivered.
 #[derive(Debug)]
 pub struct Received {
-    /// Payloads delivered for the first time, ascending by seq; redundant copies of
-    /// already-delivered payloads are dropped.
+    /// Payloads delivered for the first time, ascending by `(slot, seq)`;
+    /// redundant copies of already-delivered payloads are dropped.
     pub fresh: Vec<Payload>,
     /// Whether the packet carried any payload elements (new or redundant). An
     /// ack-only packet carried none, and the peer is not waiting for it to be acked —
@@ -230,10 +231,10 @@ pub struct Received {
     pub carried_payloads: bool,
 }
 
-/// The outcome of offering a received payload seq to the dedup state.
+/// The outcome of offering a received payload `(slot, seq)` to the dedup state.
 #[derive(Debug, PartialEq, Eq)]
 enum Delivery {
-    /// First time this seq has been delivered — hand it to the caller.
+    /// First time this `(slot, seq)` has been delivered — hand it to the caller.
     New,
     /// Already delivered (at/below the contiguous prefix, or seen out of order).
     Duplicate,
@@ -241,20 +242,35 @@ enum Delivery {
     OutOfWindow,
 }
 
-/// Receive-side payload dedup.
+/// Receive-side payload dedup, per slot.
 ///
-/// Tracks `delivered_through`, the top of the contiguous run of delivered seqs,
-/// plus `ahead`, the delivered seqs above it that are waiting for the gaps below
-/// them to fill. A seq is a duplicate only if it's within that known-delivered
-/// state — never merely because a higher seq arrived first — so a redundant low
-/// seq is never mistaken for one that aged out.
+/// Each slot has its own contiguous delivered prefix (`delivered_through`) plus
+/// an `ahead` set of delivered seqs above it waiting for the gaps below to fill,
+/// because each slot carries its own monotonic seq space starting at 0 — a
+/// single global cursor would conflate one slot's progress with another's. A seq
+/// is a duplicate only if it's within that slot's known-delivered state — never
+/// merely because a higher seq arrived first — so a redundant low seq is never
+/// mistaken for one that aged out.
 struct Dedup {
+    /// Per-slot dedup state.
+    slots: HashMap<SlotId, SlotDedup>,
+    /// The highest per-slot cursor force-retired via [`Link::retire_through`], so
+    /// a desynced or replayed cursor can't retire turns the peer never confirmed.
+    /// Inbound cursors are applied only when strictly greater than this; anything
+    /// else is a no-op. Without it, a stream framing desync handing a garbage
+    /// `u64` to `retire_through` could retire turns the peer never received —
+    /// silent lockstep desync, worse than a crash.
+    retired_through: HashMap<SlotId, u64>,
+    /// How far above the prefix a seq may sit before it's rejected.
+    window: u64,
+}
+
+/// One slot's receive-side dedup state.
+struct SlotDedup {
     /// Top of the contiguous delivered prefix; `None` until seq 0 is delivered.
     delivered_through: Option<u64>,
     /// Delivered seqs above the prefix, kept until the gaps below them fill.
     ahead: BTreeSet<u64>,
-    /// How far above the prefix a seq may sit before it's rejected.
-    window: u64,
 }
 
 impl Dedup {
@@ -264,17 +280,28 @@ impl Dedup {
 
     fn with_window(window: u64) -> Self {
         Self {
-            delivered_through: None,
-            ahead: BTreeSet::new(),
+            slots: HashMap::new(),
+            retired_through: HashMap::new(),
             window,
         }
     }
 
-    /// Records `seq` as delivered and reports whether it's new, a duplicate, or
-    /// out of the receive window.
-    fn accept(&mut self, seq: u64) -> Delivery {
+    /// The top of the contiguous delivered prefix for `slot`, or `None` before
+    /// the slot's first payload arrives.
+    fn delivered_through(&self, slot: SlotId) -> Option<u64> {
+        self.slots.get(&slot).and_then(|s| s.delivered_through)
+    }
+
+    /// Records `(slot, seq)` as delivered and reports whether it's new, a
+    /// duplicate, or out of the receive window.
+    fn accept(&mut self, slot: SlotId, seq: u64) -> Delivery {
+        let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
+            delivered_through: None,
+            ahead: BTreeSet::new(),
+        });
+
         // The lowest seq not yet part of the contiguous delivered prefix.
-        let base = self.delivered_through.map_or(0, |t| t + 1);
+        let base = state.delivered_through.map_or(0, |t| t + 1);
 
         if seq < base {
             return Delivery::Duplicate;
@@ -282,17 +309,29 @@ impl Dedup {
         if seq - base >= self.window {
             return Delivery::OutOfWindow;
         }
-        if !self.ahead.insert(seq) {
+        if !state.ahead.insert(seq) {
             return Delivery::Duplicate;
         }
 
         // Absorb any now-contiguous run into the delivered prefix.
         let mut next = base;
-        while self.ahead.remove(&next) {
-            self.delivered_through = Some(next);
+        while state.ahead.remove(&next) {
+            state.delivered_through = Some(next);
             next += 1;
         }
         Delivery::New
+    }
+
+    /// Advances the per-slot retired-through guard, returning whether the cursor
+    /// was strictly greater than the last one applied for `slot` (so the caller
+    /// should retire). A cursor not strictly advancing is a no-op.
+    fn advance_retired_through(&mut self, slot: SlotId, through_seq: u64) -> bool {
+        if matches!(self.retired_through.get(&slot), Some(prev) if *prev >= through_seq) {
+            false
+        } else {
+            self.retired_through.insert(slot, through_seq);
+            true
+        }
     }
 }
 
@@ -306,23 +345,33 @@ mod tests {
     use crate::quic::{client_config, server_config};
 
     #[test]
-    fn dedup_returns_each_seq_once() {
+    fn dedup_returns_each_seq_once_per_slot() {
         let mut dedup = Dedup::with_window(8);
-        assert_eq!(dedup.accept(0), Delivery::New);
-        assert_eq!(dedup.accept(0), Delivery::Duplicate);
-        assert_eq!(dedup.accept(1), Delivery::New);
-        assert_eq!(dedup.accept(1), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::Duplicate);
+    }
+
+    #[test]
+    fn dedup_keeps_slots_independent() {
+        // Two slots both have seq 0; both are new — the identity is (slot, seq).
+        let mut dedup = Dedup::with_window(8);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(1), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(1), 0), Delivery::Duplicate);
     }
 
     #[test]
     fn dedup_handles_out_of_order_within_window() {
         let mut dedup = Dedup::with_window(8);
-        assert_eq!(dedup.accept(0), Delivery::New);
-        assert_eq!(dedup.accept(3), Delivery::New); // gap at 1, 2
-        assert_eq!(dedup.accept(3), Delivery::Duplicate);
-        assert_eq!(dedup.accept(1), Delivery::New);
-        assert_eq!(dedup.accept(2), Delivery::New); // closes the gap; 3 folds in
-        assert_eq!(dedup.accept(0), Delivery::Duplicate); // below the prefix now
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 3), Delivery::New); // gap at 1, 2
+        assert_eq!(dedup.accept(SlotId(0), 3), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 2), Delivery::New); // closes the gap; 3 folds in
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::Duplicate); // below the prefix now
     }
 
     #[test]
@@ -330,16 +379,16 @@ mod tests {
         // The regression: a high seq arriving first must not push an older, not
         // yet delivered seq out as "too old". Both are new deliveries.
         let mut dedup = Dedup::with_window(8);
-        assert_eq!(dedup.accept(7), Delivery::New);
-        assert_eq!(dedup.accept(0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 7), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
     }
 
     #[test]
     fn dedup_rejects_seq_beyond_window() {
         let mut dedup = Dedup::with_window(8);
-        assert_eq!(dedup.accept(0), Delivery::New); // prefix top = 0, base = 1
-        assert_eq!(dedup.accept(9), Delivery::OutOfWindow); // 9 - 1 >= 8
-        assert_eq!(dedup.accept(8), Delivery::New); // 8 - 1 < 8, still in window
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New); // prefix top = 0, base = 1
+        assert_eq!(dedup.accept(SlotId(0), 9), Delivery::OutOfWindow); // 9 - 1 >= 8
+        assert_eq!(dedup.accept(SlotId(0), 8), Delivery::New); // 8 - 1 < 8, still in window
     }
 
     fn self_signed() -> (
@@ -388,10 +437,10 @@ mod tests {
         )
     }
 
-    fn turn(byte: u8) -> Payload {
+    fn turn(slot: u8, seq: u64, byte: u8) -> Payload {
         Payload {
-            seq: 0, // assigned by the sending link
-            slot: 0,
+            seq,
+            slot: u32::from(slot),
             commands: vec![byte].into(),
         }
     }
@@ -401,7 +450,7 @@ mod tests {
         let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
 
         for i in 0..5u8 {
-            client.send(Some(turn(i))).unwrap();
+            client.send(Some(turn(0, i as u64, i))).unwrap();
         }
         assert_eq!(client.payloads_in_flight(), 5);
 
@@ -420,6 +469,37 @@ mod tests {
         server.send(None).unwrap();
         client.recv().await.unwrap();
         assert_eq!(client.payloads_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn delivers_each_slot_independently() {
+        // Two slots' turns interleave on the wire; each is dedup'd by (slot, seq).
+        let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
+
+        client.send(Some(turn(0, 0, 0xA0))).unwrap();
+        client.send(Some(turn(1, 0, 0xB0))).unwrap();
+        client.send(Some(turn(0, 1, 0xA1))).unwrap();
+        client.send(Some(turn(1, 1, 0xB1))).unwrap();
+
+        let mut delivered = Vec::new();
+        while delivered.len() < 4 {
+            delivered.extend(server.recv().await.unwrap().fresh);
+        }
+
+        // Slot 0's turns and slot 1's turns each arrive in their own seq order;
+        // the two streams are independent.
+        let slot0: Vec<u8> = delivered
+            .iter()
+            .filter(|p| p.slot == 0)
+            .map(|p| p.commands[0])
+            .collect();
+        let slot1: Vec<u8> = delivered
+            .iter()
+            .filter(|p| p.slot == 1)
+            .map(|p| p.commands[0])
+            .collect();
+        assert_eq!(slot0, vec![0xA0, 0xA1]);
+        assert_eq!(slot1, vec![0xB0, 0xB1]);
     }
 
     #[tokio::test]
@@ -477,7 +557,10 @@ mod tests {
             .unwrap();
 
         match server.recv().await {
-            Err(LinkError::PayloadOutOfWindow { seq }) => assert_eq!(seq, u64::MAX),
+            Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
+                assert_eq!(slot, SlotId(0));
+                assert_eq!(seq, u64::MAX);
+            }
             other => panic!("expected PayloadOutOfWindow, got {other:?}"),
         }
     }

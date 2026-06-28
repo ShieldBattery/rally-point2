@@ -436,9 +436,9 @@ async fn acks_a_one_way_sender_with_no_peer_traffic() {
     // turn to carry acks on and must flush ack-only packets on its own cadence.
     let mut solo = connect_slot(&endpoint, addr, &tenant, SessionId(7), SlotId(0)).await;
 
-    for _ in 0..3 {
+    for seq in 0..3u64 {
         solo.send(Some(Payload {
-            seq: 0,
+            seq,
             slot: 0,
             commands: vec![0x05].into(),
         }))

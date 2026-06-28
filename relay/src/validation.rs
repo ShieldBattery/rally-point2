@@ -87,11 +87,13 @@ fn is_stripped_from_live_turn(opcode: u8) -> bool {
 /// how many commands were stripped out of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedTurn {
-    /// The payload to fan out. Its `slot` is bound to the authorized slot and its
-    /// `commands` are the client's bytes with the commands a live turn shouldn't
-    /// carry (relay-owned pacing and replay-playback) removed. Its `seq` is left
-    /// at `0`: the transport seq is per-link and is assigned by each outbound link
-    /// as the payload is packed, not here.
+    /// The payload to fan out. Its `slot` is bound to the authorized slot (never
+    /// the client-sent value), its `commands` are the client's bytes with the
+    /// commands a live turn shouldn't carry (relay-owned pacing and
+    /// replay-playback) removed, and its `seq` is the client's origin identity —
+    /// preserved verbatim. The seq is the turn's identity across the whole mesh:
+    /// assigned by the sending client and honored by every hop, so the relay
+    /// forwards it untouched rather than restamping.
     pub payload: Payload,
     /// How many commands were stripped — relay-owned pacing or replay-playback.
     /// Non-zero means the client emitted something a live turn has no business
@@ -118,19 +120,24 @@ pub enum ValidationError {
     #[error("command {opcode:#04x} at offset {offset} runs past the end of the turn")]
     Truncated { offset: usize, opcode: u8 },
 }
-
 /// Validates and sanitizes one client turn, binding it to `slot`.
 ///
 /// `commands` is the raw native SC:R command stream the client submitted (with
-/// no transport framing). On success the returned [`ValidatedTurn`] holds a
-/// payload safe to forward: bound to `slot`, every command length-checked, and
-/// the commands a live turn shouldn't carry (relay-owned pacing, replay-playback)
-/// stripped. An empty `commands` (a bare turn signal, or a turn that stripped down
-/// to nothing) is valid and yields an empty payload.
+/// no transport framing), and `seq` is the turn's origin identity — assigned by
+/// the sending client and preserved end-to-end. On success the returned
+/// [`ValidatedTurn`] holds a payload safe to forward: bound to `slot`, the
+/// client's `seq` preserved verbatim, every command length-checked, and the
+/// commands a live turn shouldn't carry (relay-owned pacing, replay-playback)
+/// stripped. An empty `commands` (a bare turn signal, or a turn that stripped
+/// down to nothing) is valid and yields an empty payload.
 ///
 /// This is the attacker-facing parse: it never panics and never reads beyond a
 /// command's declared length.
-pub fn validate_turn(slot: SlotId, commands: &[u8]) -> Result<ValidatedTurn, ValidationError> {
+pub fn validate_turn(
+    slot: SlotId,
+    seq: u64,
+    commands: &[u8],
+) -> Result<ValidatedTurn, ValidationError> {
     let mut forwarded = Vec::with_capacity(commands.len());
     let mut stripped_control: u32 = 0;
     let mut offset = 0;
@@ -166,7 +173,7 @@ pub fn validate_turn(slot: SlotId, commands: &[u8]) -> Result<ValidatedTurn, Val
 
     Ok(ValidatedTurn {
         payload: Payload {
-            seq: 0,
+            seq,
             slot: u32::from(slot.0),
             commands: forwarded.into(),
         },
@@ -179,10 +186,14 @@ mod tests {
     use super::*;
 
     const SLOT: SlotId = SlotId(3);
-
-    /// Validate `commands` for [`SLOT`] and unwrap the sanitized turn.
+    /// Validate `commands` for [`SLOT`] with `seq` and unwrap the sanitized turn.
     fn validated(commands: &[u8]) -> ValidatedTurn {
-        validate_turn(SLOT, commands).expect("turn should validate")
+        validated_with_seq(SLOT, 0, commands)
+    }
+
+    /// Validate `commands` for `slot` with `seq` and unwrap the sanitized turn.
+    fn validated_with_seq(slot: SlotId, seq: u64, commands: &[u8]) -> ValidatedTurn {
+        validate_turn(slot, seq, commands).expect("turn should validate")
     }
 
     #[test]
@@ -191,8 +202,18 @@ mod tests {
         assert_eq!(turn.payload.slot, u32::from(SLOT.0));
         assert!(turn.payload.commands.is_empty());
         assert_eq!(turn.stripped_control, 0);
-        // seq is the outbound link's to assign, not the validator's.
+        // seq is preserved verbatim from the client, not assigned here.
         assert_eq!(turn.payload.seq, 0);
+    }
+
+    #[test]
+    fn preserves_the_client_seq_verbatim() {
+        // The seq is the turn's origin identity: assigned by the client and
+        // honored untouched, never restamped by the validator.
+        for seq in [0u64, 1, 42, 0x100, u64::MAX] {
+            let turn = validated_with_seq(SLOT, seq, &[0x05]);
+            assert_eq!(turn.payload.seq, seq);
+        }
     }
 
     #[test]
@@ -200,7 +221,7 @@ mod tests {
         // A keep-alive carries no slot of its own, and the turn never does on the
         // wire either — the relay always stamps the authorized slot.
         for slot in [0u8, 1, 7, 255] {
-            let turn = validate_turn(SlotId(slot), &[0x05]).unwrap();
+            let turn = validate_turn(SlotId(slot), 0, &[0x05]).unwrap();
             assert_eq!(turn.payload.slot, u32::from(slot));
         }
     }
@@ -291,7 +312,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_opcode() {
         // 0x00 is a hole in the table; the whole turn is refused.
-        let err = validate_turn(SLOT, &[0x00]).unwrap_err();
+        let err = validate_turn(SLOT, 0, &[0x00]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -309,7 +330,7 @@ mod tests {
         // decision to revisit only if SB brings save/load back — not a claim that
         // the commands are inherently invalid.
         for opcode in [0x06u8, 0x07] {
-            let err = validate_turn(SLOT, &[opcode]).unwrap_err();
+            let err = validate_turn(SLOT, 0, &[opcode]).unwrap_err();
             assert_eq!(err, ValidationError::UnknownOpcode { offset: 0, opcode });
         }
     }
@@ -318,7 +339,7 @@ mod tests {
     fn reports_the_offset_of_a_bad_opcode_mid_stream() {
         // A valid KeepAlive, then garbage: the error points at the garbage.
         let stream = [0x05, 0xFF];
-        let err = validate_turn(SLOT, &stream).unwrap_err();
+        let err = validate_turn(SLOT, 0, &stream).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -331,7 +352,7 @@ mod tests {
     #[test]
     fn rejects_a_fixed_command_that_overruns_the_turn() {
         // Build claims 8 bytes but only 4 are present.
-        let err = validate_turn(SLOT, &[0x0C, 1, 2, 3]).unwrap_err();
+        let err = validate_turn(SLOT, 0, &[0x0C, 1, 2, 3]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -344,7 +365,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_missing_its_count_byte() {
         // Classic select with no count byte at all.
-        let err = validate_turn(SLOT, &[0x09]).unwrap_err();
+        let err = validate_turn(SLOT, 0, &[0x09]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -357,7 +378,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_whose_count_overruns_the_turn() {
         // Select claims 3 entries (2 + 2*3 = 8 bytes) but only carries one.
-        let err = validate_turn(SLOT, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
+        let err = validate_turn(SLOT, 0, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {

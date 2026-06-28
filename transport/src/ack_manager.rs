@@ -13,8 +13,12 @@
 //!
 //! - **packet seq** ([`Packet::seq`], a per-connection `u32` that resets each
 //!   QUIC connection) identifies a datagram so the peer can ack it.
-//! - **payload seq** ([`Payload::seq`], a `u64`) is the transport identity of a
-//!   command unit — the dedup/retirement key, independent of game state.
+//! - **payload seq** ([`Payload::seq`], a `u64`) is the **origin** identity of a
+//!   command unit — assigned once by the sending client (the sole authority for
+//!   its own slot's turn stream; it alone knows production order) and preserved
+//!   end-to-end across every hop, never restamped. Each slot carries its own
+//!   monotonic seq space starting at 0, so the dedup/ack/retirement key is
+//!   `(slot, seq)`, not `seq` alone: two slots both have a seq 0.
 //!
 //! One [`AckManager`] runs per link at each endpoint (client ↔ home relay, and
 //! relay ↔ relay across the mesh). It owns no I/O: the driver pulls a built
@@ -25,6 +29,7 @@
 use std::collections::BTreeMap;
 
 use prost::Message;
+use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{Packet, Payload};
 
 use crate::sequence_buffer::SequenceBuffer;
@@ -42,9 +47,10 @@ const SENT_PACKETS_SIZE: usize = 256;
 
 /// Manages sending packets and processing acknowledgements for one link.
 ///
-/// Packets contain one or more payloads, each with its own sequence number. When
-/// an ack for a packet arrives, every payload that packet carried is considered
-/// delivered and is dropped from the re-send set.
+/// Packets contain one or more payloads, each identified by `(slot, seq)` — its
+/// origin identity, preserved end-to-end. When an ack for a packet arrives,
+/// every payload that packet carried is considered delivered and is dropped from
+/// the re-send set.
 pub struct AckManager {
     /// Seq to assign to the next packet we build, mirroring the `u32` wire field
     /// exactly so there's no narrowing on the way out. The QUIC connection is
@@ -52,15 +58,13 @@ pub struct AckManager {
     /// is years of uninterrupted play); a connection that somehow reached it
     /// would need to be reset rather than allowed to wrap.
     packet_seq: u32,
-    /// Seq to assign to the next fresh payload. Incremented per payload.
-    payload_seq: u64,
     /// Our recently-sent packets, keyed by packet seq, recording which payloads
     /// each carried so an ack can retire them.
     sent_packets: SequenceBuffer<SentPacket>,
     /// Payloads we've sent at least once that have not yet been acked, keyed by
-    /// payload seq. Iterated oldest-first to refill each outgoing packet's
-    /// redundancy budget.
-    unacked_payloads: BTreeMap<u64, SentPayload>,
+    /// `(slot, seq)` — the origin identity. Iterated per slot, oldest-seq-first
+    /// within each slot, to refill each outgoing packet's redundancy budget.
+    unacked_payloads: BTreeMap<(SlotId, u64), SentPayload>,
     /// The peer's recently-received packets, keyed by their packet seq. Drives
     /// the `ack` / `ack_bits` we send back.
     received_packets: SequenceBuffer<ReceivedPacket>,
@@ -70,7 +74,6 @@ impl AckManager {
     pub fn new() -> Self {
         Self {
             packet_seq: 0,
-            payload_seq: 0,
             sent_packets: SequenceBuffer::with_capacity(SENT_PACKETS_SIZE),
             unacked_payloads: BTreeMap::new(),
             received_packets: SequenceBuffer::with_capacity(RECEIVED_PACKETS_SIZE),
@@ -104,11 +107,6 @@ impl AckManager {
         self.packet_seq
     }
 
-    /// Seq that will be assigned to the next fresh payload built.
-    pub fn next_payload_seq(&self) -> u64 {
-        self.payload_seq
-    }
-
     /// Builds the `ack_bits` field: bit `N` is set when the peer's packet
     /// `(most_recent - N - 1)` has been received.
     fn ack_bits(&self) -> u32 {
@@ -134,12 +132,13 @@ impl AckManager {
     /// Builds the next outgoing [`Packet`].
     ///
     /// The packet is stamped with the next packet seq and the current ack state.
-    /// If `payload` is `Some`, it is assigned the next payload seq, always
-    /// included (even if it alone exceeds `max_packet_len` — the current turn is
-    /// never dropped), and tracked for re-sending until acked. The remaining
-    /// space up to `max_packet_len` is then filled with still-unacked payloads,
-    /// oldest first, for redundancy. If `payload` is `None`, the result is an
-    /// ack-only packet with no payloads.
+    /// If `payload` is `Some`, it is included verbatim — its `(slot, seq)` is its
+    /// origin identity, already assigned by the sending client and preserved
+    /// untouched here — always included (even if it alone exceeds `max_packet_len`
+    /// — the current turn is never dropped), and tracked for re-sending until
+    /// acked. The remaining space up to `max_packet_len` is then filled with
+    /// still-unacked payloads, oldest-seq-first within each slot, for redundancy.
+    /// If `payload` is `None`, the result is an ack-only packet with no payloads.
     ///
     /// `max_packet_len` is the live datagram budget (e.g. quinn's
     /// `max_datagram_size()`); pass the current value each call so the bundle
@@ -164,10 +163,9 @@ impl AckManager {
         // so we never overrun the datagram budget.
         let mut used = packet.encoded_len();
 
-        // Assign the fresh payload its seq and always include it.
-        let fresh = payload.map(|mut p| {
-            p.seq = self.payload_seq;
-            self.payload_seq += 1;
+        // The fresh payload is included verbatim. Its `(slot, seq)` origin identity
+        // is already assigned upstream and is never rewritten here.
+        let fresh = payload.map(|p| {
             let len = p.encoded_len();
             (p, len)
         });
@@ -176,12 +174,14 @@ impl AckManager {
             packet.payloads.push(p.clone());
         }
 
-        // Refill with still-unacked payloads, oldest first, while they fit. The
-        // fresh payload isn't in `unacked_payloads` yet, so it can't double up.
-        // Oldest-first favors the turns whose loss would stall a peer soonest. When
-        // a near-MTU stream keeps the budget full for a long run this under-covers
-        // the newer unacked turns; spreading coverage by `send_count` (re-sending
-        // the least-sent ones) is a future refinement, which is why it is tracked.
+        // Refill with still-unacked payloads, oldest-seq-first within each slot.
+        // The key is `(slot, seq)`, so a BTreeMap iteration visits each slot's
+        // payloads in ascending seq order — the turns whose loss would stall a peer
+        // soonest within that slot. The fresh payload isn't in
+        // `unacked_payloads` yet, so it can't double up. When a near-MTU stream
+        // keeps the budget full for a long run this under-covers the newer
+        // unacked turns; spreading coverage by `send_count` (re-sending the
+        // least-sent ones) is a future refinement, which is why it is tracked.
         for sent in self.unacked_payloads.values_mut() {
             let element = payload_element_len(sent.encoded_len);
             if used + element > max_packet_len {
@@ -195,7 +195,7 @@ impl AckManager {
         // Record the fresh payload as unacked only after the redundancy pass.
         if let Some((p, len)) = fresh {
             self.unacked_payloads.insert(
-                p.seq,
+                (SlotId(p.slot as u8), p.seq),
                 SentPayload {
                     send_count: 1,
                     encoded_len: len,
@@ -207,7 +207,11 @@ impl AckManager {
         self.sent_packets.insert(
             u64::from(packet.seq),
             SentPacket {
-                payload_seqs: packet.payloads.iter().map(|p| p.seq).collect(),
+                payload_slots_seqs: packet
+                    .payloads
+                    .iter()
+                    .map(|p| (SlotId(p.slot as u8), p.seq))
+                    .collect(),
             },
         );
 
@@ -269,27 +273,30 @@ impl AckManager {
         Ok(())
     }
 
-    /// Retires every still-unacked payload with seq `<= through_seq`, returning
-    /// how many were dropped.
+    /// Force-retires every still-unacked payload in `slot` with seq `<= through_seq`,
+    /// returning how many were dropped.
     ///
     /// Per-packet acks are selective; this is the cumulative counterpart. When a
-    /// reliable side-channel confirms the peer has received the command stream
-    /// through a given payload seq — the force-advance the driver uses when the
-    /// unacked window grows under sustained datagram loss — this advances the
-    /// window past it without waiting for the corresponding datagram acks. Stale
+    /// reliable side-channel confirms the peer has received one slot's command
+    /// stream through a given payload seq — the force-advance the driver uses
+    /// when the unacked window grows under sustained datagram loss — this
+    /// advances that slot's window past it without waiting for the corresponding
+    /// datagram acks. It retires only that slot's seqs: each slot has its own seq
+    /// space, so a cursor for slot A must not touch slot B's window. Stale
     /// `sent_packets` entries that still reference a retired payload are harmless:
     /// a later ack for them simply finds nothing left to remove.
-    pub fn retire_payloads_through(&mut self, through_seq: u64) -> usize {
+    pub fn retire_payloads_through(&mut self, slot: SlotId, through_seq: u64) -> usize {
         let before = self.unacked_payloads.len();
-        self.unacked_payloads.retain(|&seq, _| seq > through_seq);
+        self.unacked_payloads
+            .retain(|&(s, seq), _| s != slot || seq > through_seq);
         before - self.unacked_payloads.len()
     }
 
     /// Marks one of our sent packets as acked, retiring every payload it carried.
     fn retire_packet(&mut self, packet_seq: u64) {
         if let Some(packet) = self.sent_packets.remove(packet_seq) {
-            for seq in packet.payload_seqs.iter() {
-                self.unacked_payloads.remove(seq);
+            for (slot, seq) in packet.payload_slots_seqs.iter() {
+                self.unacked_payloads.remove(&(*slot, *seq));
             }
         }
     }
@@ -310,7 +317,9 @@ fn payload_element_len(payload_len: usize) -> usize {
 /// What one of our sent packets carried, so an ack can retire its payloads.
 #[derive(Default, Clone)]
 struct SentPacket {
-    payload_seqs: Box<[u64]>,
+    /// The `(slot, seq)` of each payload this packet carried — the origin
+    /// identity, which a later ack retires in full.
+    payload_slots_seqs: Box<[(SlotId, u64)]>,
 }
 
 /// A payload we've sent and are still re-sending until it's acked.
@@ -350,10 +359,13 @@ mod tests {
     /// payloads used in these tests.
     const MTU: usize = 1200;
 
-    fn test_payload() -> Payload {
+    /// A payload for `slot` with seq `seq`. Under the origin-identity model the
+    /// seq is assigned upstream (by the sender's home relay) and preserved, so
+    /// tests set it directly rather than expecting the manager to assign it.
+    fn test_payload(slot: u8, seq: u64) -> Payload {
         Payload {
-            seq: 0, // overwritten by the manager
-            slot: 0,
+            seq,
+            slot: u32::from(slot),
             commands: vec![0u8; 4].into(),
         }
     }
@@ -379,12 +391,12 @@ mod tests {
     }
 
     #[test]
-    fn sequence_numbers_increment() {
+    fn packet_seq_numbers_increment_and_payload_seq_is_preserved() {
         let mut manager = AckManager::new();
         for i in 0..10u64 {
-            let packet = manager.build_outgoing(Some(test_payload()), MTU);
+            let packet = manager.build_outgoing(Some(test_payload(0, i)), MTU);
             assert_eq!(packet.seq, i as u32);
-            // The fresh payload is always pushed first.
+            // The fresh payload is always pushed first, its seq preserved.
             assert_eq!(packet.payloads[0].seq, i);
         }
     }
@@ -397,8 +409,7 @@ mod tests {
         assert!(packet.payloads.is_empty());
         assert_eq!(packet.ack, None);
         assert_eq!(packet.ack_bits, 0);
-        // No payload seq was consumed, but a packet seq was.
-        assert_eq!(manager.next_payload_seq(), 0);
+        // No payload was carried, but a packet seq was.
         assert_eq!(manager.next_packet_seq(), 1);
         assert_eq!(manager.payloads_in_flight(), 0);
     }
@@ -408,8 +419,8 @@ mod tests {
         // Budget of 0 suppresses redundancy so each payload rides exactly one
         // packet — giving fine-grained control over what's acked.
         let mut manager = AckManager::new();
-        for _ in 0..10 {
-            manager.build_outgoing(Some(test_payload()), 0);
+        for i in 0..10u64 {
+            manager.build_outgoing(Some(test_payload(0, i)), 0);
         }
         assert_eq!(manager.payloads_in_flight(), 10);
 
@@ -439,7 +450,7 @@ mod tests {
             .unwrap();
         assert_eq!(manager.payloads_in_flight(), 3);
 
-        let packet = manager.build_outgoing(Some(test_payload()), 0);
+        let packet = manager.build_outgoing(Some(test_payload(0, 10)), 0);
         // We've received peer packets 0..=6, all present.
         assert_eq!(packet.ack, Some(6));
         assert_eq!(packet.ack_bits, 0b0011_1111);
@@ -450,7 +461,7 @@ mod tests {
             .unwrap();
         assert_eq!(manager.payloads_in_flight(), 2);
 
-        let packet = manager.build_outgoing(Some(test_payload()), 0);
+        let packet = manager.build_outgoing(Some(test_payload(0, 11)), 0);
         assert_eq!(packet.ack, Some(8));
         // Bit 0 (peer packet 7) is clear; the rest of the window is set.
         assert_eq!(packet.ack_bits, 0b1111_1110);
@@ -459,7 +470,7 @@ mod tests {
     #[test]
     fn rejects_ack_for_unsent_packet() {
         let mut manager = AckManager::new();
-        manager.build_outgoing(Some(test_payload()), MTU); // only packet 0 sent
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU); // only packet 0 sent
 
         assert_eq!(
             manager.handle_incoming(&incoming(0, Some(1), &[])),
@@ -483,7 +494,7 @@ mod tests {
     fn rejects_ack_bits_referencing_prehistory() {
         // Send one packet so ack 0 is itself valid (0 < 1 sent).
         let mut manager = AckManager::new();
-        manager.build_outgoing(Some(test_payload()), MTU);
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU);
 
         // ack 0 with bit 0 set claims to ack packet -1, which cannot exist.
         let packet = Packet {
@@ -503,38 +514,50 @@ mod tests {
     }
 
     #[test]
-    fn retire_payloads_through_advances_the_window() {
+    fn retire_payloads_through_advances_only_one_slots_window() {
         // No redundancy, so each payload rides exactly one packet and none is
         // retired by datagram acks during this test.
         let mut manager = AckManager::new();
-        for _ in 0..5 {
-            manager.build_outgoing(Some(test_payload()), 0);
+        // Slot 0: seqs 0..=4, slot 1: seqs 0..=4 — independent seq spaces.
+        for i in 0..5u64 {
+            manager.build_outgoing(Some(test_payload(0, i)), 0);
+            manager.build_outgoing(Some(test_payload(1, i)), 0);
         }
-        assert_eq!(manager.payloads_in_flight(), 5); // payload seqs 0..=4
+        assert_eq!(manager.payloads_in_flight(), 10);
 
-        // A side-channel confirms delivery through payload seq 2.
-        let retired = manager.retire_payloads_through(2);
-        assert_eq!(retired, 3); // seqs 0, 1, 2
-        assert_eq!(manager.payloads_in_flight(), 2); // seqs 3, 4 remain
+        // A side-channel confirms delivery of slot 0 through payload seq 2.
+        // Only slot 0's seqs 0,1,2 retire; slot 1 is untouched.
+        let retired = manager.retire_payloads_through(SlotId(0), 2);
+        assert_eq!(retired, 3);
+        assert_eq!(manager.payloads_in_flight(), 7); // slot 1's 5 + slot 0's 2
 
         // Idempotent: re-confirming an already-passed cursor retires nothing.
-        assert_eq!(manager.retire_payloads_through(2), 0);
-        assert_eq!(manager.payloads_in_flight(), 2);
+        assert_eq!(manager.retire_payloads_through(SlotId(0), 2), 0);
+        assert_eq!(manager.payloads_in_flight(), 7);
+
+        // Retiring slot 1 through 4 drops all of slot 1; slot 0's survivors stay.
+        let retired = manager.retire_payloads_through(SlotId(1), 4);
+        assert_eq!(retired, 5);
+        assert_eq!(manager.payloads_in_flight(), 2); // slot 0's seqs 3, 4
 
         // A subsequent packet only repacks the payloads still in flight.
         let packet = manager.build_outgoing(None, MTU);
-        let seqs: Vec<u64> = packet.payloads.iter().map(|p| p.seq).collect();
-        assert_eq!(seqs, vec![3, 4]);
+        let keys: Vec<(u8, u64)> = packet
+            .payloads
+            .iter()
+            .map(|p| (p.slot as u8, p.seq))
+            .collect();
+        assert_eq!(keys, vec![(0, 3), (0, 4)]);
     }
 
     #[test]
-    fn redundancy_repacks_unacked_payloads() {
+    fn redundancy_repacks_unacked_payloads_within_a_slot() {
         // With a real budget, each new packet should re-carry the earlier
         // unacked payloads alongside the fresh one.
         let mut manager = AckManager::new();
-        manager.build_outgoing(Some(test_payload()), MTU);
-        manager.build_outgoing(Some(test_payload()), MTU);
-        let third = manager.build_outgoing(Some(test_payload()), MTU);
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU);
+        manager.build_outgoing(Some(test_payload(0, 1)), MTU);
+        let third = manager.build_outgoing(Some(test_payload(0, 2)), MTU);
 
         // Fresh payload (seq 2) plus the two still-unacked ones (seq 0, 1).
         let seqs: Vec<u64> = third.payloads.iter().map(|p| p.seq).collect();
@@ -542,13 +565,35 @@ mod tests {
     }
 
     #[test]
+    fn redundancy_refills_across_slots_oldest_per_slot_first() {
+        // Two slots each with unacked payloads. Refill visits slot 0's oldest
+        // then slot 1's oldest (BTreeMap order on (slot, seq)), not a single
+        // global seq order — the correct semantics when each slot has its own
+        // seq space.
+        let mut manager = AckManager::new();
+        manager.build_outgoing(Some(test_payload(0, 100)), 0); // slot 0, high seq
+        manager.build_outgoing(Some(test_payload(1, 5)), 0); // slot 1, low seq
+
+        // A packet with room for both unacked payloads.
+        let packet = manager.build_outgoing(None, MTU);
+        let keys: Vec<(u8, u64)> = packet
+            .payloads
+            .iter()
+            .map(|p| (p.slot as u8, p.seq))
+            .collect();
+        // Slot 0's seq 100 comes before slot 1's seq 5 because the key orders by
+        // slot first — "oldest per slot", not "lowest seq globally".
+        assert_eq!(keys, vec![(0, 100), (1, 5)]);
+    }
+
+    #[test]
     fn redundancy_respects_size_budget() {
         let mut manager = AckManager::new();
-        manager.build_outgoing(Some(test_payload()), MTU);
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU);
 
         // A budget that fits only the fresh payload leaves no room to repack the
         // earlier one.
-        let only_fresh = manager.build_outgoing(Some(test_payload()), 0);
+        let only_fresh = manager.build_outgoing(Some(test_payload(0, 1)), 0);
         assert_eq!(only_fresh.payloads.len(), 1);
         assert_eq!(only_fresh.payloads[0].seq, 1);
     }
@@ -558,9 +603,9 @@ mod tests {
         let mut local = AckManager::new();
         let mut remote = AckManager::new();
 
-        for _ in 0..500 {
-            let outgoing = local.build_outgoing(Some(test_payload()), MTU);
-            let incoming = remote.build_outgoing(Some(test_payload()), MTU);
+        for i in 0..500u64 {
+            let outgoing = local.build_outgoing(Some(test_payload(0, i)), MTU);
+            let incoming = remote.build_outgoing(Some(test_payload(0, i)), MTU);
             remote.handle_incoming(&outgoing).unwrap();
             local.handle_incoming(&incoming).unwrap();
         }
@@ -577,9 +622,9 @@ mod tests {
         let mut remote = AckManager::new();
 
         let mut drop_count = 0;
-        for i in 0..100 {
-            let outgoing = local.build_outgoing(Some(test_payload()), MTU);
-            let incoming = remote.build_outgoing(Some(test_payload()), MTU);
+        for i in 0..100u64 {
+            let outgoing = local.build_outgoing(Some(test_payload(0, i)), MTU);
+            let incoming = remote.build_outgoing(Some(test_payload(0, i)), MTU);
 
             // Drop every 4th local -> remote packet.
             if i % 4 == 0 {
@@ -596,13 +641,13 @@ mod tests {
         assert_eq!(remote.payloads_in_flight(), 1);
 
         // remote -> local had no loss, so local sees a full ack window.
-        let packet = local.build_outgoing(Some(test_payload()), MTU);
+        let packet = local.build_outgoing(Some(test_payload(0, 100)), MTU);
         assert_eq!(packet.ack, Some(99));
         assert_eq!(packet.ack_bits, 0xFFFF_FFFF);
 
         // local -> remote dropped every 4th packet; reading right-to-left from
         // peer packet 98 down to 66, every 4th bit is clear.
-        let packet = remote.build_outgoing(Some(test_payload()), MTU);
+        let packet = remote.build_outgoing(Some(test_payload(0, 100)), MTU);
         assert_eq!(packet.ack, Some(99));
         assert_eq!(packet.ack_bits, 0b1011_1011_1011_1011_1011_1011_1011_1011);
     }
