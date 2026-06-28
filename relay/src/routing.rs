@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::Payload;
+use rally_point_proto::messages::{Payload, SlotConditions};
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::quinn::VarInt;
 use rally_point_transport::{Link, LinkError};
@@ -296,13 +296,17 @@ pub async fn run_slot_link(
     slot: SlotId,
     inbox: SlotInbox,
     sessions: Sessions,
-    mesh_links: crate::mesh::MeshLinks,
-    seen_registries: crate::mesh::SeenRegistries,
+    mesh: crate::mesh::MeshState,
 ) {
     let SlotInbox {
         mut forward_rx,
         shutdown,
     } = inbox;
+    let crate::mesh::MeshState {
+        links: mesh_links,
+        seen: seen_registries,
+        conditions,
+    } = mesh;
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -356,6 +360,14 @@ pub async fn run_slot_link(
                 if received.carried_payloads {
                     acks_owed = true;
                 }
+                // Sample this client's QUIC path stats on every received packet.
+                // A turn arrives every game step under active play, so this keeps
+                // the mesh's outgoing conditions current exactly when the
+                // decision-maker needs them. Quinn stats don't change while idle,
+                // so a quiet slot's last sample stays valid. Sampling once per
+                // packet (not per payload) is enough — all payloads in one packet
+                // share the same connection's path.
+                publish_slot_conditions(&conditions, &key, slot, link.connection());
                 for payload in received.fresh {
                     match validate_turn(slot, payload.seq, &payload.commands) {
                         Ok(turn) => {
@@ -508,14 +520,13 @@ pub async fn run_slot_link(
                     slot = slot.0,
                     "isolating lagging slot; closing connection",
                 );
-                link.connection()
-                    .close(VarInt::from_u32(ISOLATED_CLOSE), b"forward queue full");
                 break 'serve;
             }
         }
     }
 
     deregister(&sessions, &key, slot);
+    crate::mesh::unpublish_conditions(&conditions, &key, slot);
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -540,6 +551,33 @@ fn log_link_closed(key: &SessionKey, slot: SlotId, error: &LinkError) {
     );
 }
 
+/// Samples this client's QUIC connection path stats and publishes them as the
+/// slot's conditions, so the mesh can attach them to outgoing datagrams for the
+/// latency-buffer decision-maker. RTT comes from QUIC's smoothed path estimate;
+/// lost/sent are cumulative counters the decision-maker differences between
+/// consecutive samples to get a loss rate over the interval. A connection with
+/// no RTT sample yet (a one-way sender that has received nothing back) publishes
+/// `rtt_us: 0`, which reads as "no measurement" rather than "zero latency."
+fn publish_slot_conditions(
+    registry: &crate::mesh::ConditionsRegistry,
+    key: &SessionKey,
+    slot: SlotId,
+    connection: &rally_point_transport::quinn::Connection,
+) {
+    let stats = connection.stats();
+    let path = stats.path;
+    crate::mesh::publish_conditions(
+        registry,
+        key,
+        slot,
+        SlotConditions {
+            slot: u32::from(slot.0),
+            rtt_us: path.rtt.as_micros().min(u32::MAX as u128) as u32,
+            lost_packets: path.lost_packets,
+            sent_packets: path.sent_packets,
+        },
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;

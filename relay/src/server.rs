@@ -80,20 +80,11 @@ pub async fn run(
     server_config: quinn::ServerConfig,
     registry: Arc<Registry>,
     sessions: Sessions,
-    mesh_links: crate::mesh::MeshLinks,
-    seen_registries: crate::mesh::SeenRegistries,
+    mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) -> Result<(), ServerError> {
     let endpoint = quinn::Endpoint::server(server_config, listen)?;
-    serve(
-        endpoint,
-        registry,
-        sessions,
-        mesh_links,
-        seen_registries,
-        mesh_accept,
-    )
-    .await;
+    serve(endpoint, registry, sessions, mesh, mesh_accept).await;
     Ok(())
 }
 
@@ -108,16 +99,14 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
     sessions: Sessions,
-    mesh_links: crate::mesh::MeshLinks,
-    seen_registries: crate::mesh::SeenRegistries,
+    mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) {
     serve_with_max_pending(
         endpoint,
         registry,
         sessions,
-        mesh_links,
-        seen_registries,
+        mesh,
         mesh_accept,
         MAX_PENDING_HANDSHAKES,
     )
@@ -138,14 +127,11 @@ pub async fn serve(
 ///   `mesh_accept` to the mesh-link establishment task (or the test harness).
 ///   If `mesh_accept` is `None`, the connection is closed — the relay isn't
 ///   configured for mesh.
-/// - client `ALPN` (or unknown): the existing client-auth path, holding the
-///   permit through authorization.
 pub async fn serve_with_max_pending(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
     sessions: Sessions,
-    mesh_links: crate::mesh::MeshLinks,
-    seen_registries: crate::mesh::SeenRegistries,
+    mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
     max_pending_handshakes: usize,
 ) {
@@ -166,8 +152,7 @@ pub async fn serve_with_max_pending(
         };
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
-        let mesh_links = Arc::clone(&mesh_links);
-        let seen_registries = Arc::clone(&seen_registries);
+        let mesh = mesh.clone();
         let mesh_accept = mesh_accept.clone();
         tokio::spawn(async move {
             // Complete the TLS handshake in a spawned task so handshakes run
@@ -199,16 +184,8 @@ pub async fn serve_with_max_pending(
                     connection.close(VarInt::from_u32(0), b"mesh not configured");
                 }
             } else {
-                // Client-edge connection — hold the permit through auth.
-                if let Err(error) = serve_connection(
-                    connection,
-                    &registry,
-                    sessions,
-                    mesh_links,
-                    seen_registries,
-                    permit,
-                )
-                .await
+                if let Err(error) =
+                    serve_connection(connection, &registry, sessions, mesh, permit).await
                 {
                     tracing::info!(%error, "client connection ended");
                 }
@@ -218,14 +195,11 @@ pub async fn serve_with_max_pending(
 }
 /// Authorizes one incoming client connection, wires it into routing, and serves
 /// its turns until it closes. The TLS handshake is already complete (the accept
-/// loop called `incoming.await` to inspect the ALPN); this runs the app-level
-/// authorization handshake on top.
 async fn serve_connection(
     connection: quinn::Connection,
     registry: &Registry,
     sessions: Sessions,
-    mesh_links: crate::mesh::MeshLinks,
-    seen_registries: crate::mesh::SeenRegistries,
+    mesh: crate::mesh::MeshState,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
     let handshake = auth::authenticate(&connection, registry, unix_now());
@@ -275,15 +249,13 @@ async fn serve_connection(
         slot = authorized.slot.0,
         "client authorized",
     );
-
     routing::run_slot_link(
         Link::new(connection),
         key,
         authorized.slot,
         inbox,
         sessions,
-        mesh_links,
-        seen_registries,
+        mesh,
     )
     .await;
     Ok(())

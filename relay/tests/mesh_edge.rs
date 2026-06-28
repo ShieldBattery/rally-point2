@@ -149,8 +149,7 @@ struct Relay {
     addr: SocketAddr,
     ca: CertificateDer<'static>,
     sessions: Sessions,
-    mesh_links: mesh::MeshLinks,
-    seen_registries: mesh::SeenRegistries,
+    mesh: mesh::MeshState,
     mesh_rx: mpsc::Receiver<quinn::Connection>,
 }
 
@@ -162,16 +161,14 @@ impl Relay {
         let endpoint = quinn::Endpoint::server(cfg, bind).unwrap();
         let addr = endpoint.local_addr().unwrap();
         let sessions: Sessions = Arc::default();
-        let mesh_links = mesh::new_mesh_links();
-        let seen_registries = mesh::new_seen_registries();
+        let mesh = mesh::new_mesh_state();
         let (mesh_tx, mesh_rx) = mpsc::channel(8);
 
         tokio::spawn(server::serve(
             endpoint,
             Arc::new(registry_for(tenant)),
             Arc::clone(&sessions),
-            Arc::clone(&mesh_links),
-            Arc::clone(&seen_registries),
+            mesh.clone(),
             Some(mesh_tx),
         ));
 
@@ -179,8 +176,7 @@ impl Relay {
             addr,
             ca,
             sessions,
-            mesh_links,
-            seen_registries,
+            mesh,
             mesh_rx,
         }
     }
@@ -232,26 +228,21 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     let mesh_a = MeshLink::new(conn_a);
     let mesh_b = MeshLink::new(conn_b);
 
-    // Register mesh forward channels on both relays for this session.
-    let inbox_a = mesh::register_mesh_link(&relay_a.mesh_links, key.clone());
-    let inbox_b = mesh::register_mesh_link(&relay_b.mesh_links, key.clone());
-
-    // Spawn mesh-link drivers on both relays.
+    let inbox_a = mesh::register_mesh_link(&relay_a.mesh.links, key.clone());
+    let inbox_b = mesh::register_mesh_link(&relay_b.mesh.links, key.clone());
     tokio::spawn(mesh::run_mesh_link_session(
         mesh_a,
         key.clone(),
         inbox_a,
         Arc::clone(&relay_a.sessions),
-        Arc::clone(&relay_a.mesh_links),
-        Arc::clone(&relay_a.seen_registries),
+        relay_a.mesh.clone(),
     ));
     tokio::spawn(mesh::run_mesh_link_session(
         mesh_b,
         key.clone(),
         inbox_b,
         Arc::clone(&relay_b.sessions),
-        Arc::clone(&relay_b.mesh_links),
-        Arc::clone(&relay_b.seen_registries),
+        relay_b.mesh.clone(),
     ));
 
     // Connect clients: slot 0 (sender) on A, slot 1 on B.

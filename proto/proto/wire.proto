@@ -35,7 +35,7 @@ message Packet {
 
 // One mesh datagram on a relay ↔ relay link. A relay-pair shares one QUIC
 // connection across every game both relays jointly serve, so each datagram
-// names the session it belongs to; the peer demuxes to that session's
+// names the session it belongs to; the peer demultiplexes to that session's
 // per-session transport state (its own AckManager + Dedup). The per-link
 // transport runs unchanged per session — the origin `(slot, seq)` identity is
 // unambiguous within a session's instance, so no key grows to include the
@@ -46,6 +46,17 @@ message Packet {
 // `session` field to set or mis-set: a client crate that never references
 // `MeshPacket` cannot produce one. Client ↔ relay datagrams are `Packet`;
 // relay ↔ relay datagrams are `MeshPacket`.
+//
+// `conditions` is an optional sidecar carrying the sender relay's home-client
+// link stats to the peer relay, so the latency-buffer decision-maker can see
+// the whole game's network conditions. It rides at the envelope level — never
+// inside a `Payload` — because conditions are per-link and per-moment: a
+// redundantly re-carried payload would carry stale conditions, but a fresh
+// envelope sample is always current. Absent on ack-only flushes (no turn to
+// attach fresh conditions to is the common case, and reserving room for it
+// would steal redundancy budget — the protocol's whole point). A proto3
+// optional field is wire-compatible with a `1` peer that does not know it, so
+// the mesh ALPN does not bump for this addition.
 message MeshPacket {
   // The game this datagram belongs to, scoped within the tenant the mesh link
   // authenticated for. A `0` is malformed and rejected by the reader (sessions
@@ -59,6 +70,58 @@ message MeshPacket {
   // The per-link transport packet for this session, unchanged from the
   // client-edge framing. The mesh wraps it; it does not alter it.
   Packet packet = 2;
+
+  // Per-client network conditions the sender relay observed on its own home
+  // clients this datagram, for the latency-buffer decision-maker. Absent
+  // when the sender has nothing to report (an ack-only flush, or no local
+  // clients). See `LinkConditions`.
+  optional LinkConditions conditions = 3;
+}
+
+// Per-client network conditions a relay gathered from its own home-client QUIC
+// connections, attached to each mesh datagram it forwards so the peer relay —
+// and ultimately the priority-ordered decision-maker — sees the whole game's
+// network picture. Each relay directly observes only its own home clients'
+// links (loss, RTT), so those stats travel with the turns across the mesh.
+//
+// This is the data the latency-buffer control law decides on: loss rate and
+// latency per client, combined into a game-wide view by the decision-maker
+// relay. The fields are cumulative counters the decision-maker differences
+// between consecutive samples (a delta gives the loss rate over that interval),
+// plus an instantaneous RTT — mirroring what QUIC measures per connection.
+message LinkConditions {
+  // One entry per home client (slot) the sender relay serves for this session.
+  // Only the sender's own slots appear — a relay reports its local clients'
+  // links, not conditions it received from other peers (those ride their own
+  // origin relay's datagrams). Repeated rather than a map because slot counts
+  // are tiny (≤8) and a scan is cheaper than hashing.
+  repeated SlotConditions slots = 1;
+}
+
+// One home client's link conditions, as the relay's QUIC stack observes them.
+message SlotConditions {
+  // The slot these conditions belong to. Matches the `slot` on each `Payload`,
+  // so the decision-maker attributes loss/latency to the right player.
+  uint32 slot = 1;
+
+  // The connection's smoothed round-trip time in microseconds. QUIC's path
+  // estimator already de-noises this, so it is directly usable. A relay with no
+  // recent RTT sample (a one-way sender that has received nothing back yet)
+  // sends 0, which the decision-maker reads as "no measurement," not "zero
+  // latency."
+  uint32 rtt_us = 2;
+
+  // Packets QUIC declared lost on this connection since the start (cumulative).
+  // The decision-maker differences consecutive samples to get a loss rate over
+  // the interval between them; a cumulative counter is idempotent under
+  // re-delivery (a late conditions sample can't under-count).
+  uint64 lost_packets = 3;
+
+  // Packets sent on this connection since the start (cumulative) — the
+  // denominator for the loss rate. Paired with `lost_packets` so the
+  // decision-maker computes `lost/sent` over the delta, never relying on a
+  // separately-sampled denominator that could mismatch the numerator's window.
+  uint64 sent_packets = 4;
 }
 
 // One command packet from one slot — a unit of the lockstep command stream,

@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::Payload;
+use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
 use tokio::sync::mpsc;
 
 use crate::routing::{self, SessionKey};
@@ -154,8 +154,107 @@ pub type MeshLinks = Arc<Mutex<HashMap<SessionKey, Vec<MeshForwardTx>>>>;
 pub fn new_mesh_links() -> MeshLinks {
     Arc::new(Mutex::new(HashMap::new()))
 }
+/// Per-session, per-slot network conditions a relay's home-client links
+/// observe, gathered for the latency-buffer decision-maker. Each
+/// `run_slot_link` task publishes its own client's quinn path stats here;
+/// `run_mesh_link_session` snapshots the session's slots to build the outgoing
+/// [`LinkConditions`] sidecar on each forwarded datagram.
+///
+/// Outgoing-only: the relay reports its *own* home clients' conditions. It does
+/// not store conditions received from peer relays — those ride the peer's own
+/// origin datagrams to the decision-maker, and storing them here would add a
+/// stale-conditions correctness surface for a consumer (the decision-maker) that
+/// is not yet built. The mesh-link driver traces incoming conditions
+/// for observability but does not persist them.
+///
+/// A plain (non-async) mutex mirrors [`MeshLinks`] and [`routing::Sessions`]:
+/// every critical section is a short, await-free slot edit or a snapshot clone,
+/// so the lock is never held across a turn's delivery.
+pub type ConditionsRegistry = Arc<Mutex<HashMap<SessionKey, HashMap<SlotId, SlotConditions>>>>;
 
-/// The channel sink delivering payloads to one peer-relay's mesh-link task for
+/// Creates an empty conditions registry for a relay with no sessions yet.
+pub fn new_conditions_registry() -> ConditionsRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+/// Publishes `conditions` for `key`'s `slot`, replacing any prior sample for
+/// that slot. Called by `run_slot_link` after sampling its client's quinn path
+/// stats. Idempotent in the sense that a re-publish overwrites the stale
+/// sample — conditions are per-moment, and the latest is always what the
+/// mesh attaches.
+pub fn publish_conditions(
+    registry: &ConditionsRegistry,
+    key: &SessionKey,
+    slot: SlotId,
+    conditions: SlotConditions,
+) {
+    let mut roster = registry.lock().expect("conditions registry lock poisoned");
+    roster
+        .entry(key.clone())
+        .or_default()
+        .insert(slot, conditions);
+}
+
+/// Removes `slot` from `key`'s conditions (the client disconnected). Idempotent.
+/// Called by `run_slot_link` on exit so a departing client's stale stats don't
+/// outlive its connection.
+pub fn unpublish_conditions(registry: &ConditionsRegistry, key: &SessionKey, slot: SlotId) {
+    let mut roster = registry.lock().expect("conditions registry lock poisoned");
+    if let Some(slots) = roster.get_mut(key) {
+        slots.remove(&slot);
+        if slots.is_empty() {
+            roster.remove(key);
+        }
+    }
+}
+
+/// Snapshots all slot conditions published for `key`, as the [`LinkConditions`]
+/// sidecar the mesh attaches to an outgoing datagram. Returns `None` when the
+/// session has no published conditions (no local clients, or none have sampled
+/// yet) — so an ack-only flush or a session with no local clients attaches no
+/// sidecar, preserving the redundancy budget.
+pub fn snapshot_conditions(
+    registry: &ConditionsRegistry,
+    key: &SessionKey,
+) -> Option<LinkConditions> {
+    let roster = registry.lock().expect("conditions registry lock poisoned");
+    roster.get(key).map(|slots| {
+        let mut slots: Vec<SlotConditions> = slots.values().cloned().collect();
+        // Stable order by slot so the sidecar is deterministic across samples
+        // (the decision-maker diffs consecutive samples; a stable order makes
+        // the diff unambiguous).
+        slots.sort_by_key(|s| s.slot);
+        LinkConditions { slots }
+    })
+}
+
+/// The three mesh-related registries a relay thread needs: the live mesh links
+/// (fan-out to peer relays), the session-level topological dedup (echo guard),
+/// and the per-client conditions the mesh attaches to outgoing datagrams.
+///
+/// These are always created together, passed together, and used together, so
+/// bundling them keeps the `serve` and `run_slot_link` signatures within the
+/// argument-count the codebase holds elsewhere — no `#[allow(clippy::too_many_arguments)]`
+/// needed. Clone the struct cheaply (each field is an `Arc`) to hand a copy to a
+/// spawned task.
+#[derive(Clone)]
+pub struct MeshState {
+    /// Channels to peer-relay mesh-link tasks, keyed by session.
+    pub links: MeshLinks,
+    /// Session-level topological dedup (echo guard).
+    pub seen: SeenRegistries,
+    /// Per-slot link conditions the mesh attaches to outgoing datagrams.
+    pub conditions: ConditionsRegistry,
+}
+
+/// Creates a `MeshState` with empty registries for a relay that has no peer-relay
+/// links, no sessions, and no local clients yet.
+pub fn new_mesh_state() -> MeshState {
+    MeshState {
+        links: new_mesh_links(),
+        seen: new_seen_registries(),
+        conditions: new_conditions_registry(),
+    }
+}
 /// one session.
 type MeshForwardTx = mpsc::Sender<Payload>;
 
@@ -240,10 +339,14 @@ pub async fn run_mesh_link_session(
     key: SessionKey,
     inbox: MeshInbox,
     sessions: routing::Sessions,
-    mesh_links: MeshLinks,
-    seen_registries: SeenRegistries,
+    mesh: MeshState,
 ) {
     let MeshInbox { mut forward_rx } = inbox;
+    let MeshState {
+        links: mesh_links,
+        seen: seen_registries,
+        conditions,
+    } = mesh;
 
     // Open this session's transport state on the mesh link (both ends).
     link.open_session(rally_point_proto::ids::SessionId(key.session.0));
@@ -253,8 +356,22 @@ pub async fn run_mesh_link_session(
         tokio::select! {
             received = link.recv() => {
                 match received {
-                    Ok((sid, r)) if sid.0 == key.session.0 => {
-                        for payload in r.fresh {
+                    Ok(mesh_received) if mesh_received.session.0 == key.session.0 => {
+                        // Trace incoming peer-relay conditions for observability.
+                        // Not stored: conditions received from a peer relay are
+                        // that peer's own home-client stats — they ride the peer's
+                        // origin datagrams to the decision-maker, and persisting
+                        // them here would add a stale-conditions surface for a
+                        // consumer that is not yet built.
+                        if let Some(peer_conditions) = &mesh_received.conditions {
+                            tracing::trace!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slots = peer_conditions.slots.len(),
+                                "received peer-relay link conditions",
+                            );
+                        }
+                        for payload in mesh_received.delivery.fresh {
                             let slot = rally_point_proto::ids::SlotId(payload.slot as u8);
                             // Mark before fanning out to locals — the echo guard.
                             if mark_seen(&seen_registries, &key, slot, payload.seq)
@@ -268,7 +385,7 @@ pub async fn run_mesh_link_session(
                             fan_out_to_mesh(&mesh_links, &key, payload);
                         }
                     }
-                    Ok((_other, _)) => {
+                    Ok(_other) => {
                         continue;
                     }
                     Err(error) => {
@@ -286,7 +403,13 @@ pub async fn run_mesh_link_session(
                 match forwarded {
                     Some(payload) => {
                         let session_id = rally_point_proto::ids::SessionId(key.session.0);
-                        if let Err(error) = link.send(session_id, Some(payload)) {
+                        // Attach this relay's home-client conditions to every
+                        // forwarded datagram — the decision-maker needs the whole
+                        // game's picture, and conditions ride the envelope (not
+                        // the payload) so a redundantly re-carried payload never
+                        // carries stale stats.
+                        let outgoing = snapshot_conditions(&conditions, &key);
+                        if let Err(error) = link.send(session_id, Some(payload), outgoing) {
                             tracing::info!(%error, "mesh send failed; closing link");
                             break;
                         }
@@ -296,11 +419,14 @@ pub async fn run_mesh_link_session(
             }
             _ = tokio::time::sleep_until(flush_deadline) => {
                 let session_id = rally_point_proto::ids::SessionId(key.session.0);
-                if link.payloads_in_flight(session_id) > 0
-                    && let Err(error) = link.send(session_id, None)
-                {
-                    tracing::info!(%error, "mesh flush failed; closing link");
-                    break;
+                if link.payloads_in_flight(session_id) > 0 {
+                    // An ack-only flush carries no fresh turn, so it attaches no
+                    // conditions sidecar — the probe reserves zero overhead for
+                    // absent conditions, preserving the redundancy budget.
+                    if let Err(error) = link.send(session_id, None, None) {
+                        tracing::info!(%error, "mesh flush failed; closing link");
+                        break;
+                    }
                 }
                 flush_deadline = tokio::time::Instant::now() + routing::FLUSH_INTERVAL;
             }
@@ -355,5 +481,62 @@ mod tests {
             assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
         }
         assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::Duplicate);
+    }
+
+    #[test]
+    fn conditions_registry_snapshot_unpublish_contract() {
+        // snapshot returns slots sorted by slot id (deterministic diff order),
+        // None when the session has no published conditions. unpublish removes
+        // a slot, and when the last slot leaves, the session's entry is gone
+        // (no stale empty key lingering). Covers the registry's own contract
+        // independent of the transport round-trip tests.
+        let registry = new_conditions_registry();
+        let key = SessionKey {
+            tenant: rally_point_proto::control::TenantId("t".to_owned()),
+            session: rally_point_proto::ids::SessionId(1),
+        };
+
+        // No local clients yet: no conditions.
+        assert!(snapshot_conditions(&registry, &key).is_none());
+
+        // Publish two slots out of order; snapshot sorts them by slot.
+        publish_conditions(
+            &registry,
+            &key,
+            SlotId(1),
+            SlotConditions {
+                slot: 1,
+                rtt_us: 45_000,
+                lost_packets: 10,
+                sent_packets: 500,
+            },
+        );
+        publish_conditions(
+            &registry,
+            &key,
+            SlotId(0),
+            SlotConditions {
+                slot: 0,
+                rtt_us: 12_000,
+                lost_packets: 3,
+                sent_packets: 1000,
+            },
+        );
+
+        let snap = snapshot_conditions(&registry, &key).expect("two slots published");
+        assert_eq!(snap.slots.len(), 2);
+        assert_eq!(snap.slots[0].slot, 0, "sorted by slot");
+        assert_eq!(snap.slots[1].slot, 1, "sorted by slot");
+
+        // Unpublish one: snapshot now has a single slot.
+        unpublish_conditions(&registry, &key, SlotId(0));
+        let snap = snapshot_conditions(&registry, &key).expect("one slot remains");
+        assert_eq!(snap.slots.len(), 1);
+        assert_eq!(snap.slots[0].slot, 1);
+
+        // Unpublish the last: snapshot is None again, and the session's entry
+        // was removed (re-publishing a fresh slot starts clean, not appended).
+        unpublish_conditions(&registry, &key, SlotId(1));
+        assert!(snapshot_conditions(&registry, &key).is_none());
     }
 }

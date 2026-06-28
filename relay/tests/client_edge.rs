@@ -122,8 +122,7 @@ fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
         endpoint,
         Arc::new(registry),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_links(),
-        rally_point_relay::mesh::new_seen_registries(),
+        rally_point_relay::mesh::new_mesh_state(),
         None,
     ));
     (addr, ca)
@@ -387,8 +386,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
         relay,
         Arc::new(registry_for(&[&tenant])),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_links(),
-        rally_point_relay::mesh::new_seen_registries(),
+        rally_point_relay::mesh::new_mesh_state(),
         None,
         1,
     ));

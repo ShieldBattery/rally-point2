@@ -102,8 +102,7 @@ fn start_relay_on(bind: SocketAddr, registry: Registry) -> (SocketAddr, Certific
         endpoint,
         Arc::new(registry),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_links(),
-        rally_point_relay::mesh::new_seen_registries(),
+        rally_point_relay::mesh::new_mesh_state(),
         None,
     ));
     (addr, ca)
