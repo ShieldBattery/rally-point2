@@ -23,8 +23,10 @@ thiserror = { workspace = true }
 # 32-bit game DLL without a C/NASM toolchain.
 quinn = { workspace = true }
 rustls = { workspace = true }
+# The beacon side-channel's read-loop task and watch channel. Needed by the
+# shared `beacon` module used by both the client and relay drivers.
+tokio = { workspace = true }
 
 [dev-dependencies]
-# Test runtime + self-signed certs for the loopback QUIC tests.
-tokio = { workspace = true }
+# Self-signed certs for the loopback QUIC tests.
 rcgen = { workspace = true }

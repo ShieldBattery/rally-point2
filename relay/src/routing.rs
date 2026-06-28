@@ -53,6 +53,7 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
+use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::quinn::VarInt;
 use rally_point_transport::{Link, LinkError};
 use tokio::sync::{Notify, mpsc};
@@ -89,6 +90,18 @@ const ISOLATED_CLOSE: u32 = 0x04;
 /// turns at the 24-per-second turn rate: clear of ordinary jitter, while keeping
 /// retransmit latency and a one-way sender's backlog low.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// The hard ceiling on payloads forwarded to a client but not yet known-delivered.
+/// Mirrors the client's cap: under reverse-path loss (the client received the
+/// turns but the acks riding the datagrams were lost), the beacon side-channel
+/// force-advances the window via [`Link::retire_through`] and keeps it bounded.
+/// Under forward-path sustained loss — the client genuinely receives slower than
+/// the relay forwards — the beacon can retire only what the client *got*, so the
+/// window still grows. When it crosses this cap the relay isolates the slot (the
+/// same action it takes for a stuck forward queue) rather than let seqs race ahead
+/// until the client's receive window rejects them. Sat below the client's receive
+/// window (4096) so it trips before a hard reject.
+const UNACKED_WINDOW_CAP: usize = 1024;
 
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
@@ -284,6 +297,31 @@ pub async fn run_slot_link(
         shutdown,
     } = inbox;
 
+    // The ack-beacon side-channel, mirroring the client driver. The relay opens
+    // its outbound uni-stream (open_uni completes locally); the client's stream
+    // is accepted lazily inside the reader task so a one-way-traffic client that
+    // never sends a beacon doesn't block on an accept that never completes. The
+    // reader assembles complete 8-byte frames off a cancel-safe path and forwards
+    // the latest cursor over a watch channel — the driver drains it in one
+    // `borrow_and_update` since monotonic cursors subsume their predecessors.
+    let mut beacon_send = match link.connection().open_uni().await {
+        Ok(send) => send,
+        Err(error) => {
+            log_link_closed(&key, slot, &LinkError::from(error));
+            deregister(&sessions, &key, slot);
+            return;
+        }
+    };
+    let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
+    // The highest cursor the relay has pushed to the client. Push only on advance.
+    let mut last_beacon_sent: Option<u64> = None;
+    // Whether the inbound beacon reader task is still feeding cursors. Once it
+    // ends (the client's beacon uni-stream closed or errored), `changed()`
+    // returns `Err` on every poll — an always-ready future that would spin the
+    // loop at 100% CPU. Disabling this branch on the first `Err` keeps the task
+    // asleep; the real link failure surfaces via `link.recv()`.
+    let mut beacon_alive = true;
+
     // Whether we've received from this client since we last sent it a packet. Every
     // packet we send folds in the latest acks, so a forwarded turn clears this too,
     // and the flush only needs to carry acks when no forward has.
@@ -327,6 +365,21 @@ pub async fn run_slot_link(
                         }
                     }
                 }
+                // Push the advanced delivered-through cursor to the client so it can
+                // force-advance its unacked window. Push only on advance.
+                flush_beacon(&mut beacon_send, &mut last_beacon_sent, link.delivered_through()).await;
+                if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = key.session.0,
+                        slot = slot.0,
+                        in_flight = link.payloads_in_flight(),
+                        "unacked window exhausted; isolating slot",
+                    );
+                    link.connection()
+                        .close(VarInt::from_u32(ISOLATED_CLOSE), b"unacked window exhausted");
+                    break 'serve;
+                }
             }
             forwarded = forward_rx.recv() => {
                 match forwarded {
@@ -340,6 +393,18 @@ pub async fn run_slot_link(
                             if carried_redundancy {
                                 flush_deadline = Instant::now() + FLUSH_INTERVAL;
                             }
+                            if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
+                                tracing::warn!(
+                                    tenant = key.tenant.as_ref(),
+                                    session = key.session.0,
+                                    slot = slot.0,
+                                    in_flight = link.payloads_in_flight(),
+                                    "unacked window exhausted; isolating slot",
+                                );
+                                link.connection()
+                                    .close(VarInt::from_u32(ISOLATED_CLOSE), b"unacked window exhausted");
+                                break 'serve;
+                            }
                         }
                         Err(error) => {
                             log_link_closed(&key, slot, &error);
@@ -348,6 +413,36 @@ pub async fn run_slot_link(
                     },
                     // The roster dropped our sender: we've been deregistered.
                     None => break 'serve,
+                }
+            }
+            // The client pushed a delivered-through cursor over the beacon stream.
+            // The reader task assembled the complete frame off a cancel-safe path;
+            // `watch::Receiver::changed` is cancel-safe in select!. The
+            // `if beacon_alive` precondition disables this branch once the reader
+            // task ends — otherwise `changed()` returns `Err` on every poll, an
+            // always-ready future that would spin the loop at 100% CPU.
+            result = beacon_rx.changed(), if beacon_alive => {
+                match result {
+                    Ok(()) => {
+                        if let Some(cursor) = *beacon_rx.borrow_and_update() {
+                            link.retire_through(cursor);
+                        }
+                        if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
+                            tracing::warn!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                in_flight = link.payloads_in_flight(),
+                                "unacked window exhausted; isolating slot",
+                            );
+                            link.connection()
+                                .close(VarInt::from_u32(ISOLATED_CLOSE), b"unacked window exhausted");
+                            break 'serve;
+                        }
+                    }
+                    // The reader task ended. Stop polling it; the real link failure,
+                    // if any, surfaces via `link.recv()`.
+                    Err(_) => beacon_alive = false,
                 }
             }
             _ = sleep_until(flush_deadline) => {

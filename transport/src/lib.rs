@@ -48,6 +48,10 @@ pub mod sequence_buffer;
 pub use ack_manager::{AckError, AckManager};
 pub use link::{Link, LinkError, Received};
 
+/// Shared ack-beacon side-channel helpers (read-loop task + cursor push), used
+/// by both the client and relay drivers.
+pub mod beacon;
+
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.
 pub use {quinn, rustls};

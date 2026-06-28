@@ -29,6 +29,9 @@ pub mod ids;
 pub mod token;
 pub mod version;
 
+/// Sans-I/O codec for the ack-beacon side-channel.
+pub mod beacon;
+
 /// Generated protobuf wire messages — the turn-datagram framing.
 ///
 /// Built from `proto/wire.proto` by this crate's `build.rs`. See

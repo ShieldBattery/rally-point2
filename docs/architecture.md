@@ -77,9 +77,27 @@ redundantly-packed payloads.
   it costs no extra packets; it fires only when a near-MTU turn left no room for redundancy, or the
   link is idle, and re-carries the unacked payloads then.
 - Under *sustained* loss where redundancy can't keep up, the unacked window is **capped** rather than
-  grown without bound (a reliable side-channel can force-advance it); recovering turns the datagram path
-  has given up on then falls to a higher-layer resync, which is still being designed (see
-  [Failover](#failover-and-reconnect-open)). The datagram path itself stays best-effort-fast by design.
+  grown without bound. Two mechanisms keep it bounded, each for a distinct failure:
+
+  - The **ack-beacon** side-channel handles *reverse*-path loss — the peer received the turns (redundancy
+    kept up) but the acks riding the datagrams back were lost. Each side opens one outbound reliable
+    uni-stream and pushes its monotonic `delivered_through` cursor whenever it advances; the peer reads
+    it and force-retires (`retire_through`) everything up to that cursor. The cursor advances exactly
+    when the peer is keeping up, so the beacon retires the turns the peer confirmed it got — never the
+    ones it didn't. Push-on-advance, not a timer: a healthy link with a static receive prefix sends
+    nothing.
+  - A **hard cap** (`UNACKED_WINDOW_CAP`) handles *forward*-path sustained loss — the peer genuinely
+    receives slower than the local endpoint produces, so even with the beacon the window grows (the
+    beacon can only retire what the peer *got*). When `payloads_in_flight` crosses the cap the driver
+    trips (`UnackedWindowExhausted` on the client, slot isolation on the relay) rather than let seqs
+    race ahead until the peer's receive window rejects them and drops the link. Surfacing the condition
+    is the buildable half; the resync it triggers (reconnect + replay-from-cursor) is gated on the open
+    failover design (see [Failover](#failover-and-reconnect-open)).
+
+  The beacon's read half runs in a dedicated task that assembles complete frames over a `watch` channel
+  — a `read_exact` dropped mid-frame inside a `select!` would desync the framing and hand a garbage
+  cursor to `retire_through`, so it never crosses the `select!` boundary. `retire_through` is guarded
+  monotonically as a second line of defense. The datagram path itself stays best-effort-fast by design.
 
 ## The link transport
 

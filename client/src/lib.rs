@@ -19,9 +19,8 @@
 //! bundle is a recoverable loss the next packet re-carries, while a turn too large
 //! to fit any datagram is surfaced as a hard error rather than silently dropped.
 //!
-//! TODO: the reliable-stream ack-beacon that force-advances the unacked window
-//! under sustained loss; reliable control streams for chat/control/resync;
-//! reconnect + resync-from-cursor.
+//! TODO: reliable control streams for chat/control/resync; reconnect +
+//! resync-from-cursor (the unacked-window cap that triggers it is in place).
 
 /// Re-export of the shared protocol contracts, so consumers depend on a single
 /// `rally_point_client` surface rather than pulling in `rally-point-proto`

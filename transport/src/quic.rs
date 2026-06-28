@@ -25,14 +25,19 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// ALPN protocol id negotiated on every netcode v2 QUIC connection. The trailing
 /// number is bumped on any change an older peer can't interoperate with — the
-/// datagram wire framing or the connection-binding handshake — so a peer on the
-/// old protocol is rejected at the TLS handshake rather than later, as a malformed
-/// datagram or a puzzling credential failure.
+/// datagram wire framing, the connection-binding handshake, or the connection's
+/// stream shape — so a peer on the old protocol is rejected at the TLS handshake
+/// rather than later, as a malformed datagram or a puzzling credential failure.
+///
+/// `3`: the connection now opens an ack-beacon unidirectional stream after the
+/// authorization handshake, so each side can force-advance the peer's unacked
+/// window. A `2` peer opens no such stream and never sends beacons, so its
+/// `retire_through` never fires — incompatible.
 ///
 /// `2`: the connection-binding challenge is signed together with a TLS channel
 /// binding, not the nonce alone, so a `1` peer's proof no longer verifies and is
 /// deliberately not accepted — the old proof was replayable.
-pub const ALPN: &[u8] = b"rp2/2";
+pub const ALPN: &[u8] = b"rp2/3";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]

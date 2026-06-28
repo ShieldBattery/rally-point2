@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rally_point_proto::messages::Payload;
+use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::{Link, LinkError};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
@@ -56,8 +57,25 @@ const TURN_CHANNEL_CAPACITY: usize = 1024;
 /// stretch; in those cases it fires and sends an ack-only packet that re-carries
 /// unacked turns oldest-first and folds in owed acks. It stays silent when nothing
 /// is unacked and no acks are owed. Set to a few turns at the 24-per-second turn
-/// rate — clear of ordinary jitter, while keeping retransmit latency low.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// The hard ceiling on payloads sent but not yet known-delivered. Under
+/// *reverse*-path loss (the relay received the turns but the acks riding the
+/// datagrams were lost), the beacon side-channel force-advances the window via
+/// [`Link::retire_through`] and keeps it bounded. Under *forward*-path sustained
+/// loss — redundancy can't keep up, the relay genuinely receives slower than
+/// this client produces — the beacon can retire only what the relay *got*, never
+/// what it never received, so the window still grows. When it crosses this cap
+/// the driver trips [`DriverError::UnackedWindowExhausted`] rather than let seqs
+/// race ahead until the relay's receive window rejects them as
+/// `PayloadOutOfWindow` and drops the link (the status-quo unbounded-growth
+/// failure). Surfacing the condition is the buildable half; the resync it
+/// triggers is gated on the open failover design (D11).
+///
+/// Sat below the relay's receive window (4096) so it trips *before* a hard
+/// reject, with margin for the packets in flight between the trip and any
+/// retirement the beacon could still deliver.
+const UNACKED_WINDOW_CAP: usize = 1024;
 
 /// The game thread's end of the turn channels to a running [`LinkDriver`].
 ///
@@ -110,6 +128,16 @@ pub enum DriverError {
     /// outbound turns — so the caller can tear down or resync.
     #[error("game stopped draining received turns; inbound buffer full")]
     GameStalled,
+    /// The unacked window crossed [`UNACKED_WINDOW_CAP`] even after the beacon
+    /// side-channel retired everything the peer confirmed it received — the
+    /// peer is genuinely behind, not just ack-starved. This is the sustained
+    /// forward-loss case redundancy cannot cover: turns are being produced
+    /// faster than the peer can receive them. Surfacing it is the buildable
+    /// half; the resync it triggers (reconnect + replay-from-cursor) is gated
+    /// on the open failover design (D11). Dropping further turns to keep the
+    /// window bounded would desync lockstep, so the driver stops instead.
+    #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
+    UnackedWindowExhausted { in_flight: usize, cap: usize },
 }
 
 impl LinkDriver {
@@ -138,16 +166,45 @@ impl LinkDriver {
     /// Runs the link until the game seam closes (a clean stop → `Ok`) or the link
     /// fails (→ [`DriverError`], the signal for the reconnect path to re-dial).
     ///
-    /// Multiplexes three things over one task: receiving the client's peers' turns
-    /// and handing them to the game, sending the turns the game produced, and —
-    /// during outbound silence — flushing an ack-only packet that both carries the
-    /// acks it owes and re-carries any still-unacked turns until they land.
+    /// Multiplexes four things over one task: receiving the client's peers' turns
+    /// and handing them to the game, sending the turns the game produced, flushing
+    /// ack-only packets during outbound silence, and driving the ack-beacon
+    /// side-channel that keeps the unacked window bounded under loss. The beacon
+    /// is two uni-streams — one each direction — and its read half runs in a
+    /// dedicated task so a partial stream read is never dropped mid-frame inside a
+    /// `select!` branch (which would desync the framing and hand a garbage cursor
+    /// to `retire_through`); the task forwards each complete cursor over a
+    /// `watch` channel, whose `recv` *is* cancel-safe.
     pub async fn run(self) -> Result<(), DriverError> {
         let Self {
             mut link,
             mut outbound,
             inbound,
         } = self;
+
+        // The ack-beacon side-channel. The client opens its outbound uni-stream
+        // (open_uni completes locally, no peer round-trip); the peer's stream is
+        // accepted lazily inside the reader task, so a one-way-traffic link that
+        // never sends a beacon doesn't block the dial on an accept that never
+        // completes. The reader decodes complete 8-byte frames and forwards the
+        // latest cursor over a watch channel — non-blocking, so the reader never
+        // stalls on a full channel, and the driver drains it in one
+        // `borrow_and_update` since monotonic cursors subsume their predecessors.
+        let mut beacon_send = link
+            .connection()
+            .open_uni()
+            .await
+            .map_err(|error| DriverError::Link(LinkError::from(error)))?;
+        let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
+        // The highest cursor the client has pushed to the peer. Push only on
+        // advance so a healthy link with a static receive prefix sends nothing.
+        let mut last_beacon_sent: Option<u64> = None;
+        // Whether the inbound beacon reader task is still feeding cursors. Once it
+        // ends (the peer's beacon uni-stream closed or errored), `changed()` returns
+        // `Err` immediately on every poll — an always-ready future that would spin
+        // the loop at 100% CPU. Disabling this branch on the first `Err` keeps the
+        // driver asleep; the real link failure surfaces separately via `link.recv()`.
+        let mut beacon_alive = true;
 
         // Whether we've received from the relay since we last sent it a packet.
         // Every packet we send folds in the latest acks, so any outgoing turn
@@ -201,6 +258,17 @@ impl LinkDriver {
                             Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                         }
                     }
+                    // Push the advanced delivered-through cursor to the peer so it can
+                    // force-advance its unacked window past turns it now knows we
+                    // received. Push only on advance; a static cursor (genuine forward
+                    // gap) sends nothing — the cap handles that.
+                    flush_beacon(&mut beacon_send, &mut last_beacon_sent, link.delivered_through()).await;
+                    if check_cap(link.payloads_in_flight()) {
+                        return Err(DriverError::UnackedWindowExhausted {
+                            in_flight: link.payloads_in_flight(),
+                            cap: UNACKED_WINDOW_CAP,
+                        });
+                    }
                 }
                 outgoing = outbound.recv() => {
                     match outgoing {
@@ -214,9 +282,46 @@ impl LinkDriver {
                             if carried_redundancy {
                                 flush_deadline = Instant::now() + FLUSH_INTERVAL;
                             }
+                            if check_cap(link.payloads_in_flight()) {
+                                return Err(DriverError::UnackedWindowExhausted {
+                                    in_flight: link.payloads_in_flight(),
+                                    cap: UNACKED_WINDOW_CAP,
+                                });
+                            }
                         }
                         // The game dropped its sender: a clean stop.
                         None => return Ok(()),
+                    }
+                }
+                // The peer pushed a delivered-through cursor over the beacon stream.
+                // The reader task already assembled the complete frame off a
+                // cancel-safe path, so receiving here can never be a partial read.
+                // `watch::Receiver::changed` is cancel-safe in select!. The
+                // `if beacon_alive` precondition disables this branch once the reader
+                // task ends — otherwise `changed()` returns `Err` on every poll, an
+                // always-ready future that would spin the loop at 100% CPU (the
+                // connection may still be up, so `link.recv()` wouldn't surface it).
+                result = beacon_rx.changed(), if beacon_alive => {
+                    match result {
+                        Ok(()) => {
+                            // `borrow_and_update` fetches the latest cursor and marks
+                            // it seen, so a burst of cursors collapses to one retire.
+                            if let Some(cursor) = *beacon_rx.borrow_and_update() {
+                                link.retire_through(cursor);
+                            }
+                            if check_cap(link.payloads_in_flight()) {
+                                return Err(DriverError::UnackedWindowExhausted {
+                                    in_flight: link.payloads_in_flight(),
+                                    cap: UNACKED_WINDOW_CAP,
+                                });
+                            }
+                        }
+                        // The reader task ended (peer's beacon stream closed or
+                        // errored). Stop polling it: the real link failure, if any,
+                        // surfaces via `link.recv()`; a beacon-only stream reset must
+                        // not spin the loop. The cap still bounds the window without
+                        // beacons — the driver just stops force-advancing.
+                        Err(_) => beacon_alive = false,
                     }
                 }
                 // The game dropped its receiver. This is its own branch so the stop
@@ -259,10 +364,20 @@ fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<bool, Driver
     }
 }
 
+/// Returns `true` if the unacked window has crossed the hard cap — the
+/// sustained forward-loss case the beacon cannot rescue (the peer is genuinely
+/// behind, not just ack-starved). The caller surfaces
+/// [`DriverError::UnackedWindowExhausted`]; the resync it triggers is gated on
+/// the open failover design (D11).
+fn check_cap(in_flight: usize) -> bool {
+    in_flight > UNACKED_WINDOW_CAP
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    use rally_point_proto::beacon;
     use rally_point_transport::quic::{client_config, server_config};
     use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rally_point_transport::{quinn, rustls};
@@ -597,5 +712,190 @@ mod tests {
             Err(_) => panic!("driver kept running after its receiver was dropped"),
         }
         drop(chan_a.outbound);
+    }
+
+    #[tokio::test]
+    async fn the_beacon_retires_acked_turns_under_reverse_path_loss() {
+        // Reverse-path loss: the peer *receives* the turns (redundancy keeps up),
+        // but the acks riding the datagrams back are lost. Without the beacon, the
+        // driver would re-carry these turns forever and `payloads_in_flight` would
+        // grow past the cap. The beacon pushes the peer's `delivered_through`
+        // cursor, the driver force-retires through it, and the window stays
+        // bounded — the normal recovery path.
+        //
+        // This is the inversion of `forward_path_sustained_loss_trips_the_unacked_window_cap`:
+        // there the peer never receives, so the beacon can't retire and the cap trips.
+        // Here the peer *does* receive and pushes its cursor, so the beacon retires
+        // and the driver stays alive past the cap — proving the force-advance works.
+        // A regression in flush_beacon → stream → reader → retire_through would let
+        // in_flight grow past the cap and trip UnackedWindowExhausted here.
+        //
+        // The observable is a count, not a timing sleep: a tripped driver stops
+        // sending, so "the peer received all CAP+256 turns" deterministically proves
+        // the driver sent past the cap without tripping — i.e., the beacon retired.
+        // A fixed sleep can't reach that: at any point before the cap is stressed
+        // in_flight is small whether the beacon works or not.
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // The peer opens its outbound beacon uni-stream and pushes its
+        // delivered_through cursor as it receives turns. This is what a real
+        // relay/client does via flush_beacon; here we do it by hand since link_b
+        // is a raw Link (no driver).
+        let mut peer_beacon = link_b.connection().open_uni().await.unwrap();
+        let total = (UNACKED_WINDOW_CAP + 256) as u32;
+
+        let peer = tokio::spawn(async move {
+            let mut last_pushed: Option<u64> = None;
+            while let Ok(r) = link_b.recv().await {
+                // The peer received these turns: its delivered_through advanced.
+                // Push the new cursor to the driver.
+                if let Some(cursor) = link_b.delivered_through()
+                    && !matches!(last_pushed, Some(p) if p >= cursor)
+                {
+                    let frame = beacon::encode_frame(cursor);
+                    if peer_beacon.write_all(&frame).await.is_ok() {
+                        last_pushed = Some(cursor);
+                    }
+                }
+                let _ = r; // drain; the count isn't the observable here
+            }
+        });
+
+        // No ack datagrams are ever sent back — 100% reverse-path loss. The only
+        // way the driver's window stays bounded is the beacon retiring through the
+        // peer's pushed cursor. Flood past the cap: a working beacon retires as it
+        // goes and the driver sends every turn (the flood completes); a broken
+        // beacon lets in_flight hit the cap, the driver trips UnackedWindowExhausted,
+        // and the outbound channel send fails early (the flood does NOT complete).
+        //
+        // The observable is whether the flood sent all `total` turns: that's
+        // deterministic and race-free — a tripped driver stops sending, so a
+        // broken beacon can't send past the cap no matter how long you wait.
+        let flood = {
+            let outbound = chan_a.outbound.clone();
+            tokio::spawn(async move {
+                let mut sent = 0u32;
+                for i in 0..total {
+                    if outbound.send(turn(&[(i & 0xFF) as u8])).await.is_err() {
+                        break; // Driver tripped or closed.
+                    }
+                    sent += 1;
+                    // A tiny pace lets the peer's recv + beacon push keep up, so
+                    // this is genuine reverse-path loss (turns arrive, acks
+                    // don't), not forward-path loss (peer can't receive fast
+                    // enough).
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                sent
+            })
+        };
+
+        // Wait for the flood to finish (all turns sent, or the driver tripped and
+        // the send broke). It returns the count it actually sent.
+        let sent = tokio::time::timeout(Duration::from_secs(30), flood)
+            .await
+            .expect("the flood never completed — the driver or peer stalled")
+            .expect("the flood task panicked");
+
+        // The driver must have sent well past the cap without tripping — i.e., the
+        // beacon retired the turns the peer confirmed it received. A broken beacon
+        // lets in_flight hit the cap and the driver trips after ~CAP+1 turns (the
+        // check is `in_flight > CAP`, so one more send crosses it), so the flood
+        // stalls near CAP. The threshold sits at the midpoint between broken
+        // (~CAP+1) and working (~CAP+256), giving margin against a few in-flight
+        // datagrams dropped on the trip/close.
+        assert!(
+            sent > (UNACKED_WINDOW_CAP + 128) as u32,
+            "driver tripped the cap under reverse-path loss — the beacon did not \
+             retire the peer's confirmed-delivered turns (the flood sent only \
+             {sent} turns before the driver stopped; a working beacon keeps the \
+             driver sending past the {UNACKED_WINDOW_CAP}-turn cap)"
+        );
+
+        // And the driver must still be alive (not tripped) — the flood completed
+        // because the beacon kept the window bounded, not because the channel
+        // broke for another reason.
+        assert!(
+            !task.is_finished(),
+            "driver task ended after the flood — it should still be alive with a \
+             working beacon"
+        );
+
+        drop(chan_a.outbound);
+        peer.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn forward_path_sustained_loss_trips_the_unacked_window_cap() {
+        // Forward-path sustained loss: the peer genuinely receives slower than the
+        // client produces — redundancy can't keep up, so `payloads_in_flight` grows
+        // without bound. The beacon can only retire what the peer *got*, never what
+        // it never received, so the window still grows past the cap. The driver must
+        // trip `UnackedWindowExhausted` rather than let seqs race ahead until the
+        // peer's receive window rejects them and drops the link (the status-quo
+        // unbounded-growth failure this mechanism exists to prevent). This is the test
+        // that catches a missing cap — a beacon-only design passes every other test
+        // but fails here.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // The peer never receives: drain its datagrams but never call `recv()`, so
+        // its `delivered_through` never advances and the beacon can't retire
+        // anything. Meanwhile the driver keeps producing turns. Each goes out and
+        // stays unacked — genuine forward-path loss.
+        //
+        // We must drain the raw datagrams off the wire or quinn's datagram buffer
+        // fills and the connection stalls before the cap is reached. But we never
+        // feed them to `link_b.recv()`, so no delivered_through advances.
+        let drainer = {
+            let conn = link_b.connection().clone();
+            tokio::spawn(async move {
+                // Drain datagrams without processing them — the peer "receives" at
+                // the transport level but never advances its delivered cursor.
+                loop {
+                    if conn.read_datagram().await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // Flood turns past the cap. The driver sends each one; none are acked and
+        // the beacon can't retire them (delivered_through is stuck at None). When
+        // in_flight exceeds UNACKED_WINDOW_CAP the driver trips.
+        let flood = {
+            let outbound = chan_a.outbound.clone();
+            tokio::spawn(async move {
+                for i in 0..(UNACKED_WINDOW_CAP + 64) as u16 {
+                    if outbound.send(turn(&[(i & 0xFF) as u8])).await.is_err() {
+                        break;
+                    }
+                    // Don't pace: the goal is to outrun the peer, which never
+                    // processes anything.
+                }
+            })
+        };
+
+        // The driver must surface UnackedWindowExhausted, not hang.
+        match tokio::time::timeout(Duration::from_secs(10), task).await {
+            Ok(joined) => assert!(
+                matches!(
+                    joined.unwrap(),
+                    Err(DriverError::UnackedWindowExhausted { in_flight, cap })
+                        if in_flight > cap && cap == UNACKED_WINDOW_CAP
+                ),
+                "expected UnackedWindowExhausted"
+            ),
+            Err(_) => {
+                panic!("driver hung under forward-path sustained loss instead of tripping the cap")
+            }
+        }
+
+        drainer.abort();
+        flood.abort();
     }
 }

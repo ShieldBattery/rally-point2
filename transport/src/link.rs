@@ -13,9 +13,18 @@
 //! It tracks the contiguous run of delivered seqs plus a bounded set of
 //! out-of-order ones above it, so a fresh high seq never masks an older
 //! redundant one that simply hasn't arrived yet. Each call returns a packet's
-//! new payloads in seq order, but successive calls follow packet arrival, so the
-//! delivered stream isn't globally ordered — true in-order reassembly (holding a
-//! seq until the gap below it fills, as Storm did) is a layer above this.
+//! new payloads in seq order, but successive calls follow packet arrival, so
+//! the delivered stream isn't globally ordered — true in-order reassembly (holding
+//! a seq until the gap below it fills, as Storm did) is a layer above this.
+//!
+//! The link also exposes the two halves of the ack-beacon side-channel the
+//! driver wires: [`delivered_through`](Link::delivered_through) is the cursor
+//! the driver pushes to the peer over a reliable uni-stream, and
+//! [`retire_through`](Link::retire_through) force-advances the unacked window
+//! when the peer's cursor arrives. The link owns no stream I/O — the driver
+//! opens the streams and runs the cancel-safe read loop — but it does guard
+//! `retire_through` monotonically so a desynced cursor can't retire turns the
+//! peer never confirmed.
 
 use std::collections::BTreeSet;
 
@@ -36,6 +45,13 @@ pub struct Link {
     connection: quinn::Connection,
     acks: AckManager,
     dedup: Dedup,
+    /// The highest payload seq the beacon side-channel has force-retired through,
+    /// so a desynced or replayed cursor can't retire turns the peer never
+    /// confirmed. Inbound cursors are applied only when strictly greater than
+    /// this; anything else is a no-op. Without it, a stream framing desync
+    /// handing a garbage `u64` to `retire_through` could retire turns the peer
+    /// never received — silent lockstep desync, worse than a crash.
+    last_retired_through: Option<u64>,
 }
 
 /// A send or receive on a link failed.
@@ -78,6 +94,7 @@ impl Link {
             connection,
             acks: AckManager::new(),
             dedup: Dedup::new(),
+            last_retired_through: None,
         }
     }
 
@@ -92,11 +109,33 @@ impl Link {
         self.acks.payloads_in_flight()
     }
 
-    /// Retires every unacked payload up to `through_seq`, returning how many were
-    /// dropped. For use when a reliable side-channel has confirmed cumulative
-    /// delivery and the unacked window needs force-advancing.
+    /// The top of the contiguous run of payloads this link has delivered to its
+    /// consumer (the highest seq such that every seq up to it has been delivered),
+    /// or `None` before the first payload arrives. This is the cursor the beacon
+    /// side-channel pushes to the peer so it can force-advance its unacked window
+    /// past turns it now knows were received.
+    pub fn delivered_through(&self) -> Option<u64> {
+        self.dedup.delivered_through
+    }
+
+    /// Force-retires every unacked payload up to `through_seq`, returning how many
+    /// were dropped, *unless* `through_seq` is not strictly greater than the last
+    /// cursor applied. A monotonic guard: the beacon stream is reliable-ordered,
+    /// so cursors arrive in order, but a stream framing desync (partial read handed
+    /// to the codec) could produce a garbage `u64` — retiring turns the peer never
+    /// confirmed would desync lockstep silently. Rejecting anything not strictly
+    /// advancing turns such a desync into a harmless no-op rather than a desync.
+    ///
+    /// For the guard to hold, the reader must assemble complete frames off a
+    /// cancel-safe path (a dedicated read-loop task forwarding over a channel),
+    /// never a `read_exact` dropped mid-frame inside a `select!`.
     pub fn retire_through(&mut self, through_seq: u64) -> usize {
-        self.acks.retire_payloads_through(through_seq)
+        if !matches!(self.last_retired_through, Some(prev) if prev >= through_seq) {
+            self.last_retired_through = Some(through_seq);
+            self.acks.retire_payloads_through(through_seq)
+        } else {
+            0
+        }
     }
 
     /// Builds the next packet — `payload` plus redundant unacked ones, or
