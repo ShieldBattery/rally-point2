@@ -191,10 +191,15 @@ pub fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey) {
 
 /// Delivers `payload` to every peer-relay mesh link serving `key`, without ever
 /// blocking on a slow peer. Mirrors [`routing::fan_out`] but for mesh links
-/// instead of local slots. A `source` link id (which peer relay sent the turn)
-/// could exclude the origin link to avoid echoing back, but the mesh-link driver
-/// handles that by not forwarding back on the link a turn arrived on — so this
-/// fans out to *all* mesh links for the session.
+/// instead of local slots.
+///
+/// Fans out to **all** mesh links for the session — including the one a turn
+/// arrived on. The echo is caught not by excluding the ingress link (there's no
+/// link id in the registry to exclude) but by `MeshSeen`: every ingress — local
+/// client or mesh peer — marks `(slot, seq)` before forwarding to locals, so the
+/// echo arrives, is seen as `Duplicate`, and is dropped before it reaches local
+/// clients. This is why the flood-with-dedup model requires marking on *every*
+/// forward-to-local, not just mesh ingress.
 pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
     let targets: Vec<MeshForwardTx> = {
         let roster = links.lock().expect("mesh links lock poisoned");
@@ -208,6 +213,103 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
         // now just drop (the per-link transport re-carries what was already sent).
         let _ = tx.try_send(payload.clone());
     }
+}
+
+/// Drives one session's mesh-link state on a shared [`MeshLink`].
+///
+/// A near-twin of [`routing::run_slot_link`] but for the mesh edge:
+///
+/// - **Receives** turns from the peer relay via `MeshLink::recv()`, which
+///   demultiplexes by session. Only turns for `key`'s session are processed;
+///   others are forwarded to their own session's driver (in the full multi-
+///   session driver; this single-session variant filters to `key`).
+/// - **No `validate_turn`** — the mesh trusts its peer relay. Validation
+///   happened at the ingress client edge and is never repeated at a mesh hop.
+/// - **Marks `MeshSeen`** before fanning out to local clients, so an echo (the
+///   turn re-arriving via the mesh after being fanned out) is caught as
+///   `Duplicate` and dropped.
+/// - **Fans out** to both local slots and other mesh links, so a turn from a
+///   peer relay reaches this relay's local clients and any *other* connected
+///   peer relays.
+///
+/// This single-session variant filters `MeshLink::recv()` to `key`'s session —
+/// a multi-session driver would dispatch to per-session state. Sufficient for the
+/// first `C–S===S–C` E2E (one game per relay-pair).
+pub async fn run_mesh_link_session(
+    mut link: rally_point_transport::MeshLink,
+    key: SessionKey,
+    inbox: MeshInbox,
+    sessions: routing::Sessions,
+    mesh_links: MeshLinks,
+    seen_registries: SeenRegistries,
+) {
+    let MeshInbox { mut forward_rx } = inbox;
+
+    // Open this session's transport state on the mesh link (both ends).
+    link.open_session(rally_point_proto::ids::SessionId(key.session.0));
+    let mut flush_deadline = tokio::time::Instant::now() + routing::FLUSH_INTERVAL;
+
+    loop {
+        tokio::select! {
+            received = link.recv() => {
+                match received {
+                    Ok((sid, r)) if sid.0 == key.session.0 => {
+                        for payload in r.fresh {
+                            let slot = rally_point_proto::ids::SlotId(payload.slot as u8);
+                            // Mark before fanning out to locals — the echo guard.
+                            if mark_seen(&seen_registries, &key, slot, payload.seq)
+                                == Seen::Duplicate
+                            {
+                                continue;
+                            }
+                            // Fan out to local clients (all slots except source).
+                            routing::fan_out(&sessions, &key, slot, payload.clone());
+                            // Fan out to other mesh links (echo caught by their MeshSeen).
+                            fan_out_to_mesh(&mesh_links, &key, payload);
+                        }
+                    }
+                    Ok((_other, _)) => {
+                        // A datagram for a different session — this single-session
+                        // variant ignores it. A multi-session driver would dispatch.
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            %error,
+                            "mesh link closed",
+                        );
+                        break;
+                    }
+                }
+            }
+            forwarded = forward_rx.recv() => {
+                match forwarded {
+                    Some(payload) => {
+                        let session_id = rally_point_proto::ids::SessionId(key.session.0);
+                        if let Err(error) = link.send(session_id, Some(payload)) {
+                            tracing::info!(%error, "mesh send failed; closing link");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep_until(flush_deadline) => {
+                let session_id = rally_point_proto::ids::SessionId(key.session.0);
+                if link.payloads_in_flight(session_id) > 0
+                    && let Err(error) = link.send(session_id, None)
+                {
+                    tracing::info!(%error, "mesh flush failed; closing link");
+                    break;
+                }
+                flush_deadline = tokio::time::Instant::now() + routing::FLUSH_INTERVAL;
+            }
+        }
+    }
+
+    deregister_mesh_link(&mesh_links, &key);
 }
 
 #[cfg(test)]

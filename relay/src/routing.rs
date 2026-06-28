@@ -94,7 +94,7 @@ const ISOLATED_CLOSE: u32 = 0x04;
 /// sent. It stays silent when nothing is unacked and no acks are owed. Set to a few
 /// turns at the 24-per-second turn rate: clear of ordinary jitter, while keeping
 /// retransmit latency and a one-way sender's backlog low.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The hard ceiling on payloads forwarded to a client but not yet known-delivered.
 /// Mirrors the client's cap: under reverse-path loss (the client received the
@@ -250,7 +250,7 @@ fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
 /// task acts on the signal and exits, so no replacement can register a second
 /// sender for it in the meantime. A send to an already-departed peer is ignored. A
 /// turn is therefore never silently dropped for a keeping-up peer.
-fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, payload: Payload) {
+pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, payload: Payload) {
     let targets: Vec<(SlotId, ForwardTx, Arc<Notify>)> = {
         let roster = sessions.lock().expect("sessions roster lock poisoned");
         match roster.get(key) {
