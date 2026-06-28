@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 
 use prost::Message;
-use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, MeshPacket, Packet, Payload};
 
 use crate::ack_manager::{AckError, AckManager};
@@ -53,6 +53,25 @@ use crate::link::{Dedup, Delivery, LinkError, Received};
 /// prefix is the one part that can't be probed without the packet itself, so it
 /// stays in this const — it is bounded and small.
 const MESH_PACKET_OVERHEAD: usize = 16;
+
+/// Whether this relay should be the one to dial `peer_id` on the mesh, given
+/// its own `our_id`.
+///
+/// Mesh links are one connection per relay-pair. Without a tie-break, both
+/// relays could dial each other at once and two connections would complete —
+/// one redundant, torn down after. The rule is "lower id dials higher": each
+/// side compares its own id to the peer's and dials only when it is the lower.
+/// The higher id stays in its accept loop and lets the dial arrive, so exactly
+/// one side connects and there is no race to resolve on the wire.
+///
+/// This is a *pre-connect* local decision: the peer's id must already be known
+/// (from the coordinator-assigned topology) before either side dials. A
+/// post-connect id exchange cannot decide the dial — by the time it could run,
+/// the dial has already happened. Two relays with the same id is a
+/// misconfiguration; this returns `false` so neither dials rather than both.
+pub fn should_dial_mesh(our_id: RelayId, peer_id: RelayId) -> bool {
+    our_id < peer_id
+}
 
 /// One mesh link: a shared QUIC connection plus per-session transport state.
 ///
@@ -851,5 +870,24 @@ mod tests {
 
         drop(sender);
         let _ = drain.await;
+    }
+
+    #[test]
+    fn should_dial_mesh_is_true_when_our_id_is_lower() {
+        // The lower id dials the higher: this side connects, the peer accepts.
+        assert!(should_dial_mesh(RelayId(1), RelayId(2)));
+    }
+
+    #[test]
+    fn should_dial_mesh_is_false_when_our_id_is_higher() {
+        // The higher id waits to accept — it does not dial back.
+        assert!(!should_dial_mesh(RelayId(2), RelayId(1)));
+    }
+
+    #[test]
+    fn should_dial_mesh_is_false_for_equal_ids() {
+        // Two relays with the same id is a misconfiguration: neither dials
+        // rather than both racing to connect.
+        assert!(!should_dial_mesh(RelayId(5), RelayId(5)));
     }
 }

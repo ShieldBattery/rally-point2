@@ -48,7 +48,7 @@ pub mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager};
 pub use link::{Link, LinkError, Received};
-pub use mesh_link::{MeshLink, MeshLinkError, SessionLink};
+pub use mesh_link::{MeshLink, MeshLinkError, SessionLink, should_dial_mesh};
 
 /// Shared ack-beacon side-channel helpers (read-loop task + cursor push), used
 /// by both the client and relay drivers.

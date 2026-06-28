@@ -15,10 +15,12 @@
 //! identity is stable across the mesh because no hop restamps it, so the two
 //! dedup layers collapse duplicates at different granularities without conflict.
 //!
-//! Mesh-link establishment (lower relay-id dials higher, one side dials to avoid
-//! the two-way race) and authenticated relay tokens are deferred: the first
-//! increment carries tenant-binding via a preamble, with no auth token. Real relay
-//! auth lands with the coordinator (Phase 3).
+//! Mesh-link establishment uses a lower-id-dials-higher tie-break
+//! ([`should_dial_mesh`](rally_point_transport::should_dial_mesh)): each relay
+//! compares its own id to the peer's configured id and dials only when it is the
+//! lower, so exactly one side connects and there is no two-way race to resolve
+//! on the wire. Authenticated relay tokens and tenant binding land with the
+//! coordinator (Phase 3); this increment has no auth token.
 
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
@@ -297,17 +299,38 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
     }
 }
 
-/// Drives a shared [`MeshLink`] for every session both relays jointly serve.
+/// A command to a mesh-link driver, telling it to start or stop serving one
+/// session on its shared relay-pair connection.
 ///
-/// A near-twin of [`routing::run_slot_link`] but for the mesh edge, generalized
-/// from one session to all sessions on a relay-pair's shared QUIC connection:
+/// The driver discovers sessions over time — a relay learns which games its
+/// peer also serves as clients connect and games start — so it takes a stream
+/// of these commands rather than an upfront list. Join opens the session's
+/// transport state on the link and registers its forward channel; Leave
+/// closes and deregisters it. Today the test harness drives the channel
+/// directly; the coordinator's session-descriptor push (Phase 3) will be the
+/// production source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshCommand {
+    /// Start serving `key`'s session on this link. Opens per-session transport
+    /// state and registers a forward channel so turns fanned out to the mesh
+    /// reach this link. Idempotent: joining an already-joined session is a
+    /// no-op (a re-announce after a transient drop is harmless).
+    Join(SessionKey),
+    /// Stop serving `key`'s session on this link. Closes its per-session
+    /// transport state and deregisters its forward channel. Idempotent: leaving
+    /// an absent session is a no-op.
+    Leave(SessionKey),
+}
+
+/// Drives a shared [`MeshLink`] for every session both relays jointly serve on
+/// a relay-pair's single QUIC connection.
+///
+/// A near-twin of [`routing::run_slot_link`] but for the mesh edge:
 ///
 /// - **Receives** turns from the peer relay via `MeshLink::recv()`, which
 ///   demultiplexes by session. Each datagram is routed to the session it names
-///   — a session not in `keys` is an error (the two relays' rosters have
-///   desynced), not a silent drop. The single-session driver's `Ok(_other) =>
-///   continue` branch silently dropped other sessions' datagrams; this loop
-///   owns them all.
+///   — a session not currently joined is logged and dropped, not a crash. The
+///   join may simply be in flight on the command channel.
 /// - **No `validate_turn`** — the mesh trusts its peer relay. Validation
 ///   happened at the ingress client edge and is never repeated at a mesh hop.
 /// - **Marks `MeshSeen`** before fanning out to local clients, so an echo (the
@@ -323,20 +346,25 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
 /// forward channel carries `(SessionId, Payload)` so one `select!` branch
 /// drains all sessions' outbound turns without polling N receivers.
 ///
+/// Sessions join and leave over `commands` as the relay discovers which games
+/// its peer also serves. One `Join` opens the session's transport state and
+/// registers its forward channel; one `Leave` closes and deregisters it. The
+/// driver ends when the command channel closes (its sender was dropped — the
+/// relay is tearing the link down) or the connection fails.
+///
 /// # Tenant scoping
 ///
 /// The wire carries a bare `session: u64` with no tenant (see `MeshPacket`).
 /// Session ids are unique only *within* a tenant, so the driver keys its
 /// per-session state by `SessionKey` (tenant + session) — never the bare id —
 /// and a `SessionId -> SessionState` map demultiplexes a received datagram to
-/// the right session. The collision guard lives in this function's setup
-/// loop, not just in [`join_sessions`]: a caller that skips `join_sessions`
-/// still can't silently cross-wire two tenants sharing a session id — the
-/// second is logged and dropped, never overwrites the first. This is
-/// fail-closed, not fail-open.
+/// the right session. The collision guard runs on every `Join`: a caller that
+/// skips [`join_sessions`] still can't silently cross-wire two tenants
+/// sharing a session id — the second is logged and dropped, never overwrites
+/// the first. This is fail-closed, not fail-open.
 pub async fn run_mesh_link(
     mut link: rally_point_transport::MeshLink,
-    keys: Vec<SessionKey>,
+    mut commands: mpsc::Receiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
 ) {
@@ -356,44 +384,17 @@ pub async fn run_mesh_link(
 
     // Per-session driver state, keyed by the wire's bare session id. Each entry
     // carries its full SessionKey so fan-out/conditions stay tenant-correct.
-    // The collision guard lives here: if two tenants share a session id, the
+    // The collision guard runs on Join: if two tenants share a session id, the
     // wire can't tell them apart, so the second is logged and skipped — never
     // overwrites the first.
     let mut joined: HashMap<rally_point_proto::ids::SessionId, SessionState> = HashMap::new();
-    for key in keys {
-        let session_id = key.session;
-        if let Some(existing) = joined.get(&session_id)
-            && existing.key.tenant != key.tenant
-        {
-            tracing::error!(
-                session = session_id.0,
-                existing_tenant = existing.key.tenant.as_ref(),
-                new_tenant = key.tenant.as_ref(),
-                "session id collision across tenants; refusing second tenant",
-            );
-            continue;
-        }
-        link.open_session(session_id);
-        {
-            let mut roster = mesh_links.lock();
-            roster
-                .entry(key.clone())
-                .or_default()
-                .push(forward_tx.clone());
-        }
-        joined.insert(
-            session_id,
-            SessionState {
-                key,
-                flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
-            },
-        );
-    }
 
     loop {
         // The earliest per-session flush deadline. `sleep` is cancel-safe, so
         // the loop recomputes it on every wake. With a handful of games per
-        // relay-pair the O(N) scan is trivial.
+        // relay-pair the O(N) scan is trivial; when no sessions are joined yet
+        // (the link is up, awaiting its first Join) it parks on a long sleep
+        // so the loop doesn't spin.
         let next_flush = joined
             .values()
             .map(|s| s.flush_deadline)
@@ -480,6 +481,54 @@ pub async fn run_mesh_link(
                     break;
                 }
             }
+            command = commands.recv() => {
+                match command {
+                    Some(MeshCommand::Join(key)) => {
+                        let session_id = key.session;
+                        if let Some(existing) = joined.get(&session_id)
+                            && existing.key.tenant != key.tenant
+                        {
+                            tracing::error!(
+                                session = session_id.0,
+                                existing_tenant = existing.key.tenant.as_ref(),
+                                new_tenant = key.tenant.as_ref(),
+                                "session id collision across tenants; refusing second tenant",
+                            );
+                            continue;
+                        }
+                        // Already joined (same tenant): a re-announce is harmless.
+                        if joined.contains_key(&session_id) {
+                            continue;
+                        }
+                        link.open_session(session_id);
+                        {
+                            let mut roster = mesh_links.lock();
+                            roster
+                                .entry(key.clone())
+                                .or_default()
+                                .push(forward_tx.clone());
+                        }
+                        joined.insert(
+                            session_id,
+                            SessionState {
+                                key,
+                                flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
+                            },
+                        );
+                    }
+                    Some(MeshCommand::Leave(key)) => {
+                        let session_id = key.session;
+                        if joined.remove(&session_id).is_some() {
+                            link.close_session(session_id);
+                            deregister_mesh_link(&mesh_links, &key);
+                        }
+                    }
+                    // The command channel closed: the sender (the relay's
+                    // mesh-link manager, or the test) dropped it, signaling
+                    // the link should wind down.
+                    None => break,
+                }
+            }
         }
     }
 
@@ -500,9 +549,10 @@ struct SessionState {
 /// the same session id — the wire's bare `session: u64` can't disambiguate them,
 /// so the second is refused rather than overwriting the first.
 ///
-/// Call before [`run_mesh_link`] with the full session list. This is the
-/// fail-closed gate; `run_mesh_link` also checks on its own setup loop, so a
-/// caller that omits this still can't silently cross-wire tenants.
+/// A batch pre-validation helper: a caller that collected a session list before
+/// driving the link can refuse the whole batch at once. `run_mesh_link` runs the
+/// same check on every `Join`, so a caller that sends sessions one at a time —
+/// or skips this helper — still can't silently cross-wire tenants.
 pub fn join_sessions(links: &MeshLinks, keys: &[SessionKey]) -> Result<(), SessionIdCollision> {
     let mut roster = links.lock();
     let mut seen: HashMap<
