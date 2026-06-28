@@ -80,9 +80,10 @@ pub async fn run(
     server_config: quinn::ServerConfig,
     registry: Arc<Registry>,
     mesh_links: crate::mesh::MeshLinks,
+    seen_registries: crate::mesh::SeenRegistries,
 ) -> Result<(), ServerError> {
     let endpoint = quinn::Endpoint::server(server_config, listen)?;
-    serve(endpoint, registry, mesh_links).await;
+    serve(endpoint, registry, mesh_links, seen_registries).await;
     Ok(())
 }
 
@@ -91,14 +92,24 @@ pub async fn run(
 /// Split out from [`run`] so a caller that owns its endpoint — a test binding an
 /// ephemeral port, or a process wiring its own socket — can drive the accept loop
 /// directly. Uses the default in-flight handshake limit ([`MAX_PENDING_HANDSHAKES`]).
-/// `mesh_links` is the shared mesh-link registry; turns validated at the client
-/// edge are fanned out to both local slots and connected peer relays.
+/// `mesh_links` is the shared mesh-link registry; `seen_registries` is the
+/// per-session topological-dedup set. Turns validated at the client edge are
+/// marked in `seen_registries` (to catch mesh echoes) before fanning out to both
+/// local slots and connected peer relays.
 pub async fn serve(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
     mesh_links: crate::mesh::MeshLinks,
+    seen_registries: crate::mesh::SeenRegistries,
 ) {
-    serve_with_max_pending(endpoint, registry, mesh_links, MAX_PENDING_HANDSHAKES).await;
+    serve_with_max_pending(
+        endpoint,
+        registry,
+        mesh_links,
+        seen_registries,
+        MAX_PENDING_HANDSHAKES,
+    )
+    .await;
 }
 
 /// Serves the client edge with an explicit cap on concurrent in-flight
@@ -108,6 +119,7 @@ pub async fn serve_with_max_pending(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
     mesh_links: crate::mesh::MeshLinks,
+    seen_registries: crate::mesh::SeenRegistries,
     max_pending_handshakes: usize,
 ) {
     if let Ok(addr) = endpoint.local_addr() {
@@ -121,16 +133,23 @@ pub async fn serve_with_max_pending(
     let admission = Arc::new(Semaphore::new(max_pending_handshakes));
     while let Some(incoming) = endpoint.accept().await {
         let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
-            // Too many handshakes already in flight; shed this one without work.
             incoming.refuse();
             continue;
         };
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
         let mesh_links = Arc::clone(&mesh_links);
+        let seen_registries = Arc::clone(&seen_registries);
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_connection(incoming, &registry, sessions, mesh_links, permit).await
+            if let Err(error) = serve_connection(
+                incoming,
+                &registry,
+                sessions,
+                mesh_links,
+                seen_registries,
+                permit,
+            )
+            .await
             {
                 tracing::info!(%error, "client connection ended");
             }
@@ -145,12 +164,11 @@ async fn serve_connection(
     registry: &Registry,
     sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
+    seen_registries: crate::mesh::SeenRegistries,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
     let connection = incoming.await?;
 
-    // Bound the whole authorization handshake: a client that connects but then
-    // never opens its stream, or only half-sends, must not hold this task open.
     let handshake = auth::authenticate(&connection, registry, unix_now());
     let (authorized, mut handshake_send) = match tokio::time::timeout(AUTH_TIMEOUT, handshake).await
     {
@@ -164,8 +182,6 @@ async fn serve_connection(
         }
     };
 
-    // Authorized: release the admission slot so the cap bounds only pre-auth work,
-    // not the lifetime of established sessions. (Early returns above drop it too.)
     drop(handshake_permit);
 
     let key = SessionKey {
@@ -186,16 +202,12 @@ async fn serve_connection(
         });
     };
 
-    // Acknowledge only after the slot is routable, so a peer that sees this client
-    // authorized can already have its turns delivered here. If the client has
-    // already left, this write fails and `registration` frees the slot on drop.
     handshake_send
         .write_all(&[HANDSHAKE_OK])
         .await
         .map_err(AuthError::from)?;
     let _ = handshake_send.finish();
 
-    // The link task owns the slot's lifetime from here and deregisters on exit.
     registration.disarm();
 
     tracing::info!(
@@ -212,6 +224,7 @@ async fn serve_connection(
         inbox,
         sessions,
         mesh_links,
+        seen_registries,
     )
     .await;
     Ok(())

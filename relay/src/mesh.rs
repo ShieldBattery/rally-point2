@@ -103,10 +103,44 @@ impl MeshSeen {
     }
 }
 
+/// Per-session topological-dedup registries: each `SessionKey` → the `MeshSeen`
+/// for that session, shared across all slot links + mesh-link tasks so every
+/// ingress — local client or mesh peer — marks before forwarding to locals.
+///
+/// This is the guard against echo loops: a turn relay A fanned out to relay B
+/// comes back to A via the mesh, and without a shared `MeshSeen` A would deliver
+/// it to its local clients a second time — a duplicate turn into a lockstep slot,
+/// a desync. With the registry, A's `run_slot_link` marked the turn when it
+/// validated it, so the mesh echo is caught as `Duplicate` and dropped.
+pub type SeenRegistries = Arc<Mutex<HashMap<SessionKey, MeshSeen>>>;
+
+/// Creates an empty seen-registry for a relay with no sessions yet.
+pub fn new_seen_registries() -> SeenRegistries {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Marks `(slot, seq)` as forwarded for `key`'s session, returning whether it's
+/// new or a duplicate. Used by both `run_slot_link` (local-client ingress) and
+/// `run_mesh_link` (mesh-peer ingress) before fanning out to local clients.
+pub fn mark_seen(registries: &SeenRegistries, key: &SessionKey, slot: SlotId, seq: u64) -> Seen {
+    let mut roster = registries.lock().expect("seen registries lock poisoned");
+    roster
+        .entry(key.clone())
+        .or_default()
+        .mark_forwarded(slot, seq)
+}
+
+/// Removes a session's seen registry (the session has ended). Idempotent.
+pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
+    let mut roster = registries.lock().expect("seen registries lock poisoned");
+    roster.remove(key);
+}
+
 /// Live mesh links for every session on this relay: each `SessionKey` → the
 /// channels that reach each connected peer-relay's mesh-link task for that
 /// session. A turn fanned out to the mesh goes to every peer relay serving that
-/// session except the one it arrived from.
+/// session — including the one it arrived from, which is why the sender marks
+/// `MeshSeen` before forwarding to locals: the echo is caught and dropped there.
 ///
 /// Shared across all connection + mesh-link tasks. A plain (non-async) mutex is
 /// deliberate: every critical section is a short, await-free roster edit —

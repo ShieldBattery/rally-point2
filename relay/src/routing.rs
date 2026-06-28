@@ -297,6 +297,7 @@ pub async fn run_slot_link(
     inbox: SlotInbox,
     sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
+    seen_registries: crate::mesh::SeenRegistries,
 ) {
     let SlotInbox {
         mut forward_rx,
@@ -358,6 +359,23 @@ pub async fn run_slot_link(
                 for payload in received.fresh {
                     match validate_turn(slot, payload.seq, &payload.commands) {
                         Ok(turn) => {
+                            // Mark the origin's own turn in the session's
+                            // topological-dedup set before fanning out. The mesh
+                            // floods to all peers (no link-id exclusion), so the
+                            // turn echoes back via the mesh; without marking here,
+                            // the echo would be delivered to local clients a second
+                            // time — a duplicate turn into a lockstep slot, a desync.
+                            if crate::mesh::mark_seen(
+                                &seen_registries,
+                                &key,
+                                slot,
+                                turn.payload.seq,
+                            ) == crate::mesh::Seen::Duplicate
+                            {
+                                // Shouldn't happen for a fresh client turn, but
+                                // if it does, don't deliver a duplicate.
+                                continue;
+                            }
                             fan_out(&sessions, &key, slot, turn.payload.clone());
                             crate::mesh::fan_out_to_mesh(&mesh_links, &key, turn.payload);
                         }
