@@ -20,8 +20,8 @@
 //! increment carries tenant-binding via a preamble, with no auth token. Real relay
 //! auth lands with the coordinator (Phase 3).
 
-use std::collections::{BTreeSet, HashMap};
 use parking_lot::Mutex;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rally_point_proto::ids::SlotId;
@@ -362,21 +362,24 @@ pub async fn run_mesh_link(
     let mut joined: HashMap<rally_point_proto::ids::SessionId, SessionState> = HashMap::new();
     for key in keys {
         let session_id = key.session;
-        if let Some(existing) = joined.get(&session_id) {
-            if existing.key.tenant != key.tenant {
-                tracing::error!(
-                    session = session_id.0,
-                    existing_tenant = existing.key.tenant.as_ref(),
-                    new_tenant = key.tenant.as_ref(),
-                    "session id collision across tenants; refusing second tenant",
-                );
-                continue;
-            }
+        if let Some(existing) = joined.get(&session_id)
+            && existing.key.tenant != key.tenant
+        {
+            tracing::error!(
+                session = session_id.0,
+                existing_tenant = existing.key.tenant.as_ref(),
+                new_tenant = key.tenant.as_ref(),
+                "session id collision across tenants; refusing second tenant",
+            );
+            continue;
         }
         link.open_session(session_id);
         {
             let mut roster = mesh_links.lock();
-            roster.entry(key.clone()).or_default().push(forward_tx.clone());
+            roster
+                .entry(key.clone())
+                .or_default()
+                .push(forward_tx.clone());
         }
         joined.insert(
             session_id,
@@ -464,12 +467,12 @@ pub async fn run_mesh_link(
                     if state.flush_deadline > now {
                         continue;
                     }
-                    if link.payloads_in_flight(session_id) > 0 {
-                        if let Err(error) = link.send(session_id, None, None) {
-                            tracing::info!(%error, "mesh flush failed; closing link");
-                            failed = true;
-                            break;
-                        }
+                    if link.payloads_in_flight(session_id) > 0
+                        && let Err(error) = link.send(session_id, None, None)
+                    {
+                        tracing::info!(%error, "mesh flush failed; closing link");
+                        failed = true;
+                        break;
                     }
                     state.flush_deadline = now + routing::FLUSH_INTERVAL;
                 }
@@ -500,22 +503,21 @@ struct SessionState {
 /// Call before [`run_mesh_link`] with the full session list. This is the
 /// fail-closed gate; `run_mesh_link` also checks on its own setup loop, so a
 /// caller that omits this still can't silently cross-wire tenants.
-pub fn join_sessions(
-    links: &MeshLinks,
-    keys: &[SessionKey],
-) -> Result<(), SessionIdCollision> {
+pub fn join_sessions(links: &MeshLinks, keys: &[SessionKey]) -> Result<(), SessionIdCollision> {
     let mut roster = links.lock();
-    let mut seen: HashMap<rally_point_proto::ids::SessionId, &rally_point_proto::control::TenantId> =
-        HashMap::new();
+    let mut seen: HashMap<
+        rally_point_proto::ids::SessionId,
+        &rally_point_proto::control::TenantId,
+    > = HashMap::new();
     for key in keys {
-        if let Some(existing_tenant) = seen.get(&key.session) {
-            if **existing_tenant != key.tenant {
-                return Err(SessionIdCollision {
-                    session: key.session,
-                    existing_tenant: (*existing_tenant).clone(),
-                    new_tenant: key.tenant.clone(),
-                });
-            }
+        if let Some(existing_tenant) = seen.get(&key.session)
+            && **existing_tenant != key.tenant
+        {
+            return Err(SessionIdCollision {
+                session: key.session,
+                existing_tenant: (*existing_tenant).clone(),
+                new_tenant: key.tenant.clone(),
+            });
         }
         seen.insert(key.session, &key.tenant);
         roster.entry(key.clone()).or_default();
@@ -657,7 +659,7 @@ mod tests {
         };
 
         // Same tenant, same session id: not a collision (the game rejoins).
-        join_sessions(&links, &[key_a.clone()]).expect("same tenant is fine");
+        join_sessions(&links, std::slice::from_ref(&key_a)).expect("same tenant is fine");
 
         // Different tenant, same session id: collision — refuse.
         let err = join_sessions(&links, &[key_a.clone(), key_b]).unwrap_err();

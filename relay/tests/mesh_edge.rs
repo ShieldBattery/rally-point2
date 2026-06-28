@@ -304,3 +304,139 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
 
     Ok(())
 }
+
+/// `C-S===S-C` with two games on one relay-pair: a client in game 1 on relay A
+/// sends a turn; the client in game 1 on relay B receives it. The client in
+/// game 2 on relay B does *not* receive it — turns don't leak across sessions
+/// on the shared mesh connection. This is the load-bearing proof for the
+/// multi-session driver: one `MeshLink` dispatches to N per-session states, and
+/// the `SessionId -> SessionState` demux keeps the two games independent.
+#[tokio::test]
+async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+
+    // Two games, same tenant, different session ids.
+    let session_1 = SessionId(1);
+    let session_2 = SessionId(2);
+    let key_1 = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session: session_1,
+    };
+    let key_2 = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session: session_2,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+
+    // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    mesh_ep.set_default_client_config(mesh_cfg);
+    let conn_a = mesh_ep
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let conn_b = relay_b
+        .mesh_rx
+        .recv()
+        .await
+        .expect("B dispatched mesh conn");
+
+    let mesh_a = MeshLink::new(conn_a);
+    let mesh_b = MeshLink::new(conn_b);
+
+    // One mesh-link driver per relay, serving both sessions on the shared
+    // connection.
+    tokio::spawn(mesh::run_mesh_link(
+        mesh_a,
+        vec![key_1.clone(), key_2.clone()],
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+    ));
+    tokio::spawn(mesh::run_mesh_link(
+        mesh_b,
+        vec![key_1.clone(), key_2.clone()],
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+    ));
+
+    // Game 1: slot 0 on A, slot 1 on B.
+    let client_key_0 = keypair();
+    let token_0 = mint_token(&tenant, session_1, SlotId(0), client_key_0.public);
+    let mut roots_a = rustls::RootCertStore::empty();
+    roots_a.add(relay_a.ca.clone()).unwrap();
+    let client_cfg_a = client_config(roots_a).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut client_ep_a = quinn::Endpoint::client(bind).unwrap();
+    client_ep_a.set_default_client_config(client_cfg_a);
+    let conn_slot0 = client_ep_a
+        .connect(relay_a.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    handshake(&conn_slot0, &token_0, &client_key_0).await?;
+    let mut client_a_game1 = Link::new(conn_slot0);
+
+    let client_key_1 = keypair();
+    let token_1 = mint_token(&tenant, session_1, SlotId(1), client_key_1.public);
+    let mut roots_b1 = rustls::RootCertStore::empty();
+    roots_b1.add(relay_b.ca.clone()).unwrap();
+    let client_cfg_b1 = client_config(roots_b1).unwrap();
+    let mut client_ep_b1 = quinn::Endpoint::client(bind).unwrap();
+    client_ep_b1.set_default_client_config(client_cfg_b1);
+    let conn_slot1 = client_ep_b1
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    handshake(&conn_slot1, &token_1, &client_key_1).await?;
+    let mut client_b_game1 = Link::new(conn_slot1);
+
+    // Game 2: slot 0 on B (a different game with its own session id).
+    let client_key_2 = keypair();
+    let token_2 = mint_token(&tenant, session_2, SlotId(0), client_key_2.public);
+    let mut roots_b2 = rustls::RootCertStore::empty();
+    roots_b2.add(relay_b.ca.clone()).unwrap();
+    let client_cfg_b2 = client_config(roots_b2).unwrap();
+    let mut client_ep_b2 = quinn::Endpoint::client(bind).unwrap();
+    client_ep_b2.set_default_client_config(client_cfg_b2);
+    let conn_slot0_game2 = client_ep_b2
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    handshake(&conn_slot0_game2, &token_2, &client_key_2).await?;
+    let mut client_b_game2 = Link::new(conn_slot0_game2);
+
+    // Let mesh drivers open their sessions on the MeshLinks.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Client A in game 1 sends a turn.
+    client_a_game1.send(Some(turn(0, 0))).unwrap();
+
+    // Client B in game 1 receives exactly one copy via the mesh.
+    let received_b1 = tokio::time::timeout(Duration::from_secs(2), client_b_game1.recv())
+        .await
+        .expect("client B game 1 did not receive the turn within 2s")
+        .expect("client B game 1 link error");
+    assert_eq!(received_b1.fresh.len(), 1, "B game 1: exactly one payload");
+    assert_eq!(received_b1.fresh[0].slot, 0);
+    assert_eq!(received_b1.fresh[0].seq, 0);
+
+    // Client B in game 2 does NOT receive game 1's turn. The multi-session
+    // driver's SessionId demux keeps the two games independent on the shared
+    // mesh connection.
+    let leaked = tokio::time::timeout(Duration::from_millis(200), client_b_game2.recv()).await;
+    assert!(
+        leaked.is_err(),
+        "game 2 client must not receive game 1's turn — sessions are isolated"
+    );
+
+    Ok(())
+}
