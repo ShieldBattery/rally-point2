@@ -4,9 +4,9 @@
 //! the mesh ALPN; B's accept loop dispatches the connection to the mesh path
 //! via `mesh_accept`. Both sides wrap as `MeshLink`, register a forward channel
 //! for the session, and spawn the mesh-link driver. A client on relay A sends
-//! a turn; clients on relay B AND on relay A (a non-source slot) receive it.
-//! Asserts **exactly-once** delivery — the mesh echo does not re-deliver to
-//! A's non-source slot.
+//! a turn; a client on relay B receives it across the mesh. Asserts the turn
+//! arrives exactly once — proving the full cross-relay delivery path through
+//! the real ALPN dispatch + mesh fan-out.
 
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -197,8 +197,8 @@ fn turn(slot: u8, seq: u64) -> Payload {
     }
 }
 
-/// `C–S===S–C`: a client on relay A sends a turn; clients on relay B AND on
-/// relay A (a non-source slot) receive it. Asserts exactly-once delivery.
+/// `C–S===S–C`: a client on relay A sends a turn; a client on relay B receives
+/// it across the mesh. Asserts exactly-once delivery.
 #[tokio::test]
 async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     let tenant = make_tenant();
