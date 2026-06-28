@@ -79,47 +79,74 @@ pub async fn run(
     listen: SocketAddr,
     server_config: quinn::ServerConfig,
     registry: Arc<Registry>,
+    sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
     seen_registries: crate::mesh::SeenRegistries,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) -> Result<(), ServerError> {
     let endpoint = quinn::Endpoint::server(server_config, listen)?;
-    serve(endpoint, registry, mesh_links, seen_registries).await;
+    serve(
+        endpoint,
+        registry,
+        sessions,
+        mesh_links,
+        seen_registries,
+        mesh_accept,
+    )
+    .await;
     Ok(())
 }
 
 /// Serves the client edge on an already-bound endpoint.
 ///
-/// Split out from [`run`] so a caller that owns its endpoint — a test binding an
-/// ephemeral port, or a process wiring its own socket — can drive the accept loop
-/// directly. Uses the default in-flight handshake limit ([`MAX_PENDING_HANDSHAKES`]).
-/// `mesh_links` is the shared mesh-link registry; `seen_registries` is the
-/// per-session topological-dedup set. Turns validated at the client edge are
-/// marked in `seen_registries` (to catch mesh echoes) before fanning out to both
-/// local slots and connected peer relays.
+/// `sessions` is the shared session roster the caller creates upfront and passes
+/// to both the client edge and the mesh-link drivers, so a turn validated at the
+/// client edge and a turn arriving from a mesh peer share one roster and fan out
+/// to the same local slots. `mesh_accept` receives peer-relay connections
+/// dispatched by the ALPN check; pass `None` if the relay isn't meshed.
 pub async fn serve(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
+    sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
     seen_registries: crate::mesh::SeenRegistries,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) {
     serve_with_max_pending(
         endpoint,
         registry,
+        sessions,
         mesh_links,
         seen_registries,
+        mesh_accept,
         MAX_PENDING_HANDSHAKES,
     )
     .await;
 }
 
 /// Serves the client edge with an explicit cap on concurrent in-flight
-/// authorization handshakes. Connections accepted past the cap are refused at once,
-/// before any handshake work, so unauthenticated load stays bounded.
+/// authorization handshakes, plus ALPN-based dispatch for mesh connections.
+///
+/// The admission semaphore is acquired **before** the TLS handshake (not after),
+/// so the cap bounds in-flight handshakes including the TLS exchange itself —
+/// the original "refused before any handshake work" DoS posture. Each handshake
+/// runs in a spawned task so handshakes are concurrent, not serialized. After
+/// the handshake, the negotiated ALPN dispatches:
+///
+/// - `MESH_ALPN`: a peer relay. The admission permit is dropped (mesh peers
+///   skip the client-auth bound), and the connection is sent over
+///   `mesh_accept` to the mesh-link establishment task (or the test harness).
+///   If `mesh_accept` is `None`, the connection is closed — the relay isn't
+///   configured for mesh.
+/// - client `ALPN` (or unknown): the existing client-auth path, holding the
+///   permit through authorization.
 pub async fn serve_with_max_pending(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
+    sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
     seen_registries: crate::mesh::SeenRegistries,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
     max_pending_handshakes: usize,
 ) {
     if let Ok(addr) = endpoint.local_addr() {
@@ -129,9 +156,10 @@ pub async fn serve_with_max_pending(
         tracing::warn!("no tenant signing keys registered; all clients will be rejected");
     }
 
-    let sessions: Sessions = Arc::default();
     let admission = Arc::new(Semaphore::new(max_pending_handshakes));
     while let Some(incoming) = endpoint.accept().await {
+        // Acquire the admission slot BEFORE the handshake, so the cap bounds
+        // in-flight handshakes (including TLS), not just app-level auth.
         let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
             incoming.refuse();
             continue;
@@ -140,35 +168,66 @@ pub async fn serve_with_max_pending(
         let sessions = Arc::clone(&sessions);
         let mesh_links = Arc::clone(&mesh_links);
         let seen_registries = Arc::clone(&seen_registries);
+        let mesh_accept = mesh_accept.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(
-                incoming,
-                &registry,
-                sessions,
-                mesh_links,
-                seen_registries,
-                permit,
-            )
-            .await
-            {
-                tracing::info!(%error, "client connection ended");
+            // Complete the TLS handshake in a spawned task so handshakes run
+            // concurrently, not serialized in the accept loop.
+            let connection = match incoming.await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::info!(%error, "incoming connection handshake failed");
+                    return;
+                }
+            };
+
+            let alpn = connection
+                .handshake_data()
+                .and_then(|data| {
+                    data.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
+                        .and_then(|hd| hd.protocol.clone())
+                })
+                .unwrap_or_default();
+            if alpn.as_slice() == rally_point_transport::quic::MESH_ALPN {
+                // A peer relay. Mesh connections skip the auth bound — drop the
+                // permit so the admission slot frees for the next client.
+                drop(permit);
+                if let Some(tx) = mesh_accept {
+                    if tx.send(connection).await.is_err() {
+                        tracing::info!("mesh accept channel closed; dropping connection");
+                    }
+                } else {
+                    connection.close(VarInt::from_u32(0), b"mesh not configured");
+                }
+            } else {
+                // Client-edge connection — hold the permit through auth.
+                if let Err(error) = serve_connection(
+                    connection,
+                    &registry,
+                    sessions,
+                    mesh_links,
+                    seen_registries,
+                    permit,
+                )
+                .await
+                {
+                    tracing::info!(%error, "client connection ended");
+                }
             }
         });
     }
 }
-
-/// Authorizes one incoming connection, wires it into routing, and serves its turns
-/// until it closes.
+/// Authorizes one incoming client connection, wires it into routing, and serves
+/// its turns until it closes. The TLS handshake is already complete (the accept
+/// loop called `incoming.await` to inspect the ALPN); this runs the app-level
+/// authorization handshake on top.
 async fn serve_connection(
-    incoming: quinn::Incoming,
+    connection: quinn::Connection,
     registry: &Registry,
     sessions: Sessions,
     mesh_links: crate::mesh::MeshLinks,
     seen_registries: crate::mesh::SeenRegistries,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
-    let connection = incoming.await?;
-
     let handshake = auth::authenticate(&connection, registry, unix_now());
     let (authorized, mut handshake_send) = match tokio::time::timeout(AUTH_TIMEOUT, handshake).await
     {

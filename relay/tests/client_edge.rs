@@ -121,8 +121,10 @@ fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
     tokio::spawn(server::serve(
         endpoint,
         Arc::new(registry),
+        std::sync::Arc::default(),
         rally_point_relay::mesh::new_mesh_links(),
         rally_point_relay::mesh::new_seen_registries(),
+        None,
     ));
     (addr, ca)
 }
@@ -384,8 +386,10 @@ async fn refuses_connections_beyond_the_handshake_limit() {
     tokio::spawn(server::serve_with_max_pending(
         relay,
         Arc::new(registry_for(&[&tenant])),
+        std::sync::Arc::default(),
         rally_point_relay::mesh::new_mesh_links(),
         rally_point_relay::mesh::new_seen_registries(),
+        None,
         1,
     ));
 

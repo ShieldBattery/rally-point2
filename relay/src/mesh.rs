@@ -247,8 +247,8 @@ pub async fn run_mesh_link_session(
 
     // Open this session's transport state on the mesh link (both ends).
     link.open_session(rally_point_proto::ids::SessionId(key.session.0));
-    let mut flush_deadline = tokio::time::Instant::now() + routing::FLUSH_INTERVAL;
 
+    let mut flush_deadline = tokio::time::Instant::now() + routing::FLUSH_INTERVAL;
     loop {
         tokio::select! {
             received = link.recv() => {
@@ -269,8 +269,6 @@ pub async fn run_mesh_link_session(
                         }
                     }
                     Ok((_other, _)) => {
-                        // A datagram for a different session — this single-session
-                        // variant ignores it. A multi-session driver would dispatch.
                         continue;
                     }
                     Err(error) => {
