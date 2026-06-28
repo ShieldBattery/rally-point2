@@ -23,11 +23,12 @@ use std::sync::Arc;
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// ALPN protocol id negotiated on every netcode v2 QUIC connection. The trailing
-/// number is bumped on any change an older peer can't interoperate with — the
-/// datagram wire framing, the connection-binding handshake, or the connection's
-/// stream shape — so a peer on the old protocol is rejected at the TLS handshake
-/// rather than later, as a malformed datagram or a puzzling credential failure.
+/// ALPN protocol id negotiated on every client ↔ relay QUIC connection. The
+/// trailing number is bumped on any change an older peer can't interoperate
+/// with — the datagram wire framing, the connection-binding handshake, or the
+/// connection's stream shape — so a peer on the old protocol is rejected at the
+/// TLS handshake rather than later, as a malformed datagram or a puzzling
+/// credential failure.
 ///
 /// `4`: the payload `seq` is now the turn's origin identity — assigned by the
 /// sending client and preserved end-to-end, never restamped per hop — and each
@@ -44,7 +45,39 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// `2`: the connection-binding challenge is signed together with a TLS channel
 /// binding, not the nonce alone, so a `1` peer's proof no longer verifies and is
 /// deliberately not accepted — the old proof was replayable.
+///
+/// This is the client-edge ALPN. Mesh links use [`MESH_ALPN`] — a separate
+/// `rp2-mesh/N` namespace, not this `rp2/N` line — so a relay server advertises
+/// both and dispatches by which one negotiated, and the two can never collide
+/// even as each bumps independently. The two connection kinds carry distinct
+/// wire types (`Packet` vs `MeshPacket`), so the ALPN selects which one a
+/// connection may exchange. A client dialing with this ALPN can never produce a
+/// `MeshPacket` even by mistake: the type lives in a code path the client crate
+/// never touches.
 pub const ALPN: &[u8] = b"rp2/4";
+
+/// ALPN protocol id negotiated on every relay ↔ relay mesh QUIC connection. A
+/// relay-pair shares one connection across every game both relays jointly serve,
+/// so it is distinct from the client-edge [`ALPN`]: the connection carries
+/// `MeshPacket` datagrams (a `Packet` wrapped with the session it belongs to),
+/// not client-edge `Packet` datagrams.
+///
+/// Versions on a **separate line** from the client-edge [`ALPN`] (`rp2-mesh/N`,
+/// not `rp2/N`), because the server advertises both and dispatches by which one
+/// negotiated — so the two strings must stay distinct forever, even as each
+/// bumps independently. A shared `rp2/N` line would collide: a future
+/// client-edge-only bump (a handshake change the mesh's own establishment
+/// doesn't share, like the channel-binding change that took client to `rp2/2`)
+/// would push client to the same number mesh already occupies, the server would
+/// advertise two identical strings, and `protocol()` couldn't tell a client
+/// from a peer relay. The separate namespace makes that impossible.
+///
+/// `1`: introduces `MeshPacket` — one connection per relay-pair carries every
+/// jointly-served game's traffic, demultiplexed by a session id, so the mesh has
+/// one congestion controller per backbone path rather than N competing ones. A
+/// peer that doesn't know `MeshPacket` sends bare `Packet` datagrams that can't
+/// be demuxed by session — incompatible.
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/1";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -68,7 +101,10 @@ fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// Builds the relay-side QUIC server config from its certificate chain and
 /// private key. The relay presents this chain; clients verify it against their
-/// trusted roots (see [`client_config`]).
+/// trusted roots (see [`client_config`]). The server advertises both the
+/// client-edge [`ALPN`] and the mesh [`MESH_ALPN`], so a single listening
+/// endpoint accepts both connection kinds; the negotiated ALPN tells the accept
+/// loop which wire type (`Packet` or `MeshPacket`) the connection will carry.
 pub fn server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -77,20 +113,37 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = vec![ALPN.to_vec(), MESH_ALPN.to_vec()];
 
     let server = QuicServerConfig::try_from(tls)?;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(server)))
 }
 
-/// Builds the client-side QUIC config, trusting the given root certificates to
-/// authenticate the relay it dials.
+/// Builds the client-edge QUIC config, trusting the given root certificates to
+/// authenticate the relay it dials. Negotiates the client-edge [`ALPN`], so the
+/// connection carries `Packet` datagrams — never `MeshPacket`.
 pub fn client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig, TlsError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
+
+    let client = QuicClientConfig::try_from(tls)?;
+    Ok(quinn::ClientConfig::new(Arc::new(client)))
+}
+
+/// Builds the mesh-edge QUIC config a relay uses to dial a peer relay,
+/// trusting the given root certificates to authenticate it. Negotiates the mesh
+/// [`MESH_ALPN`], so the connection carries `MeshPacket` datagrams — never
+/// client-edge `Packet`. A mesh link is a relay ↔ relay connection distinct from
+/// the client ↔ relay edge; the ALPN keeps the two wire types from crossing.
+pub fn mesh_client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig, TlsError> {
+    let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![MESH_ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
     Ok(quinn::ClientConfig::new(Arc::new(client)))

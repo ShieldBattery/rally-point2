@@ -233,7 +233,7 @@ pub struct Received {
 
 /// The outcome of offering a received payload `(slot, seq)` to the dedup state.
 #[derive(Debug, PartialEq, Eq)]
-enum Delivery {
+pub(crate) enum Delivery {
     /// First time this `(slot, seq)` has been delivered — hand it to the caller.
     New,
     /// Already delivered (at/below the contiguous prefix, or seen out of order).
@@ -251,7 +251,13 @@ enum Delivery {
 /// is a duplicate only if it's within that slot's known-delivered state — never
 /// merely because a higher seq arrived first — so a redundant low seq is never
 /// mistaken for one that aged out.
-struct Dedup {
+///
+/// Shared by the client-edge [`Link`] and the mesh `MeshLink`: both own one
+/// instance per connection and feed it received payloads, so `(slot, seq)` is
+/// unambiguous within an instance. The client edge has one game per connection
+/// by nature; the mesh shares one connection across sessions but gives each its
+/// own instance, so the session never enters the key.
+pub(crate) struct Dedup {
     /// Per-slot dedup state.
     slots: HashMap<SlotId, SlotDedup>,
     /// The highest per-slot cursor force-retired via [`Link::retire_through`], so
@@ -274,11 +280,11 @@ struct SlotDedup {
 }
 
 impl Dedup {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_window(RECEIVE_WINDOW)
     }
 
-    fn with_window(window: u64) -> Self {
+    pub(crate) fn with_window(window: u64) -> Self {
         Self {
             slots: HashMap::new(),
             retired_through: HashMap::new(),
@@ -288,13 +294,13 @@ impl Dedup {
 
     /// The top of the contiguous delivered prefix for `slot`, or `None` before
     /// the slot's first payload arrives.
-    fn delivered_through(&self, slot: SlotId) -> Option<u64> {
+    pub(crate) fn delivered_through(&self, slot: SlotId) -> Option<u64> {
         self.slots.get(&slot).and_then(|s| s.delivered_through)
     }
 
     /// Records `(slot, seq)` as delivered and reports whether it's new, a
     /// duplicate, or out of the receive window.
-    fn accept(&mut self, slot: SlotId, seq: u64) -> Delivery {
+    pub(crate) fn accept(&mut self, slot: SlotId, seq: u64) -> Delivery {
         let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
             delivered_through: None,
             ahead: BTreeSet::new(),
@@ -325,7 +331,7 @@ impl Dedup {
     /// Advances the per-slot retired-through guard, returning whether the cursor
     /// was strictly greater than the last one applied for `slot` (so the caller
     /// should retire). A cursor not strictly advancing is a no-op.
-    fn advance_retired_through(&mut self, slot: SlotId, through_seq: u64) -> bool {
+    pub(crate) fn advance_retired_through(&mut self, slot: SlotId, through_seq: u64) -> bool {
         if matches!(self.retired_through.get(&slot), Some(prev) if *prev >= through_seq) {
             false
         } else {

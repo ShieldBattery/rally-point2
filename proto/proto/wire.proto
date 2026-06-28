@@ -33,6 +33,34 @@ message Packet {
   repeated Payload payloads = 4;
 }
 
+// One mesh datagram on a relay ↔ relay link. A relay-pair shares one QUIC
+// connection across every game both relays jointly serve, so each datagram
+// names the session it belongs to; the peer demuxes to that session's
+// per-session transport state (its own AckManager + Dedup). The per-link
+// transport runs unchanged per session — the origin `(slot, seq)` identity is
+// unambiguous within a session's instance, so no key grows to include the
+// session.
+//
+// Kept a distinct message from `Packet` (not an optional field on it) so the
+// client edge, which carries one game per connection by nature, has no
+// `session` field to set or mis-set: a client crate that never references
+// `MeshPacket` cannot produce one. Client ↔ relay datagrams are `Packet`;
+// relay ↔ relay datagrams are `MeshPacket`.
+message MeshPacket {
+  // The game this datagram belongs to, scoped within the tenant the mesh link
+  // authenticated for. A `0` is malformed and rejected by the reader (sessions
+  // are 1-indexed), so the field is effectively required despite proto3 having
+  // no `required` keyword. Carried as a `uint64` to match `SessionId` in the
+  // domain types (which the token also carries as a u64); varint encoding keeps
+  // a small session id the same width as a `uint32`, so there is no per-datagram
+  // cost in practice.
+  uint64 session = 1;
+
+  // The per-link transport packet for this session, unchanged from the
+  // client-edge framing. The mesh wraps it; it does not alter it.
+  Packet packet = 2;
+}
+
 // One command packet from one slot — a unit of the lockstep command stream,
 // mirroring Storm's native model (a per-peer sequence that ticks upward; a peer
 // missing a seq stops and waits for it, which our redundancy/ack accelerates).

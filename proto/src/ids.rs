@@ -28,3 +28,9 @@ pub struct SlotId(pub u8);
 /// Carried in the authorization token as a little-endian u64 (8 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u64);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
