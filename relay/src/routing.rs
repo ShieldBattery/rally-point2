@@ -27,14 +27,18 @@
 //! are stripped. A turn that fails validation is a misbehaving or hostile client,
 //! so its connection is closed. The fanned-out payload keeps its source slot — a
 //! client needs to know whose commands these are — and is handed to each peer's
-//! link, which stamps its own transport sequence as it goes out; the sequence the
-//! sender used is discarded at the seam.
+//! link. The payload's `(slot, seq)` origin identity — assigned once by the
+//! sending client — is preserved verbatim across this seam and every later hop;
+//! no relay restamps it. Each peer link stamps its own *packet* seq (a separate,
+//! per-link ack handle naming the datagram, not the turn); the payload `seq` it
+//! forwards is the sender's, untouched.
 //!
 //! Forwarding is immediate, never reordered here: a turn is fanned out the moment
 //! it validates, because a peer must have a turn in hand *before* it simulates that
 //! turn — buffering turns to wait for an earlier one and forward them in order would
-//! add exactly the latency the relay exists to avoid. The outbound transport seq a
-//! peer link stamps is only an ack handle, not a delivery order; putting each slot's
+//! add exactly the latency the relay exists to avoid. The *packet* seq a peer link
+//! stamps is only an ack handle (it names the datagram, not the turn); the payload's
+//! origin `seq` is a separate identity, preserved untouched. Putting each slot's
 //! turns back in order before the game runs them is the client's job. Loss is
 //! covered without an explicit resend delay: each outbound packet leads with the new
 //! turn and fills the rest of its budget with still-unacked ones, so a turn dropped

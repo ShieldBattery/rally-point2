@@ -37,12 +37,16 @@ message Packet {
 // mirroring Storm's native model (a per-peer sequence that ticks upward; a peer
 // missing a seq stops and waits for it, which our redundancy/ack accelerates).
 //
-// `seq`, not a game-frame number, is the dedup/retirement identity: Storm itself
-// keys on a seq, frames don't advance during a pause, lobby commands have no
-// frame at all, and a fan-out link muxes multiple slots.
+// `(slot, seq)`, not a game-frame number, is the dedup/retirement identity: each
+// slot carries its own monotonic seq space starting at 0 (two slots both have a
+// seq 0), so seq alone never identifies a turn. Storm itself keys on a per-peer
+// seq; frames don't advance during a pause; lobby commands have no frame at all;
+// and a fan-out link muxes multiple slots.
 message Payload {
-  // Monotonic per-link payload seq — the transport identity, independent of game
-  // state. Stays below 2^63 (the sequence buffer reserves the top bit).
+  // Monotonic per-slot origin seq — the turn's transport identity, assigned once
+  // by the sending client and preserved end-to-end across every hop (never
+  // restamped per link). Independent of game state. Stays below 2^63 (the sequence
+  // buffer reserves the top bit).
   uint64 seq = 1;
 
   // The slot these commands belong to. The relay binds it to the sender's token
