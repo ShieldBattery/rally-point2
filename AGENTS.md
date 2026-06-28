@@ -6,12 +6,28 @@ multi-tenant coordinator. It replaces the Node.js `rally-point`.
 
 ## Where the design lives
 
-The authoritative design — sequenced phases plus the load-bearing decisions
-`D1`–`D11` — is `../shieldbattery/netcode-v2-build-plan.md`; the game-seam detail
-is `../shieldbattery/scr-netcode-replacement-guide.md`. If code and those docs
-disagree, the docs win unless you're deliberately changing a decision (then update
-the plan in the same change). SC:R glue and UI live in `../shieldbattery/`
-(`game/`, `server/`, `app/`), not here.
+Three design references, in two repos:
+
+- **`../shieldbattery/netcode-v2-build-plan.md`** — the authoritative design:
+  sequenced phases plus the load-bearing decisions `D1`–`D11`. If code and the
+  plan disagree, the plan wins unless you're deliberately changing a decision
+  (then update the plan in the same change).
+- **`../shieldbattery/scr-netcode-replacement-guide.md`** — the game-seam detail:
+  where the netcode v2 hooks attach to StarCraft's turn/command layer.
+- **[`docs/architecture.md`](docs/architecture.md)** — the in-repo architecture
+  overview: how and *why* the data plane is shaped the way it is. Read it before
+  "fixing" the transport — the choices that read as bugs to a standard-protocol
+  eye (out-of-order delivery, no relay-side reordering, ack-only handling, no
+  retransmit-on-timeout) are the whole point.
+
+Both shieldbattery design docs are **working references kept untracked** in that
+repo — never `git add` or commit them there. They are not artifacts of the
+shieldbattery repo; they belong to this effort. Edit them freely in the working
+tree, but leave them uncommitted (`??` in `git status`). `docs/architecture.md`
+is tracked here and committed normally.
+
+SC:R glue and UI live in `../shieldbattery/` (`game/`, `server/`, `app/`), not
+here.
 
 ## Crates
 
