@@ -118,7 +118,11 @@ fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
-    tokio::spawn(server::serve(endpoint, Arc::new(registry)));
+    tokio::spawn(server::serve(
+        endpoint,
+        Arc::new(registry),
+        rally_point_relay::mesh::new_mesh_links(),
+    ));
     (addr, ca)
 }
 
@@ -379,6 +383,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
     tokio::spawn(server::serve_with_max_pending(
         relay,
         Arc::new(registry_for(&[&tenant])),
+        rally_point_relay::mesh::new_mesh_links(),
         1,
     ));
 

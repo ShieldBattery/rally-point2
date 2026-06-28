@@ -98,7 +98,11 @@ fn start_relay_on(bind: SocketAddr, registry: Registry) -> (SocketAddr, Certific
     let server_cfg = server_config(chain, key).unwrap();
     let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
-    tokio::spawn(server::serve(endpoint, Arc::new(registry)));
+    tokio::spawn(server::serve(
+        endpoint,
+        Arc::new(registry),
+        rally_point_relay::mesh::new_mesh_links(),
+    ));
     (addr, ca)
 }
 

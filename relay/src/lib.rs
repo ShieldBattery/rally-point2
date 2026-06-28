@@ -26,11 +26,11 @@
 //! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
+pub mod mesh;
 pub mod routing;
 pub mod server;
 pub mod validation;
 
-// TODO: pub mod mesh;             // one conn per relay-pair
 // TODO: pub mod consensus;        // keyed on game_frame_count
 // TODO: pub mod turn_log;         // replicated, bounded + flushed
 // TODO: pub mod flight_recorder;  // tenant/session/slot/turn

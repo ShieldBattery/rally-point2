@@ -68,8 +68,9 @@ use crate::validation::validate_turn;
 /// How many outbound payloads may queue for one slot before fan-out to it applies
 /// backpressure. Turns are small and drained promptly; a slot this far behind is
 /// effectively a dead client. A real capacity/backpressure model is future work,
-/// so this is deliberately generous rather than tuned.
-const FORWARD_CAPACITY: usize = 1024;
+/// so this is deliberately generous rather than tuned. Shared by the client-edge
+/// slot link and the mesh-link task (same turn-magnitude, same drain cadence).
+pub(crate) const FORWARD_CAPACITY: usize = 1024;
 
 /// QUIC application close code for a connection dropped because its client sent a
 /// turn that failed validation.
@@ -295,6 +296,7 @@ pub async fn run_slot_link(
     slot: SlotId,
     inbox: SlotInbox,
     sessions: Sessions,
+    mesh_links: crate::mesh::MeshLinks,
 ) {
     let SlotInbox {
         mut forward_rx,
@@ -355,7 +357,10 @@ pub async fn run_slot_link(
                 }
                 for payload in received.fresh {
                     match validate_turn(slot, payload.seq, &payload.commands) {
-                        Ok(turn) => fan_out(&sessions, &key, slot, turn.payload),
+                        Ok(turn) => {
+                            fan_out(&sessions, &key, slot, turn.payload.clone());
+                            crate::mesh::fan_out_to_mesh(&mesh_links, &key, turn.payload);
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 tenant = key.tenant.as_ref(),

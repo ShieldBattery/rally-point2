@@ -79,9 +79,10 @@ pub async fn run(
     listen: SocketAddr,
     server_config: quinn::ServerConfig,
     registry: Arc<Registry>,
+    mesh_links: crate::mesh::MeshLinks,
 ) -> Result<(), ServerError> {
     let endpoint = quinn::Endpoint::server(server_config, listen)?;
-    serve(endpoint, registry).await;
+    serve(endpoint, registry, mesh_links).await;
     Ok(())
 }
 
@@ -90,8 +91,14 @@ pub async fn run(
 /// Split out from [`run`] so a caller that owns its endpoint — a test binding an
 /// ephemeral port, or a process wiring its own socket — can drive the accept loop
 /// directly. Uses the default in-flight handshake limit ([`MAX_PENDING_HANDSHAKES`]).
-pub async fn serve(endpoint: quinn::Endpoint, registry: Arc<Registry>) {
-    serve_with_max_pending(endpoint, registry, MAX_PENDING_HANDSHAKES).await;
+/// `mesh_links` is the shared mesh-link registry; turns validated at the client
+/// edge are fanned out to both local slots and connected peer relays.
+pub async fn serve(
+    endpoint: quinn::Endpoint,
+    registry: Arc<Registry>,
+    mesh_links: crate::mesh::MeshLinks,
+) {
+    serve_with_max_pending(endpoint, registry, mesh_links, MAX_PENDING_HANDSHAKES).await;
 }
 
 /// Serves the client edge with an explicit cap on concurrent in-flight
@@ -100,6 +107,7 @@ pub async fn serve(endpoint: quinn::Endpoint, registry: Arc<Registry>) {
 pub async fn serve_with_max_pending(
     endpoint: quinn::Endpoint,
     registry: Arc<Registry>,
+    mesh_links: crate::mesh::MeshLinks,
     max_pending_handshakes: usize,
 ) {
     if let Ok(addr) = endpoint.local_addr() {
@@ -119,8 +127,11 @@ pub async fn serve_with_max_pending(
         };
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
+        let mesh_links = Arc::clone(&mesh_links);
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(incoming, &registry, sessions, permit).await {
+            if let Err(error) =
+                serve_connection(incoming, &registry, sessions, mesh_links, permit).await
+            {
                 tracing::info!(%error, "client connection ended");
             }
         });
@@ -133,6 +144,7 @@ async fn serve_connection(
     incoming: quinn::Incoming,
     registry: &Registry,
     sessions: Sessions,
+    mesh_links: crate::mesh::MeshLinks,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
     let connection = incoming.await?;
@@ -193,7 +205,15 @@ async fn serve_connection(
         "client authorized",
     );
 
-    routing::run_slot_link(Link::new(connection), key, authorized.slot, inbox, sessions).await;
+    routing::run_slot_link(
+        Link::new(connection),
+        key,
+        authorized.slot,
+        inbox,
+        sessions,
+        mesh_links,
+    )
+    .await;
     Ok(())
 }
 
