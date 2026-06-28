@@ -22,8 +22,9 @@ ring = { workspace = true }
 # Builds the dual-stack UDP socket the default client endpoint dials relays from.
 socket2 = { workspace = true }
 thiserror = { workspace = true }
-# Bounds the dial with a deadline so a stalled relay can't hang the launch path.
-# The game DLL already drives this crate's futures on a tokio runtime.
+# Bounds the dial with a deadline so a stalled relay can't hang the launch path,
+# and drives the turn-carrying link loop (select over send/recv/ack-flush). The
+# game DLL already drives this crate's futures on a tokio runtime.
 tokio = { workspace = true }
 
 [dev-dependencies]
@@ -31,3 +32,5 @@ tokio = { workspace = true }
 rally-point-relay = { workspace = true }
 # Self-signed relay cert for the loopback test (dev-only; uses ring, not aws-lc-rs).
 rcgen = { workspace = true }
+# Hand-builds out-of-order wire packets to test the driver's in-order delivery.
+prost = { workspace = true }

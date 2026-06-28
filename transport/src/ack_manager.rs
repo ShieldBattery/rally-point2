@@ -178,6 +178,10 @@ impl AckManager {
 
         // Refill with still-unacked payloads, oldest first, while they fit. The
         // fresh payload isn't in `unacked_payloads` yet, so it can't double up.
+        // Oldest-first favors the turns whose loss would stall a peer soonest. When
+        // a near-MTU stream keeps the budget full for a long run this under-covers
+        // the newer unacked turns; spreading coverage by `send_count` (re-sending
+        // the least-sent ones) is a future refinement, which is why it is tracked.
         for sent in self.unacked_payloads.values_mut() {
             let element = payload_element_len(sent.encoded_len);
             if used + element > max_packet_len {

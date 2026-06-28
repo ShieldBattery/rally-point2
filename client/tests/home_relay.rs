@@ -165,7 +165,7 @@ async fn two_clients_exchange_a_turn_through_the_relay() {
 
     let mut delivered = Vec::new();
     while delivered.is_empty() {
-        delivered = slot1.recv().await.unwrap();
+        delivered = slot1.recv().await.unwrap().fresh;
     }
 
     assert_eq!(delivered.len(), 1);

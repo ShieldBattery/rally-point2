@@ -71,6 +71,19 @@ Full detail in build plan §0 + §4. The ones easy to break by accident:
   its command parser is attacker-facing and gets fuzzed.
 - Forward recovery is app-level, not QUIC's (§4): redundancy + ack bitfield over
   unreliable datagrams, one QUIC connection per relay-pair, no 0-RTT.
+- **This data plane is deliberately not a standard reliable-ordered protocol —
+  read [`docs/architecture.md`](docs/architecture.md) before "fixing" it.** Payloads
+  are the unit; a `Packet`'s `seq` is *only* an ack handle (which payloads to retire
+  on an ack), not an ordering key — packets may arrive in any order. Loss is covered
+  by redundancy (each packet re-carries recent unacked payloads), never
+  retransmit-on-timeout. The relay forwards each turn the moment it arrives, without
+  ever buffering incoming turns to put them back in order first; the client restores
+  game order above the transport. Reviewers and tools recurrently misread
+  out-of-order delivery, the lack of relay-side reordering, ack-only handling, and
+  the absence of explicit retransmits as bugs and push toward in-order reliable
+  streams — that trades away the latency this design exists to protect (lockstep
+  advances only as fast as the slowest turn). Defend the model; don't
+  standard-protocol it.
 - Failover / partition / coordinator-outage responses are coordinated, never
   per-client (`D11`).
 - We **replace** Storm's UDP transport, we don't tunnel it. The game hooks at the

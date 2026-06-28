@@ -51,6 +51,12 @@ pub enum LinkError {
     /// A datagram could not be queued for sending.
     #[error("sending datagram failed: {0}")]
     Send(#[from] quinn::SendDatagramError),
+    /// A datagram did not fit the path's current budget, so it was refused. With the
+    /// tiny turns of a lockstep game this should never happen; it is surfaced (rather
+    /// than retried forever) so the caller fails fast — an undeliverable turn can't
+    /// simply be dropped.
+    #[error("datagram of {needed} bytes exceeds the {budget}-byte path budget")]
+    PayloadTooLarge { needed: usize, budget: usize },
     /// A received datagram was not a well-formed packet.
     #[error("decoding incoming packet failed: {0}")]
     Decode(#[from] prost::DecodeError),
@@ -94,36 +100,61 @@ impl Link {
     }
 
     /// Builds the next packet — `payload` plus redundant unacked ones, or
-    /// ack-only when `payload` is `None` — and sends it as one QUIC datagram.
+    /// ack-only when `payload` is `None` — sends it as one QUIC datagram, and
+    /// returns how many still-unacked turns it re-carried as redundancy (the fresh
+    /// turn, if any, is not counted).
+    ///
+    /// That count lets a caller tell whether retransmission is already riding the
+    /// outbound stream (redundancy carried) or whether it must schedule a standalone
+    /// flush — a near-MTU turn fills the datagram and re-carries nothing.
     ///
     /// The bundle is sized to the connection's live `max_datagram_size()`, so it
-    /// tracks path-MTU changes. A failed send still leaves the payload tracked as
-    /// unacked, so the next packet simply re-carries it.
-    pub fn send(&mut self, payload: Option<Payload>) -> Result<(), LinkError> {
+    /// tracks path-MTU changes. A datagram that does not fit the path is surfaced as
+    /// [`PayloadTooLarge`](LinkError::PayloadTooLarge) — with the tiny turns of a
+    /// lockstep game this should never happen, but it is reported (not retried
+    /// forever) so the caller fails fast instead of silently stalling the stream.
+    pub fn send(&mut self, payload: Option<Payload>) -> Result<usize, LinkError> {
         let budget = self
             .connection
             .max_datagram_size()
             .ok_or(LinkError::DatagramsUnsupported)?;
+        let had_fresh = payload.is_some();
+
         let packet = self.acks.build_outgoing(payload, budget);
-        self.connection
-            .send_datagram(packet.encode_to_vec().into())?;
-        Ok(())
+        // Everything in the packet except the fresh turn is a redundant re-carry.
+        let redundant = packet.payloads.len() - usize::from(had_fresh);
+        let encoded = packet.encode_to_vec();
+        let datagram_len = encoded.len();
+        match self.connection.send_datagram(encoded.into()) {
+            Ok(()) => Ok(redundant),
+            Err(quinn::SendDatagramError::TooLarge) => Err(LinkError::PayloadTooLarge {
+                needed: datagram_len,
+                budget,
+            }),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    /// Awaits the next datagram, folds its acks into the manager, and returns the
-    /// payloads not delivered before (redundant copies dropped), in ascending
-    /// seq order.
-    pub async fn recv(&mut self) -> Result<Vec<Payload>, LinkError> {
+    /// Awaits the next datagram, folds its acks into the manager, and returns what
+    /// it delivered: the payloads not seen before (redundant copies dropped, in
+    /// ascending seq order) plus whether the packet carried any payloads at all.
+    pub async fn recv(&mut self) -> Result<Received, LinkError> {
         let datagram = self.connection.read_datagram().await?;
         let packet = Packet::decode(datagram)?;
         self.process_incoming(packet)
     }
 
-    /// Folds a decoded packet's acks into the manager and returns its
-    /// not-yet-delivered payloads. Split out from [`recv`](Link::recv) so the
-    /// dedup is exercised without a live connection.
-    fn process_incoming(&mut self, mut packet: Packet) -> Result<Vec<Payload>, LinkError> {
+    /// Folds a decoded packet's acks into the manager and returns its delivery.
+    /// Split out from [`recv`](Link::recv) so the dedup is exercised without a live
+    /// connection.
+    fn process_incoming(&mut self, mut packet: Packet) -> Result<Received, LinkError> {
         self.acks.handle_incoming(&packet)?;
+
+        // Whether the peer is waiting on an ack for delivered turns: a packet that
+        // carried payloads (even all-redundant ones) needs an ack back so the peer
+        // can retire them, while an ack-only packet does not — acking it would only
+        // provoke another ack-only packet in return, forever.
+        let carried_payloads = !packet.payloads.is_empty();
 
         // Process payloads low-seq first. A packet leads with its fresh (highest)
         // seq, so without this a deep-loss packet's high seq could shut the window
@@ -140,8 +171,24 @@ impl Link {
                 }
             }
         }
-        Ok(fresh)
+        Ok(Received {
+            fresh,
+            carried_payloads,
+        })
     }
+}
+
+/// What one [`recv`](Link::recv) delivered.
+#[derive(Debug)]
+pub struct Received {
+    /// Payloads delivered for the first time, ascending by seq; redundant copies of
+    /// already-delivered payloads are dropped.
+    pub fresh: Vec<Payload>,
+    /// Whether the packet carried any payload elements (new or redundant). An
+    /// ack-only packet carried none, and the peer is not waiting for it to be acked —
+    /// so the receiver must not schedule an ack in return, or two idle links would
+    /// ack each other's acks forever.
+    pub carried_payloads: bool,
 }
 
 /// The outcome of offering a received payload seq to the dedup state.
@@ -323,7 +370,7 @@ mod tests {
         // returned exactly once, in order, with its bytes intact.
         let mut delivered = Vec::new();
         while delivered.len() < 5 {
-            delivered.extend(server.recv().await.unwrap());
+            delivered.extend(server.recv().await.unwrap().fresh);
         }
         let seqs: Vec<u64> = delivered.iter().map(|p| p.seq).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
@@ -364,7 +411,7 @@ mod tests {
             .send_datagram(packet.encode_to_vec().into())
             .unwrap();
 
-        let delivered = server.recv().await.unwrap();
+        let delivered = server.recv().await.unwrap().fresh;
         let seqs: Vec<u64> = delivered.iter().map(|p| p.seq).collect();
         assert_eq!(seqs, vec![0, RECEIVE_WINDOW]);
     }
@@ -393,6 +440,35 @@ mod tests {
         match server.recv().await {
             Err(LinkError::PayloadOutOfWindow { seq }) => assert_eq!(seq, u64::MAX),
             other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_a_turn_too_large_for_a_datagram() {
+        let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
+
+        let budget = client
+            .connection()
+            .max_datagram_size()
+            .expect("loopback supports datagrams");
+
+        // A turn whose own bytes dwarf the datagram budget can ride no datagram, so
+        // send surfaces it as an error rather than silently stalling. With the tiny
+        // turns of a lockstep game this never happens.
+        let oversize = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; budget + 1].into(),
+        };
+        match client.send(Some(oversize)) {
+            Err(LinkError::PayloadTooLarge {
+                needed,
+                budget: reported,
+            }) => {
+                assert_eq!(reported, budget);
+                assert!(needed > budget);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
 }

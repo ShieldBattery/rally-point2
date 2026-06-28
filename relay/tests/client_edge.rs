@@ -220,7 +220,7 @@ async fn fans_a_validated_turn_to_the_other_slot() {
 
     let mut delivered = Vec::new();
     while delivered.is_empty() {
-        delivered = slot1.recv().await.unwrap();
+        delivered = slot1.recv().await.unwrap().fresh;
     }
 
     assert_eq!(delivered.len(), 1);
@@ -354,7 +354,7 @@ async fn isolates_identical_session_ids_across_tenants() {
     // It reaches tenant A's other slot.
     let mut delivered = Vec::new();
     while delivered.is_empty() {
-        delivered = a1.recv().await.unwrap();
+        delivered = a1.recv().await.unwrap().fresh;
     }
     assert_eq!(delivered[0].slot, 0);
     assert_eq!(&delivered[0].commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);

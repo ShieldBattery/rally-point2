@@ -13,10 +13,13 @@
 //! The relay carries its acks for a client on the packets it sends back, which are
 //! normally the other slots' forwarded turns. A client with no return traffic — a
 //! lone slot, a quiet session, a one-way sender — would otherwise never see an ack
-//! and re-send its turns forever, so when a link has gone a short idle stretch with
-//! no turn to forward back, it flushes an ack-only packet instead. The idle timer
-//! resets on every packet sent, so a normal two-way game — where a forwarded turn
-//! carries the acks each turn — keeps pushing it out and never reaches it.
+//! and re-send its turns forever, so a maintenance flush sends an ack-only packet
+//! whenever a forwarded turn is still unacked or acks are owed. That same packet
+//! re-carries unacked turns oldest-first, which retransmits a forwarded turn whose
+//! fresh packets were too full to re-carry it (a near-MTU stream). Its timer is reset
+//! by any forwarded turn that does re-carry redundancy, so a normal two-way game
+//! never triggers an extra packet; it fires only when the forward stream stops
+//! covering the unacked turns or goes idle, and stays silent when nothing is unacked.
 //!
 //! On a received turn the owning task runs it through [`validate_turn`]: the slot
 //! is rebound to the one the client is authorized for (never the slot on the
@@ -26,6 +29,16 @@
 //! client needs to know whose commands these are — and is handed to each peer's
 //! link, which stamps its own transport sequence as it goes out; the sequence the
 //! sender used is discarded at the seam.
+//!
+//! Forwarding is immediate, never reordered here: a turn is fanned out the moment
+//! it validates, because a peer must have a turn in hand *before* it simulates that
+//! turn — buffering turns to wait for an earlier one and forward them in order would
+//! add exactly the latency the relay exists to avoid. The outbound transport seq a
+//! peer link stamps is only an ack handle, not a delivery order; putting each slot's
+//! turns back in order before the game runs them is the client's job. Loss is
+//! covered without an explicit resend delay: each outbound packet leads with the new
+//! turn and fills the rest of its budget with still-unacked ones, so a turn dropped
+//! on one packet rides a later one.
 //!
 //! Each routing group's roster is scoped by tenant *and* session: session ids are
 //! only unique within a tenant, so two tenants can be assigned the same number and
@@ -62,14 +75,20 @@ const INVALID_TURN_CLOSE: u32 = 0x01;
 /// back-pressure healthy peers.
 const ISOLATED_CLOSE: u32 = 0x04;
 
-/// How long a link will go without sending before it flushes an ack-only packet to
-/// carry acks it owes. The deadline resets on every packet sent, so in a normal
-/// two-way game the forwarded turns — one per turn, ~40ms apart — keep pushing it
-/// out and it never fires; it triggers only when a client gets no turns back for
-/// this long (a lone slot, a quiet session, a stalled peer). Set to roughly three
-/// to four turns at the 24-per-second turn rate: clear of ordinary jitter, while
-/// keeping a one-way sender's unacked backlog to a few small turns.
-const IDLE_ACK_DELAY: Duration = Duration::from_millis(150);
+/// How often a link flushes a maintenance packet when the forward stream is not
+/// already re-carrying unacked turns.
+///
+/// The timer is reset whenever a forwarded turn re-carries unacked turns as
+/// redundancy — the common case, where recovery rides the forward stream and the
+/// flush never fires, so it costs no extra packets. It is *not* reset by a forward
+/// that carried no redundancy (a near-MTU turn that filled the datagram) or by an
+/// idle stretch; in those cases it fires and sends an ack-only packet that re-carries
+/// unacked turns oldest-first and folds in owed acks, so a client with no turns
+/// coming back (a lone slot, a quiet session, a stalled peer) still retires what it
+/// sent. It stays silent when nothing is unacked and no acks are owed. Set to a few
+/// turns at the 24-per-second turn rate: clear of ordinary jitter, while keeping
+/// retransmit latency and a one-way sender's backlog low.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
@@ -267,25 +286,31 @@ pub async fn run_slot_link(
 
     // Whether we've received from this client since we last sent it a packet. Every
     // packet we send folds in the latest acks, so a forwarded turn clears this too,
-    // and a standalone ack-only flush is only needed when no forward has.
+    // and the flush only needs to carry acks when no forward has.
     let mut acks_owed = false;
-    // When to flush an ack-only packet if nothing has been sent by then. Reset on
-    // every send — never on receive — so steady forwarded traffic keeps pushing it
-    // out, while a client that only sends still gets acked on this cadence.
-    let mut ack_deadline = Instant::now() + IDLE_ACK_DELAY;
+    // The next maintenance flush. Pushed out whenever a forwarded turn re-carries
+    // unacked turns (recovery is riding the forward stream, so no flush is due); left
+    // to fire when a forward carries no redundancy or the link is idle, so a turn the
+    // fresh packets can't re-carry is still retransmitted.
+    let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
 
     'serve: loop {
         tokio::select! {
             received = link.recv() => {
-                let payloads = match received {
-                    Ok(payloads) => payloads,
+                let received = match received {
+                    Ok(received) => received,
                     Err(error) => {
                         log_link_closed(&key, slot, &error);
                         break 'serve;
                     }
                 };
-                acks_owed = true;
-                for payload in payloads {
+                // Only a payload-bearing packet needs an ack in return; owing one for
+                // a client's ack-only packet would bounce ack-only packets back and
+                // forth on an idle link.
+                if received.carried_payloads {
+                    acks_owed = true;
+                }
+                for payload in received.fresh {
                     match validate_turn(slot, &payload.commands) {
                         Ok(turn) => fan_out(&sessions, &key, slot, turn.payload),
                         Err(error) => {
@@ -305,30 +330,42 @@ pub async fn run_slot_link(
             }
             forwarded = forward_rx.recv() => {
                 match forwarded {
-                    Some(payload) => {
-                        if let Err(error) = link.send(Some(payload)) {
+                    // The forwarded turn went out carrying our acks. If it also
+                    // re-carried unacked turns, recovery is riding the stream, so push
+                    // the flush out; if it carried none (a near-MTU turn), leave the
+                    // timer so the flush retransmits them.
+                    Some(payload) => match send_packet(&mut link, Some(payload)) {
+                        Ok(carried_redundancy) => {
+                            acks_owed = false;
+                            if carried_redundancy {
+                                flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                            }
+                        }
+                        Err(error) => {
                             log_link_closed(&key, slot, &error);
                             break 'serve;
                         }
-                        acks_owed = false;
-                        ack_deadline = Instant::now() + IDLE_ACK_DELAY;
-                    }
+                    },
                     // The roster dropped our sender: we've been deregistered.
                     None => break 'serve,
                 }
             }
-            _ = sleep_until(ack_deadline) => {
-                // A full idle stretch with no turn to forward back. If we owe acks,
-                // carry them on an ack-only packet so a client with no return traffic
-                // still retires the turns it has sent us.
-                if acks_owed {
-                    if let Err(error) = link.send(None) {
+            _ = sleep_until(flush_deadline) => {
+                // The fixed-cadence maintenance flush. When a forwarded turn is
+                // unacked or we owe acks, send an ack-only packet: it re-carries
+                // unacked turns oldest-first (its full budget has room the near-MTU
+                // forwarded packets did not) and folds in any acks owed. This is what
+                // retransmits a forwarded turn the fresh stream can't re-carry, and
+                // what acks a client with no return traffic; it stays silent when
+                // nothing is unacked and nothing is owed.
+                if acks_owed || link.payloads_in_flight() > 0 {
+                    if let Err(error) = send_packet(&mut link, None) {
                         log_link_closed(&key, slot, &error);
                         break 'serve;
                     }
                     acks_owed = false;
                 }
-                ack_deadline = Instant::now() + IDLE_ACK_DELAY;
+                flush_deadline = Instant::now() + FLUSH_INTERVAL;
             }
             _ = shutdown.notified() => {
                 // The relay is isolating this slot: it fell hopelessly behind and was
@@ -348,6 +385,16 @@ pub async fn run_slot_link(
     }
 
     deregister(&sessions, &key, slot);
+}
+
+/// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
+/// retransmission is already riding the forward stream and the flush can rest.
+///
+/// A turn too large to fit the client's path (which tiny lockstep turns never
+/// produce) and a real link failure are both returned as an error for the caller to
+/// close the connection on.
+fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<bool, LinkError> {
+    link.send(payload).map(|redundant| redundant > 0)
 }
 
 /// Logs a link ending for ordinary reasons (peer closed, transport error) at a

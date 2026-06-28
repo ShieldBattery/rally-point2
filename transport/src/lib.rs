@@ -14,6 +14,21 @@
 //! receipt (and would ack packets, not our redundantly-packed payloads), so the
 //! payload-level ack/redundancy is genuinely ours to own.
 //!
+//! This is **not** a standard reliable-ordered protocol, and it is easy to misread
+//! as one. A `Packet`'s seq is only an ack handle — it names which payloads a packet
+//! carried so an ack can retire them — and orders nothing;
+//! packets may arrive in any order. Loss is recovered by *redundancy*, never by
+//! waiting a round-trip to notice a gap and retransmit: the next packet already
+//! re-carries the unacked payloads. And nothing here reassembles a globally-ordered
+//! stream — each [`recv`](link::Link::recv) returns one packet's new payloads,
+//! dedup'd, in their own seq order, but successive calls follow arrival; putting
+//! turns back in game order is the job of the layer above (the client, before the
+//! game runs them). These are deliberate. The game is lockstep, where every player
+//! advances only as fast as the slowest turn, so the head-of-line blocking and
+//! retransmit-timeout latency a reliable-ordered stream would add are exactly what
+//! must be avoided — and turns are tiny, so paying redundancy bandwidth to never pay
+//! that latency is the trade.
+//!
 //! The redundancy/ack logic is ported from the proven implementation in
 //! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
 //! verbatim, while [`ack_manager`] is *re-derived* for our message shapes. It
@@ -31,7 +46,7 @@ pub mod quic;
 pub mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager};
-pub use link::{Link, LinkError};
+pub use link::{Link, LinkError, Received};
 
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.

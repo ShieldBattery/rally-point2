@@ -983,6 +983,7 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 name = "rally-point-client"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "rally-point-proto",
  "rally-point-relay",
  "rally-point-transport",
