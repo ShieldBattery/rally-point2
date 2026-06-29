@@ -447,6 +447,7 @@ mod tests {
         Payload {
             seq,
             slot: u32::from(slot),
+            game_frame_count: None,
             commands: vec![byte].into(),
         }
     }
@@ -475,6 +476,40 @@ mod tests {
         server.send(None).unwrap();
         client.recv().await.unwrap();
         assert_eq!(client.payloads_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn preserves_game_frame_count_across_send_and_recv() {
+        // The frame is a consensus annotation, not a transport key: the link
+        // dedups and retires by (slot, seq) and must carry the frame through
+        // verbatim so the relay and decision-maker can key on it. A None (lobby
+        // turn) survives too — absent is a valid state, not zero.
+        let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
+
+        client
+            .send(Some(Payload {
+                seq: 0,
+                slot: 0,
+                game_frame_count: Some(1337),
+                commands: vec![0x05].into(),
+            }))
+            .unwrap();
+        client
+            .send(Some(Payload {
+                seq: 1,
+                slot: 0,
+                game_frame_count: None,
+                commands: vec![0x05].into(),
+            }))
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        while delivered.len() < 2 {
+            delivered.extend(server.recv().await.unwrap().fresh);
+        }
+        delivered.sort_by_key(|p| p.seq);
+        assert_eq!(delivered[0].game_frame_count, Some(1337));
+        assert_eq!(delivered[1].game_frame_count, None);
     }
 
     #[tokio::test]
@@ -522,11 +557,13 @@ mod tests {
                 Payload {
                     seq: RECEIVE_WINDOW,
                     slot: 0,
+                    game_frame_count: None,
                     commands: vec![0xAA].into(),
                 },
                 Payload {
                     seq: 0,
                     slot: 0,
+                    game_frame_count: None,
                     commands: vec![0xBB].into(),
                 },
             ],
@@ -554,6 +591,7 @@ mod tests {
             payloads: vec![Payload {
                 seq: u64::MAX,
                 slot: 0,
+                game_frame_count: None,
                 commands: vec![1].into(),
             }],
         };
@@ -586,6 +624,7 @@ mod tests {
         let oversize = Payload {
             seq: 0,
             slot: 0,
+            game_frame_count: None,
             commands: vec![0u8; budget + 1].into(),
         };
         match client.send(Some(oversize)) {

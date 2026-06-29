@@ -220,6 +220,7 @@ async fn fans_a_validated_turn_to_the_other_slot() {
         .send(Some(Payload {
             seq: 0,
             slot: 9,
+            game_frame_count: None,
             commands: vec![0x05, 0x55, 0x02, 0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
         }))
         .unwrap();
@@ -353,6 +354,7 @@ async fn isolates_identical_session_ids_across_tenants() {
     a0.send(Some(Payload {
         seq: 0,
         slot: 0,
+        game_frame_count: None,
         commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
     }))
     .unwrap();
@@ -449,6 +451,7 @@ async fn acks_a_one_way_sender_with_no_peer_traffic() {
         solo.send(Some(Payload {
             seq,
             slot: 0,
+            game_frame_count: None,
             commands: vec![0x05].into(),
         }))
         .unwrap();

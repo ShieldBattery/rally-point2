@@ -149,4 +149,20 @@ message Payload {
   // bounds-checks these against the command-length table but forwards the
   // bytes verbatim.
   bytes commands = 3;
+
+  // The SC:R game frame these commands belong to — the runtime consensus
+  // coordinate, not a transport identity. This is what latency-buffer and
+  // player-leave decisions key on so every client applies them at the same
+  // simulated step, and what the flight recorder tags turns by. It is carried
+  // here as an annotation and the transport ignores it for delivery, dedup, and
+  // retirement — those key on (slot, seq), above. The relay preserves it
+  // verbatim across the seam, like seq: a forwarded turn carries the sender's
+  // frame, never a relay-stamped one.
+  //
+  // Absent on payloads that are not for a specific simulation step — lobby
+  // commands have no frame, and a 0 is a valid in-game frame, so the field is
+  // optional rather than defaulting to 0. The consensus engine and flight
+  // recorder treat a missing frame as "no consensus coordinate" (lobby turns
+  // don't participate in apply-at-turn-N decisions).
+  optional uint32 game_frame_count = 4;
 }

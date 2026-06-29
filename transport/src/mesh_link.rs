@@ -478,6 +478,7 @@ mod tests {
         Payload {
             seq,
             slot: u32::from(slot),
+            game_frame_count: None,
             commands: vec![byte].into(),
         }
     }
@@ -685,6 +686,7 @@ mod tests {
             let payload = Payload {
                 seq: i,
                 slot: 0,
+                game_frame_count: None,
                 commands: vec![i as u8; tiny_commands].into(),
             };
             match sender.send(session, Some(payload), None) {
@@ -786,6 +788,7 @@ mod tests {
             let payload = Payload {
                 seq: i,
                 slot: 0,
+                game_frame_count: None,
                 commands: vec![i as u8; 4].into(),
             };
             match sender.send(session, Some(payload), None) {
@@ -853,6 +856,7 @@ mod tests {
             let payload = Payload {
                 seq: i,
                 slot: 0,
+                game_frame_count: None,
                 commands: vec![i as u8; 4].into(),
             };
             match sender.send(session, Some(payload), Some(conditions.clone())) {

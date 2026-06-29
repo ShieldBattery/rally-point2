@@ -370,7 +370,12 @@ pub async fn run_slot_link(
                 // share the same connection's path.
                 publish_slot_conditions(&conditions, &key, slot, link.connection());
                 for payload in received.fresh {
-                    match validate_turn(slot, payload.seq, &payload.commands) {
+                    match validate_turn(
+                        slot,
+                        payload.seq,
+                        payload.game_frame_count,
+                        &payload.commands,
+                    ) {
                         Ok(turn) => {
                             // Mark the origin's own turn in the session's
                             // topological-dedup set before fanning out. The mesh
@@ -594,6 +599,7 @@ mod tests {
         Payload {
             seq: 0,
             slot: 0,
+            game_frame_count: None,
             commands: Vec::new().into(),
         }
     }

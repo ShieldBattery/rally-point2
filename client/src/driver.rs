@@ -470,6 +470,7 @@ mod tests {
             // here is ignored on the driver-send path).
             seq,
             slot: 0,
+            game_frame_count: None,
             commands: bytes.to_vec().into(),
         }
     }
@@ -541,6 +542,7 @@ mod tests {
                 payloads: vec![Payload {
                     seq: payload_seq,
                     slot: 0,
+                    game_frame_count: None,
                     commands: vec![byte].into(),
                 }],
             }

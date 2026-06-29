@@ -186,6 +186,7 @@ fn turn(slot: u8, seq: u64) -> Payload {
     Payload {
         seq,
         slot: u32::from(slot),
+        game_frame_count: None,
         // Empty commands — a bare turn signal. validate_turn accepts this
         // (it yields an empty payload after stripping). A non-empty command
         // would need to be a valid SC:R opcode or validate_turn rejects it.

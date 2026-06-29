@@ -33,8 +33,9 @@
 //! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
 //! verbatim, while [`ack_manager`] is *re-derived* for our message shapes. It
 //! keeps the original's independent per-payload `seq` as the dedup/ack key —
-//! `game_frame_count` rides inside payloads as the consensus coordinate, not
-//! as the transport key — and the relay validates payload contents.
+//! `game_frame_count` rides inside each payload as the consensus coordinate
+//! (which turn a decision applies to), never as the transport key, and the
+//! relay validates payload contents and preserves the frame verbatim.
 //!
 //! [`quic`] holds the shared QUIC/TLS setup the link runs on: the client and
 //! relay build their endpoints from the same crypto config so they stay in

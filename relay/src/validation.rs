@@ -131,11 +131,19 @@ pub enum ValidationError {
 /// stripped. An empty `commands` (a bare turn signal, or a turn that stripped
 /// down to nothing) is valid and yields an empty payload.
 ///
+/// `game_frame_count` is the consensus coordinate — which simulated step the
+/// turn belongs to. Like `seq`, it is preserved verbatim across the seam: a
+/// forwarded turn carries the sender's frame, never a relay-stamped one, so the
+/// relay never silently strips the coordinate the latency-buffer and leave
+/// consensus engines key on. `None` means the payload has no consensus coordinate
+/// (lobby turns); those don't participate in apply-at-turn-N decisions.
+///
 /// This is the attacker-facing parse: it never panics and never reads beyond a
 /// command's declared length.
 pub fn validate_turn(
     slot: SlotId,
     seq: u64,
+    game_frame_count: Option<u32>,
     commands: &[u8],
 ) -> Result<ValidatedTurn, ValidationError> {
     let mut forwarded = Vec::with_capacity(commands.len());
@@ -175,6 +183,7 @@ pub fn validate_turn(
         payload: Payload {
             seq,
             slot: u32::from(slot.0),
+            game_frame_count,
             commands: forwarded.into(),
         },
         stripped_control,
@@ -193,7 +202,7 @@ mod tests {
 
     /// Validate `commands` for `slot` with `seq` and unwrap the sanitized turn.
     fn validated_with_seq(slot: SlotId, seq: u64, commands: &[u8]) -> ValidatedTurn {
-        validate_turn(slot, seq, commands).expect("turn should validate")
+        validate_turn(slot, seq, None, commands).expect("turn should validate")
     }
 
     #[test]
@@ -217,11 +226,23 @@ mod tests {
     }
 
     #[test]
+    fn preserves_the_game_frame_count_verbatim() {
+        // The frame is the consensus coordinate — which simulated step the turn
+        // belongs to. Like seq, the relay forwards the sender's frame untouched,
+        // never dropping or restamping it, so the latency-buffer and leave
+        // consensus engines can key on it. A None (lobby turn) stays None.
+        for frame in [None, Some(0u32), Some(1), Some(42), Some(u32::MAX)] {
+            let turn = validate_turn(SLOT, 0, frame, &[0x05]).unwrap();
+            assert_eq!(turn.payload.game_frame_count, frame);
+        }
+    }
+
+    #[test]
     fn binds_to_the_authorized_slot() {
         // A keep-alive carries no slot of its own, and the turn never does on the
         // wire either — the relay always stamps the authorized slot.
         for slot in [0u8, 1, 7, 255] {
-            let turn = validate_turn(SlotId(slot), 0, &[0x05]).unwrap();
+            let turn = validate_turn(SlotId(slot), 0, None, &[0x05]).unwrap();
             assert_eq!(turn.payload.slot, u32::from(slot));
         }
     }
@@ -312,7 +333,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_opcode() {
         // 0x00 is a hole in the table; the whole turn is refused.
-        let err = validate_turn(SLOT, 0, &[0x00]).unwrap_err();
+        let err = validate_turn(SLOT, 0, None, &[0x00]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -330,7 +351,7 @@ mod tests {
         // decision to revisit only if SB brings save/load back — not a claim that
         // the commands are inherently invalid.
         for opcode in [0x06u8, 0x07] {
-            let err = validate_turn(SLOT, 0, &[opcode]).unwrap_err();
+            let err = validate_turn(SLOT, 0, None, &[opcode]).unwrap_err();
             assert_eq!(err, ValidationError::UnknownOpcode { offset: 0, opcode });
         }
     }
@@ -339,7 +360,7 @@ mod tests {
     fn reports_the_offset_of_a_bad_opcode_mid_stream() {
         // A valid KeepAlive, then garbage: the error points at the garbage.
         let stream = [0x05, 0xFF];
-        let err = validate_turn(SLOT, 0, &stream).unwrap_err();
+        let err = validate_turn(SLOT, 0, None, &stream).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -352,7 +373,7 @@ mod tests {
     #[test]
     fn rejects_a_fixed_command_that_overruns_the_turn() {
         // Build claims 8 bytes but only 4 are present.
-        let err = validate_turn(SLOT, 0, &[0x0C, 1, 2, 3]).unwrap_err();
+        let err = validate_turn(SLOT, 0, None, &[0x0C, 1, 2, 3]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -365,7 +386,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_missing_its_count_byte() {
         // Classic select with no count byte at all.
-        let err = validate_turn(SLOT, 0, &[0x09]).unwrap_err();
+        let err = validate_turn(SLOT, 0, None, &[0x09]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -378,7 +399,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_whose_count_overruns_the_turn() {
         // Select claims 3 entries (2 + 2*3 = 8 bytes) but only carries one.
-        let err = validate_turn(SLOT, 0, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
+        let err = validate_turn(SLOT, 0, None, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
