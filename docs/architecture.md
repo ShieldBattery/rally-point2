@@ -232,6 +232,22 @@ replicating a full per-game turn log) is not obviously affordable. Treat this as
 settled part of the architecture. (The client reconnect infrastructure this needs would also cover a
 client's own transient disconnects.)
 
+**Client-side turn retention (design note for D11).** The relay-side turn
+log that D4 calls "open" may not be needed at all: each client already has
+every turn it sent (it generated them) and every turn it received (it
+executed them), so the clients *are* the turn log. A replacement relay asks
+each client to replay from a target turn. The retention window a client must
+keep is `executing_turn - buffer_size` through `executing_turn + buffer_size`
+— roughly `2 * buffer_size` turns (typically 4–10, a few hundred bytes). The
+lower bound is `E - B` because the slowest client can be at most `buffer_size`
+turns behind before they stall (the buffer is exactly the cushion that absorbs
+that), so `E - B` is the oldest turn the slowest client might still be
+executing — and thus the oldest a replacement relay might need re-sent. The
+upper bound is `E + B` (the client's own send pipe). This sidesteps the
+relay-side storage/replication cost question entirely; the open work is the
+coordinated resync protocol itself (how clients re-send simultaneously, how
+the replacement distributes turns in lockstep order before anyone advances).
+
 ### Latency buffer
 
 How much turn buffer the game runs with — the latency cushion that absorbs jitter — is not fixed; it has
