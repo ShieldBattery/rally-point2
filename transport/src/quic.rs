@@ -93,6 +93,51 @@ pub enum TlsError {
     NoInitialCipherSuite(#[from] NoInitialCipherSuite),
 }
 
+/// How often a QUIC mesh connection sends a keepalive PING frame when it has
+/// no outgoing datagrams of its own. Prevents idle-timeout disconnects on a
+/// mesh link that goes briefly silent — between turns in a quiet game, or
+/// when no sessions are joined yet — without adding app-level traffic. QUIC's
+/// keepalive is cheaper than an app-level datagram (no payload, no redundancy
+/// processing) and rides the existing congestion controller.
+///
+/// Set clear of ordinary jitter (the mesh flush timer fires every 150ms
+/// during active play, so a keepalive at 5s only fires during a genuine
+/// silence). Short enough that a NAT mapping or firewall state doesn't expire
+/// mid-game (consumer NAT timeouts are typically 30–60s; AWS security groups
+/// allow established UDP flows indefinitely).
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The maximum idle time before QUIC closes a mesh connection. The default
+/// (30s) is too long for a relay mesh: a dead peer relay or a dropped NAT
+/// mapping stalls lockstep for 30s before anyone notices. 10s detects dead
+/// peers fast enough that a stall surfaces as a visible "waiting for players"
+/// dialog rather than a silent hang, while staying clear of brief silences
+/// (keepalive fires at 5s, so a live connection never approaches this
+/// timeout).
+///
+/// Applied to the mesh dial side only ([`mesh_client_config`]). QUIC
+/// negotiates the idle timeout as the minimum of both endpoints' advertised
+/// values, so the dial side's value governs the mesh connection without
+/// touching `server_config` — client-edge connections (negotiated against
+/// [`client_config`]) keep their default timeout. One side's keepalive
+/// suffices to keep both mesh ends alive (its PINGs elicit ACKs, resetting
+/// both idle timers), so the accept side needs no change.
+const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Builds a `TransportConfig` tuned for mesh connections: keepalive to
+/// prevent idle disconnects during brief silences, and a shorter-than-default
+/// idle timeout to detect dead peers fast. Applied to the mesh dial side only
+/// ([`mesh_client_config`]) — see [`MAX_IDLE_TIMEOUT`] for why the server side
+/// is left at the default.
+fn mesh_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+    config.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("10s fits in a VarInt"),
+    ));
+    config
+}
+
 /// The ring crypto provider, constructed fresh so we never depend on a
 /// process-wide default having been installed.
 fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -146,7 +191,9 @@ pub fn mesh_client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientC
     tls.alpn_protocols = vec![MESH_ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
-    Ok(quinn::ClientConfig::new(Arc::new(client)))
+    let mut config = quinn::ClientConfig::new(Arc::new(client));
+    config.transport_config(Arc::new(mesh_transport_config()));
+    Ok(config)
 }
 
 #[cfg(test)]
