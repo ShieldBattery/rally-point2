@@ -14,6 +14,11 @@
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
 //!   topological dedup, degrade-to-single-relay (`C–S–C`).
+//! - **mesh_edge** ([`mesh_edge`]) — the mesh-edge connection half: establish
+//!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise)
+//!   and spawn a `run_mesh_link` driver. The Join/Leave stream that drives
+//!   session membership is pluggable — the test sends it today, the
+//!   coordinator's session-descriptor push does in production (Phase 3).
 //! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
 //!   relay-side core that turns game-wide network conditions into a buffer-size
 //!   change, scheduled at an agreed future turn. Authority is an injected input
@@ -24,14 +29,15 @@
 //! - **flight recorder** — per-game turn stream + per-link health + events,
 //!   flushed to a durable store *before* scale-to-zero teardown.
 //!
-//! The client edge — authorization, validation, single-relay routing, and the
-//! consensus decision core — is built; the mesh edge is wired in tests but not
-//! in the running binary, and the stateful layers above the decision core are
-//! not yet. The binary half ([`main`](../main.rs)) wires up the process.
+//! The client edge — authorization, validation, single-relay routing, the
+//! consensus decision core, and the mesh-edge connection half — is built; the
+//! stateful layers above the decision core are not yet. The binary half
+//! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
 pub mod config;
 pub mod mesh;
+pub mod mesh_edge;
 pub mod routing;
 pub mod server;
 pub mod validation;

@@ -197,6 +197,31 @@ relay **dedups topologically** — it forwards each turn to a given client exact
 arrives first, reusing the same `(slot, seq)` dedup the per-link transport already does — the origin
 identity is stable across the mesh because no hop restamps it.
 
+The mesh edge's **connection half** runs in the relay binary: each `--relay-id` + `--mesh-peer ADDR#ID`
+pair dials (the lower-id side, via a `should_dial_mesh` tie-break) or accepts (the higher-id side), and
+each established connection spawns a `run_mesh_link` driver. The `--relay-id`/`--mesh-peer` CLI args are
+a **dev/loopback** escape hatch (two relays on one machine); in production the coordinator pushes peer
+topology at runtime — relays churn under scale-to-zero (D3), so the peer set is unknowable at startup,
+and the dial side needs the peer's id *before* connecting (the tie-break is a pre-connect local
+decision, not a post-connect exchange). The `MeshCommand::Join`/`Leave` that drives session membership
+on a link is **not** wired from the binary yet: today the integration test sends it on the driver's
+command sender directly, and in production the coordinator's session-descriptor push (Phase 3) will —
+targeting the specific link serving a session, never broadcasting. So the binary establishes mesh
+connections and keeps the drivers alive, but session membership is an injected input.
+
+**Mesh trust today vs. production.** Today the dial trusts the peer's cert against the same roots a
+client would — a dev/loopback pair with self-signed certs just works (each relay trusts its own leaf
+as the peer's root). Self-signed doesn't scale to production: with scale-to-zero, relays churn
+constantly, so pre-distributing each relay's cert to every potential peer is operationally infeasible.
+The production approach is an **internal CA** (AWS Private CA, or a simple CA the coordinator runs):
+one CA root signs every relay cert on startup; each relay trusts the CA root; any two relays can mesh
+without pre-sharing certs. The current `mesh_client_config` does server-auth only
+(`with_no_client_auth`); production mTLS — both sides present certs — is a transport-level change
+that lands with the coordinator (Phase 3), alongside the open `S===S` inter-relay auth question
+(mutual certs vs. a coordinator-issued shared secret). Client → relay trust is simpler: it's 1:1 (one
+relay per client), so self-signed *with pinning* (the coordinator hands the client the relay's cert
+in the session descriptor) or an internal CA both work; direct IPs (D3) rule out public CA.
+
 ### Failover and reconnect (open)
 
 A relay dying mid-game stalls lockstep for every client it serves, so a production deployment needs a

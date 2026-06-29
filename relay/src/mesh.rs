@@ -264,6 +264,13 @@ pub fn new_mesh_state() -> MeshState {
 /// connection, so a single driver task drains all sessions' outbound turns from
 /// one channel.
 type MeshForwardTx = mpsc::Sender<(rally_point_proto::ids::SessionId, Payload)>;
+/// Capacity of a mesh-link driver's `MeshCommand` channel — the Join/Leave
+/// stream the test (today) or the coordinator's session-descriptor push
+/// (Phase 3) sends on. These are low-frequency control messages (a handful
+/// per game over its life, not the turn stream), so a small bounded capacity
+/// is right: enough headroom that a slow driver draining one Join doesn't
+/// block the next, without reserving for a traffic burst that never comes.
+pub(crate) const COMMAND_CAPACITY: usize = 32;
 
 /// Removes all mesh forward channels for `key` (the peer-relay link for that
 /// session has closed). Idempotent.
