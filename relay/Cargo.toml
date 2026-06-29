@@ -23,9 +23,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[dev-dependencies]
-# Self-signed relay cert for the loopback client-edge test. The QUIC + Ed25519
-# crypto in the test itself comes from the transport re-exports (quinn/rustls)
-# and the `ring` dependency above.
+# PEM cert/key file parsing for --cert/--key.
+rustls-pemfile = { workspace = true }
+# Self-signed cert generation for dev/loopback (when --cert/--key aren't
+# supplied). Uses ring, not the default aws-lc-rs, to match the pinned QUIC
+# crypto provider — no NASM toolchain needed.
 rcgen = { workspace = true }
+hex = { workspace = true }

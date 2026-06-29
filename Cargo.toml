@@ -46,9 +46,12 @@ socket2 = "0.6"
 # TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the quinn
 # backend and keep the 32-bit client build free of a C/NASM toolchain.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# PEM cert/key file reading for the relay binary (loads --cert/--key files).
+rustls-pemfile = "2"
 # Self-signed certs for transport loopback tests (dev-only). Uses ring, not the
-# default aws-lc-rs, so `cargo test` needs no NASM toolchain either.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+# Hex encode/decode for the relay binary's --tenant-key CLI flag.
+hex = "0.4"
 # Ed25519 verification (token signatures + the connection-binding challenge) and
 # the secure RNG for challenge nonces on the relay. Reuses ring — already the
 # pinned QUIC crypto provider — so there's no second curve25519 backend to audit
@@ -83,7 +86,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- CLI ---
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 
 [workspace.lints.rust]
 # The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not

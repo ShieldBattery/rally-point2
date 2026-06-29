@@ -26,6 +26,7 @@
 //! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
+pub mod config;
 pub mod mesh;
 pub mod routing;
 pub mod server;
