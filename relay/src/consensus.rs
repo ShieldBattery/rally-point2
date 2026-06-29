@@ -88,9 +88,6 @@
 //! (authority -> peer -> client). For N>2 relays, a turn between two *remote*
 //! slots on different peer relays traverses `peer1 -> authority -> peer2`, and
 //! the authority doesn't directly observe the peer1<->peer2 mesh RTT. The robust
-//! (authority -> peer -> client). For N>2 relays, a turn between two *remote*
-//! slots on different peer relays traverses `peer1 -> authority -> peer2`, and
-//! the authority doesn't directly observe the peer1<->peer2 mesh RTT. The robust
 //! fix is accumulating one-way mesh RTT per hop as conditions flood across the
 //! mesh (a proto field + mesh-forward change). Until the mesh edge is wired,
 //! this 2-relay simplification is correct for the topology it serves and is
@@ -115,7 +112,7 @@
 //! below the current buffer, it **decrements by one turn per decision, gated
 //! by a long min-dwell** (120 turns ~ 5s at 24/sec) -- a conservative shrink so
 //! a momentary improvement doesn't flap the buffer down and right back up.
-//! long lower-dwell ensures shrinks are infrequent and well-validated -- at
+//! A long lower-dwell ensures shrinks are infrequent and well-validated -- at
 //! least 120 RTT samples confirm the improvement is stable before the buffer
 //! shrinks. Raises, by contrast, fire on the first worsening sample.
 //!
@@ -373,7 +370,7 @@ impl SlotState {
         Some(delta_lost as f64 / delta_sent as f64)
     }
 
-    /// The loss risk: `loss_rate ** eff_RTTeff_RTT` (in us). This is the expected burst
+    /// The loss risk: `loss_rate * eff_RTT` (in us). This is the expected burst
     /// duration on this link -- how many us of packets could be lost during one
     /// round-trip. Higher on high-latency links because more packets are in
     /// flight during the burst window. Returns `None` when no loss delta is
@@ -394,7 +391,7 @@ impl SlotState {
 /// One instance per session the relay is the authority for. Fed conditions and
 /// frame observations by `run_slot_link` (home-client conditions, via
 /// [`ingest_local`](Self::ingest_local)) and `run_mesh_link` (peer-relay
-/// conditions, via  -- but only when
+/// conditions, via [`ingest_remote`](Self::ingest_remote)) -- but only when
 /// `Authority::SelfRelay`.
 pub struct DecisionMaker {
     key: SessionKey,
@@ -459,11 +456,11 @@ impl DecisionMaker {
         self.authority == Authority::SelfRelay
     }
 
-    /// Ingests thisthis relay's own home-client `LinkConditions` (conditions the
+    /// Ingests this relay's own home-client `LinkConditions` (conditions the
     /// relay observed directly on its local clients) and the `game_frame_count`
     /// the carrying datagram was observed at.
     ///
-    /// Local slots have `mesh_rtt = 0` (no mesh hop --    /// relay). RTT samples are pushed into the per-slot ring buffer for
+    /// Local slots have `mesh_rtt = 0` (no mesh hop -- this relay). RTT samples are pushed into the per-slot ring buffer for
     /// jitter-aware sizing. Cumulative loss counters are rotated so the next
     /// decision can difference them. `max_frame` advances to `frame` if newer.
     ///
@@ -580,7 +577,6 @@ impl DecisionMaker {
         // A turn from A to B travels eff_A/2 + eff_B/2 = (eff_A + eff_B) / 2.
         // Using the actual pairwise path (not max_eff) avoids overshooting
         // when only one player has high latency -- lower buffer = less delay.
-        // when only one player has high latency -- lower buffer = less delay.
         eff_rtts.sort_unstable_by(|a, b| b.cmp(a)); // descending
         let path_us = if eff_rtts.len() >= 2 {
             (eff_rtts[0] + eff_rtts[1]) / 2
@@ -614,7 +610,7 @@ impl DecisionMaker {
         let target = self.target()?;
 
         let new_buffer = if target > self.buffer.0 {
-            // Raise fast: jump to the target immediately. NoNo dwelldwell -- aa
+            // Raise fast: jump to the target immediately. No dwell -- a
             // too-small buffer stalls, and you can't wait through a stall.
             target
         } else if target < self.buffer.0 {
@@ -777,11 +773,11 @@ mod tests {
         assert_eq!(maker.target(), Some(1));
     }
 
-    /// NoNo RTT measurementmeasurement (rtt_us == 0): target is None (hold).
+    /// No RTT measurement (rtt_us == 0): target is None (hold).
     #[test]
     fn target_none_when_no_rtt() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 00, 0, 100), GameFrameCount(1));
+        maker.ingest_local(&conditions(0, 0, 0, 100), GameFrameCount(1));
         assert_eq!(maker.target(), None);
     }
 
@@ -919,9 +915,9 @@ mod tests {
         assert_eq!(maker.buffer(), BufferSize(4));
     }
 
-    // -- AsymmetricAsymmetric dwell: raises immediate, lowers gated --
+    // -- Asymmetric dwell: raises immediate, lowers gated --
 
-    /// AA raise fires immediately eveneven within the dwell-- you can't dwell
+    /// A raise fires immediately even within the dwell -- you can't dwell
     /// through a stall. A lower is suppressed until the dwell elapses.
     #[test]
     fn raise_fires_immediately_lower_gated_by_dwell() {
@@ -941,7 +937,7 @@ mod tests {
         assert_eq!(maker.buffer(), BufferSize(8));
 
         // Conditions improve at frame 3 (within dwell from the raise at 2).
-        // Lower is suppressed -- andthe ring buffer still holds the 300ms
+        // Lower is suppressed -- and the ring buffer still holds the 300ms
         // spike, so the target stays at 8 anyway.
         let d3 = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(3));
         assert_eq!(d3, None, "lower should be suppressed within dwell");
@@ -961,7 +957,7 @@ mod tests {
         assert_eq!(maker.buffer(), BufferSize(7));
     }
 
-    /// Anti-flap: an oscillating target raises onon the first worsening, then
+    /// Anti-flap: an oscillating target raises on the first worsening, then
     /// holds (lowers suppressed) through the dwell.
     #[test]
     fn anti_flap_raises_on_worsening_holds_on_improvement() {
@@ -1015,7 +1011,7 @@ mod tests {
     #[test]
     fn non_authority_ingests_but_does_not_decide() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
-        let d = maker.ingest_local(&conditions(0, 150_000, 00, 100), GameFrameCount(1));
+        let d = maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
         assert_eq!(d, None, "non-authority makes no decision");
         assert_eq!(maker.max_frame(), GameFrameCount(1));
         assert_eq!(maker.target(), Some(4));
@@ -1058,12 +1054,12 @@ mod tests {
         assert_eq!(d, None);
     }
 
-    /// Regression: lossy interval THEN clean interval must dropdrop the target.
+    /// Regression: lossy interval THEN clean interval must drop the target.
     /// Raises fire immediately; the lower waits for the dwell.
     #[test]
     fn lossy_then_clean_interval_drops_target() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        // Baseline at frame 1 (raises toto 4, sets dwellsets dwell clock).
+        // Baseline at frame 1 (raises to 4, sets the dwell clock).
         maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
 
         // 50% loss at frame 22 (raise fires immediately -- no dwell on raises).
