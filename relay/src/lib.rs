@@ -14,16 +14,20 @@
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
 //!   topological dedup, degrade-to-single-relay (`C–S–C`).
-//! - **consensus** — execute per-turn latency/leave consensus keyed on
-//!   `game_frame_count`; the coordinator only sets *policy*.
+//! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
+//!   relay-side core that turns game-wide network conditions into a buffer-size
+//!   change, scheduled at an agreed future turn. Authority is an injected input
+//!   (single-relay = `SelfRelay`) until multi-relay liveness lands with the mesh
+//!   wiring + coordinator; the coordinator only sets *bounds*.
 //! - **turn log** — persist + replicate the per-game turn log; the same
 //!   "replay from cursor X" primitive serves failover and (future) observers.
 //! - **flight recorder** — per-game turn stream + per-link health + events,
 //!   flushed to a durable store *before* scale-to-zero teardown.
 //!
-//! The client edge — authorization, validation, and single-relay routing — is
-//! built; the mesh and the stateful layers above it are not yet. The binary half
-//! ([`main`](../main.rs)) wires up the process.
+//! The client edge — authorization, validation, single-relay routing, and the
+//! consensus decision core — is built; the mesh edge is wired in tests but not
+//! in the running binary, and the stateful layers above the decision core are
+//! not yet. The binary half ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
 pub mod config;
@@ -32,7 +36,7 @@ pub mod routing;
 pub mod server;
 pub mod validation;
 
-// TODO: pub mod consensus;        // keyed on game_frame_count
+pub mod consensus;
 // TODO: pub mod turn_log;         // replicated, bounded + flushed
 // TODO: pub mod flight_recorder;  // tenant/session/slot/turn
 
