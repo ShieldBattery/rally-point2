@@ -209,6 +209,19 @@ command sender directly, and in production the coordinator's session-descriptor 
 targeting the specific link serving a session, never broadcasting. So the binary establishes mesh
 connections and keeps the drivers alive, but session membership is an injected input.
 
+**Mesh-link idle teardown.** A `run_mesh_link` driver tears down its connection when it has been
+session-less for long enough — but only *after* it has served at least one session. The idle timer is
+armed on the transition from "has sessions" to "none" (the last `Leave`), not on establishment: a
+never-joined link stays parked indefinitely, ready for the coordinator's future `Join` source (the
+binary holds its command sender for exactly this — tearing never-joined links down would strand the
+pair, since the dial side runs once with no reconnect supervisor yet). Re-`Join`ing before the timer
+fires cancels it. This is *app-level* idle teardown, distinct from QUIC's own idle timeout (10s, on the
+mesh dial side via keepalive PINGs): QUIC tears down a *dead* connection (keepalive stops
+round-tripping); this tears down a *live but unused* one so a churned-out relay-pair's connection
+doesn't linger forever. The driver returns a `MeshLinkExit` (`Idle` vs. `ConnectionFailed` vs.
+`CommandChannelClosed`) so a future reconnect supervisor can tell an intentional wind-down from a
+dropped connection — only the latter is worth retrying.
+
 **Mesh trust today vs. production.** Today the dial trusts the peer's cert against the same roots a
 client would — a dev/loopback pair with self-signed certs just works (each relay trusts its own leaf
 as the peer's root). Self-signed doesn't scale to production: with scale-to-zero, relays churn

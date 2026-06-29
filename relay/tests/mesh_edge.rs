@@ -197,14 +197,145 @@ fn turn(slot: u8, seq: u64) -> Payload {
 /// Spawns a mesh-link driver on `link` and returns the command sender the test
 /// uses to join and leave sessions. A thin wrapper over `run_mesh_link` so the
 /// two-relay tests stay focused on the cross-relay path, not channel plumbing.
+///
+/// Uses the production [`mesh::IDLE_TIMEOUT`] (60s) so the multi-step cross-relay
+/// tests below aren't torn down mid-run by the idle timer. The dedicated
+/// idle-teardown test spawns its own driver with a short real duration.
 fn spawn_mesh_link(
     link: MeshLink,
     sessions: Sessions,
     mesh: mesh::MeshState,
 ) -> mpsc::Sender<mesh::MeshCommand> {
     let (tx, rx) = mpsc::channel(8);
-    tokio::spawn(mesh::run_mesh_link(link, rx, sessions, mesh));
+    tokio::spawn(mesh::run_mesh_link(
+        link,
+        rx,
+        sessions,
+        mesh,
+        mesh::IDLE_TIMEOUT,
+    ));
     tx
+}
+/// Like [`spawn_mesh_link`] but with a custom `idle_timeout` and returns the
+/// driver's `JoinHandle` so the caller can await its [`mesh::MeshLinkExit`].
+/// Used by the idle-teardown test, which needs a short real duration (not the
+/// 60s production const) so the teardown is observable in well under a second.
+fn spawn_mesh_link_timed(
+    link: MeshLink,
+    sessions: Sessions,
+    mesh: mesh::MeshState,
+    idle_timeout: Duration,
+) -> (
+    mpsc::Sender<mesh::MeshCommand>,
+    tokio::task::JoinHandle<mesh::MeshLinkExit>,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    let handle = tokio::spawn(mesh::run_mesh_link(link, rx, sessions, mesh, idle_timeout));
+    (tx, handle)
+}
+
+/// Brings up a loopback mesh connection pair (two `MeshLink`s over one real
+/// quinn connection negotiated on `MESH_ALPN`), reusing the test's self-signed
+/// cert helper. Both endpoints are returned so the caller keeps them alive.
+async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoint) {
+    let (chain, key, ca) = self_signed();
+    let server_cfg = server_config(chain, key).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca).unwrap();
+    let client_cfg = mesh_client_config(roots).unwrap();
+
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let mut client = quinn::Endpoint::client(bind).unwrap();
+    client.set_default_client_config(client_cfg);
+
+    let accept = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+    };
+    let client_conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let server_conn = accept.await.unwrap();
+
+    (
+        MeshLink::new(client_conn),
+        MeshLink::new(server_conn),
+        client,
+        server,
+    )
+}
+
+/// A link that served a session, went empty, and stayed empty past
+/// `idle_timeout` tears down with [`mesh::MeshLinkExit::Idle`]. Joins a
+/// session, leaves it, and waits past a short real-duration timeout — no
+/// `tokio::time::pause`/`advance` (that would trip quinn's own 10s idle
+/// timeout before the 200ms app-level one, surfacing `ConnectionFailed`
+/// instead of `Idle`).
+#[tokio::test]
+async fn idle_link_tears_down_after_timeout_post_session() -> Result<(), AnyError> {
+    let session = SessionId(1);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let (mesh_a, mesh_b, _ep_a, _ep_b) = mesh_link_pair().await;
+    let sessions: Sessions = Arc::default();
+    let mesh = mesh::new_mesh_state();
+    let idle_timeout = Duration::from_millis(200);
+
+    let (cmds_a, handle_a) =
+        spawn_mesh_link_timed(mesh_a, Arc::clone(&sessions), mesh.clone(), idle_timeout);
+    // Keep mesh_b alive so the QUIC connection doesn't close — dropping the
+    // peer's Connection handle closes it from the other side, and A's driver
+    // would exit `ConnectionFailed` instead of `Idle`. mesh_b isn't driven
+    // (no recv loop); quinn's endpoint processes keepalive ACKs internally.
+    let _peer_alive = mesh_b;
+
+    // Join, then leave — arming the idle timer on the transition to empty.
+    cmds_a.send(mesh::MeshCommand::Join(key.clone())).await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cmds_a.send(mesh::MeshCommand::Leave(key)).await?;
+
+    // Wait past the idle timeout (200ms) plus a margin.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let exit = handle_a.await.expect("driver task panicked");
+    assert_eq!(exit, mesh::MeshLinkExit::Idle, "should tear down idle");
+    Ok(())
+}
+
+/// A never-joined link stays parked: the idle timer is not armed until a link
+/// has served at least one session, so a link that got no `Join` survives
+/// well past `idle_timeout`. This is the custody contract the binary relies
+/// on (it holds the command sender so drivers stay ready for the future Join
+/// source) — tearing never-joined links down would strand the pair.
+#[tokio::test]
+async fn never_joined_link_survives_past_idle_timeout() -> Result<(), AnyError> {
+    let (mesh_a, mesh_b, _ep_a, _ep_b) = mesh_link_pair().await;
+    let sessions: Sessions = Arc::default();
+    let mesh = mesh::new_mesh_state();
+    let idle_timeout = Duration::from_millis(150);
+
+    let (_cmds_a, handle_a) =
+        spawn_mesh_link_timed(mesh_a, Arc::clone(&sessions), mesh.clone(), idle_timeout);
+    let _peer_alive = mesh_b;
+
+    // Wait well past the idle timeout without ever sending a Join.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The driver must still be running — never armed, never fired.
+    assert!(
+        !handle_a.is_finished(),
+        "never-joined link should stay parked, not tear down"
+    );
+    // Cancel the task so the test doesn't leak it.
+    handle_a.abort();
+    Ok(())
 }
 
 /// `C–S===S–C`: a client on relay A sends a turn; a client on relay B receives

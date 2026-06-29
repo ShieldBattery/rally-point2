@@ -272,6 +272,47 @@ type MeshForwardTx = mpsc::Sender<(rally_point_proto::ids::SessionId, Payload)>;
 /// block the next, without reserving for a traffic burst that never comes.
 pub(crate) const COMMAND_CAPACITY: usize = 32;
 
+/// How long a mesh link stays up after its last session leaves before the
+/// driver tears it down. Production passes this as the `idle_timeout` arg to
+/// [`run_mesh_link`]; tests pass a shorter real duration so the teardown is
+/// observable without waiting a full minute.
+///
+/// This is *app-level* idle teardown, distinct from the QUIC idle timeout
+/// (`transport::quic::MAX_IDLE_TIMEOUT`, 10s) that fires when the *connection*
+/// goes dead (keepalive PINGs stop round-tripping). A live but session-less
+/// link stays up at the QUIC layer (keepalive keeps it healthy); this timer
+/// tears down a link nobody is using anymore so a churned-out relay-pair's
+/// connection doesn't linger forever.
+///
+/// Armed only after a link has served at least one session (had a `Join`, then
+/// went empty again) — a never-joined link stays parked, ready for the
+/// coordinator's future `Join` source (the binary holds its command sender for
+/// exactly this; tearing never-joined links down would strand the pair, since
+/// the dial side runs once with no reconnect supervisor yet).
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Why a mesh-link driver exited. A reconnect supervisor (when one lands)
+/// distinguishes intentional teardown from a dropped connection: only the
+/// latter is worth retrying, since `Idle` means a deliberate wind-down and
+/// `CommandChannelClosed` means the relay itself is shutting the link down.
+///
+/// `ConnectionFailed` covers every transport-level exit — a QUIC idle
+/// timeout, a read/send error, or a keepalive that stopped round-tripping.
+/// Those surface the same from the driver's perspective (the link is gone);
+/// the reconnect supervisor treats them all as retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshLinkExit {
+    /// The link had at least one session, went empty, and stayed empty past
+    /// [`IDLE_TIMEOUT`]. An intentional wind-down, not a failure.
+    Idle,
+    /// The connection failed: a recv/send error or QUIC idle timeout. The
+    /// peer is unreachable or dead.
+    ConnectionFailed,
+    /// The command channel closed (the relay is tearing the link down — its
+    /// `MeshCommand` sender was dropped). An intentional shutdown.
+    CommandChannelClosed,
+}
+
 /// Removes all mesh forward channels for `key` (the peer-relay link for that
 /// session has closed). Idempotent.
 pub fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey) {
@@ -328,7 +369,6 @@ pub enum MeshCommand {
     /// an absent session is a no-op.
     Leave(SessionKey),
 }
-
 /// Drives a shared [`MeshLink`] for every session both relays jointly serve on
 /// a relay-pair's single QUIC connection.
 ///
@@ -356,8 +396,20 @@ pub enum MeshCommand {
 /// Sessions join and leave over `commands` as the relay discovers which games
 /// its peer also serves. One `Join` opens the session's transport state and
 /// registers its forward channel; one `Leave` closes and deregisters it. The
-/// driver ends when the command channel closes (its sender was dropped — the
-/// relay is tearing the link down) or the connection fails.
+/// driver ends — returning a [`MeshLinkExit`] — when the link goes idle past
+/// `idle_timeout` (after having served at least one session), the command
+/// channel closes, or the connection fails.
+///
+/// # Idle teardown
+///
+/// `idle_timeout` is how long the driver keeps the link up after its last
+/// session leaves, *once the link has served at least one session*. The timer
+/// is armed only on the transition from "has sessions" to "no sessions" — a
+/// never-joined link stays parked indefinitely, ready for the coordinator's
+/// future `Join` source (the binary holds its command sender for exactly
+/// this). Re-`Join`ing before the timer fires cancels it. Production passes
+/// [`IDLE_TIMEOUT`]; tests pass a shorter real duration. This is distinct from
+/// QUIC's own idle timeout (see [`IDLE_TIMEOUT`]).
 ///
 /// # Tenant scoping
 ///
@@ -374,7 +426,8 @@ pub async fn run_mesh_link(
     mut commands: mpsc::Receiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
-) {
+    idle_timeout: std::time::Duration,
+) -> MeshLinkExit {
     let MeshState {
         links: mesh_links,
         seen: seen_registries,
@@ -396,7 +449,22 @@ pub async fn run_mesh_link(
     // overwrites the first.
     let mut joined: HashMap<rally_point_proto::ids::SessionId, SessionState> = HashMap::new();
 
-    loop {
+    // Idle teardown state. `idle_since` is the instant the last session left
+    // (None while sessions are joined, or before the first Join); the driver
+    // tears down when `idle_since + idle_timeout` passes without a re-Join.
+    //
+    // This alone encodes "has served traffic": it is only set to `Some` after a
+    // `joined.remove()` that emptied `joined`, which can only follow a prior
+    // successful Join. A never-joined link keeps `idle_since = None` and stays
+    // parked indefinitely, ready for the coordinator's future Join source (the
+    // binary holds its command sender for exactly this).
+    let mut idle_since: Option<tokio::time::Instant> = None;
+
+    // Each break carries its `MeshLinkExit` inline, so a reconnect supervisor
+    // can tell an intentional wind-down (Idle, CommandChannelClosed) from a
+    // dropped connection (ConnectionFailed). Non-exit paths `continue` the
+    // loop; the value a `break` carries becomes the function's return.
+    let exit = loop {
         // The earliest per-session flush deadline. `sleep` is cancel-safe, so
         // the loop recomputes it on every wake. With a handful of games per
         // relay-pair the O(N) scan is trivial; when no sessions are joined yet
@@ -407,6 +475,14 @@ pub async fn run_mesh_link(
             .map(|s| s.flush_deadline)
             .min()
             .unwrap_or(tokio::time::Instant::now() + routing::FLUSH_INTERVAL);
+
+        // The idle-teardown deadline. Only armed once the link has served at
+        // least one session and is now empty (`idle_since` is Some); otherwise
+        // the fallback (a day out) keeps the branch dormant. Cancel-safe like
+        // the flush timer.
+        let idle_deadline = idle_since
+            .map(|t| t + idle_timeout)
+            .unwrap_or(tokio::time::Instant::now() + std::time::Duration::from_secs(86_400));
 
         tokio::select! {
             received = link.recv() => {
@@ -438,6 +514,7 @@ pub async fn run_mesh_link(
                             routing::fan_out(&sessions, &key, slot, payload.clone());
                             fan_out_to_mesh(&mesh_links, &key, payload);
                         }
+                        continue;
                     }
                     Err(rally_point_transport::MeshLinkError::UnknownSession(session)) => {
                         tracing::warn!(
@@ -448,7 +525,7 @@ pub async fn run_mesh_link(
                     }
                     Err(error) => {
                         tracing::info!(%error, "mesh link closed");
-                        break;
+                        break MeshLinkExit::ConnectionFailed;
                     }
                 }
             }
@@ -462,15 +539,16 @@ pub async fn run_mesh_link(
                         let outgoing = snapshot_conditions(&conditions, &key);
                         if let Err(error) = link.send(session_id, Some(payload), outgoing) {
                             tracing::info!(%error, "mesh send failed; closing link");
-                            break;
+                            break MeshLinkExit::ConnectionFailed;
                         }
+                        continue;
                     }
-                    None => break,
+                    None => break MeshLinkExit::CommandChannelClosed,
                 }
             }
             _ = tokio::time::sleep_until(next_flush) => {
                 let now = tokio::time::Instant::now();
-                let mut failed = false;
+                let mut failed = None;
                 for (&session_id, state) in joined.iter_mut() {
                     if state.flush_deadline > now {
                         continue;
@@ -478,15 +556,26 @@ pub async fn run_mesh_link(
                     if link.payloads_in_flight(session_id) > 0
                         && let Err(error) = link.send(session_id, None, None)
                     {
-                        tracing::info!(%error, "mesh flush failed; closing link");
-                        failed = true;
+                        failed = Some(error);
                         break;
                     }
                     state.flush_deadline = now + routing::FLUSH_INTERVAL;
                 }
-                if failed {
-                    break;
+                if let Some(error) = failed {
+                    tracing::info!(%error, "mesh flush failed; closing link");
+                    break MeshLinkExit::ConnectionFailed;
                 }
+                continue;
+            }
+            // Idle teardown: the link served at least one session, went empty,
+            // and stayed empty past `idle_timeout`. An intentional wind-down —
+            // not a failure to retry. The `if` guard keeps this branch dormant
+            // until `idle_since` is Some (armed after the first Join→empty
+            // transition); `idle_deadline`'s day-out fallback makes the guard
+            // the sole gate.
+            _ = tokio::time::sleep_until(idle_deadline), if idle_since.is_some() => {
+                tracing::info!("mesh link idle; closing");
+                break MeshLinkExit::Idle;
             }
             command = commands.recv() => {
                 match command {
@@ -522,26 +611,36 @@ pub async fn run_mesh_link(
                                 flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
                             },
                         );
+                        idle_since = None;
+                        continue;
                     }
                     Some(MeshCommand::Leave(key)) => {
                         let session_id = key.session;
                         if joined.remove(&session_id).is_some() {
                             link.close_session(session_id);
                             deregister_mesh_link(&mesh_links, &key);
+                            // Arm the idle timer when the last session leaves,
+                            // so the driver tears the link down after
+                            // `idle_timeout` of no further Joins.
+                            if joined.is_empty() {
+                                idle_since = Some(tokio::time::Instant::now());
+                            }
                         }
+                        continue;
                     }
                     // The command channel closed: the sender (the relay's
                     // mesh-link manager, or the test) dropped it, signaling
                     // the link should wind down.
-                    None => break,
+                    None => break MeshLinkExit::CommandChannelClosed,
                 }
             }
         }
-    }
+    };
 
     for state in joined.values() {
         deregister_mesh_link(&mesh_links, &state.key);
     }
+    exit
 }
 
 /// One session's per-link driver state: its routing key (tenant-correct), and

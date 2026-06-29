@@ -110,7 +110,7 @@ pub async fn run_mesh_accept(
         // &mut self), so the MeshLink moves into the spawned task. The command
         // sender is handed back over `links` for the Join source to drive.
         tokio::spawn(async move {
-            mesh::run_mesh_link(link, rx, sessions, mesh).await;
+            mesh::run_mesh_link(link, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
         });
         // A send failure here means the links collector has gone away (the relay
         // is tearing down); the driver keeps running on its connection until
@@ -218,7 +218,7 @@ pub async fn run_mesh_dial(
     // *client* `Endpoint::client` created here is not kept alive anywhere else.
     tokio::spawn(async move {
         let _endpoint = endpoint; // keep alive for the connection's lifetime
-        mesh::run_mesh_link(link, rx, sessions, mesh).await;
+        mesh::run_mesh_link(link, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
     });
     let _ = links.send(tx).await;
 }
