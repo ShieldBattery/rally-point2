@@ -169,7 +169,7 @@ impl AsRef<str> for KeyId {
 /// challenge-response after connecting (see module docs). Stored as a raw byte
 /// array — this crate does not depend on a crypto library; sign/verify live in
 /// the consuming crates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientPublicKey(pub [u8; PUBLIC_KEY_LEN]);
 
 impl ClientPublicKey {

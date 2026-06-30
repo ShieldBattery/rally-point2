@@ -5,8 +5,10 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 
 > **Implementation status — temporary note, delete once complete.** What exists today is the
 > single-relay core: `client–relay–client` with the per-link transport, the relay's validating client
-> edge, and the client's forward-recovery driver. The mesh, resilience/failover, consensus, and
-> coordinator described below are designed but not yet built.
+> edge, the client's forward-recovery driver, the mesh-edge connection half + idle teardown, the
+> consensus decision core, and the coordinator MVP (relay registry, per-tenant token issuance,
+> session setup, and the HTTP control-plane API). Resilience/failover, the coordinator-driven mesh
+> Join push, and the decision-maker runtime wiring are designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly

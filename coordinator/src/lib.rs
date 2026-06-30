@@ -5,23 +5,30 @@
 //! policy, but stays **off the turn hot path** so running games survive a
 //! coordinator outage. Responsibilities:
 //!
-//! - **registry** — authenticated relay phone-home + fleet inventory.
-//! - **sessions** — accept app-server session requests (N players / regions),
-//!   issue connection-bound, per-tenant tokens, and push session descriptors
-//!   including the pre-provisioned backup relay.
-//! - **tenants** — per-tenant signing keys, quotas, rate limits, provisioning
-//!   budget; **prod is an isolated deployment**.
-//! - **policy** — set latency/leave consensus *bounds* at setup; the relay
-//!   executes per-turn.
+//! - **registry** ([`registry`]) — relay phone-home + fleet inventory
+//! - **tenant** ([`tenant`]) — per-tenant Ed25519 signing keys + token
+//!   issuance; the coordinator's counterpart to the relay's verification
+//!   registry.
+//! - **session** ([`session`]) — accept app-server session requests (N players
+//!   / regions), assign home + backup relays, issue connection-bound tokens,
+//!   and build session descriptors including the backup relay.
+//! - **api** ([`api`]) — the HTTP control-plane API (relay phone-home +
+//!   session setup endpoints), exposed as a testable router.
+//! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
+//!   executes per-turn. The bounds type itself lives in
+//!   [`rally_point_proto::control::BufferBounds`] (it crosses the
+//!   coordinator→relay boundary), and the coordinator sets it via
+//!   [`tenant::enroll`].
 //!
-//! The modules for these are not built yet; this half currently exposes only
-//! shared constants. The binary half ([`main`](../main.rs)) wires up the process.
+//! The coordinator's logic modules are pure: no I/O, no async, no network.
+//! They operate over the proto control types and the coordinator's in-memory
+//! registries. The `api` module wraps them in an HTTP router; the binary half
+//! ([`main`](../main.rs)) binds the listener and serves it.
 
-// TODO: pub mod registry;  // authenticated phone-home
-// TODO: pub mod session;   // session setup + descriptor push (backup relay)
-// TODO: pub mod tenant;    // per-tenant keys / quotas
-// TODO: pub mod policy;    // consensus policy bounds
+pub mod api;
+pub mod registry;
+pub mod session;
+pub mod tenant;
 
 /// Default port the coordinator serves its app-server + relay control API on.
-// TODO: confirm the control transport (HTTP vs QUIC control streams).
 pub const DEFAULT_PORT: u16 = 14_910;

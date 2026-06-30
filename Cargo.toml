@@ -87,6 +87,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- CLI ---
 clap = { version = "4.6", features = ["derive", "env"] }
+# --- HTTP (coordinator control plane) ---
+# axum is the coordinator's app-server + relay control API. The coordinator is
+# control-plane only (low-frequency JSON over HTTP), so a lightweight Tokio
+# web framework is the right tool — no need for a QUIC control channel.
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "tokio",
+  "json",
+] }
+# tower's `ServiceExt::oneshot` drives the coordinator's HTTP router in tests
+# without binding a socket.
+tower = { version = "0.5", default-features = false }
 
 [workspace.lints.rust]
 # The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not

@@ -22,10 +22,10 @@
 
 use std::fmt::Write;
 
-use rally_point_proto::control::TenantId;
+use rally_point_proto::control::{BufferBounds, TenantId};
 use rally_point_proto::ids::{GameFrameCount, SessionId};
 use rally_point_proto::messages::{LinkConditions, SlotConditions};
-use rally_point_relay::consensus::{Authority, BufferBounds, ControlLaw, DecisionMaker};
+use rally_point_relay::consensus::{Authority, ControlLaw, DecisionMaker};
 use rally_point_relay::routing::SessionKey;
 
 /// One turn's worth of synthetic link conditions for a single slot. RTT is in

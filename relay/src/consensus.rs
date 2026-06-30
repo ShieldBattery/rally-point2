@@ -128,34 +128,11 @@
 
 use std::collections::HashMap;
 
+use rally_point_proto::control::BufferBounds;
 use rally_point_proto::ids::{GameFrameCount, SlotId};
 use rally_point_proto::messages::LinkConditions;
 
 use crate::routing::SessionKey;
-
-/// The latency-buffer bounds the coordinator sets at setup. The decision-maker
-/// stays within these; the coordinator only sets policy and makes no
-/// per-adjustment decision, so a running game is unaffected by a coordinator
-/// outage.
-///
-/// `min` is the floor (never below -- StarCraft's `builtin_turn_latency` + a
-/// minimum user cushion); `max` is the ceiling (the coordinator's provisioning
-/// budget / worst-case tolerance). The decision-maker clamps its output to
-/// this range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferBounds {
-    /// The minimum buffer (in turns) the decision-maker may set.
-    pub min: u32,
-    /// The maximum buffer (in turns) the decision-maker may set.
-    pub max: u32,
-}
-
-impl BufferBounds {
-    /// Clamp `value` into `[min, max]`.
-    fn clamp(&self, value: u32) -> u32 {
-        value.clamp(self.min, self.max)
-    }
-}
 
 /// The buffer size in turns. StarCraft's `net_user_latency` is the added
 /// user latency (0/1/2 in the native game); the decision-maker may widen past
