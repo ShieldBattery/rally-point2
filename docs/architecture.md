@@ -205,11 +205,20 @@ each established connection spawns a `run_mesh_link` driver. The `--relay-id`/`-
 a **dev/loopback** escape hatch (two relays on one machine); in production the coordinator pushes peer
 topology at runtime — relays churn under scale-to-zero (D3), so the peer set is unknowable at startup,
 and the dial side needs the peer's id *before* connecting (the tie-break is a pre-connect local
-decision, not a post-connect exchange). The `MeshCommand::Join`/`Leave` that drives session membership
-on a link is **not** wired from the binary yet: today the integration test sends it on the driver's
-command sender directly, and in production the coordinator's session-descriptor push (Phase 3) will —
-targeting the specific link serving a session, never broadcasting. So the binary establishes mesh
-connections and keeps the drivers alive, but session membership is an injected input.
+decision). The dialer knows whom it dialed, but the acceptor only sees an inbound connection from an
+ephemeral port, so right after connecting the dialer sends a one-way identity hello (`MeshHello`) and
+the acceptor reads it; each established link is then **labeled with its peer's id**. This is labeling,
+not the tie-break — it carries no authority and doesn't decide the dial.
+
+The labeled links feed a **`MeshControl` Join source**: it holds each peer's `MeshCommand` sender keyed
+by id, and turns a coordinator `SessionDescriptor` into targeted `MeshCommand::Join`/`Leave` on the link
+to each peer the descriptor names — never a broadcast. It records *desired* membership, so a descriptor
+that names a peer whose link hasn't established yet joins the moment that link registers (and vice
+versa), making it robust to link-vs-descriptor arrival order. The one piece still missing is the
+**coordinator→relay control transport** that delivers the descriptor: until it lands, the binary
+collects labeled links into `MeshControl` and stands ready, the parked drivers awaiting their first
+Join, and the integration test drives `Join` on the command senders directly (and through
+`apply_descriptor`) to prove the path end-to-end.
 
 **Mesh-link idle teardown.** A `run_mesh_link` driver tears down its connection when it has been
 session-less for long enough — but only *after* it has served at least one session. The idle timer is

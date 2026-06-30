@@ -15,10 +15,15 @@
 //! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
 //!   topological dedup, degrade-to-single-relay (`C–S–C`).
 //! - **mesh_edge** ([`mesh_edge`]) — the mesh-edge connection half: establish
-//!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise)
+//!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise),
+//!   exchange a peer-identity hello so each link is labeled with its peer's id,
 //!   and spawn a `run_mesh_link` driver. The Join/Leave stream that drives
 //!   session membership is pluggable — the test sends it today, the
 //!   coordinator's session-descriptor push does in production (Phase 3).
+//! - **mesh_control** ([`mesh_control`]) — the Join source: holds the per-peer
+//!   `MeshCommand` senders the connection half surfaces and turns a coordinator
+//!   `SessionDescriptor` into targeted `Join`/`Leave` on the links serving that
+//!   session. Robust to whether a link or its descriptor arrives first.
 //! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
 //!   relay-side core that turns game-wide network conditions into a buffer-size
 //!   change, scheduled at an agreed future turn. Authority is an injected input
@@ -37,6 +42,7 @@
 pub mod auth;
 pub mod config;
 pub mod mesh;
+pub mod mesh_control;
 pub mod mesh_edge;
 pub mod routing;
 pub mod server;

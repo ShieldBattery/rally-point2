@@ -77,7 +77,15 @@ pub const ALPN: &[u8] = b"rp2/4";
 /// one congestion controller per backbone path rather than N competing ones. A
 /// peer that doesn't know `MeshPacket` sends bare `Packet` datagrams that can't
 /// be demuxed by session — incompatible.
-pub const MESH_ALPN: &[u8] = b"rp2-mesh/1";
+///
+/// `2`: the dialing relay sends a `MeshHello` (its relay id) on a fresh
+/// unidirectional stream immediately after connecting, and the accepting relay
+/// now *requires* it before serving the link (it labels the link with the peer's
+/// id so session joins can target it). A `1` peer never sends that hello, so a
+/// mixed pair would connect and then stall until the acceptor's hello timeout —
+/// an asymmetric runtime failure. Bumping the version rejects the mismatch
+/// cleanly at TLS negotiation instead.
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/2";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -302,6 +310,59 @@ mod tests {
         assert!(
             server_result.is_err(),
             "the server must reject a stale-ALPN handshake"
+        );
+    }
+
+    /// A relay still on the previous mesh ALPN (`rp2-mesh/1`, before the
+    /// mandatory post-connect identity hello) is rejected at the handshake by a
+    /// current relay, rather than connecting and then stalling until the
+    /// acceptor's hello timeout. The mesh establishment protocol is versioned on
+    /// its own `rp2-mesh/N` line, so a connection-shape change like requiring
+    /// the hello is an incompatible bump old and new builds can't negotiate.
+    ///
+    /// Mirrors [`rejects_a_peer_with_a_stale_alpn`] for the mesh edge: the server
+    /// advertises both current ALPNs, and a dialer offering only the stale
+    /// `rp2-mesh/1` matches neither.
+    #[tokio::test]
+    async fn rejects_a_mesh_peer_with_a_stale_alpn() {
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("a connection arrived");
+            incoming.await
+        });
+
+        // A mesh dialer identical to the real one except it advertises the prior
+        // mesh ALPN — neither current ALPN the server offers.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"rp2-mesh/1".to_vec()];
+        let stale_cfg =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(stale_cfg);
+
+        let client_result = client.connect(server_addr, "localhost").unwrap().await;
+        let server_result = server_task.await.unwrap();
+
+        assert!(
+            client_result.is_err(),
+            "a stale mesh-ALPN dialer must fail the handshake"
+        );
+        assert!(
+            server_result.is_err(),
+            "the server must reject a stale mesh-ALPN handshake"
         );
     }
 }

@@ -2,25 +2,26 @@
 //! (`mesh_edge::run_mesh_accept` + `run_mesh_dial`): two real relays serve on
 //! their own endpoints, the lower-id one dials the higher-id one through the
 //! production dial path, the higher-id one accepts through the production
-//! accept drain, and each established link's `MeshCommand` sender comes back on
-//! the `links` channel. The test sends `Join` on both senders (exactly as the
-//! coordinator's session-descriptor push will in Phase 3, and as `mesh_edge.rs`
-//! sends it on the command channel directly), then proves a turn flows
-//! cross-relay.
+//! accept drain, and each established link comes back on the `links` channel as
+//! `(peer id, MeshCommand sender)` — the dialer's id known from config, the
+//! acceptor's learned from the identity hello. The first test sends `Join` on
+//! both senders directly and proves a turn flows cross-relay; the second drives
+//! the same turn through `MeshControl::apply_descriptor`, exactly as the
+//! coordinator's session-descriptor push will once its control transport exists.
 //!
 //! This mirrors `mesh_edge.rs::cross_relay_turn_delivery_is_exactly_once` but
 //! exercises the connection-establishment layer (`mesh_edge`) instead of
 //! manually creating `MeshLink`s and spawning `run_mesh_link`. The per-link
-//! driver, dedup, and fan-out are already proven by `mesh_edge.rs`; this test
-//! proves the connection half wires them up correctly and the returned
-//! command senders drive Join end-to-end.
+//! driver, dedup, and fan-out are already proven by `mesh_edge.rs`; these tests
+//! prove the connection half wires them up correctly, labels each link with its
+//! peer, and that Join drives cross-relay delivery end-to-end.
 
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rally_point_proto::control::TenantId;
+use rally_point_proto::control::{BufferBounds, RelayPeer, SessionDescriptor, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_proto::token::{
@@ -30,6 +31,7 @@ use rally_point_proto::token::{
 };
 use rally_point_relay::auth::HANDSHAKE_OK;
 use rally_point_relay::mesh;
+use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_edge;
 use rally_point_relay::routing::{SessionKey, Sessions};
 use rally_point_relay::server;
@@ -243,8 +245,9 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     let relay_b = Relay::start(&tenant, 2);
 
     // B's accept drain: spawns a `run_mesh_link` driver for each peer relay
-    // that dials in, returning the command sender on `links_b_rx`.
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<mpsc::Sender<mesh::MeshCommand>>(8);
+    // that dials in, returning `(peer id, command sender)` on `links_b_rx`.
+    let (links_b_tx, mut links_b_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -253,8 +256,10 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     ));
 
     // A dials B. The dial establishes the connection and spawns a
-    // `run_mesh_link` driver, returning the command sender on `links_a_rx`.
-    let (links_a_tx, mut links_a_rx) = mpsc::channel::<mpsc::Sender<mesh::MeshCommand>>(8);
+    // `run_mesh_link` driver, returning `(peer id, command sender)` on
+    // `links_a_rx`.
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let dial = mesh_edge::MeshDial {
@@ -271,20 +276,28 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
         links_a_tx,
     ));
 
-    // Collect the command senders from each side's `links` channel.
-    let cmds_a = links_a_rx
+    // Collect each side's link, labeled with the peer it reaches. A dialed B,
+    // so A's link is labeled with B's id; B read the dialer's identity hello,
+    // so B's link is labeled with A's id.
+    let (peer_a, cmds_a) = links_a_rx
         .recv()
         .await
         .ok_or("dial side did not produce a link")?;
-    let cmds_b = links_b_rx
+    let (peer_b, cmds_b) = links_b_rx
         .recv()
         .await
         .ok_or("accept side did not produce a link")?;
+    assert_eq!(peer_a, RelayId(2), "A's link reaches B");
+    assert_eq!(
+        peer_b,
+        RelayId(1),
+        "B learned the dialer's id from the hello",
+    );
 
-    // Send Join on both sides — the test drives this exactly as the
-    // coordinator's session-descriptor push will in Phase 3.
-    cmds_a.send(mesh::MeshCommand::Join(key.clone())).await?;
-    cmds_b.send(mesh::MeshCommand::Join(key.clone())).await?;
+    // Send Join on both sides — the test drives the command senders directly,
+    // standing in for the coordinator-fed `MeshControl` Join source.
+    cmds_a.send(mesh::MeshCommand::Join(key.clone()))?;
+    cmds_b.send(mesh::MeshCommand::Join(key.clone()))?;
 
     // Connect clients: slot 0 (sender) on relay A, slot 1 on relay B.
     let mut client_a =
@@ -316,6 +329,114 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     Ok(())
 }
 
+/// The same cross-relay turn, but driven by [`mesh_control::MeshControl`]
+/// applying a coordinator [`SessionDescriptor`] instead of a hand-sent `Join`.
+///
+/// Proves the production Join path end to end: each established link registers
+/// in the relay's `MeshControl` keyed by the peer id the hello carried, a
+/// descriptor names that peer, `apply_descriptor` emits the targeted `Join` on
+/// the right link, and a turn flows cross-relay. This is exactly what the
+/// coordinator's session-descriptor push will drive once its control transport
+/// to the relay exists.
+#[tokio::test]
+async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(1);
+
+    // Relay A (id 1) dials; relay B (id 2) accepts.
+    let relay_a = Relay::start(&tenant, 1);
+    let relay_b = Relay::start(&tenant, 2);
+
+    // Each relay's Join source.
+    let control_a = mesh_control::MeshControl::new(RelayId(1));
+    let control_b = mesh_control::MeshControl::new(RelayId(2));
+
+    let (links_b_tx, mut links_b_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    tokio::spawn(mesh_edge::run_mesh_accept(
+        relay_b.mesh_accept_rx,
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+        links_b_tx,
+    ));
+
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let dial = mesh_edge::MeshDial {
+        our_id: RelayId(1),
+        peer_id: RelayId(2),
+        peer_addr: relay_b.addr,
+        server_name: "localhost".to_owned(),
+        roots,
+    };
+    tokio::spawn(mesh_edge::run_mesh_dial(
+        dial,
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+    ));
+
+    // Register each established link in its relay's control, keyed by the peer
+    // id the connection half labeled it with. Awaiting the link makes this
+    // deterministic — no sleeping to hope the link came up.
+    let (peer_a, cmds_a) = links_a_rx
+        .recv()
+        .await
+        .ok_or("dial side did not produce a link")?;
+    control_a.register_link(peer_a, cmds_a);
+    let (peer_b, cmds_b) = links_b_rx
+        .recv()
+        .await
+        .ok_or("accept side did not produce a link")?;
+    control_b.register_link(peer_b, cmds_b);
+
+    // The coordinator pushes each relay its descriptor: A's only peer is B, and
+    // B's only peer is A. Applying it emits the targeted Join on the link the
+    // peer id selects.
+    control_a.apply_descriptor(&SessionDescriptor {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+        peers: vec![RelayPeer {
+            relay_id: RelayId(2),
+            relay_addr: relay_b.addr,
+        }],
+        bounds: BufferBounds::new(1, 6).unwrap(),
+    });
+    control_b.apply_descriptor(&SessionDescriptor {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+        peers: vec![RelayPeer {
+            relay_id: RelayId(1),
+            relay_addr: relay_a.addr,
+        }],
+        bounds: BufferBounds::new(1, 6).unwrap(),
+    });
+
+    // Connect clients: slot 0 (sender) on relay A, slot 1 on relay B.
+    let mut client_a =
+        connect_client(relay_a.addr, &relay_a.ca, &tenant, session, SlotId(0)).await?;
+    let mut client_b =
+        connect_client(relay_b.addr, &relay_b.ca, &tenant, session, SlotId(1)).await?;
+
+    // Let the mesh drivers process the Join (open their sessions) before the turn.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    client_a.send(Some(turn(0, 0))).unwrap();
+
+    let received_b = tokio::time::timeout(Duration::from_secs(2), client_b.recv())
+        .await
+        .map_err(|_| "client B did not receive the turn within 2s")?
+        .map_err(|e| format!("client B link error: {e}"))?;
+    assert_eq!(received_b.fresh.len(), 1, "B: exactly one payload");
+    assert_eq!(received_b.fresh[0].slot, 0);
+    assert_eq!(received_b.fresh[0].seq, 0);
+
+    drop(relay_a);
+    Ok(())
+}
+
 /// `should_dial_mesh` returns false for equal ids, so neither relay dials —
 /// `run_mesh_dial` is a no-op and the `links` channel receives nothing.
 #[tokio::test]
@@ -324,7 +445,8 @@ async fn equal_relay_ids_do_not_dial() -> Result<(), AnyError> {
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 1);
 
-    let (links_tx, mut links_rx) = mpsc::channel::<mpsc::Sender<mesh::MeshCommand>>(8);
+    let (links_tx, mut links_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let dial = mesh_edge::MeshDial {
@@ -358,7 +480,8 @@ async fn higher_id_relay_does_not_dial_lower_id_peer() -> Result<(), AnyError> {
     let relay_a = Relay::start(&tenant, 2); // higher id
     let relay_b = Relay::start(&tenant, 1); // lower id (would dial A)
 
-    let (links_tx, mut links_rx) = mpsc::channel::<mpsc::Sender<mesh::MeshCommand>>(8);
+    let (links_tx, mut links_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let dial = mesh_edge::MeshDial {

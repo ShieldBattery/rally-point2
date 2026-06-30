@@ -48,6 +48,13 @@ impl std::fmt::Display for SessionId {
 /// discovered by exchanging ids over a stream — by the time such an exchange
 /// could run, the dial that needed deciding has already happened.
 ///
+/// A separate, *post-connect* step does carry the id over the wire, for a
+/// different reason: once connected, the dialer announces its id to the
+/// acceptor (a `MeshHello`) so the higher-id side, which only sees an inbound
+/// connection from an ephemeral source port, can label which peer that link
+/// reaches. That labeling does not decide the dial — it just lets a relay aim a
+/// session join at the right link instead of broadcasting.
+///
 /// Real relay-to-relay authentication and tenant binding land with the
 /// coordinator (Phase 3); the id is the ordering key that establishment needs
 /// before that, and nothing more.

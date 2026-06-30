@@ -205,8 +205,8 @@ fn spawn_mesh_link(
     link: MeshLink,
     sessions: Sessions,
     mesh: mesh::MeshState,
-) -> mpsc::Sender<mesh::MeshCommand> {
-    let (tx, rx) = mpsc::channel(8);
+) -> mpsc::UnboundedSender<mesh::MeshCommand> {
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(mesh::run_mesh_link(
         link,
         rx,
@@ -226,10 +226,10 @@ fn spawn_mesh_link_timed(
     mesh: mesh::MeshState,
     idle_timeout: Duration,
 ) -> (
-    mpsc::Sender<mesh::MeshCommand>,
+    mpsc::UnboundedSender<mesh::MeshCommand>,
     tokio::task::JoinHandle<mesh::MeshLinkExit>,
 ) {
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(mesh::run_mesh_link(link, rx, sessions, mesh, idle_timeout));
     (tx, handle)
 }
@@ -297,9 +297,9 @@ async fn idle_link_tears_down_after_timeout_post_session() -> Result<(), AnyErro
     let _peer_alive = mesh_b;
 
     // Join, then leave — arming the idle timer on the transition to empty.
-    cmds_a.send(mesh::MeshCommand::Join(key.clone())).await?;
+    cmds_a.send(mesh::MeshCommand::Join(key.clone()))?;
     tokio::time::sleep(Duration::from_millis(20)).await;
-    cmds_a.send(mesh::MeshCommand::Leave(key)).await?;
+    cmds_a.send(mesh::MeshCommand::Leave(key))?;
 
     // Wait past the idle timeout (200ms) plus a margin.
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -375,14 +375,8 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
 
     let cmds_a = spawn_mesh_link(mesh_a, Arc::clone(&relay_a.sessions), relay_a.mesh.clone());
     let cmds_b = spawn_mesh_link(mesh_b, Arc::clone(&relay_b.sessions), relay_b.mesh.clone());
-    cmds_a
-        .send(mesh::MeshCommand::Join(key.clone()))
-        .await
-        .unwrap();
-    cmds_b
-        .send(mesh::MeshCommand::Join(key.clone()))
-        .await
-        .unwrap();
+    cmds_a.send(mesh::MeshCommand::Join(key.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key.clone())).unwrap();
 
     // Connect clients: slot 0 (sender) on A, slot 1 on B.
     let client_key_0 = keypair();
@@ -500,14 +494,8 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     let cmds_a = spawn_mesh_link(mesh_a, Arc::clone(&relay_a.sessions), relay_a.mesh.clone());
     let cmds_b = spawn_mesh_link(mesh_b, Arc::clone(&relay_b.sessions), relay_b.mesh.clone());
     for k in [&key_1, &key_2] {
-        cmds_a
-            .send(mesh::MeshCommand::Join(k.clone()))
-            .await
-            .unwrap();
-        cmds_b
-            .send(mesh::MeshCommand::Join(k.clone()))
-            .await
-            .unwrap();
+        cmds_a.send(mesh::MeshCommand::Join(k.clone())).unwrap();
+        cmds_b.send(mesh::MeshCommand::Join(k.clone())).unwrap();
     }
 
     // Game 1: slot 0 on A, slot 1 on B.
@@ -635,14 +623,8 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     let cmds_b = spawn_mesh_link(mesh_b, Arc::clone(&relay_b.sessions), relay_b.mesh.clone());
 
     // Session 1 joins first and exchanges a turn, proving the link is live.
-    cmds_a
-        .send(mesh::MeshCommand::Join(key_1.clone()))
-        .await
-        .unwrap();
-    cmds_b
-        .send(mesh::MeshCommand::Join(key_1.clone()))
-        .await
-        .unwrap();
+    cmds_a.send(mesh::MeshCommand::Join(key_1.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key_1.clone())).unwrap();
 
     let client_key_1a = keypair();
     let token_1a = mint_token(&tenant, session_1, SlotId(0), client_key_1a.public);
@@ -684,14 +666,8 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     assert_eq!(received_s1.fresh.len(), 1, "session 1: exactly one payload");
 
     // Now session 2 joins the already-running link — the dynamic-join path.
-    cmds_a
-        .send(mesh::MeshCommand::Join(key_2.clone()))
-        .await
-        .unwrap();
-    cmds_b
-        .send(mesh::MeshCommand::Join(key_2.clone()))
-        .await
-        .unwrap();
+    cmds_a.send(mesh::MeshCommand::Join(key_2.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key_2.clone())).unwrap();
 
     let client_key_2a = keypair();
     let token_2a = mint_token(&tenant, session_2, SlotId(0), client_key_2a.public);
@@ -728,9 +704,12 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
 
 /// The per-Join collision guard on the live driver: two tenants that both
 /// assigned session id 1 can't be told apart on the wire, so the second Join
-/// is refused — not overwriting the first. A client in tenant A's session 1
-/// still receives turns after the colliding Join is attempted, proving the
-/// first tenant's session survived and the second didn't cross-wire it.
+/// is refused — not overwriting the first. The colliding tenant then *leaves*
+/// the shared id; because the driver keys `joined` by the bare wire session id,
+/// a Leave that matched on id alone would evict whatever holds it — tenant A.
+/// A client in tenant A's session 1 still receives turns after both the
+/// colliding Join and its Leave are attempted, proving the Leave matched the
+/// full SessionKey and left the legitimate tenant's session intact.
 #[tokio::test]
 async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Result<(), AnyError> {
     // tenant_b only needs to differ in name — the collision is on the mesh
@@ -778,26 +757,25 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     let cmds_b = spawn_mesh_link(mesh_b, Arc::clone(&relay_b.sessions), relay_b.mesh.clone());
 
     // Tenant A joins session 1 first on both sides.
-    cmds_a
-        .send(mesh::MeshCommand::Join(key_a.clone()))
-        .await
-        .unwrap();
-    cmds_b
-        .send(mesh::MeshCommand::Join(key_a.clone()))
-        .await
-        .unwrap();
+    cmds_a.send(mesh::MeshCommand::Join(key_a.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key_a.clone())).unwrap();
 
     // Tenant B attempts to join the same session id — must be refused, not
     // overwriting tenant A's session. The command is accepted by the channel
     // (the driver logs and drops it); there's no ack, so we prove refusal by
     // showing tenant A's session still works afterward.
+    cmds_b.send(mesh::MeshCommand::Join(key_b.clone())).unwrap();
+    cmds_a.send(mesh::MeshCommand::Join(key_b.clone())).unwrap();
+
+    // Tenant B then leaves the colliding id. The driver keys `joined` by the
+    // bare wire session id, so a Leave matching on id alone would evict tenant
+    // A's session 1. The Leave must match the full SessionKey and be ignored
+    // here, leaving tenant A's session intact — proven by the delivery below.
     cmds_b
-        .send(mesh::MeshCommand::Join(key_b.clone()))
-        .await
+        .send(mesh::MeshCommand::Leave(key_b.clone()))
         .unwrap();
     cmds_a
-        .send(mesh::MeshCommand::Join(key_b.clone()))
-        .await
+        .send(mesh::MeshCommand::Leave(key_b.clone()))
         .unwrap();
 
     // Connect tenant A's clients: slot 0 on A, slot 1 on B.
@@ -835,12 +813,12 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Tenant A's turn still delivers across the mesh after the colliding Join
-    // was attempted — proving tenant A's session survived and tenant B did not
-    // overwrite it (which would have cross-wired the two tenants).
+    // and its Leave were attempted — proving tenant A's session survived, tenant
+    // B never overwrote it, and B's Leave on the shared id did not evict it.
     client_a.send(Some(turn(0, 0))).unwrap();
     let received = tokio::time::timeout(Duration::from_secs(2), client_b.recv())
         .await
-        .expect("tenant A's turn did not arrive within 2s after colliding Join")
+        .expect("tenant A's turn did not arrive within 2s after colliding Join + Leave")
         .expect("client B link error");
     assert_eq!(received.fresh.len(), 1, "exactly one payload delivered");
     assert_eq!(received.fresh[0].slot, 0);

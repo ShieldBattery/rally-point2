@@ -8,13 +8,15 @@
 //! The mesh edge's connection half is wired here: peer-relay connections that
 //! arrive on the mesh ALPN are dispatched to [`mesh_edge::run_mesh_accept`], and
 //! each `--mesh-peer` dials via [`mesh_edge::run_mesh_dial`] when the
-//! [`should_dial_mesh`] tie-break says this relay is the lower id. The
-//! `MeshCommand::Join`/`Leave` that drives session membership is *not* wired
-//! here: today the integration test sends it on the driver's command sender
-//! directly, and in production the coordinator's session-descriptor push
-//! (Phase 3) does — targeting the specific link serving a session, never
-//! broadcasting. So the binary establishes the mesh connections but does not
-//! yet know which sessions to join on them.
+//! [`should_dial_mesh`] tie-break says this relay is the lower id. Each
+//! established link surfaces `(peer id, MeshCommand sender)`, which the binary
+//! collects into a [`mesh_control::MeshControl`] — the Join source that turns a
+//! coordinator `SessionDescriptor` into targeted `Join`/`Leave` on the link to
+//! each session peer. What is *not* wired yet is the descriptor *source*: the
+//! coordinator→relay control transport that would call `apply_descriptor`. Until
+//! it lands the registry fills as links establish and stands ready, and the
+//! parked drivers wait for their first Join (the integration test drives `Join`
+//! on the command senders directly).
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -27,6 +29,7 @@ use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
 use rally_point_relay::mesh;
+use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_edge;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::{DEFAULT_PORT, server};
@@ -159,13 +162,15 @@ async fn main() -> Result<()> {
     // The mesh-edge connection half. When a relay-id is configured, spawn the
     // accept drain (peer relays dialing us arrive on `mesh_accept`) and one
     // dial task per `--mesh-peer` (we dial the peers we're lower-id than).
-    // Each established link's `MeshCommand` sender comes back on `links_rx` —
-    // the Join source (the test today, the coordinator's session-descriptor
-    // push in Phase 3) sends Join/Leave on those senders.
+    // Each established link comes back on `links_rx` as `(peer id, MeshCommand
+    // sender)` — the peer id labels which relay the link reaches, so the Join
+    // source can target a session join at the right link.
     let mesh_accept = if let Some(our_id) = cli.relay_id {
         let (mesh_accept_tx, mesh_accept_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(8);
-        let (links_tx, mut links_rx) =
-            tokio::sync::mpsc::channel::<tokio::sync::mpsc::Sender<mesh::MeshCommand>>(8);
+        let (links_tx, mut links_rx) = tokio::sync::mpsc::channel::<(
+            RelayId,
+            tokio::sync::mpsc::UnboundedSender<mesh::MeshCommand>,
+        )>(8);
 
         // Clone `links_tx` for the accept task; the original stays for the dial
         // tasks below (each clones again per peer).
@@ -201,18 +206,21 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Hold the link senders so the drivers' command channels stay alive.
-        // `run_mesh_link` ends when its command sender is dropped (the contract
-        // in its docs), so dropping a sender the instant it arrives would
-        // terminate every mesh link right after it establishes. Collect them
-        // into a Vec that outlives the loop. Today nothing sends Join from the
-        // binary (the coordinator's session-descriptor push is Phase 3); this
-        // is purely lifetime custody so the drivers stay up and ready for the
-        // future Join source.
+        // The relay's Join source. Each established link registers here keyed by
+        // its peer id; a coordinator `SessionDescriptor` then drives targeted
+        // `Join`/`Leave` on the links serving each session. Registering also
+        // keeps the drivers' command channels alive — `run_mesh_link` ends when
+        // its command sender is dropped, so the registry holding each sender is
+        // what keeps a freshly established (not-yet-joined) link parked and ready.
+        //
+        // The descriptor *source* — the coordinator→relay control transport that
+        // would call `apply_descriptor` — is the remaining wiring. Until it lands
+        // the registry fills as links establish and stands ready (the integration
+        // test drives `Join` on the command senders directly).
+        let mesh_control = mesh_control::MeshControl::new(RelayId(our_id));
         tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(tx) = links_rx.recv().await {
-                held.push(tx);
+            while let Some((peer_id, command_tx)) = links_rx.recv().await {
+                mesh_control.register_link(peer_id, command_tx);
             }
         });
 

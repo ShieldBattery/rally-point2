@@ -264,13 +264,30 @@ pub fn new_mesh_state() -> MeshState {
 /// connection, so a single driver task drains all sessions' outbound turns from
 /// one channel.
 type MeshForwardTx = mpsc::Sender<(rally_point_proto::ids::SessionId, Payload)>;
-/// Capacity of a mesh-link driver's `MeshCommand` channel — the Join/Leave
-/// stream the test (today) or the coordinator's session-descriptor push
-/// (Phase 3) sends on. These are low-frequency control messages (a handful
-/// per game over its life, not the turn stream), so a small bounded capacity
-/// is right: enough headroom that a slow driver draining one Join doesn't
-/// block the next, without reserving for a traffic burst that never comes.
-pub(crate) const COMMAND_CAPACITY: usize = 32;
+/// Creates the command channel for one mesh-link driver — the `Join`/`Leave`
+/// stream the test (today) or the coordinator's session-descriptor push drives.
+///
+/// Unbounded by design. These are rare control messages (a handful per game, not
+/// the turn stream) that the driver's select loop drains promptly, so the queue
+/// does not grow in practice. Making it unbounded means a burst of session
+/// starts on one relay-pair can never *drop* a `Join`/`Leave`: a dropped command
+/// would silently desync mesh membership — most insidiously a dropped `Leave`,
+/// which would leave the driver forwarding a session the coordinator has
+/// removed, with no later event to correct it. Backpressure is the wrong tool
+/// for a control channel where every message must arrive; the only delivery
+/// failure is the receiver going away (the driver exited), which the Join source
+/// ([`mesh_control`](crate::mesh_control)) treats as a dead link to re-sync on
+/// reconnect.
+///
+/// This is distinct from the per-turn forward channel (`FORWARD_CAPACITY`),
+/// which is deliberately bounded: there, dropping a redundant copy under load is
+/// correct (the transport re-carries it), so backpressure is the right tool.
+pub(crate) fn command_channel() -> (
+    mpsc::UnboundedSender<MeshCommand>,
+    mpsc::UnboundedReceiver<MeshCommand>,
+) {
+    mpsc::unbounded_channel()
+}
 
 /// How long a mesh link stays up after its last session leaves before the
 /// driver tears it down. Production passes this as the `idle_timeout` arg to
@@ -423,7 +440,7 @@ pub enum MeshCommand {
 /// the first. This is fail-closed, not fail-open.
 pub async fn run_mesh_link(
     mut link: rally_point_transport::MeshLink,
-    mut commands: mpsc::Receiver<MeshCommand>,
+    mut commands: mpsc::UnboundedReceiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
     idle_timeout: std::time::Duration,
@@ -616,7 +633,15 @@ pub async fn run_mesh_link(
                     }
                     Some(MeshCommand::Leave(key)) => {
                         let session_id = key.session;
-                        if joined.remove(&session_id).is_some() {
+                        // Match the full SessionKey, not just the wire's bare
+                        // session id. A colliding cross-tenant Join (same id,
+                        // different tenant) was refused at Join time and never
+                        // entered `joined`, so a later Leave carrying that
+                        // refused key must not evict the tenant that
+                        // legitimately holds the id — that would close the wrong
+                        // tenant's session and cross-wire the two.
+                        if joined.get(&session_id).is_some_and(|state| state.key == key) {
+                            joined.remove(&session_id);
                             link.close_session(session_id);
                             deregister_mesh_link(&mesh_links, &key);
                             // Arm the idle timer when the last session leaves,
