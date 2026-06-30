@@ -30,3 +30,9 @@ rustls-pemfile = { workspace = true }
 # crypto provider — no NASM toolchain needed.
 rcgen = { workspace = true }
 hex = { workspace = true }
+# WebSocket client for the relay's persistent control connection to the
+# coordinator (descriptors down today, liveness up later).
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+# JSON codec for the control-connection messages.
+serde_json = { workspace = true }

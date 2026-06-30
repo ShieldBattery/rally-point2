@@ -13,12 +13,13 @@
 //!   slot and session.
 //! - The latency-buffer bounds the relay's decision-maker clamps to.
 //!
-//! The coordinator also builds a [`SessionDescriptor`] per relay — the push
-//! that drives `MeshCommand::Join` in production. `create_session` records
-//! which relays serve which session; `descriptor_for` reads that membership to
-//! build the per-relay mesh-peer list. Today `create_session` returns the
-//! response for the app server; the descriptor push to relays is the wiring
-//! step that follows.
+//! The coordinator also builds a [`SessionDescriptor`] per relay — what drives
+//! `MeshCommand::Join` in production. `create_session` records which relays
+//! serve which session; `descriptor_for` reads that membership to build the
+//! per-relay mesh-peer list. `create_session` both returns the response for the
+//! app server *and* stages each relay's descriptor in the
+//! [outbox](crate::descriptors), which the relay's descriptor-fetch endpoint
+//! delivers to the running relay.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::token::ExpiresAt;
 
+use crate::descriptors::RelayDescriptors;
 use crate::registry::{self, RelayRegistry, SessionSetupError};
 use crate::tenant::{self, TenantStore};
 
@@ -55,6 +57,10 @@ pub struct SessionSetup {
     /// Which relays serve which session. Populated by `create_session`,
     /// read by `descriptor_for`.
     session_relays: SessionRelays,
+    /// Per-relay descriptor outbox — what each relay should currently apply on
+    /// its mesh links. Populated by `create_session`; read by the relay's
+    /// descriptor-fetch endpoint.
+    descriptors: RelayDescriptors,
     /// The session-id counter. Monotonic within this coordinator's lifetime;
     /// scoped per `SessionSetup` instance so tests get isolated counters.
     /// Session ids are unique within a tenant but not globally (two tenants
@@ -70,6 +76,7 @@ impl SessionSetup {
             registry,
             tenants,
             session_relays: Arc::new(Mutex::new(HashMap::new())),
+            descriptors: RelayDescriptors::new(),
             next_session: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -84,6 +91,12 @@ impl SessionSetup {
     /// the `CoordinatorState`).
     pub fn tenants(&self) -> &TenantStore {
         &self.tenants
+    }
+
+    /// Exposes the per-relay descriptor outbox (the descriptor-fetch endpoint
+    /// reads the current set a relay should apply).
+    pub fn descriptors(&self) -> &RelayDescriptors {
+        &self.descriptors
     }
 }
 
@@ -138,7 +151,16 @@ pub fn create_session(
     setup
         .session_relays
         .lock()
-        .insert((request.tenant.clone(), session), relay_ids);
+        .insert((request.tenant.clone(), session), relay_ids.clone());
+
+    // Stage each relay's descriptor in the outbox so the relay's descriptor
+    // fetch delivers it. Built after membership is recorded, since
+    // `descriptor_for` reads that membership to list a relay's mesh peers.
+    for &relay_id in &relay_ids {
+        if let Some(descriptor) = descriptor_for(setup, &request.tenant, session, relay_id) {
+            setup.descriptors.record(relay_id, descriptor);
+        }
+    }
 
     let mut tokens = Vec::with_capacity(request.players.len());
     for player in &request.players {
@@ -552,6 +574,63 @@ mod tests {
         // Only relay 2 is a peer — relay 3 is excluded.
         assert_eq!(desc.peers.len(), 1);
         assert_eq!(desc.peers[0].relay_id, RelayId(2));
+    }
+
+    #[test]
+    fn create_session_stages_descriptors_for_each_relay() {
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        // Both relays serving the session have a descriptor staged in the outbox,
+        // each naming the other as its mesh peer.
+        let for_home = setup.descriptors().current_for(resp.home_relay.relay_id);
+        assert_eq!(for_home.len(), 1);
+        assert_eq!(for_home[0].session, resp.session);
+        assert_eq!(for_home[0].peers.len(), 1);
+        assert_eq!(for_home[0].peers[0].relay_id, resp.backup_relay.relay_id);
+
+        let for_backup = setup.descriptors().current_for(resp.backup_relay.relay_id);
+        assert_eq!(for_backup.len(), 1);
+        assert_eq!(for_backup[0].peers[0].relay_id, resp.home_relay.relay_id);
+    }
+
+    #[test]
+    fn create_session_single_relay_stages_a_peerless_descriptor() {
+        // A single-relay session still stages a descriptor (with no peers) so the
+        // relay learns the session and its bounds, even with no mesh.
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 5, 14900);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+
+        create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        let staged = setup.descriptors().current_for(RelayId(5));
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].peers.is_empty());
     }
 
     #[test]

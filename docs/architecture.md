@@ -7,8 +7,11 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > single-relay core: `client–relay–client` with the per-link transport, the relay's validating client
 > edge, the client's forward-recovery driver, the mesh-edge connection half + idle teardown, the
 > consensus decision core, and the coordinator MVP (relay registry, per-tenant token issuance,
-> session setup, and the HTTP control-plane API). Resilience/failover, the coordinator-driven mesh
-> Join push, and the decision-maker runtime wiring are designed but not yet built.
+> session setup, and the HTTP control-plane API). The **coordinator→relay descriptor push** is now
+> wired end-to-end: each relay holds a persistent, bootstrap-secret-authenticated control connection
+> to the coordinator, which pushes the relay's session descriptors down it to drive mesh `Join`/`Leave`.
+> Resilience/failover, the relay→coordinator liveness reporting that will share that connection, and the
+> decision-maker runtime wiring are designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -214,11 +217,10 @@ The labeled links feed a **`MeshControl` Join source**: it holds each peer's `Me
 by id, and turns a coordinator `SessionDescriptor` into targeted `MeshCommand::Join`/`Leave` on the link
 to each peer the descriptor names — never a broadcast. It records *desired* membership, so a descriptor
 that names a peer whose link hasn't established yet joins the moment that link registers (and vice
-versa), making it robust to link-vs-descriptor arrival order. The one piece still missing is the
-**coordinator→relay control transport** that delivers the descriptor: until it lands, the binary
-collects labeled links into `MeshControl` and stands ready, the parked drivers awaiting their first
-Join, and the integration test drives `Join` on the command senders directly (and through
-`apply_descriptor`) to prove the path end-to-end.
+versa), making it robust to link-vs-descriptor arrival order. The descriptors arrive over the
+relay's **control connection** to the coordinator (see [The control connection](#the-control-connection-coordinator--relay));
+a relay run without a coordinator URL (pure dev/loopback) instead has its `Join`s driven directly by
+the integration test on the command senders (and through `apply_descriptor`).
 
 **Mesh-link idle teardown.** A `run_mesh_link` driver tears down its connection when it has been
 session-less for long enough — but only *after* it has served at least one session. The idle timer is
@@ -298,6 +300,56 @@ authenticated **relay registry** (relays phone home to enroll), assigns each gam
 relays** and region, and provisions relay capacity. Matchmaking and lobby formation stay in the
 per-tenant app server; the coordinator only finds and spins up relays. Production runs its own isolated
 coordinator, signing key, and relay fleet; staging and external developers share a separate one.
+
+### The control connection (coordinator ↔ relay)
+
+Each relay holds **one persistent control connection** open to its coordinator — a WebSocket on the
+coordinator's HTTP server, dialed by the relay. The coordinator pushes the relay's **session
+descriptors** down it (driving mesh `Join`/`Leave`), and the relay will report **liveness** back up the
+same connection as presence tracking lands. One channel, authenticated once at the handshake, in both
+directions.
+
+**Logical push, physical pull.** The coordinator decides a relay's mesh membership and the relay
+applies it — the data flows coordinator→relay. But the relay is what *opens* the connection, rather than
+the coordinator reaching into a relay that churns under scale-to-zero and may sit behind a firewall.
+Reaching out also reuses the coordinator's existing HTTP server and authenticates with an ordinary
+HTTP credential, instead of standing up an inbound control surface on the attacker-facing relay.
+
+**A held connection, not polling.** The connection stays open rather than the relay polling an endpoint.
+That buys three things: the coordinator pushes a change the instant it happens (no poll interval of
+staleness); the connection's own liveness *is* a heartbeat (a drop is an immediate "this relay is gone"
+signal — exactly what presence tracking and failover want, instead of inferring death from missed
+polls); and the two directions share one connection instead of two periodic round-trips. It is a
+WebSocket rather than QUIC because the coordinator is deliberately an HTTP service and a low-frequency
+control channel gains nothing from QUIC's congestion control or stream multiplexing — a held TCP
+connection is plenty, and rides the server that already exists.
+
+**Declarative current-state.** The coordinator holds, per relay, that relay's *current* descriptor set
+(the descriptor for every session it should serve) behind a watch, and pushes the whole set — on connect
+(a re-sync) and again on every change. The relay applies each descriptor through its idempotent Join
+source, so re-pushing an unchanged set is a no-op and a reconnect converges rather than double-applies.
+The set is **not** a stream of deltas; the one thing a relay must do that a delta would carry explicitly
+is detect *removals* — a session gone from the set is one to leave — which it does by diffing against
+what it last applied, kept across reconnects so a session removed while the relay was briefly
+disconnected is left when the next connection's full set arrives without it.
+
+**Auth.** The relay presents a coordinator-issued **bootstrap secret** (`Authorization: Bearer …`) on the
+upgrade; a mismatch is rejected before the socket opens (a constant-time compare, so the secret isn't
+probed a byte at a time). It **fails closed**: the coordinator refuses to start with no secret unless an
+explicit insecure opt-in is set, so an unauthenticated control endpoint is never a silent default — the
+open mode exists only for trusted dev/loopback that has consciously asked for it. This authenticates the
+relay *to* the coordinator; the reverse direction (the relay trusting it reached the real coordinator) is
+TLS's job: the connection runs over `wss://` (rustls on this workspace's ring provider, validating against
+the public web PKI), so a publicly-trusted coordinator cert works today, while trusting an internal-CA or
+self-signed cert (a custom root store) rides the still-open internal-CA / cert story alongside the `S===S`
+inter-relay auth — until then a `wss://` coordinator needs a public cert or the secret-bearing channel
+runs on trusted transport as `ws://`. **The secret today authenticates "a relay," not a specific relay
+id** — a secret-holder can subscribe as any `relay_id` and read that relay's descriptor set, and the
+requested id is not checked against the registry. Binding the connection to a relay identity (per-relay
+credentials or a signed bootstrap token carrying the id, plus rejecting unregistered ids) lands with that
+same cert work; until then the connection is for trusted (internal / loopback) deployment only. A
+keepalive ping for faster dead-connection detection, and the relay→coordinator liveness frames, are the
+channel's next additions.
 
 ## Components
 

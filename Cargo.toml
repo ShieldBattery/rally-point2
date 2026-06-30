@@ -95,10 +95,32 @@ axum = { version = "0.8", default-features = false, features = [
   "http1",
   "tokio",
   "json",
+  # The relay holds a persistent control connection to the coordinator over a
+  # WebSocket on this same server — bidirectional, so the coordinator pushes
+  # descriptors down and (later) the relay reports liveness up the one channel.
+  "ws",
 ] }
 # tower's `ServiceExt::oneshot` drives the coordinator's HTTP router in tests
 # without binding a socket.
 tower = { version = "0.5", default-features = false }
+# WebSocket client for the relay's persistent control connection to the
+# coordinator. `rustls-tls-webpki-roots` enables wss:// over rustls; the crate
+# brings rustls/tokio-rustls with default-features off, so it rides this
+# workspace's pinned **ring** provider (its `ClientConfig::builder()` uses the
+# single compiled provider) — no aws-lc-rs, no second crypto stack, no NASM.
+# webpki public roots cover wss against a publicly-trusted coordinator cert; an
+# internal-CA / custom-root config is part of the deferred relay-trust work.
+# Pinned to the same 0.29 axum's `ws` feature already pulls, so the tree carries
+# one copy, not two.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+  "connect",
+  "handshake",
+  "rustls-tls-webpki-roots",
+] }
+# `StreamExt::next` for reading the relay's WebSocket control stream. (The send
+# half — `SinkExt` + the `sink` feature — lands when the relay reports liveness
+# back up this same connection.)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 # The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not

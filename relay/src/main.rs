@@ -12,11 +12,11 @@
 //! established link surfaces `(peer id, MeshCommand sender)`, which the binary
 //! collects into a [`mesh_control::MeshControl`] — the Join source that turns a
 //! coordinator `SessionDescriptor` into targeted `Join`/`Leave` on the link to
-//! each session peer. What is *not* wired yet is the descriptor *source*: the
-//! coordinator→relay control transport that would call `apply_descriptor`. Until
-//! it lands the registry fills as links establish and stands ready, and the
-//! parked drivers wait for their first Join (the integration test drives `Join`
-//! on the command senders directly).
+//! each session peer. The descriptor *source* is wired too: with `--coordinator-url`
+//! set, a [`coordinator_client`] task holds a control connection open to the
+//! coordinator and drives the Join source from the descriptor sets it pushes.
+//! Without it (pure dev/loopback), the registry fills as links establish and tests
+//! drive `Join` directly.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use rally_point_proto::ids::RelayId;
 use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
+use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh;
 use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_edge;
@@ -106,6 +107,22 @@ struct Cli {
     /// production cert otherwise.
     #[arg(long, env = "RELAY_MESH_SERVER_NAME", default_value = "localhost")]
     mesh_server_name: String,
+
+    /// Base URL of the coordinator's control-plane API (e.g.
+    /// `http://coordinator.internal:14910`). When set together with `--relay-id`,
+    /// the relay holds a control connection open to the coordinator and applies
+    /// the session descriptors it pushes — the production source of mesh
+    /// `Join`/`Leave`. Absent (pure dev/loopback), mesh membership is driven only
+    /// by tests or by links establishing; no coordinator is contacted.
+    #[arg(long, env = "RELAY_COORDINATOR_URL")]
+    coordinator_url: Option<String>,
+
+    /// Bootstrap secret presented to the coordinator (`Authorization: Bearer
+    /// <secret>`) when opening the control connection. Must match the
+    /// coordinator's `--bootstrap-secret`. Absent for dev/loopback against an
+    /// open coordinator.
+    #[arg(long, env = "RELAY_COORDINATOR_SECRET")]
+    coordinator_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -212,12 +229,23 @@ async fn main() -> Result<()> {
         // keeps the drivers' command channels alive — `run_mesh_link` ends when
         // its command sender is dropped, so the registry holding each sender is
         // what keeps a freshly established (not-yet-joined) link parked and ready.
-        //
-        // The descriptor *source* — the coordinator→relay control transport that
-        // would call `apply_descriptor` — is the remaining wiring. Until it lands
-        // the registry fills as links establish and stands ready (the integration
-        // test drives `Join` on the command senders directly).
         let mesh_control = mesh_control::MeshControl::new(RelayId(our_id));
+
+        // The descriptor source. When a coordinator URL is configured, hold a
+        // control connection open to it and apply the session-descriptor sets it
+        // pushes through the Join source — the production path that drives
+        // `Join`/`Leave`. Without a URL (pure dev/loopback with `--mesh-peer`),
+        // the registry still fills as links establish and tests drive `Join` on
+        // the command senders directly.
+        if let Some(coordinator_url) = cli.coordinator_url.clone() {
+            tokio::spawn(coordinator_client::run_descriptor_subscriber(
+                coordinator_url,
+                RelayId(our_id),
+                cli.coordinator_secret.clone(),
+                mesh_control.clone(),
+            ));
+        }
+
         tokio::spawn(async move {
             while let Some((peer_id, command_tx)) = links_rx.recv().await {
                 mesh_control.register_link(peer_id, command_tx);

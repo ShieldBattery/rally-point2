@@ -306,6 +306,50 @@ pub struct SessionDescriptor {
     pub bounds: BufferBounds,
 }
 
+// ---------------------------------------------------------------------------
+// Persistent control connection (coordinator ⇄ relay)
+// ---------------------------------------------------------------------------
+
+/// A message the coordinator sends down the persistent control connection a
+/// relay holds open to it.
+///
+/// The connection is the relay's single, authenticated control channel: the
+/// coordinator pushes mesh topology down it, and (as the control plane grows)
+/// the relay reports liveness up it. This enum is the **down** direction. It is
+/// tagged so the channel can carry new message kinds without a wire break — a
+/// relay and coordinator deploy independently, so during a rolling deploy a newer
+/// coordinator may send a message kind an older relay does not know. The
+/// [`Unknown`](Self::Unknown) catch-all makes that a *skip* rather than a parse
+/// error: an unrecognized `type` deserializes to `Unknown` instead of failing, so
+/// an older relay ignores the new message and keeps its connection rather than
+/// churning it.
+///
+/// The descriptor set is **declarative current state**, not a stream of deltas:
+/// the coordinator sends the relay's whole current set on connect (so a
+/// reconnecting relay re-syncs) and again whenever it changes, and the relay
+/// applies it idempotently. Re-sending the same set is a no-op on the relay, so
+/// the channel never has to guarantee exactly-once delivery — losing a message
+/// to a dropped connection just means the next one (on reconnect) carries the
+/// current truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CoordinatorToRelay {
+    /// The relay's full current session-descriptor set — every session this
+    /// relay should serve, each naming that session's mesh peers. The relay
+    /// joins the named peers' links and leaves any session no longer present.
+    Descriptors {
+        /// The descriptors, one per session this relay currently serves.
+        descriptors: Vec<SessionDescriptor>,
+    },
+    /// A message kind this build does not recognize — a newer coordinator sent
+    /// one this relay's protocol version predates. An unknown `type` decodes here
+    /// (rather than erroring), so the relay skips it and keeps the connection. The
+    /// payload is intentionally dropped: a relay can't act on a message it doesn't
+    /// understand, only refrain from breaking on it.
+    #[serde(other)]
+    Unknown,
+}
+
 /// serde helper for opaque byte slices (token wire bytes).
 mod serde_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -358,6 +402,37 @@ mod tests {
         let json = serde_json::to_string(&hello).unwrap();
         let back: RelayHello = serde_json::from_str(&json).unwrap();
         assert_eq!(back, hello);
+    }
+
+    #[test]
+    fn coordinator_to_relay_descriptors_roundtrips_json() {
+        let message = CoordinatorToRelay::Descriptors {
+            descriptors: vec![SessionDescriptor {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                peers: vec![RelayPeer {
+                    relay_id: RelayId(2),
+                    relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                }],
+                bounds: BufferBounds::new(1, 6).unwrap(),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        // The tagged frame is self-describing: a `type` discriminator names the
+        // variant so the channel can grow new message kinds.
+        assert!(json.contains("\"type\":\"descriptors\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn coordinator_to_relay_unknown_type_decodes_to_unknown_not_an_error() {
+        // Forward compatibility: a message kind a newer coordinator added, which
+        // this build predates, must decode to `Unknown` rather than failing — so
+        // an older relay skips it instead of tearing down its control connection.
+        let json = r#"{"type":"some_future_message","extra":123}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }
 
     #[test]

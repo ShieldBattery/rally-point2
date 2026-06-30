@@ -12,8 +12,13 @@
 //! - **session** ([`session`]) — accept app-server session requests (N players
 //!   / regions), assign home + backup relays, issue connection-bound tokens,
 //!   and build session descriptors including the backup relay.
-//! - **api** ([`api`]) — the HTTP control-plane API (relay phone-home +
-//!   session setup endpoints), exposed as a testable router.
+//! - **descriptors** ([`descriptors`]) — the per-relay descriptor outbox: the
+//!   coordinator side of the control connection. Holds each relay's current
+//!   session-descriptor set behind a watch channel and pushes it down the
+//!   relay's open control connection whenever it changes.
+//! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
+//!   setup, and the relay's persistent control connection (an authenticated
+//!   WebSocket), exposed as a testable router.
 //! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
 //!   executes per-turn. The bounds type itself lives in
 //!   [`rally_point_proto::control::BufferBounds`] (it crosses the
@@ -26,6 +31,7 @@
 //! ([`main`](../main.rs)) binds the listener and serves it.
 
 pub mod api;
+pub mod descriptors;
 pub mod registry;
 pub mod session;
 pub mod tenant;

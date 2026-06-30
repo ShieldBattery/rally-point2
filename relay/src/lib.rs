@@ -24,6 +24,10 @@
 //!   `MeshCommand` senders the connection half surfaces and turns a coordinator
 //!   `SessionDescriptor` into targeted `Join`/`Leave` on the links serving that
 //!   session. Robust to whether a link or its descriptor arrives first.
+//! - **coordinator_client** ([`coordinator_client`]) — the relay side of the
+//!   coordinator→relay control transport: polls the coordinator for this relay's
+//!   current session-descriptor set and feeds each descriptor to the
+//!   `mesh_control` Join source, reconciling membership as sessions come and go.
 //! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
 //!   relay-side core that turns game-wide network conditions into a buffer-size
 //!   change, scheduled at an agreed future turn. Authority is an injected input
@@ -41,6 +45,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod coordinator_client;
 pub mod mesh;
 pub mod mesh_control;
 pub mod mesh_edge;
