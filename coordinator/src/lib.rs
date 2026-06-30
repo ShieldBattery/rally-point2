@@ -5,7 +5,7 @@
 //! policy, but stays **off the turn hot path** so running games survive a
 //! coordinator outage. Responsibilities:
 //!
-//! - **registry** ([`registry`]) — relay phone-home + fleet inventory
+//! - **registry** ([`registry`]) — relay enrollment + fleet inventory
 //! - **tenant** ([`tenant`]) — per-tenant Ed25519 signing keys + token
 //!   issuance; the coordinator's counterpart to the relay's verification
 //!   registry.

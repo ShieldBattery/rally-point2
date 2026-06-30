@@ -9,8 +9,10 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > consensus decision core, and the coordinator MVP (relay registry, per-tenant token issuance,
 > session setup, and the HTTP control-plane API). The **coordinator→relay descriptor push** is now
 > wired end-to-end: each relay holds a persistent, bootstrap-secret-authenticated control connection
-> to the coordinator, which pushes the relay's session descriptors down it to drive mesh `Join`/`Leave`.
-> Resilience/failover, the relay→coordinator liveness reporting that will share that connection, and the
+> to the coordinator, **enrolls itself** over it (its identity and address ride the first frame, into the registry), and
+> receives the session descriptors the coordinator pushes back down to drive mesh `Join`/`Leave`.
+> Resilience/failover, the relay→coordinator liveness reporting that will share that connection (and the
+> connection-lifetime-bound deregistration it brings), dual-stack advertise addresses, and the
 > decision-maker runtime wiring are designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
@@ -296,8 +298,8 @@ can drive an in-game netgraph or other debugging output.
 ### Control plane: the coordinator
 
 The coordinator sits off the hot path. It mints per-tenant, connection-bound **tokens**, runs the
-authenticated **relay registry** (relays phone home to enroll), assigns each game its **home and backup
-relays** and region, and provisions relay capacity. Matchmaking and lobby formation stay in the
+authenticated **relay registry** (relays enroll over their control connection), assigns each game its
+**home and backup relays** and region, and provisions relay capacity. Matchmaking and lobby formation stay in the
 per-tenant app server; the coordinator only finds and spins up relays. Production runs its own isolated
 coordinator, signing key, and relay fleet; staging and external developers share a separate one.
 
@@ -308,6 +310,20 @@ coordinator's HTTP server, dialed by the relay. The coordinator pushes the relay
 descriptors** down it (driving mesh `Join`/`Leave`), and the relay will report **liveness** back up the
 same connection as presence tracking lands. One channel, authenticated once at the handshake, in both
 directions.
+
+**Enroll over the connection.** A relay's *first* frame is its `Hello` — its id and the address clients
+and peer relays reach it at — which enrolls it into the coordinator's registry. So a relay registers
+*and* receives its topology over one authenticated connection, not a phone-home POST plus a separate
+socket; the registry membership and the descriptor stream share a lifecycle and a credential. The relay
+**asserts** its address (it isn't observed from the connection's source, since a relay serves both IPv4
+and IPv6 but reaches the coordinator over only one of them): a `--advertise-addr` flag, defaulting to the
+listen address, with cloud-substrate auto-discovery later. Two near-term simplifications: enroll carries
+a **single** address — the dual-stack model (a v4 *and* a v6 endpoint, with per-family selection at the
+consumers) is a follow-up reshape of the relay-address contract — and a dropped connection does **not**
+deregister the relay (enrollment persists, as a phone-home would). Connection-lifetime-bound
+registration — a drop evicts the relay, a reconnect re-enrolls — needs to handle a reconnect overwriting
+the entry the dropping connection would remove, so it lands with the liveness work that rides this same
+connection.
 
 **Logical push, physical pull.** The coordinator decides a relay's mesh membership and the relay
 applies it — the data flows coordinator→relay. But the relay is what *opens* the connection, rather than

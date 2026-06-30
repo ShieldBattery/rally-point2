@@ -29,3 +29,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 rally-point-relay = { workspace = true }
 tower = { workspace = true }
+# A raw WebSocket client for the control-endpoint tests (e.g. a connection that
+# never sends its enroll Hello), which the relay's own client can't express.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

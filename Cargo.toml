@@ -117,10 +117,12 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "handshake",
   "rustls-tls-webpki-roots",
 ] }
-# `StreamExt::next` for reading the relay's WebSocket control stream. (The send
-# half — `SinkExt` + the `sink` feature — lands when the relay reports liveness
-# back up this same connection.)
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `StreamExt::next` to read the relay's WebSocket control stream and `SinkExt::send`
+# to send its enroll Hello (and, later, liveness) back up the same connection.
+futures-util = { version = "0.3", default-features = false, features = [
+  "std",
+  "sink",
+] }
 
 [workspace.lints.rust]
 # The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not

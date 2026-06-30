@@ -66,15 +66,19 @@ impl AsRef<str> for TenantId {
 // Relay registry (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
 
-/// The first message a relay sends when it phones home to its coordinator.
+/// The first frame a relay sends on its control connection, enrolling it into
+/// the coordinator's registry (wrapped in [`RelayToCoordinator::Hello`]).
 ///
-/// The relay presents its coordinator-assigned id, its listen address (where
-/// clients and peer relays reach it), and the protocol version it implements;
-/// the coordinator records these in its registry and uses them to build
-/// session descriptors and mesh topology.
+/// The relay presents its coordinator-assigned id, its advertised address (where
+/// clients and peer relays reach it), and the protocol version it implements; the
+/// coordinator records these in its registry and uses them to build session
+/// descriptors and mesh topology.
 ///
-/// Phone-home authentication (a coordinator-injected bootstrap secret) is
-/// not yet enforced — the enroll endpoint is open for dev/loopback today.
+/// The control connection that carries this is authenticated by a
+/// coordinator-issued bootstrap secret (fail-closed: the coordinator refuses to
+/// serve it unauthenticated without an explicit insecure opt-in). The relay id
+/// here is still an unverified claim — binding the connection to a relay identity
+/// is deferred to the relay-identity / mTLS work.
 ///
 /// `relay_addr` is the public address clients and peer relays connect to. It
 /// serializes as the familiar `"ip:port"` string via serde's built-in
@@ -350,6 +354,29 @@ pub enum CoordinatorToRelay {
     Unknown,
 }
 
+/// A message a relay sends **up** the persistent control connection it holds to
+/// the coordinator — the counterpart to [`CoordinatorToRelay`].
+///
+/// The first frame a relay sends is its [`Hello`](Self::Hello): it enrolls the
+/// relay into the coordinator's registry over the same authenticated connection
+/// that then carries descriptor pushes back down, so a relay has one channel to
+/// the coordinator rather than a separate phone-home. Tagged and forward-compatible
+/// the same way as the down direction — a message kind a newer relay sends that an
+/// older coordinator predates decodes to [`Unknown`](Self::Unknown) and is skipped
+/// rather than tearing the connection down. Relay→coordinator liveness reporting
+/// will arrive as further variants here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RelayToCoordinator {
+    /// The relay's identity and reachable address, sent as the first frame to
+    /// enroll into the coordinator's registry.
+    Hello(RelayHello),
+    /// A message kind this coordinator does not recognize (a newer relay). Decodes
+    /// here so the coordinator skips it rather than dropping the connection.
+    #[serde(other)]
+    Unknown,
+}
+
 /// serde helper for opaque byte slices (token wire bytes).
 mod serde_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -433,6 +460,30 @@ mod tests {
         let json = r#"{"type":"some_future_message","extra":123}"#;
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn relay_to_coordinator_hello_roundtrips_json() {
+        let message = RelayToCoordinator::Hello(RelayHello::new(
+            RelayId(3),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+        ));
+        let json = serde_json::to_string(&message).unwrap();
+        // The Hello's fields ride alongside the tag (internally tagged).
+        assert!(json.contains("\"type\":\"hello\""));
+        assert!(json.contains("\"relay_id\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn relay_to_coordinator_unknown_type_decodes_to_unknown_not_an_error() {
+        // The up direction is forward-compatible too: a frame a newer relay sends
+        // that an older coordinator predates decodes to `Unknown`, not an error.
+        let json = r#"{"type":"future_up_frame","x":1}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
     }
 
     #[test]

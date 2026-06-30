@@ -1,4 +1,4 @@
-//! HTTP control-plane API: relay phone-home + session setup endpoints.
+//! HTTP control-plane API: session setup + the relay control connection.
 //!
 //! Exposes a [`router`] function that builds the axum [`Router`] over the
 //! coordinator's shared state. The binary binds a TCP listener and serves it;
@@ -7,31 +7,34 @@
 //!
 //! # Endpoints
 //!
-//! - `POST /relay/enroll` — a relay phones home. Body: [`RelayHello`];
-//!   response: the [`RelayEntry`] the coordinator now holds.
 //! - `POST /session/create` — an app server requests a session. Body:
 //!   [`SessionRequest`]; response: [`SessionResponse`] with per-player tokens
 //!   and the relay topology.
-//! - `GET /relay/{relay_id}/control` — a relay opens its persistent control
-//!   connection (a WebSocket). The coordinator pushes the relay's current
-//!   session-descriptor set down it — on connect (re-sync) and on every change —
-//!   driving `MeshCommand::Join`/`Leave` on the running relay. The connection is
-//!   authenticated by a coordinator-issued **bootstrap secret** the relay
-//!   presents as `Authorization: Bearer <secret>` on the upgrade. Auth is
-//!   [`ControlAuth`]: either a required secret or an explicit `Open` (no auth) —
-//!   there is no implicit open default, and the binary refuses to start `Open`
-//!   without an explicit opt-in. This same connection is where relay→coordinator
-//!   liveness reporting will ride later — one channel, authenticated once, in
-//!   both directions.
+//! - `GET /relay/control` — a relay opens its persistent control connection (a
+//!   WebSocket). The relay's first frame is a [`RelayToCoordinator::Hello`] that
+//!   **enrolls** it into the registry; the coordinator then pushes the relay's
+//!   current session-descriptor set down the same connection — on connect
+//!   (re-sync) and on every change — driving `MeshCommand::Join`/`Leave` on the
+//!   running relay. So a relay registers and receives topology over one channel,
+//!   not a separate phone-home plus a socket. The connection is authenticated by
+//!   a coordinator-issued **bootstrap secret** the relay presents as
+//!   `Authorization: Bearer <secret>` on the upgrade. Auth is [`ControlAuth`]:
+//!   either a required secret or an explicit `Open` (no auth) — there is no
+//!   implicit open default, and the binary refuses to start `Open` without an
+//!   explicit opt-in. This same connection is where relay→coordinator liveness
+//!   reporting will ride later — one channel, authenticated once, in both
+//!   directions.
 //!
-//! The JSON endpoints are HTTP/1.1; the control endpoint upgrades to a WebSocket.
-//! App-server auth on `session/create` is still open — that is a separate
-//! per-tenant credential, not the relay bootstrap secret.
+//! `session/create` is JSON over HTTP/1.1; the control endpoint upgrades to a
+//! WebSocket. App-server auth on `session/create` is still open — that is a
+//! separate per-tenant credential, not the relay bootstrap secret.
+
+use std::time::Duration;
 
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
@@ -39,11 +42,11 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayEntry, RelayHello, SessionDescriptor, SessionRequest, SessionResponse,
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
+    SessionResponse,
 };
-use rally_point_proto::ids::RelayId;
 
-use crate::registry;
+use crate::registry::{self, RelayRegistry};
 use crate::session::{self, SessionSetup};
 
 /// How the relay control endpoint authenticates a connecting relay.
@@ -89,6 +92,13 @@ pub fn resolve_control_auth(
     }
 }
 
+/// How long a control connection has, after the WebSocket upgrade, to send its
+/// enroll `Hello` before the coordinator drops it. Bounds an authenticated (or,
+/// in `Open` mode, any) connection that opens the socket but never enrolls, so it
+/// cannot pin a task indefinitely — the symmetric counterpart to the relay's own
+/// client-edge authorization timeout.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The shared state the HTTP handlers operate over: the coordinator's
 /// session-setup context plus the relay control-connection auth posture.
 /// Cloned cheaply (the setup's fields are `Arc`-backed), so axum's per-request
@@ -100,29 +110,17 @@ pub struct CoordinatorState {
     pub setup: SessionSetup,
     /// How a relay authenticates to open its control connection.
     pub control_auth: ControlAuth,
+    /// How long a connection has to send its enroll `Hello` before it is dropped
+    /// (see [`HELLO_TIMEOUT`]). A field so tests can shorten it.
+    pub hello_timeout: Duration,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
 pub fn router(state: CoordinatorState) -> Router {
     Router::new()
-        .route("/relay/enroll", post(enroll_relay))
         .route("/session/create", post(create_session))
-        .route("/relay/{relay_id}/control", get(relay_control))
+        .route("/relay/control", get(relay_control))
         .with_state(state)
-}
-
-/// Enrolls a relay that has phoned home.
-async fn enroll_relay(
-    State(state): State<CoordinatorState>,
-    Json(hello): Json<RelayHello>,
-) -> Json<RelayEntry> {
-    let entry = registry::enroll(state.setup.registry(), hello);
-    tracing::info!(
-        relay_id = %entry.relay_id,
-        addr = %entry.relay_addr,
-        "relay enrolled"
-    );
-    Json(entry)
 }
 
 /// Creates a game session: assigns relays, mints tokens.
@@ -162,50 +160,74 @@ async fn create_session(
 
 /// Accepts a relay's persistent control connection (a WebSocket).
 ///
-/// Authenticates the relay against the bootstrap secret, then upgrades and serves
-/// the relay's descriptor stream. The auth check runs before the upgrade, so a
-/// rejected relay gets a `401` rather than an open socket.
+/// Authenticates against the bootstrap secret before the upgrade — a rejected
+/// relay gets a `401` rather than an open socket — then upgrades and serves the
+/// connection, which enrolls the relay (from its `Hello`) and pushes descriptors.
 ///
 /// **Known limitation (deferred):** the bootstrap secret authenticates "a relay,"
-/// not *this* `relay_id`. A holder of the shared secret can connect as any relay
-/// id and receive that relay's descriptor set, and the path `relay_id` is not
-/// checked against the registry. Binding the connection to a relay identity —
-/// per-relay credentials or a signed bootstrap token carrying the `relay_id`, plus
-/// rejecting unregistered ids — lands with the relay-identity / mTLS work, the
-/// same effort that brings coordinator→relay trust. Until then this endpoint is
-/// for trusted (loopback / internal) deployment only.
+/// not a specific relay id. A holder of the shared secret can connect, enroll as
+/// any relay id, and receive that relay's descriptor set; the id in the `Hello`
+/// is an unverified claim. Binding the connection to a relay identity — per-relay
+/// credentials or a signed bootstrap token carrying the id — lands with the
+/// relay-identity / mTLS work, the same effort that brings coordinator→relay
+/// trust. Until then this endpoint is for trusted (loopback / internal)
+/// deployment only.
 async fn relay_control(
     State(state): State<CoordinatorState>,
-    Path(relay_id): Path<u64>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !control_auth_ok(&headers, &state.control_auth) {
-        tracing::warn!(
-            relay_id,
-            "relay control connection rejected: bad bootstrap secret"
-        );
+        tracing::warn!("relay control connection rejected: bad bootstrap secret");
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let relay_id = RelayId(relay_id);
+    let registry = state.setup.registry().clone();
     let descriptors = state.setup.descriptors().clone();
-    tracing::info!(relay_id = relay_id.0, "relay control connection accepted");
-    ws.on_upgrade(move |socket| serve_relay_control(socket, relay_id, descriptors))
+    let hello_timeout = state.hello_timeout;
+    ws.on_upgrade(move |socket| serve_relay_control(socket, registry, descriptors, hello_timeout))
 }
 
-/// Serves one relay's control connection: push the current descriptor set, then
-/// push again whenever it changes, until the relay disconnects.
+/// Serves one relay's control connection: enroll from its `Hello`, push the
+/// current descriptor set, then push again whenever it changes, until the relay
+/// disconnects.
 ///
-/// The first send re-syncs a (re)connecting relay to its current membership; the
-/// loop then waits on either a change to that set or an inbound frame. Inbound
-/// frames are where relay→coordinator reporting will arrive; none is defined yet,
-/// so a non-close frame is ignored. The loop ends when the relay closes, the
-/// connection errors, or the coordinator's outbox is dropped (shutdown).
+/// The relay's first frame must be its [`RelayToCoordinator::Hello`], sent within
+/// `hello_timeout`; it enrolls the relay into the registry, and only then does the
+/// connection subscribe to that relay's descriptors and re-sync it. The loop then
+/// waits on either a change to that set or an inbound frame; no further up-frames
+/// are defined yet (liveness reporting will arrive here), so a non-close frame is
+/// ignored. The loop ends when the relay closes, the connection errors, or the
+/// coordinator's outbox is dropped (shutdown).
+///
+/// The relay is **not** deregistered when the connection drops: tying registry
+/// membership to the live connection (so a drop evicts the relay) needs to handle
+/// a reconnect overwriting the entry the dropping connection would remove, which
+/// is the province of the liveness work — so for now enrollment persists, exactly
+/// as a phone-home would have.
 async fn serve_relay_control(
     mut socket: WebSocket,
-    relay_id: RelayId,
+    registry: RelayRegistry,
     descriptors: crate::descriptors::RelayDescriptors,
+    hello_timeout: Duration,
 ) {
+    // The first frame enrolls the relay, and must arrive within the deadline — a
+    // connection that opens the socket but never sends a Hello is dropped rather
+    // than left to pin a task. A bad/absent first frame likewise just closes.
+    let hello = match tokio::time::timeout(hello_timeout, read_hello(&mut socket)).await {
+        Ok(Some(hello)) => hello,
+        Ok(None) => return,
+        Err(_elapsed) => {
+            tracing::debug!("control connection sent no Hello within the deadline; closing");
+            return;
+        }
+    };
+    let relay_id = hello.relay_id;
+    registry::enroll(&registry, hello);
+    tracing::info!(
+        relay_id = relay_id.0,
+        "relay enrolled over control connection"
+    );
+
     let mut rx = descriptors.subscribe(relay_id);
 
     // Initial re-sync. Clone the set out of the watch borrow before awaiting —
@@ -229,7 +251,8 @@ async fn serve_relay_control(
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
-                    // relay→coordinator messages (liveness) are not defined yet.
+                    // Further relay→coordinator messages (liveness) are not
+                    // defined yet; an unrecognized one is ignored, not fatal.
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         tracing::debug!(%error, relay_id = relay_id.0, "relay control connection error");
@@ -240,6 +263,45 @@ async fn serve_relay_control(
         }
     }
     tracing::info!(relay_id = relay_id.0, "relay control connection closed");
+}
+
+/// Reads the relay's opening [`RelayToCoordinator::Hello`] from a freshly
+/// upgraded connection, returning the [`RelayHello`] it carries.
+///
+/// The first *application* frame must be a Hello: the protocol puts enrollment
+/// first, so anything else (a non-Hello message, an undecodable frame, binary)
+/// is a violation and closes the connection (`None`) rather than waiting — a
+/// later-protocol relay still works because its Hello decodes as one (unknown
+/// fields are ignored). Only WebSocket ping/pong control frames are skipped; the
+/// caller's deadline bounds how long a silent connection may sit before the Hello.
+async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                return match serde_json::from_str::<RelayToCoordinator>(&text) {
+                    Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
+                    Ok(RelayToCoordinator::Unknown) => {
+                        tracing::warn!("first control frame was not a Hello; closing");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "bad first control frame; closing");
+                        None
+                    }
+                };
+            }
+            // Ping/pong control frames may precede the Hello; keep waiting (the
+            // caller's timeout bounds the wait).
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            // A close, a stream end, a binary frame, or a read error before any
+            // Hello ends the handshake.
+            Some(Ok(_)) | None => return None,
+            Some(Err(error)) => {
+                tracing::debug!(%error, "control connection error before hello");
+                return None;
+            }
+        }
+    }
 }
 
 /// Sends a descriptor set down a relay's control connection as one tagged JSON
@@ -328,6 +390,7 @@ mod tests {
         CoordinatorState {
             setup,
             control_auth: ControlAuth::Open,
+            hello_timeout: HELLO_TIMEOUT,
         }
     }
 
@@ -342,42 +405,6 @@ mod tests {
                 client_pubkey: ClientPublicKey([0xBB; 32]),
             },
         ]
-    }
-
-    #[tokio::test]
-    async fn enroll_relay_endpoint_returns_entry() {
-        let state = CoordinatorState {
-            setup: crate::session::SessionSetup::new(
-                registry::new_registry(),
-                crate::tenant::new_store(),
-            ),
-            control_auth: ControlAuth::Open,
-        };
-        let app = router(state);
-
-        let hello = RelayHello::new(
-            RelayId(7),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-        );
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/relay/enroll")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&hello).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let entry: RelayEntry = serde_json::from_slice(&body).unwrap();
-        assert_eq!(entry.relay_id, RelayId(7));
     }
 
     #[tokio::test]
@@ -478,6 +505,7 @@ mod tests {
                 crate::tenant::new_store(),
             ),
             control_auth: ControlAuth::Open,
+            hello_timeout: HELLO_TIMEOUT,
         };
         let app = router(state);
 

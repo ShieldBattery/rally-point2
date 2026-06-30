@@ -10,7 +10,7 @@
 //! (coordinator/app-server), never on the relay.
 
 use color_eyre::eyre::WrapErr;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::RelayId;
@@ -172,6 +172,26 @@ pub fn server_config_from_self_signed(
         .map_err(|e| color_eyre::eyre::eyre!("building QUIC server config: {e}"))
 }
 
+/// Resolves the address a relay advertises to the coordinator — where clients
+/// and peer relays reach it, carried in the relay's enroll `Hello` — from the
+/// optional `--advertise-addr` override and the `--listen` address.
+///
+/// An explicit override always wins. Otherwise the listen address is used when it
+/// names a concrete IP; when listen is the unspecified address (`[::]` /
+/// `0.0.0.0` — the default, and not a routable destination) it falls back to
+/// loopback on the listen port, a working dev/loopback default. Production sets
+/// `--advertise-addr` explicitly (later, derived from the cloud substrate — see
+/// the dual-stack advertise follow-up).
+pub fn resolve_advertise_addr(advertise: Option<SocketAddr>, listen: SocketAddr) -> SocketAddr {
+    match advertise {
+        Some(addr) => addr,
+        None if listen.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port())
+        }
+        None => listen,
+    }
+}
+
 /// A parsed mesh-peer entry: the peer relay's listen endpoint and its id.
 ///
 /// Dev/loopback only as a CLI-parsed value. In production the coordinator
@@ -299,6 +319,32 @@ mod tests {
         assert!(!key.secret_der().is_empty());
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
+    }
+
+    // --- resolve_advertise_addr ---
+
+    #[test]
+    fn resolve_advertise_addr_prefers_the_explicit_override() {
+        let advertise: SocketAddr = "203.0.113.7:14900".parse().unwrap();
+        let listen: SocketAddr = "0.0.0.0:14900".parse().unwrap();
+        assert_eq!(resolve_advertise_addr(Some(advertise), listen), advertise);
+    }
+
+    #[test]
+    fn resolve_advertise_addr_uses_a_concrete_listen_address() {
+        let listen: SocketAddr = "192.0.2.10:14900".parse().unwrap();
+        assert_eq!(resolve_advertise_addr(None, listen), listen);
+    }
+
+    #[test]
+    fn resolve_advertise_addr_falls_back_to_loopback_for_an_unspecified_listen() {
+        // The default `[::]` listen is not a routable address to hand a client, so
+        // with no override the relay advertises loopback on the same port (dev).
+        let listen: SocketAddr = "[::]:14900".parse().unwrap();
+        assert_eq!(
+            resolve_advertise_addr(None, listen),
+            "127.0.0.1:14900".parse().unwrap()
+        );
     }
 
     // --- parse_mesh_peers ---

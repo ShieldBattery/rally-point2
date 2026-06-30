@@ -1,21 +1,22 @@
-//! Relay registry: the coordinator's view of which relays have phoned home
+//! Relay registry: the coordinator's view of which relays have enrolled
 //! and are available to serve sessions.
 //!
-//! A relay phones home once at startup with a [`RelayHello`]. The coordinator
-//! records it here and uses the registry to pick home + backup relays for
-//! session requests and to build mesh topology (the [`RelayPeer`] list in a
-//! session descriptor).
+//! A relay enrolls when it opens its control connection, sending a [`RelayHello`]
+//! as its first frame. The coordinator records it here and uses the registry to
+//! pick home + backup relays for session requests and to build mesh topology
+//! (the [`RelayPeer`] list in a session descriptor).
 //!
-//! Phone-home authentication (a coordinator-injected bootstrap secret so a
-//! rogue relay cannot register and MITM) is not yet enforced — the enroll
-//! endpoint is open for dev/loopback today. It lands alongside the relay
-//! enrollment flow.
+//! The control connection that carries enrollment is authenticated by a
+//! coordinator-issued bootstrap secret (fail-closed). Binding the connection to a
+//! specific relay *identity* (so a secret-holder cannot enroll as an arbitrary id)
+//! is deferred to the relay-identity / mTLS work.
 //!
 //! The registry is a plain `parking_lot::Mutex<HashMap<...>>` — every critical
 //! section is a short, await-free insert or lookup, mirroring the relay's
 //! `routing::Sessions` and `mesh::MeshLinks`. It is the coordinator's
 //! in-memory state: a coordinator restart loses the registry, and relays
-//! re-phone-home to repopulate it. Persistence (coordinator HA) is open.
+//! re-enroll (their control connections redial) to repopulate it. Persistence
+//! (coordinator HA) is open.
 //!
 //! # Tenant isolation
 //!
@@ -47,11 +48,12 @@ pub struct RelayRegistry {
 
 use std::sync::Arc;
 
-/// Registers a relay that has phoned home.
+/// Registers a relay that has enrolled (sent its `Hello` on its control
+/// connection).
 ///
 /// Re-registering the same `relay_id` replaces the prior entry (a relay that
-/// restarted with a new address). Returns the entry the coordinator now holds
-/// for this relay.
+/// restarted, or reconnected, with a new address). Returns the entry the
+/// coordinator now holds for this relay.
 pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> RelayEntry {
     let entry = RelayEntry {
         relay_id: hello.relay_id,

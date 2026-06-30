@@ -24,7 +24,9 @@ use std::sync::Arc;
 use clap::Parser;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
+use rally_point_proto::control::RelayHello;
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::version::ProtocolVersion;
 use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
@@ -123,6 +125,13 @@ struct Cli {
     /// open coordinator.
     #[arg(long, env = "RELAY_COORDINATOR_SECRET")]
     coordinator_secret: Option<String>,
+
+    /// Public address clients and peer relays reach this relay at — sent to the
+    /// coordinator in the enroll `Hello`. Defaults to `--listen` when that is a
+    /// concrete address, else loopback on the listen port (dev/loopback).
+    /// Production sets this explicitly (later, derived from the cloud substrate).
+    #[arg(long, env = "RELAY_ADVERTISE_ADDR")]
+    advertise_addr: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -238,9 +247,17 @@ async fn main() -> Result<()> {
         // the registry still fills as links establish and tests drive `Join` on
         // the command senders directly.
         if let Some(coordinator_url) = cli.coordinator_url.clone() {
+            let advertise_addr = config::resolve_advertise_addr(cli.advertise_addr, cli.listen);
+            let relay_hello =
+                RelayHello::new(RelayId(our_id), advertise_addr, ProtocolVersion::CURRENT);
+            tracing::info!(
+                relay_id = our_id,
+                advertise = %advertise_addr,
+                "enrolling with coordinator over the control connection",
+            );
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
                 coordinator_url,
-                RelayId(our_id),
+                relay_hello,
                 cli.coordinator_secret.clone(),
                 mesh_control.clone(),
             ));

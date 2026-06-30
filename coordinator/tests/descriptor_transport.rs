@@ -4,14 +4,15 @@
 //!
 //! This is the seam the two halves were built to meet at, exercised for real: a
 //! bound coordinator WebSocket server and the relay's live `coordinator_client`.
-//! It covers the three behaviors that matter — the initial push on connect drives
-//! a `Join`, a session ending pushes a `Leave`, and a wrong bootstrap secret
-//! drives nothing — none of which the per-side unit tests can show on their own.
+//! It covers the behaviors that matter — the relay's Hello enrolls it, the initial
+//! push on connect drives a `Join`, a session ending pushes a `Leave`, and a wrong
+//! bootstrap secret drives nothing — none of which the per-side unit tests show.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{registry, session, tenant};
 use rally_point_proto::control::{
@@ -34,6 +35,49 @@ fn session_key(session: SessionId) -> SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     }
+}
+
+/// The relay's enroll `Hello` (id + a loopback address on `port`), the first frame
+/// the subscriber sends on each connection.
+fn relay_hello(id: u64, port: u16) -> RelayHello {
+    RelayHello::new(
+        RelayId(id),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        ProtocolVersion::CURRENT,
+    )
+}
+
+/// Polls the registry until `id` enrolls, up to a couple of seconds. Returns
+/// whether it appeared — enrollment happens asynchronously once the relay's
+/// subscriber connects and sends its Hello.
+async fn wait_for_enrollment(reg: &RelayRegistry, id: RelayId) -> bool {
+    for _ in 0..100 {
+        if registry::peer(reg, id).is_some() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Serves a bare coordinator (empty registry/tenant, open auth) on an ephemeral
+/// port with the given Hello-handshake deadline, for tests that drive the control
+/// endpoint directly rather than through a session.
+async fn serve_bare_coordinator(hello_timeout: Duration) -> String {
+    let setup = session::SessionSetup::new(registry::new_registry(), tenant::new_store());
+    let app = api::router(CoordinatorState {
+        setup,
+        control_auth: ControlAuth::Open,
+        hello_timeout,
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
 }
 
 /// Stands up a coordinator with two relays + a tenant, creates a session, and
@@ -91,6 +135,7 @@ async fn coordinator_with_session(
     let app = api::router(CoordinatorState {
         setup,
         control_auth,
+        hello_timeout: api::HELLO_TIMEOUT,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -121,7 +166,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
     // The relay holds its control connection open with the matching secret.
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
-        RelayId(1),
+        relay_hello(1, 14900),
         Some(secret.to_owned()),
         control,
         Duration::from_millis(50),
@@ -143,7 +188,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
 
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
-        RelayId(1),
+        relay_hello(1, 14900),
         None,
         control,
         Duration::from_millis(50),
@@ -177,7 +222,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
     // and it keeps retrying without ever receiving a descriptor.
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
-        RelayId(1),
+        relay_hello(1, 14900),
         Some("wrong-secret".to_owned()),
         control,
         Duration::from_millis(50),
@@ -185,4 +230,85 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
 
     let result = timeout(Duration::from_millis(500), rx2.recv()).await;
     assert!(result.is_err(), "a rejected relay must never drive a Join");
+}
+
+#[tokio::test]
+async fn a_relays_hello_enrolls_it_into_the_registry() {
+    // The coordinator pre-enrolls relays 1 and 2; relay 5 is not enrolled.
+    let (base_url, _session, setup) = coordinator_with_session(None).await;
+    assert!(
+        registry::peer(setup.registry(), RelayId(5)).is_none(),
+        "relay 5 starts unenrolled",
+    );
+
+    // Relay 5 opens its control connection; its Hello (the first frame) enrolls it
+    // — no separate phone-home. It has no peers, so the empty descriptor set it
+    // receives drives nothing.
+    let control = MeshControl::new(RelayId(5));
+    tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
+        base_url,
+        relay_hello(5, 15000),
+        None,
+        control,
+        Duration::from_millis(50),
+    ));
+
+    assert!(
+        wait_for_enrollment(setup.registry(), RelayId(5)).await,
+        "the relay should enroll via its Hello",
+    );
+    let peer = registry::peer(setup.registry(), RelayId(5)).expect("relay 5 enrolled");
+    assert_eq!(peer.relay_addr, "127.0.0.1:15000".parse().unwrap());
+}
+
+#[tokio::test]
+async fn a_connection_that_never_sends_a_hello_is_dropped() {
+    use futures_util::StreamExt;
+
+    // A short handshake deadline so the test doesn't wait the production timeout.
+    let base_url = serve_bare_coordinator(Duration::from_millis(150)).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+
+    // Connect, then send nothing. The coordinator must drop the connection after
+    // the deadline; without the timeout the stream would hang until the outer
+    // bound and the test would fail.
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let closed = timeout(Duration::from_secs(2), async {
+        // Drain until the coordinator closes (stream ends) or errors.
+        while let Some(Ok(_)) = socket.next().await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the coordinator should drop a connection that never enrolls",
+    );
+}
+
+#[tokio::test]
+async fn a_non_hello_first_frame_is_rejected_promptly() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A long deadline: if the coordinator merely waited for a Hello it would hold
+    // the connection for the full timeout, and the test's outer bound would trip.
+    // The tightened handshake closes on a non-Hello first frame instead.
+    let base_url = serve_bare_coordinator(Duration::from_secs(30)).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    // A well-formed frame that is not a Hello (an unrecognized message type).
+    socket
+        .send(Message::Text(r#"{"type":"not_a_hello"}"#.into()))
+        .await
+        .unwrap();
+
+    let closed = timeout(Duration::from_secs(2), async {
+        // Drain until the coordinator closes (stream ends) or errors.
+        while let Some(Ok(_)) = socket.next().await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a non-Hello first frame must be rejected without waiting out the deadline",
+    );
 }

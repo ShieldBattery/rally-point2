@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
     let state = CoordinatorState {
         setup,
         control_auth,
+        hello_timeout: api::HELLO_TIMEOUT,
     };
 
     let app = api::router(state);

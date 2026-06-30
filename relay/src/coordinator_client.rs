@@ -3,10 +3,12 @@
 //!
 //! This is the relay side of the persistent coordinator↔relay control connection.
 //! The relay dials the coordinator's control endpoint (a WebSocket), presents its
-//! bootstrap secret, and then receives the coordinator's pushes: the relay's
-//! current [`SessionDescriptor`] set, sent on connect and again whenever it
-//! changes. Each set is fed to the [`MeshControl`] Join source, which turns it
-//! into targeted mesh `Join`/`Leave`.
+//! bootstrap secret, and **enrolls** by sending its `Hello` (id + reachable
+//! address) as the first frame — registering itself over the same authenticated
+//! connection rather than a separate phone-home. It then receives the
+//! coordinator's pushes: the relay's current [`SessionDescriptor`] set, sent on
+//! connect and again whenever it changes. Each set is fed to the [`MeshControl`]
+//! Join source, which turns it into targeted mesh `Join`/`Leave`.
 //!
 //! # Why a held connection, not polling
 //!
@@ -34,9 +36,10 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use rally_point_proto::control::{CoordinatorToRelay, SessionDescriptor};
-use rally_point_proto::ids::RelayId;
+use futures_util::{SinkExt, StreamExt};
+use rally_point_proto::control::{
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor,
+};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -75,15 +78,18 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// Holds the coordinator control connection open and drives the Join source,
 /// reconnecting whenever it drops. Spawned as a task on the relay when a
 /// coordinator URL is configured; never returns.
+///
+/// `relay_hello` is the relay's identity + reachable address, sent as the first
+/// frame on each connection to enroll into the coordinator's registry.
 pub async fn run_descriptor_subscriber(
     coordinator_url: String,
-    relay_id: RelayId,
+    relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
 ) {
     run_descriptor_subscriber_with(
         coordinator_url,
-        relay_id,
+        relay_hello,
         bootstrap_secret,
         control,
         RECONNECT_DELAY,
@@ -95,7 +101,7 @@ pub async fn run_descriptor_subscriber(
 /// need not wait the production interval between attempts.
 pub async fn run_descriptor_subscriber_with(
     coordinator_url: String,
-    relay_id: RelayId,
+    relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
     reconnect_delay: Duration,
@@ -103,11 +109,12 @@ pub async fn run_descriptor_subscriber_with(
     // Kept across reconnects: a session removed while disconnected is left when
     // the next connection's full-set re-sync arrives without it.
     let mut applied: HashSet<SessionKey> = HashSet::new();
+    let relay_id = relay_hello.relay_id;
 
     loop {
         match connect_and_stream(
             &coordinator_url,
-            relay_id,
+            &relay_hello,
             bootstrap_secret.as_deref(),
             &control,
             &mut applied,
@@ -128,21 +135,29 @@ pub async fn run_descriptor_subscriber_with(
     }
 }
 
-/// Dials the coordinator's control endpoint and applies every descriptor set it
-/// pushes, until the connection closes or errors. `applied` is updated in place
+/// Dials the coordinator's control endpoint, enrolls by sending the relay's
+/// `Hello` as the first frame, then applies every descriptor set the coordinator
+/// pushes until the connection closes or errors. `applied` is updated in place
 /// across the connection's lifetime (and persists into the next one).
 async fn connect_and_stream(
     coordinator_url: &str,
-    relay_id: RelayId,
+    relay_hello: &RelayHello,
     secret: Option<&str>,
     control: &MeshControl,
     applied: &mut HashSet<SessionKey>,
 ) -> Result<(), ControlError> {
-    let request = build_request(coordinator_url, relay_id, secret)?;
+    let relay_id = relay_hello.relay_id;
+    let request = build_request(coordinator_url, secret)?;
     let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
+
+    // Enroll: the first frame is this relay's Hello, registering it on the same
+    // authenticated connection that then carries descriptor pushes back.
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello.clone()))
+        .expect("a relay hello always serializes");
+    socket.send(Message::Text(hello.into())).await?;
     tracing::info!(
         relay_id = relay_id.0,
-        "coordinator control connection established"
+        "coordinator control connection established",
     );
 
     while let Some(message) = socket.next().await {
@@ -185,18 +200,14 @@ fn apply_message(
 
 /// Builds the WebSocket upgrade request: the control URL plus, when a secret is
 /// configured, the `Authorization: Bearer <secret>` header the coordinator
-/// checks before upgrading.
+/// checks before upgrading. The relay's identity rides the enroll `Hello`, not
+/// the URL, so the path carries no relay id.
 fn build_request(
     coordinator_url: &str,
-    relay_id: RelayId,
     secret: Option<&str>,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, ControlError> {
     let base = to_ws_scheme(coordinator_url);
-    let url = format!(
-        "{}/relay/{}/control",
-        base.trim_end_matches('/'),
-        relay_id.0
-    );
+    let url = format!("{}/relay/control", base.trim_end_matches('/'));
     let mut request = url.into_client_request()?;
     if let Some(secret) = secret {
         let value = format!("Bearer {secret}").parse()?;
@@ -264,7 +275,7 @@ mod tests {
     use super::*;
     use crate::mesh::MeshCommand;
     use rally_point_proto::control::{BufferBounds, RelayPeer, TenantId};
-    use rally_point_proto::ids::SessionId;
+    use rally_point_proto::ids::{RelayId, SessionId};
     use tokio::sync::mpsc;
 
     const TENANT: &str = "sb-test";
@@ -409,8 +420,8 @@ mod tests {
 
     #[test]
     fn build_request_targets_the_control_path_and_sets_the_bearer() {
-        let request = build_request("http://host:14910/", RelayId(7), Some("s3cret")).unwrap();
-        assert_eq!(request.uri().path(), "/relay/7/control");
+        let request = build_request("http://host:14910/", Some("s3cret")).unwrap();
+        assert_eq!(request.uri().path(), "/relay/control");
         assert_eq!(request.uri().scheme_str(), Some("ws"));
         assert_eq!(
             request.headers().get(AUTHORIZATION).unwrap(),
@@ -420,7 +431,7 @@ mod tests {
 
     #[test]
     fn build_request_without_a_secret_sets_no_authorization() {
-        let request = build_request("http://host:14910", RelayId(1), None).unwrap();
+        let request = build_request("http://host:14910", None).unwrap();
         assert!(request.headers().get(AUTHORIZATION).is_none());
     }
 }
