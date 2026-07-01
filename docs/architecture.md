@@ -228,15 +228,18 @@ the integration test on the command senders (and through `apply_descriptor`).
 **Mesh-link idle teardown.** A `run_mesh_link` driver tears down its connection when it has been
 session-less for long enough — but only *after* it has served at least one session. The idle timer is
 armed on the transition from "has sessions" to "none" (the last `Leave`), not on establishment: a
-never-joined link stays parked indefinitely, ready for the coordinator's future `Join` source (the
-binary holds its command sender for exactly this — tearing never-joined links down would strand the
-pair, since the dial side runs once with no reconnect supervisor yet). Re-`Join`ing before the timer
+never-joined link stays parked indefinitely, ready for the coordinator's `Join` source (the
+binary holds its command sender for exactly this — tearing a never-joined link down would strand the
+pair, since the reconnect supervisor redials a *failed* connection but leaves an idle teardown alone).
+Re-`Join`ing before the timer
 fires cancels it. This is *app-level* idle teardown, distinct from QUIC's own idle timeout (10s, on the
 mesh dial side via keepalive PINGs): QUIC tears down a *dead* connection (keepalive stops
 round-tripping); this tears down a *live but unused* one so a churned-out relay-pair's connection
 doesn't linger forever. The driver returns a `MeshLinkExit` (`Idle` vs. `ConnectionFailed` vs.
-`CommandChannelClosed`) so a future reconnect supervisor can tell an intentional wind-down from a
-dropped connection — only the latter is worth retrying.
+`CommandChannelClosed`) so the dial side's **reconnect supervisor** can tell an intentional wind-down
+from a dropped connection: it redials a failed connection (after a short delay, re-registering the fresh
+link so the Join source re-syncs its sessions onto it) and leaves an idle teardown or a
+relay-initiated shutdown alone.
 
 **Mesh trust today vs. production.** Today the dial trusts the peer's cert against the same roots a
 client would — a dev/loopback pair with self-signed certs just works (each relay trusts its own leaf

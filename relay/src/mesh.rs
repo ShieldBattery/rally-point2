@@ -303,13 +303,15 @@ pub(crate) fn command_channel() -> (
 ///
 /// Armed only after a link has served at least one session (had a `Join`, then
 /// went empty again) — a never-joined link stays parked, ready for the
-/// coordinator's future `Join` source (the binary holds its command sender for
-/// exactly this; tearing never-joined links down would strand the pair, since
-/// the dial side runs once with no reconnect supervisor yet).
+/// coordinator's `Join` source (the binary holds its command sender for exactly
+/// this). Tearing a never-joined link down would strand the pair: the dial-side
+/// reconnect supervisor redials a *failed* connection but treats an idle teardown
+/// as an intentional wind-down and stops, so a parked link torn down for idling
+/// would not come back.
 pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Why a mesh-link driver exited. A reconnect supervisor (when one lands)
-/// distinguishes intentional teardown from a dropped connection: only the
+/// Why a mesh-link driver exited. The dial-side reconnect supervisor uses this to
+/// distinguish intentional teardown from a dropped connection: only the
 /// latter is worth retrying, since `Idle` means a deliberate wind-down and
 /// `CommandChannelClosed` means the relay itself is shutting the link down.
 ///

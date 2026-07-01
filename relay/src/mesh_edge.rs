@@ -224,12 +224,20 @@ pub async fn run_mesh_accept(
     }
 }
 
-/// Dials a peer relay and spawns a [`mesh::run_mesh_link`] driver on the
-/// established connection, surfacing `(peer id, `[`MeshCommand`](mesh::MeshCommand)`
-/// sender)` over `links`. The peer id is the configured `peer_id` — the dialer
-/// already knows whom it dialed — and the dialer announces that id to the peer
-/// (a [`MeshHello`](rally_point_proto::mesh::MeshHello)) so the accepting side
-/// can label its own end of the link.
+/// The delay between mesh redial attempts, after a link's connection failed or a
+/// dial attempt didn't connect. Mesh establishment is not latency-critical — a
+/// running game rides already-established links, and a link returning a couple of
+/// seconds later is fine — so a fixed short delay avoids hammering a peer that is
+/// restarting or briefly unreachable, mirroring the coordinator control
+/// connection's reconnect delay.
+pub const MESH_REDIAL_DELAY: Duration = Duration::from_secs(2);
+
+/// Dials a peer relay and *keeps a link to it established*, redialing after the
+/// connection fails, surfacing `(peer id, `[`MeshCommand`](mesh::MeshCommand)`
+/// sender)` over `links` on each (re)established link. The peer id is the
+/// configured `peer_id` — the dialer already knows whom it dialed — and the dialer
+/// announces that id to the peer (a [`MeshHello`](rally_point_proto::mesh::MeshHello))
+/// so the accepting side can label its own end of the link.
 ///
 /// This is the *lower-id* side of a relay-pair: the [`should_dial_mesh`]
 /// tie-break (`our_id < peer_id`) is checked before dialing, and if it returns
@@ -237,14 +245,30 @@ pub async fn run_mesh_accept(
 /// Two relays with the same id is a misconfiguration: `should_dial_mesh`
 /// returns `false` for equal ids, so neither dials rather than both.
 ///
-/// A dial that fails (peer unreachable, TLS rejected, hello not sent) is logged
-/// and the `links` channel receives nothing for it — one failed peer does not
-/// end the relay. Production should retry with backoff; today this dials once.
+/// The dial is *supervised*: a dial that fails to connect, or an established
+/// link's connection that later drops, is retried after [`MESH_REDIAL_DELAY`] —
+/// one transient failure no longer strands the pair until the process restarts.
+/// A fresh link re-registers under the same peer id, and the Join source re-syncs
+/// the sessions it should serve onto it. An *intentional* wind-down is not
+/// retried: an idle teardown (the link served its sessions and went empty) or the
+/// relay dropping its command sender ends the supervisor.
 pub async fn run_mesh_dial(
     dial: MeshDial,
     sessions: Sessions,
     mesh: MeshState,
     links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+) {
+    run_mesh_dial_with(dial, sessions, mesh, links, MESH_REDIAL_DELAY).await
+}
+
+/// [`run_mesh_dial`] with the redial delay injected, so a test need not wait the
+/// production interval between attempts.
+pub async fn run_mesh_dial_with(
+    dial: MeshDial,
+    sessions: Sessions,
+    mesh: MeshState,
+    links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    redial_delay: Duration,
 ) {
     let MeshDial {
         our_id,
@@ -266,6 +290,12 @@ pub async fn run_mesh_dial(
         return;
     }
 
+    // Build the client config + endpoint once and reuse them across redials. Both
+    // are terminal on failure — a bad TLS config or an unbindable client socket
+    // won't fix itself by retrying, so there's nothing to supervise. The endpoint
+    // outlives every connection dialed from it (a quinn `Endpoint` closes its
+    // connections when dropped), so keeping it on this task's stack for the whole
+    // supervisor loop keeps each attempt's connection alive while its driver runs.
     let mesh_cfg = match rally_point_transport::quic::mesh_client_config(roots) {
         Ok(cfg) => cfg,
         Err(error) => {
@@ -283,6 +313,65 @@ pub async fn run_mesh_dial(
     };
     endpoint.set_default_client_config(mesh_cfg);
 
+    let target = DialTarget {
+        our_id,
+        peer_id,
+        peer_addr,
+        server_name,
+    };
+
+    // Supervisor loop: (re)establish the link, then decide from how it ended
+    // whether to redial. Only a connection failure yields `Retry` — an intentional
+    // wind-down yields `Stop`, which ends the `while let` and stops supervising.
+    while let DialOutcome::Retry =
+        dial_and_serve(&endpoint, &target, &sessions, &mesh, &links).await
+    {
+        tokio::time::sleep(redial_delay).await;
+    }
+}
+
+/// The fixed target of a supervised dial, reused across redial attempts.
+struct DialTarget {
+    our_id: RelayId,
+    peer_id: RelayId,
+    peer_addr: SocketAddr,
+    server_name: String,
+}
+
+/// What the supervisor should do after one dial attempt and the link's lifetime.
+enum DialOutcome {
+    /// The connection failed — a dial that didn't connect, or an established
+    /// link's connection that dropped. Redial after the delay.
+    Retry,
+    /// The link wound down intentionally — an idle teardown, or the relay dropped
+    /// its command sender. Stop supervising this peer.
+    Stop,
+}
+
+/// One dial attempt: connect, announce our id, hand the link's command sender to
+/// the Join source, and run the link driver to completion — returning whether the
+/// supervisor should redial.
+///
+/// A connect or hello failure is [`Retry`](DialOutcome::Retry) (the peer may be
+/// briefly unreachable). Once the link runs, the driver's [`MeshLinkExit`] decides:
+/// a [`ConnectionFailed`](mesh::MeshLinkExit::ConnectionFailed) is retried, while
+/// an [`Idle`](mesh::MeshLinkExit::Idle) teardown or a
+/// [`CommandChannelClosed`](mesh::MeshLinkExit::CommandChannelClosed) shutdown is
+/// intentional and stops the supervisor.
+async fn dial_and_serve(
+    endpoint: &quinn::Endpoint,
+    target: &DialTarget,
+    sessions: &Sessions,
+    mesh: &MeshState,
+    links: &mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+) -> DialOutcome {
+    let DialTarget {
+        our_id,
+        peer_id,
+        peer_addr,
+        server_name,
+    } = target;
+
     tracing::info!(
         our_id = our_id.0,
         peer_id = peer_id.0,
@@ -290,20 +379,18 @@ pub async fn run_mesh_dial(
         server_name,
         "dialing mesh peer",
     );
-    // `endpoint.connect` returns a `Connecting` that borrows the endpoint, so
-    // `endpoint` must outlive the `.await`.
-    let connecting = match endpoint.connect(peer_addr, &server_name) {
+    let connecting = match endpoint.connect(*peer_addr, server_name) {
         Ok(c) => c,
         Err(error) => {
-            tracing::error!(%error, "starting mesh dial connect; not dialing peer");
-            return;
+            tracing::info!(%error, peer_id = peer_id.0, "starting mesh dial connect failed; will retry");
+            return DialOutcome::Retry;
         }
     };
     let connection = match connecting.await {
         Ok(conn) => conn,
         Err(error) => {
-            tracing::info!(%error, "mesh dial to peer failed");
-            return;
+            tracing::info!(%error, peer_id = peer_id.0, "mesh dial to peer failed; will retry");
+            return DialOutcome::Retry;
         }
     };
 
@@ -317,24 +404,48 @@ pub async fn run_mesh_dial(
     // Announce our id so the accepting peer can label its end of the link. The
     // dial tie-break already decided this side connects; the hello is purely so
     // the higher-id acceptor learns which peer reached it.
-    if let Err(error) = send_mesh_hello(&connection, our_id).await {
-        tracing::info!(%error, peer_id = peer_id.0, "mesh hello send failed; abandoning dial");
-        return;
+    if let Err(error) = send_mesh_hello(&connection, *our_id).await {
+        tracing::info!(%error, peer_id = peer_id.0, "mesh hello send failed; will retry");
+        return DialOutcome::Retry;
     }
 
     let link = rally_point_transport::MeshLink::new(connection);
     let (tx, rx) = mesh::command_channel();
-    let sessions = Arc::clone(&sessions);
-    let mesh = mesh.clone();
-    // Move `endpoint` into the driver task: a quinn `Endpoint` closes its
-    // connections when dropped, and the dialed connection would die the moment
-    // this function returns if `endpoint` stayed local. The accept side needs
-    // no such move — the *server* `Endpoint` that accepted the connection is
-    // owned by `server::serve` and outlives the connections it accepts, but a
-    // *client* `Endpoint::client` created here is not kept alive anywhere else.
-    tokio::spawn(async move {
-        let _endpoint = endpoint; // keep alive for the connection's lifetime
-        mesh::run_mesh_link(link, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
-    });
-    let _ = links.send((peer_id, tx)).await;
+    // Hand the fresh command sender to the Join source. On a redial this
+    // re-registers under the same peer id, which re-syncs the sessions the peer
+    // should serve onto the new link (the old, dead sender is replaced).
+    let _ = links.send((*peer_id, tx)).await;
+
+    let exit = mesh::run_mesh_link(
+        link,
+        rx,
+        Arc::clone(sessions),
+        mesh.clone(),
+        mesh::IDLE_TIMEOUT,
+    )
+    .await;
+
+    match exit {
+        mesh::MeshLinkExit::ConnectionFailed => {
+            tracing::info!(
+                peer_id = peer_id.0,
+                "mesh link connection failed; redialing"
+            );
+            DialOutcome::Retry
+        }
+        mesh::MeshLinkExit::Idle => {
+            tracing::info!(
+                peer_id = peer_id.0,
+                "mesh link idle-torn-down; not redialing"
+            );
+            DialOutcome::Stop
+        }
+        mesh::MeshLinkExit::CommandChannelClosed => {
+            tracing::info!(
+                peer_id = peer_id.0,
+                "mesh link command channel closed (relay wound it down); not redialing",
+            );
+            DialOutcome::Stop
+        }
+    }
 }

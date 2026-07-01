@@ -505,3 +505,72 @@ async fn higher_id_relay_does_not_dial_lower_id_peer() -> Result<(), AnyError> {
     );
     Ok(())
 }
+
+/// The dial is supervised: when an established link's connection fails, the dialer
+/// redials and surfaces a fresh link, rather than the pair being stranded until
+/// the process restarts.
+///
+/// The test drains relay B's accept channel directly (instead of handing it to
+/// `run_mesh_accept`) so it can application-close the first connection — forcing
+/// the dialer's link driver to exit `ConnectionFailed` — and then observe the
+/// redial arrive as a second accepted connection and a second surfaced link.
+#[tokio::test]
+async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+
+    // A (id 1) dials; B (id 2) accepts. B stays up throughout, so the redial can
+    // reconnect to it.
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let dial = mesh_edge::MeshDial {
+        our_id: RelayId(1),
+        peer_id: RelayId(2),
+        peer_addr: relay_b.addr,
+        server_name: "localhost".to_owned(),
+        roots,
+    };
+    // A short redial delay so the test doesn't wait the production interval.
+    tokio::spawn(mesh_edge::run_mesh_dial_with(
+        dial,
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+        Duration::from_millis(50),
+    ));
+
+    // The first dial connects: B accepts a connection and A surfaces a link
+    // labeled with B's id.
+    let conn1 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "B did not accept A's first dial within 2s")?
+        .ok_or("B's accept channel closed")?;
+    let (peer1, _cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface its first link within 2s")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer1, RelayId(2), "A's first link reaches B");
+
+    // The link's connection fails: B application-closes it, so A's driver exits
+    // `ConnectionFailed` and the supervisor redials.
+    conn1.close(0u32.into(), b"drop to force a redial");
+
+    // A redials: B accepts a second connection, and A surfaces a fresh link — the
+    // proof the dial is supervised, not fire-once.
+    let _conn2 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "A did not redial after the connection failed")?
+        .ok_or("B's accept channel closed")?;
+    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface a link after redialing")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
+
+    drop(relay_a);
+    Ok(())
+}
