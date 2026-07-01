@@ -52,12 +52,13 @@
 //! non-issue.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rally_point_proto::control::SessionDescriptor;
+use rally_point_proto::control::{RelayPeer, SessionDescriptor};
 use rally_point_proto::ids::RelayId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::mesh::MeshCommand;
 use crate::routing::SessionKey;
@@ -73,7 +74,6 @@ pub struct MeshControl {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[derive(Default)]
 struct Inner {
     /// The command sender for each established peer-relay link, keyed by peer id.
     links: HashMap<RelayId, mpsc::UnboundedSender<MeshCommand>>,
@@ -83,16 +83,42 @@ struct Inner {
     /// successfully told to join (and not yet leave). Only entries for peers
     /// with a live link exist here.
     joined: HashMap<RelayId, HashSet<SessionKey>>,
+    /// Latest reachable address seen for each peer (from descriptors), so the
+    /// desired-peer set published for the dialer carries addresses, not just ids.
+    /// Pruned to the currently-desired peers on each publish.
+    peer_addrs: HashMap<RelayId, SocketAddr>,
+    /// Publishes the peers this relay currently needs mesh links to (id +
+    /// address), so the on-demand dialer can (re)establish them. Declarative
+    /// latest-wins state — like the coordinator's descriptor push, a level down:
+    /// the coordinator says which peers a session needs, and this republishes the
+    /// union across all sessions for the connection half to act on.
+    desired_peers_tx: watch::Sender<Vec<RelayPeer>>,
 }
 
 impl MeshControl {
     /// Creates an empty `MeshControl` for a relay with no peer links and no
     /// sessions yet. `our_id` is this relay's id.
     pub fn new(our_id: RelayId) -> Self {
+        let (desired_peers_tx, _) = watch::channel(Vec::new());
         Self {
             our_id,
-            inner: Arc::new(Mutex::new(Inner::default())),
+            inner: Arc::new(Mutex::new(Inner {
+                links: HashMap::new(),
+                desired: HashMap::new(),
+                joined: HashMap::new(),
+                peer_addrs: HashMap::new(),
+                desired_peers_tx,
+            })),
         }
+    }
+
+    /// Subscribes to the set of peers this relay currently needs mesh links to
+    /// (id + address). The on-demand dialer watches this and keeps a dial
+    /// supervisor alive per higher-id peer, so a link torn down while idle is
+    /// re-established when a later session needs the peer again. The set is the
+    /// union of every current session's mesh peers, republished on every change.
+    pub fn desired_peers(&self) -> watch::Receiver<Vec<RelayPeer>> {
+        self.inner.lock().desired_peers_tx.subscribe()
     }
 
     /// Registers the command sender for an established link to `peer_id`.
@@ -133,6 +159,15 @@ impl MeshControl {
             .collect();
 
         let mut inner = self.inner.lock();
+
+        // Remember each named peer's reachable address, so the desired-peer set
+        // published for the dialer can carry it (a relay never dials itself).
+        for peer in &descriptor.peers {
+            if peer.relay_id != self.our_id {
+                inner.peer_addrs.insert(peer.relay_id, peer.relay_addr);
+            }
+        }
+
         let old_peers = inner.desired.get(&key).cloned().unwrap_or_default();
 
         // An empty peer set means a single-relay session (no mesh); forget the
@@ -147,6 +182,7 @@ impl MeshControl {
         // changed: the union of the old and new peer sets.
         let affected: HashSet<RelayId> = old_peers.union(&new_peers).copied().collect();
         reconcile_peers(&mut inner, affected);
+        publish_desired_peers(&mut inner);
     }
 
     /// Ends a session's mesh membership: forgets the desired set and reconciles
@@ -158,7 +194,42 @@ impl MeshControl {
             return;
         };
         reconcile_peers(&mut inner, peers);
+        publish_desired_peers(&mut inner);
     }
+}
+
+/// Recomputes the peers this relay currently needs mesh links to — the union of
+/// every session's desired peers, each paired with its latest known address — and
+/// publishes it if it changed. The address book is pruned to just the desired
+/// peers so it can't grow without bound across a relay's lifetime.
+///
+/// Publishing only on a real change keeps the dialer from re-evaluating on every
+/// descriptor that leaves the peer set untouched. `send_if_modified` updates the
+/// stored value even with no subscribers yet (a relay without a dialer), so a
+/// dialer that subscribes later still sees the current set.
+fn publish_desired_peers(inner: &mut Inner) {
+    let desired_ids: HashSet<RelayId> = inner.desired.values().flatten().copied().collect();
+    inner.peer_addrs.retain(|id, _| desired_ids.contains(id));
+
+    let mut peers: Vec<RelayPeer> = desired_ids
+        .iter()
+        .filter_map(|id| {
+            inner.peer_addrs.get(id).map(|&addr| RelayPeer {
+                relay_id: *id,
+                relay_addr: addr,
+            })
+        })
+        .collect();
+    peers.sort_by_key(|p| p.relay_id.0);
+
+    inner.desired_peers_tx.send_if_modified(|current| {
+        if *current == peers {
+            false
+        } else {
+            *current = peers;
+            true
+        }
+    });
 }
 
 /// Drives each named peer's link from its delivered state toward what `desired`
@@ -463,5 +534,64 @@ mod tests {
         let (tx2_new, mut rx2_new) = link();
         control.register_link(RelayId(2), tx2_new);
         assert_eq!(rx2_new.try_recv().unwrap(), MeshCommand::Join(key(1)));
+    }
+
+    #[test]
+    fn apply_descriptor_publishes_desired_peers_with_addresses() {
+        let control = MeshControl::new(RelayId(1));
+        let mut peers_rx = control.desired_peers();
+        assert!(peers_rx.borrow_and_update().is_empty());
+
+        control.apply_descriptor(&descriptor(1, &[2, 3]));
+
+        assert!(peers_rx.has_changed().unwrap());
+        let published = peers_rx.borrow_and_update().clone();
+        assert_eq!(published.len(), 2);
+        // Sorted by id, each carrying the address the descriptor named.
+        assert_eq!(published[0].relay_id, RelayId(2));
+        assert_eq!(
+            published[0].relay_addr,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14902))
+        );
+        assert_eq!(published[1].relay_id, RelayId(3));
+    }
+
+    #[test]
+    fn ending_a_session_republishes_the_shrunk_peer_set() {
+        let control = MeshControl::new(RelayId(1));
+        let mut peers_rx = control.desired_peers();
+        control.apply_descriptor(&descriptor(1, &[2]));
+        peers_rx.borrow_and_update();
+
+        control.end_session(&key(1));
+        assert!(peers_rx.has_changed().unwrap());
+        assert!(peers_rx.borrow_and_update().is_empty());
+    }
+
+    #[test]
+    fn a_self_reference_is_not_published_as_a_desired_peer() {
+        let control = MeshControl::new(RelayId(1));
+        let mut peers_rx = control.desired_peers();
+        // The descriptor erroneously lists this relay (1) among its own peers.
+        control.apply_descriptor(&descriptor(1, &[1, 2]));
+        let published = peers_rx.borrow_and_update().clone();
+        assert_eq!(published.len(), 1, "a relay never dials itself");
+        assert_eq!(published[0].relay_id, RelayId(2));
+    }
+
+    #[test]
+    fn an_unchanged_peer_set_does_not_republish() {
+        let control = MeshControl::new(RelayId(1));
+        let mut peers_rx = control.desired_peers();
+        control.apply_descriptor(&descriptor(1, &[2]));
+        peers_rx.borrow_and_update();
+
+        // A second session naming the same peer leaves the desired-peer union
+        // unchanged, so the dialer isn't needlessly re-woken.
+        control.apply_descriptor(&descriptor(2, &[2]));
+        assert!(
+            !peers_rx.has_changed().unwrap(),
+            "an unchanged peer set must not republish",
+        );
     }
 }

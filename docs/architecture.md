@@ -225,13 +225,24 @@ relay's **control connection** to the coordinator (see [The control connection](
 a relay run without a coordinator URL (pure dev/loopback) instead has its `Join`s driven directly by
 the integration test on the command senders (and through `apply_descriptor`).
 
+**On-demand dialing.** Nothing lists mesh peers at startup in production — the coordinator's descriptors
+do, at runtime. So the *dial* side of the connection half is driven by the Join source: `MeshControl`
+republishes a **desired-peer set** (the union of every current session's mesh peers, with addresses) as
+it changes, and an **on-demand dialer** keeps one dial supervisor alive per peer this relay should dial
+(the higher-id peers — lower-id peers dial *us* and arrive on the accept side). When a descriptor names a
+peer with no link — a fresh pairing, or one whose link had idled out — the dialer establishes it; when a
+peer is no longer named, its link idles out and its supervisor stops. This is what makes idle teardown
+safe rather than stranding: a torn-down link comes back on demand the next time a session needs the pair.
+(`--mesh-peer` stays the dev/loopback path — a static dial at startup with no coordinator to push
+topology.)
+
 **Mesh-link idle teardown.** A `run_mesh_link` driver tears down its connection when it has been
 session-less for long enough — but only *after* it has served at least one session. The idle timer is
 armed on the transition from "has sessions" to "none" (the last `Leave`), not on establishment: a
 never-joined link stays parked indefinitely, ready for the coordinator's `Join` source (the
-binary holds its command sender for exactly this — tearing a never-joined link down would strand the
-pair, since the reconnect supervisor redials a *failed* connection but leaves an idle teardown alone).
-Re-`Join`ing before the timer
+binary holds its command sender for exactly this). Tearing an idle link down doesn't strand the pair:
+the reconnect supervisor leaves an intentional teardown alone, but the on-demand dialer re-establishes the
+link when a later descriptor names the peer again. Re-`Join`ing before the timer
 fires cancels it. This is *app-level* idle teardown, distinct from QUIC's own idle timeout (10s, on the
 mesh dial side via keepalive PINGs): QUIC tears down a *dead* connection (keepalive stops
 round-tripping); this tears down a *live but unused* one so a churned-out relay-pair's connection

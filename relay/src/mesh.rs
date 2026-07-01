@@ -626,8 +626,12 @@ pub async fn run_mesh_link(
                         joined.insert(
                             session_id,
                             SessionState {
-                                key,
+                                key: key.clone(),
                                 flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
+                                _registration: MeshLinkRegistration {
+                                    links: mesh_links.clone(),
+                                    key,
+                                },
                             },
                         );
                         idle_since = None;
@@ -643,9 +647,10 @@ pub async fn run_mesh_link(
                         // legitimately holds the id — that would close the wrong
                         // tenant's session and cross-wire the two.
                         if joined.get(&session_id).is_some_and(|state| state.key == key) {
+                            // Dropping the removed `SessionState` deregisters this
+                            // session's mesh forward channel (its RAII guard).
                             joined.remove(&session_id);
                             link.close_session(session_id);
-                            deregister_mesh_link(&mesh_links, &key);
                             // Arm the idle timer when the last session leaves,
                             // so the driver tears the link down after
                             // `idle_timeout` of no further Joins.
@@ -664,18 +669,42 @@ pub async fn run_mesh_link(
         }
     };
 
-    for state in joined.values() {
-        deregister_mesh_link(&mesh_links, &state.key);
-    }
+    // No explicit teardown here: each joined session's `SessionState` deregisters
+    // its own forward channel when dropped, and `joined` is dropped as this
+    // function returns — or when the driver task is cancelled — so the cleanup runs
+    // on every exit path.
     exit
 }
 
-/// One session's per-link driver state: its routing key (tenant-correct), and
-/// its own flush deadline (independent per session — one game's flush cadence
-/// doesn't reset another's).
+/// One session's per-link driver state: its routing key (tenant-correct), its own
+/// flush deadline (independent per session — one game's flush cadence doesn't reset
+/// another's), and the RAII guard that deregisters its mesh forward channel.
 struct SessionState {
     key: SessionKey,
     flush_deadline: tokio::time::Instant,
+    /// Deregisters this session's mesh forward channel when the `SessionState` is
+    /// dropped — on a `Leave`, a normal wind-down, or the driver task being
+    /// cancelled. Never read; its `Drop` is the point.
+    _registration: MeshLinkRegistration,
+}
+
+/// An RAII guard tying a session's mesh forward-channel registration to the
+/// lifetime of its [`SessionState`]. Dropping it deregisters the channel, so the
+/// registration is torn down on *every* exit from [`run_mesh_link`]: a `Leave`
+/// removes the `SessionState`; a normal wind-down or a **cancelled** driver task (a
+/// dialer retargeting or removing this peer drops the whole driver future) drops the
+/// `joined` map. Without it, task cancellation would skip the cleanup and leave a
+/// dead forward channel in `mesh.links` for a session this link no longer serves —
+/// a leak, since session ids are never reused.
+struct MeshLinkRegistration {
+    links: MeshLinks,
+    key: SessionKey,
+}
+
+impl Drop for MeshLinkRegistration {
+    fn drop(&mut self) {
+        deregister_mesh_link(&self.links, &self.key);
+    }
 }
 
 /// Validates a list of sessions for a mesh link, refusing if two tenants share

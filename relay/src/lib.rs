@@ -48,6 +48,7 @@ pub mod config;
 pub mod coordinator_client;
 pub mod mesh;
 pub mod mesh_control;
+pub mod mesh_dialer;
 pub mod mesh_edge;
 pub mod routing;
 pub mod server;

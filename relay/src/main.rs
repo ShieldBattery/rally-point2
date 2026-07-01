@@ -33,6 +33,7 @@ use rally_point_relay::config::{
 use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh;
 use rally_point_relay::mesh_control;
+use rally_point_relay::mesh_dialer;
 use rally_point_relay::mesh_edge;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::{DEFAULT_PORT, server};
@@ -207,9 +208,25 @@ async fn main() -> Result<()> {
             links_tx.clone(),
         ));
 
+        // Roots to trust peer certs against — needed by the static `--mesh-peer`
+        // dials and the coordinator-driven on-demand dialer alike, so build them
+        // once (falls back to our own leaf when `--mesh-roots` is absent).
+        let mesh_roots = config::load_mesh_roots(&cli.mesh_roots, &ca)?;
+
+        // Static `--mesh-peer` dials are the no-coordinator dev/loopback path.
+        // When a coordinator URL is set, the on-demand dialer drives dialing from
+        // the pushed descriptors instead — running both would have two supervisors
+        // dial the same peer and fight over its registration, so `--mesh-peer` is
+        // ignored in that case.
         let peers = config::parse_mesh_peers(&cli.mesh_peers)?;
-        if !peers.is_empty() {
-            let roots = config::load_mesh_roots(&cli.mesh_roots, &ca)?;
+        if cli.coordinator_url.is_some() {
+            if !peers.is_empty() {
+                tracing::warn!(
+                    "ignoring --mesh-peer: --coordinator-url is set, so the coordinator's \
+                     descriptors drive mesh dialing",
+                );
+            }
+        } else {
             for peer in peers {
                 if peer.id.0 == our_id {
                     tracing::warn!(
@@ -226,7 +243,7 @@ async fn main() -> Result<()> {
                     peer_id: peer.id,
                     peer_addr: peer.addr,
                     server_name: cli.mesh_server_name.clone(),
-                    roots: roots.clone(),
+                    roots: mesh_roots.clone(),
                 };
                 tokio::spawn(mesh_edge::run_mesh_dial(dial, sessions, mesh, links_tx));
             }
@@ -247,6 +264,25 @@ async fn main() -> Result<()> {
         // the registry still fills as links establish and tests drive `Join` on
         // the command senders directly.
         if let Some(coordinator_url) = cli.coordinator_url.clone() {
+            // The on-demand dialer: establish (and re-establish) mesh links to the
+            // peers the coordinator's descriptors name, driven by the Join source's
+            // desired-peer set. This is the production dial path — the static
+            // `--mesh-peer` dials above are dev/loopback, where no coordinator
+            // pushes topology.
+            let dialer_config = mesh_dialer::DialerConfig {
+                our_id: RelayId(our_id),
+                server_name: cli.mesh_server_name.clone(),
+                roots: mesh_roots.clone(),
+                sessions: Arc::clone(&sessions),
+                mesh: mesh_state.clone(),
+                links: links_tx.clone(),
+                redial_delay: mesh_edge::MESH_REDIAL_DELAY,
+            };
+            tokio::spawn(mesh_dialer::run_mesh_dialer(
+                dialer_config,
+                mesh_control.desired_peers(),
+            ));
+
             let advertise_addr = config::resolve_advertise_addr(cli.advertise_addr, cli.listen);
             let relay_hello =
                 RelayHello::new(RelayId(our_id), advertise_addr, ProtocolVersion::CURRENT);
