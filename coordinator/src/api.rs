@@ -21,9 +21,10 @@
 //!   `Authorization: Bearer <secret>` on the upgrade. Auth is [`ControlAuth`]:
 //!   either a required secret or an explicit `Open` (no auth) — there is no
 //!   implicit open default, and the binary refuses to start `Open` without an
-//!   explicit opt-in. This same connection is where relay→coordinator liveness
-//!   reporting will ride later — one channel, authenticated once, in both
-//!   directions.
+//!   explicit opt-in. The relay also reports liveness up this same connection (a
+//!   periodic heartbeat); a relay that goes silent past the liveness deadline, or
+//!   whose connection drops, is deregistered — one channel, authenticated once, in
+//!   both directions.
 //!
 //! `session/create` is JSON over HTTP/1.1; the control endpoint upgrades to a
 //! WebSocket. App-server auth on `session/create` is still open — that is a
@@ -45,6 +46,7 @@ use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
     SessionResponse,
 };
+use rally_point_proto::ids::RelayId;
 
 use crate::registry::{self, RelayRegistry};
 use crate::session::{self, SessionSetup};
@@ -99,6 +101,14 @@ pub fn resolve_control_auth(
 /// client-edge authorization timeout.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the coordinator waits to hear *anything* from an enrolled relay
+/// before declaring its control connection dead. Reset on every inbound frame; a
+/// relay sends a heartbeat well inside this window, so the deadline only lapses
+/// when several heartbeats are missed — a crashed relay or a TCP connection that
+/// died without a close. Comfortably larger than the relay's heartbeat interval
+/// (a few times over) so ordinary jitter or a single dropped beat never trips it.
+pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The shared state the HTTP handlers operate over: the coordinator's
 /// session-setup context plus the relay control-connection auth posture.
 /// Cloned cheaply (the setup's fields are `Arc`-backed), so axum's per-request
@@ -113,6 +123,10 @@ pub struct CoordinatorState {
     /// How long a connection has to send its enroll `Hello` before it is dropped
     /// (see [`HELLO_TIMEOUT`]). A field so tests can shorten it.
     pub hello_timeout: Duration,
+    /// How long an enrolled relay may go silent (no heartbeat or any other frame)
+    /// before its connection is dropped and it is deregistered (see
+    /// [`LIVENESS_TIMEOUT`]). A field so tests can shorten it.
+    pub liveness_timeout: Duration,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -184,31 +198,40 @@ async fn relay_control(
     let registry = state.setup.registry().clone();
     let descriptors = state.setup.descriptors().clone();
     let hello_timeout = state.hello_timeout;
-    ws.on_upgrade(move |socket| serve_relay_control(socket, registry, descriptors, hello_timeout))
+    let liveness_timeout = state.liveness_timeout;
+    ws.on_upgrade(move |socket| {
+        serve_relay_control(
+            socket,
+            registry,
+            descriptors,
+            hello_timeout,
+            liveness_timeout,
+        )
+    })
 }
 
-/// Serves one relay's control connection: enroll from its `Hello`, push the
-/// current descriptor set, then push again whenever it changes, until the relay
-/// disconnects.
+/// Serves one relay's control connection: enroll from its `Hello`, push
+/// descriptors, watch the relay's liveness, and deregister it when the connection
+/// drops.
 ///
 /// The relay's first frame must be its [`RelayToCoordinator::Hello`], sent within
-/// `hello_timeout`; it enrolls the relay into the registry, and only then does the
-/// connection subscribe to that relay's descriptors and re-sync it. The loop then
-/// waits on either a change to that set or an inbound frame; no further up-frames
-/// are defined yet (liveness reporting will arrive here), so a non-close frame is
-/// ignored. The loop ends when the relay closes, the connection errors, or the
-/// coordinator's outbox is dropped (shutdown).
+/// `hello_timeout`; it enrolls the relay into the registry and yields the
+/// connection's generation. The connection then serves descriptors and watches
+/// liveness ([`push_and_watch`]) until it ends — the relay closes, the socket
+/// errors, the relay goes silent past `liveness_timeout`, or the coordinator's
+/// outbox is dropped (shutdown).
 ///
-/// The relay is **not** deregistered when the connection drops: tying registry
-/// membership to the live connection (so a drop evicts the relay) needs to handle
-/// a reconnect overwriting the entry the dropping connection would remove, which
-/// is the province of the liveness work — so for now enrollment persists, exactly
-/// as a phone-home would have.
+/// When the connection drops, the relay is deregistered — but only if this
+/// connection is still the current one ([`registry::remove_if_current`]): a relay
+/// that already reconnected (a newer connection re-enrolled it) keeps its live
+/// entry, so a stale drop racing a reconnect does not evict a relay that is in fact
+/// connected.
 async fn serve_relay_control(
     mut socket: WebSocket,
     registry: RelayRegistry,
     descriptors: crate::descriptors::RelayDescriptors,
     hello_timeout: Duration,
+    liveness_timeout: Duration,
 ) {
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
@@ -222,18 +245,54 @@ async fn serve_relay_control(
         }
     };
     let relay_id = hello.relay_id;
-    registry::enroll(&registry, hello);
+    let generation = registry::enroll(&registry, hello);
     tracing::info!(
         relay_id = relay_id.0,
         "relay enrolled over control connection"
     );
 
+    push_and_watch(&mut socket, &descriptors, relay_id, liveness_timeout).await;
+
+    if registry::remove_if_current(&registry, relay_id, generation) {
+        tracing::info!(
+            relay_id = relay_id.0,
+            "relay deregistered on control disconnect"
+        );
+    }
+    tracing::info!(relay_id = relay_id.0, "relay control connection closed");
+}
+
+/// Subscribes to `relay_id`'s descriptor set, re-syncs it on connect, then pushes
+/// every change down the connection while watching the relay's liveness. Returns
+/// when the connection ends: the relay closes, the socket errors, the liveness
+/// deadline lapses (the relay went silent *or* a descriptor send stalled), or the
+/// coordinator's outbox is dropped on shutdown.
+///
+/// Liveness is a single absolute deadline that every inbound frame pushes forward.
+/// Crucially, the deadline also bounds the descriptor sends: a relay that stops
+/// reading stalls the WebSocket send under backpressure, and if that send couldn't
+/// be raced against the deadline it would block the loop from ever polling the
+/// timer — leaving a wedged relay registered indefinitely, the exact degraded path
+/// this watch exists to catch. So each send (including the initial re-sync) races
+/// the same deadline, and a send that can't finish in time ends the connection.
+async fn push_and_watch(
+    socket: &mut WebSocket,
+    descriptors: &crate::descriptors::RelayDescriptors,
+    relay_id: RelayId,
+    liveness_timeout: Duration,
+) {
     let mut rx = descriptors.subscribe(relay_id);
 
-    // Initial re-sync. Clone the set out of the watch borrow before awaiting —
-    // a watch borrow must never be held across an await.
+    // A relay silent past this deadline — or one whose send stalls past it — is
+    // treated as dead. Every inbound frame pushes it forward; a heartbeat lands
+    // well inside the window, so it only lapses when the relay stops making
+    // progress (a crash, a half-open connection, or a peer that stopped reading).
+    let mut deadline = tokio::time::Instant::now() + liveness_timeout;
+
+    // Initial re-sync, bounded by the deadline. Clone the set out of the watch
+    // borrow before awaiting — a watch borrow must never be held across an await.
     let initial = rx.borrow_and_update().clone();
-    if push_descriptors(&mut socket, &initial).await.is_err() {
+    if !send_before_deadline(socket, &initial, relay_id, deadline).await {
         return;
     }
 
@@ -244,25 +303,83 @@ async fn serve_relay_control(
                     break; // the outbox was dropped: coordinator shutting down
                 }
                 let set = rx.borrow_and_update().clone();
-                if push_descriptors(&mut socket, &set).await.is_err() {
+                if !send_before_deadline(socket, &set, relay_id, deadline).await {
                     break;
                 }
             }
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
-                    // Further relay→coordinator messages (liveness) are not
-                    // defined yet; an unrecognized one is ignored, not fatal.
-                    Some(Ok(_)) => {}
+                    Some(Ok(message)) => {
+                        note_inbound(relay_id, &message);
+                        // Any frame proves the relay is alive — push the deadline out.
+                        deadline = tokio::time::Instant::now() + liveness_timeout;
+                    }
                     Some(Err(error)) => {
                         tracing::debug!(%error, relay_id = relay_id.0, "relay control connection error");
                         break;
                     }
                 }
             }
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::info!(
+                    relay_id = relay_id.0,
+                    "relay control connection went silent past the liveness deadline; dropping",
+                );
+                break;
+            }
         }
     }
-    tracing::info!(relay_id = relay_id.0, "relay control connection closed");
+}
+
+/// Pushes a descriptor set, but only up to the liveness `deadline`: if the send
+/// can't complete before then — the relay stopped reading and backpressure stalled
+/// the socket — the connection is treated as dead so it can't hold a registry entry
+/// open while wedged. Returns whether the connection should keep running: `false`
+/// on a send error or a stall past the deadline (the caller then ends it).
+async fn send_before_deadline(
+    socket: &mut WebSocket,
+    set: &[SessionDescriptor],
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    tokio::select! {
+        result = push_descriptors(socket, set) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "descriptor push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "descriptor push stalled past the liveness deadline; dropping",
+            );
+            false
+        }
+    }
+}
+
+/// Notes what an inbound relay frame was, for observability. The content drives
+/// nothing yet — any frame already counts as the liveness signal — but recognizing
+/// the heartbeat (and flagging anything undecodable) keeps the channel legible.
+fn note_inbound(relay_id: RelayId, message: &Message) {
+    let Message::Text(text) = message else {
+        return; // a ping/pong/binary frame: a liveness signal with nothing to read
+    };
+    match serde_json::from_str::<RelayToCoordinator>(text) {
+        Ok(RelayToCoordinator::Heartbeat) => {
+            tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
+        }
+        // A second Hello or a future up-frame: presence is enough, content unused.
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%error, relay_id = relay_id.0, "undecodable relay control frame")
+        }
+    }
 }
 
 /// Reads the relay's opening [`RelayToCoordinator::Hello`] from a freshly
@@ -280,7 +397,9 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    Ok(RelayToCoordinator::Unknown) => {
+                    // A heartbeat (or any future up-frame) before the enroll Hello
+                    // is a protocol violation: enrollment must come first.
+                    Ok(RelayToCoordinator::Heartbeat | RelayToCoordinator::Unknown) => {
                         tracing::warn!("first control frame was not a Hello; closing");
                         None
                     }
@@ -391,6 +510,7 @@ mod tests {
             setup,
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS_TIMEOUT,
         }
     }
 
@@ -506,6 +626,7 @@ mod tests {
             ),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS_TIMEOUT,
         };
         let app = router(state);
 

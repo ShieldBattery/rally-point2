@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         setup,
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
+        liveness_timeout: api::LIVENESS_TIMEOUT,
     };
 
     let app = api::router(state);

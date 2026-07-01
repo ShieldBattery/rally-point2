@@ -17,9 +17,10 @@
 //! scale-to-zero and may sit behind a firewall. Holding the connection open means
 //! the coordinator pushes a change the instant it happens — no poll interval of
 //! staleness — and the connection itself is a liveness signal: when it drops, each
-//! side knows immediately, which is what the (coming) relay→coordinator presence
-//! reporting wants. The same channel will carry that reporting up; descriptors
-//! come down. One connection, authenticated once.
+//! side knows immediately. The relay also sends a periodic heartbeat up the
+//! connection so the coordinator can tell a live relay from one whose connection
+//! died silently (a half-open socket that never delivered a close). Heartbeats go
+//! up, descriptors come down. One connection, authenticated once.
 //!
 //! # Declarative sets, reconnect, and removals
 //!
@@ -52,6 +53,14 @@ use crate::routing::SessionKey;
 /// the connection, so a couple of seconds avoids hammering a coordinator that is
 /// restarting or briefly unreachable.
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// How often the relay sends a heartbeat up its control connection, so the
+/// coordinator can tell a live relay from one whose connection died silently. Well
+/// under the coordinator's liveness deadline, so a single dropped beat or ordinary
+/// jitter never trips it. The send doubles as the relay's own dead-coordinator
+/// detector: a heartbeat on a half-open socket eventually errors, ending the
+/// connection so the relay redials.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why a control-connection attempt ended.
 #[derive(Debug, thiserror::Error)]
@@ -93,18 +102,20 @@ pub async fn run_descriptor_subscriber(
         bootstrap_secret,
         control,
         RECONNECT_DELAY,
+        HEARTBEAT_INTERVAL,
     )
     .await
 }
 
-/// [`run_descriptor_subscriber`] with the reconnect delay injected, so a test
-/// need not wait the production interval between attempts.
+/// [`run_descriptor_subscriber`] with the reconnect delay and heartbeat interval
+/// injected, so a test need not wait the production intervals.
 pub async fn run_descriptor_subscriber_with(
     coordinator_url: String,
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
     reconnect_delay: Duration,
+    heartbeat_interval: Duration,
 ) {
     // Kept across reconnects: a session removed while disconnected is left when
     // the next connection's full-set re-sync arrives without it.
@@ -118,6 +129,7 @@ pub async fn run_descriptor_subscriber_with(
             bootstrap_secret.as_deref(),
             &control,
             &mut applied,
+            heartbeat_interval,
         )
         .await
         {
@@ -137,14 +149,20 @@ pub async fn run_descriptor_subscriber_with(
 
 /// Dials the coordinator's control endpoint, enrolls by sending the relay's
 /// `Hello` as the first frame, then applies every descriptor set the coordinator
-/// pushes until the connection closes or errors. `applied` is updated in place
-/// across the connection's lifetime (and persists into the next one).
+/// pushes while sending a periodic heartbeat up the connection — until it closes
+/// or errors. `applied` is updated in place across the connection's lifetime (and
+/// persists into the next one).
+///
+/// A heartbeat send that fails ends the connection so the caller redials: on a
+/// half-open socket (a silently dead coordinator) the periodic send is what
+/// eventually surfaces the failure, since no inbound frame arrives to reveal it.
 async fn connect_and_stream(
     coordinator_url: &str,
     relay_hello: &RelayHello,
     secret: Option<&str>,
     control: &MeshControl,
     applied: &mut HashSet<SessionKey>,
+    heartbeat_interval: Duration,
 ) -> Result<(), ControlError> {
     let relay_id = relay_hello.relay_id;
     let request = build_request(coordinator_url, secret)?;
@@ -160,15 +178,30 @@ async fn connect_and_stream(
         "coordinator control connection established",
     );
 
-    while let Some(message) = socket.next().await {
-        match message? {
-            Message::Text(text) => {
-                apply_message(control, serde_json::from_str(text.as_str())?, applied);
+    // The Hello already proved liveness at t=0, so skip the immediate first tick
+    // and send the first heartbeat one interval later.
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat)
+                    .expect("a heartbeat always serializes");
+                socket.send(Message::Text(frame.into())).await?;
             }
-            Message::Close(_) => break,
-            // No pings are sent on this channel today, and the relay sends
-            // nothing yet; any other frame is ignored.
-            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+            message = socket.next() => {
+                let Some(message) = message else { break };
+                match message? {
+                    Message::Text(text) => {
+                        apply_message(control, serde_json::from_str(text.as_str())?, applied);
+                    }
+                    Message::Close(_) => break,
+                    // The coordinator sends no pings today and the relay reads only
+                    // descriptor text frames; any other frame is ignored.
+                    Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+                }
+            }
         }
     }
     Ok(())

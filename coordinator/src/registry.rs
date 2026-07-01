@@ -29,10 +29,25 @@
 //! throughout the relay's routing and mesh layers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{RelayEntry, RelayHello, RelayPeer};
 use rally_point_proto::ids::RelayId;
+
+/// A registered relay, paired with the generation of the control connection that
+/// last enrolled it.
+///
+/// The generation is a fencing token. Each new control connection enrolls with a
+/// strictly greater generation, so when a connection drops it can deregister the
+/// relay *only if it is still the current one* — a relay that has already
+/// reconnected (a later connection re-enrolled it with a higher generation) is not
+/// evicted by the stale drop. See [`enroll`] and [`remove_if_current`].
+struct Registered {
+    entry: RelayEntry,
+    generation: u64,
+}
 
 /// The coordinator's relay registry: `RelayId` → the relay's entry.
 ///
@@ -43,36 +58,49 @@ use rally_point_proto::ids::RelayId;
 /// hand a copy to a session-setup task.
 #[derive(Clone, Default)]
 pub struct RelayRegistry {
-    relays: Arc<Mutex<HashMap<RelayId, RelayEntry>>>,
+    relays: Arc<Mutex<HashMap<RelayId, Registered>>>,
+    /// Hands out a fresh, strictly-increasing generation per enroll. Monotonic
+    /// for the coordinator's lifetime, so two connections (even for the same
+    /// relay id) never share one.
+    next_generation: Arc<AtomicU64>,
 }
 
-use std::sync::Arc;
-
 /// Registers a relay that has enrolled (sent its `Hello` on its control
-/// connection).
+/// connection), returning the **connection generation** the coordinator now holds
+/// for it.
 ///
 /// Re-registering the same `relay_id` replaces the prior entry (a relay that
-/// restarted, or reconnected, with a new address). Returns the entry the
-/// coordinator now holds for this relay.
-pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> RelayEntry {
+/// restarted, or reconnected, with a new address) and assigns a strictly greater
+/// generation. The caller — a control-connection task — keeps the returned
+/// generation and passes it to [`remove_if_current`] when its connection drops, so
+/// a drop only deregisters the relay when no newer connection has since taken over.
+pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
     let entry = RelayEntry {
         relay_id: hello.relay_id,
         relay_addr: hello.relay_addr,
         protocol: hello.protocol,
     };
-    registry.relays.lock().insert(entry.relay_id, entry.clone());
-    entry
+    let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
+    registry
+        .relays
+        .lock()
+        .insert(entry.relay_id, Registered { entry, generation });
+    generation
 }
 
 /// Looks up a relay by id, returning a [`RelayPeer`] (the id + address a
 /// session descriptor carries).
 pub fn peer(registry: &RelayRegistry, id: RelayId) -> Option<RelayPeer> {
-    registry.relays.lock().get(&id).map(RelayPeer::from)
+    registry
+        .relays
+        .lock()
+        .get(&id)
+        .map(|r| RelayPeer::from(&r.entry))
 }
 
 /// Looks up a relay's full entry by id.
 pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
-    registry.relays.lock().get(&id).cloned()
+    registry.relays.lock().get(&id).map(|r| r.entry.clone())
 }
 
 /// All registered relays as [`RelayPeer`] entries, in an unspecified order.
@@ -82,7 +110,7 @@ pub fn all_peers(registry: &RelayRegistry) -> Vec<RelayPeer> {
         .relays
         .lock()
         .values()
-        .map(RelayPeer::from)
+        .map(|r| RelayPeer::from(&r.entry))
         .collect()
 }
 
@@ -97,9 +125,32 @@ pub fn is_empty(registry: &RelayRegistry) -> bool {
     registry.relays.lock().is_empty()
 }
 
-/// Removes a relay (it has gone away). Idempotent.
+/// Removes a relay (it has gone away), regardless of which connection enrolled
+/// it. Idempotent. Prefer [`remove_if_current`] from a control-connection task,
+/// which is safe against a relay that reconnected while this connection was
+/// dropping.
 pub fn remove(registry: &RelayRegistry, id: RelayId) {
     registry.relays.lock().remove(&id);
+}
+
+/// Deregisters a relay when its control connection drops, but **only if that
+/// connection is still the current one** — its `generation` matches the one held
+/// for the relay. Returns whether the relay was removed.
+///
+/// This is the safe deregister for a control-connection task. If the relay
+/// reconnected while this connection was dropping, the later connection re-enrolled
+/// it with a higher generation, so the match fails and the stale drop leaves the
+/// live entry untouched — closing the reconnect race that an unconditional
+/// [`remove`] would lose.
+pub fn remove_if_current(registry: &RelayRegistry, id: RelayId, generation: u64) -> bool {
+    let mut relays = registry.relays.lock();
+    match relays.get(&id) {
+        Some(registered) if registered.generation == generation => {
+            relays.remove(&id);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Creates an empty relay registry for a coordinator with no relays phoned
@@ -152,9 +203,11 @@ mod tests {
         let reg = new_registry();
         assert!(is_empty(&reg));
 
-        let entry = enroll(&reg, hello(1, 14900));
-        assert_eq!(entry.relay_id, RelayId(1));
+        enroll(&reg, hello(1, 14900));
         assert!(!is_empty(&reg));
+
+        let e = entry(&reg, RelayId(1)).unwrap();
+        assert_eq!(e.relay_id, RelayId(1));
 
         let p = peer(&reg, RelayId(1)).unwrap();
         assert_eq!(p.relay_id, RelayId(1));
@@ -170,6 +223,46 @@ mod tests {
         let p = peer(&reg, RelayId(1)).unwrap();
         assert_eq!(p.relay_addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 14999)));
         assert_eq!(len(&reg), 1);
+    }
+
+    #[test]
+    fn enroll_hands_out_strictly_increasing_generations() {
+        let reg = new_registry();
+        let g0 = enroll(&reg, hello(1, 14900));
+        let g1 = enroll(&reg, hello(1, 14999)); // same relay reconnecting
+        let g2 = enroll(&reg, hello(2, 14901)); // a different relay
+        assert!(g1 > g0, "a re-enroll gets a later generation");
+        assert!(g2 > g1, "every enroll gets a distinct, later generation");
+    }
+
+    #[test]
+    fn remove_if_current_removes_on_a_matching_generation() {
+        let reg = new_registry();
+        let generation = enroll(&reg, hello(1, 14900));
+        assert!(remove_if_current(&reg, RelayId(1), generation));
+        assert!(is_empty(&reg));
+        // A second drop of the same connection is a no-op (already gone).
+        assert!(!remove_if_current(&reg, RelayId(1), generation));
+    }
+
+    #[test]
+    fn remove_if_current_keeps_a_relay_that_already_reconnected() {
+        // The reconnect race: connection #1 enrolls, connection #2 re-enrolls the
+        // same relay (a reconnect), then connection #1's drop fires. The stale
+        // generation must not evict the live entry connection #2 installed.
+        let reg = new_registry();
+        let stale = enroll(&reg, hello(1, 14900));
+        let current = enroll(&reg, hello(1, 14999));
+        assert_ne!(stale, current);
+
+        assert!(
+            !remove_if_current(&reg, RelayId(1), stale),
+            "a stale connection must not deregister a reconnected relay",
+        );
+        assert!(!is_empty(&reg), "the relay stays registered");
+        // The current connection's own later drop still deregisters it.
+        assert!(remove_if_current(&reg, RelayId(1), current));
+        assert!(is_empty(&reg));
     }
 
     #[test]

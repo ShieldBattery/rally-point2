@@ -16,7 +16,7 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, PlayerHandoff, RelayHello, SessionRequest, TenantId,
+    BufferBounds, PlayerHandoff, RelayHello, RelayToCoordinator, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -29,6 +29,10 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const TENANT: &str = "sb-test";
+
+/// A generous liveness deadline for tests that don't exercise the timeout — long
+/// enough that no enrolled relay is ever deregistered for going silent.
+const LIVENESS: Duration = Duration::from_secs(30);
 
 fn session_key(session: SessionId) -> SessionKey {
     SessionKey {
@@ -60,15 +64,35 @@ async fn wait_for_enrollment(reg: &RelayRegistry, id: RelayId) -> bool {
     false
 }
 
+/// Polls the registry until `id` is gone, up to a couple of seconds. Returns
+/// whether it disappeared — deregistration happens asynchronously once the relay's
+/// control connection drops or its liveness deadline lapses.
+async fn wait_for_deregistration(reg: &RelayRegistry, id: RelayId) -> bool {
+    for _ in 0..100 {
+        if registry::peer(reg, id).is_none() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
 /// Serves a bare coordinator (empty registry/tenant, open auth) on an ephemeral
-/// port with the given Hello-handshake deadline, for tests that drive the control
-/// endpoint directly rather than through a session.
-async fn serve_bare_coordinator(hello_timeout: Duration) -> String {
-    let setup = session::SessionSetup::new(registry::new_registry(), tenant::new_store());
+/// port with the given Hello-handshake and liveness deadlines, for tests that
+/// drive the control endpoint directly rather than through a session. Returns the
+/// base URL and a handle to the same registry so a test can observe enrollment and
+/// deregistration.
+async fn serve_bare_coordinator(
+    hello_timeout: Duration,
+    liveness_timeout: Duration,
+) -> (String, RelayRegistry) {
+    let reg = registry::new_registry();
+    let setup = session::SessionSetup::new(reg.clone(), tenant::new_store());
     let app = api::router(CoordinatorState {
         setup,
         control_auth: ControlAuth::Open,
         hello_timeout,
+        liveness_timeout,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -77,7 +101,7 @@ async fn serve_bare_coordinator(hello_timeout: Duration) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), reg)
 }
 
 /// Stands up a coordinator with two relays + a tenant, creates a session, and
@@ -136,6 +160,7 @@ async fn coordinator_with_session(
         setup,
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
+        liveness_timeout: api::LIVENESS_TIMEOUT,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -170,6 +195,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         Some(secret.to_owned()),
         control,
         Duration::from_millis(50),
+        Duration::from_secs(3600),
     ));
 
     // The coordinator pushes relay 1's current set on connect; it names peer 2,
@@ -192,6 +218,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         None,
         control,
         Duration::from_millis(50),
+        Duration::from_secs(3600),
     ));
 
     // The initial push joins the session.
@@ -226,6 +253,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         Some("wrong-secret".to_owned()),
         control,
         Duration::from_millis(50),
+        Duration::from_secs(3600),
     ));
 
     let result = timeout(Duration::from_millis(500), rx2.recv()).await;
@@ -251,6 +279,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         None,
         control,
         Duration::from_millis(50),
+        Duration::from_secs(3600),
     ));
 
     assert!(
@@ -266,7 +295,7 @@ async fn a_connection_that_never_sends_a_hello_is_dropped() {
     use futures_util::StreamExt;
 
     // A short handshake deadline so the test doesn't wait the production timeout.
-    let base_url = serve_bare_coordinator(Duration::from_millis(150)).await;
+    let (base_url, _reg) = serve_bare_coordinator(Duration::from_millis(150), LIVENESS).await;
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
 
     // Connect, then send nothing. The coordinator must drop the connection after
@@ -292,7 +321,7 @@ async fn a_non_hello_first_frame_is_rejected_promptly() {
     // A long deadline: if the coordinator merely waited for a Hello it would hold
     // the connection for the full timeout, and the test's outer bound would trip.
     // The tightened handshake closes on a non-Hello first frame instead.
-    let base_url = serve_bare_coordinator(Duration::from_secs(30)).await;
+    let (base_url, _reg) = serve_bare_coordinator(Duration::from_secs(30), LIVENESS).await;
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
     let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
@@ -310,5 +339,98 @@ async fn a_non_hello_first_frame_is_rejected_promptly() {
     assert!(
         closed.is_ok(),
         "a non-Hello first frame must be rejected without waiting out the deadline",
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_control_connection_deregisters_the_relay() {
+    let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS).await;
+
+    // A relay holds its control connection open; its Hello enrolls it.
+    let control = MeshControl::new(RelayId(7));
+    let handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
+        base_url,
+        relay_hello(7, 15007),
+        None,
+        control,
+        Duration::from_millis(50),
+        Duration::from_secs(3600), // effectively no heartbeat during the test
+    ));
+    assert!(
+        wait_for_enrollment(&reg, RelayId(7)).await,
+        "the relay enrolls from its Hello",
+    );
+
+    // The relay goes away: dropping its connection deregisters it. This is the
+    // clean-close path, well inside the (generous) liveness deadline, so the
+    // removal is driven by the drop, not the timeout.
+    handle.abort();
+    assert!(
+        wait_for_deregistration(&reg, RelayId(7)).await,
+        "a dropped control connection deregisters the relay",
+    );
+}
+
+#[tokio::test]
+async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A short liveness deadline so the test doesn't wait the production timeout.
+    let (base_url, reg) =
+        serve_bare_coordinator(api::HELLO_TIMEOUT, Duration::from_millis(300)).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    // Enroll with a Hello, then go silent — never send a heartbeat.
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(7, 15007))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    assert!(
+        wait_for_enrollment(&reg, RelayId(7)).await,
+        "the relay enrolls from its Hello",
+    );
+
+    // Past the deadline with no heartbeat, the coordinator deregisters the relay
+    // and closes the connection.
+    assert!(
+        wait_for_deregistration(&reg, RelayId(7)).await,
+        "a silent relay is deregistered after the liveness deadline",
+    );
+    let closed = timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = socket.next().await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the coordinator closes the timed-out connection",
+    );
+}
+
+#[tokio::test]
+async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
+    // The liveness deadline is short, but the relay heartbeats well inside it, so
+    // the coordinator keeps resetting the deadline and never deregisters it. This
+    // exercises the relay actually sending heartbeats over a live connection.
+    let (base_url, reg) =
+        serve_bare_coordinator(api::HELLO_TIMEOUT, Duration::from_millis(300)).await;
+    let control = MeshControl::new(RelayId(7));
+    let _handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
+        base_url,
+        relay_hello(7, 15007),
+        None,
+        control,
+        Duration::from_millis(50),
+        Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
+    ));
+    assert!(
+        wait_for_enrollment(&reg, RelayId(7)).await,
+        "the relay enrolls from its Hello",
+    );
+
+    // Wait well past the liveness deadline; the heartbeats keep the relay alive.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        registry::peer(&reg, RelayId(7)).is_some(),
+        "a heartbeating relay must not be deregistered",
     );
 }

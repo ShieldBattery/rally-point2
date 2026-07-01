@@ -11,9 +11,10 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > wired end-to-end: each relay holds a persistent, bootstrap-secret-authenticated control connection
 > to the coordinator, **enrolls itself** over it (its identity and address ride the first frame, into the registry), and
 > receives the session descriptors the coordinator pushes back down to drive mesh `Join`/`Leave`.
-> Resilience/failover, the relay→coordinator liveness reporting that will share that connection (and the
-> connection-lifetime-bound deregistration it brings), dual-stack advertise addresses, and the
-> decision-maker runtime wiring are designed but not yet built.
+> The relay also **reports liveness** up that same connection — a periodic heartbeat — so a relay whose
+> connection drops or goes silent is **deregistered** (a generation fencing token makes the eviction safe
+> against a relay that has already reconnected). Resilience/failover, dual-stack advertise addresses, and
+> the decision-maker runtime wiring are designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -307,8 +308,8 @@ coordinator, signing key, and relay fleet; staging and external developers share
 
 Each relay holds **one persistent control connection** open to its coordinator — a WebSocket on the
 coordinator's HTTP server, dialed by the relay. The coordinator pushes the relay's **session
-descriptors** down it (driving mesh `Join`/`Leave`), and the relay will report **liveness** back up the
-same connection as presence tracking lands. One channel, authenticated once at the handshake, in both
+descriptors** down it (driving mesh `Join`/`Leave`), and the relay reports **liveness** back up the
+same connection (a periodic heartbeat). One channel, authenticated once at the handshake, in both
 directions.
 
 **Enroll over the connection.** A relay's *first* frame is its `Hello` — its id and the address clients
@@ -317,13 +318,18 @@ and peer relays reach it at — which enrolls it into the coordinator's registry
 socket; the registry membership and the descriptor stream share a lifecycle and a credential. The relay
 **asserts** its address (it isn't observed from the connection's source, since a relay serves both IPv4
 and IPv6 but reaches the coordinator over only one of them): a `--advertise-addr` flag, defaulting to the
-listen address, with cloud-substrate auto-discovery later. Two near-term simplifications: enroll carries
-a **single** address — the dual-stack model (a v4 *and* a v6 endpoint, with per-family selection at the
-consumers) is a follow-up reshape of the relay-address contract — and a dropped connection does **not**
-deregister the relay (enrollment persists, as a phone-home would). Connection-lifetime-bound
-registration — a drop evicts the relay, a reconnect re-enrolls — needs to handle a reconnect overwriting
-the entry the dropping connection would remove, so it lands with the liveness work that rides this same
-connection.
+listen address, with cloud-substrate auto-discovery later. One near-term simplification remains: enroll
+carries a **single** address — the dual-stack model (a v4 *and* a v6 endpoint, with per-family selection
+at the consumers) is a follow-up reshape of the relay-address contract.
+
+**Deregister on drop.** Registration is connection-lifetime-bound: when a relay's control connection
+drops — or goes silent past the liveness deadline (below) — the coordinator deregisters it, so the
+registry reflects the relays actually reachable rather than every one that ever enrolled. The race this
+has to survive is a relay's *new* connection re-enrolling it while its *old* connection is still tearing
+down: a naïve drop would evict the live entry the reconnect just installed. It is closed with a
+**generation fencing token** — each enroll stamps the entry with a strictly-increasing generation, and a
+dropping connection removes the relay only if its generation still matches the one held, so a stale drop
+racing a reconnect is a no-op.
 
 **Logical push, physical pull.** The coordinator decides a relay's mesh membership and the relay
 applies it — the data flows coordinator→relay. But the relay is what *opens* the connection, rather than
@@ -333,9 +339,12 @@ HTTP credential, instead of standing up an inbound control surface on the attack
 
 **A held connection, not polling.** The connection stays open rather than the relay polling an endpoint.
 That buys three things: the coordinator pushes a change the instant it happens (no poll interval of
-staleness); the connection's own liveness *is* a heartbeat (a drop is an immediate "this relay is gone"
-signal — exactly what presence tracking and failover want, instead of inferring death from missed
-polls); and the two directions share one connection instead of two periodic round-trips. It is a
+staleness); the connection carries liveness directly — a clean drop is an immediate "this relay is gone"
+signal, and a connection that dies *without* a close (a crashed relay, a half-open TCP, or a peer that
+stopped reading and stalls the coordinator's sends under backpressure) is caught within a bounded window
+by the relay's periodic heartbeat plus a coordinator-side liveness deadline that also bounds the
+descriptor sends — exactly what presence tracking and failover want, instead of inferring death from
+missed polls; and the two directions share one connection instead of two periodic round-trips. It is a
 WebSocket rather than QUIC because the coordinator is deliberately an HTTP service and a low-frequency
 control channel gains nothing from QUIC's congestion control or stream multiplexing — a held TCP
 connection is plenty, and rides the server that already exists.
@@ -363,9 +372,9 @@ runs on trusted transport as `ws://`. **The secret today authenticates "a relay,
 id** — a secret-holder can subscribe as any `relay_id` and read that relay's descriptor set, and the
 requested id is not checked against the registry. Binding the connection to a relay identity (per-relay
 credentials or a signed bootstrap token carrying the id, plus rejecting unregistered ids) lands with that
-same cert work; until then the connection is for trusted (internal / loopback) deployment only. A
-keepalive ping for faster dead-connection detection, and the relay→coordinator liveness frames, are the
-channel's next additions.
+same cert work; until then the connection is for trusted (internal / loopback) deployment only. The
+relay→coordinator heartbeat now rides this channel — it doubles as the keepalive that surfaces a connection
+that died without a close — so per-relay identity binding is the channel's main remaining hardening.
 
 ## Components
 

@@ -360,17 +360,29 @@ pub enum CoordinatorToRelay {
 /// The first frame a relay sends is its [`Hello`](Self::Hello): it enrolls the
 /// relay into the coordinator's registry over the same authenticated connection
 /// that then carries descriptor pushes back down, so a relay has one channel to
-/// the coordinator rather than a separate phone-home. Tagged and forward-compatible
-/// the same way as the down direction — a message kind a newer relay sends that an
-/// older coordinator predates decodes to [`Unknown`](Self::Unknown) and is skipped
-/// rather than tearing the connection down. Relay→coordinator liveness reporting
-/// will arrive as further variants here.
+/// the coordinator rather than a separate phone-home. After enrolling, the relay
+/// sends a periodic [`Heartbeat`](Self::Heartbeat) so the coordinator can tell a
+/// live relay from one whose connection has silently died. Tagged and
+/// forward-compatible the same way as the down direction — a message kind a newer
+/// relay sends that an older coordinator predates decodes to
+/// [`Unknown`](Self::Unknown) and is skipped rather than tearing the connection
+/// down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayToCoordinator {
     /// The relay's identity and reachable address, sent as the first frame to
     /// enroll into the coordinator's registry.
     Hello(RelayHello),
+    /// A periodic presence ping proving the control connection is still alive.
+    ///
+    /// The coordinator resets a per-connection liveness deadline on each one;
+    /// when enough are missed — a relay that crashed, or a TCP connection that
+    /// died without ever sending a close — the deadline lapses, the coordinator
+    /// drops the connection and deregisters the relay. It carries no payload:
+    /// presence is the whole signal. Richer periodic status (session count, load)
+    /// can ride a later frame, which the forward-compatible envelope already
+    /// accommodates without a wire break.
+    Heartbeat,
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -473,6 +485,16 @@ mod tests {
         // The Hello's fields ride alongside the tag (internally tagged).
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"relay_id\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn relay_to_coordinator_heartbeat_roundtrips_json() {
+        let message = RelayToCoordinator::Heartbeat;
+        let json = serde_json::to_string(&message).unwrap();
+        // A payload-free presence ping: just the tag, no other fields.
+        assert_eq!(json, r#"{"type":"heartbeat"}"#);
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
     }
