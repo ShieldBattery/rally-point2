@@ -184,6 +184,74 @@ async fn two_clients_exchange_a_turn_through_the_relay() {
 }
 
 #[tokio::test]
+async fn an_oversize_turn_crosses_the_relay_via_control_streams() {
+    use rally_point_client::LinkDriver;
+
+    // The full production path for a turn too large to ever ride a datagram:
+    // the sending driver diverts it onto its control stream, the relay
+    // validates it like any turn and fans it out, the relay's egress diverts
+    // it again onto the recipient's control stream, and the receiving driver
+    // folds it back into the ordered turn stream between its datagram
+    // neighbors.
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(43);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let (driver0, chan0) = LinkDriver::new(link0);
+    let (driver1, chan1) = LinkDriver::new(link1);
+    let task0 = tokio::spawn(driver0.run());
+    let task1 = tokio::spawn(driver1.run());
+
+    // The oversize turn must survive the relay's validator, so it is a long
+    // run of well-formed commands, not padding: 500 build commands ≈ 4KB —
+    // far past any datagram budget.
+    let build = [0x0C, 1, 2, 3, 4, 5, 6, 7];
+    let oversize: Vec<u8> = build
+        .iter()
+        .copied()
+        .cycle()
+        .take(build.len() * 500)
+        .collect();
+
+    let turn = |commands: &[u8]| Payload {
+        commands: commands.to_vec().into(),
+        ..Default::default()
+    };
+    chan0.outbound.send(turn(&build)).await.unwrap();
+    chan0.outbound.send(turn(&oversize)).await.unwrap();
+    chan0.outbound.send(turn(&build)).await.unwrap();
+
+    let mut inbound1 = chan1.inbound;
+    let mut got = Vec::new();
+    while got.len() < 3 {
+        let payload = tokio::time::timeout(Duration::from_secs(5), inbound1.recv())
+            .await
+            .expect("the oversize turn never crossed the relay")
+            .expect("driver 1 closed early");
+        got.push(payload);
+    }
+    assert_eq!(
+        got.iter().map(|p| p.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "one ordered stream regardless of which path each turn took",
+    );
+    assert_eq!(got[1].commands.len(), oversize.len());
+    assert_eq!(&got[1].commands[..], &oversize[..]);
+    // Bound to the sender's authorized slot at the relay, like any turn.
+    assert!(got.iter().all(|p| p.slot == 0));
+
+    drop(chan0.outbound);
+    drop(chan1.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+}
+
+#[tokio::test]
 async fn connect_fails_when_the_signing_key_does_not_match_the_token() {
     let tenant = make_tenant(KID, TENANT);
     let (addr, ca) = start_relay(registry_for(&[&tenant]));

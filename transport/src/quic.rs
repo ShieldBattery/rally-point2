@@ -30,6 +30,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// TLS handshake rather than later, as a malformed datagram or a puzzling
 /// credential failure.
 ///
+/// `5`: each side opens a reliable **control stream** (one bidirectional
+/// stream, after the auth handshake) carrying length-prefixed `ControlFrame`s —
+/// the divert path for a turn too large to ever ride a datagram. A `4` peer
+/// never accepts the stream and never opens its own, so an oversize turn
+/// diverted to it would sit unread while lockstep stalls on the missing seq —
+/// a silent mid-game hang, rejected at the handshake instead.
+///
 /// `4`: the payload `seq` is now the turn's origin identity — assigned by the
 /// sending client and preserved end-to-end, never restamped per hop — and each
 /// slot carries its own seq space. The ack-beacon frame correspondingly carries
@@ -54,7 +61,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// connection may exchange. A client dialing with this ALPN can never produce a
 /// `MeshPacket` even by mistake: the type lives in a code path the client crate
 /// never touches.
-pub const ALPN: &[u8] = b"rp2/4";
+pub const ALPN: &[u8] = b"rp2/5";
 
 /// ALPN protocol id negotiated on every relay ↔ relay mesh QUIC connection. A
 /// relay-pair shares one connection across every game both relays jointly serve,

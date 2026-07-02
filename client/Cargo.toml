@@ -22,6 +22,8 @@ ring = { workspace = true }
 # Builds the dual-stack UDP socket the default client endpoint dials relays from.
 socket2 = { workspace = true }
 thiserror = { workspace = true }
+# Correlated diagnostics (a diverted oversize turn, a dead control stream).
+tracing = { workspace = true }
 # Bounds the dial with a deadline so a stalled relay can't hang the launch path,
 # and drives the turn-carrying link loop (select over send/recv/ack-flush). The
 # game DLL already drives this crate's futures on a tokio runtime.

@@ -133,6 +133,41 @@ impl Link {
         }
     }
 
+    /// Whether `payload` can ever ride a datagram on this link's current path:
+    /// a packet carrying it alone, under worst-case header state, fits the live
+    /// `max_datagram_size()`. The caller's pre-check for the divert-to-stream
+    /// path — a payload this returns `false` for must go over the reliable
+    /// control stream, never into [`send`](Self::send) (which would refuse it
+    /// anyway, but by then the caller has lost the payload to the move).
+    pub fn payload_fits(&self, payload: &Payload) -> Result<bool, LinkError> {
+        let budget = self
+            .connection
+            .max_datagram_size()
+            .ok_or(LinkError::DatagramsUnsupported)?;
+        Ok(crate::ack_manager::lone_packet_len(payload) <= budget)
+    }
+
+    /// Folds a payload that arrived *outside* the datagram path — the reliable
+    /// control stream, where oversize turns ride — into this link's receive
+    /// state: the same per-slot dedup and delivered-prefix bookkeeping a
+    /// datagram delivery runs, with no ack-state change (QUIC's stream
+    /// reliability already guarantees the delivery; there is nothing to ack or
+    /// retire). Keeping the two paths on one `Dedup` is what lets the
+    /// delivered-through cursor advance across a stream-delivered seq —
+    /// otherwise the beacon would stall at the gap forever — and what makes a
+    /// duplicate (a turn somehow sent both ways) collapse to one delivery.
+    ///
+    /// Returns whether the payload is new (`true`) or an already-delivered
+    /// duplicate (`false`). A seq beyond the receive window is an error, as on
+    /// the datagram path.
+    pub fn deliver_external(&mut self, slot: SlotId, seq: u64) -> Result<bool, LinkError> {
+        match self.dedup.accept(slot, seq) {
+            Delivery::New => Ok(true),
+            Delivery::Duplicate => Ok(false),
+            Delivery::OutOfWindow => Err(LinkError::PayloadOutOfWindow { slot, seq }),
+        }
+    }
+
     /// Builds the next packet — `payload` plus redundant unacked ones, or
     /// ack-only when `payload` is `None` — sends it as one QUIC datagram, and
     /// returns how many still-unacked turns it re-carried as redundancy (the fresh
@@ -153,6 +188,21 @@ impl Link {
             .max_datagram_size()
             .ok_or(LinkError::DatagramsUnsupported)?;
         let had_fresh = payload.is_some();
+
+        // A payload that can never ride any datagram is refused *before* it is
+        // registered as unacked. Registered, it would poison recovery: every
+        // rebuilt bundle would try and fail to carry it, and its seq would hold
+        // a permanent gap in the peer's delivered prefix. Refused here, the
+        // caller diverts it (the reliable control stream) or fails fast. This
+        // is distinct from a *bundle* that outgrew a shrunken path below —
+        // that payload fit when checked, is registered, and its refusal is a
+        // recoverable loss the next (smaller) bundle re-carries.
+        if let Some(p) = &payload {
+            let needed = crate::ack_manager::lone_packet_len(p);
+            if needed > budget {
+                return Err(LinkError::PayloadTooLarge { needed, budget });
+            }
+        }
 
         let packet = self.acks.build_outgoing(payload, budget);
         // Everything in the packet except the fresh turn is a redundant re-carry.

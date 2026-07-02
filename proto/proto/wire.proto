@@ -189,6 +189,33 @@ message Payload {
   optional BufferDirective buffer_directive = 5;
 }
 
+// One message on the client ↔ relay reliable control stream — the channel for
+// what the datagram path deliberately cannot carry. Each side opens one
+// bidirectional QUIC stream after the auth handshake and writes length-prefixed
+// `ControlFrame`s on it (see `proto::control_stream` for the framing and its
+// size cap); the peer reads the stream it accepted.
+//
+// The first resident is the oversize turn: a turn too large to ever fit a
+// datagram cannot ride redundancy (no bundle could carry it), so it travels
+// here — same `Payload`, same `(slot, seq)` identity, folded back into the
+// per-slot ordered stream on arrival exactly as if a datagram had delivered
+// it. QUIC's stream reliability replaces the redundancy/ack machinery for
+// these: nothing to re-carry, nothing to retire. The head-of-line blocking a
+// reliable stream brings is confined to the rare oversize turn that chose it.
+//
+// A oneof so chat/resync/lobby-control can join later without a wire break: a
+// frame whose kind a peer predates decodes with the oneof unset, and the
+// reader skips it rather than tearing the stream down.
+message ControlFrame {
+  oneof kind {
+    // A turn too large for the datagram path, validated and forwarded like
+    // any other turn. Client → relay carries the client's own turn; relay →
+    // client carries a peer's forwarded turn (which may bear the envelope
+    // stamps every forwarded turn can: frame annotation, buffer directive).
+    Payload oversize_turn = 1;
+  }
+}
+
 // A relay-authored instruction to change the latency buffer at an agreed future
 // game frame. The latency buffer is the lockstep cushion that absorbs network
 // jitter; the deciding relay resizes it as conditions shift and every client

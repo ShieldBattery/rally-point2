@@ -54,6 +54,7 @@ pub use mesh_link::{MeshLink, MeshLinkError, SessionLink, should_dial_mesh};
 /// Shared ack-beacon side-channel helpers (read-loop task + cursor push), used
 /// by both the client and relay drivers.
 pub mod beacon;
+pub mod control;
 
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.

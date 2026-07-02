@@ -34,6 +34,7 @@ pub mod version;
 
 /// Sans-I/O codec for the ack-beacon side-channel.
 pub mod beacon;
+pub mod control_stream;
 
 /// Generated protobuf wire messages — the turn-datagram framing.
 ///

@@ -275,6 +275,21 @@ impl MeshLink {
         let packet_budget = datagram_budget
             .saturating_sub(conditions_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
+        // A payload that can never ride any datagram is refused *before* it is
+        // registered as unacked (mirroring `Link::send`): registered, every
+        // rebuilt bundle would try and fail to carry it while its seq holds a
+        // permanent gap in the peer's delivered prefix. The mesh has no
+        // reliable divert path yet, so the caller drops the turn and logs —
+        // cross-relay oversize turns await a mesh control stream.
+        if let Some(p) = &payload {
+            let needed = crate::ack_manager::lone_packet_len(p);
+            if needed > packet_budget {
+                return Err(MeshLinkError::PayloadTooLarge {
+                    needed,
+                    budget: packet_budget,
+                });
+            }
+        }
         let packet = session_link.acks.build_outgoing(payload, packet_budget);
         // Everything in the packet except the fresh turn is a redundant re-carry.
         let redundant = packet.payloads.len() - usize::from(had_fresh);

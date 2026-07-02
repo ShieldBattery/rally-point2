@@ -25,8 +25,13 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > relay first; relay-id order remains only as the fallback for a descriptor without one), and **handoff
 > is presence-driven**: relays exchange per-session live-player counts over reliable mesh presence
 > streams, and the verdict falls to the next relay in the order the moment the deciding relay's players
-> leave — no coordinator re-push needed. Resilience/failover and dual-stack advertise addresses remain
-> designed but not yet built.
+> leave — no coordinator re-push needed. The client ↔ relay **reliable control stream** is built (one
+> bidirectional stream per side, extensible length-prefixed frames): a turn too large to ever ride a
+> datagram diverts onto it end-to-end — client to relay, validated, and relay to each recipient — and
+> rejoins the ordered turn stream at the receiver; chat/resync are future frame kinds on the same
+> channel, and the mesh's equivalent divert path (a cross-relay oversize turn today is dropped with a
+> warning rather than killing the shared link) is a follow-up. Resilience/failover and dual-stack
+> advertise addresses remain designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly

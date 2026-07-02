@@ -17,9 +17,11 @@
 //! redundancy, but when one is too full (a near-MTU turn) or the link is idle, a
 //! maintenance flush re-carries them oldest-first, so a dropped turn still lands
 //! without sending redundant packets while the stream is already covering it;
-//! surfaces a turn too large to fit a datagram as a hard error (the tiny turns of a
-//! lockstep game never produce one, but it is not silently dropped); and flushes
-//! acks for a quiet or one-way link so the peer still retires what it has sent.
+//! diverts a turn too large to ever fit a datagram onto the reliable control
+//! stream (QUIC's stream reliability replaces redundancy for it — the tiny turns
+//! of a lockstep game rarely produce one, but it must arrive, not error or drop);
+//! and flushes acks for a quiet or one-way link so the peer still retires what it
+//! has sent.
 //!
 //! Delivery to the game is **in seq order**. The link dedups and orders within a
 //! datagram but follows arrival order across datagrams, so the driver buffers
@@ -38,7 +40,8 @@ use std::time::Duration;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
-use rally_point_transport::{Link, LinkError};
+use rally_point_transport::control::{ControlSendError, send_control_turn, spawn_control_reader};
+use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
@@ -116,13 +119,14 @@ pub enum DriverError {
     /// re-dial and resume from the last delivered turn.
     #[error("home-relay link failed: {0}")]
     Link(#[from] LinkError),
-    /// A turn did not fit a datagram, so it can be delivered in no packet. With the
-    /// tiny turns of a lockstep game this should never happen; the driver surfaces it
-    /// (rather than silently stalling the stream) and stops, since dropping the turn
-    /// would desync lockstep. An oversize turn ultimately belongs on the reliable
-    /// control stream (not built yet).
-    #[error("turn of {needed} bytes exceeds the {budget}-byte datagram budget")]
-    TurnTooLarge { needed: usize, budget: usize },
+    /// A turn too large for the datagram path could not go out on the reliable
+    /// control stream either — the stream is gone (the connection dropped), or
+    /// the turn exceeds even the control frame cap and no channel can deliver
+    /// it. Either way the turn cannot be silently dropped (that desyncs
+    /// lockstep), so the driver stops; a broken stream is the same reconnect
+    /// trigger as a broken link.
+    #[error("oversize turn could not be diverted: {0}")]
+    ControlStream(#[from] ControlSendError),
     /// The game stopped draining received turns and the inbound buffer filled, so
     /// the relay's turns have nowhere to go. The driver surfaces this instead of
     /// blocking on the handoff — parking there would also stall its acks and
@@ -196,6 +200,24 @@ impl LinkDriver {
             .await
             .map_err(|error| DriverError::Link(LinkError::from(error)))?;
         let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
+
+        // The reliable control stream — the divert path for a turn too large
+        // to ever ride a datagram. Each side opens one bidirectional stream
+        // and writes on it alone; the peer reads the stream it accepted. Our
+        // send half exists from here on (open_bi completes locally); the
+        // relay's frames arrive via the reader task, which accepts lazily so
+        // a session that never sees an oversize turn parks it harmlessly.
+        // The recv half of our own stream is unused by convention (the relay
+        // writes on the stream *it* opened) and dropped.
+        let (mut control_send, _our_stream_recv) = link
+            .connection()
+            .open_bi()
+            .await
+            .map_err(|error| DriverError::Link(LinkError::from(error)))?;
+        let mut control_rx = spawn_control_reader(link.connection().clone());
+        // Mirrors `beacon_alive`: once the reader task ends, its channel is an
+        // always-ready `None` that would spin the loop, so the branch disarms.
+        let mut control_alive = true;
         // The highest cursor the client has pushed to the peer, per slot. Push
         // only on advance so a healthy link with a static receive prefix sends
         // nothing.
@@ -242,8 +264,6 @@ impl LinkDriver {
                     if received.carried_payloads {
                         acks_owed = true;
                     }
-                    // Track which slots advanced so we can push their cursors after.
-                    let mut advanced: Vec<SlotId> = Vec::new();
                     for payload in received.fresh {
                         let slot = SlotId(payload.slot as u8);
                         let slot_next = next_seq.entry(slot).or_insert(0);
@@ -254,53 +274,61 @@ impl LinkDriver {
                                 .insert(payload.seq, payload);
                         }
                     }
-                    // Release the contiguous run per slot, holding the rest. Hand off
-                    // without ever awaiting: blocking on a full channel would park the
-                    // whole driver — no acks, no outbound turns, no link-failure
-                    // detection — behind a stalled consumer.
-                    let mut stall: Option<(SlotId, Payload)> = None;
-                    for (slot, slot_next) in next_seq.iter_mut() {
-                        let Some(slot_pending) = pending.get_mut(slot) else {
-                            continue;
-                        };
-                        while let Some(payload) = slot_pending.remove(slot_next) {
-                            match inbound.try_send(payload) {
-                                Ok(()) => *slot_next += 1,
-                                Err(mpsc::error::TrySendError::Full(payload)) => {
-                                    stall = Some((*slot, payload));
-                                    break;
-                                }
-                                // The game dropped its receiver: a clean stop.
-                                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                            }
-                        }
-                        // Record this slot as having advanced for the beacon push.
-                        if let Some(cursor) = link.delivered_through(*slot) {
-                            advanced.push(*slot);
-                            let _ = cursor; // delivered_through already reflects the advance
-                        }
+                    match release_ready(&mut next_seq, &mut pending, &inbound) {
+                        Release::Delivered => {}
+                        Release::GameClosed => return Ok(()),
+                        Release::GameStalled => return Err(DriverError::GameStalled),
                     }
-                    if let Some((slot, payload)) = stall {
-                        // Put the held turn back before surfacing.
-                        pending.entry(slot).or_default().insert(*next_seq.get(&slot).unwrap(), payload);
-                        return Err(DriverError::GameStalled);
-                    }
-                    // Push the advanced delivered-through cursors to the peer so it can
-                    // force-advance its unacked window past turns it now knows we
-                    // received. Push only on advance; a static cursor (genuine forward
-                    // gap) sends nothing — the cap handles that.
-                    if !advanced.is_empty() {
-                        let cursors: HashMap<SlotId, u64> = advanced
-                            .iter()
-                            .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c)))
-                            .collect();
-                        flush_beacon(&mut beacon_send, &mut last_beacon_sent, cursors).await;
-                    }
+                    flush_delivered_cursors(&link, &mut beacon_send, &mut last_beacon_sent, &next_seq)
+                        .await;
                     if check_cap(link.payloads_in_flight()) {
                         return Err(DriverError::UnackedWindowExhausted {
                             in_flight: link.payloads_in_flight(),
                             cap: UNACKED_WINDOW_CAP,
                         });
+                    }
+                }
+                // An oversize turn from the relay, delivered over the reliable
+                // control stream because no datagram could carry it. Folding it
+                // through the link's dedup keeps the two delivery paths one
+                // stream: the per-slot delivered cursor advances across it and
+                // a copy that somehow arrived both ways collapses to one
+                // delivery. It then joins the same per-slot reorder buffer, so
+                // the game sees one ordered stream regardless of which path
+                // each turn took.
+                received = control_rx.recv(), if control_alive => {
+                    match received {
+                        Some(payload) => {
+                            let slot = SlotId(payload.slot as u8);
+                            if link.deliver_external(slot, payload.seq)? {
+                                next_seq.entry(slot).or_insert(0);
+                                pending
+                                    .entry(slot)
+                                    .or_default()
+                                    .insert(payload.seq, payload);
+                                match release_ready(&mut next_seq, &mut pending, &inbound) {
+                                    Release::Delivered => {}
+                                    Release::GameClosed => return Ok(()),
+                                    Release::GameStalled => return Err(DriverError::GameStalled),
+                                }
+                                flush_delivered_cursors(
+                                    &link,
+                                    &mut beacon_send,
+                                    &mut last_beacon_sent,
+                                    &next_seq,
+                                )
+                                .await;
+                            }
+                        }
+                        // The reader task ended (stream closed or a framing
+                        // violation). Not itself fatal — the link may be fine
+                        // and most sessions never see an oversize turn — but
+                        // one that later needs the stream will stall, so it is
+                        // worth a log line before the branch disarms.
+                        None => {
+                            tracing::info!("control stream reader ended");
+                            control_alive = false;
+                        }
                     }
                 }
                 outgoing = outbound.recv() => {
@@ -314,16 +342,28 @@ impl LinkDriver {
                             // sole authority for its own slot's production order.
                             payload.seq = next_outbound_seq;
                             next_outbound_seq += 1;
-                            let carried_redundancy = send_packet(&mut link, Some(payload))?;
-                            acks_owed = false;
-                            if carried_redundancy {
-                                flush_deadline = Instant::now() + FLUSH_INTERVAL;
-                            }
-                            if check_cap(link.payloads_in_flight()) {
-                                return Err(DriverError::UnackedWindowExhausted {
-                                    in_flight: link.payloads_in_flight(),
-                                    cap: UNACKED_WINDOW_CAP,
-                                });
+                            if link.payload_fits(&payload)? {
+                                let carried_redundancy = send_packet(&mut link, Some(payload))?;
+                                acks_owed = false;
+                                if carried_redundancy {
+                                    flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                                }
+                                if check_cap(link.payloads_in_flight()) {
+                                    return Err(DriverError::UnackedWindowExhausted {
+                                        in_flight: link.payloads_in_flight(),
+                                        cap: UNACKED_WINDOW_CAP,
+                                    });
+                                }
+                            } else {
+                                // Too large for any datagram: divert to the
+                                // reliable control stream, whose QUIC-level
+                                // reliability replaces redundancy for this turn
+                                // — it never enters the unacked window and no
+                                // ack retires it. A write failure is fatal
+                                // (`?`): unlike a lost datagram, nothing
+                                // re-carries this turn, and dropping it would
+                                // desync lockstep.
+                                send_control_turn(&mut control_send, payload).await?;
                             }
                         }
                         // The game dropped its sender: a clean stop.
@@ -383,17 +423,84 @@ impl LinkDriver {
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
 /// retransmission is already riding the outbound stream and the flush can rest.
 ///
-/// A turn too large to fit a datagram (which the tiny turns of a lockstep game never
-/// produce) and a genuine link failure are both returned as a [`DriverError`].
+/// A refused datagram (`PayloadTooLarge`) here is a *bundle* that outgrew a
+/// path-MTU shrink between sizing and sending — a recoverable loss the next,
+/// smaller bundle re-carries, so it is not an error. It can never be a lone
+/// turn too big for the path: the caller pre-checks with
+/// [`Link::payload_fits`] and diverts those to the control stream before they
+/// reach here (and the link itself refuses one pre-registration as a second
+/// line of defense).
 fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<bool, DriverError> {
     match link.send(payload) {
         Ok(redundant) => Ok(redundant > 0),
-        // A turn too big for a datagram. It can't be dropped silently (that desyncs
-        // lockstep), so surface it and stop rather than retry it forever.
         Err(LinkError::PayloadTooLarge { needed, budget }) => {
-            Err(DriverError::TurnTooLarge { needed, budget })
+            tracing::debug!(
+                needed,
+                budget,
+                "datagram refused by a shrunken path; will re-carry"
+            );
+            Ok(false)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// What [`release_ready`] observed while handing released turns to the game.
+enum Release {
+    /// Every releasable turn was handed off (possibly none).
+    Delivered,
+    /// The game dropped its receiver: a clean stop.
+    GameClosed,
+    /// The game stopped draining and the inbound buffer filled.
+    GameStalled,
+}
+
+/// Releases each slot's contiguous run of pending turns to the game, holding
+/// the rest. Hands off without ever awaiting: blocking on a full channel would
+/// park the whole driver — no acks, no outbound turns, no link-failure
+/// detection — behind a stalled consumer. Shared by the datagram and
+/// control-stream delivery paths, so a turn is released the same way no matter
+/// which path delivered it.
+fn release_ready(
+    next_seq: &mut HashMap<SlotId, u64>,
+    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+    inbound: &mpsc::Sender<Payload>,
+) -> Release {
+    for (slot, slot_next) in next_seq.iter_mut() {
+        let Some(slot_pending) = pending.get_mut(slot) else {
+            continue;
+        };
+        while let Some(payload) = slot_pending.remove(slot_next) {
+            match inbound.try_send(payload) {
+                Ok(()) => *slot_next += 1,
+                Err(mpsc::error::TrySendError::Full(payload)) => {
+                    // Put the held turn back before surfacing the stall.
+                    slot_pending.insert(*slot_next, payload);
+                    return Release::GameStalled;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Release::GameClosed,
+            }
+        }
+    }
+    Release::Delivered
+}
+
+/// Pushes each slot's delivered-through cursor to the peer so it can
+/// force-advance its unacked window past turns it now knows we received.
+/// `flush_beacon` pushes only cursors that advanced past `last_sent`, so a
+/// static cursor (a genuine forward gap) sends nothing — the cap handles that.
+async fn flush_delivered_cursors(
+    link: &Link,
+    beacon_send: &mut quinn::SendStream,
+    last_sent: &mut HashMap<SlotId, u64>,
+    next_seq: &HashMap<SlotId, u64>,
+) {
+    let cursors: HashMap<SlotId, u64> = next_seq
+        .keys()
+        .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c)))
+        .collect();
+    if !cursors.is_empty() {
+        flush_beacon(beacon_send, last_sent, cursors).await;
     }
 }
 
@@ -503,23 +610,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_over_mtu_turn_fails_fast_instead_of_dropping_silently() {
-        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+    async fn an_over_mtu_turn_is_delivered_via_the_control_stream() {
+        // A turn far larger than any datagram can never ride the datagram path
+        // — no bundle could carry it, and no redundancy could recover it. The
+        // driver must divert it to the reliable control stream, and the peer's
+        // driver must fold it back into the ordered turn stream, interleaved
+        // correctly with ordinary datagram turns around it.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
-        let task = tokio::spawn(driver_a.run());
+        let (driver_b, chan_b) = LinkDriver::new(link_b);
+        let task_a = tokio::spawn(driver_a.run());
+        let task_b = tokio::spawn(driver_b.run());
 
-        // A turn far larger than any datagram can never be delivered. The driver
-        // must surface that as a hard error rather than silently drop it from the
-        // lockstep stream — or treat it as a loss it could never actually recover.
-        chan_a.outbound.send(turn(0, &[0u8; 4096])).await.unwrap();
+        // An ordinary turn, then the oversize one, then another ordinary one:
+        // the oversize turn takes a different path but must arrive in seq
+        // order between its neighbors.
+        chan_a.outbound.send(turn(0, &[0x01])).await.unwrap();
+        chan_a
+            .outbound
+            .send(turn(0, &vec![0x42; 4096]))
+            .await
+            .unwrap();
+        chan_a.outbound.send(turn(0, &[0x03])).await.unwrap();
 
-        match tokio::time::timeout(Duration::from_secs(5), task).await {
-            Ok(joined) => assert!(matches!(
-                joined.unwrap(),
-                Err(DriverError::TurnTooLarge { .. })
-            )),
-            Err(_) => panic!("driver hung on an oversize turn instead of failing fast"),
+        let mut inbound_b = chan_b.inbound;
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            let payload = tokio::time::timeout(Duration::from_secs(5), inbound_b.recv())
+                .await
+                .expect("the oversize turn never arrived")
+                .expect("driver b closed early");
+            got.push(payload);
         }
+        assert_eq!(got[0].commands[0], 0x01);
+        assert_eq!(
+            got[1].commands.len(),
+            4096,
+            "the oversize turn arrives whole"
+        );
+        assert_eq!(got[1].commands[0], 0x42);
+        assert_eq!(got[2].commands[0], 0x03);
+        assert_eq!(
+            got.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "one ordered stream regardless of delivery path",
+        );
+
+        drop(chan_a.outbound);
+        drop(chan_b.outbound);
+        let _ = task_a.await;
+        let _ = task_b.await;
     }
 
     #[tokio::test]

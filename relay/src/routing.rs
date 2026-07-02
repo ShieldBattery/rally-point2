@@ -337,6 +337,26 @@ pub async fn run_slot_link(
         }
     };
     let mut beacon_rx = spawn_beacon_reader(link.connection().clone());
+    // The reliable control stream — the divert path for a turn too large to
+    // ever ride a datagram, in both directions: the client's own oversize turn
+    // arrives on the stream the client opened (read by the reader task below),
+    // and an oversize forwarded turn goes out on this stream the relay opens.
+    // Each side writes only on the stream it opened, so this send half exists
+    // from here on; the reader accepts the client's lazily.
+    let (mut control_send, _our_stream_recv) = match link.connection().open_bi().await {
+        Ok(halves) => halves,
+        Err(error) => {
+            log_link_closed(&key, slot, &LinkError::from(error));
+            deregister(&sessions, &key, slot);
+            report_own_presence(&presence, &decision_makers, &sessions, &key);
+            return;
+        }
+    };
+    let mut control_rx =
+        rally_point_transport::control::spawn_control_reader(link.connection().clone());
+    // Mirrors `beacon_alive` below: a `None` from an ended reader task must
+    // disarm the branch, not spin the loop.
+    let mut control_alive = true;
     // The highest cursor the relay has pushed to the client, per slot. Push only
     // on advance.
     let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
@@ -464,36 +484,133 @@ pub async fn run_slot_link(
             }
             forwarded = forward_rx.recv() => {
                 match forwarded {
-                    // The forwarded turn went out carrying our acks. If it also
-                    // re-carried unacked turns, recovery is riding the stream, so push
-                    // the flush out; if it carried none (a near-MTU turn), leave the
-                    // timer so the flush retransmits them.
-                    Some(payload) => match send_packet(&mut link, Some(payload)) {
-                        Ok(carried_redundancy) => {
-                            acks_owed = false;
-                            if carried_redundancy {
-                                flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                    Some(payload) => {
+                        let fits = match link.payload_fits(&payload) {
+                            Ok(fits) => fits,
+                            Err(error) => {
+                                log_link_closed(&key, slot, &error);
+                                break 'serve;
                             }
-                            if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
+                        };
+                        if !fits {
+                            // Too large for any datagram on this client's path:
+                            // divert to the reliable control stream, whose QUIC
+                            // reliability replaces redundancy for this turn. A
+                            // write failure closes the link — nothing re-carries
+                            // a diverted turn, and dropping it would desync
+                            // lockstep.
+                            if let Err(error) = rally_point_transport::control::send_control_turn(
+                                &mut control_send,
+                                payload,
+                            )
+                            .await
+                            {
+                                tracing::info!(
+                                    tenant = key.tenant.as_ref(),
+                                    session = key.session.0,
+                                    slot = slot.0,
+                                    %error,
+                                    "control stream send failed; closing slot link",
+                                );
+                                break 'serve;
+                            }
+                            continue;
+                        }
+                        // The forwarded turn goes out carrying our acks. If it
+                        // also re-carried unacked turns, recovery is riding the
+                        // stream, so push the flush out; if it carried none (a
+                        // near-MTU turn), leave the timer so the flush
+                        // retransmits them.
+                        match send_packet(&mut link, Some(payload)) {
+                            Ok(carried_redundancy) => {
+                                acks_owed = false;
+                                if carried_redundancy {
+                                    flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                                }
+                                if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
+                                    tracing::warn!(
+                                        tenant = key.tenant.as_ref(),
+                                        session = key.session.0,
+                                        slot = slot.0,
+                                        in_flight = link.payloads_in_flight(),
+                                        "unacked window exhausted; isolating slot",
+                                    );
+                                    link.connection()
+                                        .close(VarInt::from_u32(ISOLATED_CLOSE), b"unacked window exhausted");
+                                    break 'serve;
+                                }
+                            }
+                            Err(error) => {
+                                log_link_closed(&key, slot, &error);
+                                break 'serve;
+                            }
+                        }
+                    }
+                    // The roster dropped our sender: we've been deregistered.
+                    None => break 'serve,
+                }
+            }
+            // The client's oversize turn, arriving over the reliable control
+            // stream because no datagram could carry it. It is the same
+            // attacker-facing ingress as a datagram turn: fold it through the
+            // link's dedup first (a duplicate must not double-forward; a seq
+            // beyond the window closes the link exactly as on the datagram
+            // path), then validate and forward it like any other turn.
+            received = control_rx.recv(), if control_alive => {
+                match received {
+                    Some(payload) => {
+                        // Dedup under the *authorized* slot — the wire slot is a
+                        // claim the relay never trusts (validate_turn rebinds it
+                        // the same way on the datagram path), so a lied-about
+                        // slot can't open a second seq space.
+                        let fresh = match link.deliver_external(slot, payload.seq) {
+                            Ok(fresh) => fresh,
+                            Err(error) => {
+                                log_link_closed(&key, slot, &error);
+                                break 'serve;
+                            }
+                        };
+                        if !fresh {
+                            continue;
+                        }
+                        match validate_turn(slot, payload.seq, payload.game_frame_count, &payload.commands) {
+                            Ok(turn) => {
+                                let payload = turn.payload;
+                                // A validated turn's frame feeds the consensus
+                                // coordinate, exactly as on the datagram path.
+                                if let Some(frame) = payload.game_frame_count {
+                                    consensus::observe_frame(
+                                        &decision_makers,
+                                        &key,
+                                        slot,
+                                        rally_point_proto::ids::GameFrameCount(frame),
+                                    );
+                                }
+                                crate::mesh::forward_turn(
+                                    &sessions,
+                                    &mesh_links,
+                                    &seen_registries,
+                                    &decision_makers,
+                                    &key,
+                                    slot,
+                                    payload,
+                                );
+                            }
+                            Err(error) => {
                                 tracing::warn!(
                                     tenant = key.tenant.as_ref(),
                                     session = key.session.0,
                                     slot = slot.0,
-                                    in_flight = link.payloads_in_flight(),
-                                    "unacked window exhausted; isolating slot",
+                                    %error,
+                                    "rejecting oversize client turn and closing connection",
                                 );
                                 link.connection()
-                                    .close(VarInt::from_u32(ISOLATED_CLOSE), b"unacked window exhausted");
+                                    .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"invalid turn");
                                 break 'serve;
                             }
                         }
-                        Err(error) => {
-                            log_link_closed(&key, slot, &error);
-                            break 'serve;
-                        }
-                    },
-                    // The roster dropped our sender: we've been deregistered.
-                    None => break 'serve,
+                    }
+                    None => control_alive = false,
                 }
             }
             // The client pushed a delivered-through cursor over the beacon stream.
@@ -595,11 +712,25 @@ fn report_own_presence(
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
 /// retransmission is already riding the forward stream and the flush can rest.
 ///
-/// A turn too large to fit the client's path (which tiny lockstep turns never
-/// produce) and a real link failure are both returned as an error for the caller to
-/// close the connection on.
+/// A refused datagram (`PayloadTooLarge`) here is a *bundle* that outgrew a
+/// path-MTU shrink between sizing and sending — a recoverable loss the next,
+/// smaller bundle re-carries, so it is not an error. It can never be a lone
+/// turn too big for the path: the forward branch pre-checks with
+/// [`Link::payload_fits`] and diverts those to the control stream (and the
+/// link itself refuses one pre-registration as a second line of defense).
 fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<bool, LinkError> {
-    link.send(payload).map(|redundant| redundant > 0)
+    match link.send(payload) {
+        Ok(redundant) => Ok(redundant > 0),
+        Err(LinkError::PayloadTooLarge { needed, budget }) => {
+            tracing::debug!(
+                needed,
+                budget,
+                "datagram refused by a shrunken path; will re-carry"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Logs a link ending for ordinary reasons (peer closed, transport error) at a

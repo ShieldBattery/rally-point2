@@ -17,14 +17,19 @@
 //! forward recovery. Redundancy bundles are sized to the live `max_datagram_size()`
 //! by the link beneath the driver; a path-MTU shrink that refuses an already-built
 //! bundle is a recoverable loss the next packet re-carries, while a turn too large
-//! to fit any datagram is surfaced as a hard error rather than silently dropped.
+//! to ever fit a datagram is diverted onto the **reliable control stream** (one
+//! bidirectional stream per side, opened after the handshake) and folded back into
+//! the ordered turn stream on the receiving side.
 //! [`DirectiveTracker`] is the game loop's state machine for the latency-buffer
 //! directives the authority relay stamps onto forwarded turns: it collapses the
 //! redundant out-of-order stamp stream into at-most-one change per decision,
 //! surfaced exactly at its apply frame.
 //!
-//! TODO: reliable control streams for chat/control/resync; reconnect +
-//! resync-from-cursor (the unacked-window cap that triggers it is in place).
+//! TODO: chat/resync frame kinds on the control stream (the stream and its
+//! extensible `ControlFrame` framing exist; oversize turns are its first
+//! resident); reconnect + resync-from-cursor (the unacked-window cap that
+//! triggers it is in place, the mechanism is gated on the open failover
+//! design).
 
 /// Re-export of the shared protocol contracts, so consumers depend on a single
 /// `rally_point_client` surface rather than pulling in `rally-point-proto`

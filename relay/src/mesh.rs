@@ -663,9 +663,32 @@ pub async fn run_mesh_link(
                         };
                         let key = state.key.clone();
                         let outgoing = snapshot_conditions(&conditions, &key);
-                        if let Err(error) = link.send(session_id, Some(payload), outgoing) {
-                            tracing::info!(%error, "mesh send failed; closing link");
-                            break MeshLinkExit::ConnectionFailed;
+                        match link.send(session_id, Some(payload), outgoing) {
+                            Ok(_) => {}
+                            // A turn too large for any mesh datagram. The mesh
+                            // has no reliable divert path yet (the client edge
+                            // does — a mesh control stream is the follow-up),
+                            // so the turn is dropped for this peer's clients:
+                            // bad for that session, but killing the shared
+                            // relay-pair link would take down every session on
+                            // it. The client edge diverts its own copies, so a
+                            // single-relay session is unaffected.
+                            Err(rally_point_transport::MeshLinkError::PayloadTooLarge {
+                                needed,
+                                budget,
+                            }) => {
+                                tracing::warn!(
+                                    tenant = key.tenant.as_ref(),
+                                    session = key.session.0,
+                                    needed,
+                                    budget,
+                                    "dropping oversize turn on the mesh (no mesh control stream yet)",
+                                );
+                            }
+                            Err(error) => {
+                                tracing::info!(%error, "mesh send failed; closing link");
+                                break MeshLinkExit::ConnectionFailed;
+                            }
                         }
                         continue;
                     }

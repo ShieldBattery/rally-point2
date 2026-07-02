@@ -1249,6 +1249,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

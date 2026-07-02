@@ -314,6 +314,23 @@ fn payload_element_len(payload_len: usize) -> usize {
     1 + prost::encoding::encoded_len_varint(payload_len as u64) + payload_len
 }
 
+/// The encoded size of a packet carrying `payload` alone, assuming worst-case
+/// header state (maximal seq/ack varints, full ack bitfield). If this exceeds
+/// the datagram budget, no packet on this link can ever carry the payload — the
+/// caller's signal to refuse it up front (or divert it to a reliable stream)
+/// rather than register it as unacked, where redundancy would try and fail to
+/// re-carry it forever while its seq holds a permanent gap in the peer's
+/// delivered prefix.
+pub(crate) fn lone_packet_len(payload: &Payload) -> usize {
+    let header = Packet {
+        seq: u32::MAX,
+        ack: Some(u32::MAX),
+        ack_bits: u32::MAX,
+        payloads: Vec::new(),
+    };
+    header.encoded_len() + payload_element_len(payload.encoded_len())
+}
+
 /// What one of our sent packets carried, so an ack can retire its payloads.
 #[derive(Default, Clone)]
 struct SentPacket {
