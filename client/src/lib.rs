@@ -18,6 +18,10 @@
 //! by the link beneath the driver; a path-MTU shrink that refuses an already-built
 //! bundle is a recoverable loss the next packet re-carries, while a turn too large
 //! to fit any datagram is surfaced as a hard error rather than silently dropped.
+//! [`DirectiveTracker`] is the game loop's state machine for the latency-buffer
+//! directives the authority relay stamps onto forwarded turns: it collapses the
+//! redundant out-of-order stamp stream into at-most-one change per decision,
+//! surfaced exactly at its apply frame.
 //!
 //! TODO: reliable control streams for chat/control/resync; reconnect +
 //! resync-from-cursor (the unacked-window cap that triggers it is in place).
@@ -32,9 +36,11 @@ pub use rally_point_proto as proto;
 pub use rally_point_transport as transport;
 
 mod dial;
+mod directive;
 mod driver;
 mod identity;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
+pub use directive::DirectiveTracker;
 pub use driver::{DriverError, LinkDriver, TurnChannels};
 pub use identity::{Identity, IdentityError};

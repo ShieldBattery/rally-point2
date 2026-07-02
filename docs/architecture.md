@@ -17,7 +17,11 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > runtime**: each relay feeds its home clients' link stats (and peer relays' stats off the mesh sidecar)
 > into a per-session decision-maker the coordinator's descriptor creates, and the authority relay
 > broadcasts a buffer change by stamping it onto the turns it forwards — an envelope `buffer_directive` the
-> game applies out of band, not a command in the byte stream. Authority is decided by relay-id order for
+> game applies out of band, not a command in the byte stream. The client half of that application — the
+> state machine that collapses the redundant out-of-order stamp stream into at-most-one change per
+> decision, surfaced exactly at its apply frame — is built (`client::DirectiveTracker`); what remains is
+> the game seam in `shieldbattery/game/` that owns one and resizes the actual turn buffer with it.
+> Authority is decided by relay-id order for
 > now; the coordinator-assigned priority order and the presence-driven handoff when the authority's players
 > leave — plus resilience/failover and dual-stack advertise addresses — are designed but not yet built.
 

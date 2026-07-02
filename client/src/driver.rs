@@ -571,6 +571,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn envelope_metadata_survives_delivery_to_the_game() {
+        use rally_point_proto::messages::BufferDirective;
+
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut inbound = chan_a.inbound;
+
+        // A relay-forwarded turn carries more than its command bytes: the frame
+        // annotation and any latency-buffer directive the authority stamped ride
+        // the envelope. The driver must hand the payload to the game whole — the
+        // envelope is the game's only channel for the buffer directive, so a
+        // driver that rebuilt payloads and dropped it would silently break
+        // buffer changes for this client.
+        let stamped = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0x0C].into(),
+            game_frame_count: Some(41),
+            buffer_directive: Some(BufferDirective {
+                buffer_turns: 4,
+                apply_at_frame: 64,
+                decision_seq: 1,
+            }),
+        };
+        link_b.send(Some(stamped.clone())).unwrap();
+
+        let delivered = inbound.recv().await.unwrap();
+        assert_eq!(delivered, stamped);
+
+        drop(chan_a.outbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn retransmits_an_unacked_turn_during_outbound_silence() {
         let (link_a, mut link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
