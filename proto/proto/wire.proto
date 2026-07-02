@@ -165,4 +165,66 @@ message Payload {
   // recorder treat a missing frame as "no consensus coordinate" (lobby turns
   // don't participate in apply-at-turn-N decisions).
   optional uint32 game_frame_count = 4;
+
+  // A latency-buffer change the decision-making relay is broadcasting, if this
+  // forwarded turn carries one. The relay that holds buffer authority stamps
+  // this onto every turn it forwards until the whole session has passed the
+  // directive's apply frame, so the instruction reaches every client riding the
+  // turn stream they already receive — a client never gets its own turns back,
+  // so it picks the change up off a peer's turn, and a client whose turns
+  // aren't flowing yet is covered because the game (and so the apply frame)
+  // can't advance without it. It is envelope metadata, never part of
+  // `commands`: the game applies it outside command processing, so the SC:R
+  // command bytes stay exactly what the sending client produced. The transport
+  // ignores it for delivery, dedup, and retirement — the carrying turn is
+  // deduped by (slot, seq) as usual, and the directive rides along for the
+  // ride. A relay that is not the authority forwards an incoming stamp
+  // untouched; only the authority ever sets or replaces this field.
+  //
+  // Idempotent by design: copies of the same directive (a re-stamped turn, a
+  // redundant re-carry, a second mesh path) all carry the same `decision_seq`,
+  // and a client keeps only the highest `decision_seq` it has seen. Absent
+  // outside the window between a decision and its apply frame — the vast
+  // majority of turns.
+  optional BufferDirective buffer_directive = 5;
+}
+
+// A relay-authored instruction to change the latency buffer at an agreed future
+// game frame. The latency buffer is the lockstep cushion that absorbs network
+// jitter; the deciding relay resizes it as conditions shift and every client
+// must apply the change at the *same* simulated step, or they desync. This
+// message is how that change reaches the clients: it rides the `Payload`
+// envelope of turns the relay forwards (see `Payload.buffer_directive`), so it
+// travels the turn stream clients already consume without a separate channel or
+// a forged command.
+//
+// It is deliberately not a native latency command in the `commands` byte stream:
+// those cap the buffer at the game's built-in range and would have to be forged
+// into a specific slot's turn. Carried here instead, the buffer is a plain turn
+// count with no ceiling, and the game applies it out of band — reading it off
+// the turn it arrives on, not parsing it as a command.
+message BufferDirective {
+  // The latency buffer to apply, in whole turns of added dispatch delay. Not
+  // capped at the game's native latency range: the deciding relay may widen the
+  // cushion further when conditions demand it, and every client applies the same
+  // count so lockstep stays in step.
+  uint32 buffer_turns = 1;
+
+  // The game frame at which every client applies `buffer_turns`. Chosen a
+  // horizon ahead of the slowest frame the relay has observed — wide enough to
+  // cover the spread between the slowest and fastest client plus delivery — so
+  // the instruction reaches every client before that frame arrives. A client
+  // that receives it for a frame already in its past applies nothing — the
+  // change is moot by then, and the next decision will carry a fresh future
+  // frame.
+  uint32 apply_at_frame = 2;
+
+  // Orders decisions within a session. The authority increments this for every
+  // decision it broadcasts, so the turn stream's out-of-order delivery and
+  // redundant re-carries can interleave a superseded directive's copies with
+  // its replacement's without ambiguity. The client rule is exactly: keep the
+  // directive with the highest `decision_seq` seen so far, apply it at its
+  // `apply_at_frame`, and ignore everything with a lower or equal seq — even
+  // when two directives name the same `apply_at_frame`.
+  uint32 decision_seq = 3;
 }

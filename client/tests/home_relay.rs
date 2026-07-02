@@ -165,8 +165,8 @@ async fn two_clients_exchange_a_turn_through_the_relay() {
         .send(Some(Payload {
             seq: 0,
             slot: 9,
-            game_frame_count: None,
             commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
         }))
         .unwrap();
 

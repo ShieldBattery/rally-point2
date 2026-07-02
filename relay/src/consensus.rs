@@ -1,15 +1,26 @@
 //! The latency-buffer decision-maker: the relay-side core of the runtime
 //! consensus authority.
 //!
-//! This is the *decision* half of D9 -- which relay decides, from what data,
-//! and the control law that turns network conditions into a buffer-size change.
-//! It is pure and synchronous: no I/O, no async, no locks of its own. The
-//! [`DecisionMaker`] is fed conditions and game-frame observations by its caller
-//! and returns a [`Decision`] describing what (if anything) to broadcast. The
-//! broadcast wire format -- native `0x55` (clamped `[0,2]`, with an out-of-band
-//! latency-label trap past 2) vs. a custom control command -- is a deliberate
-//! open design step (see the SC:R replacement guide S4 / S5.3); this module
-//! emits the *decision* and the target frame, not the bytes.
+//! This is the *decision* half of the buffer consensus -- which relay decides,
+//! from what data, and the control law that turns network conditions into a
+//! buffer-size change. The [`DecisionMaker`] itself is pure and synchronous: no
+//! I/O, no async, no locks of its own. It is fed conditions and game-frame
+//! observations by its caller and returns a [`Decision`] describing what (if
+//! anything) to broadcast; the registry-level helpers at the bottom of this
+//! module add the locking and logging the turn path needs.
+//!
+//! The broadcast rides the turn stream as envelope metadata: a decision queues
+//! a directive that [`active_directive`](DecisionMaker::active_directive) hands
+//! to the caller for every turn it forwards, which sets it on each payload's
+//! `buffer_directive` field, until the whole session has passed the directive's
+//! apply frame. It is deliberately *not* a command in the SC:R byte stream -- a
+//! native latency command would cap the buffer at the game's built-in range and
+//! would have to be forged into a slot's turn, and a client applies one turn
+//! per remote player per step, so an extra command can't just be handed over.
+//! Riding the envelope, the buffer has no ceiling and the game applies it out
+//! of band, off the turn it arrives on. The value, the frame to apply it at,
+//! and the decision seq that orders it are all this module produces; the caller
+//! sets the wire field.
 //!
 //! # Authority and authority handoff
 //!
@@ -19,11 +30,14 @@
 //! relay, and the mesh carries turns between them. "Handoff" is specifically
 //! when the authority relay drops out -- its players have all left -- and
 //! authority falls to the next relay in the order, with no coordinator
-//! round-trip.) That handoff needs the coordinator-assigned priority order and
-//! a presence signal, both of which land with the mesh wiring + coordinator
-//! (Phase 3). So authority is taken as an **injected input**: a single relay
-//! passes `Authority::SelfRelay` and the decision core runs unchanged once
-//! peer conditions flow in.
+//! round-trip.) Authority is an **injected input** to this core: the caller
+//! (`MeshControl`) computes the verdict from each coordinator descriptor --
+//! today by relay-id order, an interim rule until the coordinator assigns an
+//! explicit priority order and a presence signal drives handoff -- and
+//! re-injects it via [`DecisionMaker::sync`] on every push, so the verdict
+//! follows the relay set as players come and go. A promoted relay's decisions
+//! must outrank everything the previous authority broadcast; that is what
+//! [`observe_directive`](DecisionMaker::observe_directive) is for.
 //!
 //! # The target formula
 //!
@@ -121,16 +135,31 @@
 //! A buffer change every client must apply identically is scheduled at a
 //! future `game_frame_count` (the consensus coordinate), not applied at the
 //! decision instant: the turn in flight when the decision is made is already
-//! past the point where a mid-turn latency change is safe. The decision-maker
-//! schedules the change a fixed horizon ahead of the latest frame it has seen
-//! -- long enough that every client receives the broadcast before that frame
-//! arrives, short enough that a worsening condition isn't delayed.
+//! past the point where a mid-turn latency change is safe.
+//!
+//! The coordinate is the **minimum** of the per-slot frames observed from
+//! validated turns -- the slowest participant's progress, which is what
+//! lockstep actually advances by. Using the minimum (never a single payload's
+//! claim) is also the defense against a hostile client: `game_frame_count` is
+//! client-asserted and unvalidated, so a slot reporting an absurdly large
+//! frame only inflates *its own* per-slot observation -- the session
+//! coordinate stays pinned to the honest slots, and the worst a lone attacker
+//! can do is under-report and stall decisions, which lockstep already lets it
+//! do by stalling outright. (A single-slot session's coordinate is that slot's
+//! own claim, but with no second client there is nobody to diverge from.)
+//!
+//! The change is scheduled a horizon ahead of that coordinate: the current
+//! buffer span plus a fixed margin. The relay's view of the slowest client
+//! lags by roughly the cushion (frames are observed off turns that took the
+//! client->relay path), and the fastest client runs ahead of the slowest by at
+//! most the cushion, so the horizon scales with the buffer rather than being a
+//! constant that a large cushion could outrun.
 
 use std::collections::HashMap;
 
 use rally_point_proto::control::BufferBounds;
 use rally_point_proto::ids::{GameFrameCount, SlotId};
-use rally_point_proto::messages::LinkConditions;
+use rally_point_proto::messages::{BufferDirective, LinkConditions};
 
 use crate::routing::SessionKey;
 
@@ -165,33 +194,32 @@ pub enum Authority {
 ///
 /// The change targets a future `game_frame_count` -- every client applies it at
 /// the same simulated step, so the buffer moves identically for everyone. The
-/// `applied_frame` is scheduled a horizon ahead of the latest observed frame
-/// so the broadcast reaches every client before that frame arrives.
+/// `applied_frame` is scheduled a horizon ahead of the session's slowest
+/// observed frame so the broadcast reaches every client before that frame
+/// arrives.
 ///
-/// This is the decision, not the broadcast: the wire format (native `0x55`
-/// vs. a custom control command) and the origination `(slot, seq)` a relay uses
-/// to inject the command into the per-slot stream without colliding with a
-/// client's own seq space are a deliberate design step (see module docs + the
-/// SC:R replacement guide). The caller translates a `Decision` into bytes.
+/// This is the decision the control law reached. The change queues a directive
+/// the caller broadcasts by stamping it onto every turn it forwards (see
+/// [`active_directive`](DecisionMaker::active_directive)); this value is what a
+/// debug UI logs and what the decision was, distinct from the per-turn
+/// broadcast that carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
     /// The buffer size to apply, clamped to the coordinator's bounds.
     pub buffer: BufferSize,
     /// The frame at which every client must apply the new buffer. Guaranteed
-    /// `> latest_observed_frame` at decision time (the horizon is added to the
-    /// max frame the authority has seen).
+    /// ahead of the session frame at decision time (the horizon is added to
+    /// the slowest per-slot frame the authority has observed).
     pub applied_frame: GameFrameCount,
 }
 
-/// How far ahead of the latest observed frame a buffer change is scheduled.
-///
-/// Long enough that the broadcast reaches every client before the target frame
-/// arrives (the mesh forwards in arrival order with no reordering latency, and
-/// redundancy covers loss); short enough that a worsening condition isn't
-/// delayed past a turn or two. In turns: at the 24/sec turn rate, one turn is
-/// ~42ms, so a horizon of a few turns is well under a quarter-second of
-/// scheduling slack -- comfortable for any reasonable mesh RTT, tight enough
-/// that a player feeling lag sees relief promptly.
+/// The fixed margin of the apply horizon, in turns, added on top of the buffer
+/// span (see [`DecisionMaker::decide`]). The buffer span covers observation lag
+/// and client spread, which both scale with the cushion; this margin covers the
+/// delivery of the stamped turn itself. At the 24/sec turn rate a few turns is
+/// well under a quarter-second of scheduling slack -- comfortable for any
+/// reasonable path, tight enough that a player feeling lag sees relief
+/// promptly.
 const APPLY_HORIZON: u32 = 3;
 
 /// How many recent RTT samples to keep per slot for jitter-aware sizing.
@@ -300,6 +328,11 @@ struct SlotState {
     /// The one-way mesh hop RTT (us) from the authority to this slot's home
     /// relay. `0` for local slots; the relay-pair RTT for remote slots.
     mesh_rtt_us: u32,
+    /// The newest `game_frame_count` observed on this slot's validated turns.
+    /// Monotonic per slot; `None` until the slot's first framed turn (lobby
+    /// turns carry no frame). The session's consensus coordinate is the
+    /// *minimum* across slots, so one slot's inflated claim can't poison it.
+    frame: Option<GameFrameCount>,
     /// The prior sample's cumulative `lost_packets`. Meaningful only when
     /// `has_delta` is true.
     prev_lost: u64,
@@ -360,15 +393,16 @@ impl SlotState {
 /// The latency-buffer decision-maker for one session.
 ///
 /// Owns the per-slot condition history (RTT ring buffer for jitter, cumulative
-/// counter differencing for loss, mesh-hop RTT for cross-relay paths), the
-/// current buffer size, the last frame a decision was made at (for min-dwell
-/// on lowers), and the max frame observed (to schedule the horizon relative to
-/// the game's actual leading edge).
+/// counter differencing for loss, mesh-hop RTT for cross-relay paths, the
+/// newest validated frame), the current buffer size, the session frame the
+/// last decision was made at (for min-dwell on lowers), and the directive
+/// currently being broadcast.
 ///
-/// One instance per session the relay is the authority for. Fed conditions and
-/// frame observations by `run_slot_link` (home-client conditions, via
-/// [`ingest_local`](Self::ingest_local)) and `run_mesh_link` (peer-relay
-/// conditions, via [`ingest_remote`](Self::ingest_remote)) -- but only when
+/// One instance per session. Fed frame observations off validated turns via
+/// [`observe_frame`](Self::observe_frame) and conditions by `run_slot_link`
+/// (home-client conditions, via [`ingest_local`](Self::ingest_local)) and
+/// `run_mesh_link` (peer-relay conditions, via
+/// [`ingest_remote`](Self::ingest_remote)) -- but it decides only when
 /// `Authority::SelfRelay`.
 pub struct DecisionMaker {
     key: SessionKey,
@@ -378,17 +412,31 @@ pub struct DecisionMaker {
 
     /// The current buffer size, clamped to bounds. Starts at `bounds.min`.
     buffer: BufferSize,
-    /// Per-slot condition history.
+    /// Per-slot condition history and frame observations.
     slots: HashMap<SlotId, SlotState>,
-    /// The latest `game_frame_count` observed across all conditions-bearing
-    /// payloads for this session.
-    max_frame: GameFrameCount,
-    /// The `max_frame` at which the last decision was *made* (not applied --
-    /// the applied frame is `max_frame + APPLY_HORIZON`). Used to gate lowers:
-    /// a lower is suppressed until `max_frame - last_decision_frame >=
-    /// min_dwell_turns`. Raises are never suppressed (you can't dwell through
-    /// a stall).
+    /// The session frame at which the last decision was *made* (not applied).
+    /// Used to gate lowers: a lower is suppressed until the session frame has
+    /// advanced `min_dwell_turns` past it. Raises are never suppressed (you
+    /// can't dwell through a stall).
     last_decision_frame: Option<GameFrameCount>,
+    /// Orders this session's decisions on the wire. Incremented for every
+    /// broadcast directive, so clients receiving copies out of order (or a
+    /// superseded directive after its replacement) keep only the newest. Also
+    /// advanced by [`observe_directive`](Self::observe_directive) to the
+    /// highest seq seen on *forwarded* stamps: every directive floods through
+    /// every relay serving the session, so a relay promoted to authority
+    /// continues the numbering instead of restarting below what clients
+    /// already hold (which they would ignore).
+    decision_seq: u32,
+    /// The buffer change currently being broadcast, if any. Set when a
+    /// decision fires; handed out by
+    /// [`active_directive`](Self::active_directive) for every forwarded turn,
+    /// and retired once the session frame reaches its apply frame -- by then
+    /// every slot has passed the frame, so the change is applied (or moot)
+    /// everywhere. A non-authority relay never sets this (it makes no
+    /// decisions), so it never stamps -- it only forwards the authority's
+    /// already-stamped turns verbatim.
+    pending_directive: Option<BufferDirective>,
 }
 
 impl DecisionMaker {
@@ -408,8 +456,9 @@ impl DecisionMaker {
             law,
             authority,
             slots: HashMap::new(),
-            max_frame: GameFrameCount(0),
             last_decision_frame: None,
+            decision_seq: 0,
+            pending_directive: None,
         }
     }
 
@@ -423,9 +472,36 @@ impl DecisionMaker {
         self.buffer
     }
 
-    /// The latest `game_frame_count` observed for this session.
-    pub fn max_frame(&self) -> GameFrameCount {
-        self.max_frame
+    /// The session's consensus coordinate: the *minimum* of the per-slot
+    /// frames observed so far, i.e. the slowest participant's progress --
+    /// which is what lockstep actually advances by. `None` until at least one
+    /// slot has produced a framed turn (lobby). Taking the minimum is the
+    /// poisoning defense: `game_frame_count` is client-asserted, so one slot's
+    /// inflated claim moves only its own observation, never the coordinate.
+    pub fn session_frame(&self) -> Option<GameFrameCount> {
+        self.slots.values().filter_map(|s| s.frame).min()
+    }
+
+    /// Records a `game_frame_count` observed on one of `slot`'s validated
+    /// turns. Monotonic per slot -- an older frame arriving out of order
+    /// doesn't move the observation backward.
+    pub fn observe_frame(&mut self, slot: SlotId, frame: GameFrameCount) {
+        let state = self.slots.entry(slot).or_default();
+        if state.frame.is_none_or(|current| frame > current) {
+            state.frame = Some(frame);
+        }
+    }
+
+    /// Records the `decision_seq` of a directive this relay forwarded on
+    /// behalf of the session's authority. Keeps `decision_seq` at least that
+    /// high, so if this relay is later promoted to authority its first
+    /// decision numbers *above* everything clients have already seen --
+    /// clients keep only the highest seq, and a restarted numbering would be
+    /// silently ignored.
+    pub fn observe_directive(&mut self, seq: u32) {
+        if seq > self.decision_seq {
+            self.decision_seq = seq;
+        }
     }
 
     /// Whether this relay is the decision-making authority for this session.
@@ -433,29 +509,44 @@ impl DecisionMaker {
         self.authority == Authority::SelfRelay
     }
 
+    /// Reconciles this maker with a re-pushed session descriptor: adopts the
+    /// coordinator's current bounds and the freshly computed authority verdict.
+    /// The relay set serving a session changes as players join and leave, and
+    /// with it who the lowest-id (deciding) relay is -- a maker frozen at its
+    /// creation-time verdict could leave a session with two authorities or
+    /// none. Condition history and frame observations are kept (they describe
+    /// the links, not the descriptor); the committed buffer is kept too, since
+    /// it reflects what was last broadcast, and future decisions clamp to the
+    /// new bounds. A relay losing authority drops any directive it was still
+    /// broadcasting -- only the authority stamps.
+    pub fn sync(&mut self, bounds: BufferBounds, authority: Authority) {
+        self.bounds = bounds;
+        if self.authority != authority {
+            self.authority = authority;
+            if authority == Authority::Peer {
+                self.pending_directive = None;
+            }
+        }
+    }
+
     /// Ingests this relay's own home-client `LinkConditions` (conditions the
-    /// relay observed directly on its local clients) and the `game_frame_count`
-    /// the carrying datagram was observed at.
+    /// relay observed directly on its local clients).
     ///
-    /// Local slots have `mesh_rtt = 0` (no mesh hop -- this relay). RTT samples are pushed into the per-slot ring buffer for
-    /// jitter-aware sizing. Cumulative loss counters are rotated so the next
-    /// decision can difference them. `max_frame` advances to `frame` if newer.
+    /// Local slots have `mesh_rtt = 0` (no mesh hop -- this relay). RTT
+    /// samples are pushed into the per-slot ring buffer for jitter-aware
+    /// sizing. Cumulative loss counters are rotated so the next decision can
+    /// difference them.
     ///
     /// Returns a [`Decision`] if the control law fires a change, `None` if it
-    /// holds (target unchanged, or min-dwell suppressing a lower, or this
-    /// relay is not the authority). The caller translates a returned decision
-    /// into a broadcast.
-    pub fn ingest_local(
-        &mut self,
-        conditions: &LinkConditions,
-        frame: GameFrameCount,
-    ) -> Option<Decision> {
-        self.ingest(conditions, 0, frame)
+    /// holds (target unchanged, or min-dwell suppressing a lower, or no framed
+    /// turn observed yet, or this relay is not the authority). The caller
+    /// translates a returned decision into a broadcast.
+    pub fn ingest_local(&mut self, conditions: &LinkConditions) -> Option<Decision> {
+        self.ingest(conditions, 0)
     }
 
     /// Ingests a peer relay's `LinkConditions` sidecar (conditions the peer
-    /// relay observed on its own home clients, forwarded across the mesh) and
-    /// the `game_frame_count` the carrying datagram was observed at.
+    /// relay observed on its own home clients, forwarded across the mesh).
     ///
     /// `mesh_rtt_us` is the relay-pair RTT from the authority to the peer
     /// relay -- sampled from the `MeshLink`'s QUIC connection stats. It's added
@@ -469,23 +560,13 @@ impl DecisionMaker {
         &mut self,
         conditions: &LinkConditions,
         mesh_rtt_us: u32,
-        frame: GameFrameCount,
     ) -> Option<Decision> {
-        self.ingest(conditions, mesh_rtt_us, frame)
+        self.ingest(conditions, mesh_rtt_us)
     }
 
     /// Shared ingestion: pushes RTT samples, rotates loss counters, sets the
     /// mesh hop, then runs `decide` if this relay is the authority.
-    fn ingest(
-        &mut self,
-        conditions: &LinkConditions,
-        mesh_rtt_us: u32,
-        frame: GameFrameCount,
-    ) -> Option<Decision> {
-        if frame > self.max_frame {
-            self.max_frame = frame;
-        }
-
+    fn ingest(&mut self, conditions: &LinkConditions, mesh_rtt_us: u32) -> Option<Decision> {
         for slot in &conditions.slots {
             let id = SlotId(slot.slot as u8);
             let state = self.slots.entry(id).or_default();
@@ -584,6 +665,9 @@ impl DecisionMaker {
     /// can't dwell through a stall); lowers decrement by `lower_step` gated by
     /// `min_dwell_turns` (shrinks are infrequent and well-validated).
     fn decide(&mut self) -> Option<Decision> {
+        // No framed turn observed yet (lobby): there is no consensus
+        // coordinate to schedule against, so hold.
+        let frame = self.session_frame()?;
         let target = self.target()?;
 
         let new_buffer = if target > self.buffer.0 {
@@ -598,7 +682,7 @@ impl DecisionMaker {
             // (it set `last_decision_frame`), so a raise followed by a
             // would-be lower still waits the full dwell.
             if let Some(last) = self.last_decision_frame
-                && self.max_frame.0.saturating_sub(last.0) < self.law.min_dwell_turns
+                && frame.0.saturating_sub(last.0) < self.law.min_dwell_turns
             {
                 return None;
             }
@@ -612,14 +696,67 @@ impl DecisionMaker {
             return None;
         }
 
+        // The apply horizon: the session frame is the *slowest* client's
+        // progress as observed over its own uplink, so the relay's view lags
+        // by roughly the cushion, and the fastest client runs ahead of the
+        // slowest by at most the cushion again -- both scale with the buffer,
+        // so the horizon does too (the wider of the old and new cushion,
+        // plus a fixed delivery margin).
+        let span = self.buffer.0.max(new_buffer);
         self.buffer = BufferSize(new_buffer);
-        let applied_frame = GameFrameCount(self.max_frame.0.saturating_add(APPLY_HORIZON));
-        self.last_decision_frame = Some(self.max_frame);
+        let applied_frame =
+            GameFrameCount(frame.0.saturating_add(span).saturating_add(APPLY_HORIZON));
+        self.last_decision_frame = Some(frame);
+
+        // Queue the change for broadcast: the caller stamps it onto every turn
+        // it forwards until the session frame passes `applied_frame`. A newer
+        // decision replaces an older still-broadcasting one -- its higher
+        // `decision_seq` tells clients the latest buffer wins even when copies
+        // of both interleave on the wire.
+        self.decision_seq += 1;
+        self.pending_directive = Some(BufferDirective {
+            buffer_turns: new_buffer,
+            apply_at_frame: applied_frame.0,
+            decision_seq: self.decision_seq,
+        });
 
         Some(Decision {
             buffer: self.buffer,
             applied_frame,
         })
+    }
+
+    /// The buffer directive to stamp onto a turn this relay is about to
+    /// forward, if a decision is still being broadcast. Returns `None` -- the
+    /// overwhelmingly common case, since buffer changes are rare -- once the
+    /// session frame reaches the directive's apply frame: by then every slot
+    /// has been observed past it, so the change is applied (or moot)
+    /// everywhere and the directive retires.
+    ///
+    /// Stamping every forwarded turn until then (rather than a fixed number)
+    /// is what guarantees coverage: a client never receives its own turns
+    /// back, so it needs the stamp on a peer's turn -- and if a client's peers
+    /// aren't producing turns yet, the session frame isn't advancing either,
+    /// so the directive simply waits for them. Copies are cheap (a few bytes
+    /// on turns already being sent) and idempotent at the client (same
+    /// `decision_seq`).
+    ///
+    /// The caller sets the returned directive on the outgoing payload's
+    /// `buffer_directive` field before fanning it out to local slots and peer
+    /// relays. Only the authority ever returns a directive here: a
+    /// non-authority relay makes no decisions, so its `pending_directive` is
+    /// always `None` -- and its caller must preserve, not overwrite, a stamp
+    /// already on the turn.
+    pub fn active_directive(&mut self) -> Option<BufferDirective> {
+        let directive = self.pending_directive?;
+        if self
+            .session_frame()
+            .is_some_and(|frame| frame.0 >= directive.apply_at_frame)
+        {
+            self.pending_directive = None;
+            return None;
+        }
+        Some(directive)
     }
 
     /// Removes a slot's condition history (the client disconnected). Called
@@ -643,27 +780,117 @@ pub fn new_decision_makers() -> DecisionMakers {
     parking_lot::Mutex::new(HashMap::new())
 }
 
-/// Creates a decision-maker for `key` if one doesn't exist, bound to `bounds`
-/// and `authority`. The caller (the slot-link or mesh-link task that first
-/// sees the session) supplies the bounds the coordinator pushed and the
-/// authority verdict. Idempotent: a second call for an existing session is a
-/// no-op (the first call's bounds and authority win), so a slot-link task and
-/// a mesh-link task racing to create the same session can't clobber each other.
-pub fn ensure_maker(
+/// Creates a decision-maker for `key`, or reconciles an existing one with the
+/// coordinator's current `bounds` and the freshly computed `authority`. Called
+/// on every descriptor push: the relay set serving a session changes as
+/// players join and leave, and the authority verdict (and bounds) must follow
+/// the descriptor rather than stay frozen at whatever the first push said --
+/// a frozen verdict could leave a session with two authorities or none.
+/// Condition history survives a re-push (see [`DecisionMaker::sync`]).
+pub fn sync_maker(
     registry: &DecisionMakers,
     key: &SessionKey,
     bounds: BufferBounds,
     authority: Authority,
 ) {
+    use std::collections::hash_map::Entry;
     let mut makers = registry.lock();
-    makers.entry(key.clone()).or_insert_with(|| {
-        DecisionMaker::new(key.clone(), bounds, ControlLaw::default(), authority)
-    });
+    match makers.entry(key.clone()) {
+        Entry::Occupied(mut existing) => existing.get_mut().sync(bounds, authority),
+        Entry::Vacant(vacant) => {
+            vacant.insert(DecisionMaker::new(
+                key.clone(),
+                bounds,
+                ControlLaw::default(),
+                authority,
+            ));
+        }
+    }
 }
 
 /// Removes a session's decision-maker (the session has ended). Idempotent.
 pub fn deregister_maker(registry: &DecisionMakers, key: &SessionKey) {
     registry.lock().remove(key);
+}
+
+/// Records a `game_frame_count` observed on one of `slot`'s validated turns,
+/// if the relay has a maker for the session. The per-slot observations are
+/// what the session's consensus coordinate (the minimum across slots) is
+/// computed from, so this is called for every framed turn a link forwards. A
+/// no-op when no maker exists (no policy pushed yet).
+pub fn observe_frame(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    frame: GameFrameCount,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.observe_frame(slot, frame);
+    }
+}
+
+/// Feeds one home-client `conditions` sample into the session's decision-maker
+/// if the relay has one, logging any decision it fires. Returns the
+/// [`Decision`], if any — the broadcast the decision queues is emitted later by
+/// [`active_directive`] at fan-out. A no-op returning `None` when no maker
+/// exists for the session (no policy pushed yet), so a slot link can call it
+/// unconditionally.
+pub fn ingest_local_conditions(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    conditions: &LinkConditions,
+) -> Option<Decision> {
+    let decision = registry.lock().get_mut(key)?.ingest_local(conditions)?;
+    log_decision(key, decision);
+    Some(decision)
+}
+
+/// Feeds a peer relay's `conditions` sidecar (reached over a mesh hop of
+/// `mesh_rtt_us`) into the session's decision-maker if the relay has one,
+/// logging any decision it fires. Returns the [`Decision`], if any. A no-op
+/// returning `None` when no maker exists for the session.
+pub fn ingest_remote_conditions(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    conditions: &LinkConditions,
+    mesh_rtt_us: u32,
+) -> Option<Decision> {
+    let decision = registry
+        .lock()
+        .get_mut(key)?
+        .ingest_remote(conditions, mesh_rtt_us)?;
+    log_decision(key, decision);
+    Some(decision)
+}
+
+/// The buffer directive to stamp onto a turn forwarded for this session, if
+/// the relay is the authority and has a change it is still broadcasting.
+/// Returns `None` — the common case — when no change is pending, the change
+/// has been applied everywhere, or no maker exists for the session.
+pub fn active_directive(registry: &DecisionMakers, key: &SessionKey) -> Option<BufferDirective> {
+    registry.lock().get_mut(key)?.active_directive()
+}
+
+/// Records the `decision_seq` of an authority-stamped directive this relay is
+/// forwarding, if the relay has a maker for the session, so a later promotion
+/// to authority continues the session's decision numbering (see
+/// [`DecisionMaker::observe_directive`]). A no-op when no maker exists.
+pub fn observe_directive(registry: &DecisionMakers, key: &SessionKey, seq: u32) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.observe_directive(seq);
+    }
+}
+
+/// Logs a buffer change the authority just decided — the observable that the
+/// runtime decision-maker is live and what it chose, correlated by session.
+fn log_decision(key: &SessionKey, decision: Decision) {
+    tracing::info!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        buffer = decision.buffer.0,
+        apply_at_frame = decision.applied_frame.0,
+        "latency-buffer decision",
+    );
 }
 
 #[cfg(test)]
@@ -713,13 +940,36 @@ mod tests {
         }
     }
 
+    /// One slot-link packet's worth of input: frames observed off the packet's
+    /// validated turns, then the sampled conditions ingested.
+    fn ingest_at(maker: &mut DecisionMaker, c: &LinkConditions, frame: u32) -> Option<Decision> {
+        for slot in &c.slots {
+            maker.observe_frame(SlotId(slot.slot as u8), GameFrameCount(frame));
+        }
+        maker.ingest_local(c)
+    }
+
+    /// One mesh datagram's worth of input: frames observed off the forwarded
+    /// turns, then the peer's conditions sidecar ingested with its mesh hop.
+    fn ingest_remote_at(
+        maker: &mut DecisionMaker,
+        c: &LinkConditions,
+        mesh_rtt_us: u32,
+        frame: u32,
+    ) -> Option<Decision> {
+        for slot in &c.slots {
+            maker.observe_frame(SlotId(slot.slot as u8), GameFrameCount(frame));
+        }
+        maker.ingest_remote(c, mesh_rtt_us)
+    }
+
     // -- Target formula --
 
     /// At 150ms RTT, 0% loss: target == ceil(150000/41666.67) + 0 = 4.
     #[test]
     fn target_at_150ms_zero_loss() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(4));
     }
 
@@ -728,8 +978,8 @@ mod tests {
     #[test]
     fn target_loss_recovery_is_quantized_to_whole_turns() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
-        let _ = maker.ingest_local(&conditions(0, 150_000, 5, 200), GameFrameCount(2));
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        let _ = ingest_at(&mut maker, &conditions(0, 150_000, 5, 200), 2);
         assert_eq!(maker.target(), Some(5));
     }
 
@@ -737,7 +987,7 @@ mod tests {
     #[test]
     fn target_at_low_latency() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(2));
     }
 
@@ -746,7 +996,7 @@ mod tests {
     #[test]
     fn target_floor_falls_out_of_ceil() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 10_000, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(1));
     }
 
@@ -754,7 +1004,7 @@ mod tests {
     #[test]
     fn target_none_when_no_rtt() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 0, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 0, 0, 100), 1);
         assert_eq!(maker.target(), None);
     }
 
@@ -764,9 +1014,10 @@ mod tests {
     #[test]
     fn worst_pair_path_uses_two_highest_rtts() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(
+        ingest_at(
+            &mut maker,
             &multi_conditions(&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]),
-            GameFrameCount(1),
+            1,
         );
         assert_eq!(maker.target(), Some(4));
     }
@@ -775,13 +1026,14 @@ mod tests {
     #[test]
     fn single_outlier_does_not_over_provision() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(
+        ingest_at(
+            &mut maker,
             &multi_conditions(&[
                 (0, 20_000, 0, 100),
                 (1, 300_000, 0, 100),
                 (2, 20_000, 0, 100),
             ]),
-            GameFrameCount(1),
+            1,
         );
         assert_eq!(maker.target(), Some(4));
     }
@@ -792,8 +1044,8 @@ mod tests {
     #[test]
     fn mesh_hop_increases_target_for_cross_relay_paths() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(1));
-        maker.ingest_remote(&conditions(1, 50_000, 0, 100), 100_000, GameFrameCount(2));
+        ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
+        ingest_remote_at(&mut maker, &conditions(1, 50_000, 0, 100), 100_000, 2);
         // eff_local = 50000, eff_remote = 150000.
         // path = (150000 + 50000) / 2 = 100000. target = ceil(100000/41666.67) = 3.
         assert_eq!(maker.target(), Some(3));
@@ -803,34 +1055,34 @@ mod tests {
     #[test]
     fn mesh_hop_adds_turns_above_same_relay_baseline() {
         let mut local = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        local.ingest_local(
+        ingest_at(
+            &mut local,
             &multi_conditions(&[(0, 50_000, 0, 100), (1, 50_000, 0, 100)]),
-            GameFrameCount(1),
+            1,
         );
         let local_target = local.target().unwrap();
 
         let mut meshed = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        meshed.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(1));
-        meshed.ingest_remote(&conditions(1, 50_000, 0, 100), 100_000, GameFrameCount(2));
+        ingest_at(&mut meshed, &conditions(0, 50_000, 0, 100), 1);
+        ingest_remote_at(&mut meshed, &conditions(1, 50_000, 0, 100), 100_000, 2);
         let meshed_target = meshed.target().unwrap();
 
         assert!(meshed_target > local_target);
     }
 
     // -- Loss on high-latency links --
-    // -- Loss on high-latency links --
 
     /// Same 20% loss on 50ms vs 300ms: the high-latency link needs more turns.
     #[test]
     fn loss_on_high_latency_link_adds_more_turns() {
         let mut low = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        low.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(1));
-        low.ingest_local(&conditions(0, 50_000, 20, 200), GameFrameCount(2));
+        ingest_at(&mut low, &conditions(0, 50_000, 0, 100), 1);
+        ingest_at(&mut low, &conditions(0, 50_000, 20, 200), 2);
         let low_target = low.target().unwrap();
 
         let mut high = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        high.ingest_local(&conditions(0, 300_000, 0, 100), GameFrameCount(1));
-        high.ingest_local(&conditions(0, 300_000, 20, 200), GameFrameCount(2));
+        ingest_at(&mut high, &conditions(0, 300_000, 0, 100), 1);
+        ingest_at(&mut high, &conditions(0, 300_000, 20, 200), 2);
         let high_target = high.target().unwrap();
 
         assert!(high_target > low_target);
@@ -845,9 +1097,9 @@ mod tests {
     fn jitter_uses_recent_max_rtt() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         for frame in 1..=4 {
-            maker.ingest_local(&conditions(0, 100_000, 0, 100), GameFrameCount(frame));
+            ingest_at(&mut maker, &conditions(0, 100_000, 0, 100), frame);
         }
-        maker.ingest_local(&conditions(0, 200_000, 0, 100), GameFrameCount(5));
+        ingest_at(&mut maker, &conditions(0, 200_000, 0, 100), 5);
 
         assert_eq!(maker.target(), Some(5));
     }
@@ -857,13 +1109,13 @@ mod tests {
     fn jitter_spike_raises_target_above_baseline() {
         let mut spiky = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         for frame in 1..=4 {
-            spiky.ingest_local(&conditions(0, 100_000, 0, 100), GameFrameCount(frame));
+            ingest_at(&mut spiky, &conditions(0, 100_000, 0, 100), frame);
         }
-        spiky.ingest_local(&conditions(0, 200_000, 0, 100), GameFrameCount(5));
+        ingest_at(&mut spiky, &conditions(0, 200_000, 0, 100), 5);
 
         let mut stable = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         for frame in 1..=5 {
-            stable.ingest_local(&conditions(0, 100_000, 0, 100), GameFrameCount(frame));
+            ingest_at(&mut stable, &conditions(0, 100_000, 0, 100), frame);
         }
 
         assert!(spiky.target().unwrap() > stable.target().unwrap());
@@ -875,7 +1127,7 @@ mod tests {
     #[test]
     fn raise_jumps_to_target() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        let d = maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
         assert_eq!(maker.buffer(), BufferSize(4));
     }
@@ -887,7 +1139,7 @@ mod tests {
             buffer: BufferSize(5),
             ..DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay)
         };
-        let d = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
         assert_eq!(maker.buffer(), BufferSize(4));
     }
@@ -900,12 +1152,12 @@ mod tests {
     fn raise_fires_immediately_lower_gated_by_dwell() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         // 150ms -> target 4. Raise to 4 at frame 1.
-        let d1 = maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        let d1 = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d1.unwrap().buffer, BufferSize(4));
 
         // Conditions worsen at frame 2 (within 120-turn dwell). Raise fires
         // immediately -- no dwell on raises.
-        let d2 = maker.ingest_local(&conditions(0, 300_000, 0, 100), GameFrameCount(2));
+        let d2 = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 2);
         assert_eq!(
             d2.unwrap().buffer,
             BufferSize(8),
@@ -916,20 +1168,20 @@ mod tests {
         // Conditions improve at frame 3 (within dwell from the raise at 2).
         // Lower is suppressed -- and the ring buffer still holds the 300ms
         // spike, so the target stays at 8 anyway.
-        let d3 = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(3));
+        let d3 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 3);
         assert_eq!(d3, None, "lower should be suppressed within dwell");
         assert_eq!(maker.buffer(), BufferSize(8));
 
         // Flush the 300ms spike from the ring buffer (32 samples) so the
         // recent max drops to 50ms. Frames 4--35.
         for frame in 4..=35 {
-            let _ = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(frame));
+            let _ = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), frame);
         }
         // Now the target is 2 (50ms), but we're still within the dwell.
         assert_eq!(maker.target(), Some(2));
 
         // After the dwell (frame 2 + 120 = 122, so frame 123). Lower fires.
-        let d4 = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(123));
+        let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 123);
         assert!(d4.is_some(), "lower should fire after dwell");
         assert_eq!(maker.buffer(), BufferSize(7));
     }
@@ -940,15 +1192,15 @@ mod tests {
     fn anti_flap_raises_on_worsening_holds_on_improvement() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         // 150ms -> target 4. Raise to 4 at frame 1.
-        let d = maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
 
         // Target drops to 2 (50ms) at frame 2 -- lower suppressed.
-        let d = maker.ingest_local(&conditions(0, 50_000, 0, 100), GameFrameCount(2));
+        let d = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 2);
         assert_eq!(d, None);
 
         // Target spikes to 8 (300ms) at frame 3 -- raise fires immediately.
-        let d = maker.ingest_local(&conditions(0, 300_000, 0, 100), GameFrameCount(3));
+        let d = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 3);
         assert_eq!(
             d.unwrap().buffer,
             BufferSize(8),
@@ -965,7 +1217,7 @@ mod tests {
     #[test]
     fn raise_clamps_to_max() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 3), law(), Authority::SelfRelay);
-        let d = maker.ingest_local(&conditions(0, 300_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(3));
         assert_eq!(maker.buffer(), BufferSize(3));
     }
@@ -977,7 +1229,7 @@ mod tests {
             buffer: BufferSize(3),
             ..DecisionMaker::new(key(), bounds(2, 20), law(), Authority::SelfRelay)
         };
-        let d = maker.ingest_local(&conditions(0, 10_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(2));
         assert_eq!(maker.buffer(), BufferSize(2));
     }
@@ -988,34 +1240,70 @@ mod tests {
     #[test]
     fn non_authority_ingests_but_does_not_decide() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
-        let d = maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d, None, "non-authority makes no decision");
-        assert_eq!(maker.max_frame(), GameFrameCount(1));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(1)));
         assert_eq!(maker.target(), Some(4));
     }
 
     // -- Frame tracking --
 
-    /// `max_frame` tracks the latest observed frame.
+    /// The session frame is the minimum of the per-slot observations -- the
+    /// slowest participant's progress, which is what lockstep advances by.
+    /// Each slot's own observation is monotonic.
     #[test]
-    fn max_frame_tracks_latest() {
+    fn session_frame_is_the_minimum_across_slots() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 10_000, 0, 100), GameFrameCount(5));
-        assert_eq!(maker.max_frame(), GameFrameCount(5));
-        maker.ingest_local(&conditions(0, 10_000, 0, 100), GameFrameCount(3));
-        assert_eq!(maker.max_frame(), GameFrameCount(5));
-        maker.ingest_local(&conditions(0, 10_000, 0, 100), GameFrameCount(10));
-        assert_eq!(maker.max_frame(), GameFrameCount(10));
+        assert_eq!(maker.session_frame(), None, "no framed turn yet");
+
+        maker.observe_frame(SlotId(0), GameFrameCount(10));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(10)));
+
+        maker.observe_frame(SlotId(1), GameFrameCount(4));
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(4)),
+            "the slowest slot pins the coordinate",
+        );
+
+        // Per-slot observations are monotonic: an older frame arriving out of
+        // order doesn't move a slot backward.
+        maker.observe_frame(SlotId(1), GameFrameCount(3));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(4)));
+
+        maker.observe_frame(SlotId(1), GameFrameCount(12));
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(10)),
+            "slot 0 is now the slowest",
+        );
     }
 
-    /// The applied frame is always `max_frame + APPLY_HORIZON`.
+    /// One slot claiming an absurd frame can't poison the coordinate: the
+    /// minimum stays with the honest slots, so decision scheduling and the
+    /// dwell clock are unaffected by a hostile client's `game_frame_count`.
     #[test]
-    fn applied_frame_is_horizon_ahead_of_max() {
+    fn an_inflated_frame_claim_does_not_move_the_session_frame() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        let d = maker
-            .ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(50))
-            .unwrap();
-        assert_eq!(d.applied_frame, GameFrameCount(53));
+        maker.observe_frame(SlotId(0), GameFrameCount(100));
+        maker.observe_frame(SlotId(1), GameFrameCount(u32::MAX));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(100)));
+
+        // A decision still schedules against the honest coordinate, not the
+        // inflated claim: raise 0 -> 4 at frame 101 applies at 101 + 4 + 3.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 101).unwrap();
+        assert_eq!(d.applied_frame, GameFrameCount(101 + 4 + APPLY_HORIZON));
+    }
+
+    /// The applied frame is a horizon ahead of the session frame: the buffer
+    /// span (covering observation lag and client spread, both of which scale
+    /// with the cushion) plus the fixed delivery margin.
+    #[test]
+    fn applied_frame_is_a_buffer_spanned_horizon_ahead() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // Raise 0 -> 4 at frame 50: span = max(0, 4) = 4.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 50).unwrap();
+        assert_eq!(d.applied_frame, GameFrameCount(50 + 4 + APPLY_HORIZON));
         assert!(d.applied_frame.0 > 50);
     }
 
@@ -1025,8 +1313,8 @@ mod tests {
     #[test]
     fn stale_sidecar_no_spurious_loss() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
-        let d = maker.ingest_local(&conditions(0, 150_000, 0, 50), GameFrameCount(2));
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 50), 2);
         assert_eq!(maker.target(), Some(4));
         assert_eq!(d, None);
     }
@@ -1037,23 +1325,135 @@ mod tests {
     fn lossy_then_clean_interval_drops_target() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         // Baseline at frame 1 (raises to 4, sets the dwell clock).
-        maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
 
         // 50% loss at frame 22 (raise fires immediately -- no dwell on raises).
         // loss_risk = 0.5 ** 150000 = 75000. Target = 4 + 2 = 6.
-        let d1 = maker.ingest_local(&conditions(0, 150_000, 50, 200), GameFrameCount(2));
+        let d1 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 200), 2);
         assert_eq!(d1.unwrap().buffer, BufferSize(6));
 
         // Clean interval at frame 3 (loss_risk = 0, target = 4). But this is a
         // lower, and we're within the 120-turn dwell from the raise at frame 2.
-        let d2 = maker.ingest_local(&conditions(0, 150_000, 50, 300), GameFrameCount(3));
+        let d2 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 300), 3);
         assert_eq!(d2, None, "lower suppressed within dwell");
         assert_eq!(maker.target(), Some(4));
 
         // After the dwell (frame 2 + 120 = 122, so frame 123). Lower fires.
-        let d3 = maker.ingest_local(&conditions(0, 150_000, 50, 300), GameFrameCount(123));
+        let d3 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 300), 123);
         assert!(d3.is_some(), "lower should fire after dwell");
         assert_eq!(maker.buffer(), BufferSize(5));
+    }
+
+    // -- Directive broadcast --
+
+    /// A decision queues a directive that `active_directive` stamps onto every
+    /// forwarded turn until the session frame reaches its apply frame -- then
+    /// it retires: every slot has been observed past the frame, so the change
+    /// is applied (or moot) everywhere.
+    #[test]
+    fn a_directive_is_stamped_until_the_session_passes_its_apply_frame() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // No decision yet: nothing to stamp.
+        assert_eq!(maker.active_directive(), None);
+
+        // 150ms -> raise to 4 at frame 10.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 10).expect("a raise fires");
+        let stamp = maker
+            .active_directive()
+            .expect("a decision queues a directive");
+        assert_eq!(stamp.buffer_turns, 4);
+        assert_eq!(stamp.apply_at_frame, d.applied_frame.0);
+        assert_eq!(stamp.decision_seq, 1);
+
+        // Every forwarded turn carries it while the session hasn't reached the
+        // apply frame -- there is no fixed budget for a quiet spell to exhaust.
+        for _ in 0..100 {
+            assert_eq!(maker.active_directive(), Some(stamp));
+        }
+
+        // The slowest slot passes the apply frame: the directive retires.
+        maker.observe_frame(SlotId(0), GameFrameCount(d.applied_frame.0));
+        assert_eq!(maker.active_directive(), None, "applied everywhere");
+        assert_eq!(maker.active_directive(), None, "and stays retired");
+    }
+
+    /// The broadcast outlives a one-sided stretch of traffic: while one slot
+    /// is stalled, the session frame (the minimum) doesn't advance, so the
+    /// directive keeps stamping every turn the other slot produces until the
+    /// stalled slot is back and past the apply frame.
+    #[test]
+    fn a_directive_outlives_a_one_sided_stall() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(10));
+        maker.observe_frame(SlotId(1), GameFrameCount(10));
+        // Slot 1's link degrades (300ms): raise to 8, applied at 10 + 8 + 3.
+        let d = ingest_at(&mut maker, &conditions(1, 300_000, 0, 100), 10).expect("a raise fires");
+
+        // Slot 0 keeps producing turns well past the apply frame while slot 1
+        // is stalled. The session frame stays pinned at the stalled slot, so
+        // every one of slot 0's forwarded turns still carries the stamp.
+        for frame in 11..(d.applied_frame.0 + 50) {
+            maker.observe_frame(SlotId(0), GameFrameCount(frame));
+            assert!(maker.active_directive().is_some(), "still broadcasting");
+        }
+
+        // Slot 1 recovers and passes the apply frame: the directive retires.
+        maker.observe_frame(SlotId(1), GameFrameCount(d.applied_frame.0));
+        assert_eq!(maker.active_directive(), None);
+    }
+
+    /// A newer decision supersedes an older still-broadcasting one, and its
+    /// higher `decision_seq` is what lets clients rank interleaved copies.
+    #[test]
+    fn a_new_decision_supersedes_a_still_broadcasting_one() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        let first = maker.active_directive().expect("the first raise queues");
+        assert_eq!(first.buffer_turns, 4);
+        assert_eq!(first.decision_seq, 1);
+
+        // Conditions worsen: a raise to 8 fires, replacing the pending directive.
+        ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 2);
+        let second = maker
+            .active_directive()
+            .expect("the new directive is pending");
+        assert_eq!(second.buffer_turns, 8, "the latest buffer wins");
+        assert!(
+            second.decision_seq > first.decision_seq,
+            "copies of both may interleave on the wire; the seq ranks them",
+        );
+    }
+
+    /// A non-authority relay makes no decision, so it never has a directive to
+    /// stamp -- it only forwards the authority's already-stamped turns.
+    #[test]
+    fn a_non_authority_never_stamps_a_directive() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        // It ingests conditions (and would compute a target) but makes no decision.
+        ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 1);
+        assert!(maker.target().is_some(), "it still tracks conditions");
+        assert_eq!(maker.active_directive(), None, "but never stamps");
+    }
+
+    /// A held decision (target unchanged, or a dwell-suppressed lower) queues
+    /// no directive -- only an actual buffer change is broadcast.
+    #[test]
+    fn a_held_decision_queues_no_directive() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // Raise to 4, then let the session pass the apply frame so the
+        // directive retires and nothing is pending.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
+        maker.observe_frame(SlotId(0), GameFrameCount(d.applied_frame.0));
+        assert_eq!(maker.active_directive(), None);
+
+        // Same conditions again: target unchanged, no decision, nothing queued.
+        let held = ingest_at(
+            &mut maker,
+            &conditions(0, 150_000, 0, 100),
+            d.applied_frame.0 + 1,
+        );
+        assert_eq!(held, None, "target unchanged holds");
+        assert_eq!(maker.active_directive(), None, "a hold queues no directive");
     }
 
     // -- Slot removal --
@@ -1062,7 +1462,7 @@ mod tests {
     #[test]
     fn remove_slot_clears_history() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
-        maker.ingest_local(&conditions(0, 150_000, 0, 100), GameFrameCount(1));
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert!(maker.slots.contains_key(&SlotId(0)));
         assert!(maker.target().is_some());
         maker.remove_slot(SlotId(0));
@@ -1072,17 +1472,60 @@ mod tests {
 
     // -- Registry --
 
-    /// `ensure_maker` is idempotent -- a second call doesn't clobber.
+    /// `sync_maker` creates on the first push and reconciles bounds and
+    /// authority on a re-push -- the descriptor is declarative, so who decides
+    /// follows the current relay set instead of staying frozen at creation.
     #[test]
-    fn ensure_maker_is_idempotent() {
+    fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
         let registry = new_decision_makers();
         let k = key();
-        ensure_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
-        ensure_maker(&registry, &k, bounds(0, 99), Authority::Peer);
+        sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        {
+            let makers = registry.lock();
+            let maker = makers.get(&k).unwrap();
+            assert_eq!(maker.bounds, bounds(0, 5));
+            assert_eq!(maker.authority, Authority::SelfRelay);
+        }
+
+        // A lower-id relay joined the session: this relay is no longer the
+        // authority, and the coordinator widened the bounds.
+        sync_maker(&registry, &k, bounds(0, 99), Authority::Peer);
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
-        assert_eq!(maker.bounds, bounds(0, 5));
-        assert_eq!(maker.authority, Authority::SelfRelay);
+        assert_eq!(maker.bounds, bounds(0, 99), "bounds follow the descriptor");
+        assert_eq!(
+            maker.authority,
+            Authority::Peer,
+            "authority follows the current relay set",
+        );
+    }
+
+    /// A relay demoted by a re-push stops broadcasting: only the authority
+    /// stamps, so its pending directive is dropped -- while its condition
+    /// history survives (it describes the links, not the descriptor).
+    #[test]
+    fn losing_authority_drops_the_pending_directive_but_keeps_history() {
+        let registry = new_decision_makers();
+        let k = key();
+        sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        {
+            let mut makers = registry.lock();
+            let maker = makers.get_mut(&k).unwrap();
+            ingest_at(maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
+        }
+        assert!(active_directive(&registry, &k).is_some());
+
+        sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        assert_eq!(
+            active_directive(&registry, &k),
+            None,
+            "a demoted relay stops stamping",
+        );
+        let makers = registry.lock();
+        assert!(
+            makers.get(&k).unwrap().target().is_some(),
+            "condition history survives the demotion",
+        );
     }
 
     /// `deregister_maker` removes a session's decision-maker.
@@ -1090,7 +1533,7 @@ mod tests {
     fn deregister_maker_removes_session() {
         let registry = new_decision_makers();
         let k = key();
-        ensure_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
         assert!(!registry.lock().contains_key(&k));

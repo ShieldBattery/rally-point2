@@ -57,13 +57,14 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::{Payload, SlotConditions};
+use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::quinn::VarInt;
 use rally_point_transport::{Link, LinkError};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 
+use crate::consensus;
 use crate::validation::validate_turn;
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
@@ -307,6 +308,7 @@ pub async fn run_slot_link(
         links: mesh_links,
         seen: seen_registries,
         conditions,
+        decision_makers,
     } = mesh;
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
@@ -368,7 +370,17 @@ pub async fn run_slot_link(
                 // so a quiet slot's last sample stays valid. Sampling once per
                 // packet (not per payload) is enough — all payloads in one packet
                 // share the same connection's path.
-                publish_slot_conditions(&conditions, &key, slot, link.connection());
+                let sample = sample_slot_conditions(link.connection(), slot);
+                crate::mesh::publish_conditions(&conditions, &key, slot, sample);
+                // Feed the same sample into this session's decision-maker. The
+                // decision it may fire schedules against the frames observed off
+                // validated turns below — never off this packet's raw claims.
+                let observed = LinkConditions {
+                    slots: vec![sample],
+                };
+                // Any decision it fires is logged by the helper and broadcast
+                // later, at fan-out; nothing to do with it here.
+                let _ = consensus::ingest_local_conditions(&decision_makers, &key, &observed);
                 for payload in received.fresh {
                     match validate_turn(
                         slot,
@@ -377,25 +389,29 @@ pub async fn run_slot_link(
                         &payload.commands,
                     ) {
                         Ok(turn) => {
-                            // Mark the origin's own turn in the session's
-                            // topological-dedup set before fanning out. The mesh
-                            // floods to all peers (no link-id exclusion), so the
-                            // turn echoes back via the mesh; without marking here,
-                            // the echo would be delivered to local clients a second
-                            // time — a duplicate turn into a lockstep slot, a desync.
-                            if crate::mesh::mark_seen(
+                            let payload = turn.payload;
+                            // Only a *validated* turn's frame feeds the consensus
+                            // coordinate — a rejected packet must not leave a
+                            // trace in decision state. (And the coordinate is the
+                            // minimum across slots, so even a validated turn's
+                            // inflated claim can only mislead its own slot.)
+                            if let Some(frame) = payload.game_frame_count {
+                                consensus::observe_frame(
+                                    &decision_makers,
+                                    &key,
+                                    slot,
+                                    rally_point_proto::ids::GameFrameCount(frame),
+                                );
+                            }
+                            crate::mesh::forward_turn(
+                                &sessions,
+                                &mesh_links,
                                 &seen_registries,
+                                &decision_makers,
                                 &key,
                                 slot,
-                                turn.payload.seq,
-                            ) == crate::mesh::Seen::Duplicate
-                            {
-                                // Shouldn't happen for a fresh client turn, but
-                                // if it does, don't deliver a duplicate.
-                                continue;
-                            }
-                            fan_out(&sessions, &key, slot, turn.payload.clone());
-                            crate::mesh::fan_out_to_mesh(&mesh_links, &key, turn.payload);
+                                payload,
+                            );
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -533,6 +549,12 @@ pub async fn run_slot_link(
 
     deregister(&sessions, &key, slot);
     crate::mesh::unpublish_conditions(&conditions, &key, slot);
+    // Forget this slot's condition history in the decision-maker so a departed
+    // client's stale stats don't outlive its connection. The maker itself lives
+    // until the session ends (the coordinator drops the descriptor).
+    if let Some(maker) = decision_makers.lock().get_mut(&key) {
+        maker.remove_slot(slot);
+    }
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -557,32 +579,23 @@ fn log_link_closed(key: &SessionKey, slot: SlotId, error: &LinkError) {
     );
 }
 
-/// Samples this client's QUIC connection path stats and publishes them as the
-/// slot's conditions, so the mesh can attach them to outgoing datagrams for the
-/// latency-buffer decision-maker. RTT comes from QUIC's smoothed path estimate;
-/// lost/sent are cumulative counters the decision-maker differences between
-/// consecutive samples to get a loss rate over the interval. A connection with
-/// no RTT sample yet (a one-way sender that has received nothing back) publishes
-/// `rtt_us: 0`, which reads as "no measurement" rather than "zero latency."
-fn publish_slot_conditions(
-    registry: &crate::mesh::ConditionsRegistry,
-    key: &SessionKey,
-    slot: SlotId,
+/// Samples this client's QUIC connection path stats as a [`SlotConditions`], for
+/// both the mesh sidecar and the decision-maker. RTT comes from QUIC's smoothed
+/// path estimate (via [`crate::mesh::rtt_us`], which owns the "0 means no
+/// measurement" convention); lost/sent are cumulative counters the
+/// decision-maker differences between consecutive samples to get a loss rate
+/// over the interval.
+fn sample_slot_conditions(
     connection: &rally_point_transport::quinn::Connection,
-) {
-    let stats = connection.stats();
-    let path = stats.path;
-    crate::mesh::publish_conditions(
-        registry,
-        key,
-        slot,
-        SlotConditions {
-            slot: u32::from(slot.0),
-            rtt_us: path.rtt.as_micros().min(u32::MAX as u128) as u32,
-            lost_packets: path.lost_packets,
-            sent_packets: path.sent_packets,
-        },
-    );
+    slot: SlotId,
+) -> SlotConditions {
+    let path = connection.stats().path;
+    SlotConditions {
+        slot: u32::from(slot.0),
+        rtt_us: crate::mesh::rtt_us(path.rtt),
+        lost_packets: path.lost_packets,
+        sent_packets: path.sent_packets,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -599,8 +612,8 @@ mod tests {
         Payload {
             seq: 0,
             slot: 0,
-            game_frame_count: None,
             commands: Vec::new().into(),
+            ..Default::default()
         }
     }
 
@@ -680,5 +693,109 @@ mod tests {
         let slots = roster.get(&k).expect("group present");
         assert!(slots.contains_key(&SlotId(1)));
         assert!(slots.contains_key(&SlotId(2)));
+    }
+
+    #[tokio::test]
+    async fn forward_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::messages::BufferDirective;
+
+        let sessions: Sessions = Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let seen = crate::mesh::new_seen_registries();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let k = key();
+
+        // This relay is not the session's authority: its own maker never has a
+        // directive, so the forward step must leave an incoming stamp alone.
+        consensus::sync_maker(
+            &makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::Peer,
+        );
+
+        // A local client to fan out to.
+        let (mut guard, mut inbox) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        guard.disarm();
+
+        // A turn stamped by the authority arrives over the mesh.
+        let stamp = BufferDirective {
+            buffer_turns: 6,
+            apply_at_frame: 40,
+            decision_seq: 5,
+        };
+        let stamped = Payload {
+            buffer_directive: Some(stamp),
+            commands: vec![0x05].into(),
+            ..payload()
+        };
+        crate::mesh::forward_turn(
+            &sessions,
+            &mesh_links,
+            &seen,
+            &makers,
+            &k,
+            SlotId(0),
+            stamped,
+        );
+
+        let delivered = inbox
+            .forward_rx
+            .try_recv()
+            .expect("the turn fans out to the local slot");
+        assert_eq!(
+            delivered.buffer_directive,
+            Some(stamp),
+            "the authority's stamp survives the hop through a non-authority relay",
+        );
+        // And the relay recorded the stamp's seq, so a later promotion to
+        // authority numbers its own decisions above what clients already hold.
+        {
+            let mut registry = makers.lock();
+            let maker = registry.get_mut(&k).unwrap();
+            maker.observe_frame(SlotId(0), rally_point_proto::ids::GameFrameCount(1));
+            maker.sync(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay);
+        }
+        consensus::ingest_local_conditions(
+            &makers,
+            &k,
+            &rally_point_proto::messages::LinkConditions {
+                slots: vec![rally_point_proto::messages::SlotConditions {
+                    slot: 0,
+                    rtt_us: 150_000,
+                    lost_packets: 0,
+                    sent_packets: 100,
+                }],
+            },
+        )
+        .expect("promoted, its first decision fires");
+        let own = consensus::active_directive(&makers, &k).expect("a directive is queued");
+        assert!(
+            own.decision_seq > stamp.decision_seq,
+            "a promoted relay continues the session's numbering",
+        );
+
+        // A duplicate of the stamped turn via a second mesh path is dropped
+        // before fan-out, stamp and all.
+        let duplicate = Payload {
+            buffer_directive: Some(stamp),
+            commands: vec![0x05].into(),
+            ..payload()
+        };
+        crate::mesh::forward_turn(
+            &sessions,
+            &mesh_links,
+            &seen,
+            &makers,
+            &k,
+            SlotId(0),
+            duplicate,
+        );
+        assert!(
+            inbox.forward_rx.try_recv().is_err(),
+            "the topological duplicate is dropped",
+        );
     }
 }

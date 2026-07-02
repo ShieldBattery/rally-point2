@@ -13,8 +13,13 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > receives the session descriptors the coordinator pushes back down to drive mesh `Join`/`Leave`.
 > The relay also **reports liveness** up that same connection — a periodic heartbeat — so a relay whose
 > connection drops or goes silent is **deregistered** (a generation fencing token makes the eviction safe
-> against a relay that has already reconnected). Resilience/failover, dual-stack advertise addresses, and
-> the decision-maker runtime wiring are designed but not yet built.
+> against a relay that has already reconnected). The **latency-buffer decision-maker is now wired into the
+> runtime**: each relay feeds its home clients' link stats (and peer relays' stats off the mesh sidecar)
+> into a per-session decision-maker the coordinator's descriptor creates, and the authority relay
+> broadcasts a buffer change by stamping it onto the turns it forwards — an envelope `buffer_directive` the
+> game applies out of band, not a command in the byte stream. Authority is decided by relay-id order for
+> now; the coordinator-assigned priority order and the presence-driven handoff when the authority's players
+> leave — plus resilience/failover and dual-stack advertise addresses — are designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -297,11 +302,26 @@ How much turn buffer the game runs with — the latency cushion that absorbs jit
 to move as network conditions shift over the course of a game. Changing it is a decision every client
 must apply *identically*, so one party decides and the rest obey. The relays are placed in a fixed
 **priority order**, and the highest one still in the game (still serving live players) is the
-**decision-maker**: it picks the buffer size and broadcasts a command setting it that every client
-applies at the same turn. If that relay drops out — its players have all left — the authority falls to
-the next relay in the order, with no coordinator round-trip. The coordinator's only role here is to set
-the **bounds** the decision-maker stays within; it makes no per-adjustment decision, so a running game
-is unaffected by a coordinator outage.
+**decision-maker**: it picks the buffer size and broadcasts it by **stamping it onto the turns it
+forwards** — an envelope `buffer_directive` (not a command in the game's byte stream) naming the new
+buffer, the exact future frame to apply it at, and a **decision seq** ordering it, so every client applies
+it identically at the same simulated step, out of band from command processing. A command in the byte
+stream was the alternative, rejected because a native latency command caps the buffer at the game's
+built-in range and a client applies one turn per remote player per step, so an extra command can't just be
+handed over; riding the envelope, the buffer has no ceiling and the turn it stamps is one the client
+already receives. The relay stamps **every turn it forwards until the whole session has passed the apply
+frame**: a client picks the change up off a peer's turn (it never receives its own turns back), and a
+client whose peers aren't producing turns yet is covered automatically, because lockstep — and so the
+apply frame — can't advance without it. Copies are idempotent; when decisions come quickly, the higher
+decision seq tells every client which one wins, even with copies of both interleaved on the out-of-order
+wire. Relays that are not the authority forward stamps untouched. The frame the whole scheme keys on is
+the **slowest** per-slot frame observed from validated turns — a hostile client inflating its own
+`game_frame_count` moves nothing but its own observation. If the deciding relay drops out — its players
+have all left — the authority falls to the next relay in the order, with no coordinator round-trip; the
+per-session decision-maker follows the coordinator's descriptor on every push, so bounds and the
+authority verdict track the relay set as players come and go. The coordinator's only role here is to set
+the **bounds** the decision-maker stays within; it makes no per-adjustment decision, so a running game is
+unaffected by a coordinator outage.
 
 To decide well the decision-maker needs the **whole game's** network conditions, but each relay directly
 observes only its *own* home clients' links — loss, RTT, and the like, which QUIC already measures per

@@ -366,8 +366,8 @@ mod tests {
         Payload {
             seq,
             slot: u32::from(slot),
-            game_frame_count: None,
             commands: vec![0u8; 4].into(),
+            ..Default::default()
         }
     }
 

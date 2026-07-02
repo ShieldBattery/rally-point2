@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn reconcile_applies_descriptors_then_leaves_dropped_sessions() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let mut applied = HashSet::new();
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn reconcile_is_idempotent_on_a_repeated_set() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let mut applied = HashSet::new();
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn reconcile_tracks_multiple_sessions_and_leaves_only_the_one_that_dropped() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let mut applied = HashSet::new();
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let mut applied = HashSet::new();
@@ -435,7 +435,7 @@ mod tests {
             serde_json::from_str(json).expect("an unknown type must not be a decode error");
         assert_eq!(message, CoordinatorToRelay::Unknown);
 
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let mut applied = HashSet::new();

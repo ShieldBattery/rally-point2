@@ -61,11 +61,11 @@ pub struct SessionSetup {
     /// its mesh links. Populated by `create_session`; read by the relay's
     /// descriptor-fetch endpoint.
     descriptors: RelayDescriptors,
-    /// The session-id counter. Monotonic within this coordinator's lifetime;
-    /// scoped per `SessionSetup` instance so tests get isolated counters.
-    /// Session ids are unique within a tenant but not globally (two tenants
-    /// can both have session 1) — the relay keys its routing groups on
-    /// `SessionKey` (tenant + session) for exactly this reason.
+    /// The session-id counter, seeded from wall-clock time at construction.
+    /// Monotonic within this coordinator's lifetime; scoped per `SessionSetup`
+    /// instance. Session ids are unique within a tenant but not globally (two
+    /// tenants can both share a session id) — the relay keys its routing
+    /// groups on `SessionKey` (tenant + session) for exactly this reason.
     next_session: Arc<AtomicU64>,
 }
 
@@ -77,7 +77,7 @@ impl SessionSetup {
             tenants,
             session_relays: Arc::new(Mutex::new(HashMap::new())),
             descriptors: RelayDescriptors::new(),
-            next_session: Arc::new(AtomicU64::new(1)),
+            next_session: Arc::new(AtomicU64::new(first_session_id())),
         }
     }
 
@@ -100,10 +100,25 @@ impl SessionSetup {
     }
 }
 
-/// Assigns the next session id. Monotonic within this coordinator's lifetime;
-/// a coordinator restart resets the counter, so a re-created session could
-/// reuse an id — acceptable because the old session's relays have been told
-/// to leave (or the coordinator restarted and lost all state anyway).
+/// The first session id for a freshly constructed coordinator: the wall clock
+/// in microseconds since the Unix epoch. Relays hold per-session state keyed
+/// on `(tenant, session)` — routing groups, dedup sets, decision-makers — and
+/// deliberately keep it through a coordinator outage so running games survive
+/// one. A restarted coordinator that counted from 1 again could hand a new
+/// game a key a relay still holds the old game's state under; a time seed
+/// makes ids from different coordinator lifetimes disjoint (the process would
+/// have to mint a session per microsecond of downtime to catch up to the next
+/// seed). Never 0, so an id is always distinguishable from an unset field.
+fn first_session_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_micros() as u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Assigns the next session id. Monotonic within this coordinator's lifetime,
+/// starting from the time-seeded counter so ids never repeat across restarts.
 fn next_session_id(setup: &SessionSetup) -> SessionId {
     SessionId(setup.next_session.fetch_add(1, Ordering::Relaxed))
 }
@@ -646,17 +661,31 @@ mod tests {
     }
 
     #[test]
-    fn independent_session_setups_have_independent_counters() {
-        let setup1 = setup_with_two_relays_and_tenant();
-        let setup2 = setup_with_two_relays_and_tenant();
+    fn a_restarted_coordinator_does_not_reuse_session_ids() {
+        // Relays keep per-session state through a coordinator outage, so ids
+        // from different coordinator lifetimes must be disjoint. The counter
+        // is seeded from the wall clock in microseconds: a restarted process
+        // seeds later than any id the previous lifetime minted (a lifetime
+        // would have to mint a session per microsecond of its whole runtime
+        // to catch up to the next seed). Guard the seed's scale — a
+        // regression to counting from 1 is the failure this test exists for.
+        assert!(
+            first_session_id() > 1_600_000_000_000_000,
+            "the seed is wall-clock microseconds, not a small counter",
+        );
 
+        let before = setup_with_two_relays_and_tenant();
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
         };
-        let r1 = create_session(&setup1, req.clone(), ExpiresAt(u64::MAX)).unwrap();
-        let r2 = create_session(&setup2, req, ExpiresAt(u64::MAX)).unwrap();
-        // Two independent SessionSetup instances start their counters at 1.
-        assert_eq!(r1.session, r2.session);
+        let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX)).unwrap();
+
+        let after = setup_with_two_relays_and_tenant();
+        let new = create_session(&after, req, ExpiresAt(u64::MAX)).unwrap();
+        assert!(
+            new.session.0 >= old.session.0,
+            "a fresh coordinator's ids never start below the old one's",
+        );
     }
 }

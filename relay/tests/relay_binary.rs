@@ -81,6 +81,7 @@ async fn a_client_connects_through_a_self_signed_relay_and_exchanges_a_turn() ->
             slot: 0,
             game_frame_count: Some(42),
             commands: vec![0x05].into(),
+            ..Default::default()
         }))
         .map_err(|e| e.to_string())?;
 

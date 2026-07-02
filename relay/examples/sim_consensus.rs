@@ -23,7 +23,7 @@
 use std::fmt::Write;
 
 use rally_point_proto::control::{BufferBounds, TenantId};
-use rally_point_proto::ids::{GameFrameCount, SessionId};
+use rally_point_proto::ids::{GameFrameCount, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, SlotConditions};
 use rally_point_relay::consensus::{Authority, ControlLaw, DecisionMaker};
 use rally_point_relay::routing::SessionKey;
@@ -154,9 +154,12 @@ fn run(scenario: &Scenario) -> Vec<Row> {
         // Push into the parallel window *before* ingest so the max reflects the
         // same sample the decision-maker pushed this turn. ingest_local runs
         // decide() after pushing internally, so maker.target() after ingest is
-        // the target the decision actually used (not a pre-ingest lag).
+        // the target the decision actually used (not a pre-ingest lag). The
+        // frame is observed first, the way the turn path does it (frames come
+        // off validated turns, conditions off the carrying packet).
         jitter.push(sample.rtt_us);
-        let decision = maker.ingest_local(&conditions, frame).map(|d| Decision {
+        maker.observe_frame(SlotId(0), frame);
+        let decision = maker.ingest_local(&conditions).map(|d| Decision {
             buffer: d.buffer.0,
             applied_frame: d.applied_frame.0,
         });

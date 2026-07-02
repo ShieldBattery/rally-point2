@@ -255,7 +255,11 @@ async fn main() -> Result<()> {
         // keeps the drivers' command channels alive — `run_mesh_link` ends when
         // its command sender is dropped, so the registry holding each sender is
         // what keeps a freshly established (not-yet-joined) link parked and ready.
-        let mesh_control = mesh_control::MeshControl::new(RelayId(our_id));
+        // Share the decision-maker registry the turn path holds (in `mesh_state`)
+        // so a maker created here on a coordinator descriptor is the same one the
+        // slot-link and mesh-link tasks feed conditions into and stamp decisions on.
+        let mesh_control =
+            mesh_control::MeshControl::new(RelayId(our_id), mesh_state.decision_makers.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it

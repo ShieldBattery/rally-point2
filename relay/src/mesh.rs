@@ -247,6 +247,14 @@ pub struct MeshState {
     pub seen: SeenRegistries,
     /// Per-slot link conditions the mesh attaches to outgoing datagrams.
     pub conditions: ConditionsRegistry,
+    /// Per-session latency-buffer decision-makers. The slot-link and mesh-link
+    /// tasks feed conditions in (home-client stats directly, peer-relay stats off
+    /// the mesh sidecar) and stamp the authority's buffer changes onto the turns
+    /// they forward. `MeshControl` creates and destroys the makers as descriptors
+    /// arrive and sessions end; sharing the registry here is what lets the turn
+    /// path reach them. Bundled with the mesh registries because it has the same
+    /// per-session lifecycle and is threaded through the same tasks.
+    pub decision_makers: Arc<crate::consensus::DecisionMakers>,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -256,6 +264,7 @@ pub fn new_mesh_state() -> MeshState {
         links: new_mesh_links(),
         seen: new_seen_registries(),
         conditions: new_conditions_registry(),
+        decision_makers: Arc::new(crate::consensus::new_decision_makers()),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -366,6 +375,50 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
     }
 }
 
+/// Forwards one turn: topological dedup, buffer-directive stamping, then
+/// fan-out to local slots and peer relays. The single forward step shared by
+/// the client-edge path (`run_slot_link`) and the mesh path (`run_mesh_link`),
+/// so every path a turn can take treats the stamp identically.
+///
+/// Marking `(slot, seq)` in the session's seen-set before fanning out is what
+/// catches the mesh echo: the mesh floods to all peers (no link-id exclusion),
+/// so the turn comes back via the mesh, is seen as `Duplicate`, and is dropped
+/// before it reaches local clients a second time — a duplicate turn into a
+/// lockstep slot is a desync.
+///
+/// Stamping is stamp-or-preserve: when this relay's decision-maker has an
+/// active directive (it is the session's authority), the directive is set on
+/// the outgoing payload; when it has none — every non-authority relay, always
+/// — a stamp already on the turn is left untouched, so the authority's
+/// broadcast survives the hop across relays that merely forward it.
+pub fn forward_turn(
+    sessions: &routing::Sessions,
+    mesh_links: &MeshLinks,
+    seen: &SeenRegistries,
+    decision_makers: &crate::consensus::DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    mut payload: Payload,
+) {
+    if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
+        return;
+    }
+    match crate::consensus::active_directive(decision_makers, key) {
+        Some(directive) => payload.buffer_directive = Some(directive),
+        // Preserving an upstream stamp also records its seq: every directive
+        // floods through every relay serving the session, so if this relay is
+        // later promoted to authority, its own decisions number above what
+        // clients already hold instead of restarting below it.
+        None => {
+            if let Some(incoming) = &payload.buffer_directive {
+                crate::consensus::observe_directive(decision_makers, key, incoming.decision_seq);
+            }
+        }
+    }
+    routing::fan_out(sessions, key, slot, payload.clone());
+    fan_out_to_mesh(mesh_links, key, payload);
+}
+
 /// A command to a mesh-link driver, telling it to start or stop serving one
 /// session on its shared relay-pair connection.
 ///
@@ -451,6 +504,7 @@ pub async fn run_mesh_link(
         links: mesh_links,
         seen: seen_registries,
         conditions,
+        decision_makers,
     } = mesh;
 
     // One merged forward channel for every session on this link: fan_out_to_mesh
@@ -515,6 +569,11 @@ pub async fn run_mesh_link(
                             continue;
                         };
                         let key = state.key.clone();
+                        // Feed the peer relay's home-client conditions into this
+                        // session's decision-maker. The mesh hop is a property of
+                        // the relay-pair, sampled from this link's QUIC RTT, so a
+                        // remote slot's effective path includes the trip across
+                        // the backbone.
                         if let Some(peer_conditions) = &mesh_received.conditions {
                             tracing::trace!(
                                 tenant = key.tenant.as_ref(),
@@ -522,16 +581,38 @@ pub async fn run_mesh_link(
                                 slots = peer_conditions.slots.len(),
                                 "received peer-relay link conditions",
                             );
+                            let mesh_rtt_us = link_rtt_us(link.connection());
+                            // Any decision it fires is logged by the helper and
+                            // broadcast later, at fan-out.
+                            let _ = crate::consensus::ingest_remote_conditions(
+                                &decision_makers,
+                                &key,
+                                peer_conditions,
+                                mesh_rtt_us,
+                            );
                         }
                         for payload in mesh_received.delivery.fresh {
-                            let slot = rally_point_proto::ids::SlotId(payload.slot as u8);
-                            if mark_seen(&seen_registries, &key, slot, payload.seq)
-                                == Seen::Duplicate
-                            {
-                                continue;
+                            let slot = SlotId(payload.slot as u8);
+                            // A remote slot's frame observation, validated by its
+                            // home relay. Lobby turns carry no frame and don't
+                            // move the consensus coordinate.
+                            if let Some(frame) = payload.game_frame_count {
+                                crate::consensus::observe_frame(
+                                    &decision_makers,
+                                    &key,
+                                    slot,
+                                    rally_point_proto::ids::GameFrameCount(frame),
+                                );
                             }
-                            routing::fan_out(&sessions, &key, slot, payload.clone());
-                            fan_out_to_mesh(&mesh_links, &key, payload);
+                            forward_turn(
+                                &sessions,
+                                &mesh_links,
+                                &seen_registries,
+                                &decision_makers,
+                                &key,
+                                slot,
+                                payload,
+                            );
                         }
                         continue;
                     }
@@ -705,6 +786,22 @@ impl Drop for MeshLinkRegistration {
     fn drop(&mut self) {
         deregister_mesh_link(&self.links, &self.key);
     }
+}
+
+/// Converts a QUIC smoothed-RTT estimate to the conditions sidecar's `u32`
+/// microseconds. The single conversion both sampling sites share — the mesh
+/// link's backbone hop and the slot link's client path in `routing` — so the
+/// convention stays in one place: a connection with no RTT sample yet reports
+/// `0` ("no measurement", never "zero latency"), clamped to the field width.
+pub(crate) fn rtt_us(rtt: std::time::Duration) -> u32 {
+    rtt.as_micros().min(u32::MAX as u128) as u32
+}
+
+/// The mesh link's smoothed round-trip time in microseconds — the hop across
+/// the backbone a remote slot's turns travel, added to each remote slot's
+/// effective path in the decision-maker.
+fn link_rtt_us(connection: &rally_point_transport::quinn::Connection) -> u32 {
+    rtt_us(connection.stats().path.rtt)
 }
 
 /// Validates a list of sessions for a mesh link, refusing if two tenants share

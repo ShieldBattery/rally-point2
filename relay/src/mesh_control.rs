@@ -60,6 +60,7 @@ use rally_point_proto::control::{RelayPeer, SessionDescriptor};
 use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
+use crate::consensus::{self, Authority, DecisionMakers};
 use crate::mesh::MeshCommand;
 use crate::routing::SessionKey;
 
@@ -69,8 +70,13 @@ use crate::routing::SessionKey;
 #[derive(Clone)]
 pub struct MeshControl {
     /// This relay's own id, used to drop a self-reference defensively if a
-    /// descriptor ever lists it (a relay never meshes with itself).
+    /// descriptor ever lists it (a relay never meshes with itself), and to decide
+    /// buffer authority (the lowest relay id serving a session decides).
     our_id: RelayId,
+    /// Per-session decision-makers, created and destroyed here as descriptors
+    /// arrive and sessions end. Shared with the turn path (via `MeshState`) so the
+    /// slot-link and mesh-link tasks feed conditions in and stamp decisions out.
+    decision_makers: Arc<DecisionMakers>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -97,11 +103,18 @@ struct Inner {
 
 impl MeshControl {
     /// Creates an empty `MeshControl` for a relay with no peer links and no
-    /// sessions yet. `our_id` is this relay's id.
-    pub fn new(our_id: RelayId) -> Self {
+    /// sessions yet. `our_id` is this relay's id. `decision_makers` is the
+    /// registry the relay's turn path holds (via `MeshState`), so a maker this
+    /// creates on a descriptor is the one the slot-link and mesh-link tasks
+    /// feed and stamp — a required argument, because a `MeshControl` minting
+    /// its own registry would create makers the turn path silently never
+    /// reads. A caller with no turn path (tests, a standalone control plane)
+    /// passes `Arc::default()`.
+    pub fn new(our_id: RelayId, decision_makers: Arc<DecisionMakers>) -> Self {
         let (desired_peers_tx, _) = watch::channel(Vec::new());
         Self {
             our_id,
+            decision_makers,
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 desired: HashMap::new(),
@@ -158,6 +171,27 @@ impl MeshControl {
             .filter(|id| *id != self.our_id)
             .collect();
 
+        // Create or reconcile this session's decision-maker with the
+        // coordinator's bounds and this relay's authority. Authority is decided
+        // by relay-id order: the lowest id among the relays serving the session
+        // is the decision-maker, so one relay decides and the rest forward its
+        // stamped turns. A single-relay session (no peers) is trivially the
+        // authority. Reconciling on every push — not just creating on the first
+        // — is what keeps the verdict true as the relay set changes: a re-push
+        // that adds a lower-id relay demotes this one, and one that removes the
+        // lowest promotes the next. (Relays receive a re-push at slightly
+        // different moments, so two can disagree briefly while it propagates;
+        // the directive's decision seq keeps clients consistent through that
+        // window.) This id-order rule is interim until the coordinator assigns
+        // an explicit priority order and a presence signal drives handoff when
+        // the authority's players leave; it takes no coordinator round-trip.
+        let authority = if new_peers.iter().all(|id| self.our_id.0 < id.0) {
+            Authority::SelfRelay
+        } else {
+            Authority::Peer
+        };
+        consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
+
         let mut inner = self.inner.lock();
 
         // Remember each named peer's reachable address, so the desired-peer set
@@ -185,10 +219,15 @@ impl MeshControl {
         publish_desired_peers(&mut inner);
     }
 
-    /// Ends a session's mesh membership: forgets the desired set and reconciles
-    /// its peers, which leaves each link that was joined. Idempotent — ending an
-    /// unknown session is a no-op.
+    /// Ends a session's mesh membership: destroys its decision-maker, forgets the
+    /// desired set, and reconciles its peers, which leaves each link that was
+    /// joined. Idempotent — ending an unknown session is a no-op.
+    ///
+    /// The decision-maker is dropped first, unconditionally: a single-relay
+    /// session has a maker but no mesh peers to reconcile, so gating its teardown
+    /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
+        consensus::deregister_maker(&self.decision_makers, key);
         let mut inner = self.inner.lock();
         let Some(peers) = inner.desired.remove(key) else {
             return;
@@ -341,7 +380,7 @@ mod tests {
 
     #[test]
     fn applies_join_to_each_registered_peer() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
         control.register_link(RelayId(2), tx2);
@@ -355,7 +394,7 @@ mod tests {
 
     #[test]
     fn joins_only_named_peers_never_broadcasts() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
         control.register_link(RelayId(2), tx2);
@@ -373,7 +412,7 @@ mod tests {
 
     #[test]
     fn descriptor_before_link_joins_when_the_link_registers() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
 
         // The descriptor names peer 2, but its link has not established yet.
         control.apply_descriptor(&descriptor(1, &[2]));
@@ -386,7 +425,7 @@ mod tests {
 
     #[test]
     fn re_applied_descriptor_leaves_a_dropped_peer() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
         control.register_link(RelayId(2), tx2);
@@ -408,7 +447,7 @@ mod tests {
 
     #[test]
     fn end_session_leaves_all_peers_and_forgets_membership() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
         control.register_link(RelayId(2), tx2);
@@ -430,7 +469,7 @@ mod tests {
 
     #[test]
     fn end_session_on_an_unknown_session_is_a_no_op() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         control.register_link(RelayId(2), tx2);
         // Never applied a descriptor for session 9.
@@ -440,7 +479,7 @@ mod tests {
 
     #[test]
     fn reconnect_replaces_sender_and_rejoins_desired_sessions() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2_old, mut rx2_old) = link();
         control.register_link(RelayId(2), tx2_old);
         control.apply_descriptor(&descriptor(1, &[2]));
@@ -457,7 +496,7 @@ mod tests {
     fn drops_a_descriptor_self_reference() {
         // A descriptor that erroneously lists this relay among its own peers
         // must not produce a self-join — a relay never meshes with itself.
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx1, mut rx1) = link();
         // Even if a link were somehow registered under our own id, we don't join.
         control.register_link(RelayId(1), tx1);
@@ -473,7 +512,7 @@ mod tests {
         // A burst of session starts on one relay-pair — more than the previous
         // bounded command-channel capacity — must not drop any join. The
         // unbounded channel absorbs the burst; the driver drains it in order.
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         control.register_link(RelayId(2), tx2);
 
@@ -493,7 +532,7 @@ mod tests {
         // The exact gap finding #2 flagged: a session's final `Leave` — with no
         // later descriptor to re-push it — must not be lost behind a backlog of
         // undrained commands. With an unbounded channel it is durably queued.
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2, mut rx2) = link();
         control.register_link(RelayId(2), tx2);
 
@@ -520,7 +559,7 @@ mod tests {
         // When a link's driver has exited (its receiver dropped), the stale
         // sender is removed but intent is kept, so a reconnect re-joins from
         // scratch rather than the session being lost.
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let (tx2_dead, rx2_dead) = link();
         control.register_link(RelayId(2), tx2_dead);
         drop(rx2_dead); // the driver exited; the channel is now closed
@@ -538,7 +577,7 @@ mod tests {
 
     #[test]
     fn apply_descriptor_publishes_desired_peers_with_addresses() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let mut peers_rx = control.desired_peers();
         assert!(peers_rx.borrow_and_update().is_empty());
 
@@ -558,7 +597,7 @@ mod tests {
 
     #[test]
     fn ending_a_session_republishes_the_shrunk_peer_set() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let mut peers_rx = control.desired_peers();
         control.apply_descriptor(&descriptor(1, &[2]));
         peers_rx.borrow_and_update();
@@ -570,7 +609,7 @@ mod tests {
 
     #[test]
     fn a_self_reference_is_not_published_as_a_desired_peer() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let mut peers_rx = control.desired_peers();
         // The descriptor erroneously lists this relay (1) among its own peers.
         control.apply_descriptor(&descriptor(1, &[1, 2]));
@@ -581,7 +620,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_peer_set_does_not_republish() {
-        let control = MeshControl::new(RelayId(1));
+        let control = MeshControl::new(RelayId(1), Arc::default());
         let mut peers_rx = control.desired_peers();
         control.apply_descriptor(&descriptor(1, &[2]));
         peers_rx.borrow_and_update();
@@ -593,5 +632,121 @@ mod tests {
             !peers_rx.has_changed().unwrap(),
             "an unchanged peer set must not republish",
         );
+    }
+
+    // -- Decision-maker lifecycle --
+
+    #[test]
+    fn apply_descriptor_creates_a_self_authority_maker_for_a_single_relay_session() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone());
+
+        // A descriptor with no peers is a single-relay session: the relay is its
+        // own buffer authority.
+        control.apply_descriptor(&descriptor(1, &[]));
+
+        let registry = makers.lock();
+        let maker = registry.get(&key(1)).expect("a maker was created");
+        assert!(
+            maker.is_authority(),
+            "a single-relay session is its own authority",
+        );
+    }
+
+    #[test]
+    fn authority_is_the_lowest_relay_id_serving_the_session() {
+        // our_id 1, peer 2: we're the lowest, so we decide.
+        let low = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), low.clone());
+        control.apply_descriptor(&descriptor(1, &[2]));
+        assert!(
+            low.lock().get(&key(1)).unwrap().is_authority(),
+            "the lowest relay id is the authority",
+        );
+
+        // our_id 3, peer 2: the peer is lower, so it decides, not us.
+        let high = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(3), high.clone());
+        control.apply_descriptor(&descriptor(1, &[2]));
+        assert!(
+            !high.lock().get(&key(1)).unwrap().is_authority(),
+            "a relay that isn't the lowest id defers to the peer that is",
+        );
+    }
+
+    #[test]
+    fn a_repushed_descriptor_moves_authority_with_the_relay_set() {
+        // Relay 2 starts as the session's only relay: it is the authority.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(2), makers.clone());
+        control.apply_descriptor(&descriptor(1, &[]));
+        assert!(makers.lock().get(&key(1)).unwrap().is_authority());
+
+        // A player homed on relay 1 joins: the re-pushed descriptor names a
+        // lower id, so relay 2 is demoted — a frozen verdict here would leave
+        // the session with two authorities stamping conflicting directives.
+        control.apply_descriptor(&descriptor(1, &[1]));
+        assert!(
+            !makers.lock().get(&key(1)).unwrap().is_authority(),
+            "a lower-id relay joining demotes this one",
+        );
+
+        // Relay 1's players leave: the re-push drops it, promoting relay 2
+        // back — a frozen verdict here would leave the session with none.
+        control.apply_descriptor(&descriptor(1, &[]));
+        assert!(
+            makers.lock().get(&key(1)).unwrap().is_authority(),
+            "the lowest id leaving promotes the next",
+        );
+    }
+
+    #[test]
+    fn end_session_destroys_the_maker() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone());
+
+        control.apply_descriptor(&descriptor(1, &[]));
+        assert!(makers.lock().contains_key(&key(1)));
+
+        control.end_session(&key(1));
+        assert!(
+            !makers.lock().contains_key(&key(1)),
+            "ending the session drops its maker, even with no mesh peers",
+        );
+    }
+
+    #[test]
+    fn a_created_maker_ingests_conditions_and_queues_a_directive() {
+        use rally_point_proto::ids::{GameFrameCount, SlotId};
+        use rally_point_proto::messages::{LinkConditions, SlotConditions};
+
+        // The whole relay-side path, end to end at the registry level: a descriptor
+        // creates the maker, a validated turn's frame and a high-RTT sample fed
+        // through the same helpers the turn path uses make it decide, and the
+        // decision is available to stamp.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone());
+        control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
+
+        consensus::observe_frame(&makers, &key(1), SlotId(0), GameFrameCount(1));
+        let conditions = LinkConditions {
+            slots: vec![SlotConditions {
+                slot: 0,
+                rtt_us: 150_000,
+                lost_packets: 0,
+                sent_packets: 100,
+            }],
+        };
+        let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+            .expect("a raise fires on the first high-RTT sample");
+        assert_eq!(
+            decision.buffer.0, 4,
+            "150ms -> 4 turns, within bounds (1, 6)"
+        );
+
+        let directive =
+            consensus::active_directive(&makers, &key(1)).expect("a directive is queued");
+        assert_eq!(directive.buffer_turns, 4);
+        assert_eq!(directive.apply_at_frame, decision.applied_frame.0);
     }
 }

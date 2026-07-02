@@ -184,6 +184,9 @@ pub fn validate_turn(
             seq,
             slot: u32::from(slot.0),
             game_frame_count,
+            // A freshly validated client turn carries no buffer directive: the
+            // relay stamps those onto turns it forwards, never onto ingress.
+            buffer_directive: None,
             commands: forwarded.into(),
         },
         stripped_control,

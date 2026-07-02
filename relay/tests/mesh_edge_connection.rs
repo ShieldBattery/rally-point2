@@ -205,8 +205,8 @@ fn turn(slot: u8, seq: u64) -> Payload {
     Payload {
         seq,
         slot: u32::from(slot),
-        game_frame_count: None,
         commands: vec![].into(),
+        ..Default::default()
     }
 }
 
@@ -353,8 +353,8 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     let relay_b = Relay::start(&tenant, 2);
 
     // Each relay's Join source.
-    let control_a = mesh_control::MeshControl::new(RelayId(1));
-    let control_b = mesh_control::MeshControl::new(RelayId(2));
+    let control_a = mesh_control::MeshControl::new(RelayId(1), Arc::default());
+    let control_b = mesh_control::MeshControl::new(RelayId(2), Arc::default());
 
     let (links_b_tx, mut links_b_rx) =
         mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);

@@ -447,8 +447,8 @@ mod tests {
         Payload {
             seq,
             slot: u32::from(slot),
-            game_frame_count: None,
             commands: vec![byte].into(),
+            ..Default::default()
         }
     }
 
@@ -492,14 +492,15 @@ mod tests {
                 slot: 0,
                 game_frame_count: Some(1337),
                 commands: vec![0x05].into(),
+                ..Default::default()
             }))
             .unwrap();
         client
             .send(Some(Payload {
                 seq: 1,
                 slot: 0,
-                game_frame_count: None,
                 commands: vec![0x05].into(),
+                ..Default::default()
             }))
             .unwrap();
 
@@ -510,6 +511,54 @@ mod tests {
         delivered.sort_by_key(|p| p.seq);
         assert_eq!(delivered[0].game_frame_count, Some(1337));
         assert_eq!(delivered[1].game_frame_count, None);
+    }
+
+    #[tokio::test]
+    async fn preserves_buffer_directive_across_send_and_recv() {
+        // A relay-authored buffer change rides the Payload envelope, so the link
+        // must carry it through verbatim like any other payload field — it is not
+        // a transport key (dedup and retirement stay on (slot, seq)), just metadata
+        // the game applies out of band. Absent is the common case and survives too.
+        use rally_point_proto::messages::BufferDirective;
+        let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
+
+        client
+            .send(Some(Payload {
+                seq: 0,
+                slot: 0,
+                game_frame_count: Some(500),
+                buffer_directive: Some(BufferDirective {
+                    buffer_turns: 6,
+                    apply_at_frame: 512,
+                    decision_seq: 3,
+                }),
+                commands: vec![0x0C].into(),
+            }))
+            .unwrap();
+        client
+            .send(Some(Payload {
+                seq: 1,
+                slot: 0,
+                game_frame_count: Some(501),
+                commands: vec![0x0C].into(),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        while delivered.len() < 2 {
+            delivered.extend(server.recv().await.unwrap().fresh);
+        }
+        delivered.sort_by_key(|p| p.seq);
+        assert_eq!(
+            delivered[0].buffer_directive,
+            Some(BufferDirective {
+                buffer_turns: 6,
+                apply_at_frame: 512,
+                decision_seq: 3,
+            }),
+        );
+        assert_eq!(delivered[1].buffer_directive, None);
     }
 
     #[tokio::test]
@@ -557,14 +606,14 @@ mod tests {
                 Payload {
                     seq: RECEIVE_WINDOW,
                     slot: 0,
-                    game_frame_count: None,
                     commands: vec![0xAA].into(),
+                    ..Default::default()
                 },
                 Payload {
                     seq: 0,
                     slot: 0,
-                    game_frame_count: None,
                     commands: vec![0xBB].into(),
+                    ..Default::default()
                 },
             ],
         };
@@ -591,8 +640,8 @@ mod tests {
             payloads: vec![Payload {
                 seq: u64::MAX,
                 slot: 0,
-                game_frame_count: None,
                 commands: vec![1].into(),
+                ..Default::default()
             }],
         };
         client
@@ -624,8 +673,8 @@ mod tests {
         let oversize = Payload {
             seq: 0,
             slot: 0,
-            game_frame_count: None,
             commands: vec![0u8; budget + 1].into(),
+            ..Default::default()
         };
         match client.send(Some(oversize)) {
             Err(LinkError::PayloadTooLarge {

@@ -113,6 +113,15 @@ fn self_signed() -> (
 /// Binds an ephemeral relay endpoint serving `registry`, returning its address
 /// and the CA a client trusts to reach it.
 fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
+    start_relay_with_mesh(registry, rally_point_relay::mesh::new_mesh_state())
+}
+
+/// [`start_relay`] with a caller-supplied [`MeshState`], so a test can hold its
+/// decision-maker registry (to seed a pending buffer change) or its mesh links.
+fn start_relay_with_mesh(
+    registry: Registry,
+    mesh: rally_point_relay::mesh::MeshState,
+) -> (SocketAddr, CertificateDer<'static>) {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
@@ -122,7 +131,7 @@ fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
         endpoint,
         Arc::new(registry),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_state(),
+        mesh,
         None,
     ));
     (addr, ca)
@@ -220,8 +229,8 @@ async fn fans_a_validated_turn_to_the_other_slot() {
         .send(Some(Payload {
             seq: 0,
             slot: 9,
-            game_frame_count: None,
             commands: vec![0x05, 0x55, 0x02, 0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
         }))
         .unwrap();
 
@@ -236,6 +245,87 @@ async fn fans_a_validated_turn_to_the_other_slot() {
     assert_eq!(turn.slot, 0);
     // The latency control is stripped; gameplay commands pass through verbatim.
     assert_eq!(&turn.commands[..], &[0x05, 0x0C, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+#[tokio::test]
+async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
+    use rally_point_proto::ids::GameFrameCount;
+    use rally_point_proto::messages::{LinkConditions, SlotConditions};
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(77);
+
+    // Seed a buffer decision into the relay's decision-maker before any client
+    // connects: create the session's maker as the authority, then feed it a
+    // high-RTT sample so it decides to raise the buffer and queues that change
+    // for broadcast. Holding the registry that `MeshState` carries is what lets
+    // the test set this up; the relay's turn path then stamps it.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+    );
+    // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
+    // 4 turns, raised from the min of 0, so the pending directive names buffer
+    // 4 applied a horizon past frame 1.
+    consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(1));
+    let seed = LinkConditions {
+        slots: vec![SlotConditions {
+            slot: 0,
+            rtt_us: 150_000,
+            lost_packets: 0,
+            sent_packets: 100,
+        }],
+    };
+    let decision = consensus::ingest_local_conditions(&makers, &key, &seed)
+        .expect("the seeded high-RTT sample raises the buffer");
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    // Slot 0 sends a plain build with no frame of its own. The relay's live
+    // loopback samples can't displace the seeded decision (a raise needs a
+    // worse target than the seeded 150ms; a lower is dwell-gated), so the
+    // pending directive stands, and the relay forwards the turn to slot 1.
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+
+    let mut delivered = Vec::new();
+    while delivered.is_empty() {
+        delivered = slot1.recv().await.unwrap().fresh;
+    }
+
+    // The forwarded turn carries the buffer change the relay decided: slot 1 now
+    // learns the new buffer and the frame to apply it at, riding the turn stream
+    // it already receives — no separate channel, no forged command.
+    let turn = &delivered[0];
+    let directive = turn
+        .buffer_directive
+        .as_ref()
+        .expect("the forwarded turn carries the pending buffer directive");
+    assert_eq!(directive.buffer_turns, 4);
+    assert_eq!(directive.apply_at_frame, decision.applied_frame.0);
+    // The command bytes are untouched — the directive is envelope metadata, not a
+    // command the game parses.
+    assert_eq!(&turn.commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
 }
 
 #[tokio::test]
@@ -354,8 +444,8 @@ async fn isolates_identical_session_ids_across_tenants() {
     a0.send(Some(Payload {
         seq: 0,
         slot: 0,
-        game_frame_count: None,
         commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+        ..Default::default()
     }))
     .unwrap();
 
@@ -451,8 +541,8 @@ async fn acks_a_one_way_sender_with_no_peer_traffic() {
         solo.send(Some(Payload {
             seq,
             slot: 0,
-            game_frame_count: None,
             commands: vec![0x05].into(),
+            ..Default::default()
         }))
         .unwrap();
     }
