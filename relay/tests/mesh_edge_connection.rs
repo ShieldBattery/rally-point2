@@ -353,8 +353,8 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     let relay_b = Relay::start(&tenant, 2);
 
     // Each relay's Join source.
-    let control_a = mesh_control::MeshControl::new(RelayId(1), Arc::default());
-    let control_b = mesh_control::MeshControl::new(RelayId(2), Arc::default());
+    let control_a = mesh_control::MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let control_b = mesh_control::MeshControl::new(RelayId(2), Arc::default(), Arc::default());
 
     let (links_b_tx, mut links_b_rx) =
         mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
@@ -408,6 +408,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
             relay_addr: relay_b.addr,
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
+        authority_order: vec![],
     });
     control_b.apply_descriptor(&SessionDescriptor {
         tenant: TenantId(TENANT.to_owned()),
@@ -417,6 +418,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
             relay_addr: relay_a.addr,
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
+        authority_order: vec![],
     });
 
     // Connect clients: slot 0 (sender) on relay A, slot 1 on relay B.
@@ -440,6 +442,162 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
 
     drop(relay_a);
     Ok(())
+}
+
+/// Buffer authority hands off to the next relay in the coordinator-assigned
+/// order when the deciding relay's players all leave — driven end to end over
+/// the production mesh presence path, with no descriptor re-push.
+///
+/// Relay A heads the order and serves the session's first client, so it
+/// decides. When that client disconnects, A's slot roster empties: A demotes
+/// itself locally, its mesh driver pushes the zero over the presence stream,
+/// and B — next in the order, still serving a player — promotes itself. The
+/// assertions poll rather than sleep because presence propagates on the mesh
+/// flush cadence.
+#[tokio::test]
+async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(1);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Relay A (id 1) dials; relay B (id 2) accepts. Each control shares its
+    // relay's decision-maker and presence registries, as the binary wires it —
+    // the descriptor's order must land where the turn-path reports do.
+    let relay_a = Relay::start(&tenant, 1);
+    let relay_b = Relay::start(&tenant, 2);
+    let control_a = mesh_control::MeshControl::new(
+        RelayId(1),
+        relay_a.mesh.decision_makers.clone(),
+        relay_a.mesh.presence.clone(),
+    );
+    let control_b = mesh_control::MeshControl::new(
+        RelayId(2),
+        relay_b.mesh.decision_makers.clone(),
+        relay_b.mesh.presence.clone(),
+    );
+
+    let (links_b_tx, mut links_b_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    tokio::spawn(mesh_edge::run_mesh_accept(
+        relay_b.mesh_accept_rx,
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+        links_b_tx,
+    ));
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    tokio::spawn(mesh_edge::run_mesh_dial(
+        mesh_edge::MeshDial {
+            our_id: RelayId(1),
+            peer_id: RelayId(2),
+            peer_addr: relay_b.addr,
+            server_name: "localhost".to_owned(),
+            roots,
+        },
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+    ));
+
+    let (peer_a, cmds_a) = links_a_rx
+        .recv()
+        .await
+        .ok_or("dial side did not produce a link")?;
+    control_a.register_link(peer_a, cmds_a);
+    let (peer_b, cmds_b) = links_b_rx
+        .recv()
+        .await
+        .ok_or("accept side did not produce a link")?;
+    control_b.register_link(peer_b, cmds_b);
+
+    // The coordinator ranked A first (the session's home relay).
+    let descriptor_for = |peers: Vec<RelayPeer>| SessionDescriptor {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+        peers,
+        bounds: BufferBounds::new(1, 6).unwrap(),
+        authority_order: vec![RelayId(1), RelayId(2)],
+    };
+    control_a.apply_descriptor(&descriptor_for(vec![RelayPeer {
+        relay_id: RelayId(2),
+        relay_addr: relay_b.addr,
+    }]));
+    control_b.apply_descriptor(&descriptor_for(vec![RelayPeer {
+        relay_id: RelayId(1),
+        relay_addr: relay_a.addr,
+    }]));
+
+    // A player on each relay. A's client is the one whose departure hands off.
+    let mut client_a =
+        connect_client(relay_a.addr, &relay_a.ca, &tenant, session, SlotId(0)).await?;
+    let mut client_b =
+        connect_client(relay_b.addr, &relay_b.ca, &tenant, session, SlotId(1)).await?;
+
+    let a_is_authority = || {
+        relay_a
+            .mesh
+            .decision_makers
+            .lock()
+            .get(&key)
+            .is_some_and(|m| m.is_authority())
+    };
+    let b_is_authority = || {
+        relay_b
+            .mesh
+            .decision_makers
+            .lock()
+            .get(&key)
+            .is_some_and(|m| m.is_authority())
+    };
+
+    // Steady state: A (first in order, serving a player) decides, B defers.
+    // Polled, not asserted immediately: right after Join, A's roster was still
+    // empty, so B may hold a transiently different view until A's first
+    // nonzero presence report lands.
+    wait_for("A to hold authority and B to defer", || {
+        a_is_authority() && !b_is_authority()
+    })
+    .await?;
+
+    // Prove the session actually carries turns while A decides.
+    client_a.send(Some(turn(0, 0))).unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(2), client_b.recv())
+        .await
+        .map_err(|_| "client B did not receive the turn within 2s")?
+        .map_err(|e| format!("client B link error: {e}"))?;
+    assert_eq!(received.fresh.len(), 1);
+
+    // A's only player leaves. No descriptor re-push follows — the handoff must
+    // ride the relays' own presence exchange.
+    drop(client_a);
+    wait_for("authority to hand off from A to B", || {
+        !a_is_authority() && b_is_authority()
+    })
+    .await?;
+
+    drop(relay_a);
+    Ok(())
+}
+
+/// Polls `cond` until it holds, failing after a few seconds. Presence and
+/// authority propagate on the mesh flush cadence (~150ms), so tests observe
+/// them by polling, never by a single fixed sleep.
+async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) -> Result<(), AnyError> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("timed out waiting for {what}").into())
 }
 
 /// `should_dial_mesh` returns false for equal ids, so neither relay dials —

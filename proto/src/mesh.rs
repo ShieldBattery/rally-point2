@@ -22,8 +22,20 @@
 //! reads and writes stay with the caller; this module only frames and unframes,
 //! so neither async I/O nor a QUIC backend leaks in here (mirroring the
 //! authorization [`handshake`](crate::handshake) codec).
+//!
+//! The same streams then carry **presence**: each relay tells its peer how many
+//! live home clients it serves per session ([`MeshPresence`]), which is what
+//! drives buffer-authority handoff when the deciding relay's players all leave.
+//! Presence rides a reliable stream rather than the datagram path because the
+//! transition it reports is exactly when the sender's datagrams dry up: a relay
+//! whose players have all left originates no turns and re-carries nothing, so a
+//! datagram sidecar would stop flowing at the one moment it matters. The dialer
+//! keeps its hello stream open and appends presence frames after the hello; the
+//! acceptor opens its own unidirectional stream carrying presence frames alone.
+//! Each side thus opens exactly one uni-stream, so the reader never has to
+//! guess a stream's kind.
 
-use crate::ids::RelayId;
+use crate::ids::{RelayId, SessionId};
 use crate::version::ProtocolVersion;
 
 /// The identity a dialing relay announces to the relay that accepted its mesh
@@ -75,6 +87,61 @@ impl MeshHello {
     }
 }
 
+/// One relay's live home-client count for one session, announced to a mesh
+/// peer whenever it changes (and re-announced when a link or session join is
+/// (re)established, so a fresh stream starts from a known state).
+///
+/// This is the presence signal buffer-authority handoff keys on: the relays sit
+/// in a coordinator-assigned priority order, and the first one still serving
+/// live players is the decision-maker — so each relay must know, per session,
+/// whether its peers still serve anyone. A count rather than a boolean so the
+/// signal stays useful to consumers that care how many (debug UIs, future
+/// presence reporting); the authority rule only reads "zero or not".
+///
+/// Within one stream, frames for the same session supersede each other in
+/// stream order — the reliable stream gives that ordering for free, which is
+/// why presence does not need a sequence number of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshPresence {
+    /// The session the count belongs to, scoped by the mesh link's tenant
+    /// context exactly like a `MeshPacket`'s bare session id.
+    pub session: SessionId,
+    /// How many live home clients the announcing relay currently serves for
+    /// this session. Zero means the relay is no longer serving players — the
+    /// handoff trigger.
+    pub live_players: u32,
+}
+
+/// Size of the fixed presence wire frame: an 8-byte session id plus a 4-byte
+/// live-player count, both little-endian. Like the hello, every field is
+/// fixed-width so the reader takes exactly this many bytes with no length
+/// prefix to validate.
+pub const MESH_PRESENCE_LEN: usize = 8 + 4;
+
+impl MeshPresence {
+    /// Encodes the announcement as its fixed-size wire frame.
+    pub fn encode(&self) -> [u8; MESH_PRESENCE_LEN] {
+        let mut frame = [0u8; MESH_PRESENCE_LEN];
+        frame[..8].copy_from_slice(&self.session.0.to_le_bytes());
+        frame[8..].copy_from_slice(&self.live_players.to_le_bytes());
+        frame
+    }
+
+    /// Decodes an announcement from its fixed-size wire frame. Infallible for
+    /// the same reason as [`MeshHello::decode`]: fixed-width fields, no
+    /// peer-driven allocation.
+    pub fn decode(frame: [u8; MESH_PRESENCE_LEN]) -> Self {
+        let mut session_bytes = [0u8; 8];
+        session_bytes.copy_from_slice(&frame[..8]);
+        let mut live_bytes = [0u8; 4];
+        live_bytes.copy_from_slice(&frame[8..]);
+        Self {
+            session: SessionId(u64::from_le_bytes(session_bytes)),
+            live_players: u32::from_le_bytes(live_bytes),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +165,32 @@ mod tests {
     fn decodes_max_values_without_panicking() {
         let hello = MeshHello::new(RelayId(u64::MAX), ProtocolVersion(u16::MAX));
         assert_eq!(MeshHello::decode(hello.encode()), hello);
+    }
+
+    #[test]
+    fn presence_round_trips_through_its_fixed_frame() {
+        let presence = MeshPresence {
+            session: SessionId(0x0102_0304_0506_0708),
+            live_players: 0x0A0B_0C0D,
+        };
+        assert_eq!(MeshPresence::decode(presence.encode()), presence);
+        // Zero live players — the handoff trigger — must survive verbatim.
+        let empty = MeshPresence {
+            session: SessionId(u64::MAX),
+            live_players: 0,
+        };
+        assert_eq!(MeshPresence::decode(empty.encode()), empty);
+    }
+
+    #[test]
+    fn presence_frame_is_little_endian_session_then_count() {
+        let presence = MeshPresence {
+            session: SessionId(7),
+            live_players: 3,
+        };
+        let frame = presence.encode();
+        assert_eq!(&frame[..8], &7u64.to_le_bytes());
+        assert_eq!(&frame[8..], &3u32.to_le_bytes());
+        assert_eq!(frame.len(), MESH_PRESENCE_LEN);
     }
 }

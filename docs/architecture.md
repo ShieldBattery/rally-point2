@@ -21,9 +21,12 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > state machine that collapses the redundant out-of-order stamp stream into at-most-one change per
 > decision, surfaced exactly at its apply frame — is built (`client::DirectiveTracker`); what remains is
 > the game seam in `shieldbattery/game/` that owns one and resizes the actual turn buffer with it.
-> Authority is decided by relay-id order for
-> now; the coordinator-assigned priority order and the presence-driven handoff when the authority's players
-> leave — plus resilience/failover and dual-stack advertise addresses — are designed but not yet built.
+> Authority now follows the **coordinator-assigned priority order** in each session descriptor (home
+> relay first; relay-id order remains only as the fallback for a descriptor without one), and **handoff
+> is presence-driven**: relays exchange per-session live-player counts over reliable mesh presence
+> streams, and the verdict falls to the next relay in the order the moment the deciding relay's players
+> leave — no coordinator re-push needed. Resilience/failover and dual-stack advertise addresses remain
+> designed but not yet built.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -323,9 +326,18 @@ the **slowest** per-slot frame observed from validated turns — a hostile clien
 `game_frame_count` moves nothing but its own observation. If the deciding relay drops out — its players
 have all left — the authority falls to the next relay in the order, with no coordinator round-trip; the
 per-session decision-maker follows the coordinator's descriptor on every push, so bounds and the
-authority verdict track the relay set as players come and go. The coordinator's only role here is to set
-the **bounds** the decision-maker stays within; it makes no per-adjustment decision, so a running game is
-unaffected by a coordinator outage.
+authority verdict track the relay set as players come and go. **How a relay knows who still serves
+players:** its own slot roster directly, and its peers via per-session live-player counts exchanged on a
+reliable uni-stream per mesh-link direction (the dialer appends them to the identity-hello stream it
+already opened; the acceptor opens one of its own). Presence rides a reliable stream, not the datagram
+path, because the transition it reports is exactly when the sender's datagrams dry up: a relay whose
+players all left forwards nothing, so a datagram sidecar would stop flowing at the one moment it
+matters. Counts are pushed on change (reconciled against the roster on the mesh flush cadence), and a
+relay that has *never* reported is assumed live — descriptors usually land before any client has
+connected, and assuming live makes every relay independently crown the same first-in-order relay
+instead of each skipping the silent others. The coordinator's only role here is to assign the **order**
+(home relay first) and set the **bounds** the decision-maker stays within; it makes no per-adjustment
+decision, so a running game is unaffected by a coordinator outage.
 
 To decide well the decision-maker needs the **whole game's** network conditions, but each relay directly
 observes only its *own* home clients' links — loss, RTT, and the like, which QUIC already measures per

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
-use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ClientPublicKey,
@@ -206,14 +206,8 @@ fn spawn_mesh_link(
     sessions: Sessions,
     mesh: mesh::MeshState,
 ) -> mpsc::UnboundedSender<mesh::MeshCommand> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(mesh::run_mesh_link(
-        link,
-        rx,
-        sessions,
-        mesh,
-        mesh::IDLE_TIMEOUT,
-    ));
+    let (tx, handle) = spawn_mesh_link_timed(link, sessions, mesh, mesh::IDLE_TIMEOUT);
+    drop(handle);
     tx
 }
 /// Like [`spawn_mesh_link`] but with a custom `idle_timeout` and returns the
@@ -230,7 +224,23 @@ fn spawn_mesh_link_timed(
     tokio::task::JoinHandle<mesh::MeshLinkExit>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let handle = tokio::spawn(mesh::run_mesh_link(link, rx, sessions, mesh, idle_timeout));
+    // These raw link pairs skip the hello exchange, so build the presence
+    // streams the production edge would have set up: an outbound uni-stream
+    // and a reader accepting the peer's. Presence isn't the subject here; the
+    // driver just needs its I/O to exist.
+    let handle = tokio::spawn(async move {
+        let Ok(presence_tx) = link.connection().open_uni().await else {
+            return mesh::MeshLinkExit::ConnectionFailed;
+        };
+        let presence_rx =
+            rally_point_relay::presence::spawn_presence_reader_accepting(link.connection().clone());
+        let presence_io = rally_point_relay::presence::PresenceIo {
+            peer_id: RelayId(0),
+            tx: presence_tx,
+            rx: presence_rx,
+        };
+        mesh::run_mesh_link(link, presence_io, rx, sessions, mesh, idle_timeout).await
+    });
     (tx, handle)
 }
 

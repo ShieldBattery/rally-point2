@@ -258,8 +258,11 @@ async fn main() -> Result<()> {
         // Share the decision-maker registry the turn path holds (in `mesh_state`)
         // so a maker created here on a coordinator descriptor is the same one the
         // slot-link and mesh-link tasks feed conditions into and stamp decisions on.
-        let mesh_control =
-            mesh_control::MeshControl::new(RelayId(our_id), mesh_state.decision_makers.clone());
+        let mesh_control = mesh_control::MeshControl::new(
+            RelayId(our_id),
+            mesh_state.decision_makers.clone(),
+            mesh_state.presence.clone(),
+        );
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it

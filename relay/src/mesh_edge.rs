@@ -70,6 +70,7 @@ use rally_point_transport::rustls::RootCertStore;
 use tokio::sync::mpsc;
 
 use crate::mesh::{self, MeshState};
+use crate::presence;
 use crate::routing::Sessions;
 
 /// How long the accepting relay waits for the dialing relay's identity hello
@@ -98,30 +99,34 @@ enum MeshHelloError {
 }
 
 /// Announces our identity to the peer that accepted our dial, so it can label
-/// the link with our id. Opens a fresh unidirectional stream, writes the fixed
-/// hello frame, and closes the stream.
+/// the link with our id. Opens a fresh unidirectional stream and writes the
+/// fixed hello frame — and returns the stream still open, because it stays in
+/// service for the link's lifetime carrying this relay's presence frames (the
+/// dialer's report channel; see [`presence`](crate::presence)).
 async fn send_mesh_hello(
     connection: &quinn::Connection,
     our_id: RelayId,
-) -> Result<(), MeshHelloError> {
+) -> Result<quinn::SendStream, MeshHelloError> {
     let mut stream = connection.open_uni().await?;
     let hello = MeshHello::new(our_id, ProtocolVersion::CURRENT);
     stream.write_all(&hello.encode()).await?;
-    // A failed finish only means the stream's clean-close frame was lost; the
-    // hello bytes are already on the wire, so it does not fail the exchange.
-    let _ = stream.finish();
-    Ok(())
+    Ok(stream)
 }
 
 /// Reads the dialing peer's identity hello on the unidirectional stream it
 /// opened right after connecting, bounded by [`MESH_HELLO_TIMEOUT`] so a peer
 /// that connects but never identifies itself cannot pin this task open.
-async fn recv_mesh_hello(connection: &quinn::Connection) -> Result<MeshHello, MeshHelloError> {
+/// Returns the stream alongside the hello: the dialer keeps writing to it —
+/// its presence frames follow the hello — so the acceptor hands it to a
+/// presence reader rather than dropping it.
+async fn recv_mesh_hello(
+    connection: &quinn::Connection,
+) -> Result<(MeshHello, quinn::RecvStream), MeshHelloError> {
     let read = async {
         let mut stream = connection.accept_uni().await?;
         let mut frame = [0u8; MESH_HELLO_LEN];
         stream.read_exact(&mut frame).await?;
-        Ok::<MeshHello, MeshHelloError>(MeshHello::decode(frame))
+        Ok::<_, MeshHelloError>((MeshHello::decode(frame), stream))
     };
     tokio::time::timeout(MESH_HELLO_TIMEOUT, read)
         .await
@@ -185,8 +190,8 @@ pub async fn run_mesh_accept(
         let mesh = mesh.clone();
         let links = links.clone();
         tokio::spawn(async move {
-            let peer_id = match recv_mesh_hello(&connection).await {
-                Ok(hello) => {
+            let (peer_id, hello_stream) = match recv_mesh_hello(&connection).await {
+                Ok((hello, stream)) => {
                     if hello.protocol != ProtocolVersion::CURRENT {
                         tracing::warn!(
                             peer_id = hello.relay_id.0,
@@ -195,7 +200,7 @@ pub async fn run_mesh_accept(
                             "mesh peer protocol version differs from ours",
                         );
                     }
-                    hello.relay_id
+                    (hello.relay_id, stream)
                 }
                 Err(error) => {
                     tracing::info!(%error, "mesh peer did not identify itself; dropping connection");
@@ -216,10 +221,27 @@ pub async fn run_mesh_accept(
             // links collector has gone away (the relay is tearing down); the
             // driver still runs on its connection until that fails, since the
             // collector dropping just means nobody is enumerating new links.
+            // Presence: the dialer's reports keep arriving on its hello
+            // stream; ours go out on a uni-stream of our own — the only one an
+            // acceptor ever opens, so the dialer can locate it unambiguously.
+            let presence_rx = presence::spawn_presence_reader(hello_stream);
+            let presence_tx = match connection.open_uni().await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::info!(%error, "mesh presence stream open failed; dropping connection");
+                    return;
+                }
+            };
+
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
             let _ = links.send((peer_id, tx)).await;
-            mesh::run_mesh_link(link, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
+            let presence_io = presence::PresenceIo {
+                peer_id,
+                tx: presence_tx,
+                rx: presence_rx,
+            };
+            mesh::run_mesh_link(link, presence_io, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
         });
     }
 }
@@ -403,11 +425,19 @@ async fn dial_and_serve(
 
     // Announce our id so the accepting peer can label its end of the link. The
     // dial tie-break already decided this side connects; the hello is purely so
-    // the higher-id acceptor learns which peer reached it.
-    if let Err(error) = send_mesh_hello(&connection, *our_id).await {
-        tracing::info!(%error, peer_id = peer_id.0, "mesh hello send failed; will retry");
-        return DialOutcome::Retry;
-    }
+    // the higher-id acceptor learns which peer reached it. The hello stream
+    // stays open — our presence frames follow the hello on it.
+    let presence_tx = match send_mesh_hello(&connection, *our_id).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::info!(%error, peer_id = peer_id.0, "mesh hello send failed; will retry");
+            return DialOutcome::Retry;
+        }
+    };
+    // The peer's presence arrives on the one uni-stream an acceptor opens;
+    // the reader accepts it lazily so an establishment that races the peer's
+    // open never stalls the dial.
+    let presence_rx = presence::spawn_presence_reader_accepting(connection.clone());
 
     let link = rally_point_transport::MeshLink::new(connection);
     let (tx, rx) = mesh::command_channel();
@@ -416,8 +446,14 @@ async fn dial_and_serve(
     // should serve onto the new link (the old, dead sender is replaced).
     let _ = links.send((*peer_id, tx)).await;
 
+    let presence_io = presence::PresenceIo {
+        peer_id: *peer_id,
+        tx: presence_tx,
+        rx: presence_rx,
+    };
     let exit = mesh::run_mesh_link(
         link,
+        presence_io,
         rx,
         Arc::clone(sessions),
         mesh.clone(),

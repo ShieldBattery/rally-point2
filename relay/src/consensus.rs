@@ -521,6 +521,17 @@ impl DecisionMaker {
     /// broadcasting -- only the authority stamps.
     pub fn sync(&mut self, bounds: BufferBounds, authority: Authority) {
         self.bounds = bounds;
+        self.set_authority(authority);
+    }
+
+    /// Applies a fresh authority verdict without touching the bounds. This is
+    /// the presence-driven half of authority tracking: between descriptor
+    /// pushes, the verdict moves as relays' players come and go, while the
+    /// bounds stay whatever the coordinator last set. A relay losing authority
+    /// drops any directive it was still broadcasting — only the authority
+    /// stamps — while `decision_seq` is kept, so a later re-promotion keeps
+    /// numbering above everything clients have seen.
+    pub fn set_authority(&mut self, authority: Authority) {
         if self.authority != authority {
             self.authority = authority;
             if authority == Authority::Peer {
@@ -805,6 +816,26 @@ pub fn sync_maker(
                 authority,
             ));
         }
+    }
+}
+
+/// Applies a fresh authority verdict to a session's decision-maker, if the
+/// relay has one, logging a change of authority. The presence-driven handoff
+/// path: called when a relay's live-player report flips some relay's liveness,
+/// between (and independent of) descriptor pushes. A no-op when no maker
+/// exists — a maker is only ever created by a descriptor, which carries the
+/// bounds a maker cannot exist without.
+pub fn set_authority(registry: &DecisionMakers, key: &SessionKey, authority: Authority) {
+    if let Some(maker) = registry.lock().get_mut(key)
+        && maker.authority != authority
+    {
+        maker.set_authority(authority);
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            authority = ?authority,
+            "presence moved the session's buffer authority",
+        );
     }
 }
 

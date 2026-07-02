@@ -295,8 +295,9 @@ pub struct SessionResponse {
 /// This is what drives `MeshCommand::Join` in production: the coordinator
 /// pushes a descriptor to each relay serving a session, and the relay joins
 /// that session on the mesh link to each listed peer. The relay's
-/// decision-maker is created with `bounds` and (for the home relay)
-/// `Authority::SelfRelay`.
+/// decision-maker is created with `bounds`, and its authority verdict follows
+/// `authority_order` plus the live presence the relays exchange among
+/// themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDescriptor {
     /// The tenant the session belongs to.
@@ -308,6 +309,20 @@ pub struct SessionDescriptor {
     pub peers: Vec<RelayPeer>,
     /// The latency-buffer bounds the relay's decision-maker clamps to.
     pub bounds: BufferBounds,
+    /// The coordinator-assigned buffer-authority priority order: every relay
+    /// serving this session (including the one this descriptor is for), most
+    /// preferred first. The first relay in the order still serving live
+    /// players is the session's decision-maker, and authority falls to the
+    /// next as relays' players leave — a presence-driven handoff the relays
+    /// run among themselves, with no coordinator round-trip. The coordinator
+    /// only *ranks* the relays (home relay first, since it was chosen for the
+    /// session's latency profile); it plays no part in the live verdict.
+    ///
+    /// Defaults empty for descriptors from a coordinator that predates the
+    /// field; a relay falls back to relay-id order over the session's relay
+    /// set — the interim rule this order replaces.
+    #[serde(default)]
+    pub authority_order: Vec<RelayId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +469,7 @@ mod tests {
                     relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
                 }],
                 bounds: BufferBounds::new(1, 6).unwrap(),
+                authority_order: vec![RelayId(1), RelayId(2)],
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -518,10 +534,25 @@ mod tests {
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
             }],
             bounds: BufferBounds::new(1, 6).unwrap(),
+            authority_order: vec![RelayId(1), RelayId(2)],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(back, desc);
+    }
+
+    #[test]
+    fn session_descriptor_without_authority_order_decodes_to_empty() {
+        // A descriptor from a coordinator that predates the authority order
+        // must still decode — the relay falls back to relay-id order — rather
+        // than tearing down the control connection over a missing field.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[{"relay_id":2,"relay_addr":"127.0.0.1:14901"}],
+            "bounds":{"min":1,"max":6}
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert!(back.authority_order.is_empty());
     }
 
     #[test]

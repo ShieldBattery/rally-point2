@@ -148,6 +148,7 @@ mod tests {
                 })
                 .collect(),
             bounds: BufferBounds::new(1, 6).unwrap(),
+            authority_order: vec![],
         }
     }
 

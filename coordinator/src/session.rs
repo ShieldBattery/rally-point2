@@ -247,6 +247,12 @@ pub fn descriptor_for(
         session,
         peers,
         bounds,
+        // The recorded membership is already the authority priority order:
+        // `create_session` lists the home relay first, then the backup. The
+        // home relay was chosen for the session's latency profile, so it
+        // decides the buffer while its players are present, and authority
+        // falls down this list as relays' players leave.
+        authority_order: relay_ids,
     })
 }
 
@@ -498,6 +504,12 @@ mod tests {
         .unwrap();
         assert_eq!(desc2.peers.len(), 1);
         assert_eq!(desc2.peers[0].relay_id, RelayId(1));
+
+        // Both descriptors carry the same buffer-authority order, home relay
+        // (relay 1) first — every relay must rank the candidates identically
+        // or the presence-driven handoff would crown different authorities.
+        assert_eq!(desc.authority_order, vec![RelayId(1), RelayId(2)]);
+        assert_eq!(desc2.authority_order, desc.authority_order);
     }
 
     #[test]

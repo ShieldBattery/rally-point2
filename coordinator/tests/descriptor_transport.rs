@@ -176,7 +176,11 @@ async fn coordinator_with_session(
 /// A relay's Join source with a link to peer 2 registered, plus the receiver
 /// standing in for that link's driver so the test can observe what it was told.
 fn relay_one_with_peer_link() -> (MeshControl, mpsc::UnboundedReceiver<MeshCommand>) {
-    let control = MeshControl::new(RelayId(1), std::sync::Arc::default());
+    let control = MeshControl::new(
+        RelayId(1),
+        std::sync::Arc::default(),
+        std::sync::Arc::default(),
+    );
     let (tx2, rx2) = mpsc::unbounded_channel::<MeshCommand>();
     control.register_link(RelayId(2), tx2);
     (control, rx2)
@@ -272,7 +276,11 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
     // Relay 5 opens its control connection; its Hello (the first frame) enrolls it
     // — no separate phone-home. It has no peers, so the empty descriptor set it
     // receives drives nothing.
-    let control = MeshControl::new(RelayId(5), std::sync::Arc::default());
+    let control = MeshControl::new(
+        RelayId(5),
+        std::sync::Arc::default(),
+        std::sync::Arc::default(),
+    );
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(5, 15000),
@@ -347,7 +355,11 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
     let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS).await;
 
     // A relay holds its control connection open; its Hello enrolls it.
-    let control = MeshControl::new(RelayId(7), std::sync::Arc::default());
+    let control = MeshControl::new(
+        RelayId(7),
+        std::sync::Arc::default(),
+        std::sync::Arc::default(),
+    );
     let handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),
@@ -413,7 +425,11 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     // exercises the relay actually sending heartbeats over a live connection.
     let (base_url, reg) =
         serve_bare_coordinator(api::HELLO_TIMEOUT, Duration::from_millis(300)).await;
-    let control = MeshControl::new(RelayId(7), std::sync::Arc::default());
+    let control = MeshControl::new(
+        RelayId(7),
+        std::sync::Arc::default(),
+        std::sync::Arc::default(),
+    );
     let _handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),

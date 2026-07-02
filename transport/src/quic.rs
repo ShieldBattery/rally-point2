@@ -85,7 +85,16 @@ pub const ALPN: &[u8] = b"rp2/4";
 /// mixed pair would connect and then stall until the acceptor's hello timeout —
 /// an asymmetric runtime failure. Bumping the version rejects the mismatch
 /// cleanly at TLS negotiation instead.
-pub const MESH_ALPN: &[u8] = b"rp2-mesh/2";
+///
+/// `3`: both sides carry per-session presence (`MeshPresence` frames — live
+/// home-client counts, driving buffer-authority handoff) on reliable
+/// uni-streams: the dialer appends frames to its hello stream and keeps it
+/// open; the acceptor opens a uni-stream of its own that carries presence
+/// alone. A `2` peer closes its hello stream after the hello and never reads
+/// the acceptor's stream, so a mixed pair would half-work — presence flowing
+/// one way or not at all, leaving a session with a frozen buffer authority —
+/// which is worse to debug than a clean connect-time refusal.
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/3";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]

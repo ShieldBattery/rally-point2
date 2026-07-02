@@ -309,7 +309,16 @@ pub async fn run_slot_link(
         seen: seen_registries,
         conditions,
         decision_makers,
+        presence,
     } = mesh;
+
+    // This client joining may change who decides the session's buffer — most
+    // notably a first client arriving on the relay that heads the authority
+    // order, which turns the descriptor-time verdict into a live one. The
+    // roster already includes this slot (registration preceded this task), so
+    // report it and re-derive. The peers learn the new count from the mesh
+    // drivers' presence reconcile, off the same roster.
+    report_own_presence(&presence, &decision_makers, &sessions, &key);
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -323,6 +332,7 @@ pub async fn run_slot_link(
         Err(error) => {
             log_link_closed(&key, slot, &LinkError::from(error));
             deregister(&sessions, &key, slot);
+            report_own_presence(&presence, &decision_makers, &sessions, &key);
             return;
         }
     };
@@ -554,6 +564,31 @@ pub async fn run_slot_link(
     // until the session ends (the coordinator drops the descriptor).
     if let Some(maker) = decision_makers.lock().get_mut(&key) {
         maker.remove_slot(slot);
+    }
+    // This client leaving may hand the session's buffer authority to the next
+    // relay in the order — the presence-driven half of the handoff. The local
+    // verdict moves here; the peers hear the emptied roster from the mesh
+    // drivers' presence reconcile.
+    report_own_presence(&presence, &decision_makers, &sessions, &key);
+}
+
+/// Reports the current roster count for `key` into the presence registry and
+/// re-derives the session's authority verdict when the report flipped this
+/// relay's liveness. A session with no presence entry (no descriptor set an
+/// order — dev/loopback harnesses that inject a verdict by hand) is left
+/// untouched.
+fn report_own_presence(
+    presence: &crate::presence::PresenceRegistry,
+    decision_makers: &crate::consensus::DecisionMakers,
+    sessions: &Sessions,
+    key: &SessionKey,
+) {
+    let live = {
+        let roster = sessions.lock();
+        roster.get(key).map_or(0, |slots| slots.len() as u32)
+    };
+    if crate::presence::record_own(presence, key, live) {
+        crate::presence::recompute(presence, decision_makers, key);
     }
 }
 

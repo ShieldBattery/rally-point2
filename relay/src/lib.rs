@@ -50,6 +50,7 @@ pub mod mesh;
 pub mod mesh_control;
 pub mod mesh_dialer;
 pub mod mesh_edge;
+pub mod presence;
 pub mod routing;
 pub mod server;
 pub mod validation;

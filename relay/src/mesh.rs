@@ -255,6 +255,12 @@ pub struct MeshState {
     /// path reach them. Bundled with the mesh registries because it has the same
     /// per-session lifecycle and is threaded through the same tasks.
     pub decision_makers: Arc<crate::consensus::DecisionMakers>,
+    /// Per-session presence (the authority order plus who still serves live
+    /// players), driving the buffer-authority verdict. The slot-link tasks
+    /// report the local roster into it, the mesh-link drivers deliver peers'
+    /// reports, and `MeshControl` sets the order from each descriptor. Same
+    /// per-session lifecycle and task-threading as the registries above.
+    pub presence: Arc<crate::presence::PresenceRegistry>,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -265,6 +271,7 @@ pub fn new_mesh_state() -> MeshState {
         seen: new_seen_registries(),
         conditions: new_conditions_registry(),
         decision_makers: Arc::new(crate::consensus::new_decision_makers()),
+        presence: Arc::new(crate::presence::new_presence_registry()),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -495,6 +502,7 @@ pub enum MeshCommand {
 /// the first. This is fail-closed, not fail-open.
 pub async fn run_mesh_link(
     mut link: rally_point_transport::MeshLink,
+    presence_io: crate::presence::PresenceIo,
     mut commands: mpsc::UnboundedReceiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
@@ -505,7 +513,25 @@ pub async fn run_mesh_link(
         seen: seen_registries,
         conditions,
         decision_makers,
+        presence,
     } = mesh;
+    let crate::presence::PresenceIo {
+        peer_id,
+        tx: mut presence_tx,
+        rx: mut presence_rx,
+    } = presence_io;
+
+    // The live-player count last pushed to the peer, per session — presence is
+    // pushed on change (reconciled against the local slot roster on every
+    // flush tick and on each Join), so a stable roster sends nothing.
+    let mut presence_sent: HashMap<rally_point_proto::ids::SessionId, u32> = HashMap::new();
+    // Whether the peer's presence reader task is still feeding reports. Once
+    // it ends (the peer's stream closed or errored), `recv()` returns `None`
+    // on every poll — an always-ready future that would spin the loop —
+    // so the branch is disabled on the first `None`, exactly like the client
+    // driver's beacon branch. A dead presence stream is not itself a link
+    // failure; that surfaces through the datagram path.
+    let mut presence_alive = true;
 
     // One merged forward channel for every session on this link: fan_out_to_mesh
     // pushes (SessionId, Payload) tagged with the session id, so a single
@@ -665,7 +691,49 @@ pub async fn run_mesh_link(
                     tracing::info!(%error, "mesh flush failed; closing link");
                     break MeshLinkExit::ConnectionFailed;
                 }
+                // Reconcile presence on the same cadence: push each joined
+                // session's live-player count when it differs from what the
+                // peer last heard. Riding the tick (rather than hooking every
+                // roster change into this task) keeps the roster paths free of
+                // mesh plumbing; the ≤150ms of staleness is nothing against
+                // the seconds-scale dwell of the buffer decisions presence
+                // feeds. This reliable push is also why a relay whose players
+                // have all left — and which therefore sends no datagrams at
+                // all — still gets its "I'm out" to the peer.
+                if reconcile_presence(&mut presence_tx, &mut presence_sent, &sessions, &joined)
+                    .await
+                    .is_err()
+                {
+                    tracing::info!("mesh presence push failed; closing link");
+                    break MeshLinkExit::ConnectionFailed;
+                }
                 continue;
+            }
+            // A presence report from the peer: how many live home clients it
+            // serves for one session. Record it and re-derive the session's
+            // buffer-authority verdict — this is the handoff path when the
+            // authority relay's players all leave. The reader task assembled
+            // the complete frame off a cancel-safe path; `recv` is cancel-safe.
+            received = presence_rx.recv(), if presence_alive => {
+                match received {
+                    Some(report) => {
+                        // Tenant-scope the bare wire session id through the
+                        // joined map, like a datagram; a report for an
+                        // unjoined session has no key to record under.
+                        let Some(state) = joined.get(&report.session) else {
+                            continue;
+                        };
+                        if crate::presence::record_peer(
+                            &presence,
+                            &state.key,
+                            peer_id,
+                            report.live_players,
+                        ) {
+                            crate::presence::recompute(&presence, &decision_makers, &state.key);
+                        }
+                    }
+                    None => presence_alive = false,
+                }
             }
             // Idle teardown: the link served at least one session, went empty,
             // and stayed empty past `idle_timeout`. An intentional wind-down —
@@ -716,6 +784,23 @@ pub async fn run_mesh_link(
                             },
                         );
                         idle_since = None;
+                        // Announce this session's presence right away rather
+                        // than waiting a flush tick: a fresh join (or a
+                        // rejoin on a redialed link, whose `presence_sent`
+                        // starts empty) is exactly when the peer knows
+                        // nothing yet.
+                        if reconcile_presence(
+                            &mut presence_tx,
+                            &mut presence_sent,
+                            &sessions,
+                            &joined,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::info!("mesh presence push failed; closing link");
+                            break MeshLinkExit::ConnectionFailed;
+                        }
                         continue;
                     }
                     Some(MeshCommand::Leave(key)) => {
@@ -732,6 +817,7 @@ pub async fn run_mesh_link(
                             // session's mesh forward channel (its RAII guard).
                             joined.remove(&session_id);
                             link.close_session(session_id);
+                            presence_sent.remove(&session_id);
                             // Arm the idle timer when the last session leaves,
                             // so the driver tears the link down after
                             // `idle_timeout` of no further Joins.
@@ -755,6 +841,40 @@ pub async fn run_mesh_link(
     // function returns — or when the driver task is cancelled — so the cleanup runs
     // on every exit path.
     exit
+}
+
+/// Pushes each joined session's live home-client count to the peer when it
+/// differs from what the peer last heard, reading the truth straight from the
+/// slot roster. Push-on-change over a reliable stream: a stable roster writes
+/// nothing, and a transition (the handoff trigger) cannot be lost the way a
+/// datagram sidecar could — which matters precisely because the relay whose
+/// players just left has no datagrams left to ride.
+///
+/// An `Err` means the stream (and so the connection) is gone; the caller exits
+/// with `ConnectionFailed` like any other send failure.
+async fn reconcile_presence(
+    presence_tx: &mut rally_point_transport::quinn::SendStream,
+    presence_sent: &mut HashMap<rally_point_proto::ids::SessionId, u32>,
+    sessions: &routing::Sessions,
+    joined: &HashMap<rally_point_proto::ids::SessionId, SessionState>,
+) -> Result<(), rally_point_transport::quinn::WriteError> {
+    for (&session_id, state) in joined {
+        let live = {
+            let roster = sessions.lock();
+            roster.get(&state.key).map_or(0, |slots| slots.len() as u32)
+        };
+        if presence_sent.get(&session_id) == Some(&live) {
+            continue;
+        }
+        let frame = rally_point_proto::mesh::MeshPresence {
+            session: session_id,
+            live_players: live,
+        }
+        .encode();
+        presence_tx.write_all(&frame).await?;
+        presence_sent.insert(session_id, live);
+    }
+    Ok(())
 }
 
 /// One session's per-link driver state: its routing key (tenant-correct), its own
