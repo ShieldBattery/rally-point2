@@ -2,12 +2,10 @@
 
 All-Rust netcode v2 platform for [ShieldBattery](https://shieldbattery.net): a
 portable client, a shared per-link transport layer, a validating relay + mesh,
-and a multi-tenant coordinator. Replaces the Node.js `rally-point`, which is
-decommissioned at the end of the v2 cutover.
+and a multi-tenant coordinator. Replaces the Node.js `rally-point` with a newer,
+more scalable protocol + server structure.
 
-The full design and the load-bearing decisions (`D1`–`D11`) live in
-`../shieldbattery/netcode-v2-build-plan.md`. Conventions for working in this
-repo are in [`CLAUDE.md`](CLAUDE.md).
+Discussion of the architecture is available [here](./docs/architecture.md)
 
 ## Workspace
 
