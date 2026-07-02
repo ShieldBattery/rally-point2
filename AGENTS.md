@@ -50,7 +50,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings   # CI enforces; keep it clean
 cargo fmt --all
 cargo run -p rally-point-relay -- --help                # relay/coordinator are runnable skeletons
+cd relay && cargo +nightly fuzz run validate_turn       # coverage-guided fuzz of the turn validator
 ```
+
+The fuzz harness (`relay/fuzz/`, its own workspace — needs nightly + cargo-fuzz)
+asserts the turn validator's invariants, not just no-panic; the same invariants
+run on stable in every `cargo test` as randomized property tests in
+`relay/src/validation.rs`.
 
 ## Conventions
 

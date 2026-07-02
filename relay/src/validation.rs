@@ -418,4 +418,115 @@ mod tests {
         let turn = validated(&[0x09, 0]);
         assert_eq!(&turn.payload.commands[..], &[0x09, 0]);
     }
+
+    /// The invariants the validator owes the rest of the relay on *any* input,
+    /// asserted for one turn. Shared by the randomized tests below; the
+    /// coverage-guided fuzz target (`relay/fuzz/fuzz_targets/validate_turn.rs`)
+    /// asserts the same set.
+    fn assert_validator_invariants(commands: &[u8]) {
+        match validate_turn(SLOT, 7, Some(41), commands) {
+            Ok(validated) => {
+                // Binding: everything but the command bytes comes from the
+                // caller, never from the attacker-controlled input.
+                assert_eq!(validated.payload.slot, u32::from(SLOT.0));
+                assert_eq!(validated.payload.seq, 7);
+                assert_eq!(validated.payload.game_frame_count, Some(41));
+                assert_eq!(validated.payload.buffer_directive, None);
+                // No amplification, and stripping is the only rewrite.
+                assert!(validated.payload.commands.len() <= commands.len());
+                if validated.stripped_control == 0 {
+                    assert_eq!(&validated.payload.commands[..], commands);
+                }
+                // Fixpoint: what the relay forwards must itself validate
+                // clean, byte-for-byte — a peer re-parsing forwarded bytes
+                // must never disagree with the ingress validator.
+                let again = validate_turn(SLOT, 7, Some(41), &validated.payload.commands)
+                    .expect("sanitized output must re-validate");
+                assert_eq!(again.stripped_control, 0, "sanitizing must be complete");
+                assert_eq!(again.payload.commands, validated.payload.commands);
+            }
+            Err(
+                ValidationError::UnknownOpcode { offset, .. }
+                | ValidationError::Truncated { offset, .. },
+            ) => {
+                // Attribution: a rejection names real bytes of the turn.
+                assert!(offset < commands.len());
+            }
+        }
+    }
+
+    /// A tiny deterministic xorshift so the randomized tests need no dev
+    /// dependency and every run covers the same inputs (a failure reproduces).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 32) as u8
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn random_bytes_never_panic_and_uphold_the_invariants() {
+        // Pure noise: almost every case rejects at the first unknown opcode,
+        // but the walk to that rejection must stay in bounds and attributed.
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let len = rng.below(64) as usize;
+            let commands: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            assert_validator_invariants(&commands);
+        }
+    }
+
+    #[test]
+    fn random_command_streams_never_panic_and_uphold_the_invariants() {
+        // Structured noise: streams assembled *from the command table* (with
+        // occasional corruption), so the deep paths — variable lengths, strip
+        // sets, multi-command walks, mid-stream truncation — are all reached
+        // rather than dying on byte one like pure noise does.
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for _ in 0..20_000 {
+            let mut commands = Vec::new();
+            for _ in 0..rng.below(6) {
+                let opcode = rng.byte();
+                match classify(CommandId(opcode)) {
+                    Some(CommandLength::Fixed(n)) => {
+                        commands.push(opcode);
+                        for _ in 1..n {
+                            commands.push(rng.byte());
+                        }
+                    }
+                    Some(CommandLength::Variable { stride }) => {
+                        let count = rng.below(5) as u8;
+                        commands.push(opcode);
+                        commands.push(count);
+                        for _ in 0..(usize::from(stride) * usize::from(count)) {
+                            commands.push(rng.byte());
+                        }
+                    }
+                    // An opcode the table can't classify: include it sometimes
+                    // (the whole turn must reject), skip it otherwise.
+                    None => {
+                        if rng.below(4) == 0 {
+                            commands.push(opcode);
+                        }
+                    }
+                }
+            }
+            // Sometimes truncate the tail, corrupting the final command's
+            // declared length mid-stream.
+            if rng.below(3) == 0 && !commands.is_empty() {
+                let cut = rng.below(commands.len() as u64) as usize;
+                commands.truncate(cut);
+            }
+            assert_validator_invariants(&commands);
+        }
+    }
 }

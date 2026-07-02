@@ -1,0 +1,32 @@
+# The relay's fuzz harness — NOT a member of the root workspace (the empty
+# [workspace] table below makes it its own), because cargo-fuzz builds it with
+# nightly + sanitizer flags the main workspace never sees. Run with:
+#
+#   cargo +nightly fuzz run validate_turn   # from relay/fuzz's parent (relay/)
+#
+# The always-on counterpart is the randomized property test in
+# `relay/src/validation.rs`, which drives the same invariants on stable in CI;
+# this harness is the coverage-guided deep end for the attacker-facing parser.
+
+[package]
+name = "rally-point-relay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rally-point-relay = { path = ".." }
+rally-point-proto = { path = "../../proto" }
+
+[[bin]]
+name = "validate_turn"
+path = "fuzz_targets/validate_turn.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
