@@ -495,6 +495,7 @@ mod tests {
                 RelayId(1),
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
                 ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
             ),
         );
         let tenants = crate::tenant::new_store();

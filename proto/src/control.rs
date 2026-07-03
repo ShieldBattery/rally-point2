@@ -70,9 +70,10 @@ impl AsRef<str> for TenantId {
 /// the coordinator's registry (wrapped in [`RelayToCoordinator::Hello`]).
 ///
 /// The relay presents its coordinator-assigned id, its advertised address (where
-/// clients and peer relays reach it), and the protocol version it implements; the
-/// coordinator records these in its registry and uses them to build session
-/// descriptors and mesh topology.
+/// clients and peer relays reach it), the protocol version it implements, and
+/// the TLS leaf certificate clients pin to connect to it; the coordinator
+/// records these in its registry and uses them to build session responses,
+/// session descriptors, and mesh topology.
 ///
 /// The control connection that carries this is authenticated by a
 /// coordinator-issued bootstrap secret (fail-closed: the coordinator refuses to
@@ -95,6 +96,12 @@ pub struct RelayHello {
     pub relay_addr: SocketAddr,
     /// Protocol version the relay implements, for negotiation checking.
     pub protocol: ProtocolVersion,
+    /// DER encoding of the TLS leaf certificate the relay serves on its client
+    /// edge. The coordinator forwards it in session responses so clients pin
+    /// exactly this cert — self-signed relay certs stay trusted without any
+    /// out-of-band cert distribution.
+    #[serde(with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
 }
 
 impl RelayHello {
@@ -103,11 +110,17 @@ impl RelayHello {
     /// Provided because `RelayHello` is `#[non_exhaustive]`: future fields
     /// (e.g. capabilities, region) can be added without breaking external
     /// callers that construct it.
-    pub fn new(relay_id: RelayId, relay_addr: SocketAddr, protocol: ProtocolVersion) -> Self {
+    pub fn new(
+        relay_id: RelayId,
+        relay_addr: SocketAddr,
+        protocol: ProtocolVersion,
+        cert_der: Vec<u8>,
+    ) -> Self {
         Self {
             relay_id,
             relay_addr,
             protocol,
+            cert_der,
         }
     }
 }
@@ -128,6 +141,10 @@ pub struct RelayEntry {
     pub relay_addr: SocketAddr,
     /// Protocol version the relay reported at phone-home.
     pub protocol: ProtocolVersion,
+    /// DER of the TLS leaf certificate the relay reported at phone-home —
+    /// what clients pin to connect to it (carried in session responses).
+    #[serde(with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
 }
 
 impl From<&RelayEntry> for RelayPeer {
@@ -135,6 +152,36 @@ impl From<&RelayEntry> for RelayPeer {
         RelayPeer {
             relay_id: e.relay_id,
             relay_addr: e.relay_addr,
+        }
+    }
+}
+
+/// A client-facing relay endpoint in a session response: where clients connect
+/// and the TLS leaf certificate they pin to do it.
+///
+/// This is the app-server's (and ultimately the game client's) view of a relay
+/// — unlike [`RelayPeer`], which rides in session *descriptors* for
+/// relay-to-relay meshing, where trust comes from mesh roots rather than a
+/// per-relay pinned cert (so it carries no cert).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayEndpoint {
+    /// The relay's coordinator-assigned id.
+    pub relay_id: RelayId,
+    /// Where clients reach the relay.
+    pub relay_addr: SocketAddr,
+    /// DER of the TLS leaf certificate the relay serves; clients pin exactly
+    /// this cert, so self-signed relay certs work without out-of-band
+    /// distribution.
+    #[serde(with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
+}
+
+impl From<&RelayEntry> for RelayEndpoint {
+    fn from(e: &RelayEntry) -> Self {
+        RelayEndpoint {
+            relay_id: e.relay_id,
+            relay_addr: e.relay_addr,
+            cert_der: e.cert_der.clone(),
         }
     }
 }
@@ -277,11 +324,11 @@ pub struct PlayerToken {
 pub struct SessionResponse {
     /// The coordinator-assigned session id (unique within the tenant).
     pub session: SessionId,
-    /// The relay clients connect to.
-    pub home_relay: RelayPeer,
+    /// The relay clients connect to, including the cert they pin.
+    pub home_relay: RelayEndpoint,
     /// The backup relay for failover (may equal `home_relay` if only one
     /// relay is available — degraded single-relay operation).
-    pub backup_relay: RelayPeer,
+    pub backup_relay: RelayEndpoint,
     /// One token per player, matching the slots in the request.
     pub tokens: Vec<PlayerToken>,
     /// The latency-buffer bounds the relay's decision-maker clamps to.
@@ -452,6 +499,7 @@ mod tests {
             relay_id: RelayId(7),
             relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
             protocol: ProtocolVersion::CURRENT,
+            cert_der: vec![0x30, 0x82, 0xAA, 0xBB],
         };
         let json = serde_json::to_string(&hello).unwrap();
         let back: RelayHello = serde_json::from_str(&json).unwrap();
@@ -496,6 +544,7 @@ mod tests {
             RelayId(3),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
             ProtocolVersion::CURRENT,
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
         ));
         let json = serde_json::to_string(&message).unwrap();
         // The Hello's fields ride alongside the tag (internally tagged).
@@ -559,13 +608,15 @@ mod tests {
     fn session_response_roundtrips_json() {
         let resp = SessionResponse {
             session: SessionId(1),
-            home_relay: RelayPeer {
+            home_relay: RelayEndpoint {
                 relay_id: RelayId(1),
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                cert_der: vec![0x30, 0x82, 0x01, 0x02],
             },
-            backup_relay: RelayPeer {
+            backup_relay: RelayEndpoint {
                 relay_id: RelayId(2),
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                cert_der: vec![0x30, 0x82, 0x03, 0x04],
             },
             tokens: vec![PlayerToken {
                 slot: SlotId(0),

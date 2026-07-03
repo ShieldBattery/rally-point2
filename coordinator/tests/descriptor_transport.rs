@@ -48,6 +48,7 @@ fn relay_hello(id: u64, port: u16) -> RelayHello {
         RelayId(id),
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         ProtocolVersion::CURRENT,
+        vec![id as u8; 4],
     )
 }
 
@@ -112,14 +113,7 @@ async fn coordinator_with_session(
 ) -> (String, SessionId, SessionSetup) {
     let reg = registry::new_registry();
     for (id, port) in [(1u64, 14900u16), (2, 14901)] {
-        registry::enroll(
-            &reg,
-            RelayHello::new(
-                RelayId(id),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                ProtocolVersion::CURRENT,
-            ),
-        );
+        registry::enroll(&reg, relay_hello(id, port));
     }
     let tenants = tenant::new_store();
     tenant::enroll(

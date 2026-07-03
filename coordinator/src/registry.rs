@@ -79,6 +79,7 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
         relay_id: hello.relay_id,
         relay_addr: hello.relay_addr,
         protocol: hello.protocol,
+        cert_der: hello.cert_der,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
     registry
@@ -103,14 +104,15 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
     registry.relays.lock().get(&id).map(|r| r.entry.clone())
 }
 
-/// All registered relays as [`RelayPeer`] entries, in an unspecified order.
-/// Used to pick home + backup relays for a session.
-pub fn all_peers(registry: &RelayRegistry) -> Vec<RelayPeer> {
+/// All registered relays' full entries, in an unspecified order. Used to pick
+/// home + backup relays for a session — the session response needs the cert
+/// alongside the address, which [`RelayPeer`] doesn't carry.
+pub fn all_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
     registry
         .relays
         .lock()
         .values()
-        .map(|r| RelayPeer::from(&r.entry))
+        .map(|r| r.entry.clone())
         .collect()
 }
 
@@ -170,8 +172,9 @@ pub enum SessionSetupError {
     /// a distinct backup and there is only one relay.
     #[error("only {available} relay(s) available; need {needed} for a distinct backup")]
     NotEnoughRelays { available: usize, needed: usize },
-    /// A player's slot index is out of range (max 7 for an 8-player game).
-    #[error("slot {0} is out of range (max 7)")]
+    /// A player's slot index is out of range (max 11: 8 players + 4
+    /// observers, BW's 12 network participants).
+    #[error("slot {0} is out of range (max 11)")]
     SlotOutOfRange(u16),
     /// The tenant is not enrolled (no signing key registered for it).
     #[error("tenant {0:?} is not enrolled")]
@@ -195,6 +198,7 @@ mod tests {
             RelayId(id),
             SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             ProtocolVersion::CURRENT,
+            vec![id as u8; 4],
         )
     }
 
@@ -273,12 +277,12 @@ mod tests {
     }
 
     #[test]
-    fn all_peers_lists_everyone() {
+    fn all_entries_lists_everyone() {
         let reg = new_registry();
         enroll(&reg, hello(1, 14900));
         enroll(&reg, hello(2, 14901));
-        let peers = all_peers(&reg);
-        assert_eq!(peers.len(), 2);
+        let entries = all_entries(&reg);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

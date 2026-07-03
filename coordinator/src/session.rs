@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    PlayerToken, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
+    PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::token::ExpiresAt;
@@ -269,27 +269,34 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     Ok(())
 }
 
-/// Picks the home and backup relays from the registry.
+/// Picks the home and backup relays from the registry, as the client-facing
+/// endpoints (address + pinned cert) the session response carries.
 ///
 /// The home relay is the lowest-id registered relay (deterministic for a
 /// given fleet state); the backup is the next one. If only one relay is
 /// available, the backup equals the home (degraded single-relay operation).
-fn assign_relays(registry: &RelayRegistry) -> Result<(RelayPeer, RelayPeer), SessionSetupError> {
-    let mut peers = registry::all_peers(registry);
-    if peers.is_empty() {
+fn assign_relays(
+    registry: &RelayRegistry,
+) -> Result<(RelayEndpoint, RelayEndpoint), SessionSetupError> {
+    let mut entries = registry::all_entries(registry);
+    if entries.is_empty() {
         return Err(SessionSetupError::NoRelaysAvailable);
     }
 
     // Sort by relay_id for deterministic assignment.
-    peers.sort_by_key(|p| p.relay_id);
+    entries.sort_by_key(|e| e.relay_id);
 
-    let home = peers[0].clone();
-    let backup = peers.get(1).cloned().unwrap_or_else(|| home.clone());
+    let home = RelayEndpoint::from(&entries[0]);
+    let backup = entries
+        .get(1)
+        .map(RelayEndpoint::from)
+        .unwrap_or_else(|| home.clone());
     Ok((home, backup))
 }
 
-/// The maximum slot id (7 for an 8-player SC:R game).
-const MAX_SLOT: u8 = 7;
+/// The maximum slot id (11: BW supports 12 network participants — 8 players
+/// plus 4 observers).
+const MAX_SLOT: u8 = 11;
 
 #[cfg(test)]
 mod tests {
@@ -304,6 +311,12 @@ mod tests {
     use rally_point_proto::version::ProtocolVersion;
     use rally_point_relay::auth::Registry;
 
+    /// A fake per-relay cert DER, derived from the id so a test can check the
+    /// response carries the right relay's cert.
+    fn fake_cert(id: u64) -> Vec<u8> {
+        vec![id as u8; 4]
+    }
+
     fn enroll_relay(reg: &RelayRegistry, id: u64, port: u16) {
         registry::enroll(
             reg,
@@ -311,6 +324,7 @@ mod tests {
                 RelayId(id),
                 SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
                 ProtocolVersion::CURRENT,
+                fake_cert(id),
             ),
         );
     }
@@ -355,9 +369,12 @@ mod tests {
 
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
 
-        // Home is the lowest-id relay; backup is the next.
+        // Home is the lowest-id relay; backup is the next. Each carries the
+        // cert that relay reported at enrollment, so clients can pin it.
         assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        assert_eq!(resp.home_relay.cert_der, fake_cert(1));
         assert_eq!(resp.backup_relay.relay_id, RelayId(2));
+        assert_eq!(resp.backup_relay.cert_der, fake_cert(2));
 
         // One token per player.
         assert_eq!(resp.tokens.len(), 2);
@@ -467,6 +484,38 @@ mod tests {
             ExpiresAt(u64::MAX),
         );
         assert_eq!(result.unwrap_err(), SessionSetupError::NoPlayers);
+    }
+
+    #[test]
+    fn slot_11_is_accepted_and_slot_12_is_rejected() {
+        // BW supports 12 network participants (8 players + 4 observers), so
+        // slots 0..=11 are valid and 12 is out of range.
+        let setup = setup_with_two_relays_and_tenant();
+        let player = |slot: u8| PlayerHandoff {
+            slot: SlotId(slot),
+            client_pubkey: ClientPublicKey([slot; 32]),
+        };
+
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: (0..=11).map(player).collect(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(resp.tokens.len(), 12);
+
+        let result = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![player(12)],
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert_eq!(result.unwrap_err(), SessionSetupError::SlotOutOfRange(12));
     }
 
     #[test]
