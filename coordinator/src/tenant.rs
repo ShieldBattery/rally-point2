@@ -74,6 +74,17 @@ pub struct TenantStore {
     tenants: Arc<Mutex<HashMap<TenantId, TenantSigningKey>>>,
 }
 
+/// A freshly generated tenant enrollment: the public (verifying) key to seed
+/// relays with, plus the PKCS#8 keypair document so the caller can persist it
+/// and re-enroll the same key later via [`enroll_from_pkcs8`] (a coordinator
+/// restart otherwise regenerates the key, orphaning the relays' copy).
+pub struct GeneratedTenantKey {
+    /// The public (verifying) key relays verify tokens against.
+    pub verifying_key: [u8; PUBLIC_KEY_LEN],
+    /// The PKCS#8 document holding the full keypair (private half included).
+    pub pkcs8: Vec<u8>,
+}
+
 /// Generates a fresh Ed25519 keypair for `tenant` with the given `kid` and
 /// `bounds`, registering it in the store. Returns the public (verifying) key
 /// so a relay can be seeded with it.
@@ -87,18 +98,25 @@ pub fn enroll(
     tenant: TenantId,
     bounds: BufferBounds,
 ) -> Result<[u8; PUBLIC_KEY_LEN], KeyError> {
-    let pair = generate_keypair()?;
-    let pubkey: [u8; PUBLIC_KEY_LEN] = pair.public_key().as_ref().try_into().unwrap();
-    store.tenants.lock().insert(
-        tenant.clone(),
-        TenantSigningKey {
-            kid,
-            tenant,
-            pair,
-            bounds,
-        },
-    );
-    Ok(pubkey)
+    Ok(enroll_generated(store, kid, tenant, bounds)?.verifying_key)
+}
+
+/// Like [`enroll`], but also returns the generated PKCS#8 keypair document so
+/// the caller can persist it (dev flow: the binary prints it so the same key
+/// can be pinned across restarts).
+pub fn enroll_generated(
+    store: &TenantStore,
+    kid: KeyId,
+    tenant: TenantId,
+    bounds: BufferBounds,
+) -> Result<GeneratedTenantKey, KeyError> {
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| KeyError::KeyGeneration)?;
+    let verifying_key = enroll_from_pkcs8(store, kid, tenant, bounds, pkcs8.as_ref())?;
+    Ok(GeneratedTenantKey {
+        verifying_key,
+        pkcs8: pkcs8.as_ref().to_vec(),
+    })
 }
 
 /// Registers a tenant from a pre-generated PKCS#8 keypair (e.g. loaded from
@@ -196,17 +214,6 @@ pub fn mint_token(
     token.signature = Signature(sig_bytes);
 
     Ok(token)
-}
-
-/// Generates a fresh Ed25519 keypair using `ring` (the same crypto provider
-/// the relay uses for verification). The private key never leaves the
-/// coordinator.
-fn generate_keypair() -> Result<Arc<Ed25519KeyPair>, KeyError> {
-    let rng = SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| KeyError::KeyGeneration)?;
-    Ok(Arc::new(
-        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| KeyError::KeyGeneration)?,
-    ))
 }
 
 /// Why a token could not be minted or a tenant enrolled.
@@ -345,6 +352,33 @@ mod tests {
         let (store, _, tenant) = store_with_tenant();
         let b = bounds(&store, &tenant).unwrap();
         assert_eq!(b, BufferBounds::new(1, 6).unwrap());
+    }
+
+    #[test]
+    fn enroll_generated_pkcs8_re_enrolls_the_same_key() {
+        // The dev restart flow: enroll fresh, persist the PKCS#8, re-enroll
+        // from it on a new (restarted) store — same verifying key.
+        let store = new_store();
+        let bounds = BufferBounds::new(1, 6).unwrap();
+        let generated = enroll_generated(
+            &store,
+            KeyId("dev-key-1".to_owned()),
+            TenantId("sb-dev".to_owned()),
+            bounds,
+        )
+        .unwrap();
+
+        let restarted = new_store();
+        let re_enrolled = enroll_from_pkcs8(
+            &restarted,
+            KeyId("dev-key-1".to_owned()),
+            TenantId("sb-dev".to_owned()),
+            bounds,
+            &generated.pkcs8,
+        )
+        .unwrap();
+
+        assert_eq!(re_enrolled, generated.verifying_key);
     }
 
     #[test]

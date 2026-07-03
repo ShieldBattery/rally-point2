@@ -1260,6 +1260,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures-util",
+ "hex",
  "parking_lot",
  "rally-point-proto",
  "rally-point-relay",

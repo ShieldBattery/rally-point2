@@ -8,9 +8,11 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use clap::Parser;
-use color_eyre::eyre::{Context, Result};
+use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::{registry, session, tenant};
+use rally_point_proto::control::{BufferBounds, TenantId};
+use rally_point_proto::token::KeyId;
 
 /// Multi-tenant netcode v2 coordinator.
 #[derive(Debug, Parser)]
@@ -37,6 +39,48 @@ struct Cli {
         default_value_t = false
     )]
     allow_insecure_control: bool,
+
+    /// Enroll a single tenant at startup so `POST /session/create` can mint
+    /// tokens without any provisioning flow. Dev/loopback only: the signing key
+    /// lives in memory, so a restart regenerates it (invalidating the public
+    /// key any relay was seeded with) unless `--tenant-key` pins one.
+    #[arg(long, env = "COORDINATOR_DEV_TENANT", default_value_t = false)]
+    dev_tenant: bool,
+
+    /// Tenant id the dev tenant enrolls under. Must match the relay's
+    /// `--tenant` and the app server's configured tenant.
+    #[arg(
+        long,
+        env = "COORDINATOR_TENANT",
+        default_value = "sb-dev",
+        requires = "dev_tenant"
+    )]
+    tenant: String,
+
+    /// Key id (`kid`) naming the dev tenant's signing key in tokens. Must
+    /// match the relay's `--kid`.
+    #[arg(
+        long,
+        env = "COORDINATOR_KID",
+        default_value = "dev-key-1",
+        requires = "dev_tenant"
+    )]
+    kid: String,
+
+    /// Hex-encoded PKCS#8 Ed25519 keypair for the dev tenant — either a file
+    /// path containing the hex or the hex itself. Pins the signing key so the
+    /// public key stays stable across coordinator restarts. If absent, a fresh
+    /// keypair is generated and both halves are logged (the public for the
+    /// relay's `--tenant-pubkey`, the private so it can be pinned next run).
+    #[arg(long, env = "COORDINATOR_TENANT_KEY", requires = "dev_tenant")]
+    tenant_key: Option<String>,
+}
+
+/// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
+/// 6-turn worst case. Production tenants will get per-tenant policy at
+/// provisioning time; this is a sane default for loopback games.
+fn dev_tenant_bounds() -> BufferBounds {
+    BufferBounds::new(1, 6).expect("1..=6 is a valid bounds range")
 }
 
 #[tokio::main]
@@ -47,7 +91,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point coordinator starting");
 
-    let setup = session::SessionSetup::new(registry::new_registry(), tenant::new_store());
+    let tenants = tenant::new_store();
+    if cli.dev_tenant {
+        enroll_dev_tenant(&tenants, &cli)?;
+    }
+    let setup = session::SessionSetup::new(registry::new_registry(), tenants);
 
     // Fail closed: a coordinator with no bootstrap secret would serve the relay
     // control endpoint to anyone, leaking mesh topology. Require an explicit
@@ -85,6 +133,55 @@ async fn main() -> Result<()> {
         .await
         .context("coordinator API server ended with an error")?;
     Ok(())
+}
+
+/// Enrolls the `--dev-tenant` tenant into `tenants`, logging the public
+/// (verifying) key so a relay can be seeded with it (`--tenant-pubkey`).
+fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
+    let kid =
+        KeyId::new(cli.kid.clone()).map_err(|e| eyre!("kid too long (max 255 bytes): {e}"))?;
+    let tenant_id = TenantId::new(cli.tenant.clone())
+        .map_err(|e| eyre!("tenant id too long (max 255 bytes): {e}"))?;
+
+    let verifying_key = match &cli.tenant_key {
+        Some(input) => {
+            let pkcs8 = read_hex_input(input, "tenant key")?;
+            tenant::enroll_from_pkcs8(tenants, kid, tenant_id, dev_tenant_bounds(), &pkcs8)
+                .context("enrolling dev tenant from --tenant-key")?
+        }
+        None => {
+            let generated = tenant::enroll_generated(tenants, kid, tenant_id, dev_tenant_bounds())
+                .context("enrolling dev tenant")?;
+            tracing::warn!(
+                pkcs8_hex = %hex::encode(&generated.pkcs8),
+                "generated a dev tenant keypair — pass --tenant-key <pkcs8_hex> to keep the \
+                 public key stable across restarts",
+            );
+            generated.verifying_key
+        }
+    };
+
+    tracing::info!(
+        tenant = %cli.tenant,
+        kid = %cli.kid,
+        public_key_hex = %hex::encode(verifying_key),
+        "dev tenant enrolled — feed public_key_hex to the relay's --tenant-pubkey",
+    );
+    Ok(())
+}
+
+/// Resolves a hex-input value to raw bytes: if the value names an existing
+/// file, the file's (whitespace-trimmed) contents are the hex; otherwise the
+/// value itself is.
+fn read_hex_input(input: &str, label: &str) -> Result<Vec<u8>> {
+    let hex_str = if std::path::Path::new(input).exists() {
+        std::fs::read_to_string(input)
+            .map(|contents| contents.trim().to_owned())
+            .map_err(|e| eyre!("reading {label} file {input}: {e}"))?
+    } else {
+        input.to_owned()
+    };
+    hex::decode(&hex_str).map_err(|e| eyre!("decoding {label} hex: {e}"))
 }
 
 fn init_tracing() {

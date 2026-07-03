@@ -50,7 +50,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 # Self-signed certs for transport loopback tests (dev-only). Uses ring, not the
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
-# Hex encode/decode for the relay binary's --tenant-key CLI flag.
+# Hex encode/decode for the relay/coordinator binaries' tenant-key CLI flags.
 hex = "0.4"
 # Ed25519 verification (token signatures + the connection-binding challenge) and
 # the secure RNG for challenge nonces on the relay. Reuses ring — already the
