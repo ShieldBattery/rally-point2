@@ -1178,20 +1178,41 @@ fn leave_base_frame(slot_last: Option<u32>, session: Option<u32>) -> Option<u32>
 /// across a turn's delivery.
 type MakerMap = HashMap<SessionKey, DecisionMaker>;
 
+/// The tenant's correlation ids for one session, as a relay knows them from the
+/// coordinator's [`SessionDescriptor`](rally_point_proto::control::SessionDescriptor).
+/// Kept relay-side (not shared with the coordinator's own `session::SessionRefs`
+/// type) so this crate has no dependency on the coordinator crate; the shapes
+/// mirror each other because both describe the same wire fields.
+#[derive(Debug, Clone, Default)]
+struct SessionExternalRefs {
+    /// The tenant's own id for the session (ShieldBattery's `gameId`).
+    external_id: Option<String>,
+    /// The tenant's own id for the player in each slot that carried one.
+    slots: HashMap<SlotId, String>,
+}
+
 /// A registry of per-session decision-makers, one per session this relay is
 /// (or may become) the authority for. Shared across the slot-link and mesh-link
 /// tasks that feed conditions in.
 ///
 /// It also owns an optional **departure notifier** — the sender half of an
 /// unbounded channel drained by the coordinator control connection. The leave
-/// sites ([`decide_leave`], [`observe_leave`]) fire a [`DepartureNotice`] onto
-/// it the moment a synced leave for a slot first enters this relay's cache, so
-/// the coordinator learns "player X left vs. was dropped". The notifier is set
-/// once at startup when a coordinator is configured and is simply absent when
-/// the relay runs standalone (no coordinator to notify), where firing is a
-/// no-op.
+/// sites ([`decide_leave`], [`observe_leave`], and the promotion re-derivation
+/// in [`set_authority`]/[`sync_maker`]) fire a [`DepartureNotice`] onto it the
+/// moment a synced leave for a slot first enters this relay's cache, so the
+/// coordinator learns "player X left vs. was dropped". The notifier is set once
+/// at startup when a coordinator is configured and is simply absent when the
+/// relay runs standalone (no coordinator to notify), where firing is a no-op.
 ///
-/// `Default` (an empty map, no notifier) is what `Arc::<DecisionMakers>::default`
+/// It also holds each session's **correlation ids** ([`SessionExternalRefs`]),
+/// populated from the coordinator's descriptor at apply time
+/// ([`set_session_refs`](Self::set_session_refs)) so a departure notice can be
+/// self-describing (carry its own `external_id`/`external_ref`) without the
+/// coordinator's in-memory session-refs store surviving to notice time — a
+/// coordinator restart wipes that store, but the descriptor a relay already
+/// applied does not.
+///
+/// `Default` (empty maps, no notifier) is what `Arc::<DecisionMakers>::default`
 /// builds where a registry is created without going through
 /// [`new_decision_makers`] — the same empty state.
 #[derive(Default)]
@@ -1202,6 +1223,12 @@ pub struct DecisionMakers {
     /// coordinator link is down never blocks the turn path — the drain end holds
     /// the channel across reconnects and flushes pending notices on redial.
     departures: OnceLock<UnboundedSender<DepartureNotice>>,
+    /// Correlation ids per session, from the coordinator's descriptor. Absent
+    /// for a session whose descriptor never carried them (a standalone relay,
+    /// or a coordinator that predates the fields) — a departure notice for such
+    /// a session simply carries no `external_id`/`external_ref`, and the
+    /// coordinator falls back to its own store.
+    refs: parking_lot::Mutex<HashMap<SessionKey, SessionExternalRefs>>,
 }
 
 impl DecisionMakers {
@@ -1229,6 +1256,33 @@ impl DecisionMakers {
             let _ = sender.send(notice);
         }
     }
+
+    /// Records `key`'s correlation ids from a coordinator descriptor, replacing
+    /// whatever was recorded before. Called on every descriptor apply (not just
+    /// the first), so a changed descriptor's refs replace rather than
+    /// accumulate alongside a stale copy.
+    pub fn set_session_refs(
+        &self,
+        key: &SessionKey,
+        external_id: Option<String>,
+        slots: HashMap<SlotId, String>,
+    ) {
+        self.refs
+            .lock()
+            .insert(key.clone(), SessionExternalRefs { external_id, slots });
+    }
+
+    /// Forgets `key`'s correlation ids (the session ended). Idempotent; mirrors
+    /// the maker's own removal so this map doesn't outlive the sessions it
+    /// describes.
+    fn forget_session_refs(&self, key: &SessionKey) {
+        self.refs.lock().remove(key);
+    }
+
+    /// `key`'s correlation ids, if a coordinator descriptor ever carried them.
+    fn session_refs(&self, key: &SessionKey) -> Option<SessionExternalRefs> {
+        self.refs.lock().get(key).cloned()
+    }
 }
 
 /// Creates an empty decision-maker registry for a relay with no sessions yet,
@@ -1238,6 +1292,7 @@ pub fn new_decision_makers() -> DecisionMakers {
     DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
         departures: OnceLock::new(),
+        refs: parking_lot::Mutex::new(HashMap::new()),
     }
 }
 
@@ -1246,11 +1301,26 @@ pub fn new_decision_makers() -> DecisionMakers {
 /// carries the raw reason and the deciding relay's `leave_seq` for the
 /// coordinator's telemetry. The slot comes straight off the directive (the
 /// relay-authoritative departing slot).
-fn departure_notice(key: &SessionKey, leave: &LeaveDirective) -> DepartureNotice {
+///
+/// Also stamps the session's correlation ids, if this relay's descriptor ever
+/// carried them ([`DecisionMakers::set_session_refs`]) — `None` for a
+/// standalone relay, a coordinator that predates the fields, or a session this
+/// relay never received a descriptor for. Stamping them here (rather than
+/// leaving the coordinator to look them up) is what makes the notice
+/// self-describing: the descriptor a relay already applied survives a
+/// coordinator restart even though the coordinator's own in-memory copy does
+/// not.
+fn departure_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    leave: &LeaveDirective,
+) -> DepartureNotice {
+    let slot = SlotId(leave.slot as u8);
+    let refs = registry.session_refs(key);
     DepartureNotice {
         tenant: key.tenant.clone(),
         session: key.session,
-        slot: SlotId(leave.slot as u8),
+        slot,
         kind: if leave.reason == LEAVE_REASON_DROPPED {
             DepartureKind::Dropped
         } else {
@@ -1258,6 +1328,8 @@ fn departure_notice(key: &SessionKey, leave: &LeaveDirective) -> DepartureNotice
         },
         reason: leave.reason,
         leave_seq: leave.leave_seq,
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
     }
 }
 
@@ -1299,7 +1371,7 @@ pub fn sync_maker(
         }
     };
     for leave in &fresh {
-        registry.notify_departure(departure_notice(key, leave));
+        registry.notify_departure(departure_notice(registry, key, leave));
     }
     leaves
 }
@@ -1341,7 +1413,7 @@ pub fn set_authority(
         "presence moved the session's buffer authority",
     );
     for leave in &fresh {
-        registry.notify_departure(departure_notice(key, leave));
+        registry.notify_departure(departure_notice(registry, key, leave));
     }
     leaves
 }
@@ -1376,7 +1448,7 @@ pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveD
         None => false,
     };
     if inserted {
-        registry.notify_departure(departure_notice(key, leave));
+        registry.notify_departure(departure_notice(registry, key, leave));
     }
 }
 
@@ -1414,8 +1486,11 @@ pub fn leave_reconcile(
 }
 
 /// Removes a session's decision-maker (the session has ended). Idempotent.
+/// Also forgets the session's correlation ids, so the refs map doesn't outlive
+/// the sessions it describes.
 pub fn deregister_maker(registry: &DecisionMakers, key: &SessionKey) {
     registry.lock().remove(key);
+    registry.forget_session_refs(key);
 }
 
 /// Records a `game_frame_count` observed on one of `slot`'s validated turns,
@@ -1493,7 +1568,7 @@ pub fn decide_leave(
     // `decide_leave` returns `Some` only on the authority's first decision for
     // the slot (it dedups internally), so this is the one departure notice the
     // authoring relay sends for it.
-    registry.notify_departure(departure_notice(key, &directive));
+    registry.notify_departure(departure_notice(registry, key, &directive));
     Some(directive)
 }
 
@@ -2330,6 +2405,149 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a verbatim re-broadcast of an already-cached leave must not re-fire",
+        );
+    }
+
+    // -- Departure notice correlation ids --
+
+    /// Once a coordinator descriptor's correlation ids are recorded
+    /// (`set_session_refs`, what `apply_descriptor` does in production), the
+    /// authoring relay's `decide_leave` stamps them into the notice.
+    #[test]
+    fn decide_leave_stamps_session_refs_into_the_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+
+        registry.set_session_refs(
+            &k,
+            Some("game-99".to_owned()),
+            HashMap::from([(SlotId(1), "sb-user-7".to_owned())]),
+        );
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+
+        let notice = rx.try_recv().expect("one notice");
+        assert_eq!(notice.external_id, Some("game-99".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-7".to_owned()));
+    }
+
+    /// `observe_leave` (the non-authority path) stamps the same way.
+    #[test]
+    fn observe_leave_stamps_session_refs_into_the_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+
+        registry.set_session_refs(
+            &k,
+            Some("game-1".to_owned()),
+            HashMap::from([(SlotId(2), "sb-user-2".to_owned())]),
+        );
+
+        let leave = LeaveDirective {
+            slot: 2,
+            reason: DROPPED,
+            apply_at_frame: 88,
+            leave_seq: 7,
+        };
+        observe_leave(&registry, &k, &leave);
+
+        let notice = rx.try_recv().expect("one notice");
+        assert_eq!(notice.external_id, Some("game-1".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-2".to_owned()));
+    }
+
+    /// Promotion re-derivation stamps refs too — the exact 2-relay case where
+    /// no relay ever cached the directive before, so this is the only notice
+    /// that will ever fire for it, and it must not be refless just because it
+    /// takes the re-derivation path rather than `decide_leave` directly.
+    #[test]
+    fn promotion_re_derivation_stamps_session_refs_into_the_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        registry.set_session_refs(
+            &k,
+            Some("game-2".to_owned()),
+            HashMap::from([(SlotId(1), "sb-user-9".to_owned())]),
+        );
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), 3);
+        assert!(rx.try_recv().is_err(), "recording alone fires nothing");
+
+        let _ = set_authority(&registry, &k, Authority::SelfRelay);
+        let notice = rx.try_recv().expect("one notice on the re-derivation");
+        assert_eq!(notice.external_id, Some("game-2".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-9".to_owned()));
+    }
+
+    /// With no refs ever recorded for the session (a standalone relay, or a
+    /// coordinator that predates the fields), a notice simply carries `None` —
+    /// not an error, and the coordinator's own fallback then applies.
+    #[test]
+    fn a_notice_carries_no_refs_when_none_were_ever_recorded() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+
+        let notice = rx.try_recv().expect("one notice");
+        assert!(notice.external_id.is_none());
+        assert!(notice.external_ref.is_none());
+    }
+
+    /// `set_session_refs` replaces rather than accumulates on a re-apply (a
+    /// changed descriptor), and `deregister_maker` forgets a session's refs so
+    /// the map doesn't outlive the session it describes.
+    #[test]
+    fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+
+        registry.set_session_refs(
+            &k,
+            Some("game-old".to_owned()),
+            HashMap::from([(SlotId(1), "sb-user-old".to_owned())]),
+        );
+        // A re-applied descriptor with fresh refs replaces the old ones.
+        registry.set_session_refs(
+            &k,
+            Some("game-new".to_owned()),
+            HashMap::from([(SlotId(1), "sb-user-new".to_owned())]),
+        );
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+        let notice = rx.try_recv().expect("one notice");
+        assert_eq!(notice.external_id, Some("game-new".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-new".to_owned()));
+
+        // Deregistering the maker also forgets the refs: a later decide_leave
+        // on a freshly re-created maker for the same key sees none.
+        deregister_maker(&registry, &k);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+        let notice2 = rx.try_recv().expect("one notice");
+        assert!(
+            notice2.external_id.is_none(),
+            "deregistering forgot the old session's refs",
         );
     }
 

@@ -108,9 +108,7 @@ tower = { version = "0.5", default-features = false }
 # the tree via axum, so no new transitive crypto stack is pulled — the workspace
 # deliberately pins ring-only TLS (no aws-lc-rs, which breaks the 32-bit /
 # NASM-free Windows MSVC build), and reqwest's rustls provider selection is
-# fragile against that pin. This client is plain-HTTP (`build_http`), which is
-# sufficient for the dev notify flow; an https notify URL would need a rustls
-# (ring) connector wired in — a prod TODO, called out at the client.
+# fragile against that pin.
 hyper = { version = "1.10", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = [
   "client-legacy",
@@ -118,6 +116,19 @@ hyper-util = { version = "0.1", default-features = false, features = [
   "tokio",
 ] }
 http-body-util = "0.1"
+# HTTPS for the webhook client: wraps the plain-HTTP connector so an
+# `https://` notify URL works too (the prod app server sits behind an HTTPS
+# reverse proxy). `ring` (not the default `aws-lc-rs`) keeps the crypto
+# provider the same one already pinned for QUIC/mesh TLS; `webpki-roots`
+# (public CA roots) is sufficient because the proxy's cert is publicly
+# trusted, not a private/internal CA.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "ring",
+  "webpki-roots",
+] }
+# Standard (padded) base64 for the webhook's `x-rp2-signature` header.
+base64 = "0.22"
 # WebSocket client for the relay's persistent control connection to the
 # coordinator. `rustls-tls-webpki-roots` enables wss:// over rustls; the crate
 # brings rustls/tokio-rustls with default-features off, so it rides this

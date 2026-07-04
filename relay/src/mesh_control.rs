@@ -209,6 +209,24 @@ impl MeshControl {
             tenant: descriptor.tenant.clone(),
             session: descriptor.session,
         };
+
+        // Stamp the tenant's correlation ids into the decision-maker registry
+        // so a departure notice for this session can carry its own
+        // `external_id`/`external_ref` without depending on the coordinator's
+        // in-memory session-refs store (which a coordinator restart wipes —
+        // this descriptor, once applied, does not). Always overwrites: a
+        // changed re-applied descriptor's refs replace rather than accumulate
+        // alongside a stale copy.
+        self.decision_makers.set_session_refs(
+            &key,
+            descriptor.external_id.clone(),
+            descriptor
+                .slot_refs
+                .iter()
+                .map(|r| (r.slot, r.external_ref.clone()))
+                .collect(),
+        );
+
         let new_peers: HashSet<RelayId> = descriptor
             .peers
             .iter()
@@ -254,7 +272,8 @@ impl MeshControl {
         // former authority from the order because it crashed — a case presence
         // alone can't catch, since a crashed relay sends no zero report) yields
         // the synced leaves it must re-broadcast so no leave is lost.
-        let leaves = consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
+        let leaves =
+            consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
 
         let mut inner = self.inner.lock();
@@ -416,8 +435,8 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
-    use rally_point_proto::control::{BufferBounds, RelayPeer, TenantId};
-    use rally_point_proto::ids::SessionId;
+    use rally_point_proto::control::{BufferBounds, RelayPeer, SlotExternalRef, TenantId};
+    use rally_point_proto::ids::{SessionId, SlotId};
 
     const TENANT: &str = "sb-test";
 
@@ -443,6 +462,8 @@ mod tests {
             peers: peers.iter().map(|&id| relay_peer(id)).collect(),
             bounds: BufferBounds::new(1, 6).unwrap(),
             authority_order: vec![],
+            external_id: None,
+            slot_refs: vec![],
         }
     }
 
@@ -730,6 +751,71 @@ mod tests {
         assert!(
             maker.is_authority(),
             "a single-relay session is its own authority",
+        );
+    }
+
+    #[test]
+    fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
+        // End to end through the production apply path: a descriptor carrying
+        // the tenant's correlation ids, applied, must leave the registry able
+        // to stamp them into a departure notice -- without depending on the
+        // coordinator's in-memory session-refs store surviving to notice time.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_departure_notifier(tx);
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+
+        let mut descriptor = descriptor(1, &[]);
+        descriptor.external_id = Some("game-42".to_owned());
+        descriptor.slot_refs = vec![SlotExternalRef {
+            slot: SlotId(0),
+            external_ref: "sb-user-3".to_owned(),
+        }];
+        control.apply_descriptor(&descriptor);
+
+        consensus::observe_frame(
+            &makers,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::ids::GameFrameCount(10),
+        );
+        assert!(
+            consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some(),
+            "single-relay session is its own authority, so decide_leave succeeds",
+        );
+
+        let notice = rx.try_recv().expect("one departure notice");
+        assert_eq!(notice.external_id, Some("game-42".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-3".to_owned()));
+    }
+
+    #[test]
+    fn apply_descriptor_replaces_correlation_ids_on_a_changed_reapply() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_departure_notifier(tx);
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+
+        let mut first = descriptor(1, &[]);
+        first.external_id = Some("game-old".to_owned());
+        control.apply_descriptor(&first);
+
+        let mut second = descriptor(1, &[]);
+        second.external_id = Some("game-new".to_owned());
+        control.apply_descriptor(&second);
+
+        consensus::observe_frame(
+            &makers,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::ids::GameFrameCount(10),
+        );
+        assert!(consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some());
+        let notice = rx.try_recv().expect("one departure notice");
+        assert_eq!(
+            notice.external_id,
+            Some("game-new".to_owned()),
+            "the re-applied descriptor's refs replace the stale ones",
         );
     }
 

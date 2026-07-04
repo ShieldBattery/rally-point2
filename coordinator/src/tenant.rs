@@ -34,16 +34,17 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use std::sync::Arc;
 
-/// Where and how the coordinator notifies a tenant of mid-game player
-/// departures: the webhook URL to POST to, and an optional bearer secret it
-/// authenticates the POST with. Absent on a tenant means departure
-/// notifications are off for it (everything else unchanged).
+/// Where the coordinator notifies a tenant of mid-game player departures: the
+/// webhook URL to POST to. Absent on a tenant means departure notifications
+/// are off for it (everything else unchanged).
+///
+/// The POST is authenticated by an Ed25519 signature from this tenant's own
+/// signing key (the same key that mints tokens) — see [`sign_webhook`] — not a
+/// shared secret, so there is nothing else to configure here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyConfig {
     /// The URL the coordinator POSTs a departure webhook to.
     pub url: String,
-    /// The bearer secret sent as `Authorization: Bearer <secret>`, if set.
-    pub secret: Option<String>,
 }
 
 /// The coordinator's view of one tenant's signing key + policy.
@@ -257,6 +258,33 @@ pub fn mint_token(
     Ok(token)
 }
 
+/// Signs `message` with `tenant`'s Ed25519 signing key — the same key that
+/// mints tokens, reused for the departure-webhook signature headers
+/// (`x-rp2-signature`) rather than a second key. Returns `None` if the tenant
+/// is not enrolled (or was removed since).
+///
+/// A narrow signing primitive, not a broader key handle: the private key
+/// (`Ed25519KeyPair`) never leaves this module, only the resulting signature
+/// bytes do — the same posture `mint_token` already has. It differs from
+/// `mint_token` in taking an arbitrary caller-supplied byte string rather than
+/// building a `SignedToken`: the webhook signs its own domain-separated
+/// message (a timestamp + the exact request body), which has nothing to do
+/// with the token wire format.
+pub fn sign_webhook(
+    store: &TenantStore,
+    tenant: &TenantId,
+    message: &[u8],
+) -> Option<[u8; rally_point_proto::token::SIGNATURE_LEN]> {
+    let guard = store.tenants.lock();
+    let key = guard.get(tenant)?;
+    let sig = key.pair.sign(message);
+    Some(
+        sig.as_ref()
+            .try_into()
+            .expect("an Ed25519 signature is always SIGNATURE_LEN bytes"),
+    )
+}
+
 /// Why a token could not be minted or a tenant enrolled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
@@ -441,5 +469,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(pub_from_store, expected_pub);
+    }
+
+    #[test]
+    fn sign_webhook_verifies_against_the_enrolled_verifying_key() {
+        let (store, _, tenant) = store_with_tenant();
+        let (_, pubkey) = verifying_key(&store, &tenant).unwrap();
+
+        let message = b"rp2-webhook-v1:1700000000000:{\"tenant\":\"sb-test\"}";
+        let sig = sign_webhook(&store, &tenant, message).unwrap();
+
+        let verifying = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, pubkey);
+        assert!(
+            verifying.verify(message, &sig).is_ok(),
+            "the webhook signature verifies against the tenant's public key",
+        );
+
+        // A mutated message (or a wrong key) must not verify.
+        assert!(verifying.verify(b"tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn sign_webhook_for_an_unenrolled_tenant_returns_none() {
+        let store = new_store();
+        assert!(sign_webhook(&store, &TenantId("nope".to_owned()), b"anything").is_none());
     }
 }

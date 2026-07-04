@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
     PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
+    SlotExternalRef,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
@@ -257,6 +258,15 @@ pub fn create_session(
 /// multi-relay session, it's every relay in the session except the one the
 /// descriptor is being built for.
 ///
+/// Every descriptor also carries the tenant's stored correlation ids
+/// ([`session_refs`]) — the session's `external_id` and each slot's
+/// `external_ref` — so every relay serving the session can stamp them into a
+/// departure notice itself, rather than the notification depending on the
+/// coordinator's in-memory session-refs store surviving to notice time (it
+/// doesn't survive a coordinator restart; the descriptor-carried copy is what
+/// does, since a relay holds what it last received independently of the
+/// coordinator's process lifetime).
+///
 /// Returns `None` if the session has no recorded relay membership (the
 /// session doesn't exist or wasn't created through `create_session`), or if
 /// the tenant's bounds are no longer enrolled (the tenant was removed).
@@ -282,6 +292,8 @@ pub fn descriptor_for(
         .filter_map(|&id| registry::peer(&setup.registry, id))
         .collect();
 
+    let refs = session_refs(setup, tenant, session).unwrap_or_default();
+
     Some(SessionDescriptor {
         tenant: tenant.clone(),
         session,
@@ -293,6 +305,12 @@ pub fn descriptor_for(
         // decides the buffer while its players are present, and authority
         // falls down this list as relays' players leave.
         authority_order: relay_ids,
+        external_id: refs.external_id,
+        slot_refs: refs
+            .slots
+            .into_iter()
+            .map(|(slot, external_ref)| SlotExternalRef { slot, external_ref })
+            .collect(),
     })
 }
 
@@ -632,6 +650,75 @@ mod tests {
         // or the presence-driven handoff would crown different authorities.
         assert_eq!(desc.authority_order, vec![RelayId(1), RelayId(2)]);
         assert_eq!(desc2.authority_order, desc.authority_order);
+    }
+
+    #[test]
+    fn descriptor_for_includes_the_stored_session_refs() {
+        // The correlation ids the app server sent at create_session must ride
+        // in every descriptor built for the session, so a relay can stamp them
+        // into a departure notice itself rather than depending on the
+        // coordinator's in-memory session-refs store surviving to notice time.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: Some("sb-user-7".to_owned()),
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                    },
+                ],
+                external_id: Some("game-99".to_owned()),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        let desc = descriptor_for(
+            &setup,
+            &TenantId("sb-test".to_owned()),
+            resp.session,
+            RelayId(1),
+        )
+        .unwrap();
+        assert_eq!(desc.external_id, Some("game-99".to_owned()));
+        assert_eq!(desc.slot_refs.len(), 1, "only the slot with a ref appears");
+        assert_eq!(desc.slot_refs[0].slot, SlotId(0));
+        assert_eq!(desc.slot_refs[0].external_ref, "sb-user-7");
+    }
+
+    #[test]
+    fn descriptor_for_without_stored_refs_has_none_and_empty() {
+        // A session created with no correlation ids at all still builds a
+        // descriptor — just with the fields empty, not an error.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        let desc = descriptor_for(
+            &setup,
+            &TenantId("sb-test".to_owned()),
+            resp.session,
+            RelayId(1),
+        )
+        .unwrap();
+        assert!(desc.external_id.is_none());
+        assert!(desc.slot_refs.is_empty());
     }
 
     #[test]

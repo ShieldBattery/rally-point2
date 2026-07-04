@@ -395,6 +395,8 @@ mod tests {
                 .collect(),
             bounds: BufferBounds::new(1, 6).unwrap(),
             authority_order: vec![],
+            external_id: None,
+            slot_refs: vec![],
         }
     }
 
@@ -559,6 +561,8 @@ mod tests {
             kind: rally_point_proto::control::DepartureKind::Dropped,
             reason: 0x4000_0006,
             leave_seq: 3,
+            external_id: None,
+            external_ref: None,
         }
     }
 

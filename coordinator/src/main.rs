@@ -77,22 +77,14 @@ struct Cli {
     tenant_key: Option<String>,
 
     /// Webhook URL the coordinator POSTs a player-departure notification to for
-    /// the dev tenant (e.g. `http://localhost:5555/webhooks/netcode-v2/departures`).
-    /// Only meaningful with `--dev-tenant`; unset = departure notifications off
-    /// (everything else unchanged). Plain `http://` for dev — an `https://` URL
-    /// needs a TLS connector the webhook client does not yet wire.
+    /// the dev tenant (e.g. `http://localhost:5555/webhooks/netcode-v2/departures`,
+    /// or `https://...` — the webhook client handles both). Only meaningful
+    /// with `--dev-tenant`; unset = departure notifications off (everything
+    /// else unchanged). Each POST is signed with the dev tenant's own Ed25519
+    /// key (`x-rp2-timestamp` + `x-rp2-signature`) — no separate secret to
+    /// configure.
     #[arg(long, env = "COORDINATOR_DEV_NOTIFY_URL", requires = "dev_tenant")]
     dev_notify_url: Option<String>,
-
-    /// Bearer secret the coordinator sends on the departure webhook
-    /// (`Authorization: Bearer <secret>`), matching the consumer's expected
-    /// secret. Only meaningful with `--dev-notify-url`; unset = no auth header.
-    #[arg(
-        long,
-        env = "COORDINATOR_DEV_NOTIFY_SECRET",
-        requires = "dev_notify_url"
-    )]
-    dev_notify_secret: Option<String>,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
@@ -185,18 +177,10 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
     // Wire the dev tenant's departure webhook, if configured. `--dev-notify-url`
     // requires `--dev-tenant` (clap), so this only runs for the enrolled tenant.
     if let Some(url) = &cli.dev_notify_url {
-        tenant::set_notify(
-            tenants,
-            &tenant_id,
-            Some(NotifyConfig {
-                url: url.clone(),
-                secret: cli.dev_notify_secret.clone(),
-            }),
-        );
+        tenant::set_notify(tenants, &tenant_id, Some(NotifyConfig { url: url.clone() }));
         tracing::info!(
             tenant = %cli.tenant,
             url = %url,
-            has_secret = cli.dev_notify_secret.is_some(),
             "dev tenant departure webhook configured",
         );
     }

@@ -410,6 +410,8 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
+        external_id: None,
+        slot_refs: vec![],
     });
     control_b.apply_descriptor(&SessionDescriptor {
         tenant: TenantId(TENANT.to_owned()),
@@ -421,6 +423,8 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
+        external_id: None,
+        slot_refs: vec![],
     });
 
     // Connect clients: slot 0 (sender) on relay A, slot 1 on relay B.
@@ -524,6 +528,8 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         peers,
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![RelayId(1), RelayId(2)],
+        external_id: None,
+        slot_refs: vec![],
     };
     control_a.apply_descriptor(&descriptor_for(vec![RelayPeer {
         relay_id: RelayId(2),

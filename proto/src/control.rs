@@ -359,6 +359,19 @@ pub struct SessionResponse {
     pub bounds: BufferBounds,
 }
 
+/// One slot's tenant-assigned correlation id, as carried in a
+/// [`SessionDescriptor`]. A `Vec` of pairs rather than a map: JSON object keys
+/// must be strings, and `SlotId` is numeric on the wire — the same reasoning
+/// that keeps [`PlayerHandoff::external_ref`] per-player rather than in a map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotExternalRef {
+    /// The slot this ref names.
+    pub slot: SlotId,
+    /// The tenant's own id for the player in this slot — mirrors
+    /// [`PlayerHandoff::external_ref`] at session-request time.
+    pub external_ref: String,
+}
+
 /// The descriptor a coordinator pushes to each relay serving a session: the
 /// session id, the tenant, the relay's mesh peers for this session, and the
 /// consensus policy bounds.
@@ -394,6 +407,22 @@ pub struct SessionDescriptor {
     /// set — the interim rule this order replaces.
     #[serde(default)]
     pub authority_order: Vec<RelayId>,
+    /// The tenant's own id for the session (ShieldBattery's `gameId`), echoed
+    /// from the [`SessionRequest`] that created it. Carried all the way down to
+    /// every relay serving the session — not just kept coordinator-side — so a
+    /// relay can stamp it into a [`DepartureNotice`] without the notification
+    /// depending on the coordinator's in-memory session-refs store, which a
+    /// coordinator restart wipes. Optional: absent when the app server's
+    /// request carried none, or the descriptor is from a coordinator that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The tenant's own id for the player in each slot, mirroring
+    /// [`PlayerHandoff::external_ref`] at session-request time. Only slots whose
+    /// handoff carried a ref appear. Defaults empty for a descriptor from a
+    /// coordinator that predates the field.
+    #[serde(default)]
+    pub slot_refs: Vec<SlotExternalRef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +548,19 @@ pub struct DepartureNotice {
     /// The deciding relay's ordering number for this leave. Not a dedup key on
     /// its own (the coordinator dedups by slot); useful telemetry.
     pub leave_seq: u32,
+    /// The tenant's own id for the session, stamped by the relay from its
+    /// stored [`SessionDescriptor`] if it has one. `None` when the relay never
+    /// received the correlation ids — a standalone relay, a descriptor from a
+    /// coordinator that predates them, or a departure decided before any
+    /// descriptor carrying them arrived. The coordinator falls back to its own
+    /// stored session refs when this is absent (which a coordinator restart may
+    /// have forgotten — the descriptor-carried copy is what survives that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The tenant's own id for the departed player's slot. Same source and
+    /// fallback as `external_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -589,6 +631,8 @@ mod tests {
                 }],
                 bounds: BufferBounds::new(1, 6).unwrap(),
                 authority_order: vec![RelayId(1), RelayId(2)],
+                external_id: None,
+                slot_refs: vec![],
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -656,6 +700,11 @@ mod tests {
             }],
             bounds: BufferBounds::new(1, 6).unwrap(),
             authority_order: vec![RelayId(1), RelayId(2)],
+            external_id: Some("game-99".to_owned()),
+            slot_refs: vec![SlotExternalRef {
+                slot: SlotId(0),
+                external_ref: "sb-user-7".to_owned(),
+            }],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
@@ -663,11 +712,32 @@ mod tests {
     }
 
     #[test]
+    fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
+        // `skip_serializing_if` keeps an unset session id off the wire (matching
+        // `SessionRequest`'s style); `slot_refs` has no such attribute (it mirrors
+        // `authority_order`'s plain `#[serde(default)]`), so an empty Vec still
+        // serializes as `[]`, not omitted.
+        let desc = SessionDescriptor {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(1),
+            peers: vec![],
+            bounds: BufferBounds::new(1, 6).unwrap(),
+            authority_order: vec![],
+            external_id: None,
+            slot_refs: vec![],
+        };
+        let json = serde_json::to_string(&desc).unwrap();
+        assert!(!json.contains("external_id"));
+        assert!(json.contains("\"slot_refs\":[]"));
+    }
+
+    #[test]
     fn session_descriptor_without_authority_order_decodes_to_empty() {
         // A descriptor from a coordinator that predates the authority order —
-        // and the peer cert — must still decode (the relay falls back to
-        // relay-id order, and to its configured mesh roots for the dial) rather
-        // than tearing down the control connection over a missing field.
+        // the peer cert, and the correlation ids — must still decode (the relay
+        // falls back to relay-id order, and to its configured mesh roots for the
+        // dial) rather than tearing down the control connection over a missing
+        // field.
         let json = r#"{
             "tenant":"sb-staging","session":42,
             "peers":[{"relay_id":2,"relay_addr":"127.0.0.1:14901"}],
@@ -678,6 +748,12 @@ mod tests {
         assert!(
             back.peers[0].cert_der.is_empty(),
             "a peer without a cert decodes to an empty pin (mesh-roots fallback)",
+        );
+        assert!(back.external_id.is_none());
+        assert!(
+            back.slot_refs.is_empty(),
+            "a descriptor from a coordinator that predates the correlation ids \
+             decodes to no external_id and no slot_refs, not a decode error",
         );
     }
 
@@ -762,6 +838,8 @@ mod tests {
             kind: DepartureKind::Dropped,
             reason: 0x4000_0006,
             leave_seq: 1,
+            external_id: Some("game-99".to_owned()),
+            external_ref: Some("sb-user-7".to_owned()),
         };
         let message = RelayToCoordinator::Departure(notice.clone());
         let json = serde_json::to_string(&message).unwrap();
@@ -771,6 +849,38 @@ mod tests {
         assert!(json.contains("\"kind\":\"dropped\""));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn departure_without_correlation_ids_decodes_to_none() {
+        // A notice from a relay that never received (or predates) the
+        // correlation ids must still decode — the fields are optional and
+        // default to `None`, so the coordinator's own session-refs fallback
+        // kicks in rather than a decode error.
+        let json = r#"{"type":"departure","tenant":"sb-staging","session":42,"slot":2,"kind":"dropped","reason":1073741830,"leave_seq":1}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::Departure(notice) = decoded else {
+            panic!("decodes to the Departure variant");
+        };
+        assert!(notice.external_id.is_none());
+        assert!(notice.external_ref.is_none());
+    }
+
+    #[test]
+    fn departure_omits_absent_correlation_ids_on_the_wire() {
+        let notice = DepartureNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(1),
+            slot: SlotId(0),
+            kind: DepartureKind::Left,
+            reason: 3,
+            leave_seq: 1,
+            external_id: None,
+            external_ref: None,
+        };
+        let json = serde_json::to_string(&notice).unwrap();
+        assert!(!json.contains("external_id"));
+        assert!(!json.contains("external_ref"));
     }
 
     #[test]
