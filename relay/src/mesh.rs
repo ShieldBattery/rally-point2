@@ -26,8 +26,11 @@ use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
+use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::messages::{
+    LeaveDirective, LinkConditions, MeshControlFrame, Payload, SlotConditions, SlotDeparted,
+    mesh_control_frame,
+};
 use tokio::sync::mpsc;
 
 use crate::routing::{self, SessionKey};
@@ -145,11 +148,16 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
 /// session — including the one it arrived from, which is why the sender marks
 /// `MeshSeen` before forwarding to locals: the echo is caught and dropped there.
 ///
+/// Each link registers a [`MeshLinkTx`] bundling two senders into the same driver:
+/// the bounded per-turn forward channel and the unbounded control-frame channel
+/// (synced-leave propagation). Bundling them means a session's registration —
+/// created on `Join`, torn down on `Leave` or driver exit — governs both together.
+///
 /// Shared across all connection + mesh-link tasks. A plain (non-async) mutex is
 /// deliberate: every critical section is a short, await-free roster edit —
 /// senders are cloned out before any send — so the lock is never held across a
 /// turn's delivery, mirroring [`routing::Sessions`].
-pub type MeshLinks = Arc<Mutex<HashMap<SessionKey, Vec<MeshForwardTx>>>>;
+pub type MeshLinks = Arc<Mutex<HashMap<SessionKey, Vec<MeshLinkTx>>>>;
 
 /// Creates an empty mesh-link registry for a relay with no peer-relay links yet.
 /// Used by the server edge and tests to obtain a `MeshLinks` without referencing
@@ -279,7 +287,32 @@ pub fn new_mesh_state() -> MeshState {
 /// session's transport state — every game on a relay-pair shares one QUIC
 /// connection, so a single driver task drains all sessions' outbound turns from
 /// one channel.
-type MeshForwardTx = mpsc::Sender<(rally_point_proto::ids::SessionId, Payload)>;
+type MeshForwardTx = mpsc::Sender<(SessionId, Payload)>;
+
+/// The channel that pushes an outbound `MeshControlFrame` to a peer-relay's
+/// mesh-link task, which writes it on the shared bidirectional control stream.
+///
+/// **Unbounded**, unlike the per-turn forward channel — for the same reason the
+/// `MeshCommand` channel is: control frames are rare (a handful per game, on a
+/// departure), and every one must arrive. A dropped `SlotDeparted` could strand a
+/// leave the authority never learns to author; a dropped `LeaveDirective` could
+/// leave a peer relay's survivor stalled forever. Backpressure is the wrong tool
+/// where every message must be delivered; the only send failure is the driver
+/// having exited (closed channel), which the fan-out tolerates because the link is
+/// gone and a redialed one re-syncs via the Join-time reconcile.
+type MeshControlTx = mpsc::UnboundedSender<MeshControlFrame>;
+
+/// The pair of senders one session registers into [`MeshLinks`] for one link: the
+/// bounded per-turn forward channel and the unbounded control-frame channel, both
+/// draining into the same link driver. Held together so a session's registration
+/// governs both. Public only because it appears in the [`MeshLinks`] alias; its
+/// fields are private, so the registry is built and read solely through this module.
+pub struct MeshLinkTx {
+    /// Bounded per-turn forward channel (turns, redundancy re-carried on drop).
+    forward: MeshForwardTx,
+    /// Unbounded control-frame channel (synced-leave propagation, never dropped).
+    control: MeshControlTx,
+}
 /// Creates the command channel for one mesh-link driver — the `Join`/`Leave`
 /// stream the test (today) or the coordinator's session-descriptor push drives.
 ///
@@ -370,7 +403,7 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
     let targets: Vec<MeshForwardTx> = {
         let roster = links.lock();
         match roster.get(key) {
-            Some(mesh_txs) => mesh_txs.clone(),
+            Some(mesh_txs) => mesh_txs.iter().map(|tx| tx.forward.clone()).collect(),
             None => Vec::new(),
         }
     };
@@ -379,6 +412,96 @@ pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
         // A full mesh forward queue is a slow peer relay — signal it later, for
         // now just drop (the per-link transport re-carries what was already sent).
         let _ = tx.try_send((key.session, payload.clone()));
+    }
+}
+
+/// Delivers `frame` to every peer-relay mesh link serving `key` over each link's
+/// reliable control stream. The control-channel twin of [`fan_out_to_mesh`], but
+/// unbounded and drop-free: a control frame propagates a synced player-leave, so —
+/// unlike a redundantly-re-carried turn — it must never be dropped. The frame's
+/// `session` is stamped to `key` so every link on the pair reads it under the
+/// right tenant-scoped session, exactly as its bare `MeshPacket` session resolves.
+///
+/// Senders are cloned under the lock and the lock dropped before delivery, as in
+/// [`fan_out_to_mesh`]. The only send failure is a closed channel (the driver
+/// exited); that is tolerated — the link is gone, and a redialed one re-syncs its
+/// state via the Join-time reconcile.
+pub(crate) fn fan_out_control(links: &MeshLinks, key: &SessionKey, mut frame: MeshControlFrame) {
+    frame.session = key.session.0;
+    let targets: Vec<MeshControlTx> = {
+        let roster = links.lock();
+        match roster.get(key) {
+            Some(mesh_txs) => mesh_txs.iter().map(|tx| tx.control.clone()).collect(),
+            None => Vec::new(),
+        }
+    };
+    for tx in targets {
+        // `MeshControlFrame` is `Copy` (all-scalar fields), so each send takes its
+        // own copy — no clone needed.
+        let _ = tx.send(frame);
+    }
+}
+
+/// Announces a departed slot to every peer relay serving `key`: the home relay
+/// tells its peers one of its clients left, so the session's authority can author
+/// the synced leave and every relay records the departure for handoff robustness.
+pub(crate) fn fan_out_slot_departed(
+    links: &MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    last_frame: Option<u32>,
+    reason: u32,
+) {
+    fan_out_control(links, key, slot_departed_frame(key.session, slot, last_frame, reason));
+}
+
+/// Propagates a synced leave the authority decided to every peer relay serving
+/// `key`, so each pushes it down its own local survivors. A relay that receives
+/// this caches and locally fans it out but does not re-broadcast it — no echo.
+pub(crate) fn fan_out_leave_directive(links: &MeshLinks, key: &SessionKey, leave: LeaveDirective) {
+    fan_out_control(links, key, leave_directive_frame(key.session, leave));
+}
+
+/// Broadcasts a batch of synced leaves — the ones a fresh authority promotion
+/// must (re)deliver — to both local survivors ([`routing::fan_out_leave`]) and
+/// every peer relay ([`fan_out_leave_directive`]). All are idempotent: clients
+/// dedup by slot, and a peer relay caches by slot. A no-op on an empty batch (the
+/// overwhelmingly common case — most authority changes carry no pending leave).
+pub(crate) fn broadcast_leaves(
+    sessions: &routing::Sessions,
+    mesh_links: &MeshLinks,
+    key: &SessionKey,
+    leaves: Vec<LeaveDirective>,
+) {
+    for leave in leaves {
+        let slot = SlotId(leave.slot as u8);
+        routing::fan_out_leave(sessions, key, slot, leave);
+        fan_out_leave_directive(mesh_links, key, leave);
+    }
+}
+
+/// Builds a `SlotDeparted` mesh control frame for `session`.
+fn slot_departed_frame(
+    session: SessionId,
+    slot: SlotId,
+    last_frame: Option<u32>,
+    reason: u32,
+) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+            slot: u32::from(slot.0),
+            last_frame,
+            reason,
+        })),
+    }
+}
+
+/// Builds a `LeaveDirective` mesh control frame for `session`.
+fn leave_directive_frame(session: SessionId, leave: LeaveDirective) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::LeaveDirective(leave)),
     }
 }
 
@@ -452,6 +575,19 @@ pub enum MeshCommand {
     /// an absent session is a no-op.
     Leave(SessionKey),
 }
+/// The mesh control stream's I/O for one established link, handed to the link
+/// driver: the send half this relay writes its outbound `MeshControlFrame`s on,
+/// and the channel the peer's frames arrive over (fed by a
+/// [`spawn_mesh_control_reader`](rally_point_transport::mesh_control_stream::spawn_mesh_control_reader)
+/// task). Bundled so the driver's signature stays within the argument count the
+/// codebase holds elsewhere, mirroring [`PresenceIo`](crate::presence::PresenceIo).
+pub struct MeshControlIo {
+    /// The send half of the bidirectional control stream — outbound frames.
+    pub tx: rally_point_transport::quinn::SendStream,
+    /// The peer's control frames, assembled off its recv half by a reader task.
+    pub rx: mpsc::Receiver<MeshControlFrame>,
+}
+
 /// Drives a shared [`MeshLink`] for every session both relays jointly serve on
 /// a relay-pair's single QUIC connection.
 ///
@@ -507,6 +643,7 @@ pub enum MeshCommand {
 pub async fn run_mesh_link(
     mut link: rally_point_transport::MeshLink,
     presence_io: crate::presence::PresenceIo,
+    mesh_control_io: MeshControlIo,
     mut commands: mpsc::UnboundedReceiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
@@ -524,6 +661,22 @@ pub async fn run_mesh_link(
         tx: mut presence_tx,
         rx: mut presence_rx,
     } = presence_io;
+    let MeshControlIo {
+        tx: mut control_send,
+        rx: mut peer_control_rx,
+    } = mesh_control_io;
+    // Mirrors `presence_alive`: a `None` from the peer's control reader task
+    // (its stream closed) disarms the branch, not spin the loop. A dead control
+    // stream is not itself a link failure; that surfaces via the datagram path.
+    let mut peer_control_alive = true;
+
+    // One merged outbound control channel for every session on this link:
+    // `fan_out_control` pushes a `MeshControlFrame` (self-describing via its
+    // session field) here, and the driver writes it on the shared control stream.
+    // One sender is cloned into the mesh-links registry per session (alongside the
+    // forward sender); the driver owns the receiver and holds the original sender
+    // for the loop's life, so `recv()` returns `None` only on a genuine shutdown.
+    let (control_forward_tx, mut control_forward_rx) = mpsc::unbounded_channel::<MeshControlFrame>();
 
     // The live-player count last pushed to the peer, per session — presence is
     // pushed on change (reconciled against the local slot roster on every
@@ -659,6 +812,44 @@ pub async fn run_mesh_link(
                     }
                 }
             }
+            // An outbound control frame (a `SlotDeparted` or `LeaveDirective` a
+            // slot-link task or a handoff fanned out to this link): write it on
+            // the shared reliable control stream. A write failure is a dead
+            // connection — like a datagram send failure, it closes the link. The
+            // frame is self-describing (its session field), so no demux is needed.
+            outbound = control_forward_rx.recv() => {
+                match outbound {
+                    Some(frame) => {
+                        if let Err(error) =
+                            rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+                                &mut control_send,
+                                &frame,
+                            )
+                            .await
+                        {
+                            tracing::info!(%error, "mesh control send failed; closing link");
+                            break MeshLinkExit::ConnectionFailed;
+                        }
+                        continue;
+                    }
+                    None => break MeshLinkExit::CommandChannelClosed,
+                }
+            }
+            // A control frame from the peer relay: a departure it observed, or a
+            // synced leave its authority authored. The reader task assembled the
+            // complete frame off a cancel-safe path; `recv` is cancel-safe.
+            received = peer_control_rx.recv(), if peer_control_alive => {
+                match received {
+                    Some(frame) => dispatch_mesh_control(
+                        frame,
+                        &joined,
+                        &sessions,
+                        &mesh_links,
+                        &decision_makers,
+                    ),
+                    None => peer_control_alive = false,
+                }
+            }
             forwarded = forward_rx.recv() => {
                 match forwarded {
                     Some((session_id, payload)) => {
@@ -669,14 +860,16 @@ pub async fn run_mesh_link(
                         let outgoing = snapshot_conditions(&conditions, &key);
                         match link.send(session_id, Some(payload), outgoing) {
                             Ok(_) => {}
-                            // A turn too large for any mesh datagram. The mesh
-                            // has no reliable divert path yet (the client edge
-                            // does — a mesh control stream is the follow-up),
-                            // so the turn is dropped for this peer's clients:
-                            // bad for that session, but killing the shared
-                            // relay-pair link would take down every session on
-                            // it. The client edge diverts its own copies, so a
-                            // single-relay session is unaffected.
+                            // A turn too large for any mesh datagram. A reliable
+                            // control stream now exists on the mesh link, but it
+                            // carries synced-leave propagation, not oversize-turn
+                            // divert — forwarding oversize turns across it is a
+                            // deliberate follow-up, out of scope here. So the turn
+                            // is dropped for this peer's clients: bad for that
+                            // session, but killing the shared relay-pair link
+                            // would take down every session on it. The client edge
+                            // diverts its own copies, so a single-relay session is
+                            // unaffected.
                             Err(rally_point_transport::MeshLinkError::PayloadTooLarge {
                                 needed,
                                 budget,
@@ -686,7 +879,7 @@ pub async fn run_mesh_link(
                                     session = key.session.0,
                                     needed,
                                     budget,
-                                    "dropping oversize turn on the mesh (no mesh control stream yet)",
+                                    "dropping oversize turn on the mesh (control-stream divert is a follow-up)",
                                 );
                             }
                             Err(error) => {
@@ -756,7 +949,16 @@ pub async fn run_mesh_link(
                             peer_id,
                             report.live_players,
                         ) {
-                            crate::presence::recompute(&presence, &decision_makers, &state.key);
+                            // A promotion here (the peer's players all left, and
+                            // this relay is next in the order) yields any synced
+                            // leave the departed authority never delivered; push
+                            // each to local survivors and across the mesh.
+                            let leaves = crate::presence::recompute(
+                                &presence,
+                                &decision_makers,
+                                &state.key,
+                            );
+                            broadcast_leaves(&sessions, &mesh_links, &state.key, leaves);
                         }
                     }
                     None => presence_alive = false,
@@ -794,11 +996,16 @@ pub async fn run_mesh_link(
                         link.open_session(session_id);
                         {
                             let mut roster = mesh_links.lock();
-                            roster
-                                .entry(key.clone())
-                                .or_default()
-                                .push(forward_tx.clone());
+                            roster.entry(key.clone()).or_default().push(MeshLinkTx {
+                                forward: forward_tx.clone(),
+                                control: control_forward_tx.clone(),
+                            });
                         }
+                        // Re-send this relay's known leave state for the session
+                        // down the fresh registration, so a link that died and
+                        // redialed (its `joined` empty again) reconverges. All of
+                        // these are idempotent (dedup by slot everywhere).
+                        reconcile_leaves_on_join(&decision_makers, &control_forward_tx, &key);
                         joined.insert(
                             session_id,
                             SessionState {
@@ -868,6 +1075,112 @@ pub async fn run_mesh_link(
     // function returns — or when the driver task is cancelled — so the cleanup runs
     // on every exit path.
     exit
+}
+
+/// Handles one control frame received from the peer relay over the mesh control
+/// stream. Resolves the frame's bare session id to a tenant-scoped key through
+/// the same per-link `joined` state the datagram path uses (the collision guard
+/// makes that mapping unambiguous), then:
+///
+/// - **`SlotDeparted`**: records the departure — max-merging the carried last
+///   frame with this relay's own observation of the slot (the fuller view wins)
+///   and retiring the slot's live state — and, if this relay is the authority,
+///   decides the one synced leave, pushing it to local survivors and
+///   broadcasting it to every peer (including the origin, harmlessly: it dedups
+///   by slot, and may have its own survivors). A non-authority relay records but
+///   decides nothing.
+/// - **`LeaveDirective`**: caches it (dedup by slot) and fans it out to local
+///   survivors. It is **not** re-broadcast across the mesh — the authority already
+///   sent it to every relay — so there is no echo.
+///
+/// Kept defensive like the datagram path: a zero session id is malformed and a
+/// session this link has not joined has no key to act under; both are logged at
+/// debug and skipped (a race with `Join`/`Leave` is possible and benign given the
+/// Join-time reconcile).
+fn dispatch_mesh_control(
+    frame: MeshControlFrame,
+    joined: &HashMap<SessionId, SessionState>,
+    sessions: &routing::Sessions,
+    mesh_links: &MeshLinks,
+    decision_makers: &crate::consensus::DecisionMakers,
+) {
+    if frame.session == 0 {
+        tracing::debug!("mesh control frame with zero session id; dropping");
+        return;
+    }
+    let session_id = SessionId(frame.session);
+    let Some(state) = joined.get(&session_id) else {
+        tracing::debug!(
+            session = session_id.0,
+            "mesh control frame for unjoined session; dropping",
+        );
+        return;
+    };
+    let key = state.key.clone();
+
+    match frame.kind {
+        Some(mesh_control_frame::Kind::SlotDeparted(departed)) => {
+            let slot = SlotId(departed.slot as u8);
+            // The departure record max-merges the carried last frame with this
+            // relay's own observation of the slot, so the fuller view drives the
+            // apply frame — and recording retires the slot's live state, letting
+            // the session frame follow the survivors.
+            crate::consensus::record_departure(
+                decision_makers,
+                &key,
+                slot,
+                departed.last_frame.map(rally_point_proto::ids::GameFrameCount),
+                departed.reason,
+            );
+            // Only the authority turns a departure into the one synced leave;
+            // `decide_leave` returns `None` on a non-authority (having recorded
+            // the departure) and on a duplicate for an already-decided slot.
+            if let Some(leave) =
+                crate::consensus::decide_leave(decision_makers, &key, slot, departed.reason)
+            {
+                routing::fan_out_leave(sessions, &key, slot, leave);
+                fan_out_leave_directive(mesh_links, &key, leave);
+            }
+        }
+        Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
+            crate::consensus::observe_leave(decision_makers, &key, &leave);
+            routing::fan_out_leave(sessions, &key, SlotId(leave.slot as u8), leave);
+        }
+        // A kind this build predates (or the empty keepalive, already dropped by
+        // the reader): nothing to do.
+        None => {
+            tracing::debug!(session = session_id.0, "unknown mesh control frame kind; skipping");
+        }
+    }
+}
+
+/// Re-sends this relay's known leave state for `key` down a freshly registered
+/// link's control channel, so a link that died and redialed converges. Every
+/// recorded departure goes out as a `SlotDeparted` and every cached directive as
+/// a `LeaveDirective`, unconditionally — a leave is pushed once at decision time
+/// and re-pushed on every link re-join (and on an authority promotion); the relay
+/// has no sound way to tell "every survivor applied it" from "every survivor is
+/// still stalled waiting for it", so it never tries. All idempotent (dedup by
+/// slot on receipt) and cheap — a session has <=12 slots and leaves are rare.
+fn reconcile_leaves_on_join(
+    decision_makers: &crate::consensus::DecisionMakers,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
+    // Unbounded send only fails on a closed channel; the driver we are
+    // registering into is alive here, so these always enqueue.
+    for (slot, last_frame, reason) in departures {
+        let _ = control_tx.send(slot_departed_frame(
+            key.session,
+            slot,
+            last_frame.map(|f| f.0),
+            reason,
+        ));
+    }
+    for leave in directives {
+        let _ = control_tx.send(leave_directive_frame(key.session, leave));
+    }
 }
 
 /// Pushes each joined session's live home-client count to the peer when it
@@ -1122,5 +1435,116 @@ mod tests {
         assert_eq!(err.session, rally_point_proto::ids::SessionId(1));
         assert_eq!(err.existing_tenant, tenant_a);
         assert_eq!(err.new_tenant, tenant_b);
+    }
+
+    fn control_key() -> SessionKey {
+        SessionKey {
+            tenant: rally_point_proto::control::TenantId("t".to_owned()),
+            session: SessionId(1),
+        }
+    }
+
+    /// Registers one link's `(forward, control)` pair into the mesh-links registry
+    /// and returns the receivers a test drains to observe what the link was told.
+    fn register_link_channels(
+        links: &MeshLinks,
+        key: &SessionKey,
+    ) -> (mpsc::Receiver<(SessionId, Payload)>, mpsc::UnboundedReceiver<MeshControlFrame>) {
+        let (forward, forward_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
+        let (control, control_rx) = mpsc::unbounded_channel();
+        links
+            .lock()
+            .entry(key.clone())
+            .or_default()
+            .push(MeshLinkTx { forward, control });
+        (forward_rx, control_rx)
+    }
+
+    /// `fan_out_control` reaches every link serving the session (with the frame's
+    /// session stamped), and a link whose driver has exited (closed channel) is
+    /// tolerated without disturbing the healthy ones.
+    #[test]
+    fn fan_out_control_reaches_every_link_and_tolerates_a_closed_channel() {
+        let links = new_mesh_links();
+        let key = control_key();
+        let (_fwd1, mut ctl1) = register_link_channels(&links, &key);
+        let (_fwd2, mut ctl2) = register_link_channels(&links, &key);
+
+        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), 3);
+        for rx in [&mut ctl1, &mut ctl2] {
+            let frame = rx.try_recv().expect("every link is told");
+            assert_eq!(frame.session, 1, "the frame is stamped with the key's session");
+            match frame.kind {
+                Some(mesh_control_frame::Kind::SlotDeparted(sd)) => {
+                    assert_eq!(sd.slot, 2);
+                    assert_eq!(sd.last_frame, Some(41));
+                    assert_eq!(sd.reason, 3);
+                }
+                other => panic!("expected SlotDeparted, got {other:?}"),
+            }
+        }
+
+        // The second link's driver exits (receiver dropped): the next fan-out
+        // tolerates the closed channel and still reaches the healthy first link.
+        drop(ctl2);
+        let leave = LeaveDirective {
+            slot: 2,
+            reason: 3,
+            apply_at_frame: 42,
+            leave_seq: 1,
+        };
+        fan_out_leave_directive(&links, &key, leave);
+        match ctl1.try_recv().expect("the live link still gets it").kind {
+            Some(mesh_control_frame::Kind::LeaveDirective(got)) => assert_eq!(got, leave),
+            other => panic!("expected LeaveDirective, got {other:?}"),
+        }
+    }
+
+    /// A `Join`-time reconcile re-sends this relay's known leave state for the
+    /// session down the freshly registered link: a `SlotDeparted` for each
+    /// recorded departure and a `LeaveDirective` for each cached leave — so a
+    /// link that died and redialed reconverges.
+    #[test]
+    fn reconcile_leaves_on_join_re_announces_known_state() {
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+        );
+        // The authority decided one slot's leave (caches a directive and records a
+        // departure), and separately recorded a bare departure for another slot.
+        crate::consensus::observe_frame(&makers, &key, SlotId(1), GameFrameCount(50));
+        let leave = crate::consensus::decide_leave(&makers, &key, SlotId(1), 3)
+            .expect("the authority decides slot 1's leave");
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(2),
+            Some(GameFrameCount(60)),
+            0x4000_0006,
+        );
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        reconcile_leaves_on_join(&makers, &control_tx, &key);
+
+        let mut departed = Vec::new();
+        let mut directives = Vec::new();
+        while let Ok(frame) = control_rx.try_recv() {
+            assert_eq!(frame.session, 1);
+            match frame.kind {
+                Some(mesh_control_frame::Kind::SlotDeparted(sd)) => departed.push(sd.slot),
+                Some(mesh_control_frame::Kind::LeaveDirective(d)) => directives.push(d),
+                other => panic!("unexpected reconcile frame {other:?}"),
+            }
+        }
+        departed.sort_unstable();
+        assert_eq!(departed, vec![1, 2], "both departures re-announced");
+        assert_eq!(directives, vec![leave], "the cached leave re-announced verbatim");
     }
 }

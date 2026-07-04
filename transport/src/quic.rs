@@ -101,7 +101,17 @@ pub const ALPN: &[u8] = b"rp2/5";
 /// the acceptor's stream, so a mixed pair would half-work — presence flowing
 /// one way or not at all, leaving a session with a frozen buffer authority —
 /// which is worse to debug than a clean connect-time refusal.
-pub const MESH_ALPN: &[u8] = b"rp2-mesh/3";
+///
+/// `4`: both sides carry a bidirectional mesh control stream — the dialer opens
+/// it right after its hello and the acceptor `accept_bi`s it — on which they
+/// propagate synced player-leaves across the mesh (`MeshControlFrame`s:
+/// `SlotDeparted` and `LeaveDirective`). A `3` peer never opens or accepts that
+/// stream, so a mixed pair would leave the acceptor's bounded `accept_bi` to time
+/// out and drop the connection — an asymmetric runtime failure. Bumping the
+/// version rejects the mismatch cleanly at TLS negotiation instead, exactly as
+/// `2` and `3` did for their new streams. (Both relays of a deployment update
+/// together, so no long-lived mixed pair is expected.)
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/4";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]

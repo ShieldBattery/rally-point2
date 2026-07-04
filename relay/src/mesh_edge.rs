@@ -233,6 +233,27 @@ pub async fn run_mesh_accept(
                 }
             };
 
+            // The bidirectional mesh control stream carries synced-leave
+            // propagation. The dialer opens it right after its hello and writes an
+            // establishing frame, so `accept_bi` completes promptly; bound it by
+            // the same deadline as the hello so a peer that connects but never
+            // opens it (e.g. one predating this ALPN version) can't pin the task —
+            // failing to establish it drops the connection, like the hello.
+            let (control_send, control_recv) =
+                match tokio::time::timeout(MESH_HELLO_TIMEOUT, connection.accept_bi()).await {
+                    Ok(Ok(halves)) => halves,
+                    Ok(Err(error)) => {
+                        tracing::info!(%error, "mesh control stream accept failed; dropping connection");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!("mesh control stream not established within the deadline; dropping connection");
+                        return;
+                    }
+                };
+            let peer_control_rx =
+                rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
+
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
             let _ = links.send((peer_id, tx)).await;
@@ -241,7 +262,12 @@ pub async fn run_mesh_accept(
                 tx: presence_tx,
                 rx: presence_rx,
             };
-            mesh::run_mesh_link(link, presence_io, rx, sessions, mesh, mesh::IDLE_TIMEOUT).await;
+            let control_io = mesh::MeshControlIo {
+                tx: control_send,
+                rx: peer_control_rx,
+            };
+            mesh::run_mesh_link(link, presence_io, control_io, rx, sessions, mesh, mesh::IDLE_TIMEOUT)
+                .await;
         });
     }
 }
@@ -439,6 +465,26 @@ async fn dial_and_serve(
     // open never stalls the dial.
     let presence_rx = presence::spawn_presence_reader_accepting(connection.clone());
 
+    // Open the bidirectional mesh control stream and write an establishing frame
+    // right away: QUIC does not surface an opened bidirectional stream to the peer
+    // until its opener writes, so this is what makes the acceptor's bounded
+    // `accept_bi` complete promptly on a link that may carry no leaves for a while.
+    let (mut control_send, control_recv) = match connection.open_bi().await {
+        Ok(halves) => halves,
+        Err(error) => {
+            tracing::info!(%error, peer_id = peer_id.0, "mesh control stream open failed; will retry");
+            return DialOutcome::Retry;
+        }
+    };
+    if let Err(error) =
+        rally_point_transport::mesh_control_stream::establish_mesh_control(&mut control_send).await
+    {
+        tracing::info!(%error, peer_id = peer_id.0, "mesh control stream establish failed; will retry");
+        return DialOutcome::Retry;
+    }
+    let peer_control_rx =
+        rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
+
     let link = rally_point_transport::MeshLink::new(connection);
     let (tx, rx) = mesh::command_channel();
     // Hand the fresh command sender to the Join source. On a redial this
@@ -451,9 +497,14 @@ async fn dial_and_serve(
         tx: presence_tx,
         rx: presence_rx,
     };
+    let control_io = mesh::MeshControlIo {
+        tx: control_send,
+        rx: peer_control_rx,
+    };
     let exit = mesh::run_mesh_link(
         link,
         presence_io,
+        control_io,
         rx,
         Arc::clone(sessions),
         mesh.clone(),

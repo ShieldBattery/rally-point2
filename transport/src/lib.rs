@@ -55,6 +55,7 @@ pub use mesh_link::{MeshLink, MeshLinkError, SessionLink, should_dial_mesh};
 /// by both the client and relay drivers.
 pub mod beacon;
 pub mod control;
+pub mod mesh_control_stream;
 
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.

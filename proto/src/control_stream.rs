@@ -1,4 +1,4 @@
-//! Sans-I/O framing for the client ↔ relay reliable control stream.
+//! Sans-I/O framing for the reliable control streams.
 //!
 //! The datagram path deliberately carries only what redundancy can recover: a
 //! turn too large to ever fit a datagram has no bundle that could re-carry it,
@@ -11,19 +11,24 @@
 //! the ack-beacon: see [`beacon`](crate::beacon).)
 //!
 //! The framing is a 4-byte little-endian length prefix followed by an encoded
-//! [`ControlFrame`]. Unlike the hello and beacon frames, a control frame is
+//! protobuf message. Unlike the hello and beacon frames, a control frame is
 //! variable-size — it carries a whole payload — so the length prefix is
 //! load-bearing and **attacker-facing**: the relay reads these off client
 //! connections, so the length is capped ([`MAX_CONTROL_FRAME_LEN`]) before any
 //! allocation, and a frame over the cap is a protocol error that closes the
 //! stream, never a `Vec::with_capacity` the peer sized.
 //!
+//! Both reliable control streams share this framing: the client ↔ relay stream
+//! carries [`ControlFrame`](crate::messages::ControlFrame)s (oversize turns and
+//! synced leaves), and the relay ↔ relay mesh control stream carries
+//! [`MeshControlFrame`](crate::messages::MeshControlFrame)s (cross-relay leave
+//! propagation). The codec is generic over the message type so the same size-cap
+//! discipline guards both.
+//!
 //! Like the sibling codecs, the stream reads and writes stay with the caller;
 //! this module only frames and unframes.
 
 use prost::Message;
-
-use crate::messages::ControlFrame;
 
 /// The largest encoded [`ControlFrame`] a reader will accept, and the largest
 /// a writer will produce. Bounds the allocation an attacker-supplied length
@@ -46,13 +51,17 @@ pub enum ControlStreamError {
     /// refused outright.
     #[error("control frame of {len} bytes exceeds the {MAX_CONTROL_FRAME_LEN}-byte cap")]
     FrameTooLarge { len: usize },
-    /// The frame bytes did not decode as a [`ControlFrame`].
+    /// The frame bytes did not decode as the expected protobuf message.
     #[error("control frame did not decode: {0}")]
     Decode(#[from] prost::DecodeError),
 }
 
 /// Encodes `frame` with its length prefix, ready to write to the stream.
-pub fn encode_frame(frame: &ControlFrame) -> Result<Vec<u8>, ControlStreamError> {
+/// Generic over the protobuf message type so both the client ↔ relay
+/// [`ControlFrame`](crate::messages::ControlFrame) and the relay ↔ relay
+/// [`MeshControlFrame`](crate::messages::MeshControlFrame) ride the same framing
+/// and share the [`MAX_CONTROL_FRAME_LEN`] cap.
+pub fn encode_frame<M: Message>(frame: &M) -> Result<Vec<u8>, ControlStreamError> {
     let len = frame.encoded_len();
     if len > MAX_CONTROL_FRAME_LEN {
         return Err(ControlStreamError::FrameTooLarge { len });
@@ -74,14 +83,19 @@ pub fn frame_len(prefix: [u8; CONTROL_LEN_PREFIX]) -> Result<usize, ControlStrea
     Ok(len)
 }
 
-/// Decodes a frame body of exactly the length [`frame_len`] returned.
-pub fn decode_frame(body: &[u8]) -> Result<ControlFrame, ControlStreamError> {
-    Ok(ControlFrame::decode(body)?)
+/// Decodes a frame body of exactly the length [`frame_len`] returned. Generic
+/// over the message type; the caller picks which control-stream message it
+/// expects (inferred from context, or annotated as `decode_frame::<M>`).
+pub fn decode_frame<M: Message + Default>(body: &[u8]) -> Result<M, ControlStreamError> {
+    Ok(M::decode(body)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::messages::{Payload, control_frame};
+    use crate::messages::{
+        ControlFrame, LeaveDirective, MeshControlFrame, Payload, SlotDeparted, control_frame,
+        mesh_control_frame,
+    };
 
     use super::*;
 
@@ -106,7 +120,8 @@ mod tests {
         prefix.copy_from_slice(&encoded[..CONTROL_LEN_PREFIX]);
         let len = frame_len(prefix).unwrap();
         assert_eq!(len, encoded.len() - CONTROL_LEN_PREFIX);
-        assert_eq!(decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap(), frame);
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
     }
 
     #[test]
@@ -135,7 +150,71 @@ mod tests {
         // decode (kind = None) so the reader can skip it, not a stream-fatal
         // decode error.
         let unknown = [0x7A, 0x03, 1, 2, 3]; // field 15, wire type 2, len 3
-        let frame = decode_frame(&unknown).unwrap();
+        let frame: ControlFrame = decode_frame(&unknown).unwrap();
         assert_eq!(frame.kind, None);
+    }
+
+    #[test]
+    fn mesh_control_frames_round_trip_through_the_shared_framing() {
+        // A SlotDeparted frame and a LeaveDirective frame both ride the same
+        // length-prefixed codec the client-edge ControlFrame uses.
+        let departed = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                slot: 2,
+                last_frame: Some(41),
+                reason: 0x4000_0006,
+            })),
+        };
+        let encoded = encode_frame(&departed).unwrap();
+        let mut prefix = [0u8; CONTROL_LEN_PREFIX];
+        prefix.copy_from_slice(&encoded[..CONTROL_LEN_PREFIX]);
+        let len = frame_len(prefix).unwrap();
+        assert_eq!(len, encoded.len() - CONTROL_LEN_PREFIX);
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, departed);
+
+        let leave = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
+                slot: 2,
+                reason: 3,
+                apply_at_frame: 42,
+                leave_seq: 1,
+            })),
+        };
+        let encoded = encode_frame(&leave).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, leave);
+    }
+
+    #[test]
+    fn a_never_framed_departure_omits_last_frame() {
+        // A lobby/pre-game departure carries no frame basis: `last_frame` is
+        // absent, distinct from a present frame 0.
+        let departed = MeshControlFrame {
+            session: 3,
+            kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                slot: 1,
+                last_frame: None,
+                reason: 3,
+            })),
+        };
+        let encoded = encode_frame(&departed).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, departed);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::SlotDeparted(sd)) => assert_eq!(sd.last_frame, None),
+            other => panic!("expected SlotDeparted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_mesh_control_kind_decodes_with_the_oneof_unset() {
+        // The empty establishment/keepalive frame (and any future kind a peer
+        // predates) decodes with kind = None so the reader skips it.
+        let empty: MeshControlFrame = decode_frame(&[]).unwrap();
+        assert_eq!(empty.session, 0);
+        assert_eq!(empty.kind, None);
     }
 }

@@ -268,7 +268,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
-    consensus::sync_maker(
+    let _ = consensus::sync_maker(
         &makers,
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
@@ -561,7 +561,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     // one on its own outside a real coordinator-driven deployment.
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    consensus::sync_maker(
+    let _ = consensus::sync_maker(
         &makers,
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
@@ -637,7 +637,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
 
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    consensus::sync_maker(
+    let _ = consensus::sync_maker(
         &makers,
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
@@ -702,7 +702,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
 
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    consensus::sync_maker(
+    let _ = consensus::sync_maker(
         &makers,
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),

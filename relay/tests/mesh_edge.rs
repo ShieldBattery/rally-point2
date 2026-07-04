@@ -239,7 +239,29 @@ fn spawn_mesh_link_timed(
             tx: presence_tx,
             rx: presence_rx,
         };
-        mesh::run_mesh_link(link, presence_io, rx, sessions, mesh, idle_timeout).await
+        // The raw link pairs skip the production dialer/acceptor hello dance, so
+        // set up the mesh control stream symmetrically: each side opens its own
+        // send stream (writing an establishing frame so the peer's accept
+        // completes) and accepts the peer's for reading — two bidirectional
+        // streams, each used one-directionally.
+        let Ok((mut control_send, _unused_recv)) = link.connection().open_bi().await else {
+            return mesh::MeshLinkExit::ConnectionFailed;
+        };
+        if rally_point_transport::mesh_control_stream::establish_mesh_control(&mut control_send)
+            .await
+            .is_err()
+        {
+            return mesh::MeshLinkExit::ConnectionFailed;
+        }
+        let control_rx =
+            rally_point_transport::mesh_control_stream::spawn_mesh_control_reader_accepting(
+                link.connection().clone(),
+            );
+        let control_io = mesh::MeshControlIo {
+            tx: control_send,
+            rx: control_rx,
+        };
+        mesh::run_mesh_link(link, presence_io, control_io, rx, sessions, mesh, idle_timeout).await
     });
     (tx, handle)
 }

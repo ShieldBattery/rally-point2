@@ -164,12 +164,21 @@ pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authorit
     Some(Authority::Peer)
 }
 
-/// Re-derives `key`'s verdict and applies it to the session's decision-maker.
+/// Re-derives `key`'s verdict and applies it to the session's decision-maker,
+/// returning the synced leaves a promotion must (re)broadcast (empty otherwise).
 /// The presence-change hooks call this so authority follows the reports; a
-/// session with no presence entry, or no decision-maker, is left untouched.
-pub fn recompute(registry: &PresenceRegistry, makers: &DecisionMakers, key: &SessionKey) {
-    if let Some(authority) = verdict(registry, key) {
-        crate::consensus::set_authority(makers, key, authority);
+/// session with no presence entry, or no decision-maker, is left untouched and
+/// yields no leaves. The caller pushes any returned leaves down local survivors
+/// and across the mesh (see [`crate::mesh::broadcast_leaves`]).
+#[must_use]
+pub fn recompute(
+    registry: &PresenceRegistry,
+    makers: &DecisionMakers,
+    key: &SessionKey,
+) -> Vec<rally_point_proto::messages::LeaveDirective> {
+    match verdict(registry, key) {
+        Some(authority) => crate::consensus::set_authority(makers, key, authority),
+        None => Vec::new(),
     }
 }
 

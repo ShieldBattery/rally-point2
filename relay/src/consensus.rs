@@ -437,18 +437,46 @@ pub struct DecisionMaker {
     /// decisions), so it never stamps -- it only forwards the authority's
     /// already-stamped turns verbatim.
     pending_directive: Option<BufferDirective>,
-    /// Player-leaves this relay (as authority) has already decided, keyed by slot.
-    /// A leave is a one-shot: when decided, the caller pushes it down each
-    /// surviving client's reliable control stream (it is NOT stamped onto turns --
-    /// a drop stops the turn stream). This map only dedups a slot so a duplicate
-    /// drop signal doesn't re-decide it, and records the directive for a possible
-    /// re-push / authority-handoff re-derivation. A non-authority relay never
-    /// decides a leave, so this stays empty on one.
+    /// The synced player-leaves this relay has authored (as authority) or
+    /// observed (a peer relay's authority pushed it across the mesh), keyed by
+    /// slot. A leave is a one-shot: it is pushed down each surviving client's
+    /// reliable control stream (never stamped onto turns -- a drop stops the turn
+    /// stream). This map dedups a slot so a duplicate signal doesn't re-decide or
+    /// re-cache it, and -- crucially -- **survives a demotion**: it is exactly the
+    /// set a later promotion re-broadcasts, so a leave the previous authority
+    /// decided is not lost when authority moves. Bounded by the slot count (<=12),
+    /// so keeping it costs nothing.
     decided_leaves: HashMap<SlotId, LeaveDirective>,
+    /// Every slot departure this relay has observed for the session -- its own
+    /// home client's link ending, or a peer relay's `SlotDeparted` frame -- kept
+    /// so a later promotion can re-derive a leave the previous authority never got
+    /// to author. Also survives a demotion.
+    ///
+    /// Recording a departure *retires* the slot from `slots` (on every relay,
+    /// not just the slot's home — see [`note_departure`](Self::note_departure)),
+    /// so this record is the sole owner of the departed slot's last frame, and
+    /// membership here doubles as the guard that keeps late in-flight traffic
+    /// from resurrecting the slot's live state.
+    departures: HashMap<SlotId, Departure>,
     /// Next `leave_seq` to assign -- its own space, distinct from `decision_seq`
     /// (buffer and leave directives never supersede one another). Clients dedup
     /// leaves by slot, so this only has to be non-colliding per distinct leave.
+    /// Kept above every observed `leave_seq` so a promoted relay's own numbering
+    /// never collides with what clients already hold.
     next_leave_seq: u32,
+}
+
+/// One observed slot departure, kept for authority-handoff re-derivation. Holds
+/// exactly what deriving the leave's apply frame needs: the departing slot's
+/// last observed frame (`None` if it never produced a framed turn -- a lobby
+/// departure with no frame basis) and the native leave reason to author. The
+/// frame is the max-merge of every observation of this departure (the home
+/// relay's carried value, this relay's own view, any re-announce), so the
+/// fullest view wins; the reason keeps the first observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Departure {
+    last_frame: Option<GameFrameCount>,
+    reason: u32,
 }
 
 impl DecisionMaker {
@@ -472,6 +500,7 @@ impl DecisionMaker {
             decision_seq: 0,
             pending_directive: None,
             decided_leaves: HashMap::new(),
+            departures: HashMap::new(),
             next_leave_seq: 0,
         }
     }
@@ -492,6 +521,12 @@ impl DecisionMaker {
     /// slot has produced a framed turn (lobby). Taking the minimum is the
     /// poisoning defense: `game_frame_count` is client-asserted, so one slot's
     /// inflated claim moves only its own observation, never the coordinate.
+    ///
+    /// A departed slot is excluded: its departure retires it from `slots`, so
+    /// the coordinate follows the *survivors* rather than staying pinned at the
+    /// departed slot's frozen last frame for the rest of the game -- which would
+    /// freeze the dwell clock and keep a pending buffer directive from ever
+    /// retiring.
     pub fn session_frame(&self) -> Option<GameFrameCount> {
         self.slots.values().filter_map(|s| s.frame).min()
     }
@@ -499,7 +534,17 @@ impl DecisionMaker {
     /// Records a `game_frame_count` observed on one of `slot`'s validated
     /// turns. Monotonic per slot -- an older frame arriving out of order
     /// doesn't move the observation backward.
+    ///
+    /// A departed slot is ignored: its final turns can still be in flight across
+    /// the mesh when the departure lands, and re-creating its entry here would
+    /// resurrect the frozen frame that pins the session coordinate. The
+    /// departure record already captured the home relay's complete view of the
+    /// slot's last frame (every turn was observed at its home before the link
+    /// ended), so a late copy carries nothing new.
     pub fn observe_frame(&mut self, slot: SlotId, frame: GameFrameCount) {
+        if self.departures.contains_key(&slot) {
+            return;
+        }
         let state = self.slots.entry(slot).or_default();
         if state.frame.is_none_or(|current| frame > current) {
             state.frame = Some(frame);
@@ -533,30 +578,104 @@ impl DecisionMaker {
     /// it reflects what was last broadcast, and future decisions clamp to the
     /// new bounds. A relay losing authority drops any directive it was still
     /// broadcasting -- only the authority stamps.
-    pub fn sync(&mut self, bounds: BufferBounds, authority: Authority) {
+    ///
+    /// Returns the synced leaves a promotion (Peer -> SelfRelay) must (re)broadcast
+    /// -- see [`set_authority`](Self::set_authority); empty otherwise.
+    #[must_use]
+    pub fn sync(&mut self, bounds: BufferBounds, authority: Authority) -> Vec<LeaveDirective> {
         self.bounds = bounds;
-        self.set_authority(authority);
+        self.set_authority(authority)
     }
 
-    /// Applies a fresh authority verdict without touching the bounds. This is
-    /// the presence-driven half of authority tracking: between descriptor
-    /// pushes, the verdict moves as relays' players come and go, while the
-    /// bounds stay whatever the coordinator last set. A relay losing authority
-    /// drops any directive it was still broadcasting — only the authority
-    /// stamps — while `decision_seq` is kept, so a later re-promotion keeps
-    /// numbering above everything clients have seen.
-    pub fn set_authority(&mut self, authority: Authority) {
-        if self.authority != authority {
-            self.authority = authority;
-            if authority == Authority::Peer {
-                self.pending_directive = None;
-                // Forget decided leaves too — only the authority decides and
-                // pushes them. A promoted relay re-derives any still-unapplied
-                // leave from the roster-vs-live diff (clients dedup by slot, so a
-                // re-push is safe regardless of `leave_seq`).
-                self.decided_leaves.clear();
-            }
+    /// Applies a fresh authority verdict without touching the bounds, returning
+    /// the synced leaves a *promotion* must (re)broadcast (empty on any other
+    /// transition). This is the presence-driven half of authority tracking:
+    /// between descriptor pushes, the verdict moves as relays' players come and
+    /// go, while the bounds stay whatever the coordinator last set.
+    ///
+    /// A relay **losing** authority drops any buffer directive it was still
+    /// broadcasting (only the authority stamps), but keeps `decision_seq`, its
+    /// cached leaves, and its recorded departures -- those are exactly what a
+    /// later re-promotion needs.
+    ///
+    /// A relay **gaining** authority (Peer -> SelfRelay) yields the leaves to
+    /// re-broadcast: every cached directive is re-emitted *verbatim* (its apply
+    /// frame must not be recomputed -- survivors that already applied it did so
+    /// at that exact frame), and a departure with no cached directive is decided
+    /// fresh (safe: a directive that never escaped the dead authority was never
+    /// applied by anyone). The caller pushes each down local survivors and across
+    /// the mesh; all are idempotent (clients and peer relays dedup by slot), so
+    /// re-delivering a leave every survivor already applied costs a few redundant
+    /// frames, bounded by the slot count -- while skipping one a stalled survivor
+    /// never received would strand it forever.
+    #[must_use]
+    pub fn set_authority(&mut self, authority: Authority) -> Vec<LeaveDirective> {
+        if self.authority == authority {
+            return Vec::new();
         }
+        let promoting = self.authority == Authority::Peer && authority == Authority::SelfRelay;
+        self.authority = authority;
+        if authority == Authority::Peer {
+            // Only the authority stamps buffer changes; a demoted relay stops.
+            // Its cached leaves and recorded departures are deliberately kept --
+            // they are what a later promotion re-broadcasts.
+            self.pending_directive = None;
+        }
+        if promoting {
+            self.drain_handoff_leaves()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The synced leaves a freshly promoted authority must (re)broadcast so no
+    /// leave is lost when authority moves off a relay that had decided (or should
+    /// have decided) one. Every cached directive is re-emitted verbatim, and
+    /// every recorded departure without a cached directive is decided fresh and
+    /// cached. See [`set_authority`](Self::set_authority).
+    ///
+    /// Deliberately **unconditional** -- there is no "already applied everywhere,
+    /// skip it" test, because the relay cannot make one. The frames it observes
+    /// are survivors' *send stamps*, which lead their execution by the latency
+    /// buffer's depth: the survivors-only session frame reaches the apply frame
+    /// (`last_frame + 1`) essentially the moment the leave is decided, whether
+    /// every survivor applied it or every survivor is still stalled waiting for
+    /// it. A predicate that is true in both states cannot gate the one
+    /// re-delivery that would unstall a survivor the original push missed, so
+    /// the leave is always re-sent and every consumer dedups by slot instead.
+    fn drain_handoff_leaves(&mut self) -> Vec<LeaveDirective> {
+        let session = self.session_frame().map(|f| f.0);
+        let mut leaves = Vec::new();
+
+        // Cached directives (authored or observed): re-broadcast verbatim.
+        leaves.extend(self.decided_leaves.values().copied());
+
+        // Departures with no cached directive: the previous authority never got
+        // to author one (or died before it escaped), so decide fresh. Collect
+        // first to avoid holding an immutable borrow across the mutations below.
+        let to_derive: Vec<(SlotId, Departure)> = self
+            .departures
+            .iter()
+            .filter(|(slot, _)| !self.decided_leaves.contains_key(slot))
+            .map(|(slot, departure)| (*slot, *departure))
+            .collect();
+        for (slot, departure) in to_derive {
+            let last = departure.last_frame.map(|f| f.0);
+            let Some(base) = leave_base_frame(last, session) else {
+                continue; // no frame basis yet -- hold, exactly as decide_leave does
+            };
+            self.next_leave_seq += 1;
+            let directive = LeaveDirective {
+                slot: u32::from(slot.0),
+                reason: departure.reason,
+                apply_at_frame: base.saturating_add(1),
+                leave_seq: self.next_leave_seq,
+            };
+            self.decided_leaves.insert(slot, directive);
+            leaves.push(directive);
+        }
+
+        leaves
     }
 
     /// Ingests this relay's own home-client `LinkConditions` (conditions the
@@ -599,6 +718,13 @@ impl DecisionMaker {
     fn ingest(&mut self, conditions: &LinkConditions, mesh_rtt_us: u32) -> Option<Decision> {
         for slot in &conditions.slots {
             let id = SlotId(slot.slot as u8);
+            // A departed slot's stale sample can still be in flight (a mesh
+            // datagram raced the departure); re-creating its entry would
+            // resurrect state its departure deliberately retired — the same
+            // guard `observe_frame` applies.
+            if self.departures.contains_key(&id) {
+                continue;
+            }
             let state = self.slots.entry(id).or_default();
             // RTT goes into the ring buffer for jitter-aware sizing. A `0`
             // (no measurement) is skipped by `push`.
@@ -800,29 +926,40 @@ impl DecisionMaker {
     /// directly when a home client's link ends, or on a peer relay's
     /// `SlotDeparted` signal for a client the peer served.
     ///
-    /// The apply frame is `max(slot's last observed frame, session frame) + 1`:
-    /// one past the point the departing slot owes a turn it will never send, so
-    /// remaining clients apply it exactly at the step they would otherwise stall.
-    /// Both inputs are observed off validated turns, so every relay converges on
-    /// the same value -- which is what lets an authority-handoff re-derivation
-    /// reproduce the identical apply frame (clients dedup by slot and require
-    /// that agreement). Read the slot's frame *before* [`remove_slot`] clears it.
+    /// The apply frame is one past the departing slot's last observed frame --
+    /// the exact step remaining clients stall at waiting for a turn that will
+    /// never come, so the leave unstalls them right there. The session frame is
+    /// the basis only when the slot never produced a framed turn; it is never
+    /// folded in as a max (see [`leave_base_frame`] for why that would strand
+    /// stalled survivors). The last frame comes from the slot's departure record
+    /// -- captured and merged by [`note_departure`], surviving `remove_slot` --
+    /// so every relay derives the identical apply frame from the same record
+    /// (clients dedup by slot and require that agreement).
     pub fn decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
+        // Record the departure regardless of the outcome below (even a hold), so
+        // a later promotion can re-derive this slot's leave. This merges the
+        // slot's own live frame into the record and retires the slot from
+        // `slots`; the record is the single frame source from here on.
+        self.note_departure(slot, None, reason);
+
         if self.authority != Authority::SelfRelay {
             return None;
         }
         if self.decided_leaves.contains_key(&slot) {
-            return None; // already decided this slot's leave
+            return None; // already decided or cached this slot's leave
         }
-        let slot_field = u32::from(slot.0);
-        let slot_last = self.slots.get(&slot).and_then(|s| s.frame).map(|f| f.0);
+        let slot_last = self
+            .departures
+            .get(&slot)
+            .and_then(|d| d.last_frame)
+            .map(|f| f.0);
         let session = self.session_frame().map(|f| f.0);
         // No framed turn observed anywhere yet (pre-game / lobby): nothing to
         // schedule against, so hold — a `None` short-circuits decide_leave.
-        let base = slot_last.into_iter().chain(session).max()?;
+        let base = leave_base_frame(slot_last, session)?;
         self.next_leave_seq += 1;
         let directive = LeaveDirective {
-            slot: slot_field,
+            slot: u32::from(slot.0),
             reason,
             apply_at_frame: base.saturating_add(1),
             leave_seq: self.next_leave_seq,
@@ -831,12 +968,160 @@ impl DecisionMaker {
         Some(directive)
     }
 
+    /// Records a slot departure without deciding a leave for it, and retires the
+    /// slot's live state (see [`note_departure`]). Every relay calls this when it
+    /// learns a slot left (its own home client, or a peer's `SlotDeparted`), so a
+    /// later authority promotion can re-derive the leave even on a relay that was
+    /// never the authority. `last_frame` is the departing slot's last observed
+    /// frame at its home relay (`None` if it never produced a framed turn); it is
+    /// max-merged with this relay's own observation of the slot, so whichever
+    /// view is fuller wins. The reason keeps the first observation.
+    pub fn record_departure(
+        &mut self,
+        slot: SlotId,
+        last_frame: Option<GameFrameCount>,
+        reason: u32,
+    ) {
+        self.note_departure(slot, last_frame, reason);
+    }
+
+    /// Caches a synced leave this relay observed authored by the session's
+    /// authority (a peer relay's `LeaveDirective` off the mesh), so a later
+    /// promotion re-broadcasts it verbatim. First writer wins; a conflicting
+    /// duplicate for the same slot (a different apply frame or reason) is logged
+    /// -- that would mean two relays decided the same slot's leave differently, an
+    /// authority bug. Keeps `next_leave_seq` at least the observed seq so a
+    /// promoted relay's own numbering never collides with what clients hold.
+    pub fn observe_leave(&mut self, leave: &LeaveDirective) {
+        use std::collections::hash_map::Entry;
+        let slot = SlotId(leave.slot as u8);
+        match self.decided_leaves.entry(slot) {
+            Entry::Occupied(existing) => {
+                if existing.get() != leave {
+                    tracing::warn!(
+                        tenant = self.key.tenant.as_ref(),
+                        session = self.key.session.0,
+                        slot = leave.slot,
+                        cached_apply = existing.get().apply_at_frame,
+                        observed_apply = leave.apply_at_frame,
+                        "conflicting synced leave for a slot already cached; keeping the first",
+                    );
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(*leave);
+            }
+        }
+        if leave.leave_seq > self.next_leave_seq {
+            self.next_leave_seq = leave.leave_seq;
+        }
+    }
+
+    /// This slot's last observed game frame, or `None` before its first framed
+    /// turn — or after its departure was recorded, which retires the slot's live
+    /// state (the frame lives on in the departure record). Read at a departure
+    /// trigger, before recording, to fill a `SlotDeparted`'s `last_frame`.
+    pub fn slot_frame(&self, slot: SlotId) -> Option<GameFrameCount> {
+        self.slots.get(&slot).and_then(|s| s.frame)
+    }
+
+    /// This relay's known leave state for re-announcing to a freshly (re)joined
+    /// mesh link: every recorded departure (slot, last frame, reason) and every
+    /// cached leave, unconditionally. A redialed link starts knowing nothing, so
+    /// resending these lets it reconverge — all idempotent (dedup by slot on
+    /// receipt). Nothing is filtered as "already applied everywhere": the relay
+    /// cannot tell that state apart from "everyone still stalled waiting" (see
+    /// [`drain_handoff_leaves`](Self::drain_handoff_leaves)), and the cost of a
+    /// redundant re-announce is a few deduped frames, bounded by the slot count.
+    #[allow(clippy::type_complexity)]
+    fn leave_reconcile(
+        &self,
+    ) -> (
+        Vec<(SlotId, Option<GameFrameCount>, u32)>,
+        Vec<LeaveDirective>,
+    ) {
+        let departures = self
+            .departures
+            .iter()
+            .map(|(slot, departure)| (*slot, departure.last_frame, departure.reason))
+            .collect();
+        let directives = self.decided_leaves.values().copied().collect();
+        (departures, directives)
+    }
+
+    /// Records a departure and retires the slot's live state. The shared step
+    /// behind [`record_departure`](Self::record_departure) and
+    /// [`decide_leave`](Self::decide_leave).
+    ///
+    /// The record's `last_frame` is the **max-merge** of every observation: the
+    /// caller-provided frame (a `SlotDeparted`'s carried frame, or `None`), the
+    /// slot's own frame in `slots`, and any prior record — so whichever of the
+    /// home relay's carried value and this relay's own view is fuller wins, and a
+    /// re-announce can only raise it. The `reason` keeps the first observation
+    /// (a departure has one reason; a duplicate signal doesn't rewrite it).
+    ///
+    /// Removing the slot from `slots` here — on *every* relay, not just the
+    /// slot's home — is what lets `session_frame()` follow the survivors: a
+    /// departed slot's frozen frame left in place would pin the minimum for the
+    /// rest of the game, freezing the buffer machinery's dwell clock and keeping
+    /// a pending buffer directive from ever retiring. The
+    /// `observe_frame`/`ingest` guards keep late in-flight traffic from
+    /// resurrecting the entry.
+    fn note_departure(&mut self, slot: SlotId, last_frame: Option<GameFrameCount>, reason: u32) {
+        use std::collections::hash_map::Entry;
+        let own = self.slots.remove(&slot).and_then(|s| s.frame);
+        let merged = match (last_frame, own) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        match self.departures.entry(slot) {
+            Entry::Occupied(mut existing) => {
+                let record = existing.get_mut();
+                record.last_frame = match (record.last_frame, merged) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Departure {
+                    last_frame: merged,
+                    reason,
+                });
+            }
+        }
+    }
+
     /// Removes a slot's condition history (the client disconnected). Called
     /// when a home client leaves so its stale stats don't outlive its
-    /// connection -- mirroring `unpublish_conditions`.
+    /// connection -- mirroring `unpublish_conditions`. A slot whose departure was
+    /// already announced is already gone (recording a departure retires the
+    /// slot), so this is a harmless no-op there; it still covers cleanup paths
+    /// that are not departures. The slot's departure record (and any cached
+    /// leave) is kept -- those outlive the connection so a promotion can still
+    /// re-derive the leave.
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
     }
+}
+
+/// The base frame a synced leave schedules from: the departing slot's last
+/// observed frame, falling back to the session's slowest frame **only** when the
+/// slot never produced a framed turn, or `None` when neither exists (no framed
+/// turn observed anywhere -- a lobby departure with no coordinate to schedule
+/// against). The apply frame is one past this.
+///
+/// Deliberately *not* the max of the two. Survivors' stamped frames run ahead of
+/// the departed slot's last frame before they stall (a client leads the slowest
+/// slot by up to the buffer cushion), so a survivors-only session frame can
+/// exceed the departed slot's last frame -- while each stalled survivor's
+/// simulation is pinned at `last_frame + 1`, where it applies the leave the
+/// moment one arrives. Folding the session frame in would schedule the leave
+/// past that stall point: a frame the stalled survivors can never reach, a
+/// permanent stall. Shared by [`DecisionMaker::decide_leave`] and the promotion
+/// re-derivation so both reproduce the identical frame from the same departure
+/// record.
+fn leave_base_frame(slot_last: Option<u32>, session: Option<u32>) -> Option<u32> {
+    slot_last.or(session)
 }
 
 /// A registry of per-session decision-makers, one per session this relay is
@@ -859,12 +1144,13 @@ pub fn new_decision_makers() -> DecisionMakers {
 /// the descriptor rather than stay frozen at whatever the first push said --
 /// a frozen verdict could leave a session with two authorities or none.
 /// Condition history survives a re-push (see [`DecisionMaker::sync`]).
+#[must_use]
 pub fn sync_maker(
     registry: &DecisionMakers,
     key: &SessionKey,
     bounds: BufferBounds,
     authority: Authority,
-) {
+) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let mut makers = registry.lock();
     match makers.entry(key.clone()) {
@@ -876,28 +1162,96 @@ pub fn sync_maker(
                 ControlLaw::default(),
                 authority,
             ));
+            Vec::new()
         }
     }
 }
 
 /// Applies a fresh authority verdict to a session's decision-maker, if the
-/// relay has one, logging a change of authority. The presence-driven handoff
-/// path: called when a relay's live-player report flips some relay's liveness,
-/// between (and independent of) descriptor pushes. A no-op when no maker
-/// exists — a maker is only ever created by a descriptor, which carries the
-/// bounds a maker cannot exist without.
-pub fn set_authority(registry: &DecisionMakers, key: &SessionKey, authority: Authority) {
-    if let Some(maker) = registry.lock().get_mut(key)
-        && maker.authority != authority
-    {
-        maker.set_authority(authority);
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            authority = ?authority,
-            "presence moved the session's buffer authority",
-        );
+/// relay has one, logging a change of authority and returning the synced leaves a
+/// *promotion* must (re)broadcast (empty on any other transition, or when no
+/// maker exists). The presence-driven handoff path: called when a relay's
+/// live-player report flips some relay's liveness, between (and independent of)
+/// descriptor pushes. A no-op when no maker exists — a maker is only ever created
+/// by a descriptor, which carries the bounds a maker cannot exist without. The
+/// caller pushes the returned leaves down local survivors and across the mesh.
+#[must_use]
+pub fn set_authority(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    authority: Authority,
+) -> Vec<LeaveDirective> {
+    let mut guard = registry.lock();
+    let Some(maker) = guard.get_mut(key) else {
+        return Vec::new();
+    };
+    if maker.authority == authority {
+        return Vec::new();
     }
+    let leaves = maker.set_authority(authority);
+    tracing::info!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        authority = ?authority,
+        rebroadcast_leaves = leaves.len(),
+        "presence moved the session's buffer authority",
+    );
+    leaves
+}
+
+/// Records a slot departure into the session's decision-maker, if the relay has
+/// one, so a later authority promotion can re-derive the leave. Every relay calls
+/// this on a departure it learns of (its own home client, or a peer's
+/// `SlotDeparted`). A no-op when no maker exists.
+pub fn record_departure(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    last_frame: Option<GameFrameCount>,
+    reason: u32,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.record_departure(slot, last_frame, reason);
+    }
+}
+
+/// Caches a synced leave a peer relay's authority authored (received off the
+/// mesh) into the session's decision-maker, if the relay has one, so a later
+/// promotion re-broadcasts it verbatim. A no-op when no maker exists.
+pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.observe_leave(leave);
+    }
+}
+
+/// The last game frame observed on `slot`'s validated turns for the session, if
+/// the relay has a maker. Read at a departure trigger — before the departure is
+/// recorded, which retires the slot's live state — to fill a `SlotDeparted`'s
+/// `last_frame`.
+pub fn slot_frame(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+) -> Option<GameFrameCount> {
+    registry.lock().get(key).and_then(|maker| maker.slot_frame(slot))
+}
+
+/// This relay's known leave state for `key` — every recorded departure and every
+/// cached leave — for re-announcing to a freshly (re)joined mesh link. Empty when
+/// no maker exists. See [`DecisionMaker::leave_reconcile`].
+#[allow(clippy::type_complexity)]
+pub fn leave_reconcile(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+) -> (
+    Vec<(SlotId, Option<GameFrameCount>, u32)>,
+    Vec<LeaveDirective>,
+) {
+    registry
+        .lock()
+        .get(key)
+        .map(|maker| maker.leave_reconcile())
+        .unwrap_or_default()
 }
 
 /// Removes a session's decision-maker (the session has ended). Idempotent.
@@ -966,8 +1320,9 @@ pub fn active_directive(registry: &DecisionMakers, key: &SessionKey) -> Option<B
 /// Decides a synced player-leave for `slot` on the session's authority relay and
 /// queues it for broadcast, logging it. Returns the queued [`LeaveDirective`], or
 /// `None` when this relay isn't the authority / has no maker / can't schedule yet
-/// (see [`DecisionMaker::decide_leave`]). Call it *before* [`DecisionMaker::remove_slot`]
-/// so the departing slot's last observed frame is still available.
+/// (see [`DecisionMaker::decide_leave`]). Records the departure as a side effect
+/// (merging the slot's own frame into its record and retiring its live state),
+/// so the apply frame derives the same way no matter which relay decides.
 pub fn decide_leave(
     registry: &DecisionMakers,
     key: &SessionKey,
@@ -1601,7 +1956,7 @@ mod tests {
     fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
         let registry = new_decision_makers();
         let k = key();
-        sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        let _ = sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
         {
             let makers = registry.lock();
             let maker = makers.get(&k).unwrap();
@@ -1611,7 +1966,7 @@ mod tests {
 
         // A lower-id relay joined the session: this relay is no longer the
         // authority, and the coordinator widened the bounds.
-        sync_maker(&registry, &k, bounds(0, 99), Authority::Peer);
+        let _ = sync_maker(&registry, &k, bounds(0, 99), Authority::Peer);
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
         assert_eq!(maker.bounds, bounds(0, 99), "bounds follow the descriptor");
@@ -1629,7 +1984,7 @@ mod tests {
     fn losing_authority_drops_the_pending_directive_but_keeps_history() {
         let registry = new_decision_makers();
         let k = key();
-        sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
         {
             let mut makers = registry.lock();
             let maker = makers.get_mut(&k).unwrap();
@@ -1637,7 +1992,7 @@ mod tests {
         }
         assert!(active_directive(&registry, &k).is_some());
 
-        sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
         assert_eq!(
             active_directive(&registry, &k),
             None,
@@ -1655,7 +2010,7 @@ mod tests {
     fn deregister_maker_removes_session() {
         let registry = new_decision_makers();
         let k = key();
-        sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        let _ = sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
         assert!(!registry.lock().contains_key(&k));
@@ -1680,17 +2035,17 @@ mod tests {
         assert_eq!(d.leave_seq, 1);
     }
 
-    /// When the session (slowest survivor) is ahead of the departed slot's last
-    /// frame, the apply frame clamps to session_frame + 1 (never in the past).
+    /// The departed slot's own last frame is the basis even when a fast survivor
+    /// has stamped far ahead — a stalled survivor's simulation pins at
+    /// `last_frame + 1`, so scheduling from the survivors' frames would put the
+    /// leave past a frame the stalled ones can reach.
     #[test]
-    fn decide_leave_never_schedules_before_the_session_frame() {
+    fn decide_leave_schedules_from_the_departed_slot_not_the_survivors() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         maker.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
         maker.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
-        // session_frame = min = 30, slot_last = 30 -> base 30. But if the departing
-        // slot were the min, clamp still yields base = max(30, 30) = 30 -> 31.
         let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
-        assert_eq!(d.apply_at_frame, 31);
+        assert_eq!(d.apply_at_frame, 31, "one past the departed slot's frame, not the survivor's");
     }
 
     /// No framed turn observed anywhere (pre-game / lobby): nothing to schedule.
@@ -1698,6 +2053,17 @@ mod tests {
     fn decide_leave_holds_without_a_frame_basis() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
+    }
+
+    /// A slot that never produced a framed turn has no frame of its own; the
+    /// session frame (the survivors' slowest) is the fallback basis.
+    #[test]
+    fn decide_leave_falls_back_to_the_session_frame_for_a_never_framed_slot() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(40)); // a framed survivor
+        // Slot 1 departs having never framed a turn.
+        let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(d.apply_at_frame, 41, "one past the session frame fallback");
     }
 
     /// A non-authority relay never decides a leave (only the authority does).
@@ -1733,25 +2099,311 @@ mod tests {
         assert_ne!(d1.leave_seq, d2.leave_seq, "distinct leave seqs");
     }
 
-    /// Losing authority forgets decided leaves, so a re-promoted relay can
-    /// re-derive (re-decide) the same slot's leave — reproducing the same apply
-    /// frame from the same observed last frame (clients dedup by slot).
+    /// A demotion keeps the cached leave, and a re-promotion re-broadcasts it
+    /// *verbatim* — the same apply frame, even though the session frame has since
+    /// advanced past what a fresh re-derivation would compute. Survivors that
+    /// already applied it did so at that exact frame, so it must not move.
     #[test]
-    fn losing_and_regaining_authority_allows_rederivation() {
+    fn promotion_re_broadcasts_a_cached_leave_verbatim() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         let first = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(first.apply_at_frame, 51);
 
-        // Hand authority away, then take it back (a real handoff would put a
-        // different relay in between; here we just prove the state is cleared).
-        maker.set_authority(Authority::Peer);
-        maker.set_authority(Authority::SelfRelay);
+        // Demote — the cache survives — then the surviving slot's stamps advance
+        // well past the apply frame.
+        assert!(maker.set_authority(Authority::Peer).is_empty());
+        maker.observe_frame(SlotId(0), GameFrameCount(200));
 
-        // The slot can be re-decided (it was forgotten) and lands on the same
-        // apply frame — the invariant clients rely on across a handoff.
-        let redecided = maker.decide_leave(SlotId(1), DROPPED).unwrap();
-        assert_eq!(redecided.apply_at_frame, 51, "re-derivation reproduces the apply frame");
+        // Re-promote: the cached directive is re-emitted verbatim — apply frame
+        // AND leave_seq untouched, not a fresh derivation.
+        let leaves = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(leaves, vec![first], "the cached leave re-broadcasts verbatim");
+
+        // And decide_leave for that slot is now a no-op (still cached).
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
+    }
+
+    /// The overshoot regression: survivors' stamped frames advanced past the
+    /// departed slot's last frame before they stalled, so a survivors-only
+    /// session frame exceeds it — the re-derived apply frame must still be
+    /// `last_frame + 1` (where the stalled survivors are pinned), never
+    /// `session + 1` (a frame they would never reach).
+    #[test]
+    fn re_derivation_does_not_overshoot_when_survivors_ran_ahead() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        // The survivor's stamps run ahead of the departed slot's last frame.
+        maker.observe_frame(SlotId(0), GameFrameCount(55));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(55)),
+            "the survivors-only session frame exceeds the departed slot's last frame",
+        );
+
+        let leaves = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaves[0].apply_at_frame, 51,
+            "one past the departed slot's frame — the survivors' lead must not push it",
+        );
+    }
+
+    /// A promotion re-derives a departure the previous authority never decided:
+    /// the departure was recorded (via `record_departure`) but no directive was
+    /// cached, so the promoted relay decides it fresh from the stored last frame.
+    #[test]
+    fn promotion_re_derives_a_departure_with_no_cached_directive() {
+        // This relay was never the authority: it recorded a peer's SlotDeparted
+        // but decided nothing (decide_leave is a no-op on a non-authority).
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no decision as a peer");
+
+        // Promoted: it derives the leave fresh from the stored last frame 50.
+        let leaves = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].slot, 1);
+        assert_eq!(leaves[0].apply_at_frame, 51, "one past the stored last frame");
+    }
+
+    /// Recording a departure captures the slot's frame into its record and
+    /// retires the slot's live state; the teardown-time `remove_slot` that
+    /// follows at the trigger site is a harmless no-op, and the record still
+    /// drives a later promotion's re-derivation.
+    #[test]
+    fn promotion_re_derivation_survives_the_slots_retirement() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        // The trigger site reads the frame, records the departure (which merges
+        // the frame into the record and retires the slot), then runs its
+        // teardown remove_slot — now a no-op for this slot.
+        let read = maker.slot_frame(SlotId(1));
+        maker.record_departure(SlotId(1), read, DROPPED);
+        assert_eq!(maker.slot_frame(SlotId(1)), None, "recording retires the live state");
+        maker.remove_slot(SlotId(1));
+
+        let leaves = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaves[0].apply_at_frame, 51,
+            "the departure record drives re-derivation after the slot is gone",
+        );
+    }
+
+    /// A promotion re-broadcasts a cached leave even when the survivors' session
+    /// frame is at/past its apply frame. The observed frames are survivors' SEND
+    /// stamps, which lead their execution by the latency buffer's depth: a
+    /// survivor stalled waiting for this very leave has stamps at or past
+    /// `apply_at` too, so stamps-past-apply does not mean applied — a skip here
+    /// could withhold the one re-delivery that unstalls a survivor the original
+    /// push missed. Re-delivery to survivors that did apply it is deduped by slot.
+    #[test]
+    fn promotion_re_broadcasts_even_when_survivor_stamps_pass_apply() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(leave.apply_at_frame, 51);
+
+        assert!(maker.set_authority(Authority::Peer).is_empty());
+        // The surviving slot's stamps reach the apply frame — exactly what a
+        // stalled, un-served survivor's leading stamps look like.
+        maker.observe_frame(SlotId(0), GameFrameCount(51));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(51)));
+        assert_eq!(
+            maker.set_authority(Authority::SelfRelay),
+            vec![leave],
+            "the cached leave re-broadcasts regardless of the survivors' stamps",
+        );
+    }
+
+    /// A demotion no longer clears the cached leaves — the cache is exactly what a
+    /// later promotion re-broadcasts.
+    #[test]
+    fn demotion_keeps_the_cached_leaves() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert!(maker.decided_leaves.contains_key(&SlotId(1)));
+
+        assert!(maker.set_authority(Authority::Peer).is_empty());
+        assert!(
+            maker.decided_leaves.contains_key(&SlotId(1)),
+            "the cache survives demotion",
+        );
+    }
+
+    /// `observe_leave` caches a peer authority's directive and advances
+    /// `next_leave_seq` past it, so this relay's own later numbering never
+    /// collides. A conflicting duplicate keeps the first (and warns).
+    #[test]
+    fn observe_leave_caches_and_advances_the_seq() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let observed = LeaveDirective {
+            slot: 2,
+            reason: DROPPED,
+            apply_at_frame: 88,
+            leave_seq: 7,
+        };
+        maker.observe_leave(&observed);
+        assert_eq!(maker.decided_leaves.get(&SlotId(2)), Some(&observed));
+        assert_eq!(maker.next_leave_seq, 7, "seq kept at least the observed seq");
+
+        // A conflicting duplicate for the same slot keeps the first.
+        let conflicting = LeaveDirective {
+            apply_at_frame: 999,
+            ..observed
+        };
+        maker.observe_leave(&conflicting);
+        assert_eq!(
+            maker.decided_leaves.get(&SlotId(2)),
+            Some(&observed),
+            "the first cached leave wins a conflict",
+        );
+
+        // Promoted, its own first leave numbers above the observed seq.
+        maker.observe_frame(SlotId(0), GameFrameCount(100));
+        let _ = maker.set_authority(Authority::SelfRelay);
+        let own = maker.decide_leave(SlotId(0), DROPPED).unwrap();
+        assert!(own.leave_seq > 7, "own numbering continues above the observed seq");
+    }
+
+    /// The authority's inbound `SlotDeparted` path — record the departure (which
+    /// max-merges the carried frame with our own observation), then decide —
+    /// schedules from the carried frame when our own observation lags it.
+    #[test]
+    fn slot_departed_ingest_uses_the_carried_frame_when_our_observation_lags() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // Our own view of the departing slot lags (frame 30); a survivor is at 45.
+        maker.observe_frame(SlotId(0), GameFrameCount(45));
+        maker.observe_frame(SlotId(1), GameFrameCount(30));
+
+        // The peer's SlotDeparted carries the home relay's fuller view (60): the
+        // departure record max-merges it over our lagging 30.
+        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), DROPPED);
+        let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(
+            leave.apply_at_frame, 61,
+            "one past the carried last frame, not our lagging observation",
+        );
+    }
+
+    /// When the carried frame is *lower* than our own observation of the slot,
+    /// the max-merge keeps our higher value, so the apply frame reflects it.
+    #[test]
+    fn slot_departed_ingest_keeps_a_higher_own_frame_over_a_lower_carried_one() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(1), GameFrameCount(70)); // our fuller view
+        maker.observe_frame(SlotId(0), GameFrameCount(80));
+
+        // A stale SlotDeparted carries a lower frame (55): the merge keeps 70.
+        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), DROPPED);
+        let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(leave.apply_at_frame, 71, "one past our higher observed frame");
+    }
+
+    /// A non-authority relay records a departure but decides nothing.
+    #[test]
+    fn slot_departed_ingest_records_without_deciding_on_a_non_authority() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no decision as a peer");
+        // But the departure is recorded, so a later promotion re-derives it.
+        let leaves = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].apply_at_frame, 51);
+    }
+
+    // -- Departed-slot lifecycle (slot leaves the live roster, never resurrects) --
+
+    /// A departure retires the slot from the live roster on every relay, so the
+    /// session frame follows the survivors instead of staying pinned at the
+    /// departed slot's frozen last frame.
+    #[test]
+    fn a_departure_retires_the_slot_from_the_session_frame() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(0), GameFrameCount(60));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
+
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(60)),
+            "the survivors alone drive the session frame after a departure",
+        );
+    }
+
+    /// A late frame observation for a departed slot (its final turns racing the
+    /// departure across the mesh) must not resurrect the slot's live state — the
+    /// re-created entry would re-pin the session frame at the departed slot.
+    #[test]
+    fn observe_frame_ignores_a_departed_slot() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(0), GameFrameCount(60));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+
+        maker.observe_frame(SlotId(1), GameFrameCount(52));
+        assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(60)),
+            "the late observation does not re-pin the session frame",
+        );
+    }
+
+    /// A stale conditions sample for a departed slot (an in-flight datagram that
+    /// raced the departure) must not re-create its condition state either.
+    #[test]
+    fn conditions_ingest_does_not_resurrect_a_departed_slot() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(60));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+
+        let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
+        assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
+        assert_eq!(maker.target(), None, "no live slot has conditions to size from");
+    }
+
+    /// The Join-time reconcile always includes a cached leave — even when the
+    /// survivors' session frame is at/past its apply frame. As in the promotion
+    /// case, the observed frames are send stamps that lead execution by the
+    /// buffer depth, so they cannot distinguish "every survivor applied it" from
+    /// "every survivor is stalled waiting for it"; the reconcile re-announces
+    /// unconditionally and receipt dedups by slot.
+    #[test]
+    fn reconcile_always_includes_a_cached_leave() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        let leave = LeaveDirective {
+            slot: 1,
+            reason: DROPPED,
+            apply_at_frame: 51,
+            leave_seq: 1,
+        };
+        maker.observe_leave(&leave);
+
+        let (_, directives) = maker.leave_reconcile();
+        assert_eq!(directives, vec![leave]);
+
+        // The survivor's stamps reach and pass the apply frame: the directive is
+        // still re-announced (and the departure record with it).
+        maker.observe_frame(SlotId(0), GameFrameCount(75));
+        let (departures, directives) = maker.leave_reconcile();
+        assert_eq!(directives, vec![leave], "re-announced regardless of stamps");
+        assert_eq!(departures.len(), 1, "the departure record is announced too");
+        assert_eq!(
+            maker.set_authority(Authority::SelfRelay),
+            vec![leave],
+            "and a promotion re-broadcasts it just the same",
+        );
     }
 }

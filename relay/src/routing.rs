@@ -401,7 +401,7 @@ pub async fn run_slot_link(
     // roster already includes this slot (registration preceded this task), so
     // report it and re-derive. The peers learn the new count from the mesh
     // drivers' presence reconcile, off the same roster.
-    report_own_presence(&presence, &decision_makers, &sessions, &key);
+    report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -415,7 +415,7 @@ pub async fn run_slot_link(
         Err(error) => {
             log_link_closed(&key, slot, &LinkError::from(error));
             deregister(&sessions, &key, slot);
-            report_own_presence(&presence, &decision_makers, &sessions, &key);
+            report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
             return;
         }
     };
@@ -431,7 +431,7 @@ pub async fn run_slot_link(
         Err(error) => {
             log_link_closed(&key, slot, &LinkError::from(error));
             deregister(&sessions, &key, slot);
-            report_own_presence(&presence, &decision_makers, &sessions, &key);
+            report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
             return;
         }
     };
@@ -454,6 +454,13 @@ pub async fn run_slot_link(
     // link failure surfaces via `link.recv()`.
     let mut beacon_alive = true;
 
+    // Whether this slot's departure has already been announced to the mesh and
+    // decided (a clean leave-intent, handled inline with the "left" reason). The
+    // post-loop Trigger-A departure pass is the fallback for every *other* exit (a
+    // dropped link, an isolation): it announces a "dropped" departure. Skipping it
+    // once a clean leave was announced avoids a redundant "dropped" SlotDeparted
+    // chasing the "left" one across the mesh (which is idempotent, but noise).
+    let mut leave_announced = false;
     // Whether we've received from this client since we last sent it a packet. Every
     // packet we send folds in the latest acks, so a forwarded turn clears this too,
     // and the flush only needs to carry acks when no forward has.
@@ -699,17 +706,17 @@ pub async fn run_slot_link(
                     // every survivor ends up with the identical final-turn
                     // prefix and the same apply frame.
                     //
-                    // The post-loop Trigger-A `decide_leave` below still
-                    // runs on the way out, but it dedups by slot and finds
-                    // this one already decided, so it is a no-op there --
+                    // The post-loop Trigger-A departure pass is skipped for
+                    // this exit (via `leave_announced`), since the clean
+                    // departure is announced here with the "left" reason --
                     // deregistration, the presence report, and the
-                    // decision-maker's per-slot cleanup all run exactly as
-                    // they would for a dropped client. On a relay that
-                    // isn't this session's authority `decide_leave` returns
-                    // `None` here just as it does for a drop -- routing a
-                    // peer relay's own client's intent to the authority over
-                    // the mesh (`SlotDeparted`) is the same known gap as
-                    // Trigger A, not yet wired.
+                    // decision-maker's per-slot cleanup still all run as they
+                    // would for a dropped client. This client is homed on THIS
+                    // relay, so its own decision-maker records the departure and,
+                    // if this relay is the authority, decides the leave; either
+                    // way the departure is announced to the peer relays as a
+                    // `SlotDeparted` so their survivors (and the authority, if it
+                    // is a peer) hear of it.
                     Some(ControlInbound::LeaveIntent) => {
                         tracing::info!(
                             tenant = key.tenant.as_ref(),
@@ -717,14 +724,15 @@ pub async fn run_slot_link(
                             slot = slot.0,
                             "client announced clean leave",
                         );
-                        if let Some(leave) = crate::consensus::decide_leave(
+                        announce_departure(
                             &decision_makers,
+                            &sessions,
+                            &mesh_links,
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
-                        ) {
-                            fan_out_leave(&sessions, &key, slot, leave);
-                        }
+                        );
+                        leave_announced = true;
                         // The client's driver never expects an ack for the
                         // intent itself -- closing the link is the
                         // confirmation it waits on, so give it one now
@@ -855,25 +863,35 @@ pub async fn run_slot_link(
     deregister(&sessions, &key, slot);
     crate::mesh::unpublish_conditions(&conditions, &key, slot);
     // Trigger A (synced player-leave): this client's link ended, so it has left
-    // the game. Schedule a coordinated leave for its slot on the session's
-    // authority, so every remaining client drops it from lockstep at the same
-    // frame (rather than stalling on a slot that will never send another turn).
-    // A no-op unless this relay is the authority; a departed client homed on a
-    // peer relay reaches the authority via the mesh instead (SlotDeparted — not
-    // yet wired). Must run *before* `remove_slot` below, which clears the slot's
-    // last observed frame that the apply frame is computed from. On a decision,
-    // push the leave down every surviving client's reliable control stream (the
-    // departing slot is already off the roster from `deregister` above, so
-    // `fan_out_leave` targets only survivors) — the turn stream has stopped for
-    // them, so the reliable stream is the only channel that unstalls them.
-    if let Some(leave) =
-        crate::consensus::decide_leave(&decision_makers, &key, slot, LEAVE_REASON_DROPPED)
-    {
-        fan_out_leave(&sessions, &key, slot, leave);
+    // the game. Announce the departure — unless a clean leave-intent already did,
+    // with the "left" reason — as a "dropped" one: record it, tell the peer relays
+    // (`SlotDeparted`, so a peer-homed authority and peer survivors hear it), and,
+    // if this relay is the session's authority, decide the coordinated leave so
+    // every remaining client drops the slot from lockstep at the same frame
+    // (rather than stalling on a slot that will never send another turn).
+    // Recording the departure captures the slot's last observed frame into its
+    // record — the apply-frame basis — and retires the slot's live state in the
+    // decision-maker. On a decision, the leave is pushed down every surviving
+    // local client's reliable control stream (the departing slot is already off
+    // the roster from `deregister` above, so `fan_out_leave` targets only
+    // survivors) and across the mesh to peer survivors — the turn stream has
+    // stopped for them, so the reliable stream is the only channel that unstalls.
+    if !leave_announced {
+        announce_departure(
+            &decision_makers,
+            &sessions,
+            &mesh_links,
+            &key,
+            slot,
+            LEAVE_REASON_DROPPED,
+        );
     }
     // Forget this slot's condition history in the decision-maker so a departed
-    // client's stale stats don't outlive its connection. The maker itself lives
-    // until the session ends (the coordinator drops the descriptor).
+    // client's stale stats don't outlive its connection — a no-op when the
+    // departure announce above already retired the slot; it still covers exits
+    // where no maker-side departure applies. The maker itself lives until the
+    // session ends (the coordinator drops the descriptor); the departure record
+    // and any cached leave are kept, so a promotion can still re-derive the leave.
     if let Some(maker) = decision_makers.lock().get_mut(&key) {
         maker.remove_slot(slot);
     }
@@ -881,7 +899,42 @@ pub async fn run_slot_link(
     // relay in the order — the presence-driven half of the handoff. The local
     // verdict moves here; the peers hear the emptied roster from the mesh
     // drivers' presence reconcile.
-    report_own_presence(&presence, &decision_makers, &sessions, &key);
+    report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+}
+
+/// Announces a home client's departure from the game: records it, tells the peer
+/// relays over the mesh (`SlotDeparted`), and — if this relay is the session's
+/// authority — decides the one synced leave and pushes it to local survivors and
+/// across the mesh to peer survivors.
+///
+/// Every relay records the departure (for authority-handoff robustness) and
+/// announces it to its peers regardless of whether it is the authority: a
+/// peer-homed authority learns of a client it never served only through this
+/// `SlotDeparted`, and a receiving authority dedups by slot so a double-decide is
+/// impossible. Recording the departure captures the slot's last observed frame
+/// into its record — the leave's apply-frame basis — and retires the slot's live
+/// state in the decision-maker.
+fn announce_departure(
+    decision_makers: &crate::consensus::DecisionMakers,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    reason: u32,
+) {
+    // Read the last observed frame before recording retires it; it fills both
+    // the departure record and the SlotDeparted the peers receive.
+    let last_frame = consensus::slot_frame(decision_makers, key, slot);
+    consensus::record_departure(decision_makers, key, slot, last_frame, reason);
+    crate::mesh::fan_out_slot_departed(mesh_links, key, slot, last_frame.map(|f| f.0), reason);
+    // Decide locally: `Some` only on the authority (and only once per slot). The
+    // leave unstalls local survivors and, broadcast across the mesh, peer
+    // survivors — the departing slot is already off the roster, so `fan_out_leave`
+    // reaches only survivors.
+    if let Some(leave) = consensus::decide_leave(decision_makers, key, slot, reason) {
+        fan_out_leave(sessions, key, slot, leave);
+        crate::mesh::fan_out_leave_directive(mesh_links, key, leave);
+    }
 }
 
 /// Reports the current roster count for `key` into the presence registry and
@@ -889,10 +942,16 @@ pub async fn run_slot_link(
 /// relay's liveness. A session with no presence entry (no descriptor set an
 /// order — dev/loopback harnesses that inject a verdict by hand) is left
 /// untouched.
+///
+/// A verdict flip that *promotes* this relay (its own roster emptying is what
+/// usually demotes it, but a re-derive can also promote it after a peer leaves)
+/// yields any synced leave the departed authority never delivered; those are
+/// pushed to local survivors and across the mesh via [`crate::mesh::broadcast_leaves`].
 fn report_own_presence(
     presence: &crate::presence::PresenceRegistry,
     decision_makers: &crate::consensus::DecisionMakers,
     sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
 ) {
     let live = {
@@ -900,7 +959,8 @@ fn report_own_presence(
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
     if crate::presence::record_own(presence, key, live) {
-        crate::presence::recompute(presence, decision_makers, key);
+        let leaves = crate::presence::recompute(presence, decision_makers, key);
+        crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
     }
 }
 
@@ -1070,7 +1130,7 @@ mod tests {
 
         // This relay is not the session's authority: its own maker never has a
         // directive, so the forward step must leave an incoming stamp alone.
-        consensus::sync_maker(
+        let _ = consensus::sync_maker(
             &makers,
             &k,
             BufferBounds::new(0, 20).unwrap(),
@@ -1117,7 +1177,7 @@ mod tests {
             let mut registry = makers.lock();
             let maker = registry.get_mut(&k).unwrap();
             maker.observe_frame(SlotId(0), rally_point_proto::ids::GameFrameCount(1));
-            maker.sync(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay);
+            let _ = maker.sync(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay);
         }
         consensus::ingest_local_conditions(
             &makers,

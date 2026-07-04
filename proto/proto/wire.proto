@@ -305,11 +305,11 @@ message LeaveDirective {
   uint32 reason = 2;
 
   // The game frame at which every client applies the leave. One past the
-  // departing slot's last observed frame (clamped never to be in the past), so
-  // remaining clients apply it exactly at the step they would otherwise stall
-  // waiting on that slot. A client cannot advance past this frame without
-  // applying the leave — the departed slot gates the step until then — so unlike
-  // a buffer change, a leave can never be "too late," and there is no moot case.
+  // departing slot's last observed frame, so remaining clients apply it exactly
+  // at the step they would otherwise stall waiting on that slot. A client cannot
+  // advance past this frame without applying the leave — the departed slot gates
+  // the step until then — so unlike a buffer change, a leave can never be "too
+  // late," and there is no moot case.
   uint32 apply_at_frame = 3;
 
   // Orders and dedups leaves within a session, in a seq space *separate* from
@@ -333,3 +333,77 @@ message LeaveDirective {
 // the client's confirmation that the relay processed this is the relay closing
 // the link, not a reply frame.
 message LeaveIntent {}
+
+// One message on the relay ↔ relay reliable mesh control stream — the channel a
+// relay-pair uses to propagate synced player-leaves across the mesh. Each mesh
+// link carries one bidirectional QUIC stream on which both relays write
+// length-prefixed `MeshControlFrame`s (same framing and size cap as
+// `ControlFrame`; see `proto::control_stream`) and read the peer's.
+//
+// A leave that a relay's own home client triggers must reach the *other* relays'
+// local survivors too — a drop stalls every player in the game, including those
+// on peer relays — and it must reach the session's decision authority so it can
+// author the one synced `LeaveDirective` every client applies at the same frame.
+// The datagram path cannot carry that: a drop stops the turn stream the datagram
+// sidecars ride. So it rides this reliable stream, like presence does.
+//
+// A oneof so more relay ↔ relay control kinds can join later without a wire
+// break: a frame whose kind a peer predates decodes with the oneof unset, and the
+// reader skips it rather than tearing the stream down. An unset kind is also the
+// empty stream-establishment/keepalive frame the dialer writes right after
+// opening the stream so the acceptor's `accept_bi` completes promptly (QUIC does
+// not surface an opened bidirectional stream to the peer until its opener writes).
+message MeshControlFrame {
+  // The game this frame belongs to, scoped within the tenant the mesh link
+  // authenticated for — exactly like `MeshPacket.session`. A `0` is malformed
+  // (sessions are 1-indexed) and the receiver skips it; it is also the value the
+  // empty establishment frame carries, so a zero-session frame is always
+  // ignorable. The receiver resolves the bare id to a tenant-scoped key through
+  // the same per-link joined-sessions state the datagram path uses.
+  uint64 session = 1;
+
+  oneof kind {
+    // A home client of the sending relay departed the game. Every relay records
+    // the departure (for authority-handoff robustness); the session's decision
+    // authority additionally authors the synced `LeaveDirective` from it. The
+    // receiving authority dedups by slot, so a duplicate `SlotDeparted` (e.g. a
+    // re-announce on a redialed link) never double-decides.
+    SlotDeparted slot_departed = 2;
+
+    // A synced player-leave the session's authority authored, propagated to the
+    // other relays so each pushes it down its own local survivors' reliable
+    // control streams. A relay that receives this caches it (dedup by slot) and
+    // fans it out to its local clients; it does not re-broadcast it across the
+    // mesh, so there is no echo. See `LeaveDirective`.
+    LeaveDirective leave_directive = 3;
+  }
+}
+
+// A relay's announcement to its mesh peers that one of its home clients has
+// departed the game (its link ended, or it sent a clean leave-intent). Carried
+// in a `MeshControlFrame`. Every relay records the departure so a later
+// authority promotion can re-derive the leave; the current authority turns it
+// into the one synced `LeaveDirective` all clients apply.
+message SlotDeparted {
+  // The slot that departed, authoritative at its home relay (never a
+  // client-asserted value — the home relay knows which connection ended).
+  uint32 slot = 1;
+
+  // The departing slot's last observed game frame at its home relay — the basis
+  // for the leave's apply frame (`last_frame + 1`; the authority falls back to
+  // its session frame only when this is absent, never to a max of the two —
+  // survivors' stamped frames run ahead of the departed slot's before they
+  // stall, so a max could schedule the leave past the frame stalled survivors
+  // are pinned at). Absent when the slot never produced a framed turn (a
+  // lobby/pre-game departure, which the game handles natively): there is no
+  // frame basis, matching how the decision authority holds a leave with no
+  // frame to schedule against. A present `0` is a valid in-game frame, so the
+  // field is `optional` rather than defaulting to 0 — the same distinction
+  // `Payload.game_frame_count` draws.
+  optional uint32 last_frame = 2;
+
+  // The native SC:R `pending_leave_reason` value the departure carries
+  // (`0x40000006` == dropped, else left), so the authority authors the leave with
+  // the reason the home relay observed. See `LeaveDirective.reason`.
+  uint32 reason = 3;
+}

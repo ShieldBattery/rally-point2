@@ -61,9 +61,9 @@ use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
 use crate::consensus::{self, Authority, DecisionMakers};
-use crate::mesh::MeshCommand;
+use crate::mesh::{self, MeshCommand, MeshLinks};
 use crate::presence::{self, Candidate, PresenceRegistry};
-use crate::routing::SessionKey;
+use crate::routing::{SessionKey, Sessions};
 
 /// Drives the mesh links' `Join`/`Leave` commands from coordinator session
 /// descriptors. Clone it cheaply (the state is behind one `Arc`) to hand a copy
@@ -83,6 +83,13 @@ pub struct MeshControl {
     /// with it into the authority verdict. Shared with the turn-path tasks
     /// (via `MeshState`) for the same reason as the decision-makers.
     presence: Arc<PresenceRegistry>,
+    /// The turn-path handles a descriptor-driven authority promotion needs to
+    /// re-broadcast any synced leave the demoted authority never delivered: local
+    /// survivors via `sessions`, peer survivors via `mesh_links`. Empty registries
+    /// by default (a control plane with no turn path — tests, a standalone
+    /// descriptor driver); wired to the real ones with [`with_broadcast`](Self::with_broadcast).
+    sessions: Sessions,
+    mesh_links: MeshLinks,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -128,6 +135,8 @@ impl MeshControl {
             our_id,
             decision_makers,
             presence,
+            sessions: Sessions::default(),
+            mesh_links: crate::mesh::new_mesh_links(),
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 desired: HashMap::new(),
@@ -136,6 +145,19 @@ impl MeshControl {
                 desired_peers_tx,
             })),
         }
+    }
+
+    /// Wires the turn-path handles so a descriptor-driven authority *promotion*
+    /// can re-broadcast a synced leave the demoted authority never delivered —
+    /// pushing it to local survivors (`sessions`) and peer survivors
+    /// (`mesh_links`). The production relay calls this with the same registries
+    /// the turn path holds; a control plane with no turn path leaves the empty
+    /// defaults from [`new`](Self::new), where the re-broadcast is a harmless
+    /// no-op against empty registries.
+    pub fn with_broadcast(mut self, sessions: Sessions, mesh_links: MeshLinks) -> Self {
+        self.sessions = sessions;
+        self.mesh_links = mesh_links;
+        self
     }
 
     /// Subscribes to the set of peers this relay currently needs mesh links to
@@ -218,7 +240,12 @@ impl MeshControl {
             .collect();
         presence::set_order(&self.presence, &key, order);
         let authority = presence::verdict(&self.presence, &key).unwrap_or(Authority::Peer);
-        consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
+        // A verdict that promotes this relay (e.g. the coordinator dropped the
+        // former authority from the order because it crashed — a case presence
+        // alone can't catch, since a crashed relay sends no zero report) yields
+        // the synced leaves it must re-broadcast so no leave is lost.
+        let leaves = consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
+        mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
 
         let mut inner = self.inner.lock();
 
@@ -781,7 +808,7 @@ mod tests {
             RelayId(2),
             0
         ));
-        presence::recompute(&presence_registry, &makers, &key(1));
+        let _ = presence::recompute(&presence_registry, &makers, &key(1));
         assert!(
             makers.lock().get(&key(1)).unwrap().is_authority(),
             "the authority's players leaving promotes the next relay in order",

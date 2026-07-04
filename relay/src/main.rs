@@ -262,7 +262,11 @@ async fn main() -> Result<()> {
             RelayId(our_id),
             mesh_state.decision_makers.clone(),
             mesh_state.presence.clone(),
-        );
+        )
+        // Wire the turn-path handles so a descriptor-driven authority promotion
+        // (e.g. the coordinator dropping a crashed former authority) can
+        // re-broadcast any synced leave that authority never delivered.
+        .with_broadcast(Arc::clone(&sessions), mesh_state.links.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it
