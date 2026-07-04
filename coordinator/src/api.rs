@@ -10,6 +10,11 @@
 //! - `POST /session/create` — an app server requests a session. Body:
 //!   [`SessionRequest`]; response: [`SessionResponse`] with per-player tokens
 //!   and the relay topology.
+//! - `GET /tenant/:tenant/pubkey` — fetches a tenant's Ed25519 verifying key
+//!   (`{"kid", "publicKey"}`, hex-encoded), so an app server can validate
+//!   departure-webhook signatures without pinning the key in its own config.
+//!   Public key material only, so — like `/session/create` handing out relay
+//!   certs — it needs no auth; 404s for an unenrolled tenant.
 //! - `GET /relay/control` — a relay opens its persistent control connection (a
 //!   WebSocket). The relay's first frame is a [`RelayToCoordinator::Hello`] that
 //!   **enrolls** it into the registry; the coordinator then pushes the relay's
@@ -35,7 +40,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{
-        State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
@@ -44,13 +49,15 @@ use axum::{
 };
 use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
-    SessionResponse,
+    SessionResponse, TenantId,
 };
 use rally_point_proto::ids::RelayId;
+use serde::Serialize;
 
 use crate::notify::{self, DepartureDedup};
 use crate::registry;
 use crate::session::{self, SessionSetup};
+use crate::tenant;
 
 /// How the relay control endpoint authenticates a connecting relay.
 ///
@@ -138,6 +145,7 @@ pub struct CoordinatorState {
 pub fn router(state: CoordinatorState) -> Router {
     Router::new()
         .route("/session/create", post(create_session))
+        .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
         .route("/relay/control", get(relay_control))
         .with_state(state)
 }
@@ -175,6 +183,40 @@ async fn create_session(
         "session created"
     );
     Ok(Json(resp))
+}
+
+/// Response body for `GET /tenant/:tenant/pubkey`.
+///
+/// camelCase (not the control plane's snake_case): this is tenant-facing
+/// surface, like the departure webhook body, not coordinator↔relay wire.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TenantPubkeyResponse {
+    /// The `kid` naming this key — the same value a departure webhook's
+    /// signature was made under, so a consumer can key its own verifying-key
+    /// cache by it.
+    kid: String,
+    /// The raw 32-byte Ed25519 verifying key, as 64 lowercase hex characters.
+    public_key: String,
+}
+
+/// Fetches a tenant's Ed25519 verifying key, so an app server can validate
+/// departure-webhook signatures ([`crate::tenant::sign_webhook`]'s
+/// counterpart) without pinning the key in its own env config.
+///
+/// No auth: this hands out public key material only, the same trust posture
+/// as `/session/create` handing out relay certs. 404s for a tenant that isn't
+/// enrolled (never provisioned, or removed).
+async fn tenant_pubkey(
+    State(state): State<CoordinatorState>,
+    Path(tenant): Path<String>,
+) -> Result<Json<TenantPubkeyResponse>, StatusCode> {
+    let (kid, public_key) = tenant::verifying_key(state.setup.tenants(), &TenantId(tenant))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(TenantPubkeyResponse {
+        kid: kid.0,
+        public_key: hex::encode(public_key),
+    }))
 }
 
 /// Accepts a relay's persistent control connection (a WebSocket).
@@ -693,5 +735,76 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tenant_pubkey_endpoint_returns_the_enrolled_key() {
+        let reg = registry::new_registry();
+        let tenants = crate::tenant::new_store();
+        let expected_pubkey = crate::tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = crate::session::SessionSetup::new(reg, tenants);
+        let state = CoordinatorState {
+            setup,
+            departures: notify::new_dedup(),
+            control_auth: ControlAuth::Open,
+            hello_timeout: HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS_TIMEOUT,
+        };
+        let app = router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/tenant/sb-test/pubkey")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Exactly the two camelCase fields — nothing else on the shape.
+        let map = json.as_object().unwrap();
+        assert_eq!(
+            map.keys().collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([&"kid".to_owned(), &"publicKey".to_owned()]),
+            "the response is exactly {{kid, publicKey}}",
+        );
+        assert_eq!(json["kid"], "test-key-1");
+        // Hex round-trips against what enroll returned: 64 lowercase hex chars
+        // decoding back to the exact 32-byte verifying key.
+        assert_eq!(json["publicKey"], hex::encode(expected_pubkey));
+        assert_eq!(json["publicKey"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn tenant_pubkey_endpoint_404s_for_an_unknown_tenant() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/tenant/not-enrolled/pubkey")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
