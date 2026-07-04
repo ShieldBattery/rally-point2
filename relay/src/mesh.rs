@@ -436,9 +436,7 @@ pub(crate) fn fan_out_control(links: &MeshLinks, key: &SessionKey, mut frame: Me
         }
     };
     for tx in targets {
-        // `MeshControlFrame` is `Copy` (all-scalar fields), so each send takes its
-        // own copy — no clone needed.
-        let _ = tx.send(frame);
+        let _ = tx.send(frame.clone());
     }
 }
 
@@ -528,10 +526,35 @@ pub fn forward_turn(
     decision_makers: &crate::consensus::DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
-    mut payload: Payload,
+    payload: Payload,
 ) {
+    if let Some(payload) = deliver_turn_to_locals(sessions, seen, decision_makers, key, slot, payload)
+    {
+        fan_out_to_mesh(mesh_links, key, payload);
+    }
+}
+
+/// The local half of [`forward_turn`]: topological dedup, buffer-directive
+/// stamping, and fan-out to this relay's local slots — everything except the
+/// mesh flood. Returns the (possibly stamped) payload when it was fresh, so
+/// [`forward_turn`] can flood it onward, or `None` for a topological duplicate
+/// already delivered via an earlier path.
+///
+/// Also the whole receive step for an oversize turn arriving over the mesh
+/// control stream: the origin relay diverted a copy to *every* link serving the
+/// session itself, so the receiver delivers locally and deliberately does not
+/// re-flood — re-broadcasting would only produce the echo the dedup exists to
+/// drop (harmless, but pure waste on a reliable stream).
+fn deliver_turn_to_locals(
+    sessions: &routing::Sessions,
+    seen: &SeenRegistries,
+    decision_makers: &crate::consensus::DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    mut payload: Payload,
+) -> Option<Payload> {
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
-        return;
+        return None;
     }
     match crate::consensus::active_directive(decision_makers, key) {
         Some(directive) => payload.buffer_directive = Some(directive),
@@ -550,7 +573,7 @@ pub fn forward_turn(
     // the turn envelope — a drop stops the turn stream, so an envelope stamp would
     // never reach the survivors it must unstall. See `routing`'s leave trigger.
     routing::fan_out(sessions, key, slot, payload.clone());
-    fan_out_to_mesh(mesh_links, key, payload);
+    Some(payload)
 }
 
 /// A command to a mesh-link driver, telling it to start or stop serving one
@@ -835,8 +858,9 @@ pub async fn run_mesh_link(
                     None => break MeshLinkExit::CommandChannelClosed,
                 }
             }
-            // A control frame from the peer relay: a departure it observed, or a
-            // synced leave its authority authored. The reader task assembled the
+            // A control frame from the peer relay: a departure it observed, a
+            // synced leave its authority authored, or an oversize turn its
+            // datagram path could not carry. The reader task assembled the
             // complete frame off a cancel-safe path; `recv` is cancel-safe.
             received = peer_control_rx.recv(), if peer_control_alive => {
                 match received {
@@ -844,6 +868,7 @@ pub async fn run_mesh_link(
                         frame,
                         &joined,
                         &sessions,
+                        &seen_registries,
                         &mesh_links,
                         &decision_makers,
                     ),
@@ -858,18 +883,56 @@ pub async fn run_mesh_link(
                         };
                         let key = state.key.clone();
                         let outgoing = snapshot_conditions(&conditions, &key);
+                        // Too large for any mesh datagram on this path: divert to
+                        // the reliable control stream, whose QUIC reliability
+                        // replaces redundancy for this turn — the mesh twin of the
+                        // client edge's divert. Written directly on the stream
+                        // rather than through the merged outbound channel: this
+                        // driver owns the send half, select! runs one branch to
+                        // completion at a time so frames never interleave, and
+                        // queueing behind pending control frames would only delay
+                        // a turn the datagram path (which this replaces) imposes
+                        // no such ordering on. A write failure closes the link —
+                        // nothing re-carries a diverted turn.
+                        let fits = match link.payload_fits(&payload, outgoing.as_ref()) {
+                            Ok(fits) => fits,
+                            Err(error) => {
+                                tracing::info!(%error, "mesh send failed; closing link");
+                                break MeshLinkExit::ConnectionFailed;
+                            }
+                        };
+                        if !fits {
+                            tracing::debug!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = payload.slot,
+                                seq = payload.seq,
+                                "diverting oversize turn to the mesh control stream",
+                            );
+                            let frame = MeshControlFrame {
+                                session: session_id.0,
+                                kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
+                            };
+                            if let Err(error) =
+                                rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+                                    &mut control_send,
+                                    &frame,
+                                )
+                                .await
+                            {
+                                tracing::info!(%error, "mesh control send failed; closing link");
+                                break MeshLinkExit::ConnectionFailed;
+                            }
+                            continue;
+                        }
                         match link.send(session_id, Some(payload), outgoing) {
                             Ok(_) => {}
-                            // A turn too large for any mesh datagram. A reliable
-                            // control stream now exists on the mesh link, but it
-                            // carries synced-leave propagation, not oversize-turn
-                            // divert — forwarding oversize turns across it is a
-                            // deliberate follow-up, out of scope here. So the turn
-                            // is dropped for this peer's clients: bad for that
-                            // session, but killing the shared relay-pair link
-                            // would take down every session on it. The client edge
-                            // diverts its own copies, so a single-relay session is
-                            // unaffected.
+                            // The pre-check above diverts anything that can never
+                            // ride a datagram, so this arm is reachable only if
+                            // the path budget moved between the check and the send
+                            // (no await separates them, so in practice it isn't).
+                            // The payload was consumed by the failed send; log it
+                            // loudly rather than pretend it was delivered.
                             Err(rally_point_transport::MeshLinkError::PayloadTooLarge {
                                 needed,
                                 budget,
@@ -879,7 +942,7 @@ pub async fn run_mesh_link(
                                     session = key.session.0,
                                     needed,
                                     budget,
-                                    "dropping oversize turn on the mesh (control-stream divert is a follow-up)",
+                                    "oversize turn slipped past the divert pre-check; dropped",
                                 );
                             }
                             Err(error) => {
@@ -1092,6 +1155,13 @@ pub async fn run_mesh_link(
 /// - **`LeaveDirective`**: caches it (dedup by slot) and fans it out to local
 ///   survivors. It is **not** re-broadcast across the mesh — the authority already
 ///   sent it to every relay — so there is no echo.
+/// - **`OversizeTurn`**: a turn too large for the peer's datagram path, folded
+///   back into the normal turn path exactly as a datagram delivery would be —
+///   frame observation, topological dedup, buffer-directive stamping, local
+///   fan-out — trusting it like any mesh-carried turn (validated at the origin's
+///   client edge, never re-validated at a mesh hop). It too is not re-broadcast
+///   to other mesh links: the origin diverted a copy to every link serving the
+///   session itself.
 ///
 /// Kept defensive like the datagram path: a zero session id is malformed and a
 /// session this link has not joined has no key to act under; both are logged at
@@ -1101,6 +1171,7 @@ fn dispatch_mesh_control(
     frame: MeshControlFrame,
     joined: &HashMap<SessionId, SessionState>,
     sessions: &routing::Sessions,
+    seen: &SeenRegistries,
     mesh_links: &MeshLinks,
     decision_makers: &crate::consensus::DecisionMakers,
 ) {
@@ -1145,6 +1216,23 @@ fn dispatch_mesh_control(
         Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
             crate::consensus::observe_leave(decision_makers, &key, &leave);
             routing::fan_out_leave(sessions, &key, SlotId(leave.slot as u8), leave);
+        }
+        Some(mesh_control_frame::Kind::OversizeTurn(payload)) => {
+            let slot = SlotId(payload.slot as u8);
+            // The same receive step a datagram-delivered mesh turn runs: a
+            // validated remote slot's frame observation, then the shared local
+            // delivery (dedup, stamp, local fan-out). Delivery below the fan-out
+            // needs nothing new — a slot link whose client's path can't take the
+            // turn diverts it onto that client's own control stream.
+            if let Some(frame) = payload.game_frame_count {
+                crate::consensus::observe_frame(
+                    decision_makers,
+                    &key,
+                    slot,
+                    rally_point_proto::ids::GameFrameCount(frame),
+                );
+            }
+            let _ = deliver_turn_to_locals(sessions, seen, decision_makers, &key, slot, payload);
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -1546,5 +1634,79 @@ mod tests {
         departed.sort_unstable();
         assert_eq!(departed, vec![1, 2], "both departures re-announced");
         assert_eq!(directives, vec![leave], "the cached leave re-announced verbatim");
+    }
+
+    /// An oversize turn arriving over the mesh control stream folds back into
+    /// the normal receive path — its frame feeds the consensus coordinate and
+    /// the topological dedup marks it delivered (so a copy arriving by any
+    /// other path is dropped) — and it is NOT re-broadcast to other mesh links:
+    /// the origin relay diverted a copy to every link itself, so re-flooding
+    /// would only echo. (Actual delivery to a local client link is covered by
+    /// the end-to-end mesh test; the slot inbox is private to `routing`.)
+    #[test]
+    fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+        );
+
+        // A peer mesh link that must NOT hear an echo of the received turn.
+        let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        // The per-link joined state the dispatch resolves the bare session
+        // id through, as the driver would hold it after a Join.
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                },
+            },
+        );
+
+        let payload = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0xAB; 5000].into(),
+            game_frame_count: Some(7),
+            ..Default::default()
+        };
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
+        };
+        dispatch_mesh_control(frame, &joined, &sessions, &seen, &mesh_links, &makers);
+
+        // The remote slot's frame fed the consensus coordinate, exactly as a
+        // datagram-delivered turn's would.
+        assert_eq!(
+            crate::consensus::slot_frame(&makers, &key, SlotId(0)),
+            Some(GameFrameCount(7)),
+        );
+        // The turn was marked in the topological dedup: a copy arriving by any
+        // other path is a duplicate now.
+        assert_eq!(
+            mark_seen(&seen, &key, SlotId(0), 0),
+            Seen::Duplicate,
+            "the dispatch delivered (and marked) the turn",
+        );
+        // No echo: neither a datagram forward nor a control frame went back out
+        // to the mesh.
+        assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
+        assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }
 }

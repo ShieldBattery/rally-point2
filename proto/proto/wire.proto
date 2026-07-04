@@ -335,17 +335,20 @@ message LeaveDirective {
 message LeaveIntent {}
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a
-// relay-pair uses to propagate synced player-leaves across the mesh. Each mesh
-// link carries one bidirectional QUIC stream on which both relays write
-// length-prefixed `MeshControlFrame`s (same framing and size cap as
-// `ControlFrame`; see `proto::control_stream`) and read the peer's.
+// relay-pair uses for what its datagram path cannot carry: synced player-leave
+// propagation and oversize-turn divert. Each mesh link carries one
+// bidirectional QUIC stream on which both relays write length-prefixed
+// `MeshControlFrame`s (same framing and size cap as `ControlFrame`; see
+// `proto::control_stream`) and read the peer's.
 //
 // A leave that a relay's own home client triggers must reach the *other* relays'
 // local survivors too — a drop stalls every player in the game, including those
 // on peer relays — and it must reach the session's decision authority so it can
 // author the one synced `LeaveDirective` every client applies at the same frame.
 // The datagram path cannot carry that: a drop stops the turn stream the datagram
-// sidecars ride. So it rides this reliable stream, like presence does.
+// sidecars ride. So it rides this reliable stream, like presence does. An
+// oversize turn rides here for the same reason it rides the client-edge control
+// stream: no datagram bundle could ever carry (or re-carry) it.
 //
 // A oneof so more relay ↔ relay control kinds can join later without a wire
 // break: a frame whose kind a peer predates decodes with the oneof unset, and the
@@ -376,6 +379,15 @@ message MeshControlFrame {
     // fans it out to its local clients; it does not re-broadcast it across the
     // mesh, so there is no echo. See `LeaveDirective`.
     LeaveDirective leave_directive = 3;
+
+    // A turn too large for any mesh datagram, diverted here by the relay whose
+    // home client produced it — the same `Payload`, same `(slot, seq)` identity
+    // as the client-edge `ControlFrame.oversize_turn`, validated at the origin's
+    // client edge like every mesh-carried turn. The receiver folds it back into
+    // its normal turn path (topological dedup, then local fan-out) but does not
+    // re-broadcast it to other mesh links: the origin relay already diverted a
+    // copy to every link serving the session, so re-flooding would only echo.
+    Payload oversize_turn = 4;
   }
 }
 

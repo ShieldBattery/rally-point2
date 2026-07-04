@@ -278,9 +278,10 @@ impl MeshLink {
         // A payload that can never ride any datagram is refused *before* it is
         // registered as unacked (mirroring `Link::send`): registered, every
         // rebuilt bundle would try and fail to carry it while its seq holds a
-        // permanent gap in the peer's delivered prefix. The mesh has no
-        // reliable divert path yet, so the caller drops the turn and logs —
-        // cross-relay oversize turns await a mesh control stream.
+        // permanent gap in the peer's delivered prefix. This is the second line
+        // of defense — the caller pre-checks with
+        // [`payload_fits`](Self::payload_fits) and diverts oversize turns to the
+        // mesh control stream before ever calling `send`.
         if let Some(p) = &payload {
             let needed = crate::ack_manager::lone_packet_len(p);
             if needed > packet_budget {
@@ -309,6 +310,33 @@ impl MeshLink {
             }),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Whether `payload` can ever ride a mesh datagram on this connection's
+    /// current path, sized against the same budget [`send`](Self::send) applies:
+    /// the live `max_datagram_size()` minus the exact wire cost of the
+    /// `conditions` sidecar that would accompany it and the `MeshPacket`
+    /// wrapper's own overhead. The caller's pre-check for the divert path — a
+    /// payload this returns `false` for must go over the mesh control stream,
+    /// never into `send` (which would refuse it anyway, but by then the caller
+    /// has lost the payload to the move). Mirrors
+    /// [`Link::payload_fits`](crate::Link::payload_fits) on the client edge;
+    /// takes the conditions because the mesh budget, unlike the client edge's,
+    /// varies with the sidecar attached to each send.
+    pub fn payload_fits(
+        &self,
+        payload: &Payload,
+        conditions: Option<&LinkConditions>,
+    ) -> Result<bool, MeshLinkError> {
+        let datagram_budget = self
+            .connection
+            .max_datagram_size()
+            .ok_or(MeshLinkError::DatagramsUnsupported)?;
+        let conditions_overhead = conditions.map(|c| c.encoded_len()).unwrap_or(0);
+        let packet_budget = datagram_budget
+            .saturating_sub(conditions_overhead)
+            .saturating_sub(MESH_PACKET_OVERHEAD);
+        Ok(crate::ack_manager::lone_packet_len(payload) <= packet_budget)
     }
 
     /// Awaits the next datagram, demultiplexes it by session, folds its acks
@@ -889,6 +917,48 @@ mod tests {
 
         drop(sender);
         let _ = drain.await;
+    }
+
+    /// `payload_fits` sizes against the same budget `send` applies: a routine
+    /// turn fits (with or without a conditions sidecar), a turn beyond any
+    /// datagram budget does not — the caller's cue to divert it to the mesh
+    /// control stream instead of losing it to a refused `send`.
+    #[tokio::test]
+    async fn payload_fits_mirrors_the_send_budget() {
+        let (mut sender, _receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+        let session = SessionId(1);
+        sender.open_session(session);
+
+        let small = turn(0, 0, 0xA0);
+        assert!(sender.payload_fits(&small, None).unwrap());
+
+        // A full 8-slot conditions sidecar shrinks the budget but not enough to
+        // evict a routine turn.
+        let conditions = LinkConditions {
+            slots: (0..8u32)
+                .map(|slot| rally_point_proto::messages::SlotConditions {
+                    slot,
+                    rtt_us: 20_000,
+                    lost_packets: 5,
+                    sent_packets: 2000,
+                })
+                .collect(),
+        };
+        assert!(sender.payload_fits(&small, Some(&conditions)).unwrap());
+
+        // A turn far past any datagram budget must be diverted, and `send`
+        // agrees: it refuses the same payload the pre-check rejected.
+        let oversize = Payload {
+            seq: 1,
+            slot: 0,
+            commands: vec![0xAB; 5000].into(),
+            ..Default::default()
+        };
+        assert!(!sender.payload_fits(&oversize, None).unwrap());
+        assert!(matches!(
+            sender.send(session, Some(oversize), None),
+            Err(MeshLinkError::PayloadTooLarge { .. })
+        ));
     }
 
     #[test]

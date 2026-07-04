@@ -186,6 +186,23 @@ mod tests {
         let encoded = encode_frame(&leave).unwrap();
         let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
         assert_eq!(decoded, leave);
+
+        // An oversize turn diverted onto the mesh control stream: the same
+        // Payload shape the client-edge ControlFrame carries, well past any
+        // datagram budget but under the shared frame cap.
+        let oversize = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::OversizeTurn(Payload {
+                seq: 9,
+                slot: 2,
+                commands: vec![0x0C; 2000].into(),
+                game_frame_count: Some(41),
+                buffer_directive: None,
+            })),
+        };
+        let encoded = encode_frame(&oversize).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, oversize);
     }
 
     #[test]

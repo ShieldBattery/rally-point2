@@ -474,6 +474,114 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     Ok(())
 }
 
+/// `C-S===S-C` for a turn too large for any datagram: relay A's mesh forward
+/// path diverts it onto the mesh control stream (no datagram could carry it),
+/// relay B's dispatch folds it back into its normal turn path, and relay B's
+/// slot link diverts it again onto the receiving client's own control stream.
+/// Without the mesh divert this turn silently never reached B's clients — a
+/// permanent lockstep stall in any cross-relay game whose turn outgrew the
+/// datagram budget.
+#[tokio::test]
+async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Result<(), AnyError> {
+    use rally_point_transport::control::{ControlInbound, spawn_control_reader};
+
+    let tenant = make_tenant();
+    let session = SessionId(1);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+
+    // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    mesh_ep.set_default_client_config(mesh_cfg);
+    let conn_a = mesh_ep
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let conn_b = relay_b
+        .mesh_rx
+        .recv()
+        .await
+        .expect("B dispatched mesh conn");
+
+    let mesh_a = MeshLink::new(conn_a);
+    let mesh_b = MeshLink::new(conn_b);
+
+    let cmds_a = spawn_mesh_link(mesh_a, Arc::clone(&relay_a.sessions), relay_a.mesh.clone());
+    let cmds_b = spawn_mesh_link(mesh_b, Arc::clone(&relay_b.sessions), relay_b.mesh.clone());
+    cmds_a.send(mesh::MeshCommand::Join(key.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key.clone())).unwrap();
+
+    // The receiving client on relay B (slot 1), reading its control stream —
+    // that's where B's slot link delivers a turn too large for the client path.
+    let client_key_1 = keypair();
+    let token_1 = mint_token(&tenant, session, SlotId(1), client_key_1.public);
+    let mut roots_b = rustls::RootCertStore::empty();
+    roots_b.add(relay_b.ca.clone()).unwrap();
+    let client_cfg_b = client_config(roots_b).unwrap();
+    let mut client_ep_b = quinn::Endpoint::client(bind).unwrap();
+    client_ep_b.set_default_client_config(client_cfg_b);
+    let conn_slot1 = client_ep_b
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    handshake(&conn_slot1, &token_1, &client_key_1).await?;
+    let client_b = Link::new(conn_slot1);
+    let mut ctrl_b = spawn_control_reader(client_b.connection().clone());
+
+    // Let mesh drivers open their sessions on the MeshLinks.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Relay A forwards slot 0's turn, as its slot-link task would after
+    // validating it — but this one is far past any datagram budget, so A's
+    // mesh-link driver must divert it onto the mesh control stream.
+    let oversize = Payload {
+        seq: 0,
+        slot: 0,
+        commands: vec![0xAB; 5000].into(),
+        game_frame_count: Some(12),
+        ..Default::default()
+    };
+    mesh::forward_turn(
+        &relay_a.sessions,
+        &relay_a.mesh.links,
+        &relay_a.mesh.seen,
+        &relay_a.mesh.decision_makers,
+        &key,
+        SlotId(0),
+        oversize.clone(),
+    );
+
+    // Client B receives the turn on its control stream: two divert hops (mesh
+    // control stream, then the client's own), one identical payload.
+    let received = tokio::time::timeout(Duration::from_secs(2), ctrl_b.recv())
+        .await
+        .expect("client B did not receive the oversize turn within 2s")
+        .expect("client B control reader ended early");
+    let ControlInbound::OversizeTurn(delivered) = received else {
+        panic!("expected an oversize turn, got {received:?}");
+    };
+    assert_eq!(delivered.slot, 0);
+    assert_eq!(delivered.seq, 0);
+    assert_eq!(delivered.game_frame_count, Some(12));
+    assert_eq!(
+        delivered.commands, oversize.commands,
+        "the command bytes cross both divert hops verbatim",
+    );
+
+    Ok(())
+}
+
 /// `C-S===S-C` with two games on one relay-pair: a client in game 1 on relay A
 /// sends a turn; the client in game 1 on relay B receives it. The client in
 /// game 2 on relay B does *not* receive it — turns don't leak across sessions

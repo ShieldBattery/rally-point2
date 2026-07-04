@@ -6,11 +6,15 @@
 //! write length-prefixed [`MeshControlFrame`]s and read the peer's. The dialer
 //! opens the stream right after its hello and the acceptor `accept_bi`s it; each
 //! side then writes on its send half and reads the peer's on its recv half. The
-//! stream carries synced player-leave propagation — a relay tells its peers when
-//! one of its home clients departs (`SlotDeparted`), and the session's decision
-//! authority pushes the resulting synced leave to the other relays
-//! (`LeaveDirective`). A drop stops the datagram turn stream that would otherwise
-//! carry these, so — like presence — they ride a reliable stream instead.
+//! stream carries what the mesh's datagram path cannot: **synced player-leave
+//! propagation** — a relay tells its peers when one of its home clients departs
+//! (`SlotDeparted`), and the session's decision authority pushes the resulting
+//! synced leave to the other relays (`LeaveDirective`); a drop stops the
+//! datagram turn stream that would otherwise carry these, so like presence they
+//! ride a reliable stream — and the **oversize-turn divert** (`OversizeTurn`): a
+//! turn too large for any mesh datagram travels here, QUIC's stream reliability
+//! standing in for the redundancy no bundle could give it, exactly as on the
+//! client-edge control stream.
 //!
 //! This mirrors the client-edge [`control`](crate::control) reader/writer: the
 //! read loop lives in its own task so a `read_exact` never crosses a `select!`
