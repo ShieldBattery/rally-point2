@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use rally_point_proto::control::{
     PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
 };
-use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
 
 use crate::descriptors::RelayDescriptors;
@@ -45,6 +45,26 @@ use crate::tenant::{self, TenantStore};
 type SessionRelays =
     Arc<Mutex<HashMap<(rally_point_proto::control::TenantId, SessionId), Vec<RelayId>>>>;
 
+/// The tenant's own correlation ids for a session and its players, keyed by
+/// `(tenant, session)`. Recorded at `create_session` from the request and read
+/// when a departure notice arrives, so the webhook names the game + player in
+/// the tenant's own terms without the coordinator (or the tenant) keeping any
+/// other session map.
+type SessionRefsStore =
+    Arc<Mutex<HashMap<(rally_point_proto::control::TenantId, SessionId), SessionRefs>>>;
+
+/// The correlation ids a tenant attached to one session: the session's own id
+/// and the per-slot player ids. Both are optional — a request from an app server
+/// that predates the fields carries neither, and the webhook simply omits them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRefs {
+    /// The tenant's own id for the session (ShieldBattery's `gameId`).
+    pub external_id: Option<String>,
+    /// The tenant's own id for the player in each slot (a stringified
+    /// `SbUserId`). Only slots whose handoff carried an `external_ref` appear.
+    pub slots: HashMap<SlotId, String>,
+}
+
 use std::sync::Arc;
 
 /// The inputs to session setup: the registries the coordinator holds.
@@ -57,6 +77,9 @@ pub struct SessionSetup {
     /// Which relays serve which session. Populated by `create_session`,
     /// read by `descriptor_for`.
     session_relays: SessionRelays,
+    /// The tenant's correlation ids per session. Populated by `create_session`,
+    /// read by [`session_refs`] when a departure webhook is built.
+    session_refs: SessionRefsStore,
     /// Per-relay descriptor outbox — what each relay should currently apply on
     /// its mesh links. Populated by `create_session`; read by the relay's
     /// descriptor-fetch endpoint.
@@ -76,6 +99,7 @@ impl SessionSetup {
             registry,
             tenants,
             session_relays: Arc::new(Mutex::new(HashMap::new())),
+            session_refs: Arc::new(Mutex::new(HashMap::new())),
             descriptors: RelayDescriptors::new(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
         }
@@ -168,6 +192,22 @@ pub fn create_session(
         .lock()
         .insert((request.tenant.clone(), session), relay_ids.clone());
 
+    // Record the tenant's correlation ids so a later departure webhook can echo
+    // them — the notification is then self-describing (the coordinator keeps no
+    // other session→game map, and the tenant needs none either).
+    let refs = SessionRefs {
+        external_id: request.external_id.clone(),
+        slots: request
+            .players
+            .iter()
+            .filter_map(|p| p.external_ref.clone().map(|r| (p.slot, r)))
+            .collect(),
+    };
+    setup
+        .session_refs
+        .lock()
+        .insert((request.tenant.clone(), session), refs);
+
     // Stage each relay's descriptor in the outbox so the relay's descriptor
     // fetch delivers it. Built after membership is recorded, since
     // `descriptor_for` reads that membership to list a relay's mesh peers.
@@ -254,6 +294,21 @@ pub fn descriptor_for(
         // falls down this list as relays' players leave.
         authority_order: relay_ids,
     })
+}
+
+/// The tenant's correlation ids for `session`, recorded at `create_session`, or
+/// `None` if the session was never created here (or predates this coordinator
+/// lifetime). Read when a departure notice is enriched into a webhook.
+pub fn session_refs(
+    setup: &SessionSetup,
+    tenant: &rally_point_proto::control::TenantId,
+    session: SessionId,
+) -> Option<SessionRefs> {
+    setup
+        .session_refs
+        .lock()
+        .get(&(tenant.clone(), session))
+        .cloned()
 }
 
 /// Validates a session request before any work is done.
@@ -351,10 +406,12 @@ mod tests {
             PlayerHandoff {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
+                external_ref: None,
             },
             PlayerHandoff {
                 slot: SlotId(1),
                 client_pubkey: ClientPublicKey([0xBB; 32]),
+                external_ref: None,
             },
         ]
     }
@@ -365,6 +422,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
 
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
@@ -391,6 +449,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
 
@@ -431,6 +490,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -447,6 +507,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -463,6 +524,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("not-enrolled".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -480,6 +542,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![],
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -494,6 +557,7 @@ mod tests {
         let player = |slot: u8| PlayerHandoff {
             slot: SlotId(slot),
             client_pubkey: ClientPublicKey([slot; 32]),
+            external_ref: None,
         };
 
         let resp = create_session(
@@ -501,6 +565,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: (0..=11).map(player).collect(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -512,6 +577,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![player(12)],
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -526,6 +592,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -586,6 +653,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -640,6 +708,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -666,6 +735,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -705,6 +775,7 @@ mod tests {
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
+                external_id: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -721,6 +792,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX)).unwrap();
         let r2 = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
@@ -745,6 +817,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX)).unwrap();
 

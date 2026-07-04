@@ -34,6 +34,18 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use std::sync::Arc;
 
+/// Where and how the coordinator notifies a tenant of mid-game player
+/// departures: the webhook URL to POST to, and an optional bearer secret it
+/// authenticates the POST with. Absent on a tenant means departure
+/// notifications are off for it (everything else unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyConfig {
+    /// The URL the coordinator POSTs a departure webhook to.
+    pub url: String,
+    /// The bearer secret sent as `Authorization: Bearer <secret>`, if set.
+    pub secret: Option<String>,
+}
+
 /// The coordinator's view of one tenant's signing key + policy.
 #[derive(Clone)]
 struct TenantSigningKey {
@@ -50,6 +62,10 @@ struct TenantSigningKey {
     /// The latency-buffer bounds this tenant's sessions use. The coordinator
     /// sets policy (bounds); the relay's decision-maker clamps to them.
     bounds: BufferBounds,
+    /// Where the coordinator pushes departure notifications for this tenant, if
+    /// configured. Set out of band via [`set_notify`] (enrollment leaves it
+    /// `None`); absent = departure notifications off for the tenant.
+    notify: Option<NotifyConfig>,
 }
 
 impl std::fmt::Debug for TenantSigningKey {
@@ -137,9 +153,34 @@ pub fn enroll_from_pkcs8(
             tenant,
             pair: Arc::new(pair),
             bounds,
+            notify: None,
         },
     );
     Ok(pubkey)
+}
+
+/// Sets (or clears) a tenant's departure-notify config, if the tenant is
+/// enrolled. Kept separate from enrollment so the many `enroll*` call sites are
+/// unaffected: the dev flow enrolls first, then sets notify from its CLI flags.
+/// Returns whether the tenant existed (a no-op on an unknown tenant).
+pub fn set_notify(store: &TenantStore, tenant: &TenantId, notify: Option<NotifyConfig>) -> bool {
+    match store.tenants.lock().get_mut(tenant) {
+        Some(entry) => {
+            entry.notify = notify;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Looks up a tenant's departure-notify config, or `None` when the tenant is
+/// unknown or has no config (notifications off).
+pub fn notify_config(store: &TenantStore, tenant: &TenantId) -> Option<NotifyConfig> {
+    store
+        .tenants
+        .lock()
+        .get(tenant)
+        .and_then(|t| t.notify.clone())
 }
 
 /// Looks up a tenant's signing key, returning the `kid` and verifying key.

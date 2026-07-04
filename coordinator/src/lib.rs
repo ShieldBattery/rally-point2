@@ -16,6 +16,10 @@
 //!   coordinator side of the control connection. Holds each relay's current
 //!   session-descriptor set behind a watch channel and pushes it down the
 //!   relay's open control connection whenever it changes.
+//! - **notify** ([`notify`]) — the departure-webhook leg: dedup the departure
+//!   notices relays report up their control connections, enrich each with the
+//!   session's stored correlation ids + the tenant's notify config, and POST a
+//!   webhook to the tenant.
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
@@ -32,6 +36,7 @@
 
 pub mod api;
 pub mod descriptors;
+pub mod notify;
 pub mod registry;
 pub mod session;
 pub mod tenant;

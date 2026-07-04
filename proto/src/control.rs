@@ -284,6 +284,14 @@ pub struct PlayerHandoff {
     /// The client's ephemeral Ed25519 public key, embedded in the token so
     /// the relay can verify the connection-binding challenge.
     pub client_pubkey: ClientPublicKey,
+    /// The tenant's own identifier for this player (ShieldBattery sets a
+    /// stringified `SbUserId`). The coordinator stores it per slot and echoes
+    /// it in a departure webhook so the notification is self-describing —
+    /// nothing on the tenant side has to keep a session→user map. Optional so a
+    /// peer that predates the field still interops; the control protos don't
+    /// `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
 }
 
 /// A request from an app server to stand up a game session: which tenant, how
@@ -301,6 +309,13 @@ pub struct SessionRequest {
     pub tenant: TenantId,
     /// The players in the session, one per slot.
     pub players: Vec<PlayerHandoff>,
+    /// The tenant's own identifier for this session (ShieldBattery sets its
+    /// `gameId`). The coordinator stores it and echoes it in a departure
+    /// webhook, so the notification names the game without the tenant keeping a
+    /// session→game map. Optional so a peer that predates the field still
+    /// interops; the control protos don't `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// One player's completed handoff: the token the coordinator minted and the
@@ -454,10 +469,56 @@ pub enum RelayToCoordinator {
     /// can ride a later frame, which the forward-compatible envelope already
     /// accommodates without a wire break.
     Heartbeat,
+    /// A player permanently departed a running game: a synced leave for the slot
+    /// just first entered this relay's consensus cache. The relay reports it so
+    /// the coordinator can forward the "player X left vs. was dropped" fact to
+    /// the tenant. Every relay serving the session reports independently and the
+    /// coordinator dedups by `(tenant, session, slot)`, so a single relay's
+    /// coordinator link being down never loses the notice.
+    Departure(DepartureNotice),
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
     Unknown,
+}
+
+/// Whether a departing player left cleanly or was dropped, classified by the
+/// relay from the synced leave's native reason. Rides the departure webhook as
+/// `"left"` / `"dropped"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepartureKind {
+    /// A clean departure — the player quit (native `strPLAYER_LEFT`).
+    Left,
+    /// An unclean drop — the player's link died (native `strPLAYER_WAS_DROPPED`).
+    Dropped,
+}
+
+/// A relay's report that a player permanently departed a running game, sent up
+/// the relay control connection ([`RelayToCoordinator::Departure`]).
+///
+/// It carries its own `tenant`/`session`/`slot` because one relay control
+/// connection serves many sessions, so the frame must name which one. `kind` is
+/// the relay's left-vs-dropped classification; `reason` is the raw native leave
+/// reason it was classified from (kept for debugging); `leave_seq` is the
+/// deciding relay's own ordering number for the leave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepartureNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session the player departed from.
+    pub session: SessionId,
+    /// The slot that departed.
+    pub slot: SlotId,
+    /// The left-vs-dropped classification the relay derived from `reason`.
+    pub kind: DepartureKind,
+    /// The raw native `pending_leave_reason` value the relay decided
+    /// (`0x40000006` dropped, else left), carried alongside `kind` for
+    /// debugging.
+    pub reason: u32,
+    /// The deciding relay's ordering number for this leave. Not a dedup key on
+    /// its own (the coordinator dedups by slot); useful telemetry.
+    pub leave_seq: u32,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -650,9 +711,83 @@ mod tests {
         let h = PlayerHandoff {
             slot: SlotId(3),
             client_pubkey: ClientPublicKey([0x42; 32]),
+            external_ref: Some("sb-user-77".to_owned()),
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: PlayerHandoff = serde_json::from_str(&json).unwrap();
         assert_eq!(back, h);
+    }
+
+    #[test]
+    fn session_request_without_external_id_decodes() {
+        // A request from an app server that predates the correlation ids must
+        // still decode — the field is optional and defaults to `None`, so old
+        // and new peers interop (the control protos don't `deny_unknown_fields`).
+        let json = r#"{
+            "tenant":"sb-staging",
+            "players":[{"slot":0,"client_pubkey":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]}]
+        }"#;
+        let back: SessionRequest = serde_json::from_str(json).unwrap();
+        assert!(back.external_id.is_none());
+        assert!(
+            back.players[0].external_ref.is_none(),
+            "a player handoff without external_ref decodes to None too",
+        );
+    }
+
+    #[test]
+    fn session_request_omits_absent_correlation_ids_on_the_wire() {
+        // `skip_serializing_if` keeps an unset id off the wire, so a new
+        // encoder talking to an old decoder emits exactly the old shape.
+        let req = SessionRequest {
+            tenant: TenantId("sb-staging".to_owned()),
+            players: vec![PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0x11; 32]),
+                external_ref: None,
+            }],
+            external_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("external_id"));
+        assert!(!json.contains("external_ref"));
+    }
+
+    #[test]
+    fn departure_roundtrips_json() {
+        let notice = DepartureNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            slot: SlotId(2),
+            kind: DepartureKind::Dropped,
+            reason: 0x4000_0006,
+            leave_seq: 1,
+        };
+        let message = RelayToCoordinator::Departure(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        // The notice's fields ride alongside the tag (internally tagged), and
+        // the kind serializes snake_case.
+        assert!(json.contains("\"type\":\"departure\""));
+        assert!(json.contains("\"kind\":\"dropped\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn departure_kind_left_serializes_snake_case() {
+        let json = serde_json::to_string(&DepartureKind::Left).unwrap();
+        assert_eq!(json, r#""left""#);
+    }
+
+    #[test]
+    fn departure_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility, made concrete: `Departure` is an up-frame the
+        // relay sends. A decoder that predates it — here the *down*-direction
+        // `CoordinatorToRelay`, which has no `Departure` — must fold the frame
+        // into its `Unknown` catch-all rather than erroring, exactly as an older
+        // coordinator build would. This is the "old peer sees a new frame" path.
+        let json = r#"{"type":"departure","tenant":"sb-staging","session":42,"slot":2,"kind":"dropped","reason":1073741830,"leave_seq":1}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }
 }

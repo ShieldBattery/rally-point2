@@ -26,6 +26,13 @@ clap = { workspace = true }
 color-eyre = { workspace = true }
 hex = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The departure webhook client (coordinator → tenant). Plain-HTTP over hyper +
+# hyper-util — already in the tree via axum, so no new crypto stack (keeps the
+# ring-only, aws-lc-rs-free pin intact).
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 rally-point-relay = { workspace = true }

@@ -103,6 +103,21 @@ axum = { version = "0.8", default-features = false, features = [
 # tower's `ServiceExt::oneshot` drives the coordinator's HTTP router in tests
 # without binding a socket.
 tower = { version = "0.5", default-features = false }
+# The coordinator's departure webhook client (coordinator → tenant app server).
+# Built directly on hyper + hyper-util rather than reqwest: hyper is already in
+# the tree via axum, so no new transitive crypto stack is pulled — the workspace
+# deliberately pins ring-only TLS (no aws-lc-rs, which breaks the 32-bit /
+# NASM-free Windows MSVC build), and reqwest's rustls provider selection is
+# fragile against that pin. This client is plain-HTTP (`build_http`), which is
+# sufficient for the dev notify flow; an https notify URL would need a rustls
+# (ring) connector wired in — a prod TODO, called out at the client.
+hyper = { version = "1.10", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+http-body-util = "0.1"
 # WebSocket client for the relay's persistent control connection to the
 # coordinator. `rustls-tls-webpki-roots` enables wss:// over rustls; the crate
 # brings rustls/tokio-rustls with default-features off, so it rides this

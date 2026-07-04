@@ -10,7 +10,8 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
-use rally_point_coordinator::{registry, session, tenant};
+use rally_point_coordinator::tenant::NotifyConfig;
+use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{BufferBounds, TenantId};
 use rally_point_proto::token::KeyId;
 
@@ -74,6 +75,24 @@ struct Cli {
     /// relay's `--tenant-pubkey`, the private so it can be pinned next run).
     #[arg(long, env = "COORDINATOR_TENANT_KEY", requires = "dev_tenant")]
     tenant_key: Option<String>,
+
+    /// Webhook URL the coordinator POSTs a player-departure notification to for
+    /// the dev tenant (e.g. `http://localhost:5555/webhooks/netcode-v2/departures`).
+    /// Only meaningful with `--dev-tenant`; unset = departure notifications off
+    /// (everything else unchanged). Plain `http://` for dev — an `https://` URL
+    /// needs a TLS connector the webhook client does not yet wire.
+    #[arg(long, env = "COORDINATOR_DEV_NOTIFY_URL", requires = "dev_tenant")]
+    dev_notify_url: Option<String>,
+
+    /// Bearer secret the coordinator sends on the departure webhook
+    /// (`Authorization: Bearer <secret>`), matching the consumer's expected
+    /// secret. Only meaningful with `--dev-notify-url`; unset = no auth header.
+    #[arg(
+        long,
+        env = "COORDINATOR_DEV_NOTIFY_SECRET",
+        requires = "dev_notify_url"
+    )]
+    dev_notify_secret: Option<String>,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
@@ -117,6 +136,7 @@ async fn main() -> Result<()> {
 
     let state = CoordinatorState {
         setup,
+        departures: notify::new_dedup(),
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
@@ -146,12 +166,13 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
     let verifying_key = match &cli.tenant_key {
         Some(input) => {
             let pkcs8 = read_hex_input(input, "tenant key")?;
-            tenant::enroll_from_pkcs8(tenants, kid, tenant_id, dev_tenant_bounds(), &pkcs8)
+            tenant::enroll_from_pkcs8(tenants, kid, tenant_id.clone(), dev_tenant_bounds(), &pkcs8)
                 .context("enrolling dev tenant from --tenant-key")?
         }
         None => {
-            let generated = tenant::enroll_generated(tenants, kid, tenant_id, dev_tenant_bounds())
-                .context("enrolling dev tenant")?;
+            let generated =
+                tenant::enroll_generated(tenants, kid, tenant_id.clone(), dev_tenant_bounds())
+                    .context("enrolling dev tenant")?;
             tracing::warn!(
                 pkcs8_hex = %hex::encode(&generated.pkcs8),
                 "generated a dev tenant keypair — pass --tenant-key <pkcs8_hex> to keep the \
@@ -160,6 +181,25 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
             generated.verifying_key
         }
     };
+
+    // Wire the dev tenant's departure webhook, if configured. `--dev-notify-url`
+    // requires `--dev-tenant` (clap), so this only runs for the enrolled tenant.
+    if let Some(url) = &cli.dev_notify_url {
+        tenant::set_notify(
+            tenants,
+            &tenant_id,
+            Some(NotifyConfig {
+                url: url.clone(),
+                secret: cli.dev_notify_secret.clone(),
+            }),
+        );
+        tracing::info!(
+            tenant = %cli.tenant,
+            url = %url,
+            has_secret = cli.dev_notify_secret.is_some(),
+            "dev tenant departure webhook configured",
+        );
+    }
 
     tracing::info!(
         tenant = %cli.tenant,

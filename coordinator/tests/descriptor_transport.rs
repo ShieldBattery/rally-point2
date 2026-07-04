@@ -14,9 +14,10 @@ use std::time::Duration;
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{registry, session, tenant};
+use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, PlayerHandoff, RelayHello, RelayToCoordinator, SessionRequest, TenantId,
+    BufferBounds, DepartureNotice, PlayerHandoff, RelayHello, RelayToCoordinator, SessionRequest,
+    TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -33,6 +34,13 @@ const TENANT: &str = "sb-test";
 /// A generous liveness deadline for tests that don't exercise the timeout — long
 /// enough that no enrolled relay is ever deregistered for going silent.
 const LIVENESS: Duration = Duration::from_secs(30);
+
+/// A departure drain that never receives anything: these descriptor-transport
+/// tests don't exercise leave notification, so the subscriber's notifier arm
+/// simply idles (the sender is dropped, so the arm disables itself).
+fn no_departures() -> mpsc::UnboundedReceiver<DepartureNotice> {
+    mpsc::unbounded_channel().1
+}
 
 fn session_key(session: SessionId) -> SessionKey {
     SessionKey {
@@ -91,6 +99,7 @@ async fn serve_bare_coordinator(
     let setup = session::SessionSetup::new(reg.clone(), tenant::new_store());
     let app = api::router(CoordinatorState {
         setup,
+        departures: notify::new_dedup(),
         control_auth: ControlAuth::Open,
         hello_timeout,
         liveness_timeout,
@@ -133,12 +142,15 @@ async fn coordinator_with_session(
                 PlayerHandoff {
                     slot: SlotId(0),
                     client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: None,
                 },
                 PlayerHandoff {
                     slot: SlotId(1),
                     client_pubkey: ClientPublicKey([0xBB; 32]),
+                    external_ref: None,
                 },
             ],
+            external_id: None,
         },
         ExpiresAt(u64::MAX),
     )
@@ -152,6 +164,7 @@ async fn coordinator_with_session(
     };
     let app = api::router(CoordinatorState {
         setup,
+        departures: notify::new_dedup(),
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
@@ -192,6 +205,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         relay_hello(1, 14900),
         Some(secret.to_owned()),
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -215,6 +229,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         relay_hello(1, 14900),
         None,
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -250,6 +265,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         relay_hello(1, 14900),
         Some("wrong-secret".to_owned()),
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -280,6 +296,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         relay_hello(5, 15000),
         None,
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -359,6 +376,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         relay_hello(7, 15007),
         None,
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_secs(3600), // effectively no heartbeat during the test
     ));
@@ -429,6 +447,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         relay_hello(7, 15007),
         None,
         control,
+        no_departures(),
         Duration::from_millis(50),
         Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
     ));

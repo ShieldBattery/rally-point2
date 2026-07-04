@@ -58,14 +58,15 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{LeaveDirective, LinkConditions, Payload, SlotConditions};
-use rally_point_transport::control::ControlInbound;
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
+use rally_point_transport::control::ControlInbound;
 use rally_point_transport::quinn::VarInt;
 use rally_point_transport::{Link, LinkError};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 
 use crate::consensus;
+use crate::consensus::LEAVE_REASON_DROPPED;
 use crate::validation::validate_turn;
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
@@ -115,14 +116,12 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 /// window (4096) so it trips before a hard reject.
 const UNACKED_WINDOW_CAP: usize = 1024;
 
-/// The native SC:R `pending_leave_reason` value for a *dropped* player (shows
-/// "player was dropped"), written into every remaining client's leave mailbox by
-/// the synced-leave pass. A client's link ending — whether it quit, its network
-/// died, or we isolated it for lagging — surfaces here as a drop; a clean quit
-/// sends a leave-intent up the control stream first, which the relay decides
-/// under [`LEAVE_REASON_LEFT`] instead so survivors see "player left", and the
-/// game side supplies its own reason for a player-requested drop.
-const LEAVE_REASON_DROPPED: u32 = 0x4000_0006;
+// The native SC:R `pending_leave_reason` value for a *dropped* player (shows
+// "player was dropped") lives in `consensus`, which also classifies a departure
+// notice from it — one source of truth for the dropped-vs-left boundary. A
+// client's link ending (quit, network death, or isolation for lagging) surfaces
+// as a drop; a clean quit sends a leave-intent first, decided under
+// `LEAVE_REASON_LEFT` so survivors see "player left".
 
 /// The native SC:R `pending_leave_reason` value a voluntary quit produces on
 /// every other client natively (shows "player left"): this is exactly what

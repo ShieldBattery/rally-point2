@@ -156,12 +156,20 @@
 //! constant that a large cushion could outrun.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-use rally_point_proto::control::BufferBounds;
+use rally_point_proto::control::{BufferBounds, DepartureKind, DepartureNotice};
 use rally_point_proto::ids::{GameFrameCount, SlotId};
 use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::routing::SessionKey;
+
+/// The native `pending_leave_reason` value for an unclean drop
+/// (`strPLAYER_WAS_DROPPED`). Any other nonzero reason renders as "player left".
+/// A departure is classified for the coordinator by comparing against this
+/// value, so the one source of truth lives here alongside the leave decision.
+pub const LEAVE_REASON_DROPPED: u32 = 0x4000_0006;
 
 /// The buffer size in turns. StarCraft's `net_user_latency` is the added
 /// user latency (0/1/2 in the native game); the decision-maker may widen past
@@ -580,9 +588,17 @@ impl DecisionMaker {
     /// broadcasting -- only the authority stamps.
     ///
     /// Returns the synced leaves a promotion (Peer -> SelfRelay) must (re)broadcast
-    /// -- see [`set_authority`](Self::set_authority); empty otherwise.
+    /// -- see [`set_authority`](Self::set_authority); empty otherwise. The second
+    /// element names which of those are **freshly derived** by this call (a first
+    /// insert into the directive cache, not a verbatim re-broadcast of one already
+    /// cached) -- see [`set_authority`](Self::set_authority) for why the caller
+    /// needs the distinction.
     #[must_use]
-    pub fn sync(&mut self, bounds: BufferBounds, authority: Authority) -> Vec<LeaveDirective> {
+    pub fn sync(
+        &mut self,
+        bounds: BufferBounds,
+        authority: Authority,
+    ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         self.bounds = bounds;
         self.set_authority(authority)
     }
@@ -608,10 +624,23 @@ impl DecisionMaker {
     /// re-delivering a leave every survivor already applied costs a few redundant
     /// frames, bounded by the slot count -- while skipping one a stalled survivor
     /// never received would strand it forever.
+    ///
+    /// Returns `(all, fresh)`: `all` is every leave to (re)broadcast, `fresh` is
+    /// the subset that is a **first insert** into the directive cache this call --
+    /// a departure re-derived because no directive escaped the dead authority. A
+    /// verbatim re-broadcast of an already-cached directive is not in `fresh`:
+    /// whichever relay cached it first already reported it, so re-announcing it
+    /// again on every promotion would double-count the departure. The registry-
+    /// level free function uses `fresh` to fire exactly one departure notice per
+    /// slot, by whichever path (`decide_leave`, `observe_leave`, or this one)
+    /// first grows the cache.
     #[must_use]
-    pub fn set_authority(&mut self, authority: Authority) -> Vec<LeaveDirective> {
+    pub fn set_authority(
+        &mut self,
+        authority: Authority,
+    ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         if self.authority == authority {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let promoting = self.authority == Authority::Peer && authority == Authority::SelfRelay;
         self.authority = authority;
@@ -624,7 +653,7 @@ impl DecisionMaker {
         if promoting {
             self.drain_handoff_leaves()
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     }
 
@@ -632,7 +661,8 @@ impl DecisionMaker {
     /// leave is lost when authority moves off a relay that had decided (or should
     /// have decided) one. Every cached directive is re-emitted verbatim, and
     /// every recorded departure without a cached directive is decided fresh and
-    /// cached. See [`set_authority`](Self::set_authority).
+    /// cached. See [`set_authority`](Self::set_authority) for the `(all, fresh)`
+    /// shape.
     ///
     /// Deliberately **unconditional** -- there is no "already applied everywhere,
     /// skip it" test, because the relay cannot make one. The frames it observes
@@ -643,39 +673,48 @@ impl DecisionMaker {
     /// it. A predicate that is true in both states cannot gate the one
     /// re-delivery that would unstall a survivor the original push missed, so
     /// the leave is always re-sent and every consumer dedups by slot instead.
-    fn drain_handoff_leaves(&mut self) -> Vec<LeaveDirective> {
-        let session = self.session_frame().map(|f| f.0);
+    ///
+    /// The fresh derivation runs through [`decide_leave`](Self::decide_leave)
+    /// itself (not a hand-rolled duplicate of its logic) -- at this point
+    /// `self.authority` is already `SelfRelay` (the caller set it just above) and
+    /// the slot is confirmed not yet cached, so `decide_leave` always succeeds
+    /// unless there is no frame basis yet (the same "hold" it already documents).
+    /// Routing through it means a promotion-derived leave is indistinguishable
+    /// from any other `decide_leave` call, including the first-insert bookkeeping
+    /// the departure notifier keys on -- a promotion that derives a leave for a
+    /// slot no relay ever cached before (the case a 2-relay topology hits when the
+    /// only other relay is the one that just died) is exactly as much a "first
+    /// insert" as the authoring relay's own `decide_leave` would have been, and
+    /// must fire the same one notice.
+    fn drain_handoff_leaves(&mut self) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         let mut leaves = Vec::new();
+        let mut fresh = Vec::new();
 
-        // Cached directives (authored or observed): re-broadcast verbatim.
+        // Cached directives (authored or observed): re-broadcast verbatim. Never
+        // "fresh" -- the cache already held these, so whichever relay first
+        // cached them already reported the departure.
         leaves.extend(self.decided_leaves.values().copied());
 
         // Departures with no cached directive: the previous authority never got
-        // to author one (or died before it escaped), so decide fresh. Collect
-        // first to avoid holding an immutable borrow across the mutations below.
-        let to_derive: Vec<(SlotId, Departure)> = self
+        // to author one (or died before it escaped), so decide fresh through
+        // `decide_leave`. Collect first to avoid holding an immutable borrow
+        // across the mutation.
+        let to_derive: Vec<(SlotId, u32)> = self
             .departures
             .iter()
             .filter(|(slot, _)| !self.decided_leaves.contains_key(slot))
-            .map(|(slot, departure)| (*slot, *departure))
+            .map(|(slot, departure)| (*slot, departure.reason))
             .collect();
-        for (slot, departure) in to_derive {
-            let last = departure.last_frame.map(|f| f.0);
-            let Some(base) = leave_base_frame(last, session) else {
-                continue; // no frame basis yet -- hold, exactly as decide_leave does
-            };
-            self.next_leave_seq += 1;
-            let directive = LeaveDirective {
-                slot: u32::from(slot.0),
-                reason: departure.reason,
-                apply_at_frame: base.saturating_add(1),
-                leave_seq: self.next_leave_seq,
-            };
-            self.decided_leaves.insert(slot, directive);
-            leaves.push(directive);
+        for (slot, reason) in to_derive {
+            if let Some(directive) = self.decide_leave(slot, reason) {
+                leaves.push(directive);
+                fresh.push(directive);
+            }
+            // `None` means no frame basis yet (a lobby-era departure) -- hold,
+            // exactly as a direct `decide_leave` call would.
         }
 
-        leaves
+        (leaves, fresh)
     }
 
     /// Ingests this relay's own home-client `LinkConditions` (conditions the
@@ -992,10 +1031,16 @@ impl DecisionMaker {
     /// -- that would mean two relays decided the same slot's leave differently, an
     /// authority bug. Keeps `next_leave_seq` at least the observed seq so a
     /// promoted relay's own numbering never collides with what clients hold.
-    pub fn observe_leave(&mut self, leave: &LeaveDirective) {
+    ///
+    /// Returns whether this was a **first insert** for the slot — the moment the
+    /// directive cache gains the slot — so the caller fires exactly one departure
+    /// notice per (session, slot) on this relay (a redundant copy, a second mesh
+    /// path, or a reconcile-on-join re-send all return `false`).
+    #[must_use]
+    pub fn observe_leave(&mut self, leave: &LeaveDirective) -> bool {
         use std::collections::hash_map::Entry;
         let slot = SlotId(leave.slot as u8);
-        match self.decided_leaves.entry(slot) {
+        let inserted = match self.decided_leaves.entry(slot) {
             Entry::Occupied(existing) => {
                 if existing.get() != leave {
                     tracing::warn!(
@@ -1007,14 +1052,17 @@ impl DecisionMaker {
                         "conflicting synced leave for a slot already cached; keeping the first",
                     );
                 }
+                false
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(*leave);
+                true
             }
-        }
+        };
         if leave.leave_seq > self.next_leave_seq {
             self.next_leave_seq = leave.leave_seq;
         }
+        inserted
     }
 
     /// This slot's last observed game frame, or `None` before its first framed
@@ -1124,17 +1172,93 @@ fn leave_base_frame(slot_last: Option<u32>, session: Option<u32>) -> Option<u32>
     slot_last.or(session)
 }
 
-/// A registry of per-session decision-makers, one per session this relay is
-/// (or may become) the authority for. Shared across the slot-link and
-/// mesh-link tasks that feed conditions in. A plain (non-async) mutex mirrors
-/// `MeshLinks` and `routing::Sessions`: every critical section is a short,
-/// await-free insert or lookup, so the lock is never held across a turn's
-/// delivery.
-pub type DecisionMakers = parking_lot::Mutex<HashMap<SessionKey, DecisionMaker>>;
+/// The per-session decision-maker map behind [`DecisionMakers`]. A plain
+/// (non-async) mutex mirrors `MeshLinks` and `routing::Sessions`: every critical
+/// section is a short, await-free insert or lookup, so the lock is never held
+/// across a turn's delivery.
+type MakerMap = HashMap<SessionKey, DecisionMaker>;
 
-/// Creates an empty decision-maker registry for a relay with no sessions yet.
+/// A registry of per-session decision-makers, one per session this relay is
+/// (or may become) the authority for. Shared across the slot-link and mesh-link
+/// tasks that feed conditions in.
+///
+/// It also owns an optional **departure notifier** — the sender half of an
+/// unbounded channel drained by the coordinator control connection. The leave
+/// sites ([`decide_leave`], [`observe_leave`]) fire a [`DepartureNotice`] onto
+/// it the moment a synced leave for a slot first enters this relay's cache, so
+/// the coordinator learns "player X left vs. was dropped". The notifier is set
+/// once at startup when a coordinator is configured and is simply absent when
+/// the relay runs standalone (no coordinator to notify), where firing is a
+/// no-op.
+///
+/// `Default` (an empty map, no notifier) is what `Arc::<DecisionMakers>::default`
+/// builds where a registry is created without going through
+/// [`new_decision_makers`] — the same empty state.
+#[derive(Default)]
+pub struct DecisionMakers {
+    makers: parking_lot::Mutex<MakerMap>,
+    /// Set once at startup, drains into the coordinator control connection.
+    /// Absent for a standalone relay. Unbounded so queueing a notice while the
+    /// coordinator link is down never blocks the turn path — the drain end holds
+    /// the channel across reconnects and flushes pending notices on redial.
+    departures: OnceLock<UnboundedSender<DepartureNotice>>,
+}
+
+impl DecisionMakers {
+    /// Locks the per-session map. Kept method-shaped (rather than exposing the
+    /// mutex directly) so every existing `registry.lock()` call site is
+    /// unchanged by the registry gaining the departure notifier.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, MakerMap> {
+        self.makers.lock()
+    }
+
+    /// Installs the departure notifier — the sender half of the channel the
+    /// coordinator control connection drains. Set once at startup; a second call
+    /// is ignored (the first sender wins), matching the "one coordinator link
+    /// per relay" reality.
+    pub fn set_departure_notifier(&self, sender: UnboundedSender<DepartureNotice>) {
+        let _ = self.departures.set(sender);
+    }
+
+    /// Fires a departure notice up the coordinator control connection, if a
+    /// notifier is installed. A no-op on a standalone relay. The channel is
+    /// unbounded, so this never blocks; a send error means the drain end is gone
+    /// (no coordinator subscriber), which for a standalone relay is expected.
+    fn notify_departure(&self, notice: DepartureNotice) {
+        if let Some(sender) = self.departures.get() {
+            let _ = sender.send(notice);
+        }
+    }
+}
+
+/// Creates an empty decision-maker registry for a relay with no sessions yet,
+/// and no departure notifier installed (a standalone relay, or before startup
+/// wiring calls [`DecisionMakers::set_departure_notifier`]).
 pub fn new_decision_makers() -> DecisionMakers {
-    parking_lot::Mutex::new(HashMap::new())
+    DecisionMakers {
+        makers: parking_lot::Mutex::new(HashMap::new()),
+        departures: OnceLock::new(),
+    }
+}
+
+/// Builds the departure notice for a synced leave that just first entered this
+/// relay's cache: classifies left-vs-dropped from the native `reason`, and
+/// carries the raw reason and the deciding relay's `leave_seq` for the
+/// coordinator's telemetry. The slot comes straight off the directive (the
+/// relay-authoritative departing slot).
+fn departure_notice(key: &SessionKey, leave: &LeaveDirective) -> DepartureNotice {
+    DepartureNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        slot: SlotId(leave.slot as u8),
+        kind: if leave.reason == LEAVE_REASON_DROPPED {
+            DepartureKind::Dropped
+        } else {
+            DepartureKind::Left
+        },
+        reason: leave.reason,
+        leave_seq: leave.leave_seq,
+    }
 }
 
 /// Creates a decision-maker for `key`, or reconciles an existing one with the
@@ -1144,6 +1268,13 @@ pub fn new_decision_makers() -> DecisionMakers {
 /// the descriptor rather than stay frozen at whatever the first push said --
 /// a frozen verdict could leave a session with two authorities or none.
 /// Condition history survives a re-push (see [`DecisionMaker::sync`]).
+///
+/// A promotion can *freshly derive* a leave for a departure no relay ever
+/// cached before (the directive never escaped the dead authority) -- that is
+/// as much a first insert into this relay's cache as `decide_leave`/
+/// `observe_leave` firing one, so it fires exactly one departure notice too;
+/// a verbatim re-broadcast of an already-cached directive fires nothing (the
+/// relay that cached it first already reported it).
 #[must_use]
 pub fn sync_maker(
     registry: &DecisionMakers,
@@ -1152,19 +1283,25 @@ pub fn sync_maker(
     authority: Authority,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
-    let mut makers = registry.lock();
-    match makers.entry(key.clone()) {
-        Entry::Occupied(mut existing) => existing.get_mut().sync(bounds, authority),
-        Entry::Vacant(vacant) => {
-            vacant.insert(DecisionMaker::new(
-                key.clone(),
-                bounds,
-                ControlLaw::default(),
-                authority,
-            ));
-            Vec::new()
+    let (leaves, fresh) = {
+        let mut makers = registry.lock();
+        match makers.entry(key.clone()) {
+            Entry::Occupied(mut existing) => existing.get_mut().sync(bounds, authority),
+            Entry::Vacant(vacant) => {
+                vacant.insert(DecisionMaker::new(
+                    key.clone(),
+                    bounds,
+                    ControlLaw::default(),
+                    authority,
+                ));
+                (Vec::new(), Vec::new())
+            }
         }
+    };
+    for leave in &fresh {
+        registry.notify_departure(departure_notice(key, leave));
     }
+    leaves
 }
 
 /// Applies a fresh authority verdict to a session's decision-maker, if the
@@ -1175,20 +1312,27 @@ pub fn sync_maker(
 /// descriptor pushes. A no-op when no maker exists — a maker is only ever created
 /// by a descriptor, which carries the bounds a maker cannot exist without. The
 /// caller pushes the returned leaves down local survivors and across the mesh.
+///
+/// A promotion that freshly derives a leave (no relay ever cached this
+/// departure's directive before) fires exactly one departure notice for it,
+/// same as `decide_leave`/`observe_leave`; a verbatim re-broadcast of an
+/// already-cached directive fires nothing.
 #[must_use]
 pub fn set_authority(
     registry: &DecisionMakers,
     key: &SessionKey,
     authority: Authority,
 ) -> Vec<LeaveDirective> {
-    let mut guard = registry.lock();
-    let Some(maker) = guard.get_mut(key) else {
-        return Vec::new();
+    let (leaves, fresh) = {
+        let mut guard = registry.lock();
+        let Some(maker) = guard.get_mut(key) else {
+            return Vec::new();
+        };
+        if maker.authority == authority {
+            return Vec::new();
+        }
+        maker.set_authority(authority)
     };
-    if maker.authority == authority {
-        return Vec::new();
-    }
-    let leaves = maker.set_authority(authority);
     tracing::info!(
         tenant = key.tenant.as_ref(),
         session = key.session.0,
@@ -1196,6 +1340,9 @@ pub fn set_authority(
         rebroadcast_leaves = leaves.len(),
         "presence moved the session's buffer authority",
     );
+    for leave in &fresh {
+        registry.notify_departure(departure_notice(key, leave));
+    }
     leaves
 }
 
@@ -1218,9 +1365,18 @@ pub fn record_departure(
 /// Caches a synced leave a peer relay's authority authored (received off the
 /// mesh) into the session's decision-maker, if the relay has one, so a later
 /// promotion re-broadcasts it verbatim. A no-op when no maker exists.
+///
+/// On a **first insert** for the slot — the leave newly entering this relay's
+/// cache — fires one departure notice up the coordinator connection. A redundant
+/// copy (a second mesh path, a reconcile-on-join re-send) inserts nothing and
+/// fires nothing, so the coordinator sees at most one notice per relay per slot.
 pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) {
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.observe_leave(leave);
+    let inserted = match registry.lock().get_mut(key) {
+        Some(maker) => maker.observe_leave(leave),
+        None => false,
+    };
+    if inserted {
+        registry.notify_departure(departure_notice(key, leave));
     }
 }
 
@@ -1233,7 +1389,10 @@ pub fn slot_frame(
     key: &SessionKey,
     slot: SlotId,
 ) -> Option<GameFrameCount> {
-    registry.lock().get(key).and_then(|maker| maker.slot_frame(slot))
+    registry
+        .lock()
+        .get(key)
+        .and_then(|maker| maker.slot_frame(slot))
 }
 
 /// This relay's known leave state for `key` — every recorded departure and every
@@ -1331,6 +1490,10 @@ pub fn decide_leave(
 ) -> Option<LeaveDirective> {
     let directive = registry.lock().get_mut(key)?.decide_leave(slot, reason)?;
     log_leave(key, &directive);
+    // `decide_leave` returns `Some` only on the authority's first decision for
+    // the slot (it dedups internally), so this is the one departure notice the
+    // authoring relay sends for it.
+    registry.notify_departure(departure_notice(key, &directive));
     Some(directive)
 }
 
@@ -2016,6 +2179,160 @@ mod tests {
         assert!(!registry.lock().contains_key(&k));
     }
 
+    // -- Departure notifier --
+
+    /// Deciding a leave on the authority fires exactly one departure notice for
+    /// the slot, classified from the reason; a duplicate signal for the same slot
+    /// decides nothing and so fires no second notice.
+    #[test]
+    fn decide_leave_fires_one_departure_notice_on_the_authority() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+
+        // A framed turn from slot 0 gives decide_leave a basis to schedule.
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(50));
+
+        let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("a leave is decided");
+        let notice = rx.try_recv().expect("exactly one departure notice");
+        assert_eq!(notice.tenant, k.tenant);
+        assert_eq!(notice.session, k.session);
+        assert_eq!(notice.slot, SlotId(1));
+        assert_eq!(notice.kind, DepartureKind::Dropped, "0x40000006 is a drop");
+        assert_eq!(notice.reason, DROPPED);
+        assert_eq!(notice.leave_seq, leave.leave_seq);
+        assert!(rx.try_recv().is_err(), "just the one");
+
+        // A duplicate departure signal for the slot decides nothing (already
+        // cached), so no second notice fires.
+        assert_eq!(decide_leave(&registry, &k, SlotId(1), DROPPED), None);
+        assert!(
+            rx.try_recv().is_err(),
+            "no re-fire for an already-decided slot",
+        );
+    }
+
+    /// A non-authority relay observing a peer authority's leave off the mesh
+    /// fires exactly one notice on the first insert, classified "left" for a
+    /// non-drop reason; a redundant re-observe (a second mesh path or a
+    /// reconcile-on-join re-send) fires nothing.
+    #[test]
+    fn observe_leave_fires_one_departure_notice_on_first_insert() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+
+        let leave = LeaveDirective {
+            slot: 2,
+            reason: 3,
+            apply_at_frame: 90,
+            leave_seq: 7,
+        };
+        observe_leave(&registry, &k, &leave);
+        let notice = rx.try_recv().expect("one notice on the first insert");
+        assert_eq!(notice.slot, SlotId(2));
+        assert_eq!(
+            notice.kind,
+            DepartureKind::Left,
+            "reason 3 is a clean leave"
+        );
+        assert_eq!(notice.reason, 3);
+        assert_eq!(notice.leave_seq, 7);
+        assert!(rx.try_recv().is_err());
+
+        // A redundant copy is not a first insert, so it fires nothing.
+        observe_leave(&registry, &k, &leave);
+        assert!(rx.try_recv().is_err(), "no re-fire for a redundant copy");
+    }
+
+    /// With no notifier installed (a standalone relay), the leave path still
+    /// works and firing is a silent no-op — nothing to send to.
+    #[test]
+    fn a_standalone_relay_decides_leaves_without_a_notifier() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    }
+
+    /// Promotion re-derivation must ALSO fire a departure notice, not just
+    /// `decide_leave`/`observe_leave`. This is the case a 2-relay topology hits
+    /// when the authority dies: the *only* other relay recorded the departure
+    /// (off the mesh `SlotDeparted`) but, as a peer, never decided — so no
+    /// directive ever entered *any* relay's cache and no notice ever fired for
+    /// this slot anywhere. The freshly promoted relay's re-derivation is the
+    /// first (and only) time this slot's directive enters a cache, so it must
+    /// fire the one notice itself, with the recorded reason/kind — otherwise
+    /// the departure is silently lost end to end.
+    #[test]
+    fn promotion_re_derivation_fires_exactly_one_departure_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+
+        // Starts as a peer: it records a departure off a mesh `SlotDeparted` but
+        // never decides (not the authority), so nothing is cached and nothing
+        // fires yet.
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), 3);
+        assert!(rx.try_recv().is_err(), "recording alone fires nothing");
+
+        // Promoted (the dead authority was the only other relay in the
+        // topology): the departure has no cached directive anywhere, so this
+        // relay derives it fresh — a first insert into its cache — and must
+        // fire the one notice for it.
+        let leaves = set_authority(&registry, &k, Authority::SelfRelay);
+        assert_eq!(leaves.len(), 1, "the re-derived leave still broadcasts");
+
+        let notice = rx
+            .try_recv()
+            .expect("exactly one departure notice fires on the re-derivation");
+        assert_eq!(notice.slot, SlotId(1));
+        assert_eq!(
+            notice.kind,
+            DepartureKind::Left,
+            "reason 3 is a clean leave"
+        );
+        assert_eq!(notice.reason, 3);
+        assert_eq!(notice.leave_seq, leaves[0].leave_seq);
+        assert!(rx.try_recv().is_err(), "just the one");
+    }
+
+    /// The verbatim-re-broadcast half of the same rule: a directive already in
+    /// the cache before promotion must NOT re-fire — the relay that cached it
+    /// first (via `decide_leave` or `observe_leave`) already reported it, so a
+    /// promotion re-announcing it verbatim would double-count the departure.
+    #[test]
+    fn promotion_does_not_refire_an_already_cached_directive() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_departure_notifier(tx);
+
+        // Authored while the authority: decide_leave fires the one notice.
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+        assert!(rx.try_recv().is_ok(), "decide_leave fires the one notice");
+
+        // Demoted, then re-promoted: the cached directive re-broadcasts
+        // verbatim, not fresh — no second notice.
+        let _ = set_authority(&registry, &k, Authority::Peer);
+        let _ = set_authority(&registry, &k, Authority::SelfRelay);
+        assert!(
+            rx.try_recv().is_err(),
+            "a verbatim re-broadcast of an already-cached leave must not re-fire",
+        );
+    }
+
     // -- Synced player-leave (decide_leave) --
 
     const DROPPED: u32 = 0x4000_0006;
@@ -2028,10 +2345,15 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
 
-        let d = maker.decide_leave(SlotId(1), DROPPED).expect("a leave is scheduled");
+        let d = maker
+            .decide_leave(SlotId(1), DROPPED)
+            .expect("a leave is scheduled");
         assert_eq!(d.slot, 1);
         assert_eq!(d.reason, DROPPED);
-        assert_eq!(d.apply_at_frame, 51, "one past the departed slot's last frame");
+        assert_eq!(
+            d.apply_at_frame, 51,
+            "one past the departed slot's last frame"
+        );
         assert_eq!(d.leave_seq, 1);
     }
 
@@ -2045,7 +2367,10 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
         maker.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
         let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
-        assert_eq!(d.apply_at_frame, 31, "one past the departed slot's frame, not the survivor's");
+        assert_eq!(
+            d.apply_at_frame, 31,
+            "one past the departed slot's frame, not the survivor's"
+        );
     }
 
     /// No framed turn observed anywhere (pre-game / lobby): nothing to schedule.
@@ -2081,7 +2406,11 @@ mod tests {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert!(maker.decide_leave(SlotId(1), DROPPED).is_some());
-        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no re-decide for the same slot");
+        assert_eq!(
+            maker.decide_leave(SlotId(1), DROPPED),
+            None,
+            "no re-decide for the same slot"
+        );
     }
 
     /// Two slots leaving are two independent decisions with distinct seqs — the
@@ -2113,13 +2442,25 @@ mod tests {
 
         // Demote — the cache survives — then the surviving slot's stamps advance
         // well past the apply frame.
-        assert!(maker.set_authority(Authority::Peer).is_empty());
+        assert_eq!(
+            maker.set_authority(Authority::Peer),
+            (Vec::new(), Vec::new())
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(200));
 
         // Re-promote: the cached directive is re-emitted verbatim — apply frame
-        // AND leave_seq untouched, not a fresh derivation.
-        let leaves = maker.set_authority(Authority::SelfRelay);
-        assert_eq!(leaves, vec![first], "the cached leave re-broadcasts verbatim");
+        // AND leave_seq untouched, not a fresh derivation, so it is not in the
+        // `fresh` set either (no second notice for an already-cached leave).
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
+        assert_eq!(
+            leaves,
+            vec![first],
+            "the cached leave re-broadcasts verbatim"
+        );
+        assert!(
+            fresh.is_empty(),
+            "a verbatim re-broadcast is not a fresh insert"
+        );
 
         // And decide_leave for that slot is now a no-op (still cached).
         assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
@@ -2142,12 +2483,13 @@ mod tests {
             "the survivors-only session frame exceeds the departed slot's last frame",
         );
 
-        let leaves = maker.set_authority(Authority::SelfRelay);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(leaves.len(), 1);
         assert_eq!(
             leaves[0].apply_at_frame, 51,
             "one past the departed slot's frame — the survivors' lead must not push it",
         );
+        assert_eq!(fresh, leaves, "a re-derived leave is a fresh insert");
     }
 
     /// A promotion re-derives a departure the previous authority never decided:
@@ -2160,13 +2502,25 @@ mod tests {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
-        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no decision as a peer");
+        assert_eq!(
+            maker.decide_leave(SlotId(1), DROPPED),
+            None,
+            "no decision as a peer"
+        );
 
         // Promoted: it derives the leave fresh from the stored last frame 50.
-        let leaves = maker.set_authority(Authority::SelfRelay);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].slot, 1);
-        assert_eq!(leaves[0].apply_at_frame, 51, "one past the stored last frame");
+        assert_eq!(
+            leaves[0].apply_at_frame, 51,
+            "one past the stored last frame"
+        );
+        assert_eq!(
+            fresh, leaves,
+            "a departure with no cached directive is a fresh insert on promotion, \
+             which is exactly the case the departure notifier must catch",
+        );
     }
 
     /// Recording a departure captures the slot's frame into its record and
@@ -2183,15 +2537,20 @@ mod tests {
         // teardown remove_slot — now a no-op for this slot.
         let read = maker.slot_frame(SlotId(1));
         maker.record_departure(SlotId(1), read, DROPPED);
-        assert_eq!(maker.slot_frame(SlotId(1)), None, "recording retires the live state");
+        assert_eq!(
+            maker.slot_frame(SlotId(1)),
+            None,
+            "recording retires the live state"
+        );
         maker.remove_slot(SlotId(1));
 
-        let leaves = maker.set_authority(Authority::SelfRelay);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(leaves.len(), 1);
         assert_eq!(
             leaves[0].apply_at_frame, 51,
             "the departure record drives re-derivation after the slot is gone",
         );
+        assert_eq!(fresh, leaves);
     }
 
     /// A promotion re-broadcasts a cached leave even when the survivors' session
@@ -2209,16 +2568,21 @@ mod tests {
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(leave.apply_at_frame, 51);
 
-        assert!(maker.set_authority(Authority::Peer).is_empty());
+        assert_eq!(
+            maker.set_authority(Authority::Peer),
+            (Vec::new(), Vec::new())
+        );
         // The surviving slot's stamps reach the apply frame — exactly what a
         // stalled, un-served survivor's leading stamps look like.
         maker.observe_frame(SlotId(0), GameFrameCount(51));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(51)));
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(
-            maker.set_authority(Authority::SelfRelay),
+            leaves,
             vec![leave],
             "the cached leave re-broadcasts regardless of the survivors' stamps",
         );
+        assert!(fresh.is_empty(), "already cached — not a fresh insert");
     }
 
     /// A demotion no longer clears the cached leaves — the cache is exactly what a
@@ -2230,7 +2594,10 @@ mod tests {
         maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert!(maker.decided_leaves.contains_key(&SlotId(1)));
 
-        assert!(maker.set_authority(Authority::Peer).is_empty());
+        assert_eq!(
+            maker.set_authority(Authority::Peer),
+            (Vec::new(), Vec::new())
+        );
         assert!(
             maker.decided_leaves.contains_key(&SlotId(1)),
             "the cache survives demotion",
@@ -2249,16 +2616,22 @@ mod tests {
             apply_at_frame: 88,
             leave_seq: 7,
         };
-        maker.observe_leave(&observed);
+        assert!(maker.observe_leave(&observed), "first insert for the slot");
         assert_eq!(maker.decided_leaves.get(&SlotId(2)), Some(&observed));
-        assert_eq!(maker.next_leave_seq, 7, "seq kept at least the observed seq");
+        assert_eq!(
+            maker.next_leave_seq, 7,
+            "seq kept at least the observed seq"
+        );
 
         // A conflicting duplicate for the same slot keeps the first.
         let conflicting = LeaveDirective {
             apply_at_frame: 999,
             ..observed
         };
-        maker.observe_leave(&conflicting);
+        assert!(
+            !maker.observe_leave(&conflicting),
+            "a conflicting duplicate is not a first insert",
+        );
         assert_eq!(
             maker.decided_leaves.get(&SlotId(2)),
             Some(&observed),
@@ -2269,7 +2642,10 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(100));
         let _ = maker.set_authority(Authority::SelfRelay);
         let own = maker.decide_leave(SlotId(0), DROPPED).unwrap();
-        assert!(own.leave_seq > 7, "own numbering continues above the observed seq");
+        assert!(
+            own.leave_seq > 7,
+            "own numbering continues above the observed seq"
+        );
     }
 
     /// The authority's inbound `SlotDeparted` path — record the departure (which
@@ -2303,7 +2679,10 @@ mod tests {
         // A stale SlotDeparted carries a lower frame (55): the merge keeps 70.
         maker.record_departure(SlotId(1), Some(GameFrameCount(55)), DROPPED);
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
-        assert_eq!(leave.apply_at_frame, 71, "one past our higher observed frame");
+        assert_eq!(
+            leave.apply_at_frame, 71,
+            "one past our higher observed frame"
+        );
     }
 
     /// A non-authority relay records a departure but decides nothing.
@@ -2312,11 +2691,16 @@ mod tests {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
-        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no decision as a peer");
+        assert_eq!(
+            maker.decide_leave(SlotId(1), DROPPED),
+            None,
+            "no decision as a peer"
+        );
         // But the departure is recorded, so a later promotion re-derives it.
-        let leaves = maker.set_authority(Authority::SelfRelay);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].apply_at_frame, 51);
+        assert_eq!(fresh, leaves, "re-derived on promotion — a fresh insert");
     }
 
     // -- Departed-slot lifecycle (slot leaves the live roster, never resurrects) --
@@ -2367,7 +2751,11 @@ mod tests {
 
         let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
-        assert_eq!(maker.target(), None, "no live slot has conditions to size from");
+        assert_eq!(
+            maker.target(),
+            None,
+            "no live slot has conditions to size from"
+        );
     }
 
     /// The Join-time reconcile always includes a cached leave — even when the
@@ -2389,7 +2777,7 @@ mod tests {
             apply_at_frame: 51,
             leave_seq: 1,
         };
-        maker.observe_leave(&leave);
+        let _ = maker.observe_leave(&leave);
 
         let (_, directives) = maker.leave_reconcile();
         assert_eq!(directives, vec![leave]);
@@ -2400,10 +2788,15 @@ mod tests {
         let (departures, directives) = maker.leave_reconcile();
         assert_eq!(directives, vec![leave], "re-announced regardless of stamps");
         assert_eq!(departures.len(), 1, "the departure record is announced too");
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay);
         assert_eq!(
-            maker.set_authority(Authority::SelfRelay),
+            leaves,
             vec![leave],
             "and a promotion re-broadcasts it just the same",
+        );
+        assert!(
+            fresh.is_empty(),
+            "already cached via observe_leave — not a fresh insert on promotion",
         );
     }
 }

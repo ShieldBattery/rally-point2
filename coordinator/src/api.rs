@@ -48,7 +48,8 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::RelayId;
 
-use crate::registry::{self, RelayRegistry};
+use crate::notify::{self, DepartureDedup};
+use crate::registry;
 use crate::session::{self, SessionSetup};
 
 /// How the relay control endpoint authenticates a connecting relay.
@@ -118,6 +119,10 @@ pub struct CoordinatorState {
     /// The session-setup context — relay registry, tenant store, session→relay
     /// membership, and the per-relay descriptor outbox.
     pub setup: SessionSetup,
+    /// Dedup set for player-departure notices: every relay serving a session
+    /// reports the same departure, and this collapses them to one webhook per
+    /// `(tenant, session, slot)`. Shared across all relay control connections.
+    pub departures: DepartureDedup,
     /// How a relay authenticates to open its control connection.
     pub control_auth: ControlAuth,
     /// How long a connection has to send its enroll `Hello` before it is dropped
@@ -195,18 +200,12 @@ async fn relay_control(
         tracing::warn!("relay control connection rejected: bad bootstrap secret");
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let registry = state.setup.registry().clone();
-    let descriptors = state.setup.descriptors().clone();
+    let setup = state.setup.clone();
+    let departures = state.departures.clone();
     let hello_timeout = state.hello_timeout;
     let liveness_timeout = state.liveness_timeout;
     ws.on_upgrade(move |socket| {
-        serve_relay_control(
-            socket,
-            registry,
-            descriptors,
-            hello_timeout,
-            liveness_timeout,
-        )
+        serve_relay_control(socket, setup, departures, hello_timeout, liveness_timeout)
     })
 }
 
@@ -228,8 +227,8 @@ async fn relay_control(
 /// connected.
 async fn serve_relay_control(
     mut socket: WebSocket,
-    registry: RelayRegistry,
-    descriptors: crate::descriptors::RelayDescriptors,
+    setup: SessionSetup,
+    departures: DepartureDedup,
     hello_timeout: Duration,
     liveness_timeout: Duration,
 ) {
@@ -245,15 +244,16 @@ async fn serve_relay_control(
         }
     };
     let relay_id = hello.relay_id;
-    let generation = registry::enroll(&registry, hello);
+    let registry = setup.registry();
+    let generation = registry::enroll(registry, hello);
     tracing::info!(
         relay_id = relay_id.0,
         "relay enrolled over control connection"
     );
 
-    push_and_watch(&mut socket, &descriptors, relay_id, liveness_timeout).await;
+    push_and_watch(&mut socket, &setup, &departures, relay_id, liveness_timeout).await;
 
-    if registry::remove_if_current(&registry, relay_id, generation) {
+    if registry::remove_if_current(registry, relay_id, generation) {
         tracing::info!(
             relay_id = relay_id.0,
             "relay deregistered on control disconnect"
@@ -277,11 +277,12 @@ async fn serve_relay_control(
 /// the same deadline, and a send that can't finish in time ends the connection.
 async fn push_and_watch(
     socket: &mut WebSocket,
-    descriptors: &crate::descriptors::RelayDescriptors,
+    setup: &SessionSetup,
+    departures: &DepartureDedup,
     relay_id: RelayId,
     liveness_timeout: Duration,
 ) {
-    let mut rx = descriptors.subscribe(relay_id);
+    let mut rx = setup.descriptors().subscribe(relay_id);
 
     // A relay silent past this deadline — or one whose send stalls past it — is
     // treated as dead. Every inbound frame pushes it forward; a heartbeat lands
@@ -311,7 +312,7 @@ async fn push_and_watch(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        note_inbound(relay_id, &message);
+                        note_inbound(setup, departures, relay_id, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                     }
@@ -363,16 +364,25 @@ async fn send_before_deadline(
     }
 }
 
-/// Notes what an inbound relay frame was, for observability. The content drives
-/// nothing yet — any frame already counts as the liveness signal — but recognizing
-/// the heartbeat (and flagging anything undecodable) keeps the channel legible.
-fn note_inbound(relay_id: RelayId, message: &Message) {
+/// Handles an inbound relay frame: any frame already counts as the liveness
+/// signal, and a [`RelayToCoordinator::Departure`] additionally drives the
+/// departure-webhook path (dedup across relays, then a per-tenant webhook). A
+/// heartbeat is just liveness; anything undecodable is flagged.
+fn note_inbound(
+    setup: &SessionSetup,
+    departures: &DepartureDedup,
+    relay_id: RelayId,
+    message: &Message,
+) {
     let Message::Text(text) = message else {
         return; // a ping/pong/binary frame: a liveness signal with nothing to read
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
         Ok(RelayToCoordinator::Heartbeat) => {
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
+        }
+        Ok(RelayToCoordinator::Departure(notice)) => {
+            notify::handle_departure(setup, departures, notice);
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => {}
@@ -397,9 +407,13 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat (or any future up-frame) before the enroll Hello
-                    // is a protocol violation: enrollment must come first.
-                    Ok(RelayToCoordinator::Heartbeat | RelayToCoordinator::Unknown) => {
+                    // A heartbeat, a departure, or any future up-frame before the
+                    // enroll Hello is a protocol violation: enrollment comes first.
+                    Ok(
+                        RelayToCoordinator::Heartbeat
+                        | RelayToCoordinator::Departure(_)
+                        | RelayToCoordinator::Unknown,
+                    ) => {
                         tracing::warn!("first control frame was not a Hello; closing");
                         None
                     }
@@ -509,6 +523,7 @@ mod tests {
         let setup = crate::session::SessionSetup::new(reg, tenants);
         CoordinatorState {
             setup,
+            departures: notify::new_dedup(),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -520,10 +535,12 @@ mod tests {
             PlayerHandoff {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
+                external_ref: None,
             },
             PlayerHandoff {
                 slot: SlotId(1),
                 client_pubkey: ClientPublicKey([0xBB; 32]),
+                external_ref: None,
             },
         ]
     }
@@ -536,6 +553,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let resp = app
             .oneshot(
@@ -625,6 +643,7 @@ mod tests {
                 registry::new_registry(),
                 crate::tenant::new_store(),
             ),
+            departures: notify::new_dedup(),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -634,6 +653,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let resp = app
             .oneshot(
@@ -658,6 +678,7 @@ mod tests {
         let req = SessionRequest {
             tenant: TenantId("not-enrolled".to_owned()),
             players: two_players(),
+            external_id: None,
         };
         let resp = app
             .oneshot(

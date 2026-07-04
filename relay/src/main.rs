@@ -309,11 +309,23 @@ async fn main() -> Result<()> {
                 advertise = %advertise_addr,
                 "enrolling with coordinator over the control connection",
             );
+
+            // The departure notifier: the leave sites fire a notice onto this
+            // channel when a synced leave first enters the cache, and the
+            // coordinator subscriber drains it up the control connection. Only
+            // wired when a coordinator is configured; a standalone relay leaves
+            // the notifier unset (firing is then a no-op).
+            let (departures_tx, departures_rx) = tokio::sync::mpsc::unbounded_channel();
+            mesh_state
+                .decision_makers
+                .set_departure_notifier(departures_tx);
+
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
                 coordinator_url,
                 relay_hello,
                 cli.coordinator_secret.clone(),
                 mesh_control.clone(),
+                departures_rx,
             ));
         }
 
