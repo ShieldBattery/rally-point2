@@ -159,7 +159,7 @@ use std::collections::HashMap;
 
 use rally_point_proto::control::BufferBounds;
 use rally_point_proto::ids::{GameFrameCount, SlotId};
-use rally_point_proto::messages::{BufferDirective, LinkConditions};
+use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
 
 use crate::routing::SessionKey;
 
@@ -437,6 +437,18 @@ pub struct DecisionMaker {
     /// decisions), so it never stamps -- it only forwards the authority's
     /// already-stamped turns verbatim.
     pending_directive: Option<BufferDirective>,
+    /// Player-leaves this relay (as authority) has already decided, keyed by slot.
+    /// A leave is a one-shot: when decided, the caller pushes it down each
+    /// surviving client's reliable control stream (it is NOT stamped onto turns --
+    /// a drop stops the turn stream). This map only dedups a slot so a duplicate
+    /// drop signal doesn't re-decide it, and records the directive for a possible
+    /// re-push / authority-handoff re-derivation. A non-authority relay never
+    /// decides a leave, so this stays empty on one.
+    decided_leaves: HashMap<SlotId, LeaveDirective>,
+    /// Next `leave_seq` to assign -- its own space, distinct from `decision_seq`
+    /// (buffer and leave directives never supersede one another). Clients dedup
+    /// leaves by slot, so this only has to be non-colliding per distinct leave.
+    next_leave_seq: u32,
 }
 
 impl DecisionMaker {
@@ -459,6 +471,8 @@ impl DecisionMaker {
             last_decision_frame: None,
             decision_seq: 0,
             pending_directive: None,
+            decided_leaves: HashMap::new(),
+            next_leave_seq: 0,
         }
     }
 
@@ -536,6 +550,11 @@ impl DecisionMaker {
             self.authority = authority;
             if authority == Authority::Peer {
                 self.pending_directive = None;
+                // Forget decided leaves too — only the authority decides and
+                // pushes them. A promoted relay re-derives any still-unapplied
+                // leave from the roster-vs-live diff (clients dedup by slot, so a
+                // re-push is safe regardless of `leave_seq`).
+                self.decided_leaves.clear();
             }
         }
     }
@@ -770,6 +789,48 @@ impl DecisionMaker {
         Some(directive)
     }
 
+    /// Decides a synced player-leave for `slot` and queues it for broadcast.
+    /// Returns the queued [`LeaveDirective`] (for logging), or `None` when this
+    /// relay is not the authority, a leave for the slot is already broadcasting,
+    /// or there is no frame basis yet (no in-game turn observed for the session
+    /// -- a lobby/pre-game drop, which the game handles natively, not here).
+    ///
+    /// `reason` is the native `pending_leave_reason` value every client will
+    /// write (`0x40000006` dropped, else left). Call this on the authority --
+    /// directly when a home client's link ends, or on a peer relay's
+    /// `SlotDeparted` signal for a client the peer served.
+    ///
+    /// The apply frame is `max(slot's last observed frame, session frame) + 1`:
+    /// one past the point the departing slot owes a turn it will never send, so
+    /// remaining clients apply it exactly at the step they would otherwise stall.
+    /// Both inputs are observed off validated turns, so every relay converges on
+    /// the same value -- which is what lets an authority-handoff re-derivation
+    /// reproduce the identical apply frame (clients dedup by slot and require
+    /// that agreement). Read the slot's frame *before* [`remove_slot`] clears it.
+    pub fn decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
+        if self.authority != Authority::SelfRelay {
+            return None;
+        }
+        if self.decided_leaves.contains_key(&slot) {
+            return None; // already decided this slot's leave
+        }
+        let slot_field = u32::from(slot.0);
+        let slot_last = self.slots.get(&slot).and_then(|s| s.frame).map(|f| f.0);
+        let session = self.session_frame().map(|f| f.0);
+        // No framed turn observed anywhere yet (pre-game / lobby): nothing to
+        // schedule against, so hold — a `None` short-circuits decide_leave.
+        let base = slot_last.into_iter().chain(session).max()?;
+        self.next_leave_seq += 1;
+        let directive = LeaveDirective {
+            slot: slot_field,
+            reason,
+            apply_at_frame: base.saturating_add(1),
+            leave_seq: self.next_leave_seq,
+        };
+        self.decided_leaves.insert(slot, directive);
+        Some(directive)
+    }
+
     /// Removes a slot's condition history (the client disconnected). Called
     /// when a home client leaves so its stale stats don't outlive its
     /// connection -- mirroring `unpublish_conditions`.
@@ -902,6 +963,22 @@ pub fn active_directive(registry: &DecisionMakers, key: &SessionKey) -> Option<B
     registry.lock().get_mut(key)?.active_directive()
 }
 
+/// Decides a synced player-leave for `slot` on the session's authority relay and
+/// queues it for broadcast, logging it. Returns the queued [`LeaveDirective`], or
+/// `None` when this relay isn't the authority / has no maker / can't schedule yet
+/// (see [`DecisionMaker::decide_leave`]). Call it *before* [`DecisionMaker::remove_slot`]
+/// so the departing slot's last observed frame is still available.
+pub fn decide_leave(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    reason: u32,
+) -> Option<LeaveDirective> {
+    let directive = registry.lock().get_mut(key)?.decide_leave(slot, reason)?;
+    log_leave(key, &directive);
+    Some(directive)
+}
+
 /// Records the `decision_seq` of an authority-stamped directive this relay is
 /// forwarding, if the relay has a maker for the session, so a later promotion
 /// to authority continues the session's decision numbering (see
@@ -921,6 +998,20 @@ fn log_decision(key: &SessionKey, decision: Decision) {
         buffer = decision.buffer.0,
         apply_at_frame = decision.applied_frame.0,
         "latency-buffer decision",
+    );
+}
+
+/// Logs a synced player-leave the authority just decided — the observable that a
+/// coordinated leave is being broadcast, and which slot at which frame.
+fn log_leave(key: &SessionKey, leave: &LeaveDirective) {
+    tracing::info!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        slot = leave.slot,
+        reason = leave.reason,
+        apply_at_frame = leave.apply_at_frame,
+        leave_seq = leave.leave_seq,
+        "synced player-leave decision",
     );
 }
 
@@ -1568,5 +1659,99 @@ mod tests {
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
         assert!(!registry.lock().contains_key(&k));
+    }
+
+    // -- Synced player-leave (decide_leave) --
+
+    const DROPPED: u32 = 0x4000_0006;
+
+    /// The apply frame is one past the departing slot's last observed frame.
+    #[test]
+    fn decide_leave_schedules_one_past_the_departed_slots_last_frame() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // Two slots; the departing slot (1) is the furthest ahead.
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+
+        let d = maker.decide_leave(SlotId(1), DROPPED).expect("a leave is scheduled");
+        assert_eq!(d.slot, 1);
+        assert_eq!(d.reason, DROPPED);
+        assert_eq!(d.apply_at_frame, 51, "one past the departed slot's last frame");
+        assert_eq!(d.leave_seq, 1);
+    }
+
+    /// When the session (slowest survivor) is ahead of the departed slot's last
+    /// frame, the apply frame clamps to session_frame + 1 (never in the past).
+    #[test]
+    fn decide_leave_never_schedules_before_the_session_frame() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
+        maker.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
+        // session_frame = min = 30, slot_last = 30 -> base 30. But if the departing
+        // slot were the min, clamp still yields base = max(30, 30) = 30 -> 31.
+        let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(d.apply_at_frame, 31);
+    }
+
+    /// No framed turn observed anywhere (pre-game / lobby): nothing to schedule.
+    #[test]
+    fn decide_leave_holds_without_a_frame_basis() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
+    }
+
+    /// A non-authority relay never decides a leave (only the authority does).
+    #[test]
+    fn decide_leave_is_a_no_op_on_a_non_authority() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
+    }
+
+    /// A second decision for a slot already leaving is ignored (idempotent
+    /// trigger — e.g. a duplicate drop signal).
+    #[test]
+    fn decide_leave_ignores_a_slot_already_leaving() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        assert!(maker.decide_leave(SlotId(1), DROPPED).is_some());
+        assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None, "no re-decide for the same slot");
+    }
+
+    /// Two slots leaving are two independent decisions with distinct seqs — the
+    /// relay pushes each down its own control-stream frame.
+    #[test]
+    fn decide_leave_handles_multiple_slots_independently() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(55));
+        maker.observe_frame(SlotId(1), GameFrameCount(60));
+        maker.observe_frame(SlotId(2), GameFrameCount(70));
+        let d1 = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        let d2 = maker.decide_leave(SlotId(2), DROPPED).unwrap();
+        assert_eq!(d1.slot, 1);
+        assert_eq!(d2.slot, 2);
+        assert_ne!(d1.leave_seq, d2.leave_seq, "distinct leave seqs");
+    }
+
+    /// Losing authority forgets decided leaves, so a re-promoted relay can
+    /// re-derive (re-decide) the same slot's leave — reproducing the same apply
+    /// frame from the same observed last frame (clients dedup by slot).
+    #[test]
+    fn losing_and_regaining_authority_allows_rederivation() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.observe_frame(SlotId(1), GameFrameCount(50));
+        let first = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(first.apply_at_frame, 51);
+
+        // Hand authority away, then take it back (a real handoff would put a
+        // different relay in between; here we just prove the state is cleared).
+        maker.set_authority(Authority::Peer);
+        maker.set_authority(Authority::SelfRelay);
+
+        // The slot can be re-decided (it was forgotten) and lands on the same
+        // apply frame — the invariant clients rely on across a handoff.
+        let redecided = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+        assert_eq!(redecided.apply_at_frame, 51, "re-derivation reproduces the apply frame");
     }
 }

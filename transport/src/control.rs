@@ -11,15 +11,44 @@
 //!
 //! Today the stream carries oversize turns — payloads the datagram path can
 //! never fit (see [`Link::deliver_external`](crate::Link::deliver_external)
-//! for how they rejoin the ordered turn stream). The reader skips a frame
-//! kind it doesn't know, so the channel can grow chat/resync frames without a
-//! wire break.
+//! for how they rejoin the ordered turn stream) — plus the synced-leave
+//! machinery: a relay pushes a `LeaveDirective` down to a surviving client,
+//! and a client pushes a `LeaveIntent` up to announce its own clean
+//! departure. The reader skips a frame kind it doesn't know, so the channel
+//! can grow chat/resync frames without a wire break.
 
 use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
 };
-use rally_point_proto::messages::{ControlFrame, Payload, control_frame};
+use rally_point_proto::messages::{
+    ControlFrame, LeaveDirective, LeaveIntent, Payload, control_frame,
+};
 use tokio::sync::mpsc;
+
+/// A frame surfaced from the reliable control stream to its consumer.
+///
+/// The stream carries more than one kind now, so the reader hands back a tagged
+/// value rather than a bare payload. On the client edge both `OversizeTurn` and
+/// `Leave` arrive (the relay forwards oversize turns and pushes leaves down),
+/// but never `LeaveIntent` — a client never receives its own intent back, so
+/// the client edge ignores one, mirroring how the relay edge ignores a stray
+/// `Leave`. On the relay edge, `OversizeTurn` and `LeaveIntent` arrive (a
+/// client sends both up); a relay never receives a `Leave` from another relay
+/// on this stream, so the relay edge ignores one.
+#[derive(Debug)]
+pub enum ControlInbound {
+    /// An oversize turn to fold back into the ordered turn stream.
+    OversizeTurn(Payload),
+    /// A relay-pushed synced player-leave (relay → client). Delivered here, on
+    /// the reliable stream, because a drop stops the turn stream that the leave
+    /// would otherwise have to ride.
+    Leave(LeaveDirective),
+    /// A client announcing its own clean departure (client → relay only). A
+    /// relay never receives this from another relay, and a client never
+    /// receives it at all (it only ever sends one) — either edge that isn't
+    /// the relay reading a client's stream ignores it.
+    LeaveIntent,
+}
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
 /// common turn is tens of bytes against a ~1200-byte datagram budget), so this
@@ -45,7 +74,7 @@ const CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// stream is not itself a link failure (that surfaces via the datagram path),
 /// but any oversize turn that later needed it will stall the game, so the
 /// driver logs it.
-pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Payload> {
+pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<ControlInbound> {
     let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let Ok((_send_half, mut recv)) = connection.accept_bi().await else {
@@ -76,23 +105,29 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Pay
             if recv.read_exact(&mut body).await.is_err() {
                 return;
             }
-            match decode_frame(&body) {
+            let inbound = match decode_frame(&body) {
                 Ok(ControlFrame {
                     kind: Some(control_frame::Kind::OversizeTurn(payload)),
-                }) => {
-                    if tx.send(payload).await.is_err() {
-                        // Driver dropped its receiver: winding down.
-                        return;
-                    }
-                }
+                }) => ControlInbound::OversizeTurn(payload),
+                Ok(ControlFrame {
+                    kind: Some(control_frame::Kind::LeaveDirective(leave)),
+                }) => ControlInbound::Leave(leave),
+                Ok(ControlFrame {
+                    kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
+                }) => ControlInbound::LeaveIntent,
                 // A frame kind this build predates: skip it, keep the stream.
                 Ok(ControlFrame { kind: None }) => {
                     tracing::debug!("skipping unknown control frame kind");
+                    continue;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "control frame did not decode; ignoring stream");
                     return;
                 }
+            };
+            if tx.send(inbound).await.is_err() {
+                // Consumer dropped its receiver: winding down.
+                return;
             }
         }
     });
@@ -110,6 +145,41 @@ pub async fn send_control_turn(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::OversizeTurn(payload)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Pushes one synced player-leave down the control stream (relay → client). Like
+/// an oversize turn it is reliable and un-redundant: an error means the stream
+/// is gone, which the caller treats as that client having left too. Delivering
+/// the leave here rather than on the turn envelope is the whole point — a drop
+/// stalls the game and stops the datagram turn stream, so the reliable stream is
+/// the only path that still reaches a stalled survivor.
+pub async fn send_control_leave(
+    control_send: &mut quinn::SendStream,
+    leave: LeaveDirective,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LeaveDirective(leave)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Announces a client's own clean departure up the control stream (client →
+/// relay). Sent once, after the client has flushed its final turns, and never
+/// acked: the client's confirmation that the relay processed it is the relay
+/// closing the link. An error here means the stream (and almost certainly the
+/// connection) is already gone, in which case the departure needs no
+/// announcing — the relay will observe the link death directly.
+pub async fn send_control_leave_intent(
+    control_send: &mut quinn::SendStream,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

@@ -23,7 +23,9 @@
 //! [`DirectiveTracker`] is the game loop's state machine for the latency-buffer
 //! directives the authority relay stamps onto forwarded turns: it collapses the
 //! redundant out-of-order stamp stream into at-most-one change per decision,
-//! surfaced exactly at its apply frame.
+//! surfaced exactly at its apply frame. [`LeaveTracker`] is its sibling for the
+//! synced player-leave directives that ride the same envelope: at-most-one leave
+//! per slot, surfaced at its apply frame.
 //!
 //! TODO: chat/resync frame kinds on the control stream (the stream and its
 //! extensible `ControlFrame` framing exist; oversize turns are its first
@@ -44,8 +46,10 @@ mod dial;
 mod directive;
 mod driver;
 mod identity;
+mod leave;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
 pub use driver::{DriverError, LinkDriver, TurnChannels};
 pub use identity::{Identity, IdentityError};
+pub use leave::LeaveTracker;

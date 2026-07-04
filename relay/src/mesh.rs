@@ -422,6 +422,10 @@ pub fn forward_turn(
             }
         }
     }
+    // NOTE: player-leaves are NOT stamped here. A leave is delivered over the
+    // reliable control stream (the relay pushes it to each surviving client), not
+    // the turn envelope — a drop stops the turn stream, so an envelope stamp would
+    // never reach the survivors it must unstall. See `routing`'s leave trigger.
     routing::fan_out(sessions, key, slot, payload.clone());
     fan_out_to_mesh(mesh_links, key, payload);
 }

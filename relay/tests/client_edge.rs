@@ -527,6 +527,245 @@ async fn frees_the_slot_when_a_client_disconnects() {
     );
 }
 
+/// Waits for the relay to close `link`'s connection, failing the test (rather
+/// than hanging) if it never does.
+async fn expect_closed(link: &mut Link) {
+    let result = tokio::time::timeout(Duration::from_secs(5), link.recv()).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "expected the relay to have closed the link",
+    );
+}
+
+#[tokio::test]
+async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{
+        ControlInbound, send_control_leave_intent, spawn_control_reader,
+    };
+
+    // The native SC:R `pending_leave_reason` a voluntary quit writes -- see
+    // `relay::routing::LEAVE_REASON_LEFT`.
+    const LEAVE_REASON_LEFT: u32 = 3;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(200);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Seed this relay as the session's authority: `decide_leave` is a no-op on
+    // a non-authority relay, and a lone relay with no descriptor never becomes
+    // one on its own outside a real coordinator-driven deployment.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    // Accept the relay's own control stream to slot 1 so its pushed leave
+    // directive lands here.
+    let mut ctrl1 = spawn_control_reader(slot1.connection().clone());
+
+    // A framed turn from slot 0 gives `decide_leave` a basis to schedule
+    // against -- without any observed frame (pure lobby) it would hold.
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    // Give the relay a moment to observe the frame before the intent lands.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Slot 0 announces its own clean departure on the control stream it opens
+    // (mirroring the real client driver, which never reuses the relay's
+    // opened stream to send its own frames).
+    let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
+        .await
+        .expect("leave directive never arrived at the survivor")
+        .expect("control reader ended early");
+    let ControlInbound::Leave(leave) = frame else {
+        panic!("expected a LeaveDirective, got {frame:?}");
+    };
+    assert_eq!(leave.slot, 0);
+    assert_eq!(
+        leave.reason, LEAVE_REASON_LEFT,
+        "an intent-decided leave uses the native quit path's reason, not the drop one",
+    );
+
+    // The relay's confirmation that it processed the intent is closing the
+    // departing client's own link.
+    expect_closed(&mut slot0).await;
+}
+
+#[tokio::test]
+async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
+    // The same task that decides the leave from the intent also runs the
+    // post-loop Trigger-A cleanup on its way out (deregister, decide_leave,
+    // remove_slot, presence). This proves that follow-through doesn't produce
+    // a *second* directive for the same slot: the survivor sees exactly one
+    // leave push, not two.
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{
+        ControlInbound, send_control_leave_intent, spawn_control_reader,
+    };
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(201);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut ctrl1 = spawn_control_reader(slot1.connection().clone());
+
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
+        .await
+        .expect("leave directive never arrived at the survivor")
+        .expect("control reader ended early");
+    assert!(matches!(first, ControlInbound::Leave(_)));
+
+    // Let the slot's task finish tearing down (deregister, the post-loop
+    // Trigger-A decide_leave, remove_slot, presence) well past when it would
+    // have run, then confirm no second leave push ever follows.
+    expect_closed(&mut slot0).await;
+    let second = tokio::time::timeout(Duration::from_millis(300), ctrl1.recv()).await;
+    assert!(
+        second.is_err(),
+        "the post-loop cleanup must not re-decide and re-broadcast the same slot's leave",
+    );
+}
+
+#[tokio::test]
+async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
+    // The relay stops serving a slot's link the moment it processes that
+    // slot's leave-intent (the determinism cut), so nothing sent afterward
+    // can still reach a survivor. Sending only once the relay has confirmed
+    // the intent by closing the link (rather than racing the intent and a
+    // turn on the wire) is what makes this deterministic to test.
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::send_control_leave_intent;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(202);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    // Drain that first turn at slot 1 so it can't be mistaken for the later,
+    // forbidden one.
+    let mut delivered = Vec::new();
+    while delivered.is_empty() {
+        delivered = slot1.recv().await.unwrap().fresh;
+    }
+    assert_eq!(&delivered[0].commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+
+    let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+    expect_closed(&mut slot0).await;
+
+    // Only now, with the relay's slot-0 link task confirmed gone, try to send
+    // a further turn. Nothing on the relay is left reading this connection,
+    // so it can never be forwarded.
+    let _ = slot0.send(Some(Payload {
+        seq: 1,
+        slot: 0,
+        game_frame_count: Some(11),
+        commands: vec![0x0C, 8, 8, 8, 8, 8, 8, 8].into(),
+        ..Default::default()
+    }));
+
+    // Drain whatever the relay's own idle-ack flush still sends slot 1 (it
+    // owes acks regardless of the leave) for a few flush cycles, and confirm
+    // none of it ever carries the forbidden turn.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+        match tokio::time::timeout(remaining, slot1.recv()).await {
+            Ok(Ok(received)) => assert!(
+                received.fresh.is_empty(),
+                "a turn sent after the leave intent must never reach a survivor: {:?}",
+                received.fresh,
+            ),
+            // The relay's ack-only flush timed out this cycle (nothing owed,
+            // or the window elapsed) or the link itself ended -- either way,
+            // no leaked turn arrived.
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+}
+
 #[tokio::test]
 async fn acks_a_one_way_sender_with_no_peer_traffic() {
     let tenant = make_tenant(KID, TENANT);

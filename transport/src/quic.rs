@@ -131,29 +131,32 @@ pub enum TlsError {
 /// allow established UDP flows indefinitely).
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The maximum idle time before QUIC closes a mesh connection. The default
-/// (30s) is too long for a relay mesh: a dead peer relay or a dropped NAT
-/// mapping stalls lockstep for 30s before anyone notices. 10s detects dead
-/// peers fast enough that a stall surfaces as a visible "waiting for players"
-/// dialog rather than a silent hang, while staying clear of brief silences
-/// (keepalive fires at 5s, so a live connection never approaches this
-/// timeout).
+/// The maximum idle time before QUIC closes a connection. The default (30s) is
+/// too long: a dead peer or a dropped NAT mapping would stall lockstep for 30s
+/// before anyone notices. 10s detects a dead peer fast enough that a stall
+/// surfaces promptly (and, on the client edge, that a departed player's leave is
+/// decided within ~10s), while staying clear of brief silences (keepalive fires
+/// at 5s, so a live connection never approaches this timeout).
 ///
-/// Applied to the mesh dial side only ([`mesh_client_config`]). QUIC
-/// negotiates the idle timeout as the minimum of both endpoints' advertised
-/// values, so the dial side's value governs the mesh connection without
-/// touching `server_config` — client-edge connections (negotiated against
-/// [`client_config`]) keep their default timeout. One side's keepalive
-/// suffices to keep both mesh ends alive (its PINGs elicit ACKs, resetting
-/// both idle timers), so the accept side needs no change.
+/// Applied to every dial side ([`keepalive_transport_config`]): the mesh edge and
+/// the client edge. QUIC negotiates the idle timeout as the minimum of both
+/// endpoints' advertised values, so the dial side's value governs without touching
+/// `server_config`, and one side's keepalive keeps both ends alive (its PINGs
+/// elicit ACKs, resetting both idle timers), so the accept side needs no change.
 const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Builds a `TransportConfig` tuned for mesh connections: keepalive to
-/// prevent idle disconnects during brief silences, and a shorter-than-default
-/// idle timeout to detect dead peers fast. Applied to the mesh dial side only
-/// ([`mesh_client_config`]) — see [`MAX_IDLE_TIMEOUT`] for why the server side
-/// is left at the default.
-fn mesh_transport_config() -> quinn::TransportConfig {
+/// Builds a `TransportConfig` with keepalive (to prevent idle disconnects during
+/// silences) and a shorter-than-default idle timeout (to detect dead peers fast).
+/// Applied to every dial side — mesh ([`mesh_client_config`]) *and* client edge
+/// ([`client_config`]). On the client edge it is load-bearing: when a player
+/// drops, lockstep stalls every survivor and their turn traffic stops, so without
+/// keepalive their own connections would idle-time-out and the relay would wrongly
+/// drop them too; the PINGs keep a stalled-but-alive client connected until the
+/// relay pushes it the leave that unstalls it, and only the genuinely dead client
+/// (no PINGs) times out — a clean drop detector. QUIC negotiates the idle timeout
+/// as the minimum of both ends, so setting it on the dial side governs without
+/// touching `server_config`, and one side's keepalive keeps both idle timers reset.
+fn keepalive_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
     config.max_idle_timeout(Some(
@@ -199,7 +202,12 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
-    Ok(quinn::ClientConfig::new(Arc::new(client)))
+    let mut config = quinn::ClientConfig::new(Arc::new(client));
+    // Keepalive + short idle timeout on the client edge: keeps a stalled-but-alive
+    // client connected (so a drop doesn't idle-time-out the survivors) while a dead
+    // client is detected fast. See `keepalive_transport_config`.
+    config.transport_config(Arc::new(keepalive_transport_config()));
+    Ok(config)
 }
 
 /// Builds the mesh-edge QUIC config a relay uses to dial a peer relay,
@@ -216,7 +224,7 @@ pub fn mesh_client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientC
 
     let client = QuicClientConfig::try_from(tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(client));
-    config.transport_config(Arc::new(mesh_transport_config()));
+    config.transport_config(Arc::new(keepalive_transport_config()));
     Ok(config)
 }
 

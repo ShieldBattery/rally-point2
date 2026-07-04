@@ -57,7 +57,8 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
+use rally_point_proto::messages::{LeaveDirective, LinkConditions, Payload, SlotConditions};
+use rally_point_transport::control::ControlInbound;
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::quinn::VarInt;
 use rally_point_transport::{Link, LinkError};
@@ -73,6 +74,10 @@ use crate::validation::validate_turn;
 /// so this is deliberately generous rather than tuned. Shared by the client-edge
 /// slot link and the mesh-link task (same turn-magnitude, same drain cadence).
 pub(crate) const FORWARD_CAPACITY: usize = 1024;
+
+/// Depth of a slot's leave-push channel. Leaves are rare (at most one per other
+/// player, and only on a departure), so a small buffer is ample.
+const LEAVE_PUSH_CAPACITY: usize = 16;
 
 /// QUIC application close code for a connection dropped because its client sent a
 /// turn that failed validation.
@@ -110,6 +115,31 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 /// window (4096) so it trips before a hard reject.
 const UNACKED_WINDOW_CAP: usize = 1024;
 
+/// The native SC:R `pending_leave_reason` value for a *dropped* player (shows
+/// "player was dropped"), written into every remaining client's leave mailbox by
+/// the synced-leave pass. A client's link ending — whether it quit, its network
+/// died, or we isolated it for lagging — surfaces here as a drop; a clean quit
+/// sends a leave-intent up the control stream first, which the relay decides
+/// under [`LEAVE_REASON_LEFT`] instead so survivors see "player left", and the
+/// game side supplies its own reason for a player-requested drop.
+const LEAVE_REASON_DROPPED: u32 = 0x4000_0006;
+
+/// The native SC:R `pending_leave_reason` value a voluntary quit produces on
+/// every other client natively (shows "player left"): this is exactly what
+/// SC:R's own quit path writes into a peer's leave mailbox, so a synced leave
+/// decided from a client's leave-intent renders with the identical wording a
+/// native (non-networked) game would already show. Any nonzero value other
+/// than [`LEAVE_REASON_DROPPED`]'s `0x40000006` renders "player left", but this
+/// one is chosen to match the native value rather than an arbitrary nonzero.
+const LEAVE_REASON_LEFT: u32 = 3;
+
+/// QUIC application close code for a connection the relay closes on its own
+/// initiative after processing a client's leave-intent. Not an error: the
+/// client's control-stream announcement is never acked on its own terms — the
+/// relay closing the link *is* the confirmation the departing client's driver
+/// waits for once it has sent its intent.
+const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
+
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
 
@@ -124,6 +154,12 @@ type ForwardTx = mpsc::Sender<Payload>;
 /// private, so the roster is built and read solely through this module.
 pub struct SlotEntry {
     forward: ForwardTx,
+    /// Synced player-leaves to push down THIS client's reliable control stream.
+    /// Fed by [`fan_out_leave`] when a *different* slot leaves; drained by this
+    /// slot's link task, which writes each to its control stream. Separate from
+    /// `forward` (datagram turns) because a leave must reach a stalled client,
+    /// whose datagram turn flow has stopped — only the reliable stream still does.
+    leave_push: mpsc::Sender<LeaveDirective>,
     shutdown: Arc<Notify>,
 }
 
@@ -131,6 +167,8 @@ pub struct SlotEntry {
 /// turns to deliver to the client, and the signal to shut the link down.
 pub struct SlotInbox {
     forward_rx: mpsc::Receiver<Payload>,
+    /// Leaves to push down this client's control stream (see [`SlotEntry::leave_push`]).
+    leave_push_rx: mpsc::Receiver<LeaveDirective>,
     shutdown: Arc<Notify>,
 }
 
@@ -197,6 +235,8 @@ pub fn register(
     slot: SlotId,
 ) -> Option<(SlotRegistration, SlotInbox)> {
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
+    // Leaves are rare (one per departing peer), so a small channel is ample.
+    let (leave_tx, leave_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     {
         let mut roster = sessions.lock();
@@ -208,6 +248,7 @@ pub fn register(
             slot,
             SlotEntry {
                 forward: tx,
+                leave_push: leave_tx,
                 shutdown: Arc::clone(&shutdown),
             },
         );
@@ -220,6 +261,7 @@ pub fn register(
     };
     let inbox = SlotInbox {
         forward_rx: rx,
+        leave_push_rx: leave_rx,
         shutdown,
     };
     Some((registration, inbox))
@@ -282,6 +324,46 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
     }
 }
 
+/// Pushes `leave` down every *surviving* slot's control stream in the `key` group
+/// (every slot except `departing`, the one that just left). A leave rides the
+/// reliable control stream, not the datagram turn path, because the departing
+/// player's exit stalls the survivors and stops their turn flow — the reliable
+/// stream is the only channel that still reaches them to unstall. Senders are
+/// cloned under the lock and the lock dropped before delivery, as in [`fan_out`].
+pub(crate) fn fan_out_leave(
+    sessions: &Sessions,
+    key: &SessionKey,
+    departing: SlotId,
+    leave: LeaveDirective,
+) {
+    let targets: Vec<(SlotId, mpsc::Sender<LeaveDirective>)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => slots
+                .iter()
+                .filter(|(slot, _)| **slot != departing)
+                .map(|(slot, entry)| (*slot, entry.leave_push.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for (slot, tx) in targets {
+        match tx.try_send(leave) {
+            // A full leave-push queue is unexpected (leaves are rare); log rather
+            // than drop silently — a missed leave leaves that survivor stalled.
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                "leave-push queue full; a synced leave may be delayed for this slot",
+            ),
+            // The peer already left; it needs no leave for a third slot.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
 /// Drives one authorized client's link until it closes.
 ///
 /// Owns `link` outright and alternates between receiving its client's turns
@@ -302,6 +384,7 @@ pub async fn run_slot_link(
 ) {
     let SlotInbox {
         mut forward_rx,
+        mut leave_push_rx,
         shutdown,
     } = inbox;
     let crate::mesh::MeshState {
@@ -357,6 +440,10 @@ pub async fn run_slot_link(
     // Mirrors `beacon_alive` below: a `None` from an ended reader task must
     // disarm the branch, not spin the loop.
     let mut control_alive = true;
+    // Whether this slot's leave-push channel still has a sender. It lives in the
+    // roster while the slot is registered, so `None` is unreachable during the
+    // loop; the flag disarms the branch defensively so a closed channel can't spin.
+    let mut leave_push_alive = true;
     // The highest cursor the relay has pushed to the client, per slot. Push only
     // on advance.
     let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
@@ -482,6 +569,33 @@ pub async fn run_slot_link(
                     break 'serve;
                 }
             }
+            // A synced leave for another slot, to push down this client's reliable
+            // control stream. This is the whole fix for the turn-envelope deadlock:
+            // a departing peer stalls this client and stops its datagram turn flow,
+            // so the leave that must unstall it can only arrive on the reliable
+            // stream, which keeps flowing.
+            pushed = leave_push_rx.recv(), if leave_push_alive => {
+                match pushed {
+                    Some(leave) => {
+                        if let Err(error) = rally_point_transport::control::send_control_leave(
+                            &mut control_send,
+                            leave,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "leave control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => leave_push_alive = false,
+                }
+            }
             forwarded = forward_rx.recv() => {
                 match forwarded {
                     Some(payload) => {
@@ -558,7 +672,71 @@ pub async fn run_slot_link(
             // path), then validate and forward it like any other turn.
             received = control_rx.recv(), if control_alive => {
                 match received {
-                    Some(payload) => {
+                    // A client only ever *sends* oversize turns up; it never sends
+                    // a leave (those are relay → client only). Ignore a stray one.
+                    Some(ControlInbound::Leave(_)) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent leave control frame",
+                        );
+                    }
+                    // The client announcing its own clean departure. The
+                    // client already flushed its outstanding turns and waited
+                    // for their acks before sending this, so nothing of its
+                    // game state is lost by cutting it off right here.
+                    //
+                    // Decide the leave immediately rather than waiting for
+                    // the link to actually die: it gives survivors the
+                    // "left" reason straight away instead of stalling
+                    // through the idle-timeout drop path. `break 'serve`
+                    // right after is the determinism cut this whole
+                    // mechanism rests on -- this task is the single place
+                    // that serializes the client's control frames against
+                    // its datagram turns, so once it has processed the
+                    // intent, no turn from this slot is forwarded again;
+                    // every survivor ends up with the identical final-turn
+                    // prefix and the same apply frame.
+                    //
+                    // The post-loop Trigger-A `decide_leave` below still
+                    // runs on the way out, but it dedups by slot and finds
+                    // this one already decided, so it is a no-op there --
+                    // deregistration, the presence report, and the
+                    // decision-maker's per-slot cleanup all run exactly as
+                    // they would for a dropped client. On a relay that
+                    // isn't this session's authority `decide_leave` returns
+                    // `None` here just as it does for a drop -- routing a
+                    // peer relay's own client's intent to the authority over
+                    // the mesh (`SlotDeparted`) is the same known gap as
+                    // Trigger A, not yet wired.
+                    Some(ControlInbound::LeaveIntent) => {
+                        tracing::info!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "client announced clean leave",
+                        );
+                        if let Some(leave) = crate::consensus::decide_leave(
+                            &decision_makers,
+                            &key,
+                            slot,
+                            LEAVE_REASON_LEFT,
+                        ) {
+                            fan_out_leave(&sessions, &key, slot, leave);
+                        }
+                        // The client's driver never expects an ack for the
+                        // intent itself -- closing the link is the
+                        // confirmation it waits on, so give it one now
+                        // rather than leaving the connection to linger
+                        // until some other path notices it's unused.
+                        link.connection().close(
+                            VarInt::from_u32(LEAVE_PROCESSED_CLOSE),
+                            b"leave processed",
+                        );
+                        break 'serve;
+                    }
+                    Some(ControlInbound::OversizeTurn(payload)) => {
                         // Dedup under the *authorized* slot — the wire slot is a
                         // claim the relay never trusts (validate_turn rebinds it
                         // the same way on the datagram path), so a lied-about
@@ -676,6 +854,23 @@ pub async fn run_slot_link(
 
     deregister(&sessions, &key, slot);
     crate::mesh::unpublish_conditions(&conditions, &key, slot);
+    // Trigger A (synced player-leave): this client's link ended, so it has left
+    // the game. Schedule a coordinated leave for its slot on the session's
+    // authority, so every remaining client drops it from lockstep at the same
+    // frame (rather than stalling on a slot that will never send another turn).
+    // A no-op unless this relay is the authority; a departed client homed on a
+    // peer relay reaches the authority via the mesh instead (SlotDeparted — not
+    // yet wired). Must run *before* `remove_slot` below, which clears the slot's
+    // last observed frame that the apply frame is computed from. On a decision,
+    // push the leave down every surviving client's reliable control stream (the
+    // departing slot is already off the roster from `deregister` above, so
+    // `fan_out_leave` targets only survivors) — the turn stream has stopped for
+    // them, so the reliable stream is the only channel that unstalls them.
+    if let Some(leave) =
+        crate::consensus::decide_leave(&decision_makers, &key, slot, LEAVE_REASON_DROPPED)
+    {
+        fan_out_leave(&sessions, &key, slot, leave);
+    }
     // Forget this slot's condition history in the decision-maker so a departed
     // client's stale stats don't outlive its connection. The maker itself lives
     // until the session ends (the coordinator drops the descriptor).

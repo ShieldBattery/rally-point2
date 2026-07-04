@@ -187,6 +187,13 @@ message Payload {
   // outside the window between a decision and its apply frame — the vast
   // majority of turns.
   optional BufferDirective buffer_directive = 5;
+
+  // NOTE: player-leaves are deliberately NOT on the turn envelope. A drop stalls
+  // every remaining player (lockstep), which stops the turn stream — so an
+  // envelope stamp could never be delivered when it is needed. Leaves ride the
+  // reliable control stream instead (see `ControlFrame.leave_directive`). The
+  // buffer directive keeps the envelope because buffer changes happen while turns
+  // are still flowing.
 }
 
 // One message on the client ↔ relay reliable control stream — the channel for
@@ -213,6 +220,20 @@ message ControlFrame {
     // client carries a peer's forwarded turn (which may bear the envelope
     // stamps every forwarded turn can: frame annotation, buffer directive).
     Payload oversize_turn = 1;
+
+    // A synced player-leave the relay pushes DOWN to a surviving client (relay →
+    // client only). It rides the reliable stream, not the turn envelope, because
+    // a drop stalls every survivor and stops the turn stream — so this is the
+    // only channel that still reaches them. The relay sends one per surviving
+    // client when it decides a leave; the client feeds it to its leave tracker
+    // and applies it at `apply_at_frame`, clearing the departed slot and
+    // unstalling. See `LeaveDirective`.
+    LeaveDirective leave_directive = 2;
+
+    // A client announcing its own clean departure UP to the relay (client →
+    // relay only), sent after the client has flushed its final turns and is
+    // about to disconnect. See `LeaveIntent`.
+    LeaveIntent leave_intent = 3;
   }
 }
 
@@ -255,3 +276,60 @@ message BufferDirective {
   // when two directives name the same `apply_at_frame`.
   uint32 decision_seq = 3;
 }
+
+// A relay-authored instruction to apply a synced player-leave at an agreed
+// future game frame. When a player leaves or drops, every remaining client must
+// register the leave at the *same* simulated step, in the same per-slot order
+// with the same synced-RNG state — including clients that never observed the
+// drop locally — or the game desyncs. This message carries that agreement: the
+// deciding relay picks the frame and **pushes it down each surviving client's
+// reliable control stream** (see `ControlFrame.leave_directive`), because a drop
+// stops the turn stream and only the reliable stream still reaches the survivors.
+//
+// The apply frame is chosen minimally — one past the departing slot's last
+// observed frame — because remaining clients stall the instant that slot owes a
+// turn it will never send, so the leave is what unstalls them, applied at the
+// top of the receive step before the readiness check. Clients dedup by slot (a
+// slot leaves once), so `leave_seq` only orders/labels leaves for the relay.
+message LeaveDirective {
+  // The slot that left. Relay-authoritative (the relay knows which client's link
+  // ended, or validated a drop request), never a client-asserted value. Every
+  // client writes this slot's native leave reason and stops requiring its turns.
+  uint32 slot = 1;
+
+  // The native SC:R `pending_leave_reason` value to write for the departing
+  // slot: `0x40000006` == dropped (shows "player was dropped"), any other
+  // nonzero == left (shows "player left"). Carried so every client shows the
+  // same outcome; it does not affect determinism (all clients get the one value
+  // the relay chose).
+  uint32 reason = 2;
+
+  // The game frame at which every client applies the leave. One past the
+  // departing slot's last observed frame (clamped never to be in the past), so
+  // remaining clients apply it exactly at the step they would otherwise stall
+  // waiting on that slot. A client cannot advance past this frame without
+  // applying the leave — the departed slot gates the step until then — so unlike
+  // a buffer change, a leave can never be "too late," and there is no moot case.
+  uint32 apply_at_frame = 3;
+
+  // Orders and dedups leaves within a session, in a seq space *separate* from
+  // `BufferDirective.decision_seq`. Because leaves are cumulative — one slot
+  // leaving never obsoletes another slot's leave — this only dedups redundant
+  // copies of the *same* leave (the relay stamps it onto many turns) and keeps
+  // numbering continuous across an authority handoff so a promoted relay's
+  // re-broadcast outranks stale copies. It never retires a *different* leave.
+  uint32 leave_seq = 4;
+}
+
+// A client's announcement that it is leaving cleanly (client → relay only),
+// sent on the reliable control stream after the client has flushed its final
+// turns and before it disconnects. Deliberately fieldless: the relay already
+// knows which slot is departing from the authenticated connection the frame
+// arrived on, and the reason is implicitly "left" — a client that got this far
+// wasn't dropped, it is announcing its own departure. On receipt the relay
+// decides an immediate synced leave for that slot with the "left" reason (see
+// `LeaveDirective`) and pushes it down every surviving client, rather than
+// waiting for the link to go idle and reason it as "dropped". There is no ack:
+// the client's confirmation that the relay processed this is the relay closing
+// the link, not a reply frame.
+message LeaveIntent {}
