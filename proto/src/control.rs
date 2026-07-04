@@ -152,6 +152,7 @@ impl From<&RelayEntry> for RelayPeer {
         RelayPeer {
             relay_id: e.relay_id,
             relay_addr: e.relay_addr,
+            cert_der: e.cert_der.clone(),
         }
     }
 }
@@ -161,8 +162,7 @@ impl From<&RelayEntry> for RelayPeer {
 ///
 /// This is the app-server's (and ultimately the game client's) view of a relay
 /// — unlike [`RelayPeer`], which rides in session *descriptors* for
-/// relay-to-relay meshing, where trust comes from mesh roots rather than a
-/// per-relay pinned cert (so it carries no cert).
+/// relay-to-relay meshing (and pins the same enrolled cert for the mesh dial).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayEndpoint {
     /// The relay's coordinator-assigned id.
@@ -186,8 +186,8 @@ impl From<&RelayEntry> for RelayEndpoint {
     }
 }
 
-/// A peer relay in a session's mesh topology: the id and address a relay
-/// needs to dial or accept a mesh connection from.
+/// A peer relay in a session's mesh topology: the id, address, and pinned
+/// certificate a relay needs to dial (or accept) a mesh connection.
 ///
 /// Carried inside a [`SessionDescriptor`] so each relay in a session learns
 /// the lower-id side of each pair dials the higher (the `should_dial_mesh`
@@ -201,6 +201,15 @@ pub struct RelayPeer {
     pub relay_id: RelayId,
     /// Where the peer relay is reached.
     pub relay_addr: SocketAddr,
+    /// DER of the TLS leaf certificate the peer relay reported at enrollment —
+    /// the same cert clients pin from a session response. The dialing relay
+    /// pins exactly this cert for the mesh connection, so independently
+    /// self-signed relay certs trust each other with no out-of-band
+    /// distribution (mirroring [`RelayEndpoint::cert_der`] on the client edge).
+    /// Defaults to empty on a descriptor from a coordinator that predates the
+    /// field; the dialer then falls back to its configured mesh roots.
+    #[serde(default, with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +524,7 @@ mod tests {
                 peers: vec![RelayPeer {
                     relay_id: RelayId(2),
                     relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                    cert_der: vec![0x30, 0x82, 0xCC, 0xDD],
                 }],
                 bounds: BufferBounds::new(1, 6).unwrap(),
                 authority_order: vec![RelayId(1), RelayId(2)],
@@ -581,6 +591,7 @@ mod tests {
             peers: vec![RelayPeer {
                 relay_id: RelayId(2),
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                cert_der: vec![0x30, 0x82, 0xCC, 0xDD],
             }],
             bounds: BufferBounds::new(1, 6).unwrap(),
             authority_order: vec![RelayId(1), RelayId(2)],
@@ -592,8 +603,9 @@ mod tests {
 
     #[test]
     fn session_descriptor_without_authority_order_decodes_to_empty() {
-        // A descriptor from a coordinator that predates the authority order
-        // must still decode — the relay falls back to relay-id order — rather
+        // A descriptor from a coordinator that predates the authority order —
+        // and the peer cert — must still decode (the relay falls back to
+        // relay-id order, and to its configured mesh roots for the dial) rather
         // than tearing down the control connection over a missing field.
         let json = r#"{
             "tenant":"sb-staging","session":42,
@@ -602,6 +614,10 @@ mod tests {
         }"#;
         let back: SessionDescriptor = serde_json::from_str(json).unwrap();
         assert!(back.authority_order.is_empty());
+        assert!(
+            back.peers[0].cert_der.is_empty(),
+            "a peer without a cert decodes to an empty pin (mesh-roots fallback)",
+        );
     }
 
     #[test]

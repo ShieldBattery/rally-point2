@@ -145,6 +145,7 @@ mod tests {
                 .map(|&id| RelayPeer {
                     relay_id: RelayId(id),
                     relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900 + id as u16)),
+                    cert_der: vec![id as u8; 4],
                 })
                 .collect(),
             bounds: BufferBounds::new(1, 6).unwrap(),

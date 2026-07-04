@@ -541,6 +541,11 @@ mod tests {
         .unwrap();
         assert_eq!(desc.peers.len(), 1);
         assert_eq!(desc.peers[0].relay_id, RelayId(2));
+        assert_eq!(
+            desc.peers[0].cert_der,
+            fake_cert(2),
+            "the peer carries relay 2's enrolled cert, so relay 1's mesh dial pins it",
+        );
         assert_eq!(desc.bounds, BufferBounds::new(1, 6).unwrap());
 
         // Relay 2's peers → relay 1.
@@ -553,6 +558,7 @@ mod tests {
         .unwrap();
         assert_eq!(desc2.peers.len(), 1);
         assert_eq!(desc2.peers[0].relay_id, RelayId(1));
+        assert_eq!(desc2.peers[0].cert_der, fake_cert(1));
 
         // Both descriptors carry the same buffer-authority order, home relay
         // (relay 1) first — every relay must rank the candidates identically

@@ -102,16 +102,26 @@ struct Inner {
     /// successfully told to join (and not yet leave). Only entries for peers
     /// with a live link exist here.
     joined: HashMap<RelayId, HashSet<SessionKey>>,
-    /// Latest reachable address seen for each peer (from descriptors), so the
-    /// desired-peer set published for the dialer carries addresses, not just ids.
-    /// Pruned to the currently-desired peers on each publish.
-    peer_addrs: HashMap<RelayId, SocketAddr>,
+    /// Latest contact details seen for each peer (from descriptors): the
+    /// reachable address plus the enrolled certificate a dial pins, so the
+    /// desired-peer set published for the dialer carries everything a dial
+    /// needs, not just ids. Pruned to the currently-desired peers on each
+    /// publish.
+    peer_contacts: HashMap<RelayId, PeerContact>,
     /// Publishes the peers this relay currently needs mesh links to (id +
     /// address), so the on-demand dialer can (re)establish them. Declarative
     /// latest-wins state — like the coordinator's descriptor push, a level down:
     /// the coordinator says which peers a session needs, and this republishes the
     /// union across all sessions for the connection half to act on.
     desired_peers_tx: watch::Sender<Vec<RelayPeer>>,
+}
+
+/// One peer's dial ingredients as the latest descriptor reported them: where to
+/// reach it and the certificate to pin (empty when the coordinator predates
+/// carrying certs — the dialer then falls back to its configured mesh roots).
+struct PeerContact {
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
 }
 
 impl MeshControl {
@@ -141,7 +151,7 @@ impl MeshControl {
                 links: HashMap::new(),
                 desired: HashMap::new(),
                 joined: HashMap::new(),
-                peer_addrs: HashMap::new(),
+                peer_contacts: HashMap::new(),
                 desired_peers_tx,
             })),
         }
@@ -249,11 +259,18 @@ impl MeshControl {
 
         let mut inner = self.inner.lock();
 
-        // Remember each named peer's reachable address, so the desired-peer set
-        // published for the dialer can carry it (a relay never dials itself).
+        // Remember each named peer's contact details — address plus the enrolled
+        // cert a dial pins — so the desired-peer set published for the dialer can
+        // carry them (a relay never dials itself).
         for peer in &descriptor.peers {
             if peer.relay_id != self.our_id {
-                inner.peer_addrs.insert(peer.relay_id, peer.relay_addr);
+                inner.peer_contacts.insert(
+                    peer.relay_id,
+                    PeerContact {
+                        addr: peer.relay_addr,
+                        cert_der: peer.cert_der.clone(),
+                    },
+                );
             }
         }
 
@@ -294,9 +311,10 @@ impl MeshControl {
 }
 
 /// Recomputes the peers this relay currently needs mesh links to — the union of
-/// every session's desired peers, each paired with its latest known address — and
-/// publishes it if it changed. The address book is pruned to just the desired
-/// peers so it can't grow without bound across a relay's lifetime.
+/// every session's desired peers, each paired with its latest known address and
+/// pinned cert — and publishes it if it changed. The contact book is pruned to
+/// just the desired peers so it can't grow without bound across a relay's
+/// lifetime.
 ///
 /// Publishing only on a real change keeps the dialer from re-evaluating on every
 /// descriptor that leaves the peer set untouched. `send_if_modified` updates the
@@ -304,14 +322,15 @@ impl MeshControl {
 /// dialer that subscribes later still sees the current set.
 fn publish_desired_peers(inner: &mut Inner) {
     let desired_ids: HashSet<RelayId> = inner.desired.values().flatten().copied().collect();
-    inner.peer_addrs.retain(|id, _| desired_ids.contains(id));
+    inner.peer_contacts.retain(|id, _| desired_ids.contains(id));
 
     let mut peers: Vec<RelayPeer> = desired_ids
         .iter()
         .filter_map(|id| {
-            inner.peer_addrs.get(id).map(|&addr| RelayPeer {
+            inner.peer_contacts.get(id).map(|contact| RelayPeer {
                 relay_id: *id,
-                relay_addr: addr,
+                relay_addr: contact.addr,
+                cert_der: contact.cert_der.clone(),
             })
         })
         .collect();
@@ -413,6 +432,7 @@ mod tests {
         RelayPeer {
             relay_id: RelayId(id),
             relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900 + id as u16)),
+            cert_der: vec![id as u8; 4],
         }
     }
 
@@ -643,13 +663,16 @@ mod tests {
         assert!(peers_rx.has_changed().unwrap());
         let published = peers_rx.borrow_and_update().clone();
         assert_eq!(published.len(), 2);
-        // Sorted by id, each carrying the address the descriptor named.
+        // Sorted by id, each carrying the address and pinned cert the
+        // descriptor named — the cert is what the dialer's trust config pins.
         assert_eq!(published[0].relay_id, RelayId(2));
         assert_eq!(
             published[0].relay_addr,
             SocketAddr::from((Ipv4Addr::LOCALHOST, 14902))
         );
+        assert_eq!(published[0].cert_der, vec![2u8; 4]);
         assert_eq!(published[1].relay_id, RelayId(3));
+        assert_eq!(published[1].cert_der, vec![3u8; 4]);
     }
 
     #[test]

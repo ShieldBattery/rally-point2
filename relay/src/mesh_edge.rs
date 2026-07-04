@@ -149,9 +149,10 @@ pub struct MeshDial {
     /// self-signed dev certs this is `localhost`; for production it is the
     /// hostname on the relay's cert).
     pub server_name: String,
-    /// Root certificates to trust the peer's cert chain against. Today the
-    /// same roots a client would use; a mesh-specific secret lands with the
-    /// coordinator (Phase 3).
+    /// Root certificates to trust the peer's cert chain against. On the
+    /// descriptor-driven dial path this is the peer's own enrolled certificate,
+    /// pinned (see `mesh_dialer::dial_roots`); the static dev/loopback dial
+    /// passes the configured mesh roots.
     pub roots: RootCertStore,
 }
 

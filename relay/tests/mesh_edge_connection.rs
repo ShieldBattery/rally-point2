@@ -406,6 +406,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         peers: vec![RelayPeer {
             relay_id: RelayId(2),
             relay_addr: relay_b.addr,
+            cert_der: relay_b.ca.to_vec(),
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
@@ -416,6 +417,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         peers: vec![RelayPeer {
             relay_id: RelayId(1),
             relay_addr: relay_a.addr,
+            cert_der: relay_a.ca.to_vec(),
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
@@ -526,10 +528,12 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     control_a.apply_descriptor(&descriptor_for(vec![RelayPeer {
         relay_id: RelayId(2),
         relay_addr: relay_b.addr,
+        cert_der: relay_b.ca.to_vec(),
     }]));
     control_b.apply_descriptor(&descriptor_for(vec![RelayPeer {
         relay_id: RelayId(1),
         relay_addr: relay_a.addr,
+        cert_der: relay_a.ca.to_vec(),
     }]));
 
     // A player on each relay. A's client is the one whose departure hands off.
@@ -763,16 +767,18 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
         links_b_tx,
     ));
 
-    // A's on-demand dialer, fed desired peers over a watch.
+    // A's on-demand dialer, fed desired peers over a watch. Its configured
+    // fallback roots are EMPTY: trust must come entirely from the pinned cert
+    // the desired peer carries — the production two-relay shape, where each
+    // relay self-signs at startup and only the coordinator-relayed cert links
+    // them.
     let (links_a_tx, mut links_a_rx) =
         mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
     let (peers_tx, peers_rx) = watch::channel(Vec::<RelayPeer>::new());
     let config = mesh_dialer::DialerConfig {
         our_id: RelayId(1),
         server_name: "localhost".to_owned(),
-        roots,
+        roots: rustls::RootCertStore::empty(),
         sessions: Arc::clone(&relay_a.sessions),
         mesh: relay_a.mesh.clone(),
         links: links_a_tx,
@@ -780,10 +786,12 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
     };
     tokio::spawn(mesh_dialer::run_mesh_dialer(config, peers_rx));
 
-    // The coordinator's descriptors name B as a peer → the dialer dials it.
+    // The coordinator's descriptors name B as a peer, carrying B's enrolled
+    // cert → the dialer pins it and dials.
     peers_tx.send(vec![RelayPeer {
         relay_id: RelayId(2),
         relay_addr: relay_b.addr,
+        cert_der: relay_b.ca.to_vec(),
     }])?;
     let (peer1, cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
         .await
@@ -830,10 +838,16 @@ fn dialer_for_a(
     (peers_tx, links_a_rx)
 }
 
+/// A desired peer carrying no pinned cert: the dial falls back to the
+/// configured roots `dialer_for_a` was given (the old-coordinator shape). The
+/// pinned-cert path is exercised by
+/// `dialer_establishes_and_reestablishes_a_desired_peer_link`, which runs with
+/// empty fallback roots.
 fn peer_at(id: u64, addr: SocketAddr) -> RelayPeer {
     RelayPeer {
         relay_id: RelayId(id),
         relay_addr: addr,
+        cert_der: Vec::new(),
     }
 }
 

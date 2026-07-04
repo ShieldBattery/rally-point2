@@ -89,8 +89,9 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
     generation
 }
 
-/// Looks up a relay by id, returning a [`RelayPeer`] (the id + address a
-/// session descriptor carries).
+/// Looks up a relay by id, returning a [`RelayPeer`] (the id, address, and
+/// pinned cert a session descriptor carries — the cert the relay reported at
+/// enrollment, so a peer relay dialing it pins exactly what clients pin).
 pub fn peer(registry: &RelayRegistry, id: RelayId) -> Option<RelayPeer> {
     registry
         .relays
@@ -105,8 +106,8 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
 }
 
 /// All registered relays' full entries, in an unspecified order. Used to pick
-/// home + backup relays for a session — the session response needs the cert
-/// alongside the address, which [`RelayPeer`] doesn't carry.
+/// home + backup relays for a session — the session response needs the full
+/// enrollment record (protocol version and all), not just the peer view.
 pub fn all_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
     registry
         .relays
@@ -216,6 +217,11 @@ mod tests {
         let p = peer(&reg, RelayId(1)).unwrap();
         assert_eq!(p.relay_id, RelayId(1));
         assert_eq!(p.relay_addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)));
+        assert_eq!(
+            p.cert_der,
+            vec![1u8; 4],
+            "the peer carries the cert the relay enrolled with, for the mesh dial to pin",
+        );
     }
 
     #[test]
