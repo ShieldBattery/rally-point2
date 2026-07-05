@@ -147,6 +147,33 @@ const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 /// the link — the game's outcome is still reasoned from the departure.
 const MAX_GAME_RESULT_PAYLOAD_LEN: usize = 4096;
 
+/// The largest client turn the relay will accept on the oversize-turn divert path.
+///
+/// A turn too big for a datagram rides the reliable control stream
+/// ([`ControlInbound::OversizeTurn`]) and is then fanned out to the other slots'
+/// forward queues. Those queues are bounded by payload *count* ([`FORWARD_CAPACITY`]),
+/// not by bytes, and the control-stream framing only caps a single frame at 64 KiB
+/// ([`MAX_CONTROL_FRAME_LEN`](rally_point_proto::control_stream::MAX_CONTROL_FRAME_LEN)).
+/// A datagram-sized turn buffered in one of those queues costs on the order of the
+/// path MTU (~1 KiB); an oversize one can cost up to that 64 KiB frame cap. So a
+/// malicious client spraying maximum-size oversize turns occupies far more buffered
+/// memory per queued turn than a normal player -- and it does so across *every*
+/// receiving slot's queue at once.
+///
+/// A legitimate SC:R turn is at most a few hundred bytes of commands (well under a
+/// datagram); the divert path exists only for the rare turn that just clears the
+/// datagram budget. Capping accepted oversize turns here -- comfortably above any
+/// real turn and the e2e divert fixtures (~4-5 KiB), far below the 64 KiB framing
+/// cap -- bounds that per-turn amplification at the source. An over-cap turn is not
+/// one any real client produces, so it is rejected exactly like a malformed turn:
+/// the link is closed, which routes the offender through the normal departure/leave
+/// machinery so survivors get a synced leave and play on. (Silently *dropping* the
+/// turn instead would leave a permanent gap in the slot's seq stream and stall every
+/// peer in lockstep forever -- hurting honest players, not just the offender.) Peer
+/// relays are trusted infrastructure and clamp at their own client ingress, so the
+/// mesh-side divert needs no separate check.
+const MAX_OVERSIZE_TURN_COMMANDS_LEN: usize = 8192;
+
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
 
@@ -805,6 +832,25 @@ pub async fn run_slot_link(
                         break 'serve;
                     }
                     Some(ControlInbound::OversizeTurn(payload)) => {
+                        // A turn larger than any legitimate one can ever be is
+                        // rejected before it can occupy the count-bounded forward
+                        // queues (see `MAX_OVERSIZE_TURN_COMMANDS_LEN`). Closing
+                        // the link — rather than dropping the turn and stranding
+                        // peers on the seq gap — is the same response a malformed
+                        // turn gets, and only removes the offending client.
+                        if payload.commands.len() > MAX_OVERSIZE_TURN_COMMANDS_LEN {
+                            tracing::warn!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                len = payload.commands.len(),
+                                cap = MAX_OVERSIZE_TURN_COMMANDS_LEN,
+                                "rejecting over-cap oversize client turn and closing connection",
+                            );
+                            link.connection()
+                                .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"oversize turn");
+                            break 'serve;
+                        }
                         // Dedup under the *authorized* slot — the wire slot is a
                         // claim the relay never trusts (validate_turn rebinds it
                         // the same way on the datagram path), so a lied-about

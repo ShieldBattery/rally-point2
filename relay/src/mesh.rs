@@ -612,13 +612,14 @@ fn deliver_turn_to_locals(
     );
     match crate::consensus::active_directive(decision_makers, key) {
         Some(directive) => payload.buffer_directive = Some(directive),
-        // Preserving an upstream stamp also records its seq: every directive
-        // floods through every relay serving the session, so if this relay is
-        // later promoted to authority, its own decisions number above what
-        // clients already hold instead of restarting below it.
+        // Preserving an upstream stamp also records its seq and buffer: every
+        // directive floods through every relay serving the session, so if this
+        // relay is later promoted to authority, its own decisions number above
+        // what clients already hold and baseline against the committed buffer
+        // instead of restarting below it.
         None => {
             if let Some(incoming) = &payload.buffer_directive {
-                crate::consensus::observe_directive(decision_makers, key, incoming.decision_seq);
+                crate::consensus::observe_directive(decision_makers, key, incoming);
             }
         }
     }

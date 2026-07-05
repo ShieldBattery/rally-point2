@@ -235,6 +235,23 @@ pub struct Decision {
 /// promptly.
 const APPLY_HORIZON: u32 = 3;
 
+/// How much session-frame progress must elapse between rate-limited traces of the
+/// control law's inputs (see [`DecisionMaker::trace_control_inputs`]). 600 turns
+/// is ~25s at the 24/sec turn rate -- rare enough that a full game logs only a
+/// handful of lines at the debug level, frequent enough to watch the buffer
+/// track conditions over the course of a match.
+const BUFFER_TRACE_INTERVAL_TURNS: u32 = 600;
+
+/// The control law's target buffer size together with the intermediates it was
+/// derived from, so the diagnostic trace can report *why* a target came out where
+/// it did without recomputing the formula. `path_us` is the worst pairwise path,
+/// `worst_loss_risk` the highest per-slot `loss_rate * eff_rtt`.
+struct TargetInputs {
+    target: u32,
+    path_us: u32,
+    worst_loss_risk: f64,
+}
+
 /// How many recent RTT samples to keep per slot for jitter-aware sizing.
 /// At 24 turns/sec this is ~1.3s of history -- enough to catch the latency
 /// spikes that cause lockstep stalls without excessive memory (128 bytes
@@ -462,6 +479,20 @@ pub struct DecisionMaker {
     /// decisions), so it never stamps -- it only forwards the authority's
     /// already-stamped turns verbatim.
     pending_directive: Option<BufferDirective>,
+    /// Whether this authority has broadcast the session's buffer at least once.
+    /// The control law only emits a directive when the buffer *changes*, so a
+    /// session that sits at its initial buffer never broadcasts one -- and a
+    /// client that seeded a different buffer than the relay's initial state is
+    /// then never corrected. This flag drives a single unconditional broadcast of
+    /// the current buffer at the first framed turn (see [`decide`](Self::decide))
+    /// to close that gap. Reset to `false` on promotion so a newly promoted
+    /// authority re-affirms the buffer to every survivor, the same way a promotion
+    /// re-broadcasts leaves.
+    initial_directive_sent: bool,
+    /// The session frame at which the control law's inputs were last traced, for
+    /// the rate-limited diagnostic in [`decide`](Self::decide). `None` until the
+    /// first trace. Only observability state; carries no decision meaning.
+    last_trace_frame: Option<u32>,
     /// The synced player-leaves this relay has authored (as authority) or
     /// observed (a peer relay's authority pushed it across the mesh), keyed by
     /// slot. A leave is a one-shot: it is pushed down each surviving client's
@@ -1458,6 +1489,8 @@ impl DecisionMaker {
             last_decision_frame: None,
             decision_seq: 0,
             pending_directive: None,
+            initial_directive_sent: false,
+            last_trace_frame: None,
             decided_leaves: HashMap::new(),
             departures: HashMap::new(),
             next_leave_seq: 0,
@@ -1591,15 +1624,29 @@ impl DecisionMaker {
         ceiling
     }
 
-    /// Records the `decision_seq` of a directive this relay forwarded on
-    /// behalf of the session's authority. Keeps `decision_seq` at least that
-    /// high, so if this relay is later promoted to authority its first
-    /// decision numbers *above* everything clients have already seen --
-    /// clients keep only the highest seq, and a restarted numbering would be
-    /// silently ignored.
-    pub fn observe_directive(&mut self, seq: u32) {
-        if seq > self.decision_seq {
-            self.decision_seq = seq;
+    /// Records a directive this relay forwarded on behalf of the session's
+    /// authority. Keeps `decision_seq` at least that high, so if this relay is
+    /// later promoted to authority its first decision numbers *above* everything
+    /// clients have already seen -- clients keep only the highest seq, and a
+    /// restarted numbering would be silently ignored.
+    ///
+    /// Also adopts the directive's buffer as this relay's tracked buffer, so a
+    /// peer relay follows the session's committed depth rather than sitting at its
+    /// creation-time minimum. This is what lets a promoted authority baseline its
+    /// control law -- and its promotion re-broadcast (see [`set_authority`]) --
+    /// against the true current buffer instead of forcing an abrupt resize toward
+    /// a stale minimum. Adopted immediately (before the directive's apply frame),
+    /// exactly as the authority sets its own buffer the moment it decides; by the
+    /// time a promotion consults it, the apply frame has long passed.
+    ///
+    /// Only ever called on a non-authority relay (the authority forwards its own
+    /// directives through [`active_directive`](Self::active_directive), not here),
+    /// and only a strictly newer directive updates the buffer -- an out-of-order
+    /// stale copy is ignored by the same `seq` gate that guards the numbering.
+    pub fn observe_directive(&mut self, directive: &BufferDirective) {
+        if directive.decision_seq > self.decision_seq {
+            self.decision_seq = directive.decision_seq;
+            self.buffer = BufferSize(directive.buffer_turns);
         }
     }
 
@@ -1689,6 +1736,15 @@ impl DecisionMaker {
             // the window across would be complexity for a one-interval blind spot.
             // Observer membership is descriptor-driven, so it is deliberately kept.
             self.sync = SyncTracker::default();
+            // Re-affirm the buffer to every survivor: the promoted relay tracked
+            // the last-broadcast buffer as a peer (see [`observe_directive`]), so
+            // this re-broadcast carries the session's true current buffer, not a
+            // stale minimum -- a no-op resize for a survivor already at that depth,
+            // and a correction for one that missed the original directive.
+            self.initial_directive_sent = false;
+            // Trace the new authority's control inputs promptly rather than
+            // waiting out the interval from the previous authority's cadence.
+            self.last_trace_frame = None;
             self.drain_handoff_leaves()
         } else {
             (Vec::new(), Vec::new())
@@ -1849,6 +1905,16 @@ impl DecisionMaker {
     /// have data). Also public so a caller or debug UI can inspect what the
     /// target would be without firing a decision.
     pub fn target(&self) -> Option<u32> {
+        self.target_inputs().map(|inputs| inputs.target)
+    }
+
+    /// The target buffer size and the intermediates the formula derived it from
+    /// (see [`target`](Self::target) for the formula). `decide` computes this once
+    /// per ingest -- reusing the intermediates for the diagnostic trace instead of
+    /// deriving them a second time -- and `target` is the thin projection to just
+    /// the size for external callers. `None` when no slot has an RTT measurement
+    /// yet.
+    fn target_inputs(&self) -> Option<TargetInputs> {
         // Collect effective RTTs (rtt + mesh hop) from all slots with a
         // measurement. The effective RTT is the full one-way path from the
         // client to the authority relay, so the pairwise formula naturally
@@ -1890,62 +1956,36 @@ impl DecisionMaker {
         let path_turns = (path_us as f64 / turn_us).ceil() as u32;
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
 
-        Some(path_turns + loss_turns)
+        Some(TargetInputs {
+            target: path_turns + loss_turns,
+            path_us,
+            worst_loss_risk,
+        })
     }
 
-    /// Runs the control law: compute the target, then move toward it
-    /// asymmetrically -- raises jump to the target immediately (no dwell, you
-    /// can't dwell through a stall); lowers decrement by `lower_step` gated by
-    /// `min_dwell_turns` (shrinks are infrequent and well-validated).
-    fn decide(&mut self) -> Option<Decision> {
-        // No framed turn observed yet (lobby): there is no consensus
-        // coordinate to schedule against, so hold.
-        let frame = self.session_frame()?;
-        let target = self.target()?;
-
-        let new_buffer = if target > self.buffer.0 {
-            // Raise fast: jump to the target immediately. No dwell -- a
-            // too-small buffer stalls, and you can't wait through a stall.
-            target
-        } else if target < self.buffer.0 {
-            // Lower slow: check the dwell first. Every buffer-size change
-            // alters the game feel, so shrinks are gated -- at least
-            // `min_dwell_turns` must have elapsed since the last decision
-            // before the buffer shrinks. A raise resets the dwell clock
-            // (it set `last_decision_frame`), so a raise followed by a
-            // would-be lower still waits the full dwell.
-            if let Some(last) = self.last_decision_frame
-                && frame.0.saturating_sub(last.0) < self.law.min_dwell_turns
-            {
-                return None;
-            }
-            self.buffer.0.saturating_sub(self.law.lower_step)
-        } else {
-            return None;
-        };
-
-        let new_buffer = self.bounds.clamp(new_buffer);
-        if new_buffer == self.buffer.0 {
-            return None;
-        }
-
-        // The apply horizon: the session frame is the *slowest* client's
-        // progress as observed over its own uplink, so the relay's view lags
-        // by roughly the cushion, and the fastest client runs ahead of the
-        // slowest by at most the cushion again -- both scale with the buffer,
-        // so the horizon does too (the wider of the old and new cushion,
-        // plus a fixed delivery margin).
+    /// Queues a directive moving (or, when `new_buffer` equals the current buffer,
+    /// re-affirming) the session buffer to `new_buffer`, scheduled a horizon past
+    /// `frame`, and returns the [`Decision`]. Shared by the control law and the
+    /// unconditional initial broadcast so both stamp through the identical
+    /// machinery: one `decision_seq` increment, one pending directive the caller
+    /// hands out via [`active_directive`](Self::active_directive), one apply-horizon
+    /// computation.
+    ///
+    /// The apply horizon: the session frame is the *slowest* client's progress as
+    /// observed over its own uplink, so the relay's view lags by roughly the
+    /// cushion, and the fastest client runs ahead of the slowest by at most the
+    /// cushion again -- both scale with the buffer, so the horizon does too (the
+    /// wider of the old and new cushion, plus a fixed delivery margin).
+    fn queue_directive(&mut self, new_buffer: u32, frame: GameFrameCount) -> Decision {
         let span = self.buffer.0.max(new_buffer);
         self.buffer = BufferSize(new_buffer);
         let applied_frame =
             GameFrameCount(frame.0.saturating_add(span).saturating_add(APPLY_HORIZON));
         self.last_decision_frame = Some(frame);
 
-        // Queue the change for broadcast: the caller stamps it onto every turn
-        // it forwards until the session frame passes `applied_frame`. A newer
-        // decision replaces an older still-broadcasting one -- its higher
-        // `decision_seq` tells clients the latest buffer wins even when copies
-        // of both interleave on the wire.
+        // A newer decision replaces an older still-broadcasting one -- its higher
+        // `decision_seq` tells clients the latest buffer wins even when copies of
+        // both interleave on the wire.
         self.decision_seq += 1;
         self.pending_directive = Some(BufferDirective {
             buffer_turns: new_buffer,
@@ -1953,10 +1993,113 @@ impl DecisionMaker {
             decision_seq: self.decision_seq,
         });
 
-        Some(Decision {
+        Decision {
             buffer: self.buffer,
             applied_frame,
-        })
+        }
+    }
+
+    /// Runs the control law: compute the target, then move toward it
+    /// asymmetrically -- raises jump to the target immediately (no dwell, you
+    /// can't dwell through a stall); lowers decrement by `lower_step` gated by
+    /// `min_dwell_turns` (shrinks are infrequent and well-validated).
+    ///
+    /// The first framed turn on this authority also forces one *unconditional*
+    /// broadcast of the current buffer if the control law itself made no change:
+    /// the law only emits a directive when the buffer moves, so a session that
+    /// sits at its initial buffer would otherwise never broadcast one, leaving a
+    /// client that seeded a different buffer than the relay uncorrected. A real
+    /// decision at the first framed turn already broadcasts the buffer, so the
+    /// fallback fires only when the law holds -- exactly the "target sits at the
+    /// minimum" gap. Either way, a client already at that depth applies the
+    /// directive as a no-op resize. Reset on promotion, so a newly promoted
+    /// authority re-affirms the buffer once.
+    fn decide(&mut self) -> Option<Decision> {
+        // No framed turn observed yet (lobby): there is no consensus
+        // coordinate to schedule against, so hold.
+        let frame = self.session_frame()?;
+
+        let inputs = self.target_inputs();
+        if let Some(inputs) = &inputs {
+            self.trace_control_inputs(frame, inputs);
+        }
+
+        // The control law, when it has an RTT-derived target.
+        if let Some(inputs) = &inputs {
+            let target = inputs.target;
+            let new_buffer = if target > self.buffer.0 {
+                // Raise fast: jump to the target immediately. No dwell -- a
+                // too-small buffer stalls, and you can't wait through a stall.
+                Some(target)
+            } else if target < self.buffer.0 {
+                // Lower slow: check the dwell first. Every buffer-size change
+                // alters the game feel, so shrinks are gated -- at least
+                // `min_dwell_turns` must have elapsed since the last decision
+                // before the buffer shrinks. A raise resets the dwell clock
+                // (it set `last_decision_frame`), so a raise followed by a
+                // would-be lower still waits the full dwell.
+                if let Some(last) = self.last_decision_frame
+                    && frame.0.saturating_sub(last.0) < self.law.min_dwell_turns
+                {
+                    None
+                } else {
+                    Some(self.buffer.0.saturating_sub(self.law.lower_step))
+                }
+            } else {
+                None
+            };
+
+            if let Some(new_buffer) = new_buffer {
+                let new_buffer = self.bounds.clamp(new_buffer);
+                if new_buffer != self.buffer.0 {
+                    // A real change is itself the session's first broadcast, so
+                    // the initial-directive fallback below is satisfied.
+                    self.initial_directive_sent = true;
+                    return Some(self.queue_directive(new_buffer, frame));
+                }
+            }
+        }
+
+        // The law made no change (held, or no RTT yet). Broadcast the current
+        // buffer once so a differently-seeded client is corrected even while the
+        // target sits at the minimum.
+        if !self.initial_directive_sent {
+            self.initial_directive_sent = true;
+            return Some(self.queue_directive(self.buffer.0, frame));
+        }
+
+        None
+    }
+
+    /// Emits a rate-limited debug trace of the control law's inputs, so a wrong
+    /// buffer is diagnosable from logs without turning the decision stream into a
+    /// firehose. At most once per [`BUFFER_TRACE_INTERVAL_TURNS`] of session-frame
+    /// progress; the frame-counter gate is the only cost when the debug level is
+    /// off (the field expressions -- including the per-slot RTT gather -- are
+    /// evaluated only if the callsite is enabled).
+    fn trace_control_inputs(&mut self, frame: GameFrameCount, inputs: &TargetInputs) {
+        let due = self
+            .last_trace_frame
+            .is_none_or(|last| frame.0.saturating_sub(last) >= BUFFER_TRACE_INTERVAL_TURNS);
+        if !due {
+            return;
+        }
+        self.last_trace_frame = Some(frame.0);
+        tracing::debug!(
+            tenant = self.key.tenant.as_ref(),
+            session = self.key.session.0,
+            game_frame = frame.0,
+            buffer = self.buffer.0,
+            target = inputs.target,
+            path_us = inputs.path_us,
+            worst_loss_risk = inputs.worst_loss_risk,
+            eff_rtts = ?self
+                .slots
+                .iter()
+                .map(|(slot, s)| (slot.0, s.eff_rtt()))
+                .collect::<Vec<_>>(),
+            "latency-buffer control inputs",
+        );
     }
 
     /// The buffer directive to stamp onto a turn this relay is about to
@@ -3113,13 +3256,13 @@ pub fn decide_leave(
     Some(directive)
 }
 
-/// Records the `decision_seq` of an authority-stamped directive this relay is
-/// forwarding, if the relay has a maker for the session, so a later promotion
-/// to authority continues the session's decision numbering (see
+/// Records an authority-stamped directive this relay is forwarding, if the relay
+/// has a maker for the session, so a later promotion to authority continues the
+/// session's decision numbering and baselines against the committed buffer (see
 /// [`DecisionMaker::observe_directive`]). A no-op when no maker exists.
-pub fn observe_directive(registry: &DecisionMakers, key: &SessionKey, seq: u32) {
+pub fn observe_directive(registry: &DecisionMakers, key: &SessionKey, directive: &BufferDirective) {
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.observe_directive(seq);
+        maker.observe_directive(directive);
     }
 }
 
@@ -3726,6 +3869,145 @@ mod tests {
         );
         assert_eq!(held, None, "target unchanged holds");
         assert_eq!(maker.active_directive(), None, "a hold queues no directive");
+    }
+
+    // -- Initial directive & input trace --
+
+    /// The first framed turn broadcasts the current buffer unconditionally when
+    /// the control law itself makes no change (here: no RTT yet, so the target
+    /// holds) -- so a client seeded at a different buffer is corrected even while
+    /// the target sits at the minimum. It fires exactly once.
+    #[test]
+    fn the_first_framed_turn_broadcasts_the_current_buffer_when_the_law_holds() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // A framed turn with no RTT measurement (rtt_us = 0): the law has no
+        // target and holds, so the unconditional initial broadcast fires.
+        let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 5).expect("initial directive");
+        assert_eq!(
+            d.buffer,
+            BufferSize(0),
+            "carries the current (minimum) buffer"
+        );
+        // Horizon = frame + span(current buffer = 0) + APPLY_HORIZON.
+        assert_eq!(d.applied_frame, GameFrameCount(5 + APPLY_HORIZON));
+        let stamp = maker.active_directive().expect("queued for broadcast");
+        assert_eq!(stamp.buffer_turns, 0);
+        assert_eq!(stamp.decision_seq, 1);
+
+        // Fires once: a later still-RTT-less framed turn queues nothing new.
+        let again = ingest_at(&mut maker, &conditions(0, 0, 0, 200), 6);
+        assert_eq!(again, None, "the initial broadcast is a one-shot");
+    }
+
+    /// Nothing is broadcast before the first framed turn: conditions can flow in
+    /// the lobby (RTT and all), but with no consensus coordinate there is no frame
+    /// to schedule an apply against.
+    #[test]
+    fn no_initial_directive_before_the_first_framed_turn() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // Conditions but no `observe_frame`: session_frame stays None.
+        let d = maker.ingest_local(&conditions(0, 150_000, 0, 100));
+        assert_eq!(d, None, "no broadcast without a framed turn");
+        assert_eq!(maker.active_directive(), None);
+    }
+
+    /// A non-authority never broadcasts an initial directive: it makes no
+    /// decisions at all, even once the session is framed.
+    #[test]
+    fn a_non_authority_broadcasts_no_initial_directive() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 5);
+        assert_eq!(d, None, "a peer decides nothing");
+        assert_eq!(maker.active_directive(), None);
+    }
+
+    /// A real decision at the first framed turn *is* the session's first
+    /// broadcast, so no separate initial directive is queued behind it -- the
+    /// raise numbers as decision 1, not 2.
+    #[test]
+    fn a_first_turn_decision_serves_as_the_initial_broadcast() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
+        assert_eq!(d.buffer, BufferSize(4));
+        let stamp = maker.active_directive().expect("queued");
+        assert_eq!(
+            stamp.decision_seq, 1,
+            "the raise is decision 1; no initial directive precedes it",
+        );
+    }
+
+    /// A newly promoted authority re-affirms the buffer once -- and re-affirms the
+    /// *committed* buffer it tracked as a peer (via `observe_directive`), not a
+    /// stale minimum, so a survivor already at that depth applies a no-op resize
+    /// rather than being slammed down to the minimum.
+    #[test]
+    fn promotion_re_affirms_the_committed_buffer() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        // As a peer it forwarded the authority's directive, tracking the committed
+        // buffer (5) and its decision seq (7).
+        maker.observe_directive(&BufferDirective {
+            buffer_turns: 5,
+            apply_at_frame: 100,
+            decision_seq: 7,
+        });
+        assert_eq!(
+            maker.buffer(),
+            BufferSize(5),
+            "a peer tracks the committed buffer"
+        );
+        maker.observe_frame(SlotId(0), GameFrameCount(200));
+
+        // Promotion resets the initial-broadcast flag (mirrors re-broadcasting
+        // leaves): the next decision re-affirms the buffer.
+        let (all, fresh) = maker.set_authority(Authority::SelfRelay);
+        assert!(
+            all.is_empty() && fresh.is_empty(),
+            "no leaves to re-broadcast here"
+        );
+
+        let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 200)
+            .expect("re-fires after promotion");
+        assert_eq!(
+            d.buffer,
+            BufferSize(5),
+            "re-affirms the committed buffer, not the minimum"
+        );
+        let stamp = maker.active_directive().expect("queued");
+        assert_eq!(stamp.buffer_turns, 5);
+        assert!(
+            stamp.decision_seq > 7,
+            "numbers above what clients already hold",
+        );
+    }
+
+    /// The control-law input trace is rate-limited to once per
+    /// `BUFFER_TRACE_INTERVAL_TURNS` of session-frame progress: the gate advances
+    /// only when at least that much has elapsed since the last trace.
+    #[test]
+    fn the_input_trace_is_rate_limited_by_session_frame_progress() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        // First framed turn with a target: the trace fires and records the frame.
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        assert_eq!(maker.last_trace_frame, Some(1));
+
+        // One turn short of the interval: the gate holds.
+        ingest_at(
+            &mut maker,
+            &conditions(0, 150_000, 0, 100),
+            BUFFER_TRACE_INTERVAL_TURNS,
+        );
+        assert_eq!(maker.last_trace_frame, Some(1), "held within the interval");
+
+        // Reaching the interval advances the gate.
+        ingest_at(
+            &mut maker,
+            &conditions(0, 150_000, 0, 100),
+            1 + BUFFER_TRACE_INTERVAL_TURNS,
+        );
+        assert_eq!(
+            maker.last_trace_frame,
+            Some(1 + BUFFER_TRACE_INTERVAL_TURNS)
+        );
     }
 
     // -- Slot removal --

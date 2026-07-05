@@ -953,6 +953,54 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
 }
 
 #[tokio::test]
+async fn an_over_cap_oversize_turn_is_rejected_and_never_reaches_the_peer() {
+    // The oversize-turn divert path fans a client's control-stream turn out to the
+    // other slots' count-bounded forward queues, so a turn far larger than any real
+    // one would occupy disproportionate buffered bytes there. A turn past the
+    // amplification cap is not one any real client produces, so the relay rejects it
+    // like a malformed turn — closing the link — before it can be buffered or fanned
+    // out, rather than dropping it and stranding the peer on the seq gap.
+    use rally_point_transport::control::send_control_turn;
+
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(205);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    // 9000 well-formed keep-alives: past the 8 KiB amplification cap, but under the
+    // 64 KiB control-frame cap, so it reaches the relay's own size check rather than
+    // the framing guard.
+    let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    let over_cap = Payload {
+        seq: 0,
+        slot: 0,
+        commands: vec![0x05u8; 9000].into(),
+        game_frame_count: Some(1),
+        ..Default::default()
+    };
+    send_control_turn(&mut ctrl0_send, over_cap).await.unwrap();
+
+    // The relay closes the offending slot's link rather than buffering the turn.
+    expect_closed(&mut slot0).await;
+
+    // The peer never receives it: rejected before fan-out. Drain any maintenance
+    // packets over a short window and assert none carries a fresh turn.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while let Ok(received) = tokio::time::timeout_at(deadline, slot1.recv()).await {
+        match received {
+            Ok(delivery) => assert!(
+                delivery.fresh.is_empty(),
+                "an over-cap oversize turn must not reach the peer",
+            ),
+            Err(_) => break,
+        }
+    }
+}
+
+#[tokio::test]
 async fn acks_a_one_way_sender_with_no_peer_traffic() {
     let tenant = make_tenant(KID, TENANT);
     let (addr, ca) = start_relay(registry_for(&[&tenant]));

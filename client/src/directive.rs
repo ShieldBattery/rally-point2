@@ -203,6 +203,33 @@ mod tests {
     }
 
     #[test]
+    fn an_initial_equal_size_directive_surfaces_as_a_no_op_resize() {
+        // The authority broadcasts one directive at the first framed turn carrying
+        // the buffer the session already runs, so a client seeded differently is
+        // corrected. A client already at that depth receives an "equal-size"
+        // resize: the tracker ranks by `decision_seq` alone and never inspects
+        // `buffer_turns`, so it surfaces the directive exactly like any other
+        // (once, at its apply frame), and the caller resizes to the depth it is
+        // already at — a no-op. Nothing here needs to special-case it.
+        let mut tracker = DirectiveTracker::new();
+        let current_depth = 3;
+        tracker.observe(&directive(current_depth, 100, 1), 90);
+        assert_eq!(
+            tracker.take_due(100),
+            Some(directive(current_depth, 100, 1))
+        );
+        assert_eq!(
+            tracker.take_due(100),
+            None,
+            "surfaces once, like any decision"
+        );
+
+        // A later real change still ranks above it and applies normally.
+        tracker.observe(&directive(6, 200, 2), 150);
+        assert_eq!(tracker.take_due(200), Some(directive(6, 200, 2)));
+    }
+
+    #[test]
     fn a_stale_copy_of_a_moot_decision_cannot_resurface() {
         let mut tracker = DirectiveTracker::new();
         // Seen first while moot: recorded but never pending.
