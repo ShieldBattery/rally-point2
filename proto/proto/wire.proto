@@ -418,4 +418,20 @@ message SlotDeparted {
   // (`0x40000006` == dropped, else left), so the authority authors the leave with
   // the reason the home relay observed. See `LeaveDirective.reason`.
   uint32 reason = 3;
+
+  // The reachability ceiling for the leave's apply frame: the highest game frame
+  // every *surviving* slot has provably executed, computed by the departing
+  // slot's home relay from its own view of the survivors' framed turns (counted
+  // in turns, not frames — a turn stamped `frame` is provably executed once the
+  // session advanced `buffer_max` turns past it). The authority clamps
+  // `apply_at_frame = min(last_frame, reachable_frame) + 1`, so a client that
+  // inflates its own `game_frame_count` before leaving cannot schedule the leave
+  // past a frame the survivors can reach (which would strand them). Home-authored
+  // and carried verbatim so every relay — including one promoted mid-handoff —
+  // derives the identical clamped apply frame from the shared departure record.
+  // Absent when no surviving slot has framed history yet (lobby / the game's very
+  // first turns), in which case the authority applies no clamp — matching the
+  // held/`last_frame`-only path. A present `0` is a valid ceiling, so the field
+  // is `optional`, like `last_frame`.
+  optional uint32 reachable_frame = 4;
 }

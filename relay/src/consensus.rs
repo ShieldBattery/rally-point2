@@ -155,7 +155,7 @@
 //! most the cushion, so the horizon scales with the buffer rather than being a
 //! constant that a large cushion could outrun.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -345,6 +345,18 @@ struct SlotState {
     /// turns carry no frame). The session's consensus coordinate is the
     /// *minimum* across slots, so one slot's inflated claim can't poison it.
     frame: Option<GameFrameCount>,
+    /// A bounded, recent history of `(seq, game_frame_count)` for this slot's
+    /// framed turns — the turn's transport seq paired with the frame it stamped.
+    /// Used to prove which frames a *survivor* has executed when a leave is
+    /// decided: a turn stamped at seq `s` is provably executed once the session
+    /// advanced `buffer_max` turns past `s`, so the leave's apply frame can be
+    /// clamped to a frame every survivor can reach (see
+    /// [`DecisionMaker::reachable_frame`]). Capped relative to the buffer depth,
+    /// since only the window back to `frontier − buffer_max` is ever consulted.
+    /// Only populated by [`observe_turn_frame`](DecisionMaker::observe_turn_frame)
+    /// (the seq-aware production path); the seq-less
+    /// [`observe_frame`](DecisionMaker::observe_frame) leaves it empty (tests).
+    frame_history: VecDeque<(u64, u32)>,
     /// The prior sample's cumulative `lost_packets`. Meaningful only when
     /// `has_delta` is true.
     prev_lost: u64,
@@ -498,6 +510,14 @@ pub struct DecisionMaker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Departure {
     last_frame: Option<GameFrameCount>,
+    /// The home-authored reachability ceiling for the leave's apply frame — the
+    /// highest frame every survivor had provably executed when the home relay saw
+    /// the departure (see [`DecisionMaker::reachable_frame`]). Single-sourced
+    /// (only the home computes it, from `reachable_frame`) and carried in the
+    /// `SlotDeparted` frame, so [`decide_leave`](DecisionMaker::decide_leave) and
+    /// the handoff re-derivation clamp to the identical value on every relay.
+    /// `None` when the home had no survivor framed history yet (no clamp).
+    reachable_frame: Option<u32>,
     reason: u32,
 }
 
@@ -821,20 +841,23 @@ struct SyncTracker {
     members: HashMap<SlotId, Member>,
     /// Reports awaiting a complete ordinal, keyed by ordinal then slot.
     pending: BTreeMap<u64, HashMap<SlotId, SyncReport>>,
-    /// The earliest `(ordinal, frame)` calibration point this tracker has ever
-    /// recorded, paired with `latest_calibration` to derive an approximate
-    /// frames-per-ordinal rate for frame-anchored join placement (see
-    /// [`Self::join_expected`]). Kept independent of `pending`/`members` so it
-    /// survives ordinal retirement and eviction. Set once and never replaced —
-    /// even a session-wide average rate is close enough to disambiguate
-    /// candidates 16 ordinals (and therefore many frames) apart.
-    first_calibration: Option<(u64, u32)>,
-    /// The most recent `(ordinal, frame)` calibration point recorded, paired
-    /// with `first_calibration` for the rate estimate.
-    latest_calibration: Option<(u64, u32)>,
-    /// Rate-limit counter for the placement-correction warn (a nonzero nibble
-    /// correction — a reorder, a lead, or a late join).
-    correction_warns: u64,
+    /// The lowest-ordinal **corroborated** `(ordinal, median_frame)` calibration
+    /// point, paired with `corroborated_latest` to derive the frames-per-ordinal
+    /// rate for frame-anchored join placement (see [`Self::join_expected`]). A
+    /// point is corroborated only once at least [`SYNC_CORROBORATION_MIN`]
+    /// **distinct** slots have reported the same ordinal with a frame — the
+    /// median of their frames, which a single attacker (controlling one slot)
+    /// cannot move. This replaces the earlier single-slot-sourced calibration a
+    /// lone slot could swing to shift an honest joiner a full ring cycle. Kept
+    /// independent of `pending`/`members` so it survives ordinal retirement.
+    corroborated_first: Option<(u64, u32)>,
+    /// The highest-ordinal corroborated `(ordinal, median_frame)` point, paired
+    /// with `corroborated_first` for the rate and used as the projection anchor.
+    corroborated_latest: Option<(u64, u32)>,
+    /// Rate-limit counter for the placement-correction debug log (a nonzero
+    /// nibble correction — a reorder, a lead, or a join). Routine (every game
+    /// start corrects the first ordinal after a join), so it logs at debug.
+    corrections: u64,
     /// Rate-limit counter for the same-ordinal conflicting-value warn (a slot
     /// reporting two different checksums for the same placed ordinal — an
     /// honest client never does this).
@@ -849,7 +872,26 @@ struct SyncTracker {
     kind_parity_warns: u64,
     /// Rate-limit counter for the window-eviction (stalled-slot) warn.
     evict_warns: u64,
+    /// Rate-limit counter for the multiple-sync-commands-in-one-turn warn (an
+    /// honest client emits exactly one `0x37` per outgoing turn; more than one
+    /// is the flooding lever a malicious client would use to inflate its own
+    /// frontier and seed join-placement calibration — see
+    /// [`DecisionMaker::observe_sync`]).
+    multi_sync_warns: u64,
+    /// Rate-limit counter for the deferred-join-placement warn (a joining slot
+    /// that can't be safely placed yet — no corroborated rate and the frontier is
+    /// more than a ring cycle ahead; its report is dropped and retried).
+    defer_warns: u64,
 }
+
+/// The number of **distinct** slots that must report the same ordinal (each with
+/// a frame) before that ordinal's `(ordinal, median_frame)` becomes a
+/// corroborated calibration point for frame-anchored join placement. Three is the
+/// smallest count whose **median** a single attacker — who controls exactly one
+/// slot — provably cannot move: with ≤1 outlier among ≥3 values the median is
+/// still an honest slot's frame. This is what lets the join projection be
+/// tolerance-free (no "how close counts as agreeing?" parameter to tune).
+const SYNC_CORROBORATION_MIN: usize = 3;
 
 /// The hash kind SC:R's native sync check ties to a ring index's parity: even
 /// → [`SYNC_KIND_UNITS`] (the per-unit hash), odd → [`SYNC_KIND_HEADER`] (the
@@ -916,8 +958,15 @@ impl SyncTracker {
         let ring = u64::from(ring);
         let existing_next_expected = self.members.get(&slot).map(|m| m.next_expected);
         let is_new_member = existing_next_expected.is_none();
-        let expected =
-            existing_next_expected.unwrap_or_else(|| self.join_expected(ring, game_frame));
+        let expected = match existing_next_expected {
+            Some(expected) => expected,
+            None => match self.join_expected(ring, game_frame) {
+                Some(expected) => expected,
+                // Deep join with no corroborated rate and the frontier more than a
+                // ring cycle ahead: defer (see `defer_join`).
+                None => return self.defer_join(key, slot),
+            },
+        };
 
         // Nearest ordinal ≡ ring (mod 16) to `expected`. `diff` lands in
         // [-8, 8]; the ends (exactly ±8) are the ambiguous case the module
@@ -934,17 +983,31 @@ impl SyncTracker {
         }
         let placed = i128::from(expected) + i128::from(diff);
 
+        // A *joining* slot placed above the frontier means the nibble jumped a
+        // ring cycle upward off the frontier anchor — the tell-tale of a deep
+        // join we can't resolve without a corroborated rate. Defer it (drop and
+        // retry) rather than misplace it a full cycle and risk framing an honest
+        // slot. Steady-state members are exempt: they legitimately *are* the
+        // frontier. (No frontier yet — the very first observation — is never
+        // above itself.)
+        if is_new_member
+            && let Some(frontier) = self.members.values().map(|m| m.next_expected).max()
+            && placed > i128::from(frontier)
+        {
+            return self.defer_join(key, slot);
+        }
+
         if diff != 0 {
-            self.correction_warns += 1;
-            if should_warn(self.correction_warns) {
-                tracing::warn!(
+            self.corrections += 1;
+            if should_warn(self.corrections) {
+                tracing::debug!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     slot = slot.0,
                     expected,
                     ring,
                     placed,
-                    count = self.correction_warns,
+                    count = self.corrections,
                     "sync ordinal placement corrected from the ring nibble; \
                      the turn arrived out of order, the slot is running ahead, \
                      or it just joined the compare set",
@@ -965,13 +1028,6 @@ impl SyncTracker {
         member.next_expected = member.next_expected.max(next_expected_candidate);
         if is_new_member {
             member.since = since_candidate;
-        }
-
-        // A confirmed placement is a calibration point regardless of whether
-        // it's later dropped as already-retired below — it's still a genuine
-        // (ordinal, frame) fact, and the rate estimate benefits from every one.
-        if let Some(frame) = game_frame {
-            self.note_calibration(since_candidate, frame);
         }
 
         if placed < i128::from(self.base_ordinal) {
@@ -1015,6 +1071,11 @@ impl SyncTracker {
             }
         }
 
+        // Fold this ordinal into the corroborated calibration: once ≥3 distinct
+        // slots have reported it with frames, its median frame anchors the
+        // frame-rate estimate used to place late joins (see `join_expected`).
+        self.update_corroboration(ordinal);
+
         if let Some(divergence) = self.evaluate_ready(key, margin) {
             return Some(divergence);
         }
@@ -1023,47 +1084,57 @@ impl SyncTracker {
     }
 
     /// The join-placement anchor for a slot's first-ever report: the ordinal
-    /// [`Self::record`]'s nibble correction will refine.
+    /// [`Self::record`]'s nibble correction will refine — or `None` to **defer**
+    /// the placement entirely when no anchor can be trusted.
     ///
-    /// Prefers a **frame-anchored estimate**: given a calibration rate (see
-    /// [`Self::frame_rate`]) and the most recent `(ordinal, frame)` point,
-    /// projects linearly from that point to the joining report's `game_frame`
-    /// and returns the projected ordinal, clamped to `[0, frontier]` (a
-    /// joining slot cannot legitimately be *ahead* of the frontier — the
-    /// clamp is what keeps a degenerate rate estimate from producing a wild
-    /// placement rather than a merely-imprecise one, which the caller's
-    /// nibble correction can still recover from as long as it's within ±7 of
-    /// the truth).
+    /// Three cases, in order:
+    /// - **No members yet** (the tracker's very first observation): the ring's
+    ///   own face value.
+    /// - **A corroborated rate is available**: project frame-anchored from the
+    ///   corroborated latest `(ordinal, frame)` point — a point ≥3 distinct slots
+    ///   agreed on (see [`Self::frame_rate`]), so a lone slot cannot swing it —
+    ///   clamped to `[0, frontier]`. This keeps deep honest joins (>7 ordinals
+    ///   from the frontier) landing on the true ordinal, exactly as before, but
+    ///   now from a reference an attacker can't poison.
+    /// - **No corroborated rate yet**: anchor on the frontier and let
+    ///   [`Self::record`]'s nibble correction resolve the placement — but only
+    ///   within a single ring cycle (`frontier < SYNC_RING_MODULUS`). Beyond one
+    ///   cycle the nibble could land a deep joiner a full cycle off a slot's true
+    ///   ordinal with no way to tell, so return `None` to **defer**. Within a
+    ///   cycle, `record` additionally defers any placement that lands *above* the
+    ///   frontier (the tell-tale of a deep joiner whose nibble jumped a cycle
+    ///   upward) — so a slot is only ever placed at or below the frontier, within
+    ///   the nibble's reliable ±7 range of its true ordinal.
     ///
-    /// Falls back to the current frontier (the furthest any member has
-    /// reached) when no frame estimate is available — the joining report
-    /// carries no `game_frame`, or the tracker has no rate yet — and further
-    /// to the ring's own face value when there is no frontier either (no
-    /// members at all: the tracker's very first observation for the session).
-    fn join_expected(&self, ring: u64, game_frame: Option<u32>) -> u64 {
+    /// A joining slot's own single-slot frame is deliberately **never** trusted
+    /// as a rate/anchor source; that was the calibration-poisoning lever.
+    fn join_expected(&self, ring: u64, game_frame: Option<u32>) -> Option<u64> {
         let Some(frontier) = self.members.values().map(|m| m.next_expected).max() else {
-            return ring; // no members at all: the tracker's very first observation
+            return Some(ring); // no members at all: the very first observation
         };
         if let Some(frame) = game_frame
             && let Some(rate) = self.frame_rate()
-            && let Some((ref_ordinal, ref_frame)) = self.latest_calibration
+            && let Some((ref_ordinal, ref_frame)) = self.corroborated_latest
         {
             let predicted = ref_ordinal as f64 + (f64::from(frame) - f64::from(ref_frame)) / rate;
-            return predicted.clamp(0.0, frontier as f64).round() as u64;
+            return Some(predicted.clamp(0.0, frontier as f64).round() as u64);
         }
-        frontier
+        // No trustworthy rate: safe to anchor on the frontier only within a
+        // single ring cycle; deeper than that, defer (the caller drops the report
+        // and retries on the slot's next one).
+        (frontier < SYNC_RING_MODULUS).then_some(frontier)
     }
 
-    /// The approximate frames-per-ordinal rate this session is advancing at,
-    /// from the spread between [`Self::first_calibration`] and
-    /// [`Self::latest_calibration`]. `None` until two distinct-ordinal
-    /// calibration points exist, or if the computed rate isn't a sane forward
-    /// rate (frames must advance, not stall or run backward, between distinct
-    /// ordinals — a stalled/negative rate would come from a pause or
-    /// attacker-adjacent data, either way not something to project from).
+    /// The frames-per-ordinal rate this session is advancing at, from the spread
+    /// between [`Self::corroborated_first`] and [`Self::corroborated_latest`] —
+    /// both **corroborated** points (≥3 distinct slots agreeing), so the slope an
+    /// attacker sees is one it cannot move with its single slot. `None` until two
+    /// distinct-ordinal corroborated points exist, or if the computed rate isn't a
+    /// sane forward rate (frames must advance, not stall or run backward, between
+    /// distinct ordinals).
     fn frame_rate(&self) -> Option<f64> {
-        let (o1, f1) = self.first_calibration?;
-        let (o2, f2) = self.latest_calibration?;
+        let (o1, f1) = self.corroborated_first?;
+        let (o2, f2) = self.corroborated_latest?;
         if o2 <= o1 {
             return None;
         }
@@ -1071,16 +1142,50 @@ impl SyncTracker {
         (rate.is_finite() && rate > 0.0).then_some(rate)
     }
 
-    /// Records a confirmed `(ordinal, frame)` calibration point. Seeds
-    /// [`Self::first_calibration`] once and never replaces it; keeps
-    /// [`Self::latest_calibration`] at the newest ordinal seen (a late
-    /// arrival for an older ordinal must not regress it).
-    fn note_calibration(&mut self, ordinal: u64, frame: u32) {
-        if self.first_calibration.is_none() {
-            self.first_calibration = Some((ordinal, frame));
+    /// Drops a joining slot's report because it can't be safely placed yet (no
+    /// corroborated rate and the frontier is more than a ring cycle ahead, or the
+    /// placement would land above the frontier). No member is created and no
+    /// calibration is fed, so the slot stays in the join path and retries on its
+    /// next report — the natural re-placement, no separate comparison-lost flag.
+    /// Missing a possible desync for this slot is an acceptable false negative;
+    /// framing an honest slot by misplacing it a full ring cycle is not.
+    fn defer_join(&mut self, key: &SessionKey, slot: SlotId) -> Option<SyncDivergence> {
+        self.defer_warns += 1;
+        if should_warn(self.defer_warns) {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                count = self.defer_warns,
+                "deferring a joining slot's sync placement: no corroborated rate \
+                 yet and the join is more than a ring cycle from the frontier — \
+                 dropping this report, will retry on the slot's next one",
+            );
         }
-        if self.latest_calibration.is_none_or(|(o, _)| ordinal > o) {
-            self.latest_calibration = Some((ordinal, frame));
+        None
+    }
+
+    /// Folds the pending reports at `ordinal` into the corroborated calibration:
+    /// once at least [`SYNC_CORROBORATION_MIN`] **distinct** slots have reported
+    /// it with a frame, records `(ordinal, median_frame)` as a corroborated point
+    /// — extending the corroborated ordinal range at either end. The **median**
+    /// is what a single attacker cannot move (≤1 outlier among ≥3 values), so the
+    /// resulting rate/anchor is tolerance-free and poisoning-resistant.
+    fn update_corroboration(&mut self, ordinal: u64) {
+        let Some(reports) = self.pending.get(&ordinal) else {
+            return;
+        };
+        let mut frames: Vec<u32> = reports.values().filter_map(|r| r.game_frame).collect();
+        if frames.len() < SYNC_CORROBORATION_MIN {
+            return;
+        }
+        frames.sort_unstable();
+        let median = frames[frames.len() / 2];
+        if self.corroborated_first.is_none_or(|(o, _)| ordinal < o) {
+            self.corroborated_first = Some((ordinal, median));
+        }
+        if self.corroborated_latest.is_none_or(|(o, _)| ordinal > o) {
+            self.corroborated_latest = Some((ordinal, median));
         }
     }
 
@@ -1386,6 +1491,84 @@ impl DecisionMaker {
         if state.frame.is_none_or(|current| frame > current) {
             state.frame = Some(frame);
         }
+    }
+
+    /// The seq-aware sibling of [`observe_frame`](Self::observe_frame): records the
+    /// same monotone per-slot frame **and** appends `(seq, frame)` to the slot's
+    /// bounded [`frame_history`](SlotState::frame_history), so a leave decided
+    /// later can clamp its apply frame to a survivor-reachable ceiling (see
+    /// [`reachable_frame`](Self::reachable_frame)). **Every production
+    /// frame-observation on the leave path must go through this**, not the
+    /// seq-less `observe_frame`, or the clamp has no history to work from and a
+    /// slot's inflated `game_frame_count` could schedule a leave past a
+    /// survivor-reachable frame. `observe_frame` is retained only for tests that
+    /// don't exercise the leave-frame clamp.
+    ///
+    /// A departed slot is ignored, exactly as in `observe_frame`.
+    pub fn observe_turn_frame(&mut self, slot: SlotId, seq: u64, frame: GameFrameCount) {
+        if self.departures.contains_key(&slot) {
+            return;
+        }
+        // Only the window back to `frontier − buffer_max` is ever consulted; keep
+        // a little more than the buffer depth so the fastest survivor's history
+        // still reaches the threshold turn even under a bit of reordering.
+        let cap = (self.bounds.max as usize).saturating_add(4).max(8);
+        let state = self.slots.entry(slot).or_default();
+        if state.frame.is_none_or(|current| frame > current) {
+            state.frame = Some(frame);
+        }
+        state.frame_history.push_back((seq, frame.0));
+        while state.frame_history.len() > cap {
+            state.frame_history.pop_front();
+        }
+    }
+
+    /// The reachability ceiling for a leave's apply frame: the highest game frame
+    /// **every surviving slot has provably executed**, or `None` when no survivor
+    /// has framed history yet (lobby / the game's very first turns). Computed by
+    /// the departing slot's home relay and carried in the `SlotDeparted` record so
+    /// every relay clamps to the identical value (see [`decide_leave`] and the
+    /// `reachable_frame` field on [`Departure`]).
+    ///
+    /// A turn stamped at transport seq `s` is provably executed once the session
+    /// advanced `buffer_max` turns past `s`. So with `frontier_turn` the leading
+    /// seq across survivors and `threshold = frontier_turn − buffer_max`
+    /// (saturating, so the game's first turns yield the earliest framed floor
+    /// rather than nothing), each survivor's proven-executed frame is the highest
+    /// it stamped at seq ≤ `threshold`; the ceiling is the **minimum** across
+    /// survivors, so all of them can reach it. Counting is in **turns**, never
+    /// frames, so no frames-per-turn assumption enters. Excludes the departing
+    /// slot (its own claim must not raise its leave's ceiling) and any slot with
+    /// no framed history (it constrains nothing and will catch up).
+    fn reachable_frame(&self, departing: SlotId) -> Option<u32> {
+        let buffer_max = u64::from(self.bounds.max);
+        let frontier_turn = self
+            .slots
+            .iter()
+            .filter(|(slot, _)| **slot != departing)
+            .filter_map(|(_, s)| s.frame_history.back().map(|(seq, _)| *seq))
+            .max()?;
+        let threshold = frontier_turn.saturating_sub(buffer_max);
+        let mut ceiling: Option<u32> = None;
+        for (slot, s) in &self.slots {
+            if *slot == departing || s.frame_history.is_empty() {
+                continue;
+            }
+            // Highest frame proven executed (stamped at/before the threshold
+            // turn). A survivor that only started framing after the threshold has
+            // no proven frame yet; fall back to its earliest recorded frame — a
+            // low, still-reachable bound — rather than abandoning the clamp
+            // (which would reopen the inflation stall in the game's first turns).
+            let executed = s
+                .frame_history
+                .iter()
+                .filter(|(seq, _)| *seq <= threshold)
+                .map(|(_, frame)| *frame)
+                .max()
+                .or_else(|| s.frame_history.front().map(|(_, frame)| *frame))?;
+            ceiling = Some(ceiling.map_or(executed, |c| c.min(executed)));
+        }
+        ceiling
     }
 
     /// Records the `decision_seq` of a directive this relay forwarded on
@@ -1802,19 +1985,29 @@ impl DecisionMaker {
     ///
     /// The apply frame is one past the departing slot's last observed frame --
     /// the exact step remaining clients stall at waiting for a turn that will
-    /// never come, so the leave unstalls them right there. The session frame is
-    /// the basis only when the slot never produced a framed turn; it is never
-    /// folded in as a max (see [`leave_base_frame`] for why that would strand
-    /// stalled survivors). The last frame comes from the slot's departure record
-    /// -- captured and merged by [`note_departure`], surviving `remove_slot` --
-    /// so every relay derives the identical apply frame from the same record
-    /// (clients dedup by slot and require that agreement).
+    /// never come, so the leave unstalls them right there -- **clamped down** to
+    /// the home-authored reachability ceiling ([`Departure::reachable_frame`]) so
+    /// a slot that inflates its own `game_frame_count` before leaving cannot
+    /// schedule the leave past a frame the survivors can reach (which would
+    /// strand them). In the honest case `last_frame ≤ ceiling`, so the clamp is a
+    /// no-op; in the game's first turns or under cross-relay mesh lag the ceiling
+    /// can sit a little below `last_frame`, producing a bounded, deterministic
+    /// *early* drop (never a stall) — harmless because the ceiling is
+    /// single-sourced, so every client agrees. The session frame is the basis
+    /// only when the slot never produced a framed turn; it is never folded in as
+    /// a max (see [`leave_base_frame`] for why that would strand stalled
+    /// survivors) and is not clamped (no `last_frame` to inflate). Both the last
+    /// frame and the ceiling come from the slot's departure record -- surviving
+    /// `remove_slot` -- so every relay, including one promoted mid-handoff,
+    /// derives the identical apply frame (clients dedup by slot and require that
+    /// agreement).
     pub fn decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
         // Record the departure regardless of the outcome below (even a hold), so
         // a later promotion can re-derive this slot's leave. This merges the
         // slot's own live frame into the record and retires the slot from
-        // `slots`; the record is the single frame source from here on.
-        self.note_departure(slot, None, reason);
+        // `slots`; the record is the single frame source from here on. Passing
+        // `None` for the ceiling preserves whatever the home already authored.
+        self.note_departure(slot, None, None, reason);
 
         if self.authority != Authority::SelfRelay {
             return None;
@@ -1822,15 +2015,19 @@ impl DecisionMaker {
         if self.decided_leaves.contains_key(&slot) {
             return None; // already decided or cached this slot's leave
         }
-        let slot_last = self
-            .departures
-            .get(&slot)
-            .and_then(|d| d.last_frame)
-            .map(|f| f.0);
+        let record = self.departures.get(&slot);
+        let slot_last = record.and_then(|d| d.last_frame).map(|f| f.0);
+        let reachable = record.and_then(|d| d.reachable_frame);
         let session = self.session_frame().map(|f| f.0);
         // No framed turn observed anywhere yet (pre-game / lobby): nothing to
         // schedule against, so hold — a `None` short-circuits decide_leave.
         let base = leave_base_frame(slot_last, session)?;
+        // Clamp only a framed departure's base, and only when the home supplied a
+        // ceiling; the session-frame fallback has no client-inflatable basis.
+        let base = match (slot_last, reachable) {
+            (Some(_), Some(ceiling)) => base.min(ceiling),
+            _ => base,
+        };
         self.next_leave_seq += 1;
         let directive = LeaveDirective {
             slot: u32::from(slot.0),
@@ -1849,14 +2046,17 @@ impl DecisionMaker {
     /// never the authority. `last_frame` is the departing slot's last observed
     /// frame at its home relay (`None` if it never produced a framed turn); it is
     /// max-merged with this relay's own observation of the slot, so whichever
-    /// view is fuller wins. The reason keeps the first observation.
+    /// view is fuller wins. `reachable` is the home-authored apply-frame ceiling
+    /// (single-sourced, first non-`None` kept). The reason keeps the first
+    /// observation.
     pub fn record_departure(
         &mut self,
         slot: SlotId,
         last_frame: Option<GameFrameCount>,
+        reachable: Option<u32>,
         reason: u32,
     ) {
-        self.note_departure(slot, last_frame, reason);
+        self.note_departure(slot, last_frame, reachable, reason);
     }
 
     /// Caches a synced leave this relay observed authored by the session's
@@ -1874,7 +2074,18 @@ impl DecisionMaker {
     #[must_use]
     pub fn observe_leave(&mut self, leave: &LeaveDirective) -> bool {
         use std::collections::hash_map::Entry;
-        let slot = SlotId(leave.slot as u8);
+        let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
+            // A slot id past `u8` range can't name any real slot; a silent
+            // truncation would alias it onto a valid one. Drop it (defensive —
+            // the wire values are validated upstream, so this shouldn't occur).
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                slot = leave.slot,
+                "leave directive names a slot id out of range; ignoring",
+            );
+            return false;
+        };
         let inserted = match self.decided_leaves.entry(slot) {
             Entry::Occupied(existing) => {
                 if existing.get() != leave {
@@ -1920,13 +2131,20 @@ impl DecisionMaker {
     fn leave_reconcile(
         &self,
     ) -> (
-        Vec<(SlotId, Option<GameFrameCount>, u32)>,
+        Vec<(SlotId, Option<GameFrameCount>, Option<u32>, u32)>,
         Vec<LeaveDirective>,
     ) {
         let departures = self
             .departures
             .iter()
-            .map(|(slot, departure)| (*slot, departure.last_frame, departure.reason))
+            .map(|(slot, departure)| {
+                (
+                    *slot,
+                    departure.last_frame,
+                    departure.reachable_frame,
+                    departure.reason,
+                )
+            })
             .collect();
         let directives = self.decided_leaves.values().copied().collect();
         (departures, directives)
@@ -1943,6 +2161,12 @@ impl DecisionMaker {
     /// re-announce can only raise it. The `reason` keeps the first observation
     /// (a departure has one reason; a duplicate signal doesn't rewrite it).
     ///
+    /// `reachable` is the home-authored apply-frame ceiling (see
+    /// [`Departure::reachable_frame`]). It is **single-sourced** — only the
+    /// departing slot's home computes it, and it is carried verbatim — so this
+    /// keeps the first non-`None` value seen and never recomputes or merges it
+    /// (a later `decide_leave`/re-announce passing `None` must not clobber it).
+    ///
     /// Removing the slot from `slots` here — on *every* relay, not just the
     /// slot's home — is what lets `session_frame()` follow the survivors: a
     /// departed slot's frozen frame left in place would pin the minimum for the
@@ -1950,7 +2174,13 @@ impl DecisionMaker {
     /// a pending buffer directive from ever retiring. The
     /// `observe_frame`/`ingest` guards keep late in-flight traffic from
     /// resurrecting the entry.
-    fn note_departure(&mut self, slot: SlotId, last_frame: Option<GameFrameCount>, reason: u32) {
+    fn note_departure(
+        &mut self,
+        slot: SlotId,
+        last_frame: Option<GameFrameCount>,
+        reachable: Option<u32>,
+        reason: u32,
+    ) {
         use std::collections::hash_map::Entry;
         let own = self.slots.remove(&slot).and_then(|s| s.frame);
         let merged = match (last_frame, own) {
@@ -1964,10 +2194,13 @@ impl DecisionMaker {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
+                // First non-`None` wins — single-sourced from the home.
+                record.reachable_frame = record.reachable_frame.or(reachable);
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(Departure {
                     last_frame: merged,
+                    reachable_frame: reachable,
                     reason,
                 });
             }
@@ -2058,10 +2291,23 @@ impl DecisionMaker {
         }
         let margin = sync_eval_margin(self.bounds.max);
 
-        // Walk the command stream, handing each sync command to the comparator.
-        // There is exactly one per honest turn, but the walk handles any count
-        // (and stops cleanly on a malformed length) without panicking.
+        // Walk the command stream for this turn's sync command. A real client
+        // emits **exactly one** `0x37` per outgoing turn, and the comparator's
+        // ordinal counting depends on that (each turn advances a slot's ordinal
+        // by one). A turn carrying more than one is not something an honest
+        // client produces — packing several into one turn is precisely the
+        // lever a malicious client would use to inflate its own frontier and
+        // seed the join-placement calibration in a single turn (and to evade
+        // its own detection by racing ordinals past the eviction window). So
+        // only the first `0x37` is fed to the comparator; any extras are
+        // ignored (they neither advance the slot's ordinal nor feed
+        // calibration) and counted for a rate-limited anomaly warn. The walk
+        // still parses with the shared length table and stops cleanly on any
+        // malformed length without panicking.
         let mut offset = 0;
+        let mut sync_seen = false;
+        let mut extra_syncs = 0u32;
+        let mut divergence = None;
         while offset < commands.len() {
             let Some(len) = command_length(&commands[offset..]) else {
                 break; // an opcode the table doesn't know: stop, don't guess
@@ -2070,23 +2316,41 @@ impl DecisionMaker {
                 break; // a length that overruns the buffer: stop
             }
             if commands[offset] == SYNC_COMMAND && len == SYNC_COMMAND_LEN {
-                let command = &commands[offset..offset + SYNC_COMMAND_LEN];
-                let ring = command[1] >> 4;
-                let kind = command[1] & 0x0F;
-                let mut value = SyncValue::default();
-                value.copy_from_slice(&command[2..2 + SYNC_HASH16_LEN]);
-                // `[4..7]` (fog/vision, per-sender and pairwise-only in the
-                // native check) is deliberately never read — see `SyncValue`.
-                if let Some(divergence) = self
-                    .sync
-                    .record(&self.key, slot, ring, kind, value, game_frame, margin)
-                {
-                    return Some(divergence);
+                if sync_seen {
+                    // A second (or later) sync command in the same turn: ignore
+                    // it, and remember that this turn was anomalous.
+                    extra_syncs += 1;
+                } else {
+                    sync_seen = true;
+                    let command = &commands[offset..offset + SYNC_COMMAND_LEN];
+                    let ring = command[1] >> 4;
+                    let kind = command[1] & 0x0F;
+                    let mut value = SyncValue::default();
+                    value.copy_from_slice(&command[2..2 + SYNC_HASH16_LEN]);
+                    // `[4..7]` (fog/vision, per-sender and pairwise-only in the
+                    // native check) is deliberately never read — see `SyncValue`.
+                    divergence = self
+                        .sync
+                        .record(&self.key, slot, ring, kind, value, game_frame, margin);
                 }
             }
             offset += len;
         }
-        None
+        if extra_syncs > 0 {
+            self.sync.multi_sync_warns += 1;
+            if should_warn(self.sync.multi_sync_warns) {
+                tracing::warn!(
+                    tenant = self.key.tenant.as_ref(),
+                    session = self.key.session.0,
+                    slot = slot.0,
+                    extra_syncs,
+                    count = self.sync.multi_sync_warns,
+                    "turn carried more than one sync command; an honest client emits exactly \
+                     one per turn — fed only the first to the comparator and ignored the rest",
+                );
+            }
+        }
+        divergence
     }
 }
 
@@ -2429,11 +2693,26 @@ pub fn record_departure(
     key: &SessionKey,
     slot: SlotId,
     last_frame: Option<GameFrameCount>,
+    reachable: Option<u32>,
     reason: u32,
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.record_departure(slot, last_frame, reason);
+        maker.record_departure(slot, last_frame, reachable, reason);
     }
+}
+
+/// The reachability ceiling for a leave's apply frame at `slot`'s departure —
+/// the highest game frame every surviving slot has provably executed (see
+/// [`DecisionMaker::reachable_frame`]). Read on the departing slot's home relay,
+/// *before* the departure is recorded (which retires the slot's live state), to
+/// fill both the departure record and the `SlotDeparted` frame the peers
+/// receive, so every relay clamps to the identical value. `None` when no maker
+/// exists or no survivor has framed history yet.
+pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> Option<u32> {
+    registry
+        .lock()
+        .get(key)
+        .and_then(|maker| maker.reachable_frame(slot))
 }
 
 /// Caches a synced leave a peer relay's authority authored (received off the
@@ -2477,7 +2756,7 @@ pub fn leave_reconcile(
     registry: &DecisionMakers,
     key: &SessionKey,
 ) -> (
-    Vec<(SlotId, Option<GameFrameCount>, u32)>,
+    Vec<(SlotId, Option<GameFrameCount>, Option<u32>, u32)>,
     Vec<LeaveDirective>,
 ) {
     registry
@@ -2508,6 +2787,25 @@ pub fn observe_frame(
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.observe_frame(slot, frame);
+    }
+}
+
+/// The seq-aware sibling of [`observe_frame`]: records the same per-slot frame
+/// **and** the turn's transport seq into the slot's bounded frame history, so a
+/// later leave can clamp its apply frame to a survivor-reachable ceiling (see
+/// [`DecisionMaker::reachable_frame`]). **Every production frame-observation on
+/// the leave path calls this**, never the seq-less `observe_frame` (which is
+/// test-only), so the clamp always has history to work from. A no-op when no
+/// maker exists.
+pub fn observe_turn_frame(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    seq: u64,
+    frame: GameFrameCount,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.observe_turn_frame(slot, seq, frame);
     }
 }
 
@@ -3423,7 +3721,7 @@ mod tests {
         // fires yet.
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), 3);
+        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), None, 3);
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
         // Promoted (the dead authority was the only other relay in the
@@ -3546,7 +3844,7 @@ mod tests {
             HashMap::from([(SlotId(1), "sb-user-9".to_owned())]),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), 3);
+        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), None, 3);
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
         let _ = set_authority(&registry, &k, Authority::SelfRelay);
@@ -3674,6 +3972,168 @@ mod tests {
         assert_eq!(d.apply_at_frame, 41, "one past the session frame fallback");
     }
 
+    // -- Leave apply-frame clamp (Finding A): an inflated departing frame must
+    //    not schedule the leave past a frame the survivors can reach. Frames are
+    //    stamped one-per-turn (`frame = 100 + seq`); a survivor legitimately
+    //    *leads* the departing slot by the buffer depth before it stalls. --
+
+    /// Feeds a run of framed turns for `slot`, one frame per turn (frame = 100 +
+    /// seq), through the seq-aware production path that populates frame history.
+    fn feed_turns(maker: &mut DecisionMaker, slot: u8, seqs: std::ops::RangeInclusive<u64>) {
+        for seq in seqs {
+            maker.observe_turn_frame(SlotId(slot), seq, GameFrameCount(100 + seq as u32));
+        }
+    }
+
+    /// The exact production flow on the departing slot's home relay: read the
+    /// last frame and the reachability ceiling, record the departure with both,
+    /// then decide the (clamped) leave.
+    fn home_decide_leave(maker: &mut DecisionMaker, slot: u8) -> LeaveDirective {
+        let last = maker.slot_frame(SlotId(slot));
+        let ceiling = maker.reachable_frame(SlotId(slot));
+        maker.record_departure(SlotId(slot), last, ceiling, DROPPED);
+        maker
+            .decide_leave(SlotId(slot), DROPPED)
+            .expect("a leave is scheduled")
+    }
+
+    /// Steady state, honest departure: the survivor leads by the buffer depth
+    /// before stalling, so it has *provably executed* the departed slot's last
+    /// frame — the ceiling equals `last_frame` and the clamp is a no-op (no
+    /// regression from the pre-clamp behavior).
+    #[test]
+    fn decide_leave_does_not_clamp_an_honest_lead_ahead_departure() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        // Survivor slot 0 has run 6 turns (the buffer depth) past the departing
+        // slot's last frame before stalling: seqs 0..=21 (frames 100..=121).
+        feed_turns(&mut maker, 0, 0..=21);
+        // The departing slot 1's last framed turn is seq 15 / frame 115.
+        feed_turns(&mut maker, 1, 0..=15);
+        assert_eq!(
+            maker.reachable_frame(SlotId(1)),
+            Some(115),
+            "ceiling equals the departed slot's last executed frame",
+        );
+        let d = home_decide_leave(&mut maker, 1);
+        assert_eq!(d.apply_at_frame, 116, "one past last_frame, unclamped");
+    }
+
+    /// Steady state, malicious departure: the slot stamps `u32::MAX` on its last
+    /// turn then leaves. The ceiling comes from the honest survivor, not the
+    /// claim, so the leave is clamped to a survivor-reachable frame instead of
+    /// `u32::MAX` (which would have stalled every survivor forever).
+    #[test]
+    fn decide_leave_clamps_an_inflated_departing_frame_to_a_reachable_ceiling() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        feed_turns(&mut maker, 0, 0..=21); // honest survivor, leads by the buffer
+        feed_turns(&mut maker, 1, 0..=14); // the malicious slot's honest prefix
+        maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(u32::MAX)); // the lie
+        assert_eq!(
+            maker.slot_frame(SlotId(1)),
+            Some(GameFrameCount(u32::MAX)),
+            "the slot claims u32::MAX",
+        );
+        assert_eq!(
+            maker.reachable_frame(SlotId(1)),
+            Some(115),
+            "the ceiling comes from the survivor, not the departing slot's claim",
+        );
+        let d = home_decide_leave(&mut maker, 1);
+        assert_eq!(
+            d.apply_at_frame, 116,
+            "clamped to a survivor-reachable frame, not u32::MAX + 1",
+        );
+    }
+
+    /// A moderate (2x) inflation is clamped the same way — the ceiling doesn't
+    /// depend on how large the lie is.
+    #[test]
+    fn decide_leave_clamps_a_moderate_inflation_too() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        feed_turns(&mut maker, 0, 0..=21);
+        feed_turns(&mut maker, 1, 0..=14);
+        maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(230)); // ~2x the real ~115
+        let d = home_decide_leave(&mut maker, 1);
+        assert_eq!(
+            d.apply_at_frame, 116,
+            "clamped to the survivor-reachable ceiling"
+        );
+    }
+
+    /// The exact case the audit's fallback would have reopened: an in-game but
+    /// *early* (seq < buffer_max) inflated-frame departure. The threshold
+    /// saturates to 0, so the ceiling is the survivor's earliest reachable frame
+    /// — the leave is clamped, never left unclamped at `u32::MAX` (a stall).
+    #[test]
+    fn decide_leave_clamps_an_early_game_inflation_no_stall() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        feed_turns(&mut maker, 0, 0..=3); // only a few turns in (< buffer_max = 6)
+        feed_turns(&mut maker, 1, 0..=2);
+        maker.observe_turn_frame(SlotId(1), 3, GameFrameCount(u32::MAX));
+        assert_eq!(
+            maker.reachable_frame(SlotId(1)),
+            Some(100),
+            "early game: the ceiling is the earliest reachable frame",
+        );
+        let d = home_decide_leave(&mut maker, 1);
+        assert_eq!(
+            d.apply_at_frame, 101,
+            "clamped — the unclamped fallback would have stalled at u32::MAX",
+        );
+    }
+
+    /// An honest *early-game* departure takes a bounded, deterministic early-drop
+    /// (the ceiling sits a few frames below `last_frame` because the buffer
+    /// hasn't filled), never a stall: the apply frame is at or before the natural
+    /// stall point, so every survivor can reach it.
+    #[test]
+    fn decide_leave_early_game_honest_departure_is_a_bounded_early_drop_no_stall() {
+        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        feed_turns(&mut maker, 0, 0..=3);
+        feed_turns(&mut maker, 1, 0..=3); // honest last frame 103
+        let d = home_decide_leave(&mut maker, 1);
+        assert_eq!(
+            d.apply_at_frame, 101,
+            "a bounded few frames early (101 vs the honest 104)"
+        );
+        assert!(
+            d.apply_at_frame <= 104,
+            "at or before the natural stall (last_frame + 1) — reachable, never a stall",
+        );
+    }
+
+    /// Determinism: the same home-authored departure record (an inflated
+    /// `last_frame` plus the reachability ceiling) yields the *identical* clamped
+    /// apply frame on the deciding authority and on a relay promoted to re-derive
+    /// it — the agreement clients require (they dedup a leave by slot).
+    #[test]
+    fn the_clamped_apply_frame_is_reproduced_by_a_peer_and_a_promoted_authority() {
+        let last = Some(GameFrameCount(u32::MAX));
+        let ceiling = Some(115u32);
+
+        // The authority deciding directly from the record.
+        let mut authority = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        authority.record_departure(SlotId(1), last, ceiling, DROPPED);
+        let a = authority
+            .decide_leave(SlotId(1), DROPPED)
+            .expect("the authority decides the leave");
+        assert_eq!(a.apply_at_frame, 116);
+
+        // A peer that only recorded the carried departure, then is promoted: the
+        // handoff re-derivation reproduces the identical apply frame.
+        let mut peer = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer);
+        peer.record_departure(SlotId(1), last, ceiling, DROPPED);
+        let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay);
+        let p = leaves
+            .iter()
+            .find(|l| l.slot == 1)
+            .expect("promotion re-derives slot 1's leave");
+        assert_eq!(
+            p.apply_at_frame, 116,
+            "same clamped apply frame from the same carried record",
+        );
+    }
+
     /// A non-authority relay never decides a leave (only the authority does).
     #[test]
     fn decide_leave_is_a_no_op_on_a_non_authority() {
@@ -3759,7 +4219,7 @@ mod tests {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         // The survivor's stamps run ahead of the departed slot's last frame.
         maker.observe_frame(SlotId(0), GameFrameCount(55));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(55)),
@@ -3784,7 +4244,7 @@ mod tests {
         // but decided nothing (decide_leave is a no-op on a non-authority).
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -3819,7 +4279,7 @@ mod tests {
         // the frame into the record and retires the slot), then runs its
         // teardown remove_slot — now a no-op for this slot.
         let read = maker.slot_frame(SlotId(1));
-        maker.record_departure(SlotId(1), read, DROPPED);
+        maker.record_departure(SlotId(1), read, None, DROPPED);
         assert_eq!(
             maker.slot_frame(SlotId(1)),
             None,
@@ -3943,7 +4403,7 @@ mod tests {
 
         // The peer's SlotDeparted carries the home relay's fuller view (60): the
         // departure record max-merges it over our lagging 30.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), None, DROPPED);
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 61,
@@ -3960,7 +4420,7 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(80));
 
         // A stale SlotDeparted carries a lower frame (55): the merge keeps 70.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), None, DROPPED);
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 71,
@@ -3973,7 +4433,7 @@ mod tests {
     fn slot_departed_ingest_records_without_deciding_on_a_non_authority() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -3998,7 +4458,7 @@ mod tests {
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
 
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(60)),
@@ -4013,7 +4473,7 @@ mod tests {
     fn observe_frame_ignores_a_departed_slot() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
 
         maker.observe_frame(SlotId(1), GameFrameCount(52));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -4030,7 +4490,7 @@ mod tests {
     fn conditions_ingest_does_not_resurrect_a_departed_slot() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
 
         let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -4053,7 +4513,7 @@ mod tests {
         // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
         let leave = LeaveDirective {
             slot: 1,
             reason: DROPPED,
@@ -4303,7 +4763,7 @@ mod tests {
 
         // Ordinal 1: slot 1 reports, slot 2 departs before ever reporting it.
         feed(&mut m, 1, 1, SYNC_A);
-        m.record_departure(SlotId(2), None, DROPPED);
+        m.record_departure(SlotId(2), None, None, DROPPED);
         assert!(!m.sync.members.contains_key(&SlotId(2)));
 
         // Slot 0 continues; ordinal 1 completes on the two survivors once the
@@ -4332,8 +4792,8 @@ mod tests {
         feed_ring(&mut m, 0, 5, SYNC_A, 1005); // ordinal 5 arrives first
         feed_ring(&mut m, 0, 4, SYNC_A, 1004); // ordinal 4 arrives late
         assert!(
-            m.sync.correction_warns >= 1,
-            "the out-of-order arrival was corrected and flagged",
+            m.sync.corrections >= 1,
+            "the out-of-order arrival was corrected and counted",
         );
 
         // Slot 0 races on so the margin clears every ordinal through 5.
@@ -4392,49 +4852,125 @@ mod tests {
         );
     }
 
-    /// The exact case the round-2 nibble-only join placement got wrong past
-    /// ±7: slot 0 races ten ordinals ahead of slot 1's first-ever report — a
-    /// gap the shipped dev-tenant policy (1..=12) allows, and one the ±7
-    /// nibble-only correction cannot resolve on its own (nearest-mod-16 to a
-    /// frontier of 10 lands at ordinal 16, not 0). Frame-anchored join
-    /// placement still lands slot 1 at its true ordinal, because lockstep
-    /// keeps the frame skew between the two slots' turns for the same
-    /// interval small regardless of how far the ordinals themselves have
-    /// drifted apart.
+    /// A deep join (>7 ordinals from the frontier — a gap the shipped dev-tenant
+    /// policy 1..=12 allows, past the ±7 nibble ceiling) still lands on its true
+    /// ordinal **once a rate is corroborated by ≥3 distinct slots**. This is the
+    /// honest-case counterpart to the calibration-poisoning defense: with a
+    /// corroborated rate (which a lone slot cannot swing), the frame projection is
+    /// trustworthy again and the deep join is placed correctly rather than
+    /// deferred.
     #[test]
-    fn a_join_at_depth_past_the_nibble_ceiling_still_lands_on_the_true_ordinal() {
+    fn a_deep_join_lands_on_its_true_ordinal_once_three_slots_corroborate_the_rate() {
         let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
         let margin = sync_eval_margin(12);
         assert_eq!(margin, 14);
 
-        // Slot 0 alone advances ten ordinals at ~2 frames/turn (a realistic
-        // frames-per-turn rate), establishing a calibration point ten
-        // ordinals ahead of where slot 1 will join.
+        // Three slots advance together for ten ordinals at ~2 frames/turn, so
+        // every ordinal 0..10 is reported by ≥3 distinct slots with agreeing
+        // frames — a corroborated (median) rate a single slot cannot move.
         for ordinal in 0u8..10 {
-            feed_ring(&mut m, 0, ordinal, SYNC_A, 5000 + 2 * u32::from(ordinal));
+            let frame = 5000 + 2 * u32::from(ordinal);
+            for slot in [0u8, 2, 3] {
+                feed_ring(&mut m, slot, ordinal, SYNC_A, frame);
+            }
         }
-        assert_eq!(m.sync.members[&SlotId(0)].next_expected, 10);
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            10,
+            "frontier at 10"
+        );
+        assert_eq!(
+            m.sync.frame_rate(),
+            Some(2.0),
+            "≥3 slots corroborated the rate"
+        );
 
-        // Slot 1's first-ever report is genuinely ordinal 0 (ring 0), with a
-        // frame close to slot 0's own ordinal-0 frame (5000) — lockstep's
-        // small cross-client skew, not the ten-ordinal gap in arrival order.
+        // Slot 1's first-ever report is genuinely ordinal 0 (ring 0), ten
+        // ordinals behind the frontier — past the nibble ceiling — with a frame
+        // close to ordinal 0's corroborated frame (5000). The corroborated
+        // projection lands it on its true ordinal, not the frontier.
         feed_ring(&mut m, 1, 0, SYNC_A, 5001);
         assert_eq!(
             m.sync.members[&SlotId(1)].since,
             0,
-            "the frame anchor placed slot 1 at its true ordinal 0, not the frontier (10)",
+            "the corroborated anchor placed slot 1 at its true ordinal 0, not the frontier (10)",
         );
 
-        // Both slots agree at every ordinal; racing slot 0 on to clear the
-        // deeper (depth-12) margin must retire ordinal 0 silently — no false
-        // divergence from the join.
+        // Everyone agrees; racing slot 0 past the depth-12 margin retires ordinal
+        // 0 silently — no false divergence from the deep join.
         let mut divergence = None;
-        for ordinal in 10..(margin as u8) {
-            if let Some(d) = feed(&mut m, 0, ordinal, SYNC_A) {
+        for ordinal in 10u8..(margin as u8) {
+            if let Some(d) = feed_ring(&mut m, 0, ordinal, SYNC_A, 5000 + 2 * u32::from(ordinal)) {
                 divergence = Some(d);
             }
         }
         assert_eq!(divergence, None, "no false divergence from the deep join");
+    }
+
+    /// Finding B, the whole point: an attacker controlling only its own slot
+    /// cannot frame a joining victim by seeding calibration. The attacker races
+    /// the frontier ahead (one `0x37` per turn) and stamps whatever frames it
+    /// likes; when the honest victim joins at its true ordinal 0, there is no
+    /// corroborated rate (a lone slot can't make one), so the victim is DEFERRED
+    /// — never placed a full ring cycle ahead at ~16 and never named diverged.
+    #[test]
+    fn an_attacker_cannot_frame_a_joining_victim_by_seeding_calibration_alone() {
+        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        // The attacker (slot 0) races ten ordinals ahead, stamping a frame
+        // sequence designed to project a low-frame joiner up near ordinal 16.
+        for ordinal in 0u8..10 {
+            feed_ring(&mut m, 0, ordinal % 16, SYNC_A, 9000 + u32::from(ordinal));
+        }
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            10,
+            "attacker raced the frontier to 10"
+        );
+        assert!(
+            m.sync.frame_rate().is_none(),
+            "a lone slot cannot corroborate a rate to poison",
+        );
+
+        // The honest victim joins at its true ordinal 0. No corroboration + the
+        // nibble would land it above the frontier (a full cycle off) → deferred.
+        assert_eq!(feed_ring(&mut m, 1, 0, SYNC_A, 9002), None);
+        assert!(
+            !m.sync.members.contains_key(&SlotId(1)),
+            "the victim is deferred, never misplaced a full ring cycle ahead at ~16",
+        );
+        // It keeps reporting; without ≥3 corroborators it stays deferred and is
+        // never named as the diverged slot.
+        for _ in 0..5 {
+            assert_eq!(
+                feed_ring(&mut m, 1, 0, SYNC_A, 9002),
+                None,
+                "still deferred — never a divergence naming the honest victim",
+            );
+        }
+        assert!(!m.sync.members.contains_key(&SlotId(1)));
+    }
+
+    /// A 2-reporter ordinal never corroborates (the threshold is ≥3), so an
+    /// attacker's outlier frame at a 2-reporter ordinal can't poison a rate — the
+    /// median that would reject it never even gets computed, because no rate
+    /// forms from two reporters at all.
+    #[test]
+    fn a_two_reporter_ordinal_with_an_attacker_outlier_does_not_corroborate() {
+        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        // One honest slot and one attacker stamping wild frames report ordinals
+        // 0..6 — two reporters each, below the ≥3 corroboration threshold.
+        for ordinal in 0u8..6 {
+            feed_ring(&mut m, 0, ordinal, SYNC_A, 5000 + 2 * u32::from(ordinal));
+            feed_ring(&mut m, 1, ordinal, SYNC_A, 900_000 + u32::from(ordinal));
+        }
+        assert!(
+            m.sync.corroborated_latest.is_none(),
+            "two reporters never corroborate an ordinal",
+        );
+        assert!(
+            m.sync.frame_rate().is_none(),
+            "no rate forms — nothing for the attacker's outlier to poison",
+        );
     }
 
     /// When a joining report carries no `game_frame` at all, the frame anchor
@@ -4479,6 +5015,76 @@ mod tests {
             m.sync.members[&SlotId(1)].since,
             1,
             "no rate yet — falls back to the frontier, nibble-corrected, ignoring the frame",
+        );
+    }
+
+    /// A turn carrying more than one `0x37` counts as a **single** ordinal
+    /// advance. An honest client emits exactly one sync command per outgoing
+    /// turn; packing several into one turn is the lever a malicious client
+    /// would use to inflate its own frontier (and seed join-placement
+    /// calibration) in a single turn — and to race its own ordinals past the
+    /// eviction window to evade detection. Only the first is fed to the
+    /// comparator; the extras are ignored and flagged.
+    #[test]
+    fn multiple_sync_commands_in_one_turn_advance_the_ordinal_by_one() {
+        let mut m = authority_maker();
+        // Three sync commands packed into a single turn (one observe_sync call).
+        let mut commands = sync_command(0, expected_kind_for_ordinal(0), SYNC_A);
+        commands.extend(sync_command(1, expected_kind_for_ordinal(1), SYNC_A));
+        commands.extend(sync_command(2, expected_kind_for_ordinal(2), SYNC_A));
+        let divergence = m.observe_sync(SlotId(0), Some(1000), &commands);
+        assert_eq!(divergence, None);
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            1,
+            "only the first sync command counts — the ordinal advances by one, not three",
+        );
+        assert_eq!(
+            m.sync.base_ordinal, 0,
+            "the frontier did not vault the window"
+        );
+        assert_eq!(
+            m.sync.multi_sync_warns, 1,
+            "the extra sync commands were flagged once"
+        );
+    }
+
+    /// The eviction-evasion shape of the same lever: a slot cannot flood enough
+    /// `0x37`s in one turn to push the comparator's `base_ordinal` past
+    /// ordinals its honest peers haven't been compared at yet. With one sync
+    /// command per turn honored, a single turn moves the frontier by one, so
+    /// the eviction window can't be jumped in a burst.
+    #[test]
+    fn a_one_turn_sync_flood_cannot_vault_the_eviction_window() {
+        let mut m = authority_maker();
+        // An honest slot reports ordinal 0 and stops there.
+        feed(&mut m, 1, 0, SYNC_A);
+        // The attacker packs a full window-plus of sync commands into one turn.
+        let mut flood = Vec::new();
+        for ring in 0..(SYNC_WINDOW as u8 + 4) {
+            flood.extend(sync_command(
+                ring % 16,
+                expected_kind_for_ordinal(u64::from(ring % 16)),
+                SYNC_B,
+            ));
+        }
+        let divergence = m.observe_sync(SlotId(0), Some(2000), &flood);
+        assert_eq!(divergence, None, "no eviction, no premature verdict");
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            1,
+            "the flood advanced the attacker's ordinal by one, not the whole window",
+        );
+        assert_eq!(
+            m.sync.base_ordinal, 0,
+            "ordinal 0 (where the honest slot reported) is still awaiting evaluation, not evicted",
+        );
+        assert!(
+            m.sync
+                .pending
+                .get(&0)
+                .is_some_and(|r| r.contains_key(&SlotId(1))),
+            "the honest slot's ordinal-0 report is still pending, not evicted past",
         );
     }
 

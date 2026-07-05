@@ -519,10 +519,11 @@ pub async fn run_slot_link(
                             // minimum across slots, so even a validated turn's
                             // inflated claim can only mislead its own slot.)
                             if let Some(frame) = payload.game_frame_count {
-                                consensus::observe_frame(
+                                consensus::observe_turn_frame(
                                     &decision_makers,
                                     &key,
                                     slot,
+                                    payload.seq,
                                     rally_point_proto::ids::GameFrameCount(frame),
                                 );
                             }
@@ -769,12 +770,15 @@ pub async fn run_slot_link(
                             Ok(turn) => {
                                 let payload = turn.payload;
                                 // A validated turn's frame feeds the consensus
-                                // coordinate, exactly as on the datagram path.
+                                // coordinate, exactly as on the datagram path —
+                                // via the seq-aware path so the leave-frame clamp
+                                // has this turn's history too.
                                 if let Some(frame) = payload.game_frame_count {
-                                    consensus::observe_frame(
+                                    consensus::observe_turn_frame(
                                         &decision_makers,
                                         &key,
                                         slot,
+                                        payload.seq,
                                         rally_point_proto::ids::GameFrameCount(frame),
                                     );
                                 }
@@ -930,11 +934,22 @@ fn announce_departure(
     slot: SlotId,
     reason: u32,
 ) {
-    // Read the last observed frame before recording retires it; it fills both
-    // the departure record and the SlotDeparted the peers receive.
+    // Read the last observed frame and the reachability ceiling before recording
+    // retires the slot's live state; both fill the departure record and the
+    // SlotDeparted the peers receive. The ceiling is home-authored here (only the
+    // home relay computes it) so every relay clamps the leave's apply frame to
+    // the identical value — see `consensus::reachable_frame`.
     let last_frame = consensus::slot_frame(decision_makers, key, slot);
-    consensus::record_departure(decision_makers, key, slot, last_frame, reason);
-    crate::mesh::fan_out_slot_departed(mesh_links, key, slot, last_frame.map(|f| f.0), reason);
+    let reachable = consensus::reachable_frame(decision_makers, key, slot);
+    consensus::record_departure(decision_makers, key, slot, last_frame, reachable, reason);
+    crate::mesh::fan_out_slot_departed(
+        mesh_links,
+        key,
+        slot,
+        last_frame.map(|f| f.0),
+        reachable,
+        reason,
+    );
     // Decide locally: `Some` only on the authority (and only once per slot). The
     // leave unstalls local survivors and, broadcast across the mesh, peer
     // survivors — the departing slot is already off the roster, so `fan_out_leave`

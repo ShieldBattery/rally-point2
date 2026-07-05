@@ -118,6 +118,11 @@ impl LeaveTracker {
         });
     }
 
+    /// Whether a leave has been observed for this slot, applied or not.
+    pub fn contains(&self, slot: u32) -> bool {
+        self.leaves.iter().any(|l| l.directive.slot == slot)
+    }
+
     /// Surfaces every not-yet-surfaced leave whose apply frame has been reached by
     /// `next_frame` — the frame the game is about to simulate — as `(slot, reason)`
     /// pairs. Each slot's leave is returned at most once; the caller writes each
@@ -260,5 +265,18 @@ mod tests {
         let mut tracker = LeaveTracker::new();
         tracker.observe(&leave(2, DROPPED, 100, 1));
         assert_eq!(tracker.take_due(140), vec![(SlotId(2), DROPPED)]);
+    }
+
+    #[test]
+    fn contains_reflects_tracked_slots_whether_or_not_theyve_surfaced() {
+        let mut tracker = LeaveTracker::new();
+        assert!(!tracker.contains(2), "nothing tracked yet");
+
+        tracker.observe(&leave(2, DROPPED, 100, 1));
+        assert!(tracker.contains(2), "tracked, even before its apply frame");
+        assert!(!tracker.contains(3), "a different slot is untouched");
+
+        tracker.take_due(100);
+        assert!(tracker.contains(2), "still tracked once surfaced");
     }
 }

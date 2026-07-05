@@ -448,12 +448,13 @@ pub(crate) fn fan_out_slot_departed(
     key: &SessionKey,
     slot: SlotId,
     last_frame: Option<u32>,
+    reachable_frame: Option<u32>,
     reason: u32,
 ) {
     fan_out_control(
         links,
         key,
-        slot_departed_frame(key.session, slot, last_frame, reason),
+        slot_departed_frame(key.session, slot, last_frame, reachable_frame, reason),
     );
 }
 
@@ -487,6 +488,7 @@ fn slot_departed_frame(
     session: SessionId,
     slot: SlotId,
     last_frame: Option<u32>,
+    reachable_frame: Option<u32>,
     reason: u32,
 ) -> MeshControlFrame {
     MeshControlFrame {
@@ -494,6 +496,7 @@ fn slot_departed_frame(
         kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
             slot: u32::from(slot.0),
             last_frame,
+            reachable_frame,
             reason,
         })),
     }
@@ -826,10 +829,11 @@ pub async fn run_mesh_link(
                             // home relay. Lobby turns carry no frame and don't
                             // move the consensus coordinate.
                             if let Some(frame) = payload.game_frame_count {
-                                crate::consensus::observe_frame(
+                                crate::consensus::observe_turn_frame(
                                     &decision_makers,
                                     &key,
                                     slot,
+                                    payload.seq,
                                     rally_point_proto::ids::GameFrameCount(frame),
                                 );
                             }
@@ -1222,7 +1226,17 @@ fn dispatch_mesh_control(
 
     match frame.kind {
         Some(mesh_control_frame::Kind::SlotDeparted(departed)) => {
-            let slot = SlotId(departed.slot as u8);
+            let Ok(slot) = u8::try_from(departed.slot).map(SlotId) else {
+                // A slot id past `u8` range names no real slot; a silent
+                // truncation would alias it onto a valid one. Drop the frame
+                // (defensive — wire values are validated upstream).
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = departed.slot,
+                    "mesh SlotDeparted names a slot id out of range; dropping",
+                );
+                return;
+            };
             // The departure record max-merges the carried last frame with this
             // relay's own observation of the slot, so the fuller view drives the
             // apply frame — and recording retires the slot's live state, letting
@@ -1234,6 +1248,7 @@ fn dispatch_mesh_control(
                 departed
                     .last_frame
                     .map(rally_point_proto::ids::GameFrameCount),
+                departed.reachable_frame,
                 departed.reason,
             );
             // Only the authority turns a departure into the one synced leave;
@@ -1248,20 +1263,38 @@ fn dispatch_mesh_control(
         }
         Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
             crate::consensus::observe_leave(decision_makers, &key, &leave);
-            routing::fan_out_leave(sessions, &key, SlotId(leave.slot as u8), leave);
+            let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
+                // Out of `u8` range: `observe_leave` above already ignored it
+                // (its own checked conversion); nothing to fan out either.
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = leave.slot,
+                    "mesh LeaveDirective names a slot id out of range; dropping",
+                );
+                return;
+            };
+            routing::fan_out_leave(sessions, &key, slot, leave);
         }
         Some(mesh_control_frame::Kind::OversizeTurn(payload)) => {
-            let slot = SlotId(payload.slot as u8);
+            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = payload.slot,
+                    "mesh OversizeTurn names a slot id out of range; dropping",
+                );
+                return;
+            };
             // The same receive step a datagram-delivered mesh turn runs: a
             // validated remote slot's frame observation, then the shared local
             // delivery (dedup, stamp, local fan-out). Delivery below the fan-out
             // needs nothing new — a slot link whose client's path can't take the
             // turn diverts it onto that client's own control stream.
             if let Some(frame) = payload.game_frame_count {
-                crate::consensus::observe_frame(
+                crate::consensus::observe_turn_frame(
                     decision_makers,
                     &key,
                     slot,
+                    payload.seq,
                     rally_point_proto::ids::GameFrameCount(frame),
                 );
             }
@@ -1298,11 +1331,12 @@ fn reconcile_leaves_on_join(
     let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
     // Unbounded send only fails on a closed channel; the driver we are
     // registering into is alive here, so these always enqueue.
-    for (slot, last_frame, reason) in departures {
+    for (slot, last_frame, reachable_frame, reason) in departures {
         let _ = control_tx.send(slot_departed_frame(
             key.session,
             slot,
             last_frame.map(|f| f.0),
+            reachable_frame,
             reason,
         ));
     }
@@ -1601,7 +1635,7 @@ mod tests {
         let (_fwd1, mut ctl1) = register_link_channels(&links, &key);
         let (_fwd2, mut ctl2) = register_link_channels(&links, &key);
 
-        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), 3);
+        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), 3);
         for rx in [&mut ctl1, &mut ctl2] {
             let frame = rx.try_recv().expect("every link is told");
             assert_eq!(
@@ -1661,6 +1695,7 @@ mod tests {
             &key,
             SlotId(2),
             Some(GameFrameCount(60)),
+            None,
             0x4000_0006,
         );
 

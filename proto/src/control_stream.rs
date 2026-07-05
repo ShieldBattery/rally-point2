@@ -163,6 +163,7 @@ mod tests {
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
                 slot: 2,
                 last_frame: Some(41),
+                reachable_frame: Some(38),
                 reason: 0x4000_0006,
             })),
         };
@@ -214,6 +215,7 @@ mod tests {
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
                 slot: 1,
                 last_frame: None,
+                reachable_frame: None,
                 reason: 3,
             })),
         };
