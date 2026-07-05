@@ -234,6 +234,13 @@ message ControlFrame {
     // relay only), sent after the client has flushed its final turns and is
     // about to disconnect. See `LeaveIntent`.
     LeaveIntent leave_intent = 3;
+
+    // A client's end-of-game result report UP to the relay (client → relay
+    // only). The bytes are opaque to the relay — it stamps arrival against its
+    // own timeline and forwards the report up the coordinator pipeline without
+    // parsing it. Unlike a leave intent, this rides out mid-game the moment the
+    // game produces it, ahead of any final-turn drain. See `GameResult`.
+    GameResult game_result = 4;
   }
 }
 
@@ -333,6 +340,19 @@ message LeaveDirective {
 // the client's confirmation that the relay processed this is the relay closing
 // the link, not a reply frame.
 message LeaveIntent {}
+
+// A client's end-of-game result report (client → relay only), sent on the
+// reliable control stream. The relay never parses `payload`: it is the tenant's
+// own serialized result, opaque here exactly as `external_ref` is an opaque
+// correlation string. The relay validates only structurally (a size cap, one
+// report per slot per session), stamps arrival against its own timeline, and
+// forwards it up the coordinator pipeline. The reporting slot is the
+// authenticated connection's slot, never a value carried in the bytes.
+message GameResult {
+  // The tenant's opaque serialized result. Bounded by the relay's own cap; a
+  // payload over it is dropped without closing the link.
+  bytes payload = 1;
+}
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a
 // relay-pair uses for what its datagram path cannot carry: synced player-leave

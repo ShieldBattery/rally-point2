@@ -161,7 +161,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
-    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
+    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot, ResultNotice,
 };
 use rally_point_proto::ids::{GameFrameCount, SlotId};
 use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
@@ -494,6 +494,12 @@ pub struct DecisionMaker {
     /// Descriptor-driven, so it survives authority changes (unlike the comparator
     /// state, which resets on promotion).
     observers: HashSet<SlotId>,
+    /// Slots that have already reported an end-of-game result. First report per
+    /// slot wins; a repeat is dropped without firing a second notice — the same
+    /// anti-flooding posture as the one-sync-command-per-turn rule. Not tied to
+    /// the desync comparator, so it survives an authority change (a result is a
+    /// per-slot one-shot the relay reports regardless of authority).
+    reported_results: HashSet<SlotId>,
     /// The per-session desync comparator. Only meaningful while this relay is the
     /// authority; reset wholesale on promotion (a real desync re-diverges every
     /// interval, so no state need transfer across a handoff).
@@ -1443,6 +1449,7 @@ impl DecisionMaker {
             departures: HashMap::new(),
             next_leave_seq: 0,
             observers: HashSet::new(),
+            reported_results: HashSet::new(),
             sync: SyncTracker::default(),
         }
     }
@@ -2059,6 +2066,19 @@ impl DecisionMaker {
         self.note_departure(slot, last_frame, reachable, reason);
     }
 
+    /// Records that `slot` reported an end-of-game result, returning whether this
+    /// was the **first** report from the slot. A repeat returns `false` and
+    /// records nothing new, so the caller fires at most one result notice per
+    /// slot (anti-flooding, the same first-writer-wins posture as
+    /// [`observe_leave`](Self::observe_leave)). The report does not retire the
+    /// slot's live state — a result is not a departure — so `slot_frame` and
+    /// `session_frame` still read the slot's framed history when the caller
+    /// stamps the notice.
+    #[must_use]
+    pub fn record_result(&mut self, slot: SlotId) -> bool {
+        self.reported_results.insert(slot)
+    }
+
     /// Caches a synced leave this relay observed authored by the session's
     /// authority (a peer relay's `LeaveDirective` off the mesh), so a later
     /// promotion re-broadcasts it verbatim. First writer wins; a conflicting
@@ -2394,18 +2414,21 @@ struct SessionExternalRefs {
 }
 
 /// A notice a relay sends up its coordinator control connection about a running
-/// game: a player departed, or the game desynced. Both ride one channel (the
-/// leave sites and the sync comparator feed the same sender), so the reconnect
-/// buffering that guarantees a queued notice survives a coordinator restart is
-/// written once, not per kind. The coordinator client wraps each into the
-/// matching [`RelayToCoordinator`](rally_point_proto::control::RelayToCoordinator)
-/// frame when it forwards it.
+/// game: a player departed, the game desynced, or a client reported its result.
+/// All ride one channel (the leave sites, the sync comparator, and the result
+/// ingress feed the same sender), so the reconnect buffering that guarantees a
+/// queued notice survives a coordinator restart is written once, not per kind.
+/// The coordinator client wraps each into the matching
+/// [`RelayToCoordinator`](rally_point_proto::control::RelayToCoordinator) frame
+/// when it forwards it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayNotice {
     /// A player permanently departed a running game (left vs. dropped).
     Departure(DepartureNotice),
     /// The game's sims diverged — a relay-observed desync.
     Desync(DesyncNotice),
+    /// A client reported its end-of-game result, forwarded opaque.
+    Result(ResultNotice),
 }
 
 /// A registry of per-session decision-makers, one per session this relay is
@@ -2441,7 +2464,8 @@ pub struct DecisionMakers {
     /// Absent for a standalone relay. Unbounded so queueing a notice while the
     /// coordinator link is down never blocks the turn path — the drain end holds
     /// the channel across reconnects and flushes pending notices on redial.
-    /// Carries the [`RelayNotice`] union so departures and desyncs share one pipe.
+    /// Carries the [`RelayNotice`] union so departures, desyncs, and results
+    /// share one pipe.
     notices: OnceLock<UnboundedSender<RelayNotice>>,
     /// Correlation ids per session, from the coordinator's descriptor. Absent
     /// for a session whose descriptor never carried them (a standalone relay,
@@ -2485,6 +2509,11 @@ impl DecisionMakers {
     /// Fires a desync notice (see [`emit_notice`](Self::emit_notice)).
     fn notify_desync(&self, notice: DesyncNotice) {
         self.emit_notice(RelayNotice::Desync(notice));
+    }
+
+    /// Fires a result notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_result(&self, notice: ResultNotice) {
+        self.emit_notice(RelayNotice::Result(notice));
     }
 
     /// Records `key`'s correlation ids from a coordinator descriptor, replacing
@@ -2599,6 +2628,40 @@ fn desync_notice(
     }
 }
 
+/// Builds the result notice for a slot's first end-of-game report: carries the
+/// opaque payload byte-for-byte, a wall-clock arrival stamp, and the relay's own
+/// view of where the report landed in the game timeline (the session's consensus
+/// frame and the reporting slot's newest observed frame, captured by the caller
+/// while it held the maker). Stamps the session's `external_id` and the slot's
+/// `external_ref` the same way (and from the same store) as [`departure_notice`],
+/// so the notice is self-describing across a coordinator restart. The timestamp
+/// is read here rather than in the caller, mirroring [`desync_notice`].
+fn result_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    payload: Vec<u8>,
+    session_frame: Option<GameFrameCount>,
+    slot_frame: Option<GameFrameCount>,
+) -> ResultNotice {
+    let refs = registry.session_refs(key);
+    let arrival_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    ResultNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        slot,
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        payload,
+        arrival_ms,
+        session_frame: session_frame.map(|f| f.0),
+        slot_frame: slot_frame.map(|f| f.0),
+    }
+}
+
 /// Creates a decision-maker for `key`, or reconciles an existing one with the
 /// coordinator's current `bounds` and the freshly computed `authority`. Called
 /// on every descriptor push: the relay set serving a session changes as
@@ -2699,6 +2762,39 @@ pub fn record_departure(
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.record_departure(slot, last_frame, reachable, reason);
     }
+}
+
+/// Records a client's end-of-game result report into the session's
+/// decision-maker, firing exactly one result notice up the coordinator connection
+/// on the first report from `slot`. A repeat from the same slot inserts nothing
+/// and fires nothing. A no-op when no maker exists (a session this relay does not
+/// serve). `slot` is the authenticated connection's slot the report arrived on,
+/// never a value from the payload; `payload` is forwarded opaque.
+///
+/// The notice captures the relay's own view of *when* the report landed: the
+/// session's consensus frame and the reporting slot's newest observed frame at
+/// arrival, both read here while the maker is locked (the report does not retire
+/// the slot, so its framed history is still live).
+pub fn record_result(registry: &DecisionMakers, key: &SessionKey, slot: SlotId, payload: Vec<u8>) {
+    let frames = {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return;
+        };
+        if !maker.record_result(slot) {
+            return;
+        }
+        (maker.session_frame(), maker.slot_frame(slot))
+    };
+    let (session_frame, slot_frame) = frames;
+    registry.notify_result(result_notice(
+        registry,
+        key,
+        slot,
+        payload,
+        session_frame,
+        slot_frame,
+    ));
 }
 
 /// The reachability ceiling for a leave's apply frame at `slot`'s departure —
@@ -3618,6 +3714,7 @@ mod tests {
         match rx.try_recv().expect("a queued notice") {
             RelayNotice::Departure(notice) => notice,
             RelayNotice::Desync(_) => panic!("expected a departure notice, got a desync"),
+            RelayNotice::Result(_) => panic!("expected a departure notice, got a result"),
         }
     }
 
@@ -3870,6 +3967,94 @@ mod tests {
         let notice = recv_departure(&mut rx);
         assert!(notice.external_id.is_none());
         assert!(notice.external_ref.is_none());
+    }
+
+    // -- Result notifier --
+
+    /// Unwraps the next queued notice as a result, panicking on anything else.
+    fn recv_result(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RelayNotice>) -> ResultNotice {
+        match rx.try_recv().expect("a queued notice") {
+            RelayNotice::Result(notice) => notice,
+            other => panic!("expected a result notice, got {other:?}"),
+        }
+    }
+
+    /// A slot's first end-of-game result fires exactly one result notice, stamped
+    /// with the reporting slot, the opaque payload, and the relay's own frame
+    /// view (the session's slowest-slot frame and the reporting slot's own newest
+    /// frame). A second report from the same slot records nothing and fires no
+    /// second notice — the one-report-per-slot dedup.
+    #[test]
+    fn record_result_fires_one_notice_per_slot() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        // Framed turns give the notice a session/slot frame basis: the session
+        // coordinate is the slowest slot's frame (40), the reporting slot's own
+        // is its newest (52).
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        observe_frame(&registry, &k, SlotId(1), GameFrameCount(52));
+
+        record_result(&registry, &k, SlotId(1), vec![0xDE, 0xAD]);
+        let notice = recv_result(&mut rx);
+        assert_eq!(notice.tenant, k.tenant);
+        assert_eq!(notice.session, k.session);
+        assert_eq!(notice.slot, SlotId(1));
+        assert_eq!(notice.payload, vec![0xDE, 0xAD]);
+        assert_eq!(notice.session_frame, Some(40), "the slowest slot's frame");
+        assert_eq!(
+            notice.slot_frame,
+            Some(52),
+            "the reporting slot's own frame"
+        );
+        assert!(notice.arrival_ms > 0, "a wall-clock arrival stamp is set");
+        assert!(rx.try_recv().is_err(), "just the one");
+
+        // A second report from the same slot records nothing (first-writer-wins)
+        // and so fires no second notice.
+        record_result(&registry, &k, SlotId(1), vec![0xBE, 0xEF]);
+        assert!(
+            rx.try_recv().is_err(),
+            "no re-fire for an already-reported slot",
+        );
+    }
+
+    /// A result notice stamps the session's correlation ids the same way a
+    /// departure does, so it is self-describing across a coordinator restart.
+    #[test]
+    fn record_result_stamps_session_refs_into_the_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        registry.set_session_refs(
+            &k,
+            Some("game-3".to_owned()),
+            HashMap::from([(SlotId(1), "sb-user-5".to_owned())]),
+        );
+
+        record_result(&registry, &k, SlotId(1), vec![0x01]);
+        let notice = recv_result(&mut rx);
+        assert_eq!(notice.external_id, Some("game-3".to_owned()));
+        assert_eq!(notice.external_ref, Some("sb-user-5".to_owned()));
+    }
+
+    /// A result for a session this relay does not serve (no maker) records
+    /// nothing and fires no notice, rather than erroring.
+    #[test]
+    fn record_result_on_a_relay_without_a_maker_is_a_no_op() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        record_result(&registry, &k, SlotId(0), vec![0x01]);
+        assert!(rx.try_recv().is_err(), "no maker, so no notice");
     }
 
     /// `set_session_refs` replaces rather than accumulates on a re-apply (a

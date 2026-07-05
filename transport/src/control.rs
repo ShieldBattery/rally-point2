@@ -14,14 +14,16 @@
 //! for how they rejoin the ordered turn stream) — plus the synced-leave
 //! machinery: a relay pushes a `LeaveDirective` down to a surviving client,
 //! and a client pushes a `LeaveIntent` up to announce its own clean
-//! departure. The reader skips a frame kind it doesn't know, so the channel
-//! can grow chat/resync frames without a wire break.
+//! departure. A client also pushes a `GameResult` up with its end-of-game
+//! report. The reader skips a frame kind it doesn't know, so the channel can
+//! grow chat/resync frames without a wire break.
 
+use prost::bytes::Bytes;
 use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
 };
 use rally_point_proto::messages::{
-    ControlFrame, LeaveDirective, LeaveIntent, Payload, control_frame,
+    ControlFrame, GameResult, LeaveDirective, LeaveIntent, Payload, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -32,9 +34,9 @@ use tokio::sync::mpsc;
 /// `Leave` arrive (the relay forwards oversize turns and pushes leaves down),
 /// but never `LeaveIntent` — a client never receives its own intent back, so
 /// the client edge ignores one, mirroring how the relay edge ignores a stray
-/// `Leave`. On the relay edge, `OversizeTurn` and `LeaveIntent` arrive (a
-/// client sends both up); a relay never receives a `Leave` from another relay
-/// on this stream, so the relay edge ignores one.
+/// `Leave`. On the relay edge, `OversizeTurn`, `LeaveIntent`, and `GameResult`
+/// arrive (a client sends all three up); a relay never receives a `Leave` from
+/// another relay on this stream, so the relay edge ignores one.
 #[derive(Debug)]
 pub enum ControlInbound {
     /// An oversize turn to fold back into the ordered turn stream.
@@ -48,6 +50,10 @@ pub enum ControlInbound {
     /// receives it at all (it only ever sends one) — either edge that isn't
     /// the relay reading a client's stream ignores it.
     LeaveIntent,
+    /// A client's end-of-game result report (client → relay only). The bytes are
+    /// opaque here; the relay reading a client's stream stamps and forwards them,
+    /// and any other edge ignores a stray one just as it does a `LeaveIntent`.
+    GameResult(Bytes),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -115,6 +121,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 Ok(ControlFrame {
                     kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
                 }) => ControlInbound::LeaveIntent,
+                Ok(ControlFrame {
+                    kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
+                }) => ControlInbound::GameResult(payload),
                 // A frame kind this build predates: skip it, keep the stream.
                 Ok(ControlFrame { kind: None }) => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -180,6 +189,24 @@ pub async fn send_control_leave_intent(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a client's end-of-game result report up the control stream (client →
+/// relay). Sent once, the moment the game produces the result — mid-game, ahead
+/// of any final-turn drain — and never acked: it is a best-effort optimization
+/// feed, not a correctness signal, so an error here (the stream or connection
+/// gone) needs no recovery — the relay reasons the game's outcome from the
+/// departure that follows regardless.
+pub async fn send_control_game_result(
+    control_send: &mut quinn::SendStream,
+    payload: Bytes,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

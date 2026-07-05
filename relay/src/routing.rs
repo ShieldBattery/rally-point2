@@ -139,6 +139,14 @@ const LEAVE_REASON_LEFT: u32 = 3;
 /// waits for once it has sent its intent.
 const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 
+/// The largest end-of-game result payload the relay accepts on the control
+/// stream. The bytes are the tenant's opaque serialized result, forwarded
+/// unparsed; this cap bounds what one report can cost. A payload over it is an
+/// ill-formed report, not an attack on the framing (the control stream's own
+/// frame cap already bounds the whole frame), so it is dropped without closing
+/// the link — the game's outcome is still reasoned from the departure.
+const MAX_GAME_RESULT_PAYLOAD_LEN: usize = 4096;
+
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
 
@@ -806,6 +814,30 @@ pub async fn run_slot_link(
                                     .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"invalid turn");
                                 break 'serve;
                             }
+                        }
+                    }
+                    // The client's end-of-game result report. Processed in stream
+                    // order like any other control frame — a report that arrives
+                    // before a leave-intent is handled before the intent closes the
+                    // link — and, unlike the intent, it does not end the link: the
+                    // client keeps playing (a mid-game defeat report). The bytes are
+                    // opaque; the relay only enforces the size cap and forwards them
+                    // up the coordinator pipeline. The reporting slot is this
+                    // authenticated connection's slot, never a value from the
+                    // payload. An over-cap payload is an ill-formed report, dropped
+                    // without closing the link.
+                    Some(ControlInbound::GameResult(payload)) => {
+                        if payload.len() > MAX_GAME_RESULT_PAYLOAD_LEN {
+                            tracing::debug!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                len = payload.len(),
+                                cap = MAX_GAME_RESULT_PAYLOAD_LEN,
+                                "dropping oversize game-result payload",
+                            );
+                        } else {
+                            consensus::record_result(&decision_makers, &key, slot, payload.to_vec());
                         }
                     }
                     None => control_alive = false,

@@ -49,7 +49,9 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
-use rally_point_proto::control::{DepartureKind, DepartureNotice, DesyncNotice, TenantId};
+use rally_point_proto::control::{
+    DepartureKind, DepartureNotice, DesyncNotice, ResultNotice, TenantId,
+};
 use rally_point_proto::ids::{SessionId, SlotId};
 use serde::Serialize;
 
@@ -69,21 +71,30 @@ pub type DepartureDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 /// two genuinely separate divergences.
 pub type DesyncDedup = Arc<Mutex<HashSet<(TenantId, SessionId, u64)>>>;
 
-/// The two notice dedup sets a coordinator holds, bundled so the api layer
-/// threads one value rather than two through its control-connection handlers.
+/// Results already handled, keyed by `(tenant, session, slot)` — one report per
+/// slot, the sibling of [`DepartureDedup`] with the same key shape (a slot
+/// reports at most one result). Collapses the at-least-once redeliveries of one
+/// report to a single webhook.
+pub type ResultDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
+
+/// The notice dedup sets a coordinator holds, bundled so the api layer
+/// threads one value rather than several through its control-connection handlers.
 #[derive(Clone)]
 pub struct NoticeDedup {
     /// Departure dedup by `(tenant, session, slot)`.
     pub departures: DepartureDedup,
     /// Desync dedup by `(tenant, session, sync_ordinal)`.
     pub desyncs: DesyncDedup,
+    /// Result dedup by `(tenant, session, slot)`.
+    pub results: ResultDedup,
 }
 
-/// Creates an empty notice dedup set (departures + desyncs).
+/// Creates an empty notice dedup set (departures + desyncs + results).
 pub fn new_dedup() -> NoticeDedup {
     NoticeDedup {
         departures: Arc::new(Mutex::new(HashSet::new())),
         desyncs: Arc::new(Mutex::new(HashSet::new())),
+        results: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 
@@ -149,6 +160,30 @@ struct DesyncWebhook {
     detected_at_ms: u64,
     no_majority: bool,
     diverged: Vec<DivergedSlotWebhook>,
+}
+
+/// The JSON body POSTed to the tenant for a result report. Same camelCase
+/// convention and `event` discriminator as the other bodies. `payload` is the
+/// tenant's opaque result bytes as a standard-base64 string (the relay and
+/// coordinator never parse them). Optional fields (`externalId`, `externalRef`,
+/// `sessionFrame`, `slotFrame`) are omitted when absent, never `null`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResultWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ref: Option<String>,
+    payload: String,
+    arrival_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_frame: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_frame: Option<u32>,
 }
 
 /// Handles one relay's departure notice.
@@ -314,6 +349,80 @@ pub fn handle_desync(setup: &SessionSetup, dedup: &DesyncDedup, notice: DesyncNo
     };
 
     spawn_dispatch(setup, notice.tenant, config, &payload, "desync");
+}
+
+/// Handles one relay's result notice.
+///
+/// A sibling of [`handle_departure`]: first sight of a `(tenant, session, slot)`
+/// resolves the reporting slot's correlation ids and the tenant's notify config,
+/// base64-encodes the opaque payload, then spawns a signed webhook. A duplicate
+/// (an at-least-once redelivery, or a second relay that somehow saw the report),
+/// a tenant with no notify config, or a result with no `gameId` ref from any
+/// source are each a debug-logged drop — the notification is best-effort.
+///
+/// Correlation ids come notice-first, stored-session as fallback — the same rule
+/// as departures, so a coordinator restart that wiped the session store still
+/// delivers a correct webhook from the notice's self-stamped refs. The payload
+/// bytes are never parsed here; they are relayed straight through as base64.
+pub fn handle_result(setup: &SessionSetup, dedup: &ResultDedup, notice: ResultNotice) {
+    if !dedup
+        .lock()
+        .insert((notice.tenant.clone(), notice.session, notice.slot))
+    {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            slot = notice.slot.0,
+            "duplicate result notice; already handled",
+        );
+        return;
+    }
+
+    let Some(config) = tenant::notify_config(setup.tenants(), &notice.tenant) else {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            slot = notice.slot.0,
+            "no notify config for tenant; dropping result",
+        );
+        return;
+    };
+
+    let stored = session::session_refs(setup, &notice.tenant, notice.session);
+    let external_id = notice
+        .external_id
+        .clone()
+        .or_else(|| stored.as_ref().and_then(|refs| refs.external_id.clone()));
+    let external_ref = notice.external_ref.clone().or_else(|| {
+        stored
+            .as_ref()
+            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
+    });
+
+    let Some(external_id) = external_id else {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            slot = notice.slot.0,
+            "no gameId ref from the notice or a stored session; dropping result",
+        );
+        return;
+    };
+
+    let payload = ResultWebhook {
+        event: "result",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(external_id),
+        slot: notice.slot.0,
+        external_ref,
+        payload: BASE64_STANDARD.encode(&notice.payload),
+        arrival_ms: notice.arrival_ms,
+        session_frame: notice.session_frame,
+        slot_frame: notice.slot_frame,
+    };
+
+    spawn_dispatch(setup, notice.tenant, config, &payload, "result");
 }
 
 /// Serializes `payload` and spawns its webhook dispatch. The tenant store is
@@ -493,8 +602,8 @@ mod tests {
     use axum::routing::post;
     use base64::Engine as _;
     use rally_point_proto::control::{
-        BufferBounds, DepartureKind, DivergedSlot, PlayerHandoff, RelayHello, SessionRequest,
-        TenantId,
+        BufferBounds, DepartureKind, DivergedSlot, PlayerHandoff, RelayHello, ResultNotice,
+        SessionRequest, TenantId,
     };
     use rally_point_proto::ids::{RelayId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -1001,6 +1110,126 @@ mod tests {
         let mut notice = desync(session, 1, false);
         notice.external_id = None;
         handle_desync(&setup, &dedup.desyncs, notice);
+
+        assert!(
+            timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "no gameId from the notice or the stored session -> dropped",
+        );
+    }
+
+    // -- Result webhooks --
+
+    /// A result notice carrying its own gameId and player ref plus opaque bytes,
+    /// so a webhook delivers without depending on the coordinator's stored
+    /// session. `refs_from_notice` controls whether the correlation ids ride the
+    /// notice (self-describing) or are left to the stored-session fallback.
+    fn result(session: SessionId, slot: u8, refs_from_notice: bool) -> ResultNotice {
+        ResultNotice {
+            tenant: TenantId("sb-test".to_owned()),
+            session,
+            slot: SlotId(slot),
+            external_id: refs_from_notice.then(|| "game-result".to_owned()),
+            external_ref: refs_from_notice.then(|| "sb-user-result".to_owned()),
+            payload: vec![0x01, 0x02, 0x03, 0x04],
+            arrival_ms: 1_700_000_000_123,
+            session_frame: Some(4200),
+            slot_frame: Some(4242),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slot() {
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        // A tenant enrolled (for the signing key) but no session created this
+        // lifetime: the notice's self-stamped refs carry the webhook.
+        let reg = registry::new_registry();
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        // Two at-least-once redeliveries of the same slot's report webhook once.
+        handle_result(&setup, &dedup.results, result(SessionId(7), 1, true));
+        handle_result(&setup, &dedup.results, result(SessionId(7), 1, true));
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a result webhook is delivered")
+            .expect("the receiver got it");
+        assert_signed(&setup, "sb-test", &got);
+        assert_eq!(got.body["event"], "result");
+        assert_eq!(got.body["tenant"], "sb-test");
+        assert_eq!(got.body["session"], 7);
+        assert_eq!(got.body["externalId"], "game-result");
+        assert_eq!(got.body["slot"], 1);
+        assert_eq!(got.body["externalRef"], "sb-user-result");
+        // The opaque payload rides as standard base64 of the raw bytes.
+        assert_eq!(
+            got.body["payload"],
+            base64::engine::general_purpose::STANDARD.encode([0x01, 0x02, 0x03, 0x04]),
+        );
+        assert_eq!(got.body["arrivalMs"], 1_700_000_000_123u64);
+        assert_eq!(got.body["sessionFrame"], 4200);
+        assert_eq!(got.body["slotFrame"], 4242);
+
+        assert!(
+            timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a redelivery of the same (tenant, session, slot) webhooks once",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_with_no_notice_refs_falls_back_to_the_stored_session() {
+        // The notice carries no correlation ids of its own; the coordinator's
+        // stored session (from create_session) supplies both the gameId and the
+        // player ref — the refs-fallback path.
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        let (setup, session) = setup_with_session(Some("game-stored"), Some("sb-user-stored"));
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        handle_result(&setup, &dedup.results, result(session, 0, false));
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a result webhook is delivered from the stored session refs")
+            .unwrap();
+        assert_eq!(got.body["externalId"], "game-stored");
+        assert_eq!(got.body["externalRef"], "sb-user-stored");
+    }
+
+    #[tokio::test]
+    async fn a_result_with_no_gameid_from_any_source_is_a_silent_no_op() {
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        let (setup, session) = setup_with_session(None, None);
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        // Neither the notice nor the stored session has a gameId.
+        handle_result(&setup, &dedup.results, result(session, 0, false));
 
         assert!(
             timeout(Duration::from_millis(400), rx.recv())

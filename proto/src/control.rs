@@ -553,6 +553,14 @@ pub enum RelayToCoordinator {
     /// tenant "this game desynced at ordinal N; these slots diverged", which the
     /// tenant uses to void or re-adjudicate the result.
     Desync(DesyncNotice),
+    /// A client reported its end-of-game result: the relay received the opaque
+    /// bytes on its control stream, stamped their arrival against its own timeline,
+    /// and forwards them here without parsing. Only the reporting slot's home relay
+    /// sends it (results never cross the mesh), and the relay dedups one report per
+    /// slot; the coordinator dedups again by `(tenant, session, slot)` because
+    /// at-least-once delivery can re-send one. The coordinator relays the bytes to
+    /// the tenant as a webhook.
+    Result(ResultNotice),
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -676,6 +684,56 @@ pub struct DesyncNotice {
     /// [`DepartureNotice::external_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+}
+
+/// A relay's forward of a client's end-of-game result report, sent up the relay
+/// control connection ([`RelayToCoordinator::Result`]).
+///
+/// Like [`DepartureNotice`], it carries its own `tenant`/`session`/`slot` because
+/// one control connection serves many sessions. `payload` is the tenant's opaque
+/// serialized result, forwarded byte-for-byte — the relay never parses it, the
+/// same boundary that keeps `external_ref` an opaque correlation string. `slot`
+/// is the authenticated connection's slot the report arrived on, never a value
+/// from the bytes. It stamps its own correlation ids from the relay's stored
+/// [`SessionDescriptor`] so the notice is self-describing across a coordinator
+/// restart, exactly as the departure and desync notices do.
+///
+/// The frame stamps are the relay's own view of *when* the report landed in the
+/// game's timeline: `arrival_ms` is relay wall-clock at receipt, `session_frame`
+/// the session's consensus coordinate (the slowest slot's progress) then, and
+/// `slot_frame` the reporting slot's own newest observed frame. Each is `None`
+/// when the relay had no such value yet (a report before any framed turn).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session the result is for.
+    pub session: SessionId,
+    /// The slot that reported — the authenticated connection's slot, never a
+    /// value carried in the payload.
+    pub slot: SlotId,
+    /// The tenant's own id for the session, stamped by the relay from its stored
+    /// [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The tenant's own id for the reporting slot's player. Same source and
+    /// fallback as `external_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+    /// The tenant's opaque serialized result, forwarded byte-for-byte.
+    pub payload: Vec<u8>,
+    /// Relay wall-clock at receipt, unix epoch milliseconds. Records when the
+    /// relay observed the report, independent of when the webhook is delivered.
+    pub arrival_ms: u64,
+    /// The session's consensus coordinate (the slowest slot's observed frame)
+    /// when the report arrived. `None` before any slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_frame: Option<u32>,
+    /// The reporting slot's own newest observed frame when the report arrived.
+    /// `None` before that slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_frame: Option<u32>,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -1104,6 +1162,57 @@ mod tests {
         // into its `Unknown` catch-all rather than erroring, exactly as an older
         // coordinator build would. This is the "old peer sees a new frame" path.
         let json = r#"{"type":"departure","tenant":"sb-staging","session":42,"slot":2,"kind":"dropped","reason":1073741830,"leave_seq":1}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn result_roundtrips_json() {
+        let notice = ResultNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            slot: SlotId(1),
+            external_id: Some("game-99".to_owned()),
+            external_ref: Some("sb-user-7".to_owned()),
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            arrival_ms: 1_700_000_000_000,
+            session_frame: Some(4200),
+            slot_frame: Some(4242),
+        };
+        let message = RelayToCoordinator::Result(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        // The notice's fields ride alongside the tag (internally tagged).
+        assert!(json.contains("\"type\":\"result\""));
+        assert!(json.contains("\"arrival_ms\":1700000000000"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn result_without_optionals_decodes() {
+        // A notice from a relay that carried no correlation ids or frame stamps
+        // must still decode — the optional fields default, so the coordinator's
+        // own fallbacks apply rather than a decode error. The payload and
+        // arrival stamp are always present.
+        let json = r#"{"type":"result","tenant":"sb-staging","session":42,"slot":0,"payload":[1,2,3],"arrival_ms":7}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::Result(notice) = decoded else {
+            panic!("decodes to the Result variant");
+        };
+        assert!(notice.external_id.is_none());
+        assert!(notice.external_ref.is_none());
+        assert!(notice.session_frame.is_none());
+        assert!(notice.slot_frame.is_none());
+        assert_eq!(notice.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn result_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `Result` up-frame decoded by the
+        // down-direction `CoordinatorToRelay` (which has no such variant) folds
+        // into `Unknown` rather than erroring — the "old peer sees a new frame"
+        // path an older coordinator build would take.
+        let json = r#"{"type":"result","tenant":"sb-staging","session":42,"slot":0,"payload":[1,2,3],"arrival_ms":7}"#;
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }

@@ -16,7 +16,8 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, PlayerHandoff, RelayHello, RelayToCoordinator, SessionRequest, TenantId,
+    BufferBounds, PlayerHandoff, RelayHello, RelayToCoordinator, ResultNotice, SessionRequest,
+    TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -360,6 +361,47 @@ async fn a_non_hello_first_frame_is_rejected_promptly() {
     assert!(
         closed.is_ok(),
         "a non-Hello first frame must be rejected without waiting out the deadline",
+    );
+}
+
+#[tokio::test]
+async fn a_result_first_frame_is_a_protocol_violation() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A well-formed result frame sent before any enroll Hello is a protocol
+    // violation, exactly like a departure or desync would be: enrollment comes
+    // first. The coordinator must close promptly rather than wait out the (long)
+    // handshake deadline.
+    let (base_url, _reg) = serve_bare_coordinator(Duration::from_secs(30), LIVENESS).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let result = RelayToCoordinator::Result(ResultNotice {
+        tenant: TenantId(TENANT.to_owned()),
+        session: SessionId(1),
+        slot: SlotId(0),
+        external_id: None,
+        external_ref: None,
+        payload: vec![0x01, 0x02, 0x03],
+        arrival_ms: 1,
+        session_frame: None,
+        slot_frame: None,
+    });
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&result).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+    let closed = timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = socket.next().await {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a result frame before the enroll Hello must be rejected without waiting out the deadline",
     );
 }
 

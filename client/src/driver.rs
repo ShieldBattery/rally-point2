@@ -32,6 +32,14 @@
 //! `LeaveIntent` control frame and treats the relay's subsequent close of the link
 //! as a clean shutdown rather than a failure.
 //!
+//! The driver also forwards the game's end-of-game result report. The game hands
+//! it over as opaque bytes on [`TurnChannels::result`], and the driver sends it
+//! up the control stream at once — mid-game, over a live link — rather than
+//! waiting on any drain. When the game marks a result expected
+//! ([`TurnChannels::result_expected`]), a pending leave intent is held until the
+//! result has gone out first, so the result frame precedes the intent on the one
+//! ordered control stream; the leave-intent safety timeout still bounds the hold.
+//!
 //! Delivery to the game is **in seq order**. The link dedups and orders within a
 //! datagram but follows arrival order across datagrams, so the driver buffers
 //! received turns by transport seq and releases only the contiguous prefix — the
@@ -44,14 +52,16 @@
 //! draining, so the inbound buffer fills) or hands over an undeliverable turn.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{LeaveDirective, Payload};
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::control::{
-    ControlInbound, ControlSendError, send_control_leave_intent, send_control_turn,
-    spawn_control_reader,
+    ControlInbound, ControlSendError, send_control_game_result, send_control_leave_intent,
+    send_control_turn, spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
@@ -71,6 +81,11 @@ const LEAVE_CHANNEL_CAPACITY: usize = 16;
 /// departure at most once, so capacity 1 is enough; a second signal (there
 /// shouldn't be one) would simply wait for the driver to drain the first.
 const LEAVE_INTENT_CHANNEL_CAPACITY: usize = 1;
+
+/// Depth of the game → driver result channel. The game hands over its
+/// end-of-game report at most once, so capacity 1 is enough; the driver sends
+/// the first payload and drops any extra.
+const RESULT_CHANNEL_CAPACITY: usize = 1;
 
 /// How long the driver waits, after the game signals its departure, for the
 /// outbound queue and unacked window to drain before announcing the leave
@@ -141,6 +156,20 @@ pub struct TurnChannels {
     /// keeps running as if leave-intent didn't exist, and the relay falls back
     /// to its usual link-death detection.
     pub leave_intent: mpsc::Sender<()>,
+    /// The game's end-of-game result report, handed over as opaque serialized
+    /// bytes. The driver sends it up the reliable control stream the moment it
+    /// arrives — mid-game, ahead of any final-turn drain — because a defeat
+    /// report goes out over a still-live link, not after the game has wound
+    /// down. At most one is sent; a second payload is dropped, as is one handed
+    /// over after the leave intent has already gone out.
+    pub result: mpsc::Sender<Vec<u8>>,
+    /// Set by the game, synchronously from its game thread, when it will produce
+    /// a result report — before it can ever signal a leave intent. The driver
+    /// reads it to hold a pending leave intent until the result has been sent (or
+    /// the leave-intent safety timeout fires), so the result frame precedes the
+    /// intent frame on the wire. Left `false` when no result is expected, and the
+    /// intent is not held at all.
+    pub result_expected: Arc<AtomicBool>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -159,6 +188,12 @@ pub struct LinkDriver {
     leaves: mpsc::Sender<LeaveDirective>,
     /// The game thread's signal that it is departing intentionally.
     leave_intent: mpsc::Receiver<()>,
+    /// The game thread's end-of-game result report, to send up the control
+    /// stream as soon as it arrives.
+    result: mpsc::Receiver<Vec<u8>>,
+    /// Whether the game will produce a result report; holds a pending leave
+    /// intent until the result is sent so the result frame precedes it.
+    result_expected: Arc<AtomicBool>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -211,18 +246,25 @@ impl LinkDriver {
         let (leaves_tx, leaves_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
         // The game signals its own departure at most once.
         let (leave_intent_tx, leave_intent_rx) = mpsc::channel(LEAVE_INTENT_CHANNEL_CAPACITY);
+        // The game hands over its result report at most once.
+        let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let result_expected = Arc::new(AtomicBool::new(false));
         let driver = Self {
             link,
             outbound: outbound_rx,
             inbound: inbound_tx,
             leaves: leaves_tx,
             leave_intent: leave_intent_rx,
+            result: result_rx,
+            result_expected: Arc::clone(&result_expected),
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
             inbound: inbound_rx,
             leaves: leaves_rx,
             leave_intent: leave_intent_tx,
+            result: result_tx,
+            result_expected,
         };
         (driver, channels)
     }
@@ -230,12 +272,14 @@ impl LinkDriver {
     /// Runs the link until the game seam closes (a clean stop → `Ok`) or the link
     /// fails (→ [`DriverError`], the signal for the reconnect path to re-dial).
     ///
-    /// Multiplexes five things over one task: receiving the client's peers' turns
-    /// and handing them to the game, sending the turns the game produced, flushing
-    /// ack-only packets during outbound silence, driving the ack-beacon
-    /// side-channel that keeps the unacked window bounded under loss, and — once
-    /// the game signals its own departure — announcing that leave to the relay
-    /// after the first four have drained the outbound queue and unacked window.
+    /// Multiplexes over one task: receiving the client's peers' turns and handing
+    /// them to the game, sending the turns the game produced, flushing ack-only
+    /// packets during outbound silence, driving the ack-beacon side-channel that
+    /// keeps the unacked window bounded under loss, sending the game's
+    /// end-of-game result report the moment it arrives, and — once the game
+    /// signals its own departure — announcing that leave to the relay after the
+    /// outbound queue and unacked window have drained (and the result, if one was
+    /// expected, has been sent).
     /// The beacon is two uni-streams — one each direction — and its read half runs
     /// in a dedicated task so a partial stream read is never dropped mid-frame
     /// inside a `select!` branch (which would desync the framing and hand a
@@ -249,6 +293,8 @@ impl LinkDriver {
             inbound,
             leaves,
             mut leave_intent,
+            mut result,
+            result_expected,
         } = self;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -336,6 +382,17 @@ impl LinkDriver {
         // will never produce anything else.
         let mut leave_intent_alive = true;
 
+        // Whether the game's result report has been written to the control
+        // stream. Latched on the first send so a second payload is dropped, and
+        // read by `maybe_send_leave_intent` (with `result_expected`) to hold a
+        // pending intent until the result frame has preceded it on the wire.
+        let mut result_sent = false;
+        // Mirrors `leave_intent_alive`: the game hands over a result at most
+        // once, so this disarms on the channel's first resolution — the payload,
+        // or the sender dropping without one — rather than spinning on a closed
+        // channel.
+        let mut result_alive = true;
+
         loop {
             // Armed only once the game has signaled its departure
             // (`leave_deadline_at` is `Some`); the day-out fallback keeps the
@@ -394,6 +451,8 @@ impl LinkDriver {
                         &mut leave_intent_sent,
                         &outbound,
                         &link,
+                        &result_expected,
+                        result_sent,
                     )
                     .await?;
                 }
@@ -423,6 +482,13 @@ impl LinkDriver {
                         Some(ControlInbound::LeaveIntent) => {
                             tracing::warn!(
                                 "ignoring unexpected relay-sent leave-intent control frame"
+                            );
+                        }
+                        // Likewise a result report only ever travels client → relay;
+                        // a client never receives one back, so ignore a stray one.
+                        Some(ControlInbound::GameResult(_)) => {
+                            tracing::warn!(
+                                "ignoring unexpected relay-sent game-result control frame"
                             );
                         }
                         Some(ControlInbound::OversizeTurn(payload)) => {
@@ -510,6 +576,8 @@ impl LinkDriver {
                                 &mut leave_intent_sent,
                                 &outbound,
                                 &link,
+                                &result_expected,
+                                result_sent,
                             )
                             .await?;
                         }
@@ -540,6 +608,8 @@ impl LinkDriver {
                             &mut leave_intent_sent,
                             &outbound,
                             &link,
+                            &result_expected,
+                            result_sent,
                         )
                         .await?;
                     }
@@ -548,6 +618,63 @@ impl LinkDriver {
                     // the driver keeps running exactly as if leave-intent
                     // didn't exist, and the relay falls back to detecting the
                     // eventual link death itself.
+                }
+                // The game handed over its end-of-game result report. Send it up
+                // the control stream immediately — mid-game, over a fully live
+                // link — rather than waiting for any turn drain: a defeat report
+                // must go out while the link is still up. At most one is sent; a
+                // second payload, or one arriving after the leave intent already
+                // went out, is dropped. Disarmed on the channel's first
+                // resolution (the payload, or the sender dropping without one),
+                // like the leave-intent branch.
+                payload = result.recv(), if result_alive => {
+                    match payload {
+                        Some(payload) => {
+                            if result_sent {
+                                tracing::debug!(
+                                    "dropping extra game-result payload; one already sent"
+                                );
+                            } else if leave_intent_sent {
+                                tracing::debug!(
+                                    "dropping game-result payload arriving after leave intent"
+                                );
+                            } else {
+                                // A best-effort report: a failed send is not worth
+                                // tearing the driver down over — the link may still
+                                // be live for play (a mid-game defeat report leaves
+                                // the game running), and the relay reasons the
+                                // outcome from the departure that follows. Latch it
+                                // as sent regardless, so the leave-intent hold
+                                // releases and no retry piles up.
+                                if let Err(error) =
+                                    send_control_game_result(&mut control_send, payload.into())
+                                        .await
+                                {
+                                    tracing::debug!(
+                                        %error,
+                                        "game-result send failed; dropping the report"
+                                    );
+                                }
+                                result_sent = true;
+                                // Sending the result may have been the last thing
+                                // a pending leave intent was holding for.
+                                maybe_send_leave_intent(
+                                    &mut control_send,
+                                    &mut leave_deadline_at,
+                                    &mut leave_intent_sent,
+                                    &outbound,
+                                    &link,
+                                    &result_expected,
+                                    result_sent,
+                                )
+                                .await?;
+                            }
+                        }
+                        // The game dropped its result sender without ever handing
+                        // one over: nothing to send, and the leave-intent hold is
+                        // still bounded by the safety timeout.
+                        None => result_alive = false,
+                    }
                 }
                 // Safety timeout: the game signaled its departure but the
                 // outbound queue or unacked window hadn't drained within
@@ -589,6 +716,8 @@ impl LinkDriver {
                                 &mut leave_intent_sent,
                                 &outbound,
                                 &link,
+                                &result_expected,
+                                result_sent,
                             )
                             .await?;
                         }
@@ -634,15 +763,25 @@ impl LinkDriver {
 /// game has signaled (`leave_deadline_at` is `None`) or once the frame has
 /// already gone out (`leave_intent_sent`), so callers can invoke this
 /// unconditionally after anything that might have changed drain state.
+///
+/// When the game marked a result report expected (`result_expected`), the intent
+/// is additionally held until that report has been sent (`result_sent`), so the
+/// result frame precedes the intent on the single ordered control stream. The
+/// hold is bounded: the caller's [`LEAVE_INTENT_TIMEOUT`] path sends the intent
+/// regardless once it fires, since a missing or late result is harmless.
 async fn maybe_send_leave_intent(
     control_send: &mut quinn::SendStream,
     leave_deadline_at: &mut Option<Instant>,
     leave_intent_sent: &mut bool,
     outbound: &mpsc::Receiver<Payload>,
     link: &Link,
+    result_expected: &AtomicBool,
+    result_sent: bool,
 ) -> Result<(), ControlSendError> {
+    let awaiting_result = result_expected.load(Ordering::Relaxed) && !result_sent;
     if leave_deadline_at.is_some()
         && !*leave_intent_sent
+        && !awaiting_result
         && outbound.is_empty()
         && link.payloads_in_flight() == 0
     {
@@ -1501,6 +1640,106 @@ mod tests {
             .expect("driver stopped forwarding turns after its leave-intent sender was dropped")
             .unwrap();
         assert_eq!(received.fresh[0].commands[0], 0x33);
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_result_is_sent_immediately_over_a_live_link() {
+        // A result report goes out the moment the game hands it over — mid-game,
+        // with nothing draining and no leave signalled — not after any wind-down.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // Watch the control stream the way the relay does.
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        chan_a.result.send(vec![0x0A, 0x0B, 0x0C]).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("the result frame never arrived")
+            .expect("control reader ended early");
+        match frame {
+            ControlInbound::GameResult(payload) => {
+                assert_eq!(payload.as_ref(), &[0x0A, 0x0B, 0x0C])
+            }
+            other => panic!("expected a result frame, got {other:?}"),
+        }
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_result_is_written_before_the_leave_intent_when_both_are_signalled() {
+        // The ordering invariant: with a result expected, the game hands over the
+        // payload and signals its departure; the driver must write the result
+        // frame ahead of the leave-intent frame on the one ordered control stream,
+        // regardless of which channel it services first.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        // The game marks a result expected before it can signal a leave, hands
+        // over the payload, then signals its departure.
+        chan_a.result_expected.store(true, Ordering::Relaxed);
+        chan_a.result.send(vec![0xAA, 0xBB]).await.unwrap();
+        chan_a.leave_intent.send(()).await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("the result frame never arrived")
+            .expect("control reader ended early");
+        match first {
+            ControlInbound::GameResult(payload) => assert_eq!(payload.as_ref(), &[0xAA, 0xBB]),
+            other => panic!("expected the result frame first, got {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("the leave intent never arrived")
+            .expect("control reader ended early");
+        assert!(
+            matches!(second, ControlInbound::LeaveIntent),
+            "the leave intent must follow the result on the wire",
+        );
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn the_leave_intent_still_goes_out_after_the_timeout_when_no_result_arrives() {
+        // The game marked a result expected but never hands one over. The intent
+        // must not be held forever — the leave-intent safety timeout fires and it
+        // goes out anyway, since a missing or late result is harmless.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        chan_a.result_expected.store(true, Ordering::Relaxed);
+        let before = tokio::time::Instant::now();
+        chan_a.leave_intent.send(()).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("leave intent never arrived")
+            .expect("control reader ended early");
+        assert!(matches!(frame, ControlInbound::LeaveIntent));
+        assert!(
+            before.elapsed() >= LEAVE_INTENT_TIMEOUT,
+            "the intent went out before the result-hold timeout elapsed",
+        );
 
         drop(chan_a.outbound);
         drop(chan_a.inbound);

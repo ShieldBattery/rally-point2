@@ -407,8 +407,8 @@ async fn send_before_deadline(
 }
 
 /// Handles an inbound relay frame: any frame already counts as the liveness
-/// signal, and a [`RelayToCoordinator::Departure`] or
-/// [`RelayToCoordinator::Desync`] additionally drives its webhook path (dedup,
+/// signal, and a [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
+/// or [`RelayToCoordinator::Result`] additionally drives its webhook path (dedup,
 /// then a per-tenant webhook). A heartbeat is just liveness; anything undecodable
 /// is flagged.
 fn note_inbound(setup: &SessionSetup, notices: &NoticeDedup, relay_id: RelayId, message: &Message) {
@@ -424,6 +424,9 @@ fn note_inbound(setup: &SessionSetup, notices: &NoticeDedup, relay_id: RelayId, 
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
             notify::handle_desync(setup, &notices.desyncs, notice);
+        }
+        Ok(RelayToCoordinator::Result(notice)) => {
+            notify::handle_result(setup, &notices.results, notice);
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => {}
@@ -448,13 +451,14 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat, a departure, a desync, or any future up-frame
-                    // before the enroll Hello is a protocol violation: enrollment
-                    // comes first.
+                    // A heartbeat, a departure, a desync, a result, or any future
+                    // up-frame before the enroll Hello is a protocol violation:
+                    // enrollment comes first.
                     Ok(
                         RelayToCoordinator::Heartbeat
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)
+                        | RelayToCoordinator::Result(_)
                         | RelayToCoordinator::Unknown,
                     ) => {
                         tracing::warn!("first control frame was not a Hello; closing");

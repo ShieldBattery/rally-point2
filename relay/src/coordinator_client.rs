@@ -267,6 +267,7 @@ async fn send_notice(
     let frame = match notice {
         RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice.clone()),
         RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice.clone()),
+        RelayNotice::Result(notice) => RelayToCoordinator::Result(notice.clone()),
     };
     let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
     socket.send(Message::Text(text.into())).await?;
@@ -709,6 +710,7 @@ mod tests {
         let expected = match queued {
             RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice),
             RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice),
+            RelayNotice::Result(notice) => RelayToCoordinator::Result(notice),
         };
         assert_eq!(decoded, expected);
     }
