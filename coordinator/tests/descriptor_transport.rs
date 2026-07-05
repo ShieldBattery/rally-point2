@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
@@ -98,9 +99,11 @@ async fn serve_bare_coordinator(
 ) -> (String, RelayRegistry) {
     let reg = registry::new_registry();
     let setup = session::SessionSetup::new(reg.clone(), tenant::new_store());
+    let lifecycle = Lifecycle::new(setup.clone());
     let app = api::router(CoordinatorState {
         setup,
         notices: notify::new_dedup(),
+        lifecycle,
         control_auth: ControlAuth::Open,
         hello_timeout,
         liveness_timeout,
@@ -154,6 +157,9 @@ async fn coordinator_with_session(
                 },
             ],
             external_id: None,
+            // Home slot 1 on the secondary relay so both relays serve and mesh —
+            // the topology these transport tests exercise.
+            dev_relay_split: vec![SlotId(1)],
         },
         ExpiresAt(u64::MAX),
     )
@@ -161,6 +167,7 @@ async fn coordinator_with_session(
 
     // Keep a handle to the outbox before the setup moves into the router state.
     let outbox = setup.clone();
+    let lifecycle = Lifecycle::new(setup.clone());
     let control_auth = match bootstrap_secret {
         Some(secret) => ControlAuth::Secret(secret.to_owned()),
         None => ControlAuth::Open,
@@ -168,6 +175,7 @@ async fn coordinator_with_session(
     let app = api::router(CoordinatorState {
         setup,
         notices: notify::new_dedup(),
+        lifecycle,
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,

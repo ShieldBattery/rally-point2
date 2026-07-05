@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{BufferBounds, TenantId};
@@ -141,9 +142,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    let lifecycle = Lifecycle::new(setup.clone());
     let state = CoordinatorState {
         setup,
         notices: notify::new_dedup(),
+        lifecycle,
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,

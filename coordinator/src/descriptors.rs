@@ -38,12 +38,63 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{SessionDescriptor, TenantId};
-use rally_point_proto::ids::{RelayId, SessionId};
-use tokio::sync::watch;
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
+use tokio::sync::{mpsc, watch};
 
 /// One relay's current descriptor set, behind a `watch` so a connected relay's
 /// control task is woken to push it on every change.
 type RelayChannel = watch::Sender<Vec<SessionDescriptor>>;
+
+/// A coordinator-armed reap directive for one relay: close these slots' links so
+/// their normal link-death path runs. Carried down the relay's control connection
+/// as a [`CoordinatorToRelay::CloseSlot`](rally_point_proto::control::CoordinatorToRelay::CloseSlot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotClose {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session whose slots to close.
+    pub session: SessionId,
+    /// The slots to close (a slot a relay does not hold is a no-op there).
+    pub slots: Vec<SlotId>,
+}
+
+/// The per-relay outbox for reap directives — the one-shot sibling of
+/// [`RelayDescriptors`]. Descriptors are declarative latest-wins state (a
+/// `watch`); a reap is a discrete command, so it rides an unbounded mpsc per
+/// relay. A directive sent while the relay is disconnected is dropped (the reap
+/// is a best-effort nudge, and a disconnected relay's slots are already dying),
+/// which is why there is no re-sync buffering here.
+#[derive(Clone, Default)]
+pub struct RelayReaps {
+    /// The reap channel sender for each relay, replaced on each (re)subscribe so a
+    /// reconnecting relay's control task owns the live receiver.
+    senders: Arc<Mutex<HashMap<RelayId, mpsc::UnboundedSender<SlotClose>>>>,
+}
+
+impl RelayReaps {
+    /// Creates an empty reap outbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Subscribes `relay_id`'s control connection to its reap directives, creating
+    /// a fresh channel (replacing any prior sender, so a reconnect owns the live
+    /// receiver). Returns the receiver the control task drains.
+    pub fn subscribe(&self, relay_id: RelayId) -> mpsc::UnboundedReceiver<SlotClose> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.senders.lock().insert(relay_id, tx);
+        rx
+    }
+
+    /// Sends a reap directive to `relay_id`, if it currently holds a live control
+    /// connection. A no-op for a relay that never subscribed or has disconnected
+    /// (the send fails silently), matching the best-effort posture above.
+    pub fn send(&self, relay_id: RelayId, close: SlotClose) {
+        if let Some(tx) = self.senders.lock().get(&relay_id) {
+            let _ = tx.send(close);
+        }
+    }
+}
 
 /// The coordinator's per-relay descriptor outbox.
 #[derive(Clone, Default)]

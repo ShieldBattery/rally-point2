@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
     LeaveDirective, LinkConditions, MeshControlFrame, Payload, SlotConditions, SlotDeparted,
@@ -449,12 +450,20 @@ pub(crate) fn fan_out_slot_departed(
     slot: SlotId,
     last_frame: Option<u32>,
     reachable_frame: Option<u32>,
+    result: Option<ResultEcho>,
     reason: u32,
 ) {
     fan_out_control(
         links,
         key,
-        slot_departed_frame(key.session, slot, last_frame, reachable_frame, reason),
+        slot_departed_frame(
+            key.session,
+            slot,
+            last_frame,
+            reachable_frame,
+            result,
+            reason,
+        ),
     );
 }
 
@@ -484,13 +493,29 @@ pub(crate) fn broadcast_leaves(
 }
 
 /// Builds a `SlotDeparted` mesh control frame for `session`.
+///
+/// `result` is the departing slot's home-authored end-of-game result echo, if it
+/// reported one before departing: its fields ride the frame so every peer folds
+/// the identical result into its departure record (an empty payload — no result —
+/// leaves the echo fields at their defaults, which peers read as "no result").
 fn slot_departed_frame(
     session: SessionId,
     slot: SlotId,
     last_frame: Option<u32>,
     reachable_frame: Option<u32>,
+    result: Option<ResultEcho>,
     reason: u32,
 ) -> MeshControlFrame {
+    let (result_payload, result_arrival_ms, result_session_frame, result_slot_frame) = match result
+    {
+        Some(echo) => (
+            echo.payload.into(),
+            echo.arrival_ms,
+            echo.session_frame,
+            echo.slot_frame,
+        ),
+        None => (Vec::new().into(), 0, None, None),
+    };
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
@@ -498,6 +523,10 @@ fn slot_departed_frame(
             last_frame,
             reachable_frame,
             reason,
+            result_payload,
+            result_arrival_ms,
+            result_session_frame,
+            result_slot_frame,
         })),
     }
 }
@@ -1240,7 +1269,16 @@ fn dispatch_mesh_control(
             // The departure record max-merges the carried last frame with this
             // relay's own observation of the slot, so the fuller view drives the
             // apply frame — and recording retires the slot's live state, letting
-            // the session frame follow the survivors.
+            // the session frame follow the survivors. A non-empty result payload
+            // means the home relay embedded the slot's end-of-game result; fold it
+            // into the record (first non-`None` wins) so this relay's own
+            // departure notice can carry it too.
+            let result = (!departed.result_payload.is_empty()).then(|| ResultEcho {
+                payload: departed.result_payload.to_vec(),
+                arrival_ms: departed.result_arrival_ms,
+                session_frame: departed.result_session_frame,
+                slot_frame: departed.result_slot_frame,
+            });
             crate::consensus::record_departure(
                 decision_makers,
                 &key,
@@ -1249,6 +1287,7 @@ fn dispatch_mesh_control(
                     .last_frame
                     .map(rally_point_proto::ids::GameFrameCount),
                 departed.reachable_frame,
+                result,
                 departed.reason,
             );
             // Only the authority turns a departure into the one synced leave;
@@ -1331,12 +1370,13 @@ fn reconcile_leaves_on_join(
     let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
     // Unbounded send only fails on a closed channel; the driver we are
     // registering into is alive here, so these always enqueue.
-    for (slot, last_frame, reachable_frame, reason) in departures {
+    for (slot, last_frame, reachable_frame, result, reason) in departures {
         let _ = control_tx.send(slot_departed_frame(
             key.session,
             slot,
             last_frame.map(|f| f.0),
             reachable_frame,
+            result,
             reason,
         ));
     }
@@ -1635,7 +1675,7 @@ mod tests {
         let (_fwd1, mut ctl1) = register_link_channels(&links, &key);
         let (_fwd2, mut ctl2) = register_link_channels(&links, &key);
 
-        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), 3);
+        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), None, 3);
         for rx in [&mut ctl1, &mut ctl2] {
             let frame = rx.try_recv().expect("every link is told");
             assert_eq!(
@@ -1695,6 +1735,7 @@ mod tests {
             &key,
             SlotId(2),
             Some(GameFrameCount(60)),
+            None,
             None,
             0x4000_0006,
         );

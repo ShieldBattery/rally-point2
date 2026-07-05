@@ -51,9 +51,11 @@ use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
     SessionResponse, TenantId,
 };
-use rally_point_proto::ids::RelayId;
-use serde::Serialize;
+use rally_point_proto::ids::{RelayId, SessionId};
+use serde::{Deserialize, Serialize};
 
+use crate::descriptors::SlotClose;
+use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
 use crate::registry;
 use crate::session::{self, SessionSetup};
@@ -130,6 +132,10 @@ pub struct CoordinatorState {
     /// one event collapse to a single webhook. Shared across all relay control
     /// connections.
     pub notices: NoticeDedup,
+    /// Per-session lifecycle: ordered webhook dispatch, the `sessionClosed`
+    /// signal, and the reap policies. Shared across all relay control connections
+    /// and the session-create + liveness endpoints.
+    pub lifecycle: Lifecycle,
     /// How a relay authenticates to open its control connection.
     pub control_auth: ControlAuth,
     /// How long a connection has to send its enroll `Hello` before it is dropped
@@ -145,6 +151,7 @@ pub struct CoordinatorState {
 pub fn router(state: CoordinatorState) -> Router {
     Router::new()
         .route("/session/create", post(create_session))
+        .route("/sessions/alive", post(sessions_alive))
         .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
         .route("/relay/control", get(relay_control))
         .with_state(state)
@@ -158,6 +165,22 @@ async fn create_session(
     State(state): State<CoordinatorState>,
     Json(request): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, StatusCode> {
+    // Capture the tenant and the player/observer slot split before the request is
+    // consumed, to register the session's lifecycle accounting after setup.
+    let tenant = request.tenant.clone();
+    let player_slots: std::collections::HashSet<_> = request
+        .players
+        .iter()
+        .filter(|p| !p.observer)
+        .map(|p| p.slot)
+        .collect();
+    let observer_slots: std::collections::HashSet<_> = request
+        .players
+        .iter()
+        .filter(|p| p.observer)
+        .map(|p| p.slot)
+        .collect();
+
     let resp = session::create_session(
         &state.setup,
         request,
@@ -166,15 +189,23 @@ async fn create_session(
     .map_err(|e| {
         tracing::warn!(error = %e, "session setup failed");
         match e {
-            registry::SessionSetupError::NoRelaysAvailable
-            | registry::SessionSetupError::NotEnoughRelays { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
             registry::SessionSetupError::TenantNotFound(_)
             | registry::SessionSetupError::SlotOutOfRange(_)
             | registry::SessionSetupError::NoPlayers => StatusCode::BAD_REQUEST,
         }
     })?;
+
+    // Arm the session's lifecycle: its serving relay set (the distinct home
+    // relays of its slots) and its player/observer slots drive `sessionClosed`
+    // and the reap policies.
+    state.lifecycle.register_session(
+        tenant.clone(),
+        resp.session,
+        state.setup.serving_relays(&tenant, resp.session),
+        player_slots,
+        observer_slots,
+    );
 
     tracing::info!(
         session = %resp.session,
@@ -183,6 +214,54 @@ async fn create_session(
         "session created"
     );
     Ok(Json(resp))
+}
+
+/// The most session ids one liveness probe may ask about, so a caller cannot make
+/// the coordinator scan an unbounded list. The probe set in steady state is only
+/// the unreconciled v2 games that missed both push paths — near zero — so a few
+/// hundred is ample headroom.
+const MAX_LIVENESS_SESSIONS: usize = 512;
+
+/// Request body for `POST /sessions/alive`: a tenant and the session ids to probe.
+#[derive(Debug, Deserialize)]
+struct SessionsAliveRequest {
+    tenant: TenantId,
+    sessions: Vec<u64>,
+}
+
+/// Response body for `POST /sessions/alive`: the subset of the probed ids the
+/// coordinator still holds live state for. Unknown, closed, and never-created ids
+/// are simply omitted — the caller force-reconciles those.
+#[derive(Debug, Serialize)]
+struct SessionsAliveResponse {
+    alive: Vec<u64>,
+}
+
+/// Batch liveness probe: which of the given sessions the coordinator still holds
+/// live state for (created this lifetime, serving set not fully closed). The 15-
+/// minute sweep asks this for its unreconciled v2 games and force-reconciles the
+/// omitted (gone/unknown) ones — the backstop against coordinator death, in place
+/// of a blind per-session timer.
+///
+/// Same open auth posture as `POST /session/create`: an app-server credential, not
+/// the relay bootstrap secret. Rejects an over-cap list rather than scan it.
+async fn sessions_alive(
+    State(state): State<CoordinatorState>,
+    Json(request): Json<SessionsAliveRequest>,
+) -> Result<Json<SessionsAliveResponse>, StatusCode> {
+    if request.sessions.len() > MAX_LIVENESS_SESSIONS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let alive = request
+        .sessions
+        .into_iter()
+        .filter(|&session| {
+            state
+                .lifecycle
+                .is_alive(&request.tenant, SessionId(session))
+        })
+        .collect();
+    Ok(Json(SessionsAliveResponse { alive }))
 }
 
 /// Response body for `GET /tenant/:tenant/pubkey`.
@@ -244,10 +323,18 @@ async fn relay_control(
     }
     let setup = state.setup.clone();
     let notices = state.notices.clone();
+    let lifecycle = state.lifecycle.clone();
     let hello_timeout = state.hello_timeout;
     let liveness_timeout = state.liveness_timeout;
     ws.on_upgrade(move |socket| {
-        serve_relay_control(socket, setup, notices, hello_timeout, liveness_timeout)
+        serve_relay_control(
+            socket,
+            setup,
+            notices,
+            lifecycle,
+            hello_timeout,
+            liveness_timeout,
+        )
     })
 }
 
@@ -271,6 +358,7 @@ async fn serve_relay_control(
     mut socket: WebSocket,
     setup: SessionSetup,
     notices: NoticeDedup,
+    lifecycle: Lifecycle,
     hello_timeout: Duration,
     liveness_timeout: Duration,
 ) {
@@ -293,7 +381,15 @@ async fn serve_relay_control(
         "relay enrolled over control connection"
     );
 
-    push_and_watch(&mut socket, &setup, &notices, relay_id, liveness_timeout).await;
+    push_and_watch(
+        &mut socket,
+        &setup,
+        &notices,
+        &lifecycle,
+        relay_id,
+        liveness_timeout,
+    )
+    .await;
 
     if registry::remove_if_current(registry, relay_id, generation) {
         tracing::info!(
@@ -321,10 +417,15 @@ async fn push_and_watch(
     socket: &mut WebSocket,
     setup: &SessionSetup,
     notices: &NoticeDedup,
+    lifecycle: &Lifecycle,
     relay_id: RelayId,
     liveness_timeout: Duration,
 ) {
     let mut rx = setup.descriptors().subscribe(relay_id);
+    // The reap outbox for this relay: the reap policies push `CloseSlot`
+    // directives here, and this loop forwards each down the connection. A fresh
+    // subscribe replaces any prior sender, so a reconnect owns the live receiver.
+    let mut reaps = setup.reaps().subscribe(relay_id);
 
     // A relay silent past this deadline — or one whose send stalls past it — is
     // treated as dead. Every inbound frame pushes it forward; a heartbeat lands
@@ -350,11 +451,20 @@ async fn push_and_watch(
                     break;
                 }
             }
+            close = reaps.recv() => {
+                // The reap outbox never closes on its own (the sender lives in the
+                // shared outbox), so `None` here would only mean a replaced
+                // subscription — treat it as end-of-stream and stop selecting.
+                let Some(close) = close else { break };
+                if !send_reap_before_deadline(socket, close, relay_id, deadline).await {
+                    break;
+                }
+            }
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        note_inbound(setup, notices, relay_id, &message);
+                        note_inbound(setup, notices, lifecycle, relay_id, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                     }
@@ -371,6 +481,41 @@ async fn push_and_watch(
                 );
                 break;
             }
+        }
+    }
+}
+
+/// Sends a `CloseSlot` reap directive down the connection, racing the same
+/// liveness deadline as a descriptor push. Returns whether the connection should
+/// keep running.
+async fn send_reap_before_deadline(
+    socket: &mut WebSocket,
+    close: SlotClose,
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let message = CoordinatorToRelay::CloseSlot {
+        tenant: close.tenant,
+        session: close.session,
+        slots: close.slots,
+    };
+    let json = serde_json::to_string(&message).expect("a close-slot frame always serializes");
+    tokio::select! {
+        result = socket.send(Message::Text(json.into())) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "close-slot push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "close-slot push stalled past the liveness deadline; dropping",
+            );
+            false
         }
     }
 }
@@ -408,10 +553,23 @@ async fn send_before_deadline(
 
 /// Handles an inbound relay frame: any frame already counts as the liveness
 /// signal, and a [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
-/// or [`RelayToCoordinator::Result`] additionally drives its webhook path (dedup,
-/// then a per-tenant webhook). A heartbeat is just liveness; anything undecodable
-/// is flagged.
-fn note_inbound(setup: &SessionSetup, notices: &NoticeDedup, relay_id: RelayId, message: &Message) {
+/// [`RelayToCoordinator::Result`], or [`RelayToCoordinator::SessionClosed`]
+/// additionally drives its webhook and lifecycle paths. A heartbeat is just
+/// liveness; anything undecodable is flagged.
+///
+/// The lifecycle accounting (result/departure account a slot; `SessionClosed`
+/// closes a serving relay) is fed *before* the webhook path and independent of the
+/// dedup and notify-config gates the webhook path applies — the reap and the
+/// `sessionClosed` signal must track a session even for a tenant with no webhook
+/// configured. Redundant notices from multiple relays are idempotent in the
+/// accounting (a set insert), so feeding every copy is harmless.
+fn note_inbound(
+    setup: &SessionSetup,
+    notices: &NoticeDedup,
+    lifecycle: &Lifecycle,
+    relay_id: RelayId,
+    message: &Message,
+) {
     let Message::Text(text) = message else {
         return; // a ping/pong/binary frame: a liveness signal with nothing to read
     };
@@ -420,13 +578,18 @@ fn note_inbound(setup: &SessionSetup, notices: &NoticeDedup, relay_id: RelayId, 
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
-            notify::handle_departure(setup, &notices.departures, notice);
+            lifecycle.on_departure(notice.tenant.clone(), notice.session, notice.slot);
+            notify::handle_departure(setup, &notices.departures, lifecycle, notice);
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
-            notify::handle_desync(setup, &notices.desyncs, notice);
+            notify::handle_desync(setup, &notices.desyncs, lifecycle, notice);
         }
         Ok(RelayToCoordinator::Result(notice)) => {
-            notify::handle_result(setup, &notices.results, notice);
+            lifecycle.on_result(notice.tenant.clone(), notice.session, notice.slot);
+            notify::handle_result(setup, &notices.results, lifecycle, notice);
+        }
+        Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
+            lifecycle.on_session_closed(tenant, session, relay_id);
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => {}
@@ -459,6 +622,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)
+                        | RelayToCoordinator::SessionClosed { .. }
                         | RelayToCoordinator::Unknown,
                     ) => {
                         tracing::warn!("first control frame was not a Hello; closing");
@@ -568,9 +732,11 @@ mod tests {
         )
         .unwrap();
         let setup = crate::session::SessionSetup::new(reg, tenants);
+        let lifecycle = Lifecycle::new(setup.clone());
         CoordinatorState {
             setup,
             notices: notify::new_dedup(),
+            lifecycle,
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -603,6 +769,7 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let resp = app
             .oneshot(
@@ -686,13 +853,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_alive_reports_live_and_omits_gone_or_unknown_and_caps() {
+        let state = state_with_relay_and_tenant();
+        // A live session registered directly on the shared lifecycle.
+        state.lifecycle.register_session(
+            TenantId("sb-test".to_owned()),
+            SessionId(5),
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            std::collections::HashSet::new(),
+        );
+        let app = router(state);
+
+        // Probe a live id (5), an unknown id (6): only the live one is returned.
+        let req_body = serde_json::json!({ "tenant": "sb-test", "sessions": [5, 6] });
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/alive")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&req_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["alive"].as_array().unwrap(),
+            &vec![serde_json::json!(5)],
+            "only the live session id is returned; gone/unknown are omitted",
+        );
+
+        // An over-cap probe list is rejected rather than scanned.
+        let too_many: Vec<u64> = (0..=(MAX_LIVENESS_SESSIONS as u64)).collect();
+        let big_body = serde_json::json!({ "tenant": "sb-test", "sessions": too_many });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions/alive")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&big_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn create_session_no_relays_returns_503() {
+        let setup =
+            crate::session::SessionSetup::new(registry::new_registry(), crate::tenant::new_store());
+        let lifecycle = Lifecycle::new(setup.clone());
         let state = CoordinatorState {
-            setup: crate::session::SessionSetup::new(
-                registry::new_registry(),
-                crate::tenant::new_store(),
-            ),
+            setup,
             notices: notify::new_dedup(),
+            lifecycle,
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -703,6 +930,7 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let resp = app
             .oneshot(
@@ -728,6 +956,7 @@ mod tests {
             tenant: TenantId("not-enrolled".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let resp = app
             .oneshot(
@@ -756,9 +985,11 @@ mod tests {
         )
         .unwrap();
         let setup = crate::session::SessionSetup::new(reg, tenants);
+        let lifecycle = Lifecycle::new(setup.clone());
         let state = CoordinatorState {
             setup,
             notices: notify::new_dedup(),
+            lifecycle,
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,

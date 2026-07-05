@@ -5,7 +5,7 @@
 //!
 //! - **coordinator ⇄ relay** — authenticated phone-home registry, session
 //!   descriptors, and consensus *policy* (bounds/rates).
-//! - **coordinator ⇄ app server** — session requests, token + home/backup relay
+//! - **coordinator ⇄ app server** — session requests, token + home relay
 //!   handoff, per-tenant quotas.
 //!
 //! Consensus *decisions* are deliberately **not** here: the relay/mesh executes
@@ -327,8 +327,8 @@ pub struct PlayerHandoff {
 /// many players, and each player's client pubkey.
 ///
 /// The app server has already formed the lobby (matchmaking stays in the app
-/// server, not the coordinator). The coordinator assigns home + backup relays,
-/// mints one connection-bound token per player, and returns a
+/// server, not the coordinator). The coordinator assigns each player a home
+/// relay, mints one connection-bound token per player, and returns a
 /// [`SessionResponse`] the app uses to hand each player `{token, relay_addr}`
 /// at game launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +345,14 @@ pub struct SessionRequest {
     /// interops; the control protos don't `deny_unknown_fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// Dev/testing only: slots that should home on a *secondary* relay instead of
+    /// the session's primary home, to force a genuine cross-relay (meshed) session
+    /// without a real network split between players. The coordinator honors it only
+    /// when a second relay is enrolled; otherwise the split collapses to the single
+    /// available home. Empty on every production request. Optional so a peer that
+    /// predates the field still interops.
+    #[serde(default)]
+    pub dev_relay_split: Vec<SlotId>,
 }
 
 /// One player's completed handoff: the token the coordinator minted and the
@@ -365,23 +373,45 @@ pub struct PlayerToken {
     pub token: Vec<u8>,
 }
 
+/// A per-slot home-relay override in a [`SessionResponse`]: a slot that homes on
+/// a relay other than the session's primary [`SessionResponse::home_relay`].
+///
+/// Only a dev-forced cross-relay split ([`SessionRequest::dev_relay_split`])
+/// produces these; a production session has none, so every slot homes on the
+/// primary. Multi-relay redundancy is per-player home relays plus the mesh: a
+/// relay named here always homes at least one slot, so it is never assigned to a
+/// session it serves no player in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotHome {
+    /// The slot this override applies to.
+    pub slot: SlotId,
+    /// The relay this slot homes on, with the cert the client pins to reach it.
+    pub relay: RelayEndpoint,
+}
+
 /// The coordinator's response to a session request: the session id, the
 /// relay topology, the per-player tokens, and the consensus policy bounds.
 ///
-/// The relay topology drives the mesh edge: each relay in the session
-/// receives a [`SessionDescriptor`] naming its peers, and the lower-id side
-/// of each pair dials. The home relay is the one clients connect to; the
-/// backup is the failover target (the failover mechanism is still open).
-/// The policy bounds are pushed to each relay's decision-maker.
+/// The home relay is the one clients connect to. A session is single-relay by
+/// default (every slot homes on `home_relay`); `slot_homes` overrides the home
+/// for individual slots, the dev-forced cross-relay split. Multi-relay
+/// redundancy is per-player home relays plus the mesh: a relay that serves a
+/// session always homes at least one of its slots. The relay topology drives the
+/// mesh edge — each serving relay receives a [`SessionDescriptor`] naming its
+/// peers, and the lower-id side of each pair dials. The policy bounds are pushed
+/// to each relay's decision-maker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResponse {
     /// The coordinator-assigned session id (unique within the tenant).
     pub session: SessionId,
-    /// The relay clients connect to, including the cert they pin.
+    /// The relay clients connect to, including the cert they pin. Every slot
+    /// homes here except those overridden in `slot_homes`.
     pub home_relay: RelayEndpoint,
-    /// The backup relay for failover (may equal `home_relay` if only one
-    /// relay is available — degraded single-relay operation).
-    pub backup_relay: RelayEndpoint,
+    /// Per-slot home overrides: slots that home on a relay other than
+    /// `home_relay`. Empty on a production session; populated only for a
+    /// dev-forced cross-relay split ([`SessionRequest::dev_relay_split`]).
+    #[serde(default)]
+    pub slot_homes: Vec<SlotHome>,
     /// One token per player, matching the slots in the request.
     pub tokens: Vec<PlayerToken>,
     /// The latency-buffer bounds the relay's decision-maker clamps to.
@@ -499,6 +529,21 @@ pub enum CoordinatorToRelay {
         /// The descriptors, one per session this relay currently serves.
         descriptors: Vec<SessionDescriptor>,
     },
+    /// A reap directive: close the named slots' links so their normal link-death
+    /// path (a synced leave, a departure notice) runs. The coordinator arms this
+    /// when a session's accounting stalls — a holdout slot silent on a live link,
+    /// or reported-but-still-linked stragglers after everyone is accounted. A
+    /// relay fires each named slot's own shutdown signal; a slot it does not
+    /// currently home or hold is a no-op, so the coordinator can name every slot
+    /// without tracking which relay holds which.
+    CloseSlot {
+        /// The tenant the session belongs to.
+        tenant: TenantId,
+        /// The session whose slots to close.
+        session: SessionId,
+        /// The slots to close. A slot this relay does not hold is ignored.
+        slots: Vec<SlotId>,
+    },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -561,6 +606,20 @@ pub enum RelayToCoordinator {
     /// at-least-once delivery can re-send one. The coordinator relays the bytes to
     /// the tenant as a webhook.
     Result(ResultNotice),
+    /// The relay tore down its last local state for a session — every slot it
+    /// homed or held is gone. The coordinator, which assigned the session's
+    /// serving relay set, waits for every serving relay to report this and then
+    /// emits the final `sessionClosed` webhook. Because a relay fires it only
+    /// after its own departures went up the same ordered channel, and the
+    /// coordinator's per-session dispatch drains in order, a delivered
+    /// `sessionClosed` guarantees no earlier notice for the session is still in
+    /// flight.
+    SessionClosed {
+        /// The tenant the session belongs to.
+        tenant: TenantId,
+        /// The session this relay closed.
+        session: SessionId,
+    },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -577,6 +636,33 @@ pub enum DepartureKind {
     Left,
     /// An unclean drop — the player's link died (native `strPLAYER_WAS_DROPPED`).
     Dropped,
+}
+
+/// The end-of-game result a departing slot reported before it left, echoed into
+/// a [`DepartureNotice`] so a departure webhook is atomic terminal truth: the
+/// player left/dropped, and here is the result — or there provably never was one
+/// (`None`). The relay's home for the departing slot authors it from the result
+/// it retained; the standalone [`ResultNotice`] still fires early at dialog time,
+/// so this embedded copy is a redundant delivery, not the only one.
+///
+/// The stamps mirror [`ResultNotice`]'s: `arrival_ms` is relay wall-clock at
+/// receipt, `session_frame` the session's consensus coordinate then, `slot_frame`
+/// the reporting slot's own newest frame. `payload` is the tenant's opaque bytes,
+/// forwarded byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultEcho {
+    /// The tenant's opaque serialized result, forwarded byte-for-byte.
+    pub payload: Vec<u8>,
+    /// Relay wall-clock at receipt, unix epoch milliseconds.
+    pub arrival_ms: u64,
+    /// The session's consensus frame when the report arrived. `None` before any
+    /// slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_frame: Option<u32>,
+    /// The reporting slot's own newest observed frame when the report arrived.
+    /// `None` before that slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_frame: Option<u32>,
 }
 
 /// A relay's report that a player permanently departed a running game, sent up
@@ -617,6 +703,15 @@ pub struct DepartureNotice {
     /// fallback as `external_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
+    /// The result this slot reported before departing, if any — embedded so the
+    /// departure webhook carries terminal truth in one delivery. `None` when the
+    /// slot departed without ever reporting; a result can never arrive after the
+    /// departure (reports ride only the live link, which the departure closes),
+    /// so an embedded result is final. The standalone [`ResultNotice`] still
+    /// fires separately, so this is a redundant copy. Optional so a relay that
+    /// predates the field still interops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultEcho>,
 }
 
 /// One slot the relay's desync comparator found on the losing side of a checksum
@@ -828,6 +923,29 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_to_relay_close_slot_roundtrips_json() {
+        let message = CoordinatorToRelay::CloseSlot {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            slots: vec![SlotId(1), SlotId(3)],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"close_slot\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn close_slot_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `CloseSlot` down-frame decoded by the
+        // up-direction `RelayToCoordinator` (which has no such variant) folds
+        // into `Unknown` rather than erroring — an older relay build's path.
+        let json = r#"{"type":"close_slot","tenant":"sb-staging","session":42,"slots":[1]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
     fn relay_to_coordinator_hello_roundtrips_json() {
         let message = RelayToCoordinator::Hello(RelayHello::new(
             RelayId(3),
@@ -860,6 +978,28 @@ mod tests {
         let json = r#"{"type":"future_up_frame","x":1}"#;
         let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
+    fn relay_to_coordinator_session_closed_roundtrips_json() {
+        let message = RelayToCoordinator::SessionClosed {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"session_closed\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn session_closed_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `SessionClosed` up-frame decoded by the
+        // down-direction `CoordinatorToRelay` (which has no such variant) folds
+        // into `Unknown` rather than erroring — an older coordinator's path.
+        let json = r#"{"type":"session_closed","tenant":"sb-staging","session":42}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }
 
     #[test]
@@ -948,11 +1088,14 @@ mod tests {
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
                 cert_der: vec![0x30, 0x82, 0x01, 0x02],
             },
-            backup_relay: RelayEndpoint {
-                relay_id: RelayId(2),
-                relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
-                cert_der: vec![0x30, 0x82, 0x03, 0x04],
-            },
+            slot_homes: vec![SlotHome {
+                slot: SlotId(1),
+                relay: RelayEndpoint {
+                    relay_id: RelayId(2),
+                    relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                    cert_der: vec![0x30, 0x82, 0x03, 0x04],
+                },
+            }],
             tokens: vec![PlayerToken {
                 slot: SlotId(0),
                 token: vec![0xAB, 0xCD],
@@ -962,6 +1105,21 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: SessionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn session_response_without_slot_homes_decodes_to_empty() {
+        // A production session (and a response from a coordinator that predates the
+        // field) carries no slot homes: the field defaults to empty rather than
+        // failing to decode, so every slot homes on `home_relay`.
+        let json = r#"{
+            "session":1,
+            "home_relay":{"relay_id":1,"relay_addr":"127.0.0.1:14900","cert_der":[48,130,1,2]},
+            "tokens":[{"slot":0,"token":[171,205]}],
+            "bounds":{"min":1,"max":6}
+        }"#;
+        let back: SessionResponse = serde_json::from_str(json).unwrap();
+        assert!(back.slot_homes.is_empty());
     }
 
     #[test]
@@ -996,6 +1154,10 @@ mod tests {
             !back.players[0].observer,
             "a player handoff without the observer field decodes to a competitor",
         );
+        assert!(
+            back.dev_relay_split.is_empty(),
+            "a request without the dev split field decodes to no split",
+        );
     }
 
     #[test]
@@ -1011,6 +1173,7 @@ mod tests {
                 observer: false,
             }],
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("external_id"));
@@ -1032,6 +1195,12 @@ mod tests {
             leave_seq: 1,
             external_id: Some("game-99".to_owned()),
             external_ref: Some("sb-user-7".to_owned()),
+            result: Some(ResultEcho {
+                payload: vec![0xDE, 0xAD],
+                arrival_ms: 1_700_000_000_000,
+                session_frame: Some(4200),
+                slot_frame: Some(4242),
+            }),
         };
         let message = RelayToCoordinator::Departure(notice.clone());
         let json = serde_json::to_string(&message).unwrap();
@@ -1039,6 +1208,8 @@ mod tests {
         // the kind serializes snake_case.
         assert!(json.contains("\"type\":\"departure\""));
         assert!(json.contains("\"kind\":\"dropped\""));
+        // The embedded result rides along.
+        assert!(json.contains("\"result\""));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
     }
@@ -1056,6 +1227,10 @@ mod tests {
         };
         assert!(notice.external_id.is_none());
         assert!(notice.external_ref.is_none());
+        assert!(
+            notice.result.is_none(),
+            "a departure from a relay that predates the embedded result decodes to None",
+        );
     }
 
     #[test]
@@ -1069,10 +1244,15 @@ mod tests {
             leave_seq: 1,
             external_id: None,
             external_ref: None,
+            result: None,
         };
         let json = serde_json::to_string(&notice).unwrap();
         assert!(!json.contains("external_id"));
         assert!(!json.contains("external_ref"));
+        assert!(
+            !json.contains("result"),
+            "an absent embedded result is omitted, not sent as null",
+        );
     }
 
     #[test]

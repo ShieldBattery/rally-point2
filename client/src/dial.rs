@@ -46,7 +46,8 @@ const CONNECT_TIMEOUT_CLOSE: u32 = 0x01;
 ///
 /// Holds the local UDP socket open for as long as its connections live, so a
 /// caller keeps the endpoint alive for the duration of a session. One endpoint
-/// can dial more than once (a home relay and, later, a backup).
+/// can dial more than once (a relay's different address families, say, or a
+/// re-dial after a drop).
 pub struct ClientEndpoint {
     endpoint: quinn::Endpoint,
 }

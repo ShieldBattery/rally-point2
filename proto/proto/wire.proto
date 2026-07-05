@@ -454,4 +454,29 @@ message SlotDeparted {
   // held/`last_frame`-only path. A present `0` is a valid ceiling, so the field
   // is `optional`, like `last_frame`.
   optional uint32 reachable_frame = 4;
+
+  // The end-of-game result the departing slot reported before it departed, if
+  // any. Home-authored: only the departing slot's home relay fills these — it
+  // received the report on that client's control stream and retained it — and
+  // every relay folds the identical result into its departure record
+  // (first-non-empty wins, exactly like `reachable_frame`). A result can never
+  // be recorded after its slot's departure (reports ride only the live link, and
+  // the serve loop closes at the intent/link death), so an embedded result is
+  // final. Empty `result_payload` means the slot departed without ever reporting
+  // — a real report is never zero bytes — so the payload's presence gates the
+  // whole echo, and the three stamps below are meaningless without it.
+  bytes result_payload = 5;
+
+  // Relay wall-clock (unix epoch milliseconds) when the home relay received the
+  // result report. `0` when there is no result (empty `result_payload`).
+  uint64 result_arrival_ms = 6;
+
+  // The session's consensus frame (the slowest slot's observed frame) when the
+  // result arrived. Absent when there is no result, or the report predated any
+  // framed turn — the same distinction `last_frame` draws.
+  optional uint32 result_session_frame = 7;
+
+  // The reporting slot's own newest observed frame when the result arrived.
+  // Absent when there is no result, or the report predated any framed turn.
+  optional uint32 result_slot_frame = 8;
 }

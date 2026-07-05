@@ -1,14 +1,17 @@
-//! Session setup: take an app-server session request, assign home + backup
-//! relays, mint one connection-bound token per player, and return the
-//! session response the app server hands to the game DLLs at launch.
+//! Session setup: take an app-server session request, assign each player a home
+//! relay, mint one connection-bound token per player, and return the session
+//! response the app server hands to the game DLLs at launch.
 //!
 //! This is the coordinator's primary production action. The app server has
 //! already formed the lobby (matchmaking stays in the app server); the
 //! coordinator finds relays and mints tokens. The response carries:
 //!
 //! - The session id (coordinator-assigned, unique within the tenant).
-//! - The home relay (where clients connect) and a backup relay (failover
-//!   target — may equal home if only one relay is available).
+//! - The home relay (where clients connect). A session is single-relay by
+//!   default — every slot homes there — but a dev-forced cross-relay split can
+//!   move individual slots onto a secondary relay, listed per slot in
+//!   `slot_homes`. Multi-relay redundancy is per-player home relays plus the
+//!   mesh: a relay that serves a session always homes at least one of its slots.
 //! - One token per player, each binding the player's client pubkey to its
 //!   slot and session.
 //! - The latency-buffer bounds the relay's decision-maker clamps to.
@@ -27,12 +30,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
     PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
-    SlotExternalRef,
+    SlotExternalRef, SlotHome,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
 
-use crate::descriptors::RelayDescriptors;
+use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::registry::{self, RelayRegistry, SessionSetupError};
 use crate::tenant::{self, TenantStore};
 
@@ -90,6 +93,10 @@ pub struct SessionSetup {
     /// its mesh links. Populated by `create_session`; read by the relay's
     /// descriptor-fetch endpoint.
     descriptors: RelayDescriptors,
+    /// Per-relay reap outbox — the one-shot `CloseSlot` directives the reap
+    /// policies arm. Drained by the relay's control connection alongside the
+    /// descriptor set.
+    reaps: RelayReaps,
     /// The session-id counter, seeded from wall-clock time at construction.
     /// Monotonic within this coordinator's lifetime; scoped per `SessionSetup`
     /// instance. Session ids are unique within a tenant but not globally (two
@@ -107,6 +114,7 @@ impl SessionSetup {
             session_relays: Arc::new(Mutex::new(HashMap::new())),
             session_refs: Arc::new(Mutex::new(HashMap::new())),
             descriptors: RelayDescriptors::new(),
+            reaps: RelayReaps::new(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
         }
     }
@@ -127,6 +135,28 @@ impl SessionSetup {
     /// reads the current set a relay should apply).
     pub fn descriptors(&self) -> &RelayDescriptors {
         &self.descriptors
+    }
+
+    /// Exposes the per-relay reap outbox (the control connection drains it, and
+    /// the reap policies push `CloseSlot` directives into it).
+    pub fn reaps(&self) -> &RelayReaps {
+        &self.reaps
+    }
+
+    /// The relays serving `session`, as recorded at `create_session` — the
+    /// distinct home relays of its slots — or empty if the session was never
+    /// created here. The reap policies fan a `CloseSlot` out to all of these; a
+    /// relay that does not hold a named slot ignores it.
+    pub fn serving_relays(
+        &self,
+        tenant: &rally_point_proto::control::TenantId,
+        session: SessionId,
+    ) -> Vec<RelayId> {
+        self.session_relays
+            .lock()
+            .get(&(tenant.clone(), session))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -156,14 +186,17 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// Creates a game session from an app-server request: assigns relays, mints
 /// tokens, and returns the response the app server hands to its clients.
 ///
-/// The home relay is the lowest-id registered relay (deterministic for a given
-/// fleet state); the backup is the next one (or the same relay if only one is
-/// available). Each player gets a token signed by its tenant's key, binding
-/// the client pubkey to the slot and session. The bounds come from the
+/// Every slot homes on the primary relay — the lowest-id registered relay
+/// (deterministic for a given fleet state) — except any listed in the request's
+/// dev-only [`dev_relay_split`](SessionRequest::dev_relay_split), which home on
+/// the secondary (next-lowest) relay instead, to force a cross-relay meshed
+/// session in testing. Each player gets a token signed by its tenant's key,
+/// binding the client pubkey to the slot and session. The bounds come from the
 /// tenant's enrolled policy.
 ///
-/// Records the session's relay membership (home + backup) so
-/// [`descriptor_for`] can list only the relays actually serving this session.
+/// Records the session's relay membership — the distinct home relays of its
+/// slots — so [`descriptor_for`] can list only the relays actually serving this
+/// session, and so every serving relay homes at least one slot.
 ///
 /// Token expiry is set to `expires_at` — the caller decides the lifetime
 /// (typically game session duration plus margin).
@@ -174,7 +207,7 @@ pub fn create_session(
 ) -> Result<SessionResponse, SessionSetupError> {
     validate_request(&request)?;
 
-    let (home, backup) = assign_relays(&setup.registry)?;
+    let (home, secondary) = assign_relays(&setup.registry)?;
 
     if !tenant::is_enrolled(&setup.tenants, &request.tenant) {
         return Err(SessionSetupError::TenantNotFound(request.tenant));
@@ -183,13 +216,33 @@ pub fn create_session(
     let session = next_session_id(setup);
     let bounds = tenant::bounds(&setup.tenants, &request.tenant).expect("checked enrollment above");
 
-    // Record which relays serve this session. The home + backup are the
-    // session's relay set; `descriptor_for` reads this to build per-relay
-    // mesh-peer lists.
+    // The dev cross-relay split: slots the request flagged home on the secondary
+    // relay instead of the primary. Honored only when a second relay is enrolled;
+    // otherwise the split collapses and every slot homes on the primary.
+    let slot_homes: Vec<SlotHome> = match &secondary {
+        Some(secondary) => request
+            .players
+            .iter()
+            .filter(|p| request.dev_relay_split.contains(&p.slot))
+            .map(|p| SlotHome {
+                slot: p.slot,
+                relay: secondary.clone(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // Record which relays serve this session: the distinct home relays of its
+    // slots. That is the primary, plus the secondary when at least one slot homes
+    // there — a serving relay always homes at least one slot. `descriptor_for`
+    // reads this to build per-relay mesh-peer lists.
     let relay_ids: Vec<RelayId> = {
         let mut ids = vec![home.relay_id];
-        if backup.relay_id != home.relay_id {
-            ids.push(backup.relay_id);
+        if let Some(secondary) = &secondary
+            && !slot_homes.is_empty()
+            && secondary.relay_id != home.relay_id
+        {
+            ids.push(secondary.relay_id);
         }
         ids
     };
@@ -254,7 +307,7 @@ pub fn create_session(
     Ok(SessionResponse {
         session,
         home_relay: home,
-        backup_relay: backup,
+        slot_homes,
         tokens,
         bounds,
     })
@@ -312,10 +365,10 @@ pub fn descriptor_for(
         peers,
         bounds,
         // The recorded membership is already the authority priority order:
-        // `create_session` lists the home relay first, then the backup. The
-        // home relay was chosen for the session's latency profile, so it
-        // decides the buffer while its players are present, and authority
-        // falls down this list as relays' players leave.
+        // `create_session` lists the primary home relay first, then any
+        // secondary home. The primary was chosen for the session's latency
+        // profile, so it decides the buffer while its players are present, and
+        // authority falls down this list as relays' players leave.
         authority_order: relay_ids,
         external_id: refs.external_id,
         slot_refs: refs
@@ -355,15 +408,17 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     Ok(())
 }
 
-/// Picks the home and backup relays from the registry, as the client-facing
-/// endpoints (address + pinned cert) the session response carries.
+/// Picks the session's home relays from the registry, as the client-facing
+/// endpoints (address + pinned cert) the session response carries: the primary
+/// home every slot dials by default, and the secondary a dev cross-relay split
+/// can move individual slots onto.
 ///
-/// The home relay is the lowest-id registered relay (deterministic for a
-/// given fleet state); the backup is the next one. If only one relay is
-/// available, the backup equals the home (degraded single-relay operation).
+/// The primary is the lowest-id registered relay (deterministic for a given
+/// fleet state); the secondary is the next one, or `None` when only one relay is
+/// enrolled (a single-relay session, where the split silently collapses).
 fn assign_relays(
     registry: &RelayRegistry,
-) -> Result<(RelayEndpoint, RelayEndpoint), SessionSetupError> {
+) -> Result<(RelayEndpoint, Option<RelayEndpoint>), SessionSetupError> {
     let mut entries = registry::all_entries(registry);
     if entries.is_empty() {
         return Err(SessionSetupError::NoRelaysAvailable);
@@ -373,11 +428,8 @@ fn assign_relays(
     entries.sort_by_key(|e| e.relay_id);
 
     let home = RelayEndpoint::from(&entries[0]);
-    let backup = entries
-        .get(1)
-        .map(RelayEndpoint::from)
-        .unwrap_or_else(|| home.clone());
-    Ok((home, backup))
+    let secondary = entries.get(1).map(RelayEndpoint::from);
+    Ok((home, secondary))
 }
 
 /// The maximum slot id (11: BW supports 12 network participants — 8 players
@@ -456,16 +508,20 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
 
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
 
-        // Home is the lowest-id relay; backup is the next. Each carries the
-        // cert that relay reported at enrollment, so clients can pin it.
+        // Home is the lowest-id relay, carrying the cert it reported at enrollment
+        // so clients can pin it. Without a dev split every slot homes there, so the
+        // response carries no per-slot overrides even with a second relay enrolled.
         assert_eq!(resp.home_relay.relay_id, RelayId(1));
         assert_eq!(resp.home_relay.cert_der, fake_cert(1));
-        assert_eq!(resp.backup_relay.relay_id, RelayId(2));
-        assert_eq!(resp.backup_relay.cert_der, fake_cert(2));
+        assert!(
+            resp.slot_homes.is_empty(),
+            "a session with no dev split homes every slot on the primary",
+        );
 
         // One token per player.
         assert_eq!(resp.tokens.len(), 2);
@@ -477,12 +533,111 @@ mod tests {
     }
 
     #[test]
+    fn dev_split_homes_listed_slots_on_the_secondary_relay() {
+        // The dev cross-relay knob: the listed slot homes on the secondary relay,
+        // the others on the primary, so both relays serve one meshed session.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        assert_eq!(
+            resp.slot_homes,
+            vec![SlotHome {
+                slot: SlotId(1),
+                relay: RelayEndpoint {
+                    relay_id: RelayId(2),
+                    relay_addr: resp.slot_homes[0].relay.relay_addr,
+                    cert_der: fake_cert(2),
+                },
+            }],
+            "only the split slot homes on the secondary relay, with its pinned cert",
+        );
+
+        // The session serves exactly the distinct home relays of its slots.
+        let serving = setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session);
+        assert_eq!(
+            serving
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([RelayId(1), RelayId(2)]),
+        );
+    }
+
+    #[test]
+    fn serving_relays_are_the_distinct_homes_and_a_lone_relay_needs_no_split() {
+        // With no split (and even with a second relay enrolled) the session serves
+        // only the primary home — a serving relay always homes at least one slot,
+        // so an unused relay is never in the set.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(
+            setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
+            vec![RelayId(1)],
+        );
+
+        // A split naming slots on a single-relay fleet collapses: no secondary
+        // exists, so every slot still homes on the primary and no override rides.
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 5, 14900);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let lone = SessionSetup::new(reg, tenants);
+        let resp = create_session(
+            &lone,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert!(
+            resp.slot_homes.is_empty(),
+            "a split with no second relay collapses to a single-relay session",
+        );
+        assert_eq!(
+            lone.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
+            vec![RelayId(5)],
+        );
+    }
+
+    #[test]
     fn issued_tokens_verify_on_the_relay() {
         let setup = setup_with_two_relays_and_tenant();
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
 
@@ -504,35 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn single_relay_session_has_backup_equal_to_home() {
-        let reg = registry::new_registry();
-        enroll_relay(&reg, 5, 14900);
-
-        let tenants = tenant::new_store();
-        tenant::enroll(
-            &tenants,
-            KeyId("test-key-1".to_owned()),
-            TenantId("sb-test".to_owned()),
-            BufferBounds::new(1, 6).unwrap(),
-        )
-        .unwrap();
-
-        let setup = SessionSetup::new(reg, tenants);
-        let resp = create_session(
-            &setup,
-            SessionRequest {
-                tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
-                external_id: None,
-            },
-            ExpiresAt(u64::MAX),
-        )
-        .unwrap();
-
-        assert_eq!(resp.home_relay, resp.backup_relay);
-    }
-
-    #[test]
     fn no_relays_available_fails() {
         let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
         let result = create_session(
@@ -541,6 +667,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         );
@@ -558,6 +685,7 @@ mod tests {
                 tenant: TenantId("not-enrolled".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         );
@@ -576,6 +704,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![],
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         );
@@ -600,6 +729,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: (0..=11).map(player).collect(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -612,6 +742,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![player(12)],
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         );
@@ -627,6 +758,9 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                // Split slot 1 onto the secondary relay so both relays serve and
+                // mesh — the only way a session spans two relays.
+                dev_relay_split: vec![SlotId(1)],
             },
             ExpiresAt(u64::MAX),
         )
@@ -696,6 +830,7 @@ mod tests {
                     },
                 ],
                 external_id: Some("game-99".to_owned()),
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -730,6 +865,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -770,6 +906,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -802,8 +939,9 @@ mod tests {
 
     #[test]
     fn descriptor_for_excludes_relays_not_in_session() {
-        // Three relays registered, but a session only uses two (home + backup).
-        // The third relay must NOT appear in the descriptor's peer list.
+        // Three relays registered, but a session only uses two (the dev split
+        // homes slot 1 on the secondary). The third relay must NOT appear in the
+        // descriptor's peer list.
         let reg = registry::new_registry();
         enroll_relay(&reg, 1, 14900);
         enroll_relay(&reg, 2, 14901);
@@ -825,12 +963,13 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: vec![SlotId(1)],
             },
             ExpiresAt(u64::MAX),
         )
         .unwrap();
 
-        // Home=1, backup=2. Relay 3 is registered but not in the session.
+        // Home=1, secondary=2. Relay 3 is registered but not in the session.
         let desc = descriptor_for(
             &setup,
             &TenantId("sb-test".to_owned()),
@@ -852,10 +991,15 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                // Split so slot 1 homes on the secondary, giving both relays a slot.
+                dev_relay_split: vec![SlotId(1)],
             },
             ExpiresAt(u64::MAX),
         )
         .unwrap();
+
+        // The split's secondary home is the relay slot 1 was moved onto.
+        let secondary_relay = resp.slot_homes[0].relay.relay_id;
 
         // Both relays serving the session have a descriptor staged in the outbox,
         // each naming the other as its mesh peer.
@@ -863,11 +1007,11 @@ mod tests {
         assert_eq!(for_home.len(), 1);
         assert_eq!(for_home[0].session, resp.session);
         assert_eq!(for_home[0].peers.len(), 1);
-        assert_eq!(for_home[0].peers[0].relay_id, resp.backup_relay.relay_id);
+        assert_eq!(for_home[0].peers[0].relay_id, secondary_relay);
 
-        let for_backup = setup.descriptors().current_for(resp.backup_relay.relay_id);
-        assert_eq!(for_backup.len(), 1);
-        assert_eq!(for_backup[0].peers[0].relay_id, resp.home_relay.relay_id);
+        let for_secondary = setup.descriptors().current_for(secondary_relay);
+        assert_eq!(for_secondary.len(), 1);
+        assert_eq!(for_secondary[0].peers[0].relay_id, resp.home_relay.relay_id);
     }
 
     #[test]
@@ -892,6 +1036,7 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -909,6 +1054,7 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX)).unwrap();
         let r2 = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
@@ -934,6 +1080,7 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
+            dev_relay_split: Vec::new(),
         };
         let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX)).unwrap();
 

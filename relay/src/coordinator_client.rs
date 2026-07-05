@@ -268,6 +268,10 @@ async fn send_notice(
         RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice.clone()),
         RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice.clone()),
         RelayNotice::Result(notice) => RelayToCoordinator::Result(notice.clone()),
+        RelayNotice::SessionClosed { tenant, session } => RelayToCoordinator::SessionClosed {
+            tenant: tenant.clone(),
+            session: *session,
+        },
     };
     let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
     socket.send(Message::Text(text.into())).await?;
@@ -291,6 +295,14 @@ fn apply_message(
     match message {
         CoordinatorToRelay::Descriptors { descriptors } => {
             reconcile(control, &descriptors, applied);
+        }
+        CoordinatorToRelay::CloseSlot {
+            tenant,
+            session,
+            slots,
+        } => {
+            let key = SessionKey { tenant, session };
+            control.close_slots(&key, &slots);
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -477,6 +489,46 @@ mod tests {
         assert_eq!(applied, HashSet::from([key(2)]));
     }
 
+    #[tokio::test]
+    async fn a_close_slot_message_signals_the_named_held_slot() {
+        // A CloseSlot down-frame reaches the roster: the named slot's shutdown
+        // signal fires (its link task would then close and deregister), and a slot
+        // the relay does not hold is a harmless no-op.
+        let sessions: crate::routing::Sessions = std::sync::Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        )
+        .with_broadcast(sessions.clone(), mesh_links);
+
+        let (mut guard, inbox) =
+            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+                .expect("slot 0 registers");
+        guard.disarm();
+        let shutdown = inbox.shutdown_handle();
+
+        let mut applied = HashSet::new();
+        apply_message(
+            &control,
+            CoordinatorToRelay::CloseSlot {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(1),
+                // Name a held slot and one the relay does not hold.
+                slots: vec![
+                    rally_point_proto::ids::SlotId(0),
+                    rally_point_proto::ids::SlotId(7),
+                ],
+            },
+            &mut applied,
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), shutdown.notified())
+            .await
+            .expect("the held slot was signaled to close");
+    }
+
     #[test]
     fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() {
         let control = MeshControl::new(
@@ -572,6 +624,7 @@ mod tests {
             leave_seq: 3,
             external_id: None,
             external_ref: None,
+            result: None,
         }
     }
 
@@ -711,6 +764,9 @@ mod tests {
             RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice),
             RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice),
             RelayNotice::Result(notice) => RelayToCoordinator::Result(notice),
+            RelayNotice::SessionClosed { tenant, session } => {
+                RelayToCoordinator::SessionClosed { tenant, session }
+            }
         };
         assert_eq!(decoded, expected);
     }

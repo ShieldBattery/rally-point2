@@ -55,6 +55,7 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::{SessionId, SlotId};
 use serde::Serialize;
 
+use crate::lifecycle::Lifecycle;
 use crate::session::{self, SessionSetup};
 use crate::tenant::{self, NotifyConfig, TenantStore};
 
@@ -129,6 +130,38 @@ struct DepartureWebhook {
     kind: DepartureKind,
     reason: u32,
     leave_seq: u32,
+    /// The result this slot reported before departing, embedded so the departure
+    /// webhook is atomic terminal truth. Omitted (not `null`) when the slot
+    /// departed without ever reporting — the consumer reads its absence as "there
+    /// provably never was one".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ResultEchoWebhook>,
+}
+
+/// The embedded result in a departure webhook body: the opaque payload as a
+/// standard-base64 string (the coordinator never parses it), plus the relay's
+/// arrival stamp and frame view. camelCase like the rest of the body; the frame
+/// stamps are omitted when absent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResultEchoWebhook {
+    payload: String,
+    arrival_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_frame: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_frame: Option<u32>,
+}
+
+impl From<rally_point_proto::control::ResultEcho> for ResultEchoWebhook {
+    fn from(echo: rally_point_proto::control::ResultEcho) -> Self {
+        ResultEchoWebhook {
+            payload: BASE64_STANDARD.encode(&echo.payload),
+            arrival_ms: echo.arrival_ms,
+            session_frame: echo.session_frame,
+            slot_frame: echo.slot_frame,
+        }
+    }
 }
 
 /// One diverged slot in a desync webhook body: the slot plus its optional tenant
@@ -186,6 +219,52 @@ struct ResultWebhook {
     slot_frame: Option<u32>,
 }
 
+/// The JSON body POSTed to the tenant when a session fully closes — every serving
+/// relay tore down its state for it. Same camelCase convention and `event`
+/// discriminator as the other bodies. `externalId` (the tenant's gameId) is
+/// omitted when the session carried none — unlike the per-player webhooks, a
+/// sessionClosed with no gameId is still useful (it names the rp2 session id the
+/// tenant persisted), so it is delivered regardless.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionClosedWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+}
+
+/// Builds the `sessionClosed` webhook dispatch for a fully-closed session: the
+/// tenant's notify config plus the serialized body (with the stored `externalId`
+/// if any). `None` when the tenant has no notify config — nothing to POST to. The
+/// [`Lifecycle`] calls this once, when the last serving relay reports closed, and
+/// enqueues the returned job onto the session's ordered queue behind every prior
+/// notice.
+pub(crate) fn session_closed_dispatch(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+) -> Option<(NotifyConfig, Bytes)> {
+    let config = tenant::notify_config(setup.tenants(), tenant)?;
+    let external_id =
+        session::session_refs(setup, tenant, session).and_then(|refs| refs.external_id);
+    let payload = SessionClosedWebhook {
+        event: "sessionClosed",
+        tenant: tenant.as_ref().to_owned(),
+        session: session.0,
+        external_id,
+    };
+    let body = match serde_json::to_vec(&payload) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(error) => {
+            tracing::error!(%error, "serializing a sessionClosed body failed; dropping");
+            return None;
+        }
+    };
+    Some((config, body))
+}
+
 /// Handles one relay's departure notice.
 ///
 /// First sight of a `(tenant, session, slot)` resolves its correlation ids and
@@ -210,7 +289,12 @@ struct ResultWebhook {
 ///
 /// The dedup entry is claimed before the later lookups, so those terminal
 /// drops are not re-processed by a later duplicate either.
-pub fn handle_departure(setup: &SessionSetup, dedup: &DepartureDedup, notice: DepartureNotice) {
+pub fn handle_departure(
+    setup: &SessionSetup,
+    dedup: &DepartureDedup,
+    lifecycle: &Lifecycle,
+    notice: DepartureNotice,
+) {
     if !dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot))
@@ -265,9 +349,17 @@ pub fn handle_departure(setup: &SessionSetup, dedup: &DepartureDedup, notice: De
         kind: notice.kind,
         reason: notice.reason,
         leave_seq: notice.leave_seq,
+        result: notice.result.map(ResultEchoWebhook::from),
     };
 
-    spawn_dispatch(setup, notice.tenant, config, &payload, "departure");
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "departure",
+    );
 }
 
 /// Handles one relay's desync notice.
@@ -283,7 +375,12 @@ pub fn handle_departure(setup: &SessionSetup, dedup: &DepartureDedup, notice: De
 /// delivers a correct webhook from the notice's self-stamped refs. Each diverged
 /// slot's `externalRef` resolves independently (notice ref, else the stored
 /// per-slot ref), so a partially-ref'd notice still names whom it can.
-pub fn handle_desync(setup: &SessionSetup, dedup: &DesyncDedup, notice: DesyncNotice) {
+pub fn handle_desync(
+    setup: &SessionSetup,
+    dedup: &DesyncDedup,
+    lifecycle: &Lifecycle,
+    notice: DesyncNotice,
+) {
     if !dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.sync_ordinal))
@@ -348,7 +445,14 @@ pub fn handle_desync(setup: &SessionSetup, dedup: &DesyncDedup, notice: DesyncNo
         diverged,
     };
 
-    spawn_dispatch(setup, notice.tenant, config, &payload, "desync");
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "desync",
+    );
 }
 
 /// Handles one relay's result notice.
@@ -364,7 +468,12 @@ pub fn handle_desync(setup: &SessionSetup, dedup: &DesyncDedup, notice: DesyncNo
 /// as departures, so a coordinator restart that wiped the session store still
 /// delivers a correct webhook from the notice's self-stamped refs. The payload
 /// bytes are never parsed here; they are relayed straight through as base64.
-pub fn handle_result(setup: &SessionSetup, dedup: &ResultDedup, notice: ResultNotice) {
+pub fn handle_result(
+    setup: &SessionSetup,
+    dedup: &ResultDedup,
+    lifecycle: &Lifecycle,
+    notice: ResultNotice,
+) {
     if !dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot))
@@ -422,16 +531,25 @@ pub fn handle_result(setup: &SessionSetup, dedup: &ResultDedup, notice: ResultNo
         slot_frame: notice.slot_frame,
     };
 
-    spawn_dispatch(setup, notice.tenant, config, &payload, "result");
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "result",
+    );
 }
 
-/// Serializes `payload` and spawns its webhook dispatch. The tenant store is
-/// cheap to clone (Arc-backed) and carried into the spawned task so `dispatch`
-/// can sign fresh on every attempt — a detached task otherwise has no path back
-/// to the tenant's signing key. `kind` labels the delivery in logs.
-fn spawn_dispatch(
-    setup: &SessionSetup,
+/// Serializes `payload` and enqueues its webhook onto the session's ordered
+/// dispatch queue ([`Lifecycle`]), so every notice for one `(tenant, session)` is
+/// delivered in the order it was enqueued — a notice's retry loop blocks the ones
+/// behind it. This is what lets a delivered `sessionClosed` guarantee no earlier
+/// notice for the session is still in flight. `kind` labels the delivery in logs.
+fn enqueue_dispatch(
+    lifecycle: &Lifecycle,
     tenant: TenantId,
+    session: SessionId,
     config: NotifyConfig,
     payload: &impl Serialize,
     kind: &'static str,
@@ -443,13 +561,7 @@ fn spawn_dispatch(
             return;
         }
     };
-    tokio::spawn(dispatch(
-        setup.tenants().clone(),
-        tenant,
-        config,
-        body,
-        kind,
-    ));
+    lifecycle.enqueue_webhook(tenant, session, config, body, kind);
 }
 
 /// The domain-separation prefix on the signed message, so a webhook signature
@@ -474,7 +586,7 @@ const SIGNATURE_HEADER: &str = "x-rp2-signature";
 /// the caller resolves them before spawning, since the private key stays behind
 /// `tenant::sign_webhook`'s narrow interface rather than being handed out as an
 /// `Arc<Ed25519KeyPair>`.
-async fn dispatch(
+pub(crate) async fn dispatch(
     tenants: TenantStore,
     tenant: TenantId,
     config: NotifyConfig,
@@ -749,6 +861,7 @@ mod tests {
                     observer: false,
                 }],
                 external_id: external_id.map(str::to_owned),
+                dev_relay_split: Vec::new(),
             },
             ExpiresAt(u64::MAX),
         )
@@ -768,6 +881,7 @@ mod tests {
             leave_seq: 1,
             external_id: None,
             external_ref: None,
+            result: None,
         }
     }
 
@@ -781,16 +895,19 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // Two relays report the same departure; the coordinator must webhook once.
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -809,6 +926,11 @@ mod tests {
         assert_eq!(got.body["kind"], "dropped");
         assert_eq!(got.body["reason"], 0x4000_0006u32);
         assert_eq!(got.body["leaveSeq"], 1);
+        // This departure carried no embedded result, so the field is omitted.
+        assert!(
+            got.body.get("result").is_none(),
+            "a departure with no embedded result omits the field, not null",
+        );
 
         // No second webhook: the duplicate relay report was deduped.
         assert!(
@@ -817,6 +939,44 @@ mod tests {
                 .is_err(),
             "duplicate departures from multiple relays webhook exactly once",
         );
+    }
+
+    #[tokio::test]
+    async fn a_departure_embeds_a_base64_result_when_the_slot_reported_one() {
+        // A departure that carries the slot's end-of-game result: the webhook
+        // embeds it as a base64 payload plus the relay's arrival/frame stamps, so
+        // one delivery is atomic terminal truth.
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        let (setup, session) = setup_with_session(Some("game-99"), Some("sb-user-7"));
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
+
+        let mut with_result = notice(session, 0, DepartureKind::Left, 3);
+        with_result.result = Some(rally_point_proto::control::ResultEcho {
+            payload: vec![0x01, 0x02, 0x03, 0x04],
+            arrival_ms: 1_700_000_000_123,
+            session_frame: Some(4200),
+            slot_frame: Some(4242),
+        });
+        handle_departure(&setup, &dedup.departures, &lifecycle, with_result);
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a webhook is delivered")
+            .unwrap();
+        assert_signed(&setup, "sb-test", &got);
+        assert_eq!(
+            got.body["result"]["payload"],
+            BASE64_STANDARD.encode([0x01, 0x02, 0x03, 0x04]),
+        );
+        assert_eq!(got.body["result"]["arrivalMs"], 1_700_000_000_123u64);
+        assert_eq!(got.body["result"]["sessionFrame"], 4200);
+        assert_eq!(got.body["result"]["slotFrame"], 4242);
     }
 
     #[tokio::test]
@@ -832,10 +992,12 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(session, 0, DepartureKind::Left, 3),
         );
 
@@ -883,6 +1045,7 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // No `create_session` call at all — the session store has nothing for
         // this (or any) session id.
@@ -890,7 +1053,7 @@ mod tests {
         restart_notice.external_id = Some("game-restart".to_owned());
         restart_notice.external_ref = Some("sb-user-restart".to_owned());
 
-        handle_departure(&setup, &dedup.departures, restart_notice);
+        handle_departure(&setup, &dedup.departures, &lifecycle, restart_notice);
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -914,10 +1077,12 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -938,10 +1103,12 @@ mod tests {
         // Deliberately do NOT point the tenant's notify config at `url`.
         let _ = url;
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -963,6 +1130,7 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // A session the coordinator never created has no stored refs, and the
         // (refless) notice carries none either -> no gameId from any source,
@@ -971,6 +1139,7 @@ mod tests {
         handle_departure(
             &setup,
             &dedup.departures,
+            &lifecycle,
             notice(SessionId(999_999), 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -1027,10 +1196,21 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // Two at-least-once redeliveries of the same event webhook once.
-        handle_desync(&setup, &dedup.desyncs, desync(SessionId(7), 91, false));
-        handle_desync(&setup, &dedup.desyncs, desync(SessionId(7), 91, false));
+        handle_desync(
+            &setup,
+            &dedup.desyncs,
+            &lifecycle,
+            desync(SessionId(7), 91, false),
+        );
+        handle_desync(
+            &setup,
+            &dedup.desyncs,
+            &lifecycle,
+            desync(SessionId(7), 91, false),
+        );
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1075,12 +1255,13 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // A no-majority desync with no game frame — gameFrame must be omitted, not
         // null, and diverged is an empty array.
         let mut notice = desync(SessionId(8), 5, true);
         notice.game_frame = None;
-        handle_desync(&setup, &dedup.desyncs, notice);
+        handle_desync(&setup, &dedup.desyncs, &lifecycle, notice);
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1105,11 +1286,12 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // Neither the notice nor the stored session has a gameId.
         let mut notice = desync(session, 1, false);
         notice.external_id = None;
-        handle_desync(&setup, &dedup.desyncs, notice);
+        handle_desync(&setup, &dedup.desyncs, &lifecycle, notice);
 
         assert!(
             timeout(Duration::from_millis(400), rx.recv())
@@ -1160,10 +1342,21 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // Two at-least-once redeliveries of the same slot's report webhook once.
-        handle_result(&setup, &dedup.results, result(SessionId(7), 1, true));
-        handle_result(&setup, &dedup.results, result(SessionId(7), 1, true));
+        handle_result(
+            &setup,
+            &dedup.results,
+            &lifecycle,
+            result(SessionId(7), 1, true),
+        );
+        handle_result(
+            &setup,
+            &dedup.results,
+            &lifecycle,
+            result(SessionId(7), 1, true),
+        );
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1206,8 +1399,14 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
-        handle_result(&setup, &dedup.results, result(session, 0, false));
+        handle_result(
+            &setup,
+            &dedup.results,
+            &lifecycle,
+            result(session, 0, false),
+        );
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1227,9 +1426,15 @@ mod tests {
             Some(NotifyConfig { url }),
         );
         let dedup = new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
 
         // Neither the notice nor the stored session has a gameId.
-        handle_result(&setup, &dedup.results, result(session, 0, false));
+        handle_result(
+            &setup,
+            &dedup.results,
+            &lifecycle,
+            result(session, 0, false),
+        );
 
         assert!(
             timeout(Duration::from_millis(400), rx.recv())

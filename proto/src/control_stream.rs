@@ -165,6 +165,10 @@ mod tests {
                 last_frame: Some(41),
                 reachable_frame: Some(38),
                 reason: 0x4000_0006,
+                result_payload: Vec::new().into(),
+                result_arrival_ms: 0,
+                result_session_frame: None,
+                result_slot_frame: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -217,6 +221,10 @@ mod tests {
                 last_frame: None,
                 reachable_frame: None,
                 reason: 3,
+                result_payload: Vec::new().into(),
+                result_arrival_ms: 0,
+                result_session_frame: None,
+                result_slot_frame: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -224,6 +232,36 @@ mod tests {
         assert_eq!(decoded, departed);
         match decoded.kind {
             Some(mesh_control_frame::Kind::SlotDeparted(sd)) => assert_eq!(sd.last_frame, None),
+            other => panic!("expected SlotDeparted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_slot_departed_carries_an_embedded_result_through_the_frame() {
+        // A departing slot that reported a result before leaving: the home relay
+        // fills the result-echo fields, and they round-trip through the frame so
+        // every relay folds the identical result into its departure record.
+        let departed = MeshControlFrame {
+            session: 5,
+            kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                slot: 0,
+                last_frame: Some(4242),
+                reachable_frame: Some(4200),
+                reason: 3,
+                result_payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+                result_arrival_ms: 1_700_000_000_000,
+                result_session_frame: Some(4200),
+                result_slot_frame: Some(4242),
+            })),
+        };
+        let encoded = encode_frame(&departed).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, departed);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::SlotDeparted(sd)) => {
+                assert_eq!(sd.result_payload.as_ref(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+                assert_eq!(sd.result_arrival_ms, 1_700_000_000_000);
+            }
             other => panic!("expected SlotDeparted, got {other:?}"),
         }
     }

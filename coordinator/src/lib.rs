@@ -10,8 +10,8 @@
 //!   issuance; the coordinator's counterpart to the relay's verification
 //!   registry.
 //! - **session** ([`session`]) — accept app-server session requests (N players
-//!   / regions), assign home + backup relays, issue connection-bound tokens,
-//!   and build session descriptors including the backup relay.
+//!   / regions), assign each player a home relay, issue connection-bound tokens,
+//!   and build the per-relay session descriptors that drive the mesh.
 //! - **descriptors** ([`descriptors`]) — the per-relay descriptor outbox: the
 //!   coordinator side of the control connection. Holds each relay's current
 //!   session-descriptor set behind a watch channel and pushes it down the
@@ -36,6 +36,7 @@
 
 pub mod api;
 pub mod descriptors;
+pub mod lifecycle;
 pub mod notify;
 pub mod registry;
 pub mod session;

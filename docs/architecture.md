@@ -354,8 +354,8 @@ can drive an in-game netgraph or other debugging output.
 ### Control plane: the coordinator
 
 The coordinator sits off the hot path. It mints per-tenant, connection-bound **tokens**, runs the
-authenticated **relay registry** (relays enroll over their control connection), assigns each game its
-**home and backup relays** and region, and provisions relay capacity. Matchmaking and lobby formation stay in the
+authenticated **relay registry** (relays enroll over their control connection), assigns each player a
+**home relay** and region, and provisions relay capacity. Matchmaking and lobby formation stay in the
 per-tenant app server; the coordinator only finds and spins up relays. Production runs its own isolated
 coordinator, signing key, and relay fleet; staging and external developers share a separate one.
 

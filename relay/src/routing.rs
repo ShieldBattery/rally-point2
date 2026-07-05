@@ -179,6 +179,15 @@ pub struct SlotInbox {
     shutdown: Arc<Notify>,
 }
 
+impl SlotInbox {
+    /// The slot's shutdown signal, for a cross-module test that drives a close and
+    /// asserts the link task would be told to exit.
+    #[cfg(test)]
+    pub(crate) fn shutdown_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown)
+    }
+}
+
 /// Identifies one game's routing group. Session ids are unique only *within* a
 /// tenant, so two tenants can independently be assigned the same number; the
 /// tenant is therefore part of the key. Slot occupancy and fan-out are scoped by
@@ -277,14 +286,21 @@ pub fn register(
 /// Removes `slot` from the `key` routing group's roster, dropping the group entry
 /// once its last slot leaves. Idempotent: removing an absent slot is a no-op, so a
 /// guard and a link task can both run it without double-free hazard.
-fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
+///
+/// Returns whether this call removed the group's **last** slot — the relay now
+/// serves no player for the session, so its caller fires the coordinator's
+/// `SessionClosed` for it (computed under the roster lock, so two slots leaving
+/// concurrently report the emptying exactly once).
+fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) -> bool {
     let mut roster = sessions.lock();
     if let Some(slots) = roster.get_mut(key) {
-        slots.remove(&slot);
+        let removed = slots.remove(&slot).is_some();
         if slots.is_empty() {
             roster.remove(key);
+            return removed;
         }
     }
+    false
 }
 
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
@@ -367,6 +383,35 @@ pub(crate) fn fan_out_leave(
             // The peer already left; it needs no leave for a third slot.
             Err(mpsc::error::TrySendError::Closed(_)) => {}
             Ok(()) => {}
+        }
+    }
+}
+
+/// Fires the shutdown signal for each of `slots` in the `key` routing group, so
+/// each named slot's link task closes its connection and leaves — the coordinator's
+/// reap directive. A slot this relay does not currently hold (never homed it, or it
+/// already departed) is simply absent from the roster and skipped, so the
+/// coordinator can name every slot of a session without tracking which relay holds
+/// which. The closed link then flows through the ordinary link-death path (a synced
+/// leave, a departure notice), which is what makes the reap self-resolving.
+///
+/// Signals rather than yanking the roster entry, exactly like [`fan_out`]'s lagging-
+/// peer path: the slot stays occupied until its own task acts on the signal and
+/// deregisters itself, so no replacement can register a second sender in the interim.
+pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    let roster = sessions.lock();
+    let Some(group) = roster.get(key) else {
+        return;
+    };
+    for slot in slots {
+        if let Some(entry) = group.get(slot) {
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                "coordinator reap: closing slot link",
+            );
+            entry.shutdown.notify_one();
         }
     }
 }
@@ -904,7 +949,7 @@ pub async fn run_slot_link(
         }
     }
 
-    deregister(&sessions, &key, slot);
+    let session_emptied = deregister(&sessions, &key, slot);
     crate::mesh::unpublish_conditions(&conditions, &key, slot);
     // Trigger A (synced player-leave): this client's link ended, so it has left
     // the game. Announce the departure — unless a clean leave-intent already did,
@@ -944,6 +989,15 @@ pub async fn run_slot_link(
     // verdict moves here; the peers hear the emptied roster from the mesh
     // drivers' presence reconcile.
     report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+    // This was the relay's last local slot for the session: it has torn down its
+    // serving state, so tell the coordinator. Fired here, after `announce_departure`
+    // already put this slot's departure on the same ordered notice channel, so the
+    // coordinator can treat a delivered `SessionClosed` as proof no earlier notice
+    // for the session is still in flight — the ordering the final `sessionClosed`
+    // webhook rests on.
+    if session_emptied {
+        consensus::session_closed(&decision_makers, &key);
+    }
 }
 
 /// Announces a home client's departure from the game: records it, tells the peer
@@ -966,20 +1020,32 @@ fn announce_departure(
     slot: SlotId,
     reason: u32,
 ) {
-    // Read the last observed frame and the reachability ceiling before recording
-    // retires the slot's live state; both fill the departure record and the
-    // SlotDeparted the peers receive. The ceiling is home-authored here (only the
-    // home relay computes it) so every relay clamps the leave's apply frame to
-    // the identical value — see `consensus::reachable_frame`.
+    // Read the last observed frame, the reachability ceiling, and the slot's
+    // retained end-of-game result before recording retires the slot's live state;
+    // all fill the departure record and the SlotDeparted the peers receive. The
+    // ceiling and the result are home-authored here (only this relay, the slot's
+    // home, holds the retained report and computes the ceiling), so every relay
+    // clamps to the identical apply frame and folds the identical result — see
+    // `consensus::reachable_frame` / `consensus::result_for`.
     let last_frame = consensus::slot_frame(decision_makers, key, slot);
     let reachable = consensus::reachable_frame(decision_makers, key, slot);
-    consensus::record_departure(decision_makers, key, slot, last_frame, reachable, reason);
+    let result = consensus::result_for(decision_makers, key, slot);
+    consensus::record_departure(
+        decision_makers,
+        key,
+        slot,
+        last_frame,
+        reachable,
+        result.clone(),
+        reason,
+    );
     crate::mesh::fan_out_slot_departed(
         mesh_links,
         key,
         slot,
         last_frame.map(|f| f.0),
         reachable,
+        result,
         reason,
     );
     // Decide locally: `Some` only on the authority (and only once per slot). The
@@ -1129,6 +1195,35 @@ mod tests {
         // Slot 0 is reclaimable; slot 1 is untouched.
         assert!(register(&sessions, &key(), SlotId(0)).is_some());
         assert!(register(&sessions, &key(), SlotId(1)).is_none());
+    }
+
+    #[tokio::test]
+    async fn close_slots_signals_a_held_slot_and_is_a_no_op_for_an_absent_one() {
+        let sessions: Sessions = Arc::default();
+        let k = key();
+        let (mut g0, inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        g0.disarm();
+
+        // Closing a slot this relay does not hold (slot 5) is a no-op — no panic,
+        // and the held slot is untouched.
+        close_slots(&sessions, &k, &[SlotId(5)]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox0.shutdown.notified())
+                .await
+                .is_err(),
+            "an absent slot's close must not signal a held one",
+        );
+
+        // Closing the held slot fires its shutdown signal (its task would then
+        // close the link and deregister), but leaves it in the roster meanwhile.
+        close_slots(&sessions, &k, &[SlotId(0), SlotId(9)]);
+        tokio::time::timeout(Duration::from_millis(100), inbox0.shutdown.notified())
+            .await
+            .expect("the held slot is signaled to close");
+        assert!(
+            sessions.lock().get(&k).unwrap().contains_key(&SlotId(0)),
+            "close_slots signals, it does not yank the roster entry",
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //!
 //! A relay enrolls when it opens its control connection, sending a [`RelayHello`]
 //! as its first frame. The coordinator records it here and uses the registry to
-//! pick home + backup relays for session requests and to build mesh topology
+//! pick each player's home relay for session requests and to build mesh topology
 //! (the [`RelayPeer`] list in a session descriptor).
 //!
 //! The control connection that carries enrollment is authenticated by a
@@ -106,7 +106,7 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
 }
 
 /// All registered relays' full entries, in an unspecified order. Used to pick
-/// home + backup relays for a session — the session response needs the full
+/// the home relays for a session — the session response needs the full
 /// enrollment record (protocol version and all), not just the peer view.
 pub fn all_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
     registry
@@ -168,11 +168,6 @@ pub enum SessionSetupError {
     /// No relays have phoned home, so there is no relay to assign.
     #[error("no relays available in the registry")]
     NoRelaysAvailable,
-    /// Not enough relays for a distinct backup. The session can still proceed
-    /// with `backup == home` (degraded single-relay), but the caller asked for
-    /// a distinct backup and there is only one relay.
-    #[error("only {available} relay(s) available; need {needed} for a distinct backup")]
-    NotEnoughRelays { available: usize, needed: usize },
     /// A player's slot index is out of range (max 11: 8 players + 4
     /// observers, BW's 12 network participants).
     #[error("slot {0} is out of range (max 11)")]

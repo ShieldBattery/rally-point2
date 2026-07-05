@@ -161,9 +161,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
-    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot, ResultNotice,
+    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot, ResultEcho,
+    ResultNotice, TenantId,
 };
-use rally_point_proto::ids::{GameFrameCount, SlotId};
+use rally_point_proto::ids::{GameFrameCount, SessionId, SlotId};
 use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -494,12 +495,16 @@ pub struct DecisionMaker {
     /// Descriptor-driven, so it survives authority changes (unlike the comparator
     /// state, which resets on promotion).
     observers: HashSet<SlotId>,
-    /// Slots that have already reported an end-of-game result. First report per
+    /// The end-of-game result each slot reported, keyed by slot. First report per
     /// slot wins; a repeat is dropped without firing a second notice — the same
-    /// anti-flooding posture as the one-sync-command-per-turn rule. Not tied to
-    /// the desync comparator, so it survives an authority change (a result is a
-    /// per-slot one-shot the relay reports regardless of authority).
-    reported_results: HashSet<SlotId>,
+    /// anti-flooding posture as the one-sync-command-per-turn rule. The full
+    /// result is retained (not just a marker) so this relay — the reporting slot's
+    /// home — can embed it into the slot's departure record and `SlotDeparted`
+    /// frame when the slot leaves. Bounded by the slot count (≤12) times the
+    /// per-result cap. Not tied to the desync comparator, so it survives an
+    /// authority change (a result is a per-slot one-shot the relay reports
+    /// regardless of authority).
+    results: HashMap<SlotId, ResultEcho>,
     /// The per-session desync comparator. Only meaningful while this relay is the
     /// authority; reset wholesale on promotion (a real desync re-diverges every
     /// interval, so no state need transfer across a handoff).
@@ -513,7 +518,7 @@ pub struct DecisionMaker {
 /// frame is the max-merge of every observation of this departure (the home
 /// relay's carried value, this relay's own view, any re-announce), so the
 /// fullest view wins; the reason keeps the first observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Departure {
     last_frame: Option<GameFrameCount>,
     /// The home-authored reachability ceiling for the leave's apply frame — the
@@ -525,6 +530,14 @@ struct Departure {
     /// `None` when the home had no survivor framed history yet (no clamp).
     reachable_frame: Option<u32>,
     reason: u32,
+    /// The end-of-game result this slot reported before departing, if any.
+    /// Home-authored: only the departing slot's home relay retains the report
+    /// and seeds this; other relays receive it in the `SlotDeparted` frame. Folded
+    /// first-non-`None`-wins, exactly like `reachable_frame` — a result can never
+    /// be recorded after a slot's departure (reports ride only the live link,
+    /// which the departure closes), so once seeded it is final. Carried into the
+    /// [`DepartureNotice`] so a departure webhook is atomic terminal truth.
+    result: Option<ResultEcho>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,7 +1462,7 @@ impl DecisionMaker {
             departures: HashMap::new(),
             next_leave_seq: 0,
             observers: HashSet::new(),
-            reported_results: HashSet::new(),
+            results: HashMap::new(),
             sync: SyncTracker::default(),
         }
     }
@@ -2013,8 +2026,9 @@ impl DecisionMaker {
         // a later promotion can re-derive this slot's leave. This merges the
         // slot's own live frame into the record and retires the slot from
         // `slots`; the record is the single frame source from here on. Passing
-        // `None` for the ceiling preserves whatever the home already authored.
-        self.note_departure(slot, None, None, reason);
+        // `None` for the ceiling and the result preserves whatever the home
+        // already authored.
+        self.note_departure(slot, None, None, None, reason);
 
         if self.authority != Authority::SelfRelay {
             return None;
@@ -2054,29 +2068,46 @@ impl DecisionMaker {
     /// frame at its home relay (`None` if it never produced a framed turn); it is
     /// max-merged with this relay's own observation of the slot, so whichever
     /// view is fuller wins. `reachable` is the home-authored apply-frame ceiling
-    /// (single-sourced, first non-`None` kept). The reason keeps the first
-    /// observation.
+    /// (single-sourced, first non-`None` kept). `result` is the departing slot's
+    /// home-authored end-of-game result echo (single-sourced, first non-`None`
+    /// kept). The reason keeps the first observation.
     pub fn record_departure(
         &mut self,
         slot: SlotId,
         last_frame: Option<GameFrameCount>,
         reachable: Option<u32>,
+        result: Option<ResultEcho>,
         reason: u32,
     ) {
-        self.note_departure(slot, last_frame, reachable, reason);
+        self.note_departure(slot, last_frame, reachable, result, reason);
     }
 
-    /// Records that `slot` reported an end-of-game result, returning whether this
-    /// was the **first** report from the slot. A repeat returns `false` and
-    /// records nothing new, so the caller fires at most one result notice per
-    /// slot (anti-flooding, the same first-writer-wins posture as
-    /// [`observe_leave`](Self::observe_leave)). The report does not retire the
-    /// slot's live state — a result is not a departure — so `slot_frame` and
-    /// `session_frame` still read the slot's framed history when the caller
-    /// stamps the notice.
+    /// Records the end-of-game result `slot` reported, returning whether this was
+    /// the **first** report from the slot. A repeat returns `false` and keeps the
+    /// first `echo`, so the caller fires at most one result notice per slot
+    /// (anti-flooding, the same first-writer-wins posture as
+    /// [`observe_leave`](Self::observe_leave)). The full `echo` is retained so the
+    /// slot's departure record and `SlotDeparted` frame can embed it when the slot
+    /// leaves. The report does not retire the slot's live state — a result is not
+    /// a departure — so the caller's frame stamps still read the slot's framed
+    /// history.
     #[must_use]
-    pub fn record_result(&mut self, slot: SlotId) -> bool {
-        self.reported_results.insert(slot)
+    pub fn record_result(&mut self, slot: SlotId, echo: ResultEcho) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.results.entry(slot) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(vacant) => {
+                vacant.insert(echo);
+                true
+            }
+        }
+    }
+
+    /// The result `slot` reported for this session, if any — read on the slot's
+    /// home relay when the slot departs, to seed the departure record and the
+    /// `SlotDeparted` frame with the retained result.
+    pub fn result_for(&self, slot: SlotId) -> Option<&ResultEcho> {
+        self.results.get(&slot)
     }
 
     /// Caches a synced leave this relay observed authored by the session's
@@ -2140,18 +2171,25 @@ impl DecisionMaker {
     }
 
     /// This relay's known leave state for re-announcing to a freshly (re)joined
-    /// mesh link: every recorded departure (slot, last frame, reason) and every
-    /// cached leave, unconditionally. A redialed link starts knowing nothing, so
-    /// resending these lets it reconverge — all idempotent (dedup by slot on
-    /// receipt). Nothing is filtered as "already applied everywhere": the relay
-    /// cannot tell that state apart from "everyone still stalled waiting" (see
-    /// [`drain_handoff_leaves`](Self::drain_handoff_leaves)), and the cost of a
-    /// redundant re-announce is a few deduped frames, bounded by the slot count.
+    /// mesh link: every recorded departure (slot, last frame, reachable ceiling,
+    /// embedded result, reason) and every cached leave, unconditionally. A redialed
+    /// link starts knowing nothing, so resending these lets it reconverge — all
+    /// idempotent (dedup by slot on receipt). Nothing is filtered as "already
+    /// applied everywhere": the relay cannot tell that state apart from "everyone
+    /// still stalled waiting" (see [`drain_handoff_leaves`](Self::drain_handoff_leaves)),
+    /// and the cost of a redundant re-announce is a few deduped frames, bounded by
+    /// the slot count.
     #[allow(clippy::type_complexity)]
     fn leave_reconcile(
         &self,
     ) -> (
-        Vec<(SlotId, Option<GameFrameCount>, Option<u32>, u32)>,
+        Vec<(
+            SlotId,
+            Option<GameFrameCount>,
+            Option<u32>,
+            Option<ResultEcho>,
+            u32,
+        )>,
         Vec<LeaveDirective>,
     ) {
         let departures = self
@@ -2162,6 +2200,7 @@ impl DecisionMaker {
                     *slot,
                     departure.last_frame,
                     departure.reachable_frame,
+                    departure.result.clone(),
                     departure.reason,
                 )
             })
@@ -2187,6 +2226,12 @@ impl DecisionMaker {
     /// keeps the first non-`None` value seen and never recomputes or merges it
     /// (a later `decide_leave`/re-announce passing `None` must not clobber it).
     ///
+    /// `result` is the departing slot's home-authored end-of-game result echo,
+    /// single-sourced and kept the same first-non-`None`-wins way as `reachable`
+    /// (the home seeds it from the report it retained; a peer receives it in the
+    /// `SlotDeparted` frame). A result can never arrive after a slot's departure,
+    /// so once seeded it never changes.
+    ///
     /// Removing the slot from `slots` here — on *every* relay, not just the
     /// slot's home — is what lets `session_frame()` follow the survivors: a
     /// departed slot's frozen frame left in place would pin the minimum for the
@@ -2199,6 +2244,7 @@ impl DecisionMaker {
         slot: SlotId,
         last_frame: Option<GameFrameCount>,
         reachable: Option<u32>,
+        result: Option<ResultEcho>,
         reason: u32,
     ) {
         use std::collections::hash_map::Entry;
@@ -2216,11 +2262,13 @@ impl DecisionMaker {
                 };
                 // First non-`None` wins — single-sourced from the home.
                 record.reachable_frame = record.reachable_frame.or(reachable);
+                record.result = record.result.take().or(result);
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(Departure {
                     last_frame: merged,
                     reachable_frame: reachable,
+                    result,
                     reason,
                 });
             }
@@ -2429,6 +2477,16 @@ pub enum RelayNotice {
     Desync(DesyncNotice),
     /// A client reported its end-of-game result, forwarded opaque.
     Result(ResultNotice),
+    /// This relay tore down its last local state for a session. Fired after the
+    /// session's departures have already gone up this same ordered channel, so
+    /// the coordinator — which waits for every serving relay to report it — can
+    /// treat a delivered close as proof no earlier notice is still in flight.
+    SessionClosed {
+        /// The tenant the session belongs to.
+        tenant: TenantId,
+        /// The session this relay closed.
+        session: SessionId,
+    },
 }
 
 /// A registry of per-session decision-makers, one per session this relay is
@@ -2516,6 +2574,11 @@ impl DecisionMakers {
         self.emit_notice(RelayNotice::Result(notice));
     }
 
+    /// Fires a session-closed notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_session_closed(&self, tenant: TenantId, session: SessionId) {
+        self.emit_notice(RelayNotice::SessionClosed { tenant, session });
+    }
+
     /// Records `key`'s correlation ids from a coordinator descriptor, replacing
     /// whatever was recorded before. Called on every descriptor apply (not just
     /// the first), so a changed descriptor's refs replace rather than
@@ -2541,6 +2604,17 @@ impl DecisionMakers {
     /// `key`'s correlation ids, if a coordinator descriptor ever carried them.
     fn session_refs(&self, key: &SessionKey) -> Option<SessionExternalRefs> {
         self.refs.lock().get(key).cloned()
+    }
+
+    /// The end-of-game result embedded in `slot`'s departure record for `key`, if
+    /// the relay has a maker holding a departure that carried one. Read while
+    /// building a [`DepartureNotice`] so the notice embeds the same result every
+    /// relay folded into its record.
+    fn departure_result(&self, key: &SessionKey, slot: SlotId) -> Option<ResultEcho> {
+        self.makers
+            .lock()
+            .get(key)
+            .and_then(|maker| maker.departures.get(&slot).and_then(|d| d.result.clone()))
     }
 }
 
@@ -2589,6 +2663,11 @@ fn departure_notice(
         leave_seq: leave.leave_seq,
         external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
         external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        // The result this slot reported before departing, folded into its
+        // departure record (home-seeded, carried across the mesh). Embedding it
+        // makes the departure webhook atomic terminal truth; `None` proves the
+        // slot departed without ever reporting.
+        result: registry.departure_result(key, slot),
     }
 }
 
@@ -2605,10 +2684,7 @@ fn desync_notice(
     divergence: &SyncDivergence,
 ) -> DesyncNotice {
     let refs = registry.session_refs(key);
-    let detected_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let detected_at_ms = now_ms();
     DesyncNotice {
         tenant: key.tenant.clone(),
         session: key.session,
@@ -2628,38 +2704,41 @@ fn desync_notice(
     }
 }
 
-/// Builds the result notice for a slot's first end-of-game report: carries the
-/// opaque payload byte-for-byte, a wall-clock arrival stamp, and the relay's own
-/// view of where the report landed in the game timeline (the session's consensus
-/// frame and the reporting slot's newest observed frame, captured by the caller
-/// while it held the maker). Stamps the session's `external_id` and the slot's
-/// `external_ref` the same way (and from the same store) as [`departure_notice`],
-/// so the notice is self-describing across a coordinator restart. The timestamp
-/// is read here rather than in the caller, mirroring [`desync_notice`].
+/// Builds the standalone result notice from the retained result `echo` a slot
+/// reported: the opaque payload byte-for-byte, the wall-clock arrival stamp, and
+/// the relay's view of where the report landed in the game timeline — all
+/// captured into the echo by [`record_result`] when the report arrived, and the
+/// same echo that will later ride the slot's departure. Stamps the session's
+/// `external_id` and the slot's `external_ref` the same way (and from the same
+/// store) as [`departure_notice`], so the notice is self-describing across a
+/// coordinator restart.
 fn result_notice(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
-    payload: Vec<u8>,
-    session_frame: Option<GameFrameCount>,
-    slot_frame: Option<GameFrameCount>,
+    echo: ResultEcho,
 ) -> ResultNotice {
     let refs = registry.session_refs(key);
-    let arrival_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
     ResultNotice {
         tenant: key.tenant.clone(),
         session: key.session,
         slot,
         external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
         external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
-        payload,
-        arrival_ms,
-        session_frame: session_frame.map(|f| f.0),
-        slot_frame: slot_frame.map(|f| f.0),
+        payload: echo.payload,
+        arrival_ms: echo.arrival_ms,
+        session_frame: echo.session_frame,
+        slot_frame: echo.slot_frame,
     }
+}
+
+/// The current wall clock in unix epoch milliseconds — a result report's or a
+/// desync's `arrival_ms`/`detected_at_ms` stamp.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Creates a decision-maker for `key`, or reconciles an existing one with the
@@ -2757,10 +2836,11 @@ pub fn record_departure(
     slot: SlotId,
     last_frame: Option<GameFrameCount>,
     reachable: Option<u32>,
+    result: Option<ResultEcho>,
     reason: u32,
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.record_departure(slot, last_frame, reachable, reason);
+        maker.record_departure(slot, last_frame, reachable, result, reason);
     }
 }
 
@@ -2771,30 +2851,43 @@ pub fn record_departure(
 /// serve). `slot` is the authenticated connection's slot the report arrived on,
 /// never a value from the payload; `payload` is forwarded opaque.
 ///
-/// The notice captures the relay's own view of *when* the report landed: the
-/// session's consensus frame and the reporting slot's newest observed frame at
-/// arrival, both read here while the maker is locked (the report does not retire
-/// the slot, so its framed history is still live).
+/// The retained result echo captures the relay's own view of *when* the report
+/// landed — a wall-clock arrival stamp plus the session's consensus frame and the
+/// reporting slot's newest observed frame at arrival, all read here while the
+/// maker is locked (the report does not retire the slot, so its framed history is
+/// still live). The same echo is retained on the maker so the slot's later
+/// departure embeds it into the departure notice; the standalone notice fired
+/// here is the early, redundant delivery.
 pub fn record_result(registry: &DecisionMakers, key: &SessionKey, slot: SlotId, payload: Vec<u8>) {
-    let frames = {
+    let echo = {
         let mut makers = registry.lock();
         let Some(maker) = makers.get_mut(key) else {
             return;
         };
-        if !maker.record_result(slot) {
+        let echo = ResultEcho {
+            payload,
+            arrival_ms: now_ms(),
+            session_frame: maker.session_frame().map(|f| f.0),
+            slot_frame: maker.slot_frame(slot).map(|f| f.0),
+        };
+        if !maker.record_result(slot, echo.clone()) {
             return;
         }
-        (maker.session_frame(), maker.slot_frame(slot))
+        echo
     };
-    let (session_frame, slot_frame) = frames;
-    registry.notify_result(result_notice(
-        registry,
-        key,
-        slot,
-        payload,
-        session_frame,
-        slot_frame,
-    ));
+    registry.notify_result(result_notice(registry, key, slot, echo));
+}
+
+/// The end-of-game result `slot` reported for `key`, if the relay has a maker
+/// that retained one. Read on the reporting slot's home relay when the slot
+/// departs — *before* the departure is recorded — to seed both the departure
+/// record and the `SlotDeparted` frame the peers receive with the retained
+/// result. `None` when no maker exists or the slot never reported.
+pub fn result_for(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> Option<ResultEcho> {
+    registry
+        .lock()
+        .get(key)
+        .and_then(|maker| maker.result_for(slot).cloned())
 }
 
 /// The reachability ceiling for a leave's apply frame at `slot`'s departure —
@@ -2844,6 +2937,15 @@ pub fn slot_frame(
         .and_then(|maker| maker.slot_frame(slot))
 }
 
+/// Fires a session-closed notice up the coordinator connection: this relay has
+/// torn down its last local state for `key`. A no-op on a standalone relay (no
+/// notifier). Fire it *after* the session's departures have already been emitted
+/// on the same channel, so the coordinator's in-order dispatch treats a delivered
+/// close as proof no earlier notice for the session is still in flight.
+pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
+    registry.notify_session_closed(key.tenant.clone(), key.session);
+}
+
 /// This relay's known leave state for `key` — every recorded departure and every
 /// cached leave — for re-announcing to a freshly (re)joined mesh link. Empty when
 /// no maker exists. See [`DecisionMaker::leave_reconcile`].
@@ -2852,7 +2954,13 @@ pub fn leave_reconcile(
     registry: &DecisionMakers,
     key: &SessionKey,
 ) -> (
-    Vec<(SlotId, Option<GameFrameCount>, Option<u32>, u32)>,
+    Vec<(
+        SlotId,
+        Option<GameFrameCount>,
+        Option<u32>,
+        Option<ResultEcho>,
+        u32,
+    )>,
     Vec<LeaveDirective>,
 ) {
     registry
@@ -3715,6 +3823,9 @@ mod tests {
             RelayNotice::Departure(notice) => notice,
             RelayNotice::Desync(_) => panic!("expected a departure notice, got a desync"),
             RelayNotice::Result(_) => panic!("expected a departure notice, got a result"),
+            RelayNotice::SessionClosed { .. } => {
+                panic!("expected a departure notice, got a session-closed")
+            }
         }
     }
 
@@ -3818,7 +3929,15 @@ mod tests {
         // fires yet.
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), None, 3);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(50)),
+            None,
+            None,
+            3,
+        );
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
         // Promoted (the dead authority was the only other relay in the
@@ -3941,7 +4060,15 @@ mod tests {
             HashMap::from([(SlotId(1), "sb-user-9".to_owned())]),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-        record_departure(&registry, &k, SlotId(1), Some(GameFrameCount(50)), None, 3);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(50)),
+            None,
+            None,
+            3,
+        );
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
         let _ = set_authority(&registry, &k, Authority::SelfRelay);
@@ -4055,6 +4182,149 @@ mod tests {
 
         record_result(&registry, &k, SlotId(0), vec![0x01]);
         assert!(rx.try_recv().is_err(), "no maker, so no notice");
+    }
+
+    /// The retained result is embedded into the slot's departure notice: after a
+    /// slot reports, its later departure carries the same result (payload + stamps)
+    /// the standalone notice did, so the departure webhook is atomic terminal
+    /// truth. `result_for` exposes the retained echo for the home relay to seed the
+    /// departure record with.
+    #[test]
+    fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        observe_frame(&registry, &k, SlotId(1), GameFrameCount(52));
+
+        // Slot 1 reports its result: the standalone result notice fires, and the
+        // echo is retained.
+        record_result(&registry, &k, SlotId(1), vec![0xDE, 0xAD]);
+        let result_notice = recv_result(&mut rx);
+        assert_eq!(result_notice.payload, vec![0xDE, 0xAD]);
+
+        // Slot 1 departs — the home relay seeds the departure record with its
+        // retained result, exactly as `announce_departure` does.
+        let retained = result_for(&registry, &k, SlotId(1)).expect("the result is retained");
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(52)),
+            None,
+            Some(retained),
+            DROPPED,
+        );
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+
+        let departure = recv_departure(&mut rx);
+        let embedded = departure.result.expect("the departure carries the result");
+        assert_eq!(embedded.payload, vec![0xDE, 0xAD]);
+        assert_eq!(embedded.session_frame, Some(40));
+        assert_eq!(embedded.slot_frame, Some(52));
+        assert_eq!(embedded.arrival_ms, result_notice.arrival_ms);
+    }
+
+    /// A departure for a slot that never reported carries no embedded result —
+    /// `None` is the proof there provably never was one.
+    #[test]
+    fn a_departure_without_a_reported_result_embeds_none() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+
+        let departure = recv_departure(&mut rx);
+        assert!(
+            departure.result.is_none(),
+            "a slot that never reported has no embedded result",
+        );
+    }
+
+    /// The embedded result folds first-non-`None`-wins, exactly like the
+    /// reachability ceiling: whichever relay first seeds a result (the home) owns
+    /// it, and a later `record_departure` — a re-announce, or the home's own
+    /// `decide_leave` passing `None` — never clobbers it.
+    #[test]
+    fn an_embedded_result_folds_first_non_none_wins() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+
+        // A peer's `SlotDeparted` carries the home-authored result first.
+        let first = ResultEcho {
+            payload: vec![0x01, 0x02],
+            arrival_ms: 111,
+            session_frame: Some(40),
+            slot_frame: Some(50),
+        };
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(50)),
+            None,
+            Some(first.clone()),
+            DROPPED,
+        );
+
+        // A later re-announce carrying a *different* result must not overwrite it.
+        let second = ResultEcho {
+            payload: vec![0x09],
+            arrival_ms: 222,
+            session_frame: Some(41),
+            slot_frame: Some(51),
+        };
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(50)),
+            None,
+            Some(second),
+            DROPPED,
+        );
+
+        // A `None`-carrying re-record (the home's own `decide_leave`) preserves it.
+        record_departure(&registry, &k, SlotId(1), None, None, None, DROPPED);
+
+        let kept = registry
+            .lock()
+            .get(&k)
+            .unwrap()
+            .departures
+            .get(&SlotId(1))
+            .unwrap()
+            .result
+            .clone();
+        assert_eq!(kept, Some(first), "the first-seeded result wins");
+    }
+
+    /// `session_closed` fires one `SessionClosed` notice naming the tenant and
+    /// session, so the coordinator can count serving relays that have torn down.
+    #[test]
+    fn session_closed_fires_a_session_closed_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        session_closed(&registry, &k);
+        match rx.try_recv().expect("a queued notice") {
+            RelayNotice::SessionClosed { tenant, session } => {
+                assert_eq!(tenant, k.tenant);
+                assert_eq!(session, k.session);
+            }
+            other => panic!("expected a session-closed notice, got {other:?}"),
+        }
     }
 
     /// `set_session_refs` replaces rather than accumulates on a re-apply (a
@@ -4176,7 +4446,7 @@ mod tests {
     fn home_decide_leave(maker: &mut DecisionMaker, slot: u8) -> LeaveDirective {
         let last = maker.slot_frame(SlotId(slot));
         let ceiling = maker.reachable_frame(SlotId(slot));
-        maker.record_departure(SlotId(slot), last, ceiling, DROPPED);
+        maker.record_departure(SlotId(slot), last, ceiling, None, DROPPED);
         maker
             .decide_leave(SlotId(slot), DROPPED)
             .expect("a leave is scheduled")
@@ -4298,7 +4568,7 @@ mod tests {
 
         // The authority deciding directly from the record.
         let mut authority = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
-        authority.record_departure(SlotId(1), last, ceiling, DROPPED);
+        authority.record_departure(SlotId(1), last, ceiling, None, DROPPED);
         let a = authority
             .decide_leave(SlotId(1), DROPPED)
             .expect("the authority decides the leave");
@@ -4307,7 +4577,7 @@ mod tests {
         // A peer that only recorded the carried departure, then is promoted: the
         // handoff re-derivation reproduces the identical apply frame.
         let mut peer = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer);
-        peer.record_departure(SlotId(1), last, ceiling, DROPPED);
+        peer.record_departure(SlotId(1), last, ceiling, None, DROPPED);
         let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay);
         let p = leaves
             .iter()
@@ -4404,7 +4674,7 @@ mod tests {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         // The survivor's stamps run ahead of the departed slot's last frame.
         maker.observe_frame(SlotId(0), GameFrameCount(55));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(55)),
@@ -4429,7 +4699,7 @@ mod tests {
         // but decided nothing (decide_leave is a no-op on a non-authority).
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -4464,7 +4734,7 @@ mod tests {
         // the frame into the record and retires the slot), then runs its
         // teardown remove_slot — now a no-op for this slot.
         let read = maker.slot_frame(SlotId(1));
-        maker.record_departure(SlotId(1), read, None, DROPPED);
+        maker.record_departure(SlotId(1), read, None, None, DROPPED);
         assert_eq!(
             maker.slot_frame(SlotId(1)),
             None,
@@ -4588,7 +4858,7 @@ mod tests {
 
         // The peer's SlotDeparted carries the home relay's fuller view (60): the
         // departure record max-merges it over our lagging 30.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), None, None, DROPPED);
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 61,
@@ -4605,7 +4875,7 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(80));
 
         // A stale SlotDeparted carries a lower frame (55): the merge keeps 70.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), None, None, DROPPED);
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 71,
@@ -4618,7 +4888,7 @@ mod tests {
     fn slot_departed_ingest_records_without_deciding_on_a_non_authority() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -4643,7 +4913,7 @@ mod tests {
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
 
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(60)),
@@ -4658,7 +4928,7 @@ mod tests {
     fn observe_frame_ignores_a_departed_slot() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
 
         maker.observe_frame(SlotId(1), GameFrameCount(52));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -4675,7 +4945,7 @@ mod tests {
     fn conditions_ingest_does_not_resurrect_a_departed_slot() {
         let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
 
         let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -4698,7 +4968,7 @@ mod tests {
         // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, DROPPED);
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         let leave = LeaveDirective {
             slot: 1,
             reason: DROPPED,
@@ -4948,7 +5218,7 @@ mod tests {
 
         // Ordinal 1: slot 1 reports, slot 2 departs before ever reporting it.
         feed(&mut m, 1, 1, SYNC_A);
-        m.record_departure(SlotId(2), None, None, DROPPED);
+        m.record_departure(SlotId(2), None, None, None, DROPPED);
         assert!(!m.sync.members.contains_key(&SlotId(2)));
 
         // Slot 0 continues; ordinal 1 completes on the two survivors once the

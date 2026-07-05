@@ -319,6 +319,16 @@ impl MeshControl {
         publish_desired_peers(&mut inner);
     }
 
+    /// Closes the named slots' links for a session — the coordinator's reap
+    /// directive. Fires each slot's shutdown signal in the roster; a slot this
+    /// relay does not currently hold is a no-op. The closed link then flows through
+    /// the ordinary link-death path (a departure notice, a synced leave), which is
+    /// what makes the reap self-resolving. A no-op against the empty default roster
+    /// (a control plane with no turn path).
+    pub fn close_slots(&self, key: &SessionKey, slots: &[rally_point_proto::ids::SlotId]) {
+        crate::routing::close_slots(&self.sessions, key, slots);
+    }
+
     /// Ends a session's mesh membership: destroys its decision-maker, forgets the
     /// desired set, and reconciles its peers, which leaves each link that was
     /// joined. Idempotent — ending an unknown session is a no-op.
