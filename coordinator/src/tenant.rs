@@ -67,6 +67,15 @@ struct TenantSigningKey {
     /// configured. Set out of band via [`set_notify`] (enrollment leaves it
     /// `None`); absent = departure notifications off for the tenant.
     notify: Option<NotifyConfig>,
+    /// The tenant's inbound-request verifying key: the public half of the
+    /// Ed25519 keypair the app server signs its coordinator-bound requests with
+    /// (`x-rp2-signature`). Distinct from `pair` (this coordinator's own
+    /// token/webhook signing key) — that signs coordinator→tenant; this
+    /// verifies tenant→coordinator, and the coordinator holds only its public
+    /// half. Set out of band via [`set_client_pubkey`] (enrollment leaves it
+    /// `None`); a tenant without one cannot make an authenticated request, so
+    /// inbound verification fails closed.
+    client_pubkey: Option<[u8; PUBLIC_KEY_LEN]>,
 }
 
 impl std::fmt::Debug for TenantSigningKey {
@@ -155,6 +164,7 @@ pub fn enroll_from_pkcs8(
             pair: Arc::new(pair),
             bounds,
             notify: None,
+            client_pubkey: None,
         },
     );
     Ok(pubkey)
@@ -182,6 +192,63 @@ pub fn notify_config(store: &TenantStore, tenant: &TenantId) -> Option<NotifyCon
         .lock()
         .get(tenant)
         .and_then(|t| t.notify.clone())
+}
+
+/// Sets a tenant's inbound-request verifying key (the public half of the app
+/// server's request-signing keypair), if the tenant is enrolled. Kept separate
+/// from enrollment — like [`set_notify`] — so the many `enroll*` call sites are
+/// unaffected: the dev flow enrolls the signing key first, then sets this from
+/// its CLI flag. Returns whether the tenant existed (a no-op on an unknown
+/// tenant).
+pub fn set_client_pubkey(
+    store: &TenantStore,
+    tenant: &TenantId,
+    client_pubkey: [u8; PUBLIC_KEY_LEN],
+) -> bool {
+    match store.tenants.lock().get_mut(tenant) {
+        Some(entry) => {
+            entry.client_pubkey = Some(client_pubkey);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Looks up a tenant's inbound-request verifying key, or `None` when the tenant
+/// is unknown or has no client key set. `None` fails inbound request auth
+/// closed — an unenrolled or client-key-less tenant cannot make an
+/// authenticated request.
+pub fn client_pubkey(store: &TenantStore, tenant: &TenantId) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    store
+        .tenants
+        .lock()
+        .get(tenant)
+        .and_then(|t| t.client_pubkey)
+}
+
+/// Derives the Ed25519 verifying (public) key from a raw 32-byte private seed.
+///
+/// The interchange format for a tenant client key is the raw 32-byte seed as
+/// hex, not a PKCS#8 document: `ring` accepts only PKCS#8 v2 and Node's crypto
+/// exports only v1, and whether either imports the other's form is
+/// version-dependent — the raw seed is the one representation both sides build
+/// a keypair from without ASN.1 version drift. The app server holds the seed
+/// (`SB_RP2_CLIENT_KEY`) and signs with it; the coordinator stores only the
+/// public half this returns and verifies against it.
+pub fn client_pubkey_from_seed(seed: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], KeyError> {
+    let pair = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| KeyError::InvalidSeed)?;
+    Ok(pair.public_key().as_ref().try_into().unwrap())
+}
+
+/// Generates a fresh 32-byte Ed25519 private seed for a dev tenant's client
+/// key, from the same `ring` system RNG the signing-key generation uses. The
+/// dev flow logs this seed (hex) for the app server's `SB_RP2_CLIENT_KEY` and
+/// stores only its derived public half.
+pub fn generate_client_key_seed() -> [u8; 32] {
+    let rng = SystemRandom::new();
+    let seed: ring::rand::Random<[u8; 32]> =
+        ring::rand::generate(&rng).expect("the system RNG can produce 32 bytes");
+    seed.expose()
 }
 
 /// Looks up a tenant's signing key, returning the `kid` and verifying key.
@@ -297,6 +364,10 @@ pub enum KeyError {
     /// The provided PKCS#8 bytes are not a valid Ed25519 keypair.
     #[error("invalid PKCS#8 key material")]
     InvalidPkcs8,
+    /// The provided bytes are not a valid Ed25519 private seed (must be exactly
+    /// 32 bytes).
+    #[error("invalid Ed25519 seed")]
+    InvalidSeed,
     /// The token could not be encoded (oversized kid or tenant string).
     #[error("token encoding error: {0}")]
     Token(rally_point_proto::token::TokenError),
@@ -493,5 +564,60 @@ mod tests {
     fn sign_webhook_for_an_unenrolled_tenant_returns_none() {
         let store = new_store();
         assert!(sign_webhook(&store, &TenantId("nope".to_owned()), b"anything").is_none());
+    }
+
+    // RFC 8032 §7.1 test vector 1: the same seed → public key pair pinned in the
+    // app-side key tests (app/game/netcode-v2-keys.test.ts) and the game's
+    // credentials.rs, reused here so the client-key seed derivation is checked
+    // against a known-answer vector rather than only round-tripping itself.
+    const RFC8032_SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    const RFC8032_PUBLIC_HEX: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    #[test]
+    fn client_pubkey_from_seed_matches_the_rfc8032_vector() {
+        let derived = client_pubkey_from_seed(&RFC8032_SEED).unwrap();
+        assert_eq!(hex::encode(derived), RFC8032_PUBLIC_HEX);
+    }
+
+    #[test]
+    fn client_pubkey_from_seed_rejects_a_wrong_length_seed() {
+        assert!(matches!(
+            client_pubkey_from_seed(&[0u8; 31]),
+            Err(KeyError::InvalidSeed)
+        ));
+    }
+
+    #[test]
+    fn set_and_get_client_pubkey_roundtrips() {
+        let (store, _, tenant) = store_with_tenant();
+
+        // Absent until set.
+        assert!(client_pubkey(&store, &tenant).is_none());
+
+        let pubkey = client_pubkey_from_seed(&RFC8032_SEED).unwrap();
+        assert!(set_client_pubkey(&store, &tenant, pubkey));
+        assert_eq!(client_pubkey(&store, &tenant), Some(pubkey));
+
+        // A no-op (and no panic) on an unknown tenant.
+        assert!(!set_client_pubkey(
+            &store,
+            &TenantId("nope".to_owned()),
+            pubkey
+        ));
+        assert!(client_pubkey(&store, &TenantId("nope".to_owned())).is_none());
+    }
+
+    #[test]
+    fn generate_client_key_seed_derives_a_valid_pubkey() {
+        // A generated seed is a usable Ed25519 seed: it derives a 32-byte key,
+        // and two calls differ (the RNG isn't stuck).
+        let seed = generate_client_key_seed();
+        assert!(client_pubkey_from_seed(&seed).is_ok());
+        assert_ne!(seed, generate_client_key_seed());
     }
 }

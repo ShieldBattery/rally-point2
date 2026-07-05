@@ -32,18 +32,39 @@
 //!   both directions.
 //!
 //! `session/create` is JSON over HTTP/1.1; the control endpoint upgrades to a
-//! WebSocket. App-server auth on `session/create` is still open — that is a
-//! separate per-tenant credential, not the relay bootstrap secret.
+//! WebSocket.
+//!
+//! # Inbound request authentication (tenant → coordinator)
+//!
+//! Every tenant-scoped *mutating* endpoint — `POST /session/create` and `POST
+//! /sessions/alive` — requires an Ed25519 request signature from the tenant's
+//! own client key, the mirror image of the coordinator→tenant webhook
+//! signature. The app server signs each request with its client key
+//! (`SB_RP2_CLIENT_KEY`); the coordinator verifies against the public half it
+//! holds (`client_pubkey`, set at enrollment). Headers: `x-rp2-timestamp`
+//! (unix *seconds*) + `x-rp2-signature` (hex) over `rp2-request-v1:<ts>:<METHOD
+//! uppercased>:<path as sent>:<raw body>`. Binding method + path stops a
+//! signed body being replayed against a different endpoint. Verification is
+//! **required** (fail closed): a missing/invalid signature, a stale timestamp
+//! (outside a ±5 minute window), or a tenant with no enrolled client key all
+//! 401 without revealing which check failed. There is deliberately **no
+//! nonce** — a request captured inside the window can be replayed, but at worst
+//! that mints a garbage session that is reaped, and the transport is HTTPS in
+//! prod / loopback in dev, so a captured-in-window replay is not a meaningful
+//! threat. `GET /tenant/:tenant/pubkey` stays unsigned (bootstrap: it hands out
+//! public key material only, the same posture as `/session/create` returning
+//! relay certs).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -52,6 +73,7 @@ use rally_point_proto::control::{
     SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::descriptors::SlotClose;
@@ -159,12 +181,32 @@ pub fn router(state: CoordinatorState) -> Router {
 
 /// Creates a game session: assigns relays, mints tokens.
 ///
+/// Authenticated by the tenant's request signature (see the module docs): the
+/// body is deserialized to learn the tenant, then the signature is verified
+/// against that tenant's enrolled `client_pubkey` before any work is done.
+/// Reads the raw body (rather than a `Json` extractor) so the signature covers
+/// exactly the bytes on the wire.
+///
 /// Token expiry is set to `u64::MAX` for now (dev/loopback). Production sets
 /// it to the game session lifetime plus margin.
 async fn create_session(
     State(state): State<CoordinatorState>,
-    Json(request): Json<SessionRequest>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<SessionResponse>, StatusCode> {
+    let request: SessionRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    )?;
+
     // Capture the tenant and the player/observer slot split before the request is
     // consumed, to register the session's lifecycle accounting after setup.
     let tenant = request.tenant.clone();
@@ -243,12 +285,28 @@ struct SessionsAliveResponse {
 /// omitted (gone/unknown) ones — the backstop against coordinator death, in place
 /// of a blind per-session timer.
 ///
-/// Same open auth posture as `POST /session/create`: an app-server credential, not
-/// the relay bootstrap secret. Rejects an over-cap list rather than scan it.
+/// Same tenant request-signature auth as `POST /session/create` (see the module
+/// docs): the body is deserialized to learn the tenant, then verified against
+/// that tenant's enrolled `client_pubkey` before the probe. Rejects an over-cap
+/// list rather than scan it.
 async fn sessions_alive(
     State(state): State<CoordinatorState>,
-    Json(request): Json<SessionsAliveRequest>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<SessionsAliveResponse>, StatusCode> {
+    let request: SessionsAliveRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    )?;
+
     if request.sessions.len() > MAX_LIVENESS_SESSIONS {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -699,6 +757,95 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The domain-separation prefix on a tenant request signature, the mirror of
+/// the webhook's `rp2-webhook-v1:`. Binds a signature to the request-auth
+/// scheme so it can never be confused with a webhook signature (opposite
+/// direction) or a player-token signature made by a different key.
+const REQUEST_SIG_DOMAIN: &str = "rp2-request-v1:";
+/// Header carrying the request signing timestamp: unix epoch *seconds*, decimal
+/// (the webhook direction uses milliseconds; these are independent schemes).
+const REQUEST_TIMESTAMP_HEADER: &str = "x-rp2-timestamp";
+/// Header carrying the Ed25519 request signature: lowercase hex of the 64-byte
+/// signature over the domain-separated, method+path-bound, timestamped message.
+const REQUEST_SIGNATURE_HEADER: &str = "x-rp2-signature";
+/// How far a request's `x-rp2-timestamp` may drift from now (in either
+/// direction) before it is rejected as stale/replayed. Matches the consumer
+/// window the app server enforces on webhook timestamps.
+const REQUEST_TIMESTAMP_WINDOW_SECS: u64 = 5 * 60;
+
+/// The bytes a tenant request signature covers: `rp2-request-v1:<ts>:<METHOD>:
+/// <path>:<raw body>`. The method (uppercased — `Method::as_str` already yields
+/// the canonical uppercase form for standard methods) and the path-as-sent are
+/// bound in so a captured, validly-signed body cannot be replayed against a
+/// different endpoint or verb.
+fn build_request_message(timestamp: &str, method: &Method, path: &str, body: &[u8]) -> Vec<u8> {
+    let method = method.as_str();
+    let mut message = Vec::with_capacity(
+        REQUEST_SIG_DOMAIN.len() + timestamp.len() + method.len() + path.len() + body.len() + 3,
+    );
+    message.extend_from_slice(REQUEST_SIG_DOMAIN.as_bytes());
+    message.extend_from_slice(timestamp.as_bytes());
+    message.push(b':');
+    message.extend_from_slice(method.as_bytes());
+    message.push(b':');
+    message.extend_from_slice(path.as_bytes());
+    message.push(b':');
+    message.extend_from_slice(body);
+    message
+}
+
+/// Verifies a tenant-scoped mutating request's signature, failing closed with
+/// `401` on any problem — a missing/unparseable timestamp, a stale timestamp
+/// (outside [`REQUEST_TIMESTAMP_WINDOW_SECS`]), a missing/non-hex signature, a
+/// tenant with no enrolled `client_pubkey`, or a signature that does not verify.
+/// Every failure maps to the same `UNAUTHORIZED` so the response never reveals
+/// which check failed. `ring`'s `verify` is itself constant-time.
+///
+/// The signed message binds the request method and the path as sent (see
+/// [`build_request_message`]); `path` uses the full path-and-query so a future
+/// query-carrying endpoint signs what is on the wire (today's endpoints carry
+/// none).
+fn verify_tenant_request(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), StatusCode> {
+    let timestamp = headers
+        .get(REQUEST_TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let ts_secs: u64 = timestamp.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now_secs.abs_diff(ts_secs) > REQUEST_TIMESTAMP_WINDOW_SECS {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let signature = headers
+        .get(REQUEST_SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|hex_str| hex::decode(hex_str).ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let client_pubkey =
+        tenant::client_pubkey(setup.tenants(), tenant).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    let message = build_request_message(timestamp, method, path, body);
+
+    UnparsedPublicKey::new(&ED25519, client_pubkey.as_ref())
+        .verify(&message, &signature)
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -710,7 +857,55 @@ mod tests {
     use rally_point_proto::ids::{RelayId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, KeyId};
     use rally_point_proto::version::ProtocolVersion;
+    use ring::signature::Ed25519KeyPair;
     use tower::ServiceExt;
+
+    /// A fixed dev-style client seed for the `sb-test` tenant: its public half
+    /// is enrolled by [`state_with_relay_and_tenant`], and [`sign_request`]
+    /// signs with it so a request verifies. Not a real secret — a test fixture.
+    const TEST_CLIENT_SEED: [u8; 32] = [0x11; 32];
+
+    /// Produces the `(x-rp2-timestamp, x-rp2-signature)` header pair a tenant
+    /// sends, signing the canonical request message with `seed` at the current
+    /// time. Mirrors the app server's `signCoordinatorRequest`.
+    fn sign_request(seed: &[u8], method: &str, path: &str, body: &[u8]) -> (String, String) {
+        let pair = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let message = build_request_message(
+            &ts,
+            &Method::from_bytes(method.as_bytes()).unwrap(),
+            path,
+            body,
+        );
+        let sig = pair.sign(&message);
+        (ts, hex::encode(sig.as_ref()))
+    }
+
+    /// Sends a signed `POST` to `app`, signing `body` with `seed` for `path`.
+    async fn signed_post(
+        app: Router,
+        path: &str,
+        body: &[u8],
+        seed: &[u8],
+    ) -> axum::http::Response<axum::body::Body> {
+        let (ts, sig) = sign_request(seed, "POST", path, body);
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header(REQUEST_TIMESTAMP_HEADER, ts)
+                .header(REQUEST_SIGNATURE_HEADER, sig)
+                .body(axum::body::Body::from(body.to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
 
     fn state_with_relay_and_tenant() -> CoordinatorState {
         let reg = registry::new_registry();
@@ -731,6 +926,10 @@ mod tests {
             BufferBounds::new(1, 6).unwrap(),
         )
         .unwrap();
+        // Enroll the tenant's inbound-request verifying key so signed requests
+        // authenticate.
+        let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
+        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
         let setup = crate::session::SessionSetup::new(reg, tenants);
         let lifecycle = Lifecycle::new(setup.clone());
         CoordinatorState {
@@ -771,6 +970,30 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
+        let body = serde_json::to_vec(&req).unwrap();
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(session.tokens.len(), 2);
+        assert_eq!(session.home_relay.relay_id, RelayId(1));
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_an_unsigned_request() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        };
+        // No signature headers at all — fails closed.
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -783,13 +1006,107 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_a_wrong_key_signature() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        // Signed with a key whose public half is not the tenant's enrolled one.
+        let resp = signed_post(app, "/session/create", &body, &[0x22; 32]).await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_a_stale_timestamp() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+
+        // A correctly-keyed signature, but over a timestamp far outside the
+        // replay window — a captured request replayed long after the fact.
+        let pair = Ed25519KeyPair::from_seed_unchecked(&TEST_CLIENT_SEED).unwrap();
+        let stale_ts = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - (REQUEST_TIMESTAMP_WINDOW_SECS + 60))
+            .to_string();
+        let message = build_request_message(&stale_ts, &Method::POST, "/session/create", &body);
+        let sig = hex::encode(pair.sign(&message).as_ref());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/session/create")
+                    .header("content-type", "application/json")
+                    .header(REQUEST_TIMESTAMP_HEADER, stale_ts)
+                    .header(REQUEST_SIGNATURE_HEADER, sig)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let session: SessionResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(session.tokens.len(), 2);
-        assert_eq!(session.home_relay.relay_id, RelayId(1));
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_request_signature_message_matches_the_cross_impl_vector() {
+        // The cross-implementation test vector, pinned byte-for-byte on both
+        // sides: the RFC 8032 §7.1 vector-1 seed, its derived public key, and a
+        // Node-produced Ed25519 signature (netcode-v2-service.test.ts pins the
+        // identical hex) over a fixed request message. Ed25519 is deterministic,
+        // so ring and Node produce the same 64 bytes for the same key+message —
+        // a drift in either side's message construction breaks one of the two
+        // tests.
+        const RFC8032_SEED: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        const EXPECTED_SIG_HEX: &str = "33a9c1ee42248bc26e7844a880a5c82512cf534b200937b607a2259b3ee8dded4f1cae21671be4f949145ac5888874c845024daae6e1c405dd9a051a12d4f209";
+
+        let pubkey = crate::tenant::client_pubkey_from_seed(&RFC8032_SEED).unwrap();
+        assert_eq!(
+            hex::encode(pubkey),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        );
+
+        // The exact canonical bytes both sides sign.
+        let message = build_request_message(
+            "1700000000",
+            &Method::POST,
+            "/session/create",
+            br#"{"tenant":"sb-dev"}"#,
+        );
+        assert_eq!(
+            message,
+            b"rp2-request-v1:1700000000:POST:/session/create:{\"tenant\":\"sb-dev\"}",
+        );
+
+        // The Node-produced signature verifies under ring.
+        let sig = hex::decode(EXPECTED_SIG_HEX).unwrap();
+        UnparsedPublicKey::new(&ED25519, pubkey.as_ref())
+            .verify(&message, &sig)
+            .expect("the cross-impl signature verifies under ring");
     }
 
     #[test]
@@ -866,21 +1183,12 @@ mod tests {
         let app = router(state);
 
         // Probe a live id (5), an unknown id (6): only the live one is returned.
-        let req_body = serde_json::json!({ "tenant": "sb-test", "sessions": [5, 6] });
-        let resp = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/sessions/alive")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_vec(&req_body).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let req_body = serde_json::to_vec(&serde_json::json!({
+            "tenant": "sb-test",
+            "sessions": [5, 6],
+        }))
+        .unwrap();
+        let resp = signed_post(app.clone(), "/sessions/alive", &req_body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -892,29 +1200,31 @@ mod tests {
             "only the live session id is returned; gone/unknown are omitted",
         );
 
-        // An over-cap probe list is rejected rather than scanned.
+        // An over-cap probe list is rejected rather than scanned (the request is
+        // still signed — the cap check is past the auth gate).
         let too_many: Vec<u64> = (0..=(MAX_LIVENESS_SESSIONS as u64)).collect();
-        let big_body = serde_json::json!({ "tenant": "sb-test", "sessions": too_many });
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/sessions/alive")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_vec(&big_body).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let big_body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "sessions": too_many }))
+                .unwrap();
+        let resp = signed_post(app, "/sessions/alive", &big_body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
     async fn create_session_no_relays_returns_503() {
-        let setup =
-            crate::session::SessionSetup::new(registry::new_registry(), crate::tenant::new_store());
+        // A tenant enrolled (with a client key, so the request authenticates) but
+        // no relays registered — the 503 path is reached only past the auth gate.
+        let tenants = crate::tenant::new_store();
+        crate::tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
+        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
+        let setup = crate::session::SessionSetup::new(registry::new_registry(), tenants);
         let lifecycle = Lifecycle::new(setup.clone());
         let state = CoordinatorState {
             setup,
@@ -932,23 +1242,17 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/session/create")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let body = serde_json::to_vec(&req).unwrap();
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
-    async fn create_session_unenrolled_tenant_returns_400() {
+    async fn create_session_unenrolled_tenant_fails_auth() {
+        // A tenant with no enrolled client key cannot produce a verifiable
+        // signature, so auth fails closed (401) before the session logic's own
+        // unenrolled-tenant 400 is ever reached — auth precedes tenant lookup.
         let state = state_with_relay_and_tenant();
         let app = router(state);
 
@@ -958,19 +1262,12 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/session/create")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let body = serde_json::to_vec(&req).unwrap();
+        // Even a signature made by *some* valid key can't help: the tenant named
+        // in the body has no enrolled client_pubkey to verify against.
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
 
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

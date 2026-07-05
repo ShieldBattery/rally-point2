@@ -77,6 +77,21 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_TENANT_KEY", requires = "dev_tenant")]
     tenant_key: Option<String>,
 
+    /// Hex-encoded raw 32-byte Ed25519 *seed* for the dev tenant's inbound
+    /// request-signing key — either a file path containing the hex or the hex
+    /// itself. This is the app server's client key (`SB_RP2_CLIENT_KEY`); the
+    /// coordinator derives and stores only its public half to verify inbound
+    /// `POST /session/create` / `POST /sessions/alive` signatures. Pins it so
+    /// the app server's key stays valid across coordinator restarts. If absent,
+    /// a fresh seed is generated and logged so it can be fed to the app server
+    /// (and pinned next run). Dev-only, same shape as `--tenant-key`.
+    #[arg(
+        long,
+        env = "COORDINATOR_DEV_TENANT_CLIENT_KEY",
+        requires = "dev_tenant"
+    )]
+    dev_tenant_client_key: Option<String>,
+
     /// Webhook URL the coordinator POSTs game-event notifications (player
     /// departures and desyncs) to for the dev tenant (e.g.
     /// `http://localhost:5555/webhooks/netcode-v2/game-events`, or `https://...` —
@@ -192,6 +207,33 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
         }
     };
 
+    // Derive and store the dev tenant's inbound-request verifying key (the
+    // public half of the app server's client key). Required: inbound request
+    // auth fails closed, so a dev tenant with no client key could never mint a
+    // session. A pinned seed (`--dev-tenant-client-key`) keeps the app server's
+    // key valid across restarts; otherwise a fresh seed is generated and logged
+    // for the app server's `SB_RP2_CLIENT_KEY`.
+    let client_pubkey = match &cli.dev_tenant_client_key {
+        Some(input) => {
+            let seed = read_hex_input(input, "dev tenant client key")?;
+            tenant::client_pubkey_from_seed(&seed)
+                .context("deriving dev tenant client pubkey from --dev-tenant-client-key")?
+        }
+        None => {
+            let seed = tenant::generate_client_key_seed();
+            let pubkey = tenant::client_pubkey_from_seed(&seed)
+                .expect("a freshly generated 32-byte seed is a valid Ed25519 seed");
+            tracing::warn!(
+                client_key_seed_hex = %hex::encode(seed),
+                "generated a dev tenant client key — set the app server's \
+                 SB_RP2_CLIENT_KEY to this seed hex, and pass --dev-tenant-client-key \
+                 <seed_hex> to keep it stable across restarts",
+            );
+            pubkey
+        }
+    };
+    tenant::set_client_pubkey(tenants, &tenant_id, client_pubkey);
+
     // Wire the dev tenant's departure webhook, if configured. `--dev-notify-url`
     // requires `--dev-tenant` (clap), so this only runs for the enrolled tenant.
     if let Some(url) = &cli.dev_notify_url {
@@ -207,7 +249,9 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
         tenant = %cli.tenant,
         kid = %cli.kid,
         public_key_hex = %hex::encode(verifying_key),
-        "dev tenant enrolled — feed public_key_hex to the relay's --tenant-pubkey",
+        client_pubkey_hex = %hex::encode(client_pubkey),
+        "dev tenant enrolled — feed public_key_hex to the relay's --tenant-pubkey; the app \
+         server signs requests with the client key (SB_RP2_CLIENT_KEY)",
     );
     Ok(())
 }
