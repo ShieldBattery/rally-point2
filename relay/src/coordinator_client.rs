@@ -39,13 +39,14 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rally_point_proto::control::{
-    CoordinatorToRelay, DepartureNotice, RelayHello, RelayToCoordinator, SessionDescriptor,
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
+use crate::consensus::RelayNotice;
 use crate::mesh_control::MeshControl;
 use crate::routing::SessionKey;
 
@@ -92,25 +93,25 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// `relay_hello` is the relay's identity + reachable address, sent as the first
 /// frame on each connection to enroll into the coordinator's registry.
 ///
-/// `departures` is the drain end of the decision-maker registry's notifier: the
-/// leave sites push a [`DepartureNotice`] onto it when a synced leave first
-/// enters the cache, and this loop forwards each up the control connection. The
-/// channel is unbounded and held across reconnects, so a departure decided while
-/// the coordinator is down goes out on the next successful connection rather than
-/// being lost.
+/// `notices` is the drain end of the decision-maker registry's notifier: the
+/// leave sites push a departure and the desync comparator pushes a desync (both
+/// as [`RelayNotice`]) onto it, and this loop forwards each up the control
+/// connection. The channel is unbounded and held across reconnects, so a notice
+/// decided while the coordinator is down goes out on the next successful
+/// connection rather than being lost.
 pub async fn run_descriptor_subscriber(
     coordinator_url: String,
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
-    departures: UnboundedReceiver<DepartureNotice>,
+    notices: UnboundedReceiver<RelayNotice>,
 ) {
     run_descriptor_subscriber_with(
         coordinator_url,
         relay_hello,
         bootstrap_secret,
         control,
-        departures,
+        notices,
         RECONNECT_DELAY,
         HEARTBEAT_INTERVAL,
     )
@@ -124,18 +125,18 @@ pub async fn run_descriptor_subscriber_with(
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
-    mut departures: UnboundedReceiver<DepartureNotice>,
+    mut notices: UnboundedReceiver<RelayNotice>,
     reconnect_delay: Duration,
     heartbeat_interval: Duration,
 ) {
     // Kept across reconnects: a session removed while disconnected is left when
     // the next connection's full-set re-sync arrives without it.
     let mut applied: HashSet<SessionKey> = HashSet::new();
-    // The one departure notice pulled from the channel but not yet confirmed
-    // sent. Held across reconnects so a notice decided (or half-sent) while the
-    // coordinator link was down is flushed first on the next connection rather
-    // than lost. The rest stay queued in the unbounded channel behind it.
-    let mut pending: Option<DepartureNotice> = None;
+    // The one notice pulled from the channel but not yet confirmed sent. Held
+    // across reconnects so a notice decided (or half-sent) while the coordinator
+    // link was down is flushed first on the next connection rather than lost. The
+    // rest stay queued in the unbounded channel behind it.
+    let mut pending: Option<RelayNotice> = None;
     let relay_id = relay_hello.relay_id;
 
     loop {
@@ -145,7 +146,7 @@ pub async fn run_descriptor_subscriber_with(
             bootstrap_secret.as_deref(),
             &control,
             &mut applied,
-            &mut departures,
+            &mut notices,
             &mut pending,
             heartbeat_interval,
         )
@@ -181,8 +182,8 @@ async fn connect_and_stream(
     secret: Option<&str>,
     control: &MeshControl,
     applied: &mut HashSet<SessionKey>,
-    departures: &mut UnboundedReceiver<DepartureNotice>,
-    pending: &mut Option<DepartureNotice>,
+    notices: &mut UnboundedReceiver<RelayNotice>,
+    pending: &mut Option<RelayNotice>,
     heartbeat_interval: Duration,
 ) -> Result<(), ControlError> {
     let relay_id = relay_hello.relay_id;
@@ -199,12 +200,12 @@ async fn connect_and_stream(
         "coordinator control connection established",
     );
 
-    // Flush a departure held over from a prior connection first: a notice decided
-    // while the coordinator was down (or one a failed send left pending) must go
-    // out on this fresh connection before anything else, so it is not lost to the
+    // Flush a notice held over from a prior connection first: one decided while
+    // the coordinator was down (or one a failed send left pending) must go out on
+    // this fresh connection before anything else, so it is not lost to the
     // reconnect. On send failure it stays pending and rides the next reconnect.
     if let Some(notice) = pending.as_ref() {
-        send_departure(&mut socket, notice).await?;
+        send_notice(&mut socket, notice).await?;
         *pending = None;
     }
 
@@ -236,17 +237,17 @@ async fn connect_and_stream(
                     Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
                 }
             }
-            // Drain one departure at a time: pull the next only once the current
-            // one is confirmed sent (the `pending.is_none()` guard), so an
-            // undelivered notice always sits in `pending` where the reconnect
-            // flush above picks it up.
-            notice = departures.recv(), if pending.is_none() && notifier_open => {
+            // Drain one notice at a time: pull the next only once the current one
+            // is confirmed sent (the `pending.is_none()` guard), so an undelivered
+            // notice always sits in `pending` where the reconnect flush above
+            // picks it up.
+            notice = notices.recv(), if pending.is_none() && notifier_open => {
                 match notice {
                     Some(notice) => {
                         *pending = Some(notice);
                         // A send error ends the connection (via `?`) with the
                         // notice still pending, so the next connection flushes it.
-                        send_departure(&mut socket, pending.as_ref().expect("just set")).await?;
+                        send_notice(&mut socket, pending.as_ref().expect("just set")).await?;
                         *pending = None;
                     }
                     None => notifier_open = false,
@@ -257,14 +258,18 @@ async fn connect_and_stream(
     Ok(())
 }
 
-/// Sends one departure notice up the control connection as a tagged JSON frame.
-async fn send_departure(
+/// Sends one relay notice up the control connection as a tagged JSON frame,
+/// wrapping it into the matching [`RelayToCoordinator`] variant by kind.
+async fn send_notice(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    notice: &DepartureNotice,
+    notice: &RelayNotice,
 ) -> Result<(), ControlError> {
-    let frame = serde_json::to_string(&RelayToCoordinator::Departure(notice.clone()))
-        .expect("a departure notice always serializes");
-    socket.send(Message::Text(frame.into())).await?;
+    let frame = match notice {
+        RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice.clone()),
+        RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice.clone()),
+    };
+    let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
+    socket.send(Message::Text(text.into())).await?;
     Ok(())
 }
 
@@ -368,7 +373,9 @@ mod tests {
 
     use super::*;
     use crate::mesh::MeshCommand;
-    use rally_point_proto::control::{BufferBounds, RelayPeer, TenantId};
+    use rally_point_proto::control::{
+        BufferBounds, DepartureNotice, DesyncNotice, DivergedSlot, RelayPeer, TenantId,
+    };
     use rally_point_proto::ids::{RelayId, SessionId};
     use tokio::sync::mpsc;
 
@@ -397,6 +404,7 @@ mod tests {
             authority_order: vec![],
             external_id: None,
             slot_refs: vec![],
+            observer_slots: vec![],
         }
     }
 
@@ -566,15 +574,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn send_departure_emits_one_tagged_departure_frame() {
+    fn desync_notice() -> DesyncNotice {
+        DesyncNotice {
+            tenant: TenantId(TENANT.to_owned()),
+            session: SessionId(42),
+            sync_ordinal: 91,
+            game_frame: Some(3000),
+            detected_at_ms: 1_700_000_000_000,
+            no_majority: false,
+            diverged: vec![DivergedSlot {
+                slot: rally_point_proto::ids::SlotId(1),
+                external_ref: Some("sb-user-1".to_owned()),
+            }],
+            external_id: Some("game-42".to_owned()),
+        }
+    }
+
+    /// Captures every frame a `send_notice` writes, so a test can assert exactly
+    /// what went on the wire. The sink carries the WebSocket's error type, so the
+    /// generic bound is satisfied exactly as the live socket satisfies it.
+    async fn capture_sent(notice: &RelayNotice) -> Vec<Message> {
         use std::sync::{Arc, Mutex};
 
-        let notice = dropped_notice();
         let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
         let for_sink = Arc::clone(&captured);
-        // A capturing sink with the WebSocket's error type, so `send_departure`'s
-        // generic bound is satisfied exactly as the live socket satisfies it.
         let mut sink = Box::pin(futures_util::sink::unfold(
             (),
             move |(), message: Message| {
@@ -585,24 +608,43 @@ mod tests {
                 }
             },
         ));
-
-        send_departure(&mut sink, &notice).await.unwrap();
-
+        send_notice(&mut sink, notice).await.unwrap();
         let frames = captured.lock().unwrap();
+        frames.clone()
+    }
+
+    #[tokio::test]
+    async fn send_notice_emits_one_tagged_departure_frame() {
+        let notice = RelayNotice::Departure(dropped_notice());
+        let frames = capture_sent(&notice).await;
         assert_eq!(frames.len(), 1, "exactly one frame");
         let Message::Text(text) = &frames[0] else {
             panic!("a text frame");
         };
         let decoded: RelayToCoordinator = serde_json::from_str(text).unwrap();
-        assert_eq!(decoded, RelayToCoordinator::Departure(notice));
+        assert_eq!(decoded, RelayToCoordinator::Departure(dropped_notice()));
     }
 
-    /// A departure queued while the coordinator is unreachable is delivered on the
+    #[tokio::test]
+    async fn send_notice_emits_one_tagged_desync_frame() {
+        // The desync kind rides the same pipe and wraps into the matching frame.
+        let notice = RelayNotice::Desync(desync_notice());
+        let frames = capture_sent(&notice).await;
+        assert_eq!(frames.len(), 1, "exactly one frame");
+        let Message::Text(text) = &frames[0] else {
+            panic!("a text frame");
+        };
+        assert!(text.contains("\"type\":\"desync\""));
+        let decoded: RelayToCoordinator = serde_json::from_str(text).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Desync(desync_notice()));
+    }
+
+    /// A notice queued while the coordinator is unreachable is delivered on the
     /// next successful connection, not lost. The first dial fails at the handshake
     /// (the server drops the socket), so the relay never touches the channel; the
     /// second dial completes, and the queued notice flushes right after the Hello.
-    #[tokio::test]
-    async fn a_queued_departure_is_delivered_after_a_reconnect() {
+    /// Run for both notice kinds, since they share the one buffered pipe.
+    async fn a_queued_notice_is_delivered_after_a_reconnect(queued: RelayNotice) {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -619,7 +661,7 @@ mod tests {
             drop(first);
 
             // Second connection: complete the WebSocket handshake, read the enroll
-            // Hello, then the flushed departure.
+            // Hello, then the flushed notice.
             let (second, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(second).await.unwrap();
             let hello = ws.next().await.unwrap().unwrap();
@@ -627,14 +669,14 @@ mod tests {
                 panic!("first frame is the Hello");
             };
             assert!(hello.contains("\"type\":\"hello\""));
-            let departure = ws.next().await.unwrap().unwrap();
-            let _ = frame_tx.send(departure);
+            let notice = ws.next().await.unwrap().unwrap();
+            let _ = frame_tx.send(notice);
         });
 
-        // Queue the departure before the subscriber starts: it sits in the
-        // unbounded channel until a live connection can carry it.
-        let (departures_tx, departures_rx) = mpsc::unbounded_channel();
-        departures_tx.send(dropped_notice()).unwrap();
+        // Queue the notice before the subscriber starts: it sits in the unbounded
+        // channel until a live connection can carry it.
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        notices_tx.send(queued.clone()).unwrap();
 
         let control = MeshControl::new(
             RelayId(1),
@@ -651,19 +693,34 @@ mod tests {
             ),
             None,
             control,
-            departures_rx,
+            notices_rx,
             Duration::from_millis(20), // redial fast after the failed first dial
             Duration::from_secs(3600), // no heartbeat during the test
         ));
 
         let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
             .await
-            .expect("the queued departure is delivered after the reconnect")
+            .expect("the queued notice is delivered after the reconnect")
             .unwrap();
         let Message::Text(text) = received else {
             panic!("a text frame");
         };
         let decoded: RelayToCoordinator = serde_json::from_str(&text).unwrap();
-        assert_eq!(decoded, RelayToCoordinator::Departure(dropped_notice()));
+        let expected = match queued {
+            RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice),
+            RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice),
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    #[tokio::test]
+    async fn a_queued_departure_is_delivered_after_a_reconnect() {
+        a_queued_notice_is_delivered_after_a_reconnect(RelayNotice::Departure(dropped_notice()))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_desync_is_delivered_after_a_reconnect() {
+        a_queued_notice_is_delivered_after_a_reconnect(RelayNotice::Desync(desync_notice())).await;
     }
 }

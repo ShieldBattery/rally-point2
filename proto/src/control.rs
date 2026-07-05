@@ -230,6 +230,25 @@ pub struct RelayPeer {
 /// it at session setup, the relay consumes it in its decision-maker), so it is
 /// defined here — the relay re-exports it from `consensus` for callers that
 /// reach it through that module.
+///
+/// **Depth and the relay's desync comparator.** The relay's
+/// `consensus::SyncTracker` reconstructs a slot's absolute sync ordinal from a
+/// 4-bit ring nibble. Its steady-state placement corrects each report
+/// relative to that same slot's own last-known ordinal, so its accuracy
+/// depends only on transport-level reordering (comfortably under the ±7 the
+/// nibble math tolerates) — never on `max`. A slot's first-ever report (a
+/// join, or an authority promotion mid-stream) instead anchors on the
+/// reporting turn's `game_frame_count`: lockstep keeps every client's frame
+/// for the same simulated interval within a couple of turns of each other
+/// regardless of buffer depth (the depth is a session-wide constant that
+/// cancels out across clients), so the frame estimate — refined by the same
+/// nibble correction — stays accurate at any realistic `max`. The
+/// comparator's evaluation margin scales with `max` instead (see
+/// `consensus::sync_eval_margin`), so a deeper buffer costs only a longer wait
+/// before an ordinal retires, not a correctness risk. Only a `max` at or
+/// above `consensus::SYNC_ABSURD_BUFFER_MAX` — a defensive backstop far above
+/// any real policy, not a live constraint — disables desync detection
+/// outright.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferBounds {
     /// The minimum buffer (in turns) the decision-maker may set.
@@ -292,6 +311,16 @@ pub struct PlayerHandoff {
     /// `deny_unknown_fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
+    /// Whether this player is an observer rather than a competitor. Observers do
+    /// not reliably emit the game's per-turn sync command, so a slot flagged here
+    /// is excluded from the relay's desync checksum cross-check (requiring a
+    /// checksum a slot never sends would stall the comparison for everyone). The
+    /// coordinator gathers the observer-flagged slots into
+    /// [`SessionDescriptor::observer_slots`] so every relay serving the session
+    /// learns them. Defaults to `false` (a competitor) so a tenant that predates
+    /// the field still interops, exactly like `external_ref`'s optionality.
+    #[serde(default)]
+    pub observer: bool,
 }
 
 /// A request from an app server to stand up a game session: which tenant, how
@@ -423,6 +452,16 @@ pub struct SessionDescriptor {
     /// coordinator that predates the field.
     #[serde(default)]
     pub slot_refs: Vec<SlotExternalRef>,
+    /// The slots the coordinator flagged as observers (gathered from the
+    /// observer-flagged handoffs in the [`SessionRequest`]). The relay's desync
+    /// comparator excludes these slots: observers do not reliably emit the
+    /// per-turn sync command, so requiring their checksums would stall the
+    /// cross-check. Carried down to every relay serving the session — like
+    /// `slot_refs`, and surviving the same persistence/restart paths — so a relay
+    /// knows observer-ness without a separate lookup. Defaults empty for a
+    /// descriptor from a coordinator that predates the field.
+    #[serde(default)]
+    pub observer_slots: Vec<SlotId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +544,15 @@ pub enum RelayToCoordinator {
     /// coordinator dedups by `(tenant, session, slot)`, so a single relay's
     /// coordinator link being down never loses the notice.
     Departure(DepartureNotice),
+    /// The relay's desync comparator found two live slots whose per-turn sync
+    /// checksums disagreed at the same sync ordinal — the two clients' simulations
+    /// have diverged. Only the session's authority relay compares, so (unlike a
+    /// departure) exactly one relay reports each event; the coordinator still
+    /// dedups by `(tenant, session, sync_ordinal)` because at-least-once delivery
+    /// can re-send one. The relay forwards it so the coordinator can tell the
+    /// tenant "this game desynced at ordinal N; these slots diverged", which the
+    /// tenant uses to void or re-adjudicate the result.
+    Desync(DesyncNotice),
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -561,6 +609,73 @@ pub struct DepartureNotice {
     /// fallback as `external_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
+}
+
+/// One slot the relay's desync comparator found on the losing side of a checksum
+/// mismatch — a diverged member of the minority. Mirrors [`SlotExternalRef`]'s
+/// shape (a slot plus its optional tenant ref) rather than a bare slot, so the
+/// desync webhook can name the diverged player in the tenant's own terms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DivergedSlot {
+    /// The slot whose checksum diverged from the agreeing majority.
+    pub slot: SlotId,
+    /// The tenant's own id for the player in this slot, stamped by the relay from
+    /// its stored [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_ref`]; `None` when the relay never received the
+    /// correlation ids for the slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+}
+
+/// A relay's report that a game desynced — two live slots' per-turn sync
+/// checksums disagreed at the same sync ordinal, so their simulations diverged.
+/// Sent up the relay control connection ([`RelayToCoordinator::Desync`]).
+///
+/// Like [`DepartureNotice`], it carries its own `tenant`/`session` because one
+/// control connection serves many sessions, and stamps its own correlation ids
+/// from the relay's stored [`SessionDescriptor`] so the notification is
+/// self-describing across a coordinator restart.
+///
+/// The event is identified by `sync_ordinal` (the count of sync commands the
+/// diverging slots had each emitted), not a relay-assigned sequence number:
+/// authority promotion restarts the comparator from scratch, and keying the
+/// event on the ordinal means a re-detection after a promotion lands at a
+/// distinct, later ordinal rather than colliding with an earlier report. The
+/// coordinator dedups on `(tenant, session, sync_ordinal)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesyncNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session that desynced.
+    pub session: SessionId,
+    /// The per-slot sync ordinal at which the mismatch was observed — the number
+    /// of sync commands each diverging slot had emitted. The event identity; the
+    /// coordinator's dedup key alongside tenant + session.
+    pub sync_ordinal: u64,
+    /// The `game_frame_count` of the turn whose sync command confirmed the
+    /// mismatch — a human-meaningful interval to correlate against replays and
+    /// results. `None` when that turn carried no frame (it shouldn't in practice —
+    /// sync commands flow only in-game — but the field is honest about it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_frame: Option<u32>,
+    /// Relay wall-clock at detection, unix epoch milliseconds. Records when the
+    /// relay observed the divergence, independent of when the webhook is delivered
+    /// (which retries may delay).
+    pub detected_at_ms: u64,
+    /// Set when no strict majority of compared slots shared one checksum value (a
+    /// 1v1 disagreement, or an even split), so which side is authoritative cannot
+    /// be determined from the relay's view alone. `diverged` is then empty — the
+    /// tenant must not infer the minority from topology. When `false`, `diverged`
+    /// names exactly the minority slots.
+    pub no_majority: bool,
+    /// The slots that diverged from the agreeing majority (the minority). Empty
+    /// when `no_majority` is set.
+    pub diverged: Vec<DivergedSlot>,
+    /// The tenant's own id for the session, stamped by the relay from its stored
+    /// [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -633,6 +748,7 @@ mod tests {
                 authority_order: vec![RelayId(1), RelayId(2)],
                 external_id: None,
                 slot_refs: vec![],
+                observer_slots: vec![],
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -705,6 +821,7 @@ mod tests {
                 slot: SlotId(0),
                 external_ref: "sb-user-7".to_owned(),
             }],
+            observer_slots: vec![SlotId(1)],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
@@ -725,10 +842,12 @@ mod tests {
             authority_order: vec![],
             external_id: None,
             slot_refs: vec![],
+            observer_slots: vec![],
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("external_id"));
         assert!(json.contains("\"slot_refs\":[]"));
+        assert!(json.contains("\"observer_slots\":[]"));
     }
 
     #[test]
@@ -754,6 +873,11 @@ mod tests {
             back.slot_refs.is_empty(),
             "a descriptor from a coordinator that predates the correlation ids \
              decodes to no external_id and no slot_refs, not a decode error",
+        );
+        assert!(
+            back.observer_slots.is_empty(),
+            "a descriptor that predates the observer field decodes to no \
+             observer_slots, not a decode error",
         );
     }
 
@@ -788,6 +912,7 @@ mod tests {
             slot: SlotId(3),
             client_pubkey: ClientPublicKey([0x42; 32]),
             external_ref: Some("sb-user-77".to_owned()),
+            observer: false,
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: PlayerHandoff = serde_json::from_str(&json).unwrap();
@@ -809,6 +934,10 @@ mod tests {
             back.players[0].external_ref.is_none(),
             "a player handoff without external_ref decodes to None too",
         );
+        assert!(
+            !back.players[0].observer,
+            "a player handoff without the observer field decodes to a competitor",
+        );
     }
 
     #[test]
@@ -821,12 +950,17 @@ mod tests {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0x11; 32]),
                 external_ref: None,
+                observer: false,
             }],
             external_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("external_id"));
         assert!(!json.contains("external_ref"));
+        // `observer` is a plain `#[serde(default)]` bool with no
+        // `skip_serializing_if`, so a competitor still serializes as
+        // `"observer":false` — an old decoder just ignores it.
+        assert!(json.contains("\"observer\":false"));
     }
 
     #[test]
@@ -887,6 +1021,79 @@ mod tests {
     fn departure_kind_left_serializes_snake_case() {
         let json = serde_json::to_string(&DepartureKind::Left).unwrap();
         assert_eq!(json, r#""left""#);
+    }
+
+    #[test]
+    fn desync_roundtrips_json() {
+        let notice = DesyncNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            sync_ordinal: 137,
+            game_frame: Some(4242),
+            detected_at_ms: 1_700_000_000_000,
+            no_majority: false,
+            diverged: vec![DivergedSlot {
+                slot: SlotId(2),
+                external_ref: Some("sb-user-7".to_owned()),
+            }],
+            external_id: Some("game-99".to_owned()),
+        };
+        let message = RelayToCoordinator::Desync(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        // The notice's fields ride alongside the tag (internally tagged).
+        assert!(json.contains("\"type\":\"desync\""));
+        assert!(json.contains("\"sync_ordinal\":137"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn desync_omits_absent_optionals_on_the_wire() {
+        // A no-majority (1v1) desync: no game frame, no correlation ids, and an
+        // empty diverged set. The optional fields are omitted (not `null`); the
+        // always-present ones (detected_at_ms, no_majority, diverged) still
+        // serialize.
+        let notice = DesyncNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(1),
+            sync_ordinal: 5,
+            game_frame: None,
+            detected_at_ms: 123,
+            no_majority: true,
+            diverged: vec![],
+            external_id: None,
+        };
+        let json = serde_json::to_string(&notice).unwrap();
+        assert!(!json.contains("game_frame"));
+        assert!(!json.contains("external_id"));
+        assert!(json.contains("\"no_majority\":true"));
+        assert!(json.contains("\"diverged\":[]"));
+    }
+
+    #[test]
+    fn desync_without_optionals_decodes() {
+        // A notice from a relay that carried no game frame or correlation ids
+        // must still decode — the optional fields default, so the coordinator's
+        // own fallbacks apply rather than a decode error.
+        let json = r#"{"type":"desync","tenant":"sb-staging","session":42,"sync_ordinal":9,"detected_at_ms":7,"no_majority":false,"diverged":[{"slot":3}]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::Desync(notice) = decoded else {
+            panic!("decodes to the Desync variant");
+        };
+        assert!(notice.game_frame.is_none());
+        assert!(notice.external_id.is_none());
+        assert_eq!(notice.diverged.len(), 1);
+        assert!(notice.diverged[0].external_ref.is_none());
+    }
+
+    #[test]
+    fn desync_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `Desync` up-frame decoded by the down-direction
+        // `CoordinatorToRelay` (which has no such variant) folds into `Unknown`
+        // rather than erroring — the "old peer sees a new frame" path.
+        let json = r#"{"type":"desync","tenant":"sb-staging","session":42,"sync_ordinal":9,"detected_at_ms":7,"no_majority":false,"diverged":[]}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }
 
     #[test]

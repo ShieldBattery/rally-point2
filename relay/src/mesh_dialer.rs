@@ -302,9 +302,7 @@ mod tests {
 
     fn fallback_with_one_root() -> RootCertStore {
         let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(self_signed_der()))
-            .unwrap();
+        roots.add(CertificateDer::from(self_signed_der())).unwrap();
         roots
     }
 
@@ -319,7 +317,10 @@ mod tests {
         // Pinning the same cert against an empty fallback yields the same
         // trust anchors, proving the fallback contributed nothing.
         let from_empty = dial_roots(RelayId(2), &pinned, &RootCertStore::empty());
-        assert_eq!(roots.roots, from_empty.roots, "the fallback contributed nothing");
+        assert_eq!(
+            roots.roots, from_empty.roots,
+            "the fallback contributed nothing"
+        );
         assert_ne!(
             roots.roots, fallback.roots,
             "the pinned store is not the fallback's contents",

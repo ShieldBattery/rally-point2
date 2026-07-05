@@ -49,7 +49,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
-use rally_point_proto::control::{DepartureKind, DepartureNotice, TenantId};
+use rally_point_proto::control::{DepartureKind, DepartureNotice, DesyncNotice, TenantId};
 use rally_point_proto::ids::{SessionId, SlotId};
 use serde::Serialize;
 
@@ -62,9 +62,29 @@ use crate::tenant::{self, NotifyConfig, TenantStore};
 /// at worst re-fires a webhook the idempotent consumer discards.
 pub type DepartureDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
-/// Creates an empty departure dedup set.
-pub fn new_dedup() -> DepartureDedup {
-    Arc::new(Mutex::new(HashSet::new()))
+/// Desyncs already handled, keyed by `(tenant, session, sync_ordinal)` — the
+/// sibling of [`DepartureDedup`]. The sync ordinal is the event identity (a
+/// re-detection after an authority promotion lands at a distinct later ordinal),
+/// so it dedups the at-least-once redeliveries of one event without collapsing
+/// two genuinely separate divergences.
+pub type DesyncDedup = Arc<Mutex<HashSet<(TenantId, SessionId, u64)>>>;
+
+/// The two notice dedup sets a coordinator holds, bundled so the api layer
+/// threads one value rather than two through its control-connection handlers.
+#[derive(Clone)]
+pub struct NoticeDedup {
+    /// Departure dedup by `(tenant, session, slot)`.
+    pub departures: DepartureDedup,
+    /// Desync dedup by `(tenant, session, sync_ordinal)`.
+    pub desyncs: DesyncDedup,
+}
+
+/// Creates an empty notice dedup set (departures + desyncs).
+pub fn new_dedup() -> NoticeDedup {
+    NoticeDedup {
+        departures: Arc::new(Mutex::new(HashSet::new())),
+        desyncs: Arc::new(Mutex::new(HashSet::new())),
+    }
 }
 
 /// How many webhook attempts before giving up. With [`BACKOFF_START`] doubling to
@@ -75,16 +95,19 @@ const BACKOFF_START: Duration = Duration::from_secs(2);
 /// The retry-backoff ceiling.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
-/// The JSON body POSTed to the tenant. camelCase, matching the *consumer's*
-/// API conventions rather than the relay control plane's snake_case — the
-/// webhook lands on the tenant's own HTTP surface, so its style wins. `kind`
-/// serializes `"left"` / `"dropped"`. The correlation ids are **omitted** (not
-/// sent as `null`) when the session carried none: the consumer validates them
-/// as optional strings, and a literal JSON `null` fails that validation rather
-/// than reading as "absent".
+/// The JSON body POSTed to the tenant for a departure. camelCase, matching the
+/// *consumer's* API conventions rather than the relay control plane's snake_case
+/// — the webhook lands on the tenant's own HTTP surface, so its style wins.
+/// `kind` serializes `"left"` / `"dropped"`. The `event` discriminator lets the
+/// consumer's one webhook endpoint fan the body out by kind (a desync body
+/// carries `"event":"desync"`). The correlation ids are **omitted** (not sent as
+/// `null`) when the session carried none: the consumer validates them as optional
+/// strings, and a literal JSON `null` fails that validation rather than reading
+/// as "absent".
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DepartureWebhook {
+    event: &'static str,
     tenant: String,
     session: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,6 +118,37 @@ struct DepartureWebhook {
     kind: DepartureKind,
     reason: u32,
     leave_seq: u32,
+}
+
+/// One diverged slot in a desync webhook body: the slot plus its optional tenant
+/// ref, camelCase like the rest of the body. The `externalRef` is omitted when
+/// absent, never `null`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DivergedSlotWebhook {
+    slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ref: Option<String>,
+}
+
+/// The JSON body POSTed to the tenant for a desync. Same camelCase convention and
+/// same `event` discriminator as the departure body. Optional fields
+/// (`externalId`, `gameFrame`) are omitted when absent, never `null`. `diverged`
+/// is always present (possibly empty, when `noMajority`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesyncWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    sync_ordinal: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game_frame: Option<u32>,
+    detected_at_ms: u64,
+    no_majority: bool,
+    diverged: Vec<DivergedSlotWebhook>,
 }
 
 /// Handles one relay's departure notice.
@@ -167,6 +221,7 @@ pub fn handle_departure(setup: &SessionSetup, dedup: &DepartureDedup, notice: De
     };
 
     let payload = DepartureWebhook {
+        event: "departure",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
         external_id: Some(external_id),
@@ -177,14 +232,114 @@ pub fn handle_departure(setup: &SessionSetup, dedup: &DepartureDedup, notice: De
         leave_seq: notice.leave_seq,
     };
 
-    // The tenant store is cheap to clone (Arc-backed) and carried into the
-    // spawned task so `dispatch` can sign fresh on every attempt — a detached
-    // task otherwise has no path back to the tenant's signing key.
+    spawn_dispatch(setup, notice.tenant, config, &payload, "departure");
+}
+
+/// Handles one relay's desync notice.
+///
+/// A sibling of [`handle_departure`]: first sight of a
+/// `(tenant, session, sync_ordinal)` resolves the session's `external_id` and the
+/// tenant's notify config, then spawns a signed webhook. A duplicate (an
+/// at-least-once redelivery of the same event), a tenant with no notify config,
+/// or a desync with no `gameId` ref from any source are each a debug-logged drop.
+///
+/// Correlation ids come notice-first, stored-session as fallback — the same rule
+/// as departures, so a coordinator restart that wiped the session store still
+/// delivers a correct webhook from the notice's self-stamped refs. Each diverged
+/// slot's `externalRef` resolves independently (notice ref, else the stored
+/// per-slot ref), so a partially-ref'd notice still names whom it can.
+pub fn handle_desync(setup: &SessionSetup, dedup: &DesyncDedup, notice: DesyncNotice) {
+    if !dedup
+        .lock()
+        .insert((notice.tenant.clone(), notice.session, notice.sync_ordinal))
+    {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            sync_ordinal = notice.sync_ordinal,
+            "duplicate desync notice; already handled",
+        );
+        return;
+    }
+
+    let Some(config) = tenant::notify_config(setup.tenants(), &notice.tenant) else {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            sync_ordinal = notice.sync_ordinal,
+            "no notify config for tenant; dropping desync",
+        );
+        return;
+    };
+
+    let stored = session::session_refs(setup, &notice.tenant, notice.session);
+    let external_id = notice
+        .external_id
+        .clone()
+        .or_else(|| stored.as_ref().and_then(|refs| refs.external_id.clone()));
+
+    let Some(external_id) = external_id else {
+        tracing::debug!(
+            tenant = notice.tenant.as_ref(),
+            session = notice.session.0,
+            sync_ordinal = notice.sync_ordinal,
+            "no gameId ref from the notice or a stored session; dropping desync",
+        );
+        return;
+    };
+
+    let diverged = notice
+        .diverged
+        .iter()
+        .map(|d| DivergedSlotWebhook {
+            slot: d.slot.0,
+            external_ref: d.external_ref.clone().or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|refs| refs.slots.get(&d.slot).cloned())
+            }),
+        })
+        .collect();
+
+    let payload = DesyncWebhook {
+        event: "desync",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(external_id),
+        sync_ordinal: notice.sync_ordinal,
+        game_frame: notice.game_frame,
+        detected_at_ms: notice.detected_at_ms,
+        no_majority: notice.no_majority,
+        diverged,
+    };
+
+    spawn_dispatch(setup, notice.tenant, config, &payload, "desync");
+}
+
+/// Serializes `payload` and spawns its webhook dispatch. The tenant store is
+/// cheap to clone (Arc-backed) and carried into the spawned task so `dispatch`
+/// can sign fresh on every attempt — a detached task otherwise has no path back
+/// to the tenant's signing key. `kind` labels the delivery in logs.
+fn spawn_dispatch(
+    setup: &SessionSetup,
+    tenant: TenantId,
+    config: NotifyConfig,
+    payload: &impl Serialize,
+    kind: &'static str,
+) {
+    let body = match serde_json::to_vec(payload) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(error) => {
+            tracing::error!(%error, kind, "serializing a webhook body failed; dropping");
+            return;
+        }
+    };
     tokio::spawn(dispatch(
         setup.tenants().clone(),
-        notice.tenant,
+        tenant,
         config,
-        payload,
+        body,
+        kind,
     ));
 }
 
@@ -201,27 +356,22 @@ const TIMESTAMP_HEADER: &str = "x-rp2-timestamp";
 /// 64-byte signature over the domain-separated, timestamped message.
 const SIGNATURE_HEADER: &str = "x-rp2-signature";
 
-/// POSTs the webhook, retrying non-2xx responses and connect errors with capped
-/// backoff, then giving up with a `warn!`. Success is any 2xx.
+/// POSTs the webhook body, retrying non-2xx responses and connect errors with
+/// capped backoff, then giving up with a `warn!`. Success is any 2xx. `kind`
+/// labels the delivery in logs (departure vs. desync); `body` is the already
+/// serialized JSON.
 ///
 /// `tenants` + `tenant` are what let a detached task sign the request itself —
-/// `handle_departure` resolves them before spawning, since the private key
-/// stays behind `tenant::sign_webhook`'s narrow interface rather than being
-/// handed out as an `Arc<Ed25519KeyPair>`.
+/// the caller resolves them before spawning, since the private key stays behind
+/// `tenant::sign_webhook`'s narrow interface rather than being handed out as an
+/// `Arc<Ed25519KeyPair>`.
 async fn dispatch(
     tenants: TenantStore,
     tenant: TenantId,
     config: NotifyConfig,
-    payload: DepartureWebhook,
+    body: Bytes,
+    kind: &'static str,
 ) {
-    let body = match serde_json::to_vec(&payload) {
-        Ok(bytes) => Bytes::from(bytes),
-        Err(error) => {
-            tracing::error!(%error, "serializing a departure webhook failed; dropping");
-            return;
-        }
-    };
-
     // An http/https-capable client: the connector negotiates rustls (ring
     // provider, webpki public-CA roots) for an `https://` notify URL and
     // falls through to plain HTTP for `http://` (the dev/loopback flow).
@@ -245,14 +395,15 @@ async fn dispatch(
                 tracing::warn!(
                     tenant = tenant.as_ref(),
                     url = %config.url,
-                    "tenant has no signing key; giving up on the departure webhook",
+                    kind,
+                    "tenant has no signing key; giving up on the webhook",
                 );
                 return;
             }
             Err(error) => {
                 // A malformed URL/header is deterministic — retrying can't fix
                 // it, so give up now rather than burning the whole budget.
-                tracing::warn!(url = %config.url, %error, "departure webhook request is unbuildable; dropping");
+                tracing::warn!(url = %config.url, %error, kind, "webhook request is unbuildable; dropping");
                 return;
             }
         };
@@ -263,13 +414,13 @@ async fn dispatch(
                 // Drain the body so the connection returns to the pool cleanly.
                 let _ = response.into_body().collect().await;
                 if (200..300).contains(&status) {
-                    tracing::debug!(url = %config.url, status, "departure webhook delivered");
+                    tracing::debug!(url = %config.url, status, kind, "webhook delivered");
                     return;
                 }
-                tracing::debug!(url = %config.url, status, attempt, "departure webhook non-2xx; retrying");
+                tracing::debug!(url = %config.url, status, attempt, kind, "webhook non-2xx; retrying");
             }
             Err(error) => {
-                tracing::debug!(url = %config.url, %error, attempt, "departure webhook attempt failed; retrying");
+                tracing::debug!(url = %config.url, %error, attempt, kind, "webhook attempt failed; retrying");
             }
         }
 
@@ -282,7 +433,8 @@ async fn dispatch(
     tracing::warn!(
         url = %config.url,
         attempts = MAX_ATTEMPTS,
-        "gave up delivering a departure webhook; the consumer's result-based fallback covers it",
+        kind,
+        "gave up delivering a webhook; the consumer's result-based fallback covers it",
     );
 }
 
@@ -341,7 +493,8 @@ mod tests {
     use axum::routing::post;
     use base64::Engine as _;
     use rally_point_proto::control::{
-        BufferBounds, DepartureKind, PlayerHandoff, RelayHello, SessionRequest, TenantId,
+        BufferBounds, DepartureKind, DivergedSlot, PlayerHandoff, RelayHello, SessionRequest,
+        TenantId,
     };
     use rally_point_proto::ids::{RelayId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -484,6 +637,7 @@ mod tests {
                     slot: SlotId(0),
                     client_pubkey: ClientPublicKey([0xAA; 32]),
                     external_ref: slot0_ref.map(str::to_owned),
+                    observer: false,
                 }],
                 external_id: external_id.map(str::to_owned),
             },
@@ -522,12 +676,12 @@ mod tests {
         // Two relays report the same departure; the coordinator must webhook once.
         handle_departure(
             &setup,
-            &dedup,
+            &dedup.departures,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
         handle_departure(
             &setup,
-            &dedup,
+            &dedup.departures,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -537,6 +691,7 @@ mod tests {
             .expect("the receiver got it");
 
         assert_signed(&setup, "sb-test", &got);
+        assert_eq!(got.body["event"], "departure");
         assert_eq!(got.body["tenant"], "sb-test");
         assert_eq!(got.body["session"], session.0);
         assert_eq!(got.body["externalId"], "game-99");
@@ -569,7 +724,11 @@ mod tests {
         );
         let dedup = new_dedup();
 
-        handle_departure(&setup, &dedup, notice(session, 0, DepartureKind::Left, 3));
+        handle_departure(
+            &setup,
+            &dedup.departures,
+            notice(session, 0, DepartureKind::Left, 3),
+        );
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -622,7 +781,7 @@ mod tests {
         restart_notice.external_id = Some("game-restart".to_owned());
         restart_notice.external_ref = Some("sb-user-restart".to_owned());
 
-        handle_departure(&setup, &dedup, restart_notice);
+        handle_departure(&setup, &dedup.departures, restart_notice);
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -649,7 +808,7 @@ mod tests {
 
         handle_departure(
             &setup,
-            &dedup,
+            &dedup.departures,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -673,7 +832,7 @@ mod tests {
 
         handle_departure(
             &setup,
-            &dedup,
+            &dedup.departures,
             notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -702,7 +861,7 @@ mod tests {
         // itself is no longer a hard stop.
         handle_departure(
             &setup,
-            &dedup,
+            &dedup.departures,
             notice(SessionId(999_999), 0, DepartureKind::Dropped, 0x4000_0006),
         );
 
@@ -711,6 +870,143 @@ mod tests {
                 .await
                 .is_err(),
             "a departure for an unknown session, with no notice-carried refs, sends no webhook",
+        );
+    }
+
+    // -- Desync webhooks --
+
+    /// A desync notice carrying its own gameId and a diverged slot with a ref, so
+    /// a webhook delivers without depending on the coordinator's stored session.
+    fn desync(session: SessionId, sync_ordinal: u64, no_majority: bool) -> DesyncNotice {
+        DesyncNotice {
+            tenant: TenantId("sb-test".to_owned()),
+            session,
+            sync_ordinal,
+            game_frame: Some(4242),
+            detected_at_ms: 1_700_000_000_000,
+            no_majority,
+            diverged: if no_majority {
+                vec![]
+            } else {
+                vec![DivergedSlot {
+                    slot: SlotId(2),
+                    external_ref: Some("sb-user-diverged".to_owned()),
+                }]
+            },
+            external_id: Some("game-desync".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        // A tenant enrolled (for the signing key) but no session created this
+        // lifetime: the notice's self-stamped refs carry the webhook.
+        let reg = registry::new_registry();
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        // Two at-least-once redeliveries of the same event webhook once.
+        handle_desync(&setup, &dedup.desyncs, desync(SessionId(7), 91, false));
+        handle_desync(&setup, &dedup.desyncs, desync(SessionId(7), 91, false));
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a desync webhook is delivered")
+            .expect("the receiver got it");
+        assert_signed(&setup, "sb-test", &got);
+        assert_eq!(got.body["event"], "desync");
+        assert_eq!(got.body["tenant"], "sb-test");
+        assert_eq!(got.body["session"], 7);
+        assert_eq!(got.body["externalId"], "game-desync");
+        assert_eq!(got.body["syncOrdinal"], 91);
+        assert_eq!(got.body["gameFrame"], 4242);
+        assert_eq!(got.body["detectedAtMs"], 1_700_000_000_000u64);
+        assert_eq!(got.body["noMajority"], false);
+        assert_eq!(got.body["diverged"][0]["slot"], 2);
+        assert_eq!(got.body["diverged"][0]["externalRef"], "sb-user-diverged");
+
+        assert!(
+            timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a redelivery of the same (tenant, session, sync_ordinal) webhooks once",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverged() {
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        let reg = registry::new_registry();
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        // A no-majority desync with no game frame — gameFrame must be omitted, not
+        // null, and diverged is an empty array.
+        let mut notice = desync(SessionId(8), 5, true);
+        notice.game_frame = None;
+        handle_desync(&setup, &dedup.desyncs, notice);
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a desync webhook is delivered")
+            .unwrap();
+        assert_eq!(got.body["event"], "desync");
+        assert_eq!(got.body["noMajority"], true);
+        assert_eq!(got.body["diverged"].as_array().unwrap().len(), 0);
+        assert!(
+            got.body.get("gameFrame").is_none(),
+            "an absent game frame is omitted, not sent as null",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
+        let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+        let (setup, session) = setup_with_session(None, None);
+        tenant::set_notify(
+            setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            Some(NotifyConfig { url }),
+        );
+        let dedup = new_dedup();
+
+        // Neither the notice nor the stored session has a gameId.
+        let mut notice = desync(session, 1, false);
+        notice.external_id = None;
+        handle_desync(&setup, &dedup.desyncs, notice);
+
+        assert!(
+            timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "no gameId from the notice or the stored session -> dropped",
         );
     }
 }

@@ -83,10 +83,7 @@ pub fn spawn_mesh_control_reader_accepting(
 /// `tx` until the stream ends, a framing violation is hit, or the consumer drops
 /// its receiver. The empty establishment/keepalive frame is dropped rather than
 /// forwarded.
-async fn read_mesh_control_frames(
-    mut recv: quinn::RecvStream,
-    tx: mpsc::Sender<MeshControlFrame>,
-) {
+async fn read_mesh_control_frames(mut recv: quinn::RecvStream, tx: mpsc::Sender<MeshControlFrame>) {
     loop {
         let mut prefix = [0u8; CONTROL_LEN_PREFIX];
         if recv.read_exact(&mut prefix).await.is_err() {

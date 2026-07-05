@@ -64,6 +64,11 @@ pub struct SessionRefs {
     /// The tenant's own id for the player in each slot (a stringified
     /// `SbUserId`). Only slots whose handoff carried an `external_ref` appear.
     pub slots: HashMap<SlotId, String>,
+    /// The slots the request flagged as observers. Carried into every relay's
+    /// [`SessionDescriptor::observer_slots`] so the relay's desync comparator
+    /// excludes them. Recorded here, alongside the correlation ids, so it
+    /// survives the same restart/persistence paths those do.
+    pub observers: Vec<SlotId>,
 }
 
 use std::sync::Arc;
@@ -203,6 +208,12 @@ pub fn create_session(
             .iter()
             .filter_map(|p| p.external_ref.clone().map(|r| (p.slot, r)))
             .collect(),
+        observers: request
+            .players
+            .iter()
+            .filter(|p| p.observer)
+            .map(|p| p.slot)
+            .collect(),
     };
     setup
         .session_refs
@@ -265,7 +276,8 @@ pub fn create_session(
 /// coordinator's in-memory session-refs store surviving to notice time (it
 /// doesn't survive a coordinator restart; the descriptor-carried copy is what
 /// does, since a relay holds what it last received independently of the
-/// coordinator's process lifetime).
+/// coordinator's process lifetime). It carries the session's observer slots the
+/// same way, so a relay's desync comparator can exclude them.
 ///
 /// Returns `None` if the session has no recorded relay membership (the
 /// session doesn't exist or wasn't created through `create_session`), or if
@@ -311,6 +323,7 @@ pub fn descriptor_for(
             .into_iter()
             .map(|(slot, external_ref)| SlotExternalRef { slot, external_ref })
             .collect(),
+        observer_slots: refs.observers,
     })
 }
 
@@ -425,11 +438,13 @@ mod tests {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,
+                observer: false,
             },
             PlayerHandoff {
                 slot: SlotId(1),
                 client_pubkey: ClientPublicKey([0xBB; 32]),
                 external_ref: None,
+                observer: false,
             },
         ]
     }
@@ -576,6 +591,7 @@ mod tests {
             slot: SlotId(slot),
             client_pubkey: ClientPublicKey([slot; 32]),
             external_ref: None,
+            observer: false,
         };
 
         let resp = create_session(
@@ -668,11 +684,15 @@ mod tests {
                         slot: SlotId(0),
                         client_pubkey: ClientPublicKey([0xAA; 32]),
                         external_ref: Some("sb-user-7".to_owned()),
+                        observer: false,
                     },
                     PlayerHandoff {
                         slot: SlotId(1),
                         client_pubkey: ClientPublicKey([0xBB; 32]),
                         external_ref: None,
+                        // An observer: it must show up in the descriptor's
+                        // observer_slots so relays exclude it from desync checks.
+                        observer: true,
                     },
                 ],
                 external_id: Some("game-99".to_owned()),
@@ -692,6 +712,11 @@ mod tests {
         assert_eq!(desc.slot_refs.len(), 1, "only the slot with a ref appears");
         assert_eq!(desc.slot_refs[0].slot, SlotId(0));
         assert_eq!(desc.slot_refs[0].external_ref, "sb-user-7");
+        assert_eq!(
+            desc.observer_slots,
+            vec![SlotId(1)],
+            "the observer-flagged slot is carried into the descriptor",
+        );
     }
 
     #[test]
@@ -719,6 +744,10 @@ mod tests {
         .unwrap();
         assert!(desc.external_id.is_none());
         assert!(desc.slot_refs.is_empty());
+        assert!(
+            desc.observer_slots.is_empty(),
+            "no observer-flagged players -> empty observer_slots",
+        );
     }
 
     #[test]

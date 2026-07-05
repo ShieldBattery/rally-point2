@@ -152,6 +152,7 @@ mod tests {
             authority_order: vec![],
             external_id: None,
             slot_refs: vec![],
+            observer_slots: vec![],
         }
     }
 

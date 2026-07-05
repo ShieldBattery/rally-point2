@@ -76,22 +76,37 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_TENANT_KEY", requires = "dev_tenant")]
     tenant_key: Option<String>,
 
-    /// Webhook URL the coordinator POSTs a player-departure notification to for
-    /// the dev tenant (e.g. `http://localhost:5555/webhooks/netcode-v2/departures`,
-    /// or `https://...` — the webhook client handles both). Only meaningful
-    /// with `--dev-tenant`; unset = departure notifications off (everything
-    /// else unchanged). Each POST is signed with the dev tenant's own Ed25519
-    /// key (`x-rp2-timestamp` + `x-rp2-signature`) — no separate secret to
-    /// configure.
+    /// Webhook URL the coordinator POSTs game-event notifications (player
+    /// departures and desyncs) to for the dev tenant (e.g.
+    /// `http://localhost:5555/webhooks/netcode-v2/game-events`, or `https://...` —
+    /// the webhook client handles both). Only meaningful with `--dev-tenant`;
+    /// unset = game-event notifications off (everything else unchanged). Each POST
+    /// is signed with the dev tenant's own Ed25519 key (`x-rp2-timestamp` +
+    /// `x-rp2-signature`) — no separate secret to configure.
     #[arg(long, env = "COORDINATOR_DEV_NOTIFY_URL", requires = "dev_tenant")]
     dev_notify_url: Option<String>,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
-/// 6-turn worst case. Production tenants will get per-tenant policy at
+/// 12-turn worst case. Production tenants will get per-tenant policy at
 /// provisioning time; this is a sane default for loopback games.
+///
+/// **Why 12.** Under netcode v2 the client's turn pipe depth *is*
+/// `buffer_turns` exactly — the seam's pipe replacement bypasses the game's
+/// own built-in 2-turn base and user-latency setting entirely, so total
+/// one-way tolerance is `buffer_turns * ~42ms` at the 24 turns/sec rate. The
+/// parity target is BW's old TR8 "Extra High" ceiling (~480ms one-way), which
+/// needs a depth of 12 (~504ms).
+///
+/// **BW-side ceiling.** The game's own sync bookkeeping (the `0x37` command's
+/// ring nibble; see the relay's `consensus::SYNC_RING_MODULUS`) is a 16-entry
+/// ring, and under v2 in-flight turns equal `buffer_turns` exactly (no native
+/// +2 on top of it, per the pipe-replacement note above) — so 12 leaves 4
+/// ring entries of headroom. Bounds beyond ~14 should get a hard look before
+/// shipping: past that point they start crowding the game's own wraparound,
+/// not just the relay's own tuning.
 fn dev_tenant_bounds() -> BufferBounds {
-    BufferBounds::new(1, 6).expect("1..=6 is a valid bounds range")
+    BufferBounds::new(1, 12).expect("1..=12 is a valid bounds range")
 }
 
 #[tokio::main]
@@ -128,7 +143,7 @@ async fn main() -> Result<()> {
 
     let state = CoordinatorState {
         setup,
-        departures: notify::new_dedup(),
+        notices: notify::new_dedup(),
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,

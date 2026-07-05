@@ -227,6 +227,15 @@ impl MeshControl {
                 .collect(),
         );
 
+        // Record the session's observer slots so the desync comparator excludes
+        // them (observers don't reliably emit sync commands). Descriptor-driven,
+        // so it is re-applied on every push, replacing any prior set.
+        consensus::set_observers(
+            &self.decision_makers,
+            &key,
+            descriptor.observer_slots.iter().copied().collect(),
+        );
+
         let new_peers: HashSet<RelayId> = descriptor
             .peers
             .iter()
@@ -464,6 +473,7 @@ mod tests {
             authority_order: vec![],
             external_id: None,
             slot_refs: vec![],
+            observer_slots: vec![],
         }
     }
 
@@ -762,7 +772,7 @@ mod tests {
         // coordinator's in-memory session-refs store surviving to notice time.
         let makers = Arc::new(consensus::new_decision_makers());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        makers.set_departure_notifier(tx);
+        makers.set_notice_notifier(tx);
         let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
 
         let mut descriptor = descriptor(1, &[]);
@@ -784,7 +794,11 @@ mod tests {
             "single-relay session is its own authority, so decide_leave succeeds",
         );
 
-        let notice = rx.try_recv().expect("one departure notice");
+        let consensus::RelayNotice::Departure(notice) =
+            rx.try_recv().expect("one departure notice")
+        else {
+            panic!("a departure notice");
+        };
         assert_eq!(notice.external_id, Some("game-42".to_owned()));
         assert_eq!(notice.external_ref, Some("sb-user-3".to_owned()));
     }
@@ -793,7 +807,7 @@ mod tests {
     fn apply_descriptor_replaces_correlation_ids_on_a_changed_reapply() {
         let makers = Arc::new(consensus::new_decision_makers());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        makers.set_departure_notifier(tx);
+        makers.set_notice_notifier(tx);
         let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
 
         let mut first = descriptor(1, &[]);
@@ -811,7 +825,11 @@ mod tests {
             rally_point_proto::ids::GameFrameCount(10),
         );
         assert!(consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some());
-        let notice = rx.try_recv().expect("one departure notice");
+        let consensus::RelayNotice::Departure(notice) =
+            rx.try_recv().expect("one departure notice")
+        else {
+            panic!("a departure notice");
+        };
         assert_eq!(
             notice.external_id,
             Some("game-new".to_owned()),

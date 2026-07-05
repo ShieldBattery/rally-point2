@@ -93,7 +93,11 @@ impl LeaveTracker {
     /// Safe to call with every stamp the redundant, out-of-order turn stream
     /// delivers, in whatever order they arrive.
     pub fn observe(&mut self, directive: &LeaveDirective) {
-        if let Some(existing) = self.leaves.iter().find(|l| l.directive.slot == directive.slot) {
+        if let Some(existing) = self
+            .leaves
+            .iter()
+            .find(|l| l.directive.slot == directive.slot)
+        {
             // Same slot already tracked: the relay's contract is that every
             // directive for a slot carries the same apply frame + reason, so a
             // disagreement is a relay bug worth catching in tests. Either way we
@@ -158,10 +162,16 @@ mod tests {
         tracker.observe(&leave(2, DROPPED, 100, 1));
 
         for frame in 90..100 {
-            assert!(tracker.take_due(frame).is_empty(), "applied early at {frame}");
+            assert!(
+                tracker.take_due(frame).is_empty(),
+                "applied early at {frame}"
+            );
         }
         assert_eq!(tracker.take_due(100), vec![(SlotId(2), DROPPED)]);
-        assert!(tracker.take_due(100).is_empty(), "a leave must surface once");
+        assert!(
+            tracker.take_due(100).is_empty(),
+            "a leave must surface once"
+        );
         assert!(tracker.take_due(101).is_empty());
     }
 

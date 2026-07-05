@@ -526,6 +526,13 @@ pub async fn run_slot_link(
                                     rally_point_proto::ids::GameFrameCount(frame),
                                 );
                             }
+                            // NOTE: the desync comparator is NOT fed here. The
+                            // mesh delivers a turn to the authority via more
+                            // than one path, so counting has to happen exactly
+                            // once per distinct (slot, seq) turn -- that's
+                            // `deliver_turn_to_locals`, right after its
+                            // mark_seen dedup, which `forward_turn` below
+                            // funnels into.
                             crate::mesh::forward_turn(
                                 &sessions,
                                 &mesh_links,
@@ -771,6 +778,8 @@ pub async fn run_slot_link(
                                         rally_point_proto::ids::GameFrameCount(frame),
                                     );
                                 }
+                                // NOTE: no desync-comparator call here either —
+                                // see the datagram path's note above.
                                 crate::mesh::forward_turn(
                                     &sessions,
                                     &mesh_links,

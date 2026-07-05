@@ -155,10 +155,14 @@
 //! most the cushion, so the horizon scales with the buffer rather than being a
 //! constant that a large cushion could outrun.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rally_point_proto::control::{BufferBounds, DepartureKind, DepartureNotice};
+use rally_point_proto::commands::command_length;
+use rally_point_proto::control::{
+    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
+};
 use rally_point_proto::ids::{GameFrameCount, SlotId};
 use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
 use tokio::sync::mpsc::UnboundedSender;
@@ -472,6 +476,16 @@ pub struct DecisionMaker {
     /// Kept above every observed `leave_seq` so a promoted relay's own numbering
     /// never collides with what clients already hold.
     next_leave_seq: u32,
+    /// Slots the coordinator flagged as observers (from the session descriptor).
+    /// Excluded from the desync comparator — observers do not reliably emit sync
+    /// commands, so requiring their checksums would stall the cross-check.
+    /// Descriptor-driven, so it survives authority changes (unlike the comparator
+    /// state, which resets on promotion).
+    observers: HashSet<SlotId>,
+    /// The per-session desync comparator. Only meaningful while this relay is the
+    /// authority; reset wholesale on promotion (a real desync re-diverges every
+    /// interval, so no state need transfer across a handoff).
+    sync: SyncTracker,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -485,6 +499,819 @@ pub struct DecisionMaker {
 struct Departure {
     last_frame: Option<GameFrameCount>,
     reason: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Relay-side desync detection
+// ---------------------------------------------------------------------------
+//
+// SC:R's lockstep sim exchanges a per-turn checksum through the command stream:
+// each client emits exactly one `0x37` sync command per outgoing turn once its
+// sync check is active. Because every client's Nth sync command covers the same
+// simulated interval, two clients whose sims have diverged produce a *different*
+// checksum at the same ordinal. Only the client's own sim reacts to a mismatch
+// (by dropping the peer over a transport that is inert under this seam), so under
+// netcode v2 a desync is invisible to everyone unless something that sees every
+// slot's turns compares the checksums itself. That is what [`SyncTracker`] does,
+// on the session's authority relay, off the same turn stream the buffer/leave
+// consensus already reads.
+
+/// The SC:R sync-command opcode. A 7-byte command emitted once per network
+/// turn while the game's sync check is active: `[0]` = this opcode; `[1]` =
+/// `(ring_index << 4) | hash_kind` — the high nibble is a 16-entry ring index
+/// (advancing `+1 mod 16` per turn) the comparator uses to place each report,
+/// the low nibble is the *hash kind* (1 or 2, never a sender/slot id — there
+/// is no sender id anywhere in this payload; identity comes from framing),
+/// locked to the ring index's parity (even → 1, odd → 2). So `[1]` cycles a
+/// fixed 16-value sequence: `0x01, 0x12, 0x21, 0x32, …, 0xF2`. `[2:3]` is
+/// `hash16` (the only byte range the comparator compares — see [`SyncValue`]);
+/// `[4..7]` is per-sender, vision-masked fog/vision data the comparator never
+/// reads (see [`SyncValue`] for why). This is definitive from a BinaryNinja RE
+/// of the native `verify_peer_sync_slot`, not inferred from the wire.
+///
+/// **Startup burst:** the enable path emits the first sync command at ring
+/// index 1 (`[1] = 0x12`), and the initial latency-depth flush emits several
+/// more `0x37`s stamped *identically* (same ring, same bytes) before the first
+/// per-turn record advances the ring — so a client's first few sync commands
+/// legitimately repeat ring 1 with identical content. [`SyncTracker::record`]'s
+/// same-ordinal duplicate-ignore absorbs this without any special-casing
+/// (live-relay confirmed): a repeat lands back at the same placed ordinal via
+/// ordinary nibble correction and is recognized as a duplicate. Ring index 0
+/// (and therefore our internal ordinal 0, which anchors to whatever ring value
+/// a tracker's very first observation happens to report — see
+/// [`SyncTracker::join_expected`]) first appears only once the ring wraps,
+/// around turn 15.
+const SYNC_COMMAND: u8 = 0x37;
+
+/// The total length of a `0x37` sync command, mirroring the command-length table.
+/// A `0x37` that does not measure this is not the sync command the comparator
+/// understands (it never is on validated bytes, but the walk stays defensive).
+const SYNC_COMMAND_LEN: usize = 7;
+
+/// The length, in bytes, of `hash16` — see [`SyncValue`] for why it's the only
+/// comparable range in the 7-byte `0x37`.
+const SYNC_HASH16_LEN: usize = 2;
+
+/// The `0x37` low nibble's valid hash-kind values (see [`SYNC_COMMAND`]'s
+/// layout note): 1 for the even-ring per-unit hash, 2 for the odd-ring
+/// game-header/rng hash. Any other low-nibble value is a malformed sync
+/// command (defensive — validated bytes shouldn't produce this; see
+/// [`SyncTracker::record`]).
+const SYNC_KIND_UNITS: u8 = 1;
+const SYNC_KIND_HEADER: u8 = 2;
+
+/// The sync command's ring index is a 16-entry ring, so a slot's true ordinal
+/// is congruent to its ring nibble modulo this. The comparator uses it to
+/// *place* each report (the ordinal congruent to the ring nearest the slot's
+/// expected position), not merely to validate one — see the module docs.
+const SYNC_RING_MODULUS: u64 = 16;
+
+/// The floor for [`sync_eval_margin`]'s per-session margin, and the value it
+/// returns for any buffer policy shallow enough not to need more: how far past
+/// an ordinal the frontier (the furthest any compared slot has reached) must
+/// move before that ordinal is evaluated. Replaces a same-instant "does
+/// everyone agree right now" check, which is unsound once slots can
+/// legitimately arrive out of order or lead each other by the latency
+/// buffer's depth (see the module docs): the margin instead waits long enough
+/// that every live slot's report for the ordinal has had time to show up,
+/// whatever order it arrived in. 8 is also where the ring nibble's own
+/// correction becomes ambiguous (see the module docs' bound note on steady-state
+/// placement), so there is no benefit to a smaller floor.
+const SYNC_EVAL_MARGIN_MIN: u64 = 8;
+
+/// A defensive backstop, not a live constraint under normal policy: buffer
+/// bounds at or above this are absurd enough (half the in-flight window,
+/// [`SYNC_WINDOW`]) that the evaluation margin they would imply
+/// ([`sync_eval_margin`]) swallows most of the window's slack, so the
+/// comparator disables itself for the session rather than risk starving on a
+/// buffer depth it was never tuned for. Ordinary policy (today's dev tenant:
+/// 1..=10) sits far under it — see [`BufferBounds`] for why depth itself no
+/// longer threatens the comparator's correctness the way it used to.
+const SYNC_ABSURD_BUFFER_MAX: u32 = (SYNC_WINDOW / 2) as u32;
+
+/// The most sync ordinals the comparator keeps in flight per session before
+/// evicting the oldest incomplete one. Sized comfortably above what
+/// [`sync_eval_margin`] can return under any buffer policy this session would
+/// actually run with (see [`SYNC_ABSURD_BUFFER_MAX`]); it is a memory-safety
+/// backstop for a slot whose sync stream stalls or stops (its ordinals then
+/// never complete and would otherwise accumulate without bound).
+const SYNC_WINDOW: usize = 64;
+
+/// The evaluation margin for a session whose buffer policy allows up to
+/// `bounds_max` turns of latency-buffer depth: a slot's arrivals can lag the
+/// frontier by roughly that depth, so a fixed margin under-waits once the
+/// policy allows a deep buffer — this scales the margin with the policy
+/// instead, floored at [`SYNC_EVAL_MARGIN_MIN`] (which also covers the
+/// transport-reordering slack a buffer depth of 0 wouldn't). `+ 2` is a small
+/// cushion above the depth itself for that same reordering slack at higher
+/// depths.
+///
+/// The debug assertion is the tripwire for [`SYNC_WINDOW`] going stale: if a
+/// future buffer policy ever needs a margin approaching half the window, the
+/// window (and the memory budget it implies) needs revisiting right alongside
+/// it, not silently.
+fn sync_eval_margin(bounds_max: u32) -> u64 {
+    let margin = (u64::from(bounds_max) + 2).max(SYNC_EVAL_MARGIN_MIN);
+    debug_assert!(
+        margin.saturating_mul(2) <= SYNC_WINDOW as u64,
+        "the evaluation margin ({margin}) should stay comfortably under half the eviction \
+         window ({SYNC_WINDOW}); a much larger buffer policy needs the window revisited too",
+    );
+    margin
+}
+
+/// One slot's compared checksum: `0x37`'s `hash16` (`[2:3]`, little-endian) —
+/// the *only* comparable byte range in the sync command.
+///
+/// The native `verify_peer_sync_slot` compares `hash16` and the hash kind
+/// straight across peers, but checks `[4]` (a folded fog checksum), `[5]`
+/// (fog window length), and `[6]` (a per-player vision bit) *pairwise*
+/// against the receiver's own local fog buffer with the sender's player bit —
+/// they are per-sender, vision-masked values that legitimately differ between
+/// honest players in the same game (each player's fog of war differs). A
+/// relay comparing them verbatim across all slots (as an earlier version of
+/// this comparator did) manufactures a false desync at ordinary game start —
+/// live-observed within the first few ordinals, long before any real
+/// divergence. So the comparator never reads `[4..7]` at all; do not
+/// "strengthen" this by adding them back.
+///
+/// **Cross-peer `hash16` equality is guaranteed by the native check's own
+/// structure**, not merely observed: `verify_peer_sync_slot` only passes a
+/// remote report when its `hash16` equals the value the *receiver* computed
+/// from its own simulation for that ring index — so in any healthy game every
+/// peer's `hash16` for a given ordinal is provably byte-identical (otherwise
+/// SC:R's own detection would already be firing constantly). Whatever term
+/// the decompiler's guessed local-player-id shift folds into the hash, it
+/// must therefore be shared state, not something that diverges honestly
+/// across peers.
+type SyncValue = [u8; SYNC_HASH16_LEN];
+
+/// A relay-authoritative desync the comparator confirmed: two live slots'
+/// checksums disagreed at the same sync ordinal. Pure data the registry layer
+/// turns into a [`DesyncNotice`] (stamping correlation ids + a detection
+/// timestamp) — the maker itself holds no clock and no tenant refs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncDivergence {
+    /// The per-slot sync ordinal the disagreement was observed at.
+    pub sync_ordinal: u64,
+    /// The `game_frame_count` of the turn whose sync command completed the
+    /// comparison — a human-meaningful interval. `None` only if that turn carried
+    /// no frame (it shouldn't; sync commands flow in-game).
+    pub game_frame: Option<u32>,
+    /// No strict majority shared one checksum (a 1v1 disagreement, or an even
+    /// split), so which sim is authoritative is undecidable from the relay's
+    /// view. `diverged` is empty when this is set.
+    pub no_majority: bool,
+    /// The minority slots that diverged from the agreeing majority, ascending.
+    /// Empty when `no_majority`.
+    pub diverged: Vec<SlotId>,
+}
+
+/// One slot's checksum report at an ordinal: its `hash16`, the hash kind
+/// (`SYNC_KIND_UNITS`/`SYNC_KIND_HEADER`) it was reported under, and the frame
+/// of the turn it rode.
+#[derive(Debug, Clone, Copy)]
+struct SyncReport {
+    value: SyncValue,
+    kind: u8,
+    game_frame: Option<u32>,
+}
+
+/// One compared slot's bookkeeping: where it's expected to report next, and
+/// where it first joined the compare set.
+#[derive(Debug, Clone, Copy)]
+struct Member {
+    /// This slot's next expected ordinal — the ordinal one past the last one
+    /// it placed a report at. Used both as the anchor a new report is
+    /// nibble-corrected against, and (via the max across all members) as the
+    /// tracker's *frontier*: the furthest any compared slot has reached.
+    next_expected: u64,
+    /// The ordinal this slot first joined the compare set at (its own true
+    /// ordinal at first observation, after nibble correction — never
+    /// retroactively 0). A member is only ever required to have reported an
+    /// ordinal at or after this, so a slot that joins mid-stream (a promotion,
+    /// or one whose sync simply started later) is never held responsible for
+    /// intervals before it existed.
+    since: u64,
+}
+
+/// The per-session sync-checksum comparator. Lives on the authority relay's
+/// [`DecisionMaker`] and is fed one call per turn (via
+/// [`DecisionMaker::observe_sync`], called exactly once per distinct
+/// `(slot, seq)` turn — see that method's docs), which walks the turn's
+/// commands for `0x37`s and hands each here.
+///
+/// # How ordinals align
+///
+/// A slot's *sync ordinal* is the count of sync commands seen from it, and the
+/// wire only carries the low 4 bits of that count: `ring`, the `0x37`'s
+/// `[1] >> 4` (a 16-entry ring, `+1 mod 16` per turn). The low nibble (`[1] &
+/// 0xF`) is the hash *kind* (1 or 2 — see [`SYNC_COMMAND`]'s layout note), not
+/// a sender/slot id; there is no sender id anywhere in this payload at all.
+/// Two properties of the transport make naive "arrival order is the ordinal"
+/// counting wrong:
+///
+/// - **Reordering and lead.** QUIC datagrams are unordered at both the client
+///   edge and across mesh flooding, and a client legitimately runs up to the
+///   latency buffer's depth *ahead* of its slowest peer's arrivals at the
+///   relay (producing turn `k+1` only requires having *executed* step
+///   `k+1 - depth`, not having every peer's turn `k` already in hand). So a
+///   slot's own turns can arrive at the relay out of order, and a slot's very
+///   first observed sync command can already be several ordinals into its
+///   stream.
+/// - **Duplication.** The mesh legitimately delivers the same turn to the
+///   authority via more than one path — that's what `mark_seen`/`MeshSeen`
+///   exist to catch. The comparator relies on its caller
+///   ([`DecisionMaker::observe_sync`]) handing it each distinct `(slot, seq)`
+///   turn exactly once; counting is not idempotent the way `observe_frame`'s
+///   monotone max is, so a duplicate that reached this far would silently
+///   drift a slot's ordinal.
+///
+/// The fix is **nibble-corrected placement**, in two flavors depending on
+/// whether the reporting slot is already known:
+///
+/// - **Steady state** (the slot has a [`Member`] entry already): placed at the
+///   ordinal congruent to `ring` (mod 16) *nearest the slot's own
+///   [`Member::next_expected`]*. This self-heals a reordered pair (a slot's
+///   own turns arriving out of sequence) — nearest-match resolves an offset
+///   of up to ±7 exactly. Critically, this bound is **transport-level
+///   reordering only** (how far out of order the mesh/QUIC can deliver two of
+///   *the same slot's* turns), which is far under ±7 regardless of the
+///   session's configured buffer depth — a slot's own emission order isn't
+///   affected by how much the buffer lets other slots lag behind it. See the
+///   bound note below.
+/// - **Join** (the slot's first-ever report): the transport-reordering
+///   argument above doesn't apply, because there's no prior report from this
+///   slot to be "out of order" relative to — its expected ordinal has to come
+///   from somewhere else, and that somewhere else (the current *frontier*,
+///   the furthest any member has reached) can be arbitrarily far from the
+///   join's true ordinal, growing with the session's buffer depth (a deeper
+///   buffer lets a fast slot's turns run further ahead of a slow slot's first
+///   arrival). Nibble-correcting around the frontier is therefore unsound at
+///   depth; instead the join anchors on the reporting turn's
+///   `game_frame_count` ([`SyncTracker::join_expected`]): lockstep keeps every
+///   client's frame for the same simulated interval within a couple of turns
+///   of each other *regardless of buffer depth* (the depth is a session-wide
+///   constant that cancels out across clients), so projecting from a recent
+///   (ordinal, frame) calibration point and nibble-correcting around *that*
+///   estimate lands on the true ordinal at any realistic depth. Falls back to
+///   frontier+nibble when no frame is available to anchor on (either the
+///   joining report carries none, or the tracker has no calibration yet), and
+///   further to the ring's own face value when there is no frontier either
+///   (the tracker's very first observation for the session at all — the
+///   promotion-mid-stream case, where there is no earlier context of any
+///   kind — see [`DecisionMaker::set_authority`]'s promotion reset).
+///
+/// Either way, a slot's join ordinal is tracked as [`Member::since`], so
+/// nothing is retroactively required of it for ordinals before that. A
+/// placement that lands below `base_ordinal` (already-retired territory —
+/// possible right after a correction, or after an eviction) is dropped
+/// silently; that one comparison is lost, which is acceptable.
+///
+/// **Bound note:** nibble correction is sound only while the gap between the
+/// value it corrects around and the report's true ordinal stays under 8 (half
+/// the 16-entry ring) — beyond that the nearest-match is ambiguous or wrong.
+/// For steady state that gap is transport reordering, bounded independent of
+/// buffer depth (see above). For a join, frame-anchoring keeps the gap to
+/// lockstep's cross-client frame skew (a couple of turns) rather than the
+/// buffer depth itself, so depth no longer threatens correctness either — see
+/// [`BufferBounds`] for this from the policy side. [`SYNC_ABSURD_BUFFER_MAX`]
+/// is the remaining backstop, for a policy so deep it stops being a
+/// buffer-tuning question at all.
+///
+/// # What retires an ordinal
+///
+/// An ordinal is evaluated once the frontier has moved at least
+/// [`sync_eval_margin`] past it (long enough that every live slot's report for
+/// it, however reordered or however deep the buffer let it lag, should have
+/// arrived) **and** every member whose `since` is at or before it has
+/// reported it. A member that hasn't reported yet despite the margin is rare
+/// but possible (a genuinely stalled link); [`SYNC_WINDOW`] eviction is the
+/// backstop that bounds the wait.
+///
+/// A retired ordinal whose reports all agree retires silently. One with a
+/// disagreement fires exactly one [`SyncDivergence`]: the strict-majority value
+/// is authoritative and every other slot is the diverged minority (dropped from
+/// the compare set, so the survivors keep being watched and a later second
+/// divergence fires again at its own ordinal); with no strict majority the
+/// comparator reports `no_majority` and goes dormant (the truth is unrecoverable
+/// for the session). A slot that departs or is dropped stops being required.
+///
+/// # Bounded state
+///
+/// In-flight ordinals are capped at [`SYNC_WINDOW`]; a slot that stalls leaves
+/// its ordinals forever-incomplete, so the oldest are evicted (with a
+/// rate-limited warn naming who failed to report) rather than growing without
+/// bound. Comparator state is reset wholesale on authority promotion — a real
+/// desync diverges every interval, so the next interval after promotion catches
+/// it, and transferring per-ordinal hash state across a handoff would be pure
+/// complexity for a one-interval blind spot.
+#[derive(Debug, Default)]
+struct SyncTracker {
+    /// Once set, the comparator has reached a verdict it cannot refine (a
+    /// no-majority split, a majority event that left fewer than two comparable
+    /// slots, or absurd buffer bounds) and no-ops for the rest of the session.
+    dormant: bool,
+    /// The lowest ordinal still awaiting evaluation; everything below has retired
+    /// (agreed, fired, or been evicted).
+    base_ordinal: u64,
+    /// Each compared slot's bookkeeping. The key set *is* the compare set: a
+    /// slot enters on its first sync command and leaves on departure or as a
+    /// dropped minority.
+    members: HashMap<SlotId, Member>,
+    /// Reports awaiting a complete ordinal, keyed by ordinal then slot.
+    pending: BTreeMap<u64, HashMap<SlotId, SyncReport>>,
+    /// The earliest `(ordinal, frame)` calibration point this tracker has ever
+    /// recorded, paired with `latest_calibration` to derive an approximate
+    /// frames-per-ordinal rate for frame-anchored join placement (see
+    /// [`Self::join_expected`]). Kept independent of `pending`/`members` so it
+    /// survives ordinal retirement and eviction. Set once and never replaced —
+    /// even a session-wide average rate is close enough to disambiguate
+    /// candidates 16 ordinals (and therefore many frames) apart.
+    first_calibration: Option<(u64, u32)>,
+    /// The most recent `(ordinal, frame)` calibration point recorded, paired
+    /// with `first_calibration` for the rate estimate.
+    latest_calibration: Option<(u64, u32)>,
+    /// Rate-limit counter for the placement-correction warn (a nonzero nibble
+    /// correction — a reorder, a lead, or a late join).
+    correction_warns: u64,
+    /// Rate-limit counter for the same-ordinal conflicting-value warn (a slot
+    /// reporting two different checksums for the same placed ordinal — an
+    /// honest client never does this).
+    duplicate_warns: u64,
+    /// Rate-limit counter for the malformed-hash-kind warn (the `0x37`'s low
+    /// nibble is neither 1 nor 2 — validated bytes shouldn't produce this;
+    /// see [`SyncTracker::record`]).
+    malformed_kind_warns: u64,
+    /// Rate-limit counter for the kind/parity-mismatch warn (a report's hash
+    /// kind disagrees with its placed ordinal's expected parity — an
+    /// alignment-drift indicator, not a desync; see [`SyncTracker::evaluate`]).
+    kind_parity_warns: u64,
+    /// Rate-limit counter for the window-eviction (stalled-slot) warn.
+    evict_warns: u64,
+}
+
+/// The hash kind SC:R's native sync check ties to a ring index's parity: even
+/// → [`SYNC_KIND_UNITS`] (the per-unit hash), odd → [`SYNC_KIND_HEADER`] (the
+/// game-header/rng hash). A placed ordinal is always congruent to its true
+/// ring index modulo 16 ([`SYNC_RING_MODULUS`]), and mod-16 preserves parity
+/// (16 is even), so an honestly-placed report's ordinal parity exactly
+/// predicts its kind — this is what [`SyncTracker::evaluate`]'s kind/parity
+/// cross-check tests.
+fn expected_kind_for_ordinal(ordinal: u64) -> u8 {
+    if ordinal.is_multiple_of(2) {
+        SYNC_KIND_UNITS
+    } else {
+        SYNC_KIND_HEADER
+    }
+}
+
+impl SyncTracker {
+    /// Records one slot's `0x37`, nibble-correcting its placement, and
+    /// evaluates any now-ready ordinals, returning a [`SyncDivergence`] if one
+    /// fired. `ring` is the command's ring nibble (the high nibble of `[1]`,
+    /// already shifted to 0..15); `kind` is the low nibble (the hash kind).
+    ///
+    /// `kind` must be [`SYNC_KIND_UNITS`] or [`SYNC_KIND_HEADER`] — anything
+    /// else is a malformed sync command (defensive; validated bytes shouldn't
+    /// produce this) and the report is skipped entirely: no member
+    /// bookkeeping, no calibration, nothing recorded, just a rate-limited warn.
+    ///
+    /// Placement: the ordinal congruent to `ring` (mod 16) nearest this slot's
+    /// expected ordinal — its own [`Member::next_expected`] if already a
+    /// member (steady state), else [`Self::join_expected`]'s frame-anchored
+    /// (or frontier, or ring-face-value) estimate for a first-ever report. See
+    /// the module docs for why the two cases differ and the bound on how far
+    /// each correction can reach. `margin` is this session's current
+    /// evaluation margin ([`sync_eval_margin`]) — threaded through to
+    /// [`Self::evaluate_ready`] rather than stored, so a mid-session bounds
+    /// change is picked up immediately without the tracker needing to be told.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        key: &SessionKey,
+        slot: SlotId,
+        ring: u8,
+        kind: u8,
+        value: SyncValue,
+        game_frame: Option<u32>,
+        margin: u64,
+    ) -> Option<SyncDivergence> {
+        if kind != SYNC_KIND_UNITS && kind != SYNC_KIND_HEADER {
+            self.malformed_kind_warns += 1;
+            if should_warn(self.malformed_kind_warns) {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    kind,
+                    count = self.malformed_kind_warns,
+                    "sync command's hash-kind nibble is neither 1 nor 2; \
+                     skipping this report as malformed",
+                );
+            }
+            return None;
+        }
+
+        let ring = u64::from(ring);
+        let existing_next_expected = self.members.get(&slot).map(|m| m.next_expected);
+        let is_new_member = existing_next_expected.is_none();
+        let expected =
+            existing_next_expected.unwrap_or_else(|| self.join_expected(ring, game_frame));
+
+        // Nearest ordinal ≡ ring (mod 16) to `expected`. `diff` lands in
+        // [-8, 8]; the ends (exactly ±8) are the ambiguous case the module
+        // docs' bound note calls out — deterministic here, but not
+        // necessarily correct, which is why each case's own bound (transport
+        // reordering for steady state, frame skew for a join) is what keeps
+        // real gaps well inside this range rather than at its edge.
+        let expected_mod = (expected % SYNC_RING_MODULUS) as i64;
+        let mut diff = ring as i64 - expected_mod;
+        if diff > 8 {
+            diff -= 16;
+        } else if diff < -8 {
+            diff += 16;
+        }
+        let placed = i128::from(expected) + i128::from(diff);
+
+        if diff != 0 {
+            self.correction_warns += 1;
+            if should_warn(self.correction_warns) {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    expected,
+                    ring,
+                    placed,
+                    count = self.correction_warns,
+                    "sync ordinal placement corrected from the ring nibble; \
+                     the turn arrived out of order, the slot is running ahead, \
+                     or it just joined the compare set",
+                );
+            }
+        }
+
+        // Advance this member's bookkeeping regardless of whether the
+        // placement itself lands in already-retired territory below — a
+        // dropped comparison must not also leave the member's own progress
+        // stale (it has still, after all, reported this many sync commands).
+        let next_expected_candidate = u64::try_from(placed + 1).unwrap_or(0);
+        let since_candidate = u64::try_from(placed).unwrap_or(0);
+        let member = self.members.entry(slot).or_insert_with(|| Member {
+            next_expected: 0,
+            since: since_candidate,
+        });
+        member.next_expected = member.next_expected.max(next_expected_candidate);
+        if is_new_member {
+            member.since = since_candidate;
+        }
+
+        // A confirmed placement is a calibration point regardless of whether
+        // it's later dropped as already-retired below — it's still a genuine
+        // (ordinal, frame) fact, and the rate estimate benefits from every one.
+        if let Some(frame) = game_frame {
+            self.note_calibration(since_candidate, frame);
+        }
+
+        if placed < i128::from(self.base_ordinal) {
+            // Already-retired territory (possible right after a correction or
+            // an eviction): the comparison is lost, which is acceptable —
+            // don't let it perturb anything beyond the bookkeeping above.
+            return None;
+        }
+        let ordinal = placed as u64; // non-negative: checked above
+
+        match self.pending.entry(ordinal).or_default().entry(slot) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                if existing.get().value != value {
+                    // An honest client never emits two different checksums for
+                    // the same turn; keep the first and just flag it.
+                    self.duplicate_warns += 1;
+                    if should_warn(self.duplicate_warns) {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            ordinal,
+                            count = self.duplicate_warns,
+                            "conflicting sync value for a slot already reported \
+                             at this ordinal; keeping the first",
+                        );
+                    }
+                }
+                // Same value: a harmless duplicate (the belt-and-suspenders
+                // case — the caller is expected to already dedup turns, but
+                // nibble correction can independently re-place a redundant
+                // report at an ordinal it already holds). Either way, nothing
+                // to insert.
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(SyncReport {
+                    value,
+                    kind,
+                    game_frame,
+                });
+            }
+        }
+
+        if let Some(divergence) = self.evaluate_ready(key, margin) {
+            return Some(divergence);
+        }
+        self.evict_over_window(key);
+        None
+    }
+
+    /// The join-placement anchor for a slot's first-ever report: the ordinal
+    /// [`Self::record`]'s nibble correction will refine.
+    ///
+    /// Prefers a **frame-anchored estimate**: given a calibration rate (see
+    /// [`Self::frame_rate`]) and the most recent `(ordinal, frame)` point,
+    /// projects linearly from that point to the joining report's `game_frame`
+    /// and returns the projected ordinal, clamped to `[0, frontier]` (a
+    /// joining slot cannot legitimately be *ahead* of the frontier — the
+    /// clamp is what keeps a degenerate rate estimate from producing a wild
+    /// placement rather than a merely-imprecise one, which the caller's
+    /// nibble correction can still recover from as long as it's within ±7 of
+    /// the truth).
+    ///
+    /// Falls back to the current frontier (the furthest any member has
+    /// reached) when no frame estimate is available — the joining report
+    /// carries no `game_frame`, or the tracker has no rate yet — and further
+    /// to the ring's own face value when there is no frontier either (no
+    /// members at all: the tracker's very first observation for the session).
+    fn join_expected(&self, ring: u64, game_frame: Option<u32>) -> u64 {
+        let Some(frontier) = self.members.values().map(|m| m.next_expected).max() else {
+            return ring; // no members at all: the tracker's very first observation
+        };
+        if let Some(frame) = game_frame
+            && let Some(rate) = self.frame_rate()
+            && let Some((ref_ordinal, ref_frame)) = self.latest_calibration
+        {
+            let predicted = ref_ordinal as f64 + (f64::from(frame) - f64::from(ref_frame)) / rate;
+            return predicted.clamp(0.0, frontier as f64).round() as u64;
+        }
+        frontier
+    }
+
+    /// The approximate frames-per-ordinal rate this session is advancing at,
+    /// from the spread between [`Self::first_calibration`] and
+    /// [`Self::latest_calibration`]. `None` until two distinct-ordinal
+    /// calibration points exist, or if the computed rate isn't a sane forward
+    /// rate (frames must advance, not stall or run backward, between distinct
+    /// ordinals — a stalled/negative rate would come from a pause or
+    /// attacker-adjacent data, either way not something to project from).
+    fn frame_rate(&self) -> Option<f64> {
+        let (o1, f1) = self.first_calibration?;
+        let (o2, f2) = self.latest_calibration?;
+        if o2 <= o1 {
+            return None;
+        }
+        let rate = (f64::from(f2) - f64::from(f1)) / (o2 - o1) as f64;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    }
+
+    /// Records a confirmed `(ordinal, frame)` calibration point. Seeds
+    /// [`Self::first_calibration`] once and never replaces it; keeps
+    /// [`Self::latest_calibration`] at the newest ordinal seen (a late
+    /// arrival for an older ordinal must not regress it).
+    fn note_calibration(&mut self, ordinal: u64, frame: u32) {
+        if self.first_calibration.is_none() {
+            self.first_calibration = Some((ordinal, frame));
+        }
+        if self.latest_calibration.is_none_or(|(o, _)| ordinal > o) {
+            self.latest_calibration = Some((ordinal, frame));
+        }
+    }
+
+    /// Evaluates every ordinal now ready: the frontier (the furthest any
+    /// member has reached) has moved at least `margin` past it (see
+    /// [`sync_eval_margin`]), and every member required for it (its `since` at
+    /// or before it) has reported it. Returns the first [`SyncDivergence`]
+    /// fired, if any — the caller's next `record` call resumes draining from
+    /// where this left off.
+    fn evaluate_ready(&mut self, key: &SessionKey, margin: u64) -> Option<SyncDivergence> {
+        loop {
+            let Some(frontier) = self.members.values().map(|m| m.next_expected).max() else {
+                return None; // no members yet
+            };
+            let base = self.base_ordinal;
+            if frontier < base + margin {
+                return None; // not enough lead yet to trust completeness
+            }
+
+            let required: Vec<SlotId> = self
+                .members
+                .iter()
+                .filter(|(_, m)| m.since <= base)
+                .map(|(slot, _)| *slot)
+                .collect();
+            if required.is_empty() {
+                // No member was active this far back -- vacuously nothing to
+                // compare (only reachable right after a promotion anchors the
+                // frontier ahead of ordinal 0, or once every once-required
+                // member has since departed). Just retire and move on.
+                self.pending.remove(&base);
+                self.base_ordinal += 1;
+                continue;
+            }
+
+            let complete = self
+                .pending
+                .get(&base)
+                .is_some_and(|reports| required.iter().all(|slot| reports.contains_key(slot)));
+            if !complete {
+                // Should be rare given the margin; a genuinely stalled member
+                // is bounded by window eviction instead of blocking here.
+                return None;
+            }
+
+            let reports = self.pending.remove(&base).expect("just matched complete");
+            self.base_ordinal += 1;
+            if let Some(divergence) = self.evaluate(base, &reports, key) {
+                return Some(divergence);
+            }
+        }
+    }
+
+    /// Marks the comparator permanently dormant because the session's
+    /// negotiated buffer bounds reach the absurd-bounds backstop
+    /// ([`SYNC_ABSURD_BUFFER_MAX`]) — not a live constraint under any real
+    /// policy, just a defensive ceiling: logs once, then behaves exactly like
+    /// any other dormant comparator (a cheap no-op).
+    fn disable_for_absurd_bounds(&mut self, key: &SessionKey, max_buffer: u32) {
+        if !self.dormant {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                max_buffer,
+                absurd_at = SYNC_ABSURD_BUFFER_MAX,
+                "session's buffer bounds reach the desync comparator's absurd-bounds \
+                 backstop; disabling desync detection for this session",
+            );
+        }
+        self.dormant = true;
+    }
+
+    /// Compares the reports at a complete `ordinal`. `None` when every
+    /// *comparable* report agrees (the ordinal retires silently, whether or
+    /// not there were zero or more kind-mismatched reports excluded);
+    /// otherwise the [`SyncDivergence`] to fire, after pruning the diverged
+    /// minority from the compare set.
+    ///
+    /// A report whose `kind` disagrees with `ordinal`'s expected parity (see
+    /// [`expected_kind_for_ordinal`]) is excluded from the comparison
+    /// entirely — a rate-limited warn, not a vote either way: kind is a
+    /// deterministic function of the true ring index, so a mismatch here
+    /// means this report's placement (not necessarily its sim) drifted, and
+    /// grouping a wrong-kind hash alongside the right-kind ones would compare
+    /// two different quantities (the native check alternates between a
+    /// per-unit hash and a game-header/rng hash — see [`SyncValue`]) as if
+    /// they were the same checksum.
+    fn evaluate(
+        &mut self,
+        ordinal: u64,
+        reports: &HashMap<SlotId, SyncReport>,
+        key: &SessionKey,
+    ) -> Option<SyncDivergence> {
+        let expected_kind = expected_kind_for_ordinal(ordinal);
+
+        let mut groups: HashMap<SyncValue, Vec<SlotId>> = HashMap::new();
+        let mut comparable = 0usize;
+        for (slot, report) in reports {
+            if report.kind != expected_kind {
+                self.kind_parity_warns += 1;
+                if should_warn(self.kind_parity_warns) {
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = key.session.0,
+                        slot = slot.0,
+                        ordinal,
+                        kind = report.kind,
+                        expected_kind,
+                        count = self.kind_parity_warns,
+                        "sync kind disagrees with this ordinal's expected parity; \
+                         excluding this report from the desync comparison as a \
+                         likely alignment drift, not a desync",
+                    );
+                }
+                continue;
+            }
+            comparable += 1;
+            groups.entry(report.value).or_default().push(*slot);
+        }
+        if groups.len() <= 1 {
+            return None; // every comparable report agreed (or fewer than 2 were comparable)
+        }
+
+        // The frame the mismatch was confirmed at. In lockstep every report at
+        // one ordinal shares a frame, so picking the newest present is only a
+        // defensive tie-break, not a meaningful choice among disagreeing values.
+        let game_frame = reports.values().filter_map(|r| r.game_frame).max();
+
+        let majority = groups
+            .iter()
+            .find(|(_, slots)| slots.len() * 2 > comparable)
+            .map(|(_, slots)| slots.clone());
+
+        match majority {
+            Some(majority_slots) => {
+                let majority: HashSet<SlotId> = majority_slots.into_iter().collect();
+                // Drawn from `groups` (comparable reports only) — a
+                // kind-excluded slot never appears here; it was never really
+                // "in" the comparison to have diverged from it.
+                let mut diverged: Vec<SlotId> = groups
+                    .values()
+                    .flatten()
+                    .copied()
+                    .filter(|slot| !majority.contains(slot))
+                    .collect();
+                diverged.sort_unstable();
+                // Drop the minority from the compare set *and* from every future
+                // pending ordinal, so the survivors are compared only against each
+                // other from here on.
+                for slot in &diverged {
+                    self.remove_member(*slot);
+                }
+                // With fewer than two comparable slots left there is nothing to
+                // compare, so stop for the session.
+                if self.members.len() < 2 {
+                    self.dormant = true;
+                }
+                Some(SyncDivergence {
+                    sync_ordinal: ordinal,
+                    game_frame,
+                    no_majority: false,
+                    diverged,
+                })
+            }
+            None => {
+                // A 1v1 or even split: undecidable, and no survivor set to keep
+                // watching. Report it and go dormant for the session.
+                self.dormant = true;
+                Some(SyncDivergence {
+                    sync_ordinal: ordinal,
+                    game_frame,
+                    no_majority: true,
+                    diverged: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// Evicts the oldest in-flight ordinal(s) while over [`SYNC_WINDOW`]. A slot
+    /// that stalled leaves its ordinals forever-incomplete; the eviction bounds
+    /// memory and is the missing-sync signal too — the evicted ordinal's report
+    /// set names who *did* report, so the rest are the stalled slots.
+    fn evict_over_window(&mut self, key: &SessionKey) {
+        while self.pending.len() > SYNC_WINDOW {
+            let ordinal = *self
+                .pending
+                .keys()
+                .next()
+                .expect("over-window is non-empty");
+            let reports = self.pending.remove(&ordinal).expect("just matched");
+            let mut missing: Vec<u8> = self
+                .members
+                .keys()
+                .filter(|member| !reports.contains_key(member))
+                .map(|slot| slot.0)
+                .collect();
+            missing.sort_unstable();
+            self.evict_warns += 1;
+            if should_warn(self.evict_warns) {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    ordinal,
+                    ?missing,
+                    count = self.evict_warns,
+                    "evicting an incomplete sync ordinal over the window cap; \
+                     a slot's sync stream is lagging or stopped",
+                );
+            }
+            if ordinal >= self.base_ordinal {
+                self.base_ordinal = ordinal + 1;
+            }
+        }
+    }
+
+    /// Removes `slot` from the compare set and drops its reports from every
+    /// pending ordinal, so it is neither required nor compared from here on.
+    /// Idempotent — a slot not in the set is a no-op.
+    fn remove_member(&mut self, slot: SlotId) {
+        self.members.remove(&slot);
+        for reports in self.pending.values_mut() {
+            reports.remove(&slot);
+        }
+    }
+}
+
+/// Whether a rate-limited warn should fire at occurrence `count`: on the first,
+/// then at every power of two. Bounds log volume to O(log n) for a persistent
+/// anomaly while never fully going silent.
+fn should_warn(count: u64) -> bool {
+    count == 1 || count.is_power_of_two()
 }
 
 impl DecisionMaker {
@@ -510,6 +1337,8 @@ impl DecisionMaker {
             decided_leaves: HashMap::new(),
             departures: HashMap::new(),
             next_leave_seq: 0,
+            observers: HashSet::new(),
+            sync: SyncTracker::default(),
         }
     }
 
@@ -651,6 +1480,12 @@ impl DecisionMaker {
             self.pending_directive = None;
         }
         if promoting {
+            // Start the desync comparator fresh. No per-ordinal checksum state
+            // transfers across a handoff — a real desync diverges every interval,
+            // so the first interval after promotion re-detects it, and carrying
+            // the window across would be complexity for a one-interval blind spot.
+            // Observer membership is descriptor-driven, so it is deliberately kept.
+            self.sync = SyncTracker::default();
             self.drain_handoff_leaves()
         } else {
             (Vec::new(), Vec::new())
@@ -1137,6 +1972,11 @@ impl DecisionMaker {
                 });
             }
         }
+        // A departed slot stops being required by the desync comparator: drop it
+        // from the compare set so ordinals it would never report can still
+        // complete on the survivors. Harmless on a non-authority relay (the
+        // comparator is empty there) and idempotent for a slot never seen.
+        self.sync.remove_member(slot);
     }
 
     /// Removes a slot's condition history (the client disconnected). Called
@@ -1149,6 +1989,104 @@ impl DecisionMaker {
     /// re-derive the leave.
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
+    }
+
+    /// Sets the session's observer slots (from the coordinator descriptor),
+    /// replacing whatever was recorded before. Any newly-observer slot is dropped
+    /// from the desync compare set — an observer must never be a required
+    /// reporter. Called on every descriptor apply, so a changed observer set
+    /// replaces rather than accumulates.
+    pub fn set_observers(&mut self, observers: HashSet<SlotId>) {
+        for slot in &observers {
+            self.sync.remove_member(*slot);
+        }
+        self.observers = observers;
+    }
+
+    /// Feeds one turn's commands into the desync comparator, returning a
+    /// [`SyncDivergence`] if this turn's sync command confirmed one. A cheap no-op
+    /// unless this relay is the session authority and the comparator is still live
+    /// (not dormant, and `slot` is a compared, non-observer, non-departed slot).
+    ///
+    /// **Caller contract: exactly once per distinct `(slot, seq)` turn.** The
+    /// comparator's per-slot ordinal counting is not idempotent the way
+    /// [`observe_frame`](Self::observe_frame)'s monotone max is — a turn handed
+    /// to this method twice (the mesh legitimately delivers the same turn to
+    /// the authority via more than one path) would be counted twice and
+    /// silently misalign that slot's ordinals. The one call site
+    /// (`deliver_turn_to_locals` in `mesh.rs`) is placed immediately after that
+    /// function's own duplicate check for exactly this reason — don't add
+    /// another call site upstream of it.
+    ///
+    /// It re-walks the command bytes itself looking for `0x37` sync commands. The
+    /// bytes were bounds-checked at the ingress client edge — mesh hops trust that
+    /// and do not re-validate — but this walk stays independent and defensive (it
+    /// parses with the shared length table and stops on any anomaly rather than
+    /// trusting a length): the authority reaches its own desync verdict from the
+    /// bytes, it does not rely on a peer's parse, and the data is still nominally
+    /// attacker-adjacent.
+    ///
+    /// `game_frame` is the turn's `game_frame_count` (carried into the notice as
+    /// the interval the mismatch was confirmed at); `commands` is the raw command
+    /// stream.
+    pub fn observe_sync(
+        &mut self,
+        slot: SlotId,
+        game_frame: Option<u32>,
+        commands: &[u8],
+    ) -> Option<SyncDivergence> {
+        if self.authority != Authority::SelfRelay {
+            return None;
+        }
+        // The session's negotiated buffer bounds may have grown to the
+        // defensive absurd-bounds backstop (see `SYNC_ABSURD_BUFFER_MAX`) —
+        // checked on every call since bounds can change mid-session
+        // (`sync`/`apply_descriptor`); cheap, and `disable_for_absurd_bounds`
+        // only logs once. Ordinary policy never approaches this.
+        if self.bounds.max >= SYNC_ABSURD_BUFFER_MAX {
+            self.sync
+                .disable_for_absurd_bounds(&self.key, self.bounds.max);
+        }
+        // No-op fast paths: a dormant comparator has reached a terminal
+        // verdict (or was just disabled above), and observers/departed slots
+        // are never compared.
+        if self.sync.dormant
+            || self.observers.contains(&slot)
+            || self.departures.contains_key(&slot)
+        {
+            return None;
+        }
+        let margin = sync_eval_margin(self.bounds.max);
+
+        // Walk the command stream, handing each sync command to the comparator.
+        // There is exactly one per honest turn, but the walk handles any count
+        // (and stops cleanly on a malformed length) without panicking.
+        let mut offset = 0;
+        while offset < commands.len() {
+            let Some(len) = command_length(&commands[offset..]) else {
+                break; // an opcode the table doesn't know: stop, don't guess
+            };
+            if len == 0 || offset + len > commands.len() {
+                break; // a length that overruns the buffer: stop
+            }
+            if commands[offset] == SYNC_COMMAND && len == SYNC_COMMAND_LEN {
+                let command = &commands[offset..offset + SYNC_COMMAND_LEN];
+                let ring = command[1] >> 4;
+                let kind = command[1] & 0x0F;
+                let mut value = SyncValue::default();
+                value.copy_from_slice(&command[2..2 + SYNC_HASH16_LEN]);
+                // `[4..7]` (fog/vision, per-sender and pairwise-only in the
+                // native check) is deliberately never read — see `SyncValue`.
+                if let Some(divergence) = self
+                    .sync
+                    .record(&self.key, slot, ring, kind, value, game_frame, margin)
+                {
+                    return Some(divergence);
+                }
+            }
+            offset += len;
+        }
+        None
     }
 }
 
@@ -1191,18 +2129,35 @@ struct SessionExternalRefs {
     slots: HashMap<SlotId, String>,
 }
 
+/// A notice a relay sends up its coordinator control connection about a running
+/// game: a player departed, or the game desynced. Both ride one channel (the
+/// leave sites and the sync comparator feed the same sender), so the reconnect
+/// buffering that guarantees a queued notice survives a coordinator restart is
+/// written once, not per kind. The coordinator client wraps each into the
+/// matching [`RelayToCoordinator`](rally_point_proto::control::RelayToCoordinator)
+/// frame when it forwards it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayNotice {
+    /// A player permanently departed a running game (left vs. dropped).
+    Departure(DepartureNotice),
+    /// The game's sims diverged — a relay-observed desync.
+    Desync(DesyncNotice),
+}
+
 /// A registry of per-session decision-makers, one per session this relay is
 /// (or may become) the authority for. Shared across the slot-link and mesh-link
 /// tasks that feed conditions in.
 ///
-/// It also owns an optional **departure notifier** — the sender half of an
+/// It also owns an optional **notice notifier** — the sender half of an
 /// unbounded channel drained by the coordinator control connection. The leave
 /// sites ([`decide_leave`], [`observe_leave`], and the promotion re-derivation
 /// in [`set_authority`]/[`sync_maker`]) fire a [`DepartureNotice`] onto it the
-/// moment a synced leave for a slot first enters this relay's cache, so the
-/// coordinator learns "player X left vs. was dropped". The notifier is set once
-/// at startup when a coordinator is configured and is simply absent when the
-/// relay runs standalone (no coordinator to notify), where firing is a no-op.
+/// moment a synced leave for a slot first enters this relay's cache, and the
+/// desync comparator ([`observe_sync`]) fires a [`DesyncNotice`] when it confirms
+/// a divergence — so the coordinator learns "player X left vs. was dropped" and
+/// "this game desynced at ordinal N". The notifier is set once at startup when a
+/// coordinator is configured and is simply absent when the relay runs standalone
+/// (no coordinator to notify), where firing is a no-op.
 ///
 /// It also holds each session's **correlation ids** ([`SessionExternalRefs`]),
 /// populated from the coordinator's descriptor at apply time
@@ -1222,7 +2177,8 @@ pub struct DecisionMakers {
     /// Absent for a standalone relay. Unbounded so queueing a notice while the
     /// coordinator link is down never blocks the turn path — the drain end holds
     /// the channel across reconnects and flushes pending notices on redial.
-    departures: OnceLock<UnboundedSender<DepartureNotice>>,
+    /// Carries the [`RelayNotice`] union so departures and desyncs share one pipe.
+    notices: OnceLock<UnboundedSender<RelayNotice>>,
     /// Correlation ids per session, from the coordinator's descriptor. Absent
     /// for a session whose descriptor never carried them (a standalone relay,
     /// or a coordinator that predates the fields) — a departure notice for such
@@ -1239,22 +2195,32 @@ impl DecisionMakers {
         self.makers.lock()
     }
 
-    /// Installs the departure notifier — the sender half of the channel the
-    /// coordinator control connection drains. Set once at startup; a second call
-    /// is ignored (the first sender wins), matching the "one coordinator link
-    /// per relay" reality.
-    pub fn set_departure_notifier(&self, sender: UnboundedSender<DepartureNotice>) {
-        let _ = self.departures.set(sender);
+    /// Installs the notice notifier — the sender half of the channel the
+    /// coordinator control connection drains (departures and desyncs both). Set
+    /// once at startup; a second call is ignored (the first sender wins), matching
+    /// the "one coordinator link per relay" reality.
+    pub fn set_notice_notifier(&self, sender: UnboundedSender<RelayNotice>) {
+        let _ = self.notices.set(sender);
     }
 
-    /// Fires a departure notice up the coordinator control connection, if a
-    /// notifier is installed. A no-op on a standalone relay. The channel is
-    /// unbounded, so this never blocks; a send error means the drain end is gone
-    /// (no coordinator subscriber), which for a standalone relay is expected.
-    fn notify_departure(&self, notice: DepartureNotice) {
-        if let Some(sender) = self.departures.get() {
+    /// Fires a notice up the coordinator control connection, if a notifier is
+    /// installed. A no-op on a standalone relay. The channel is unbounded, so this
+    /// never blocks; a send error means the drain end is gone (no coordinator
+    /// subscriber), which for a standalone relay is expected.
+    fn emit_notice(&self, notice: RelayNotice) {
+        if let Some(sender) = self.notices.get() {
             let _ = sender.send(notice);
         }
+    }
+
+    /// Fires a departure notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_departure(&self, notice: DepartureNotice) {
+        self.emit_notice(RelayNotice::Departure(notice));
+    }
+
+    /// Fires a desync notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_desync(&self, notice: DesyncNotice) {
+        self.emit_notice(RelayNotice::Desync(notice));
     }
 
     /// Records `key`'s correlation ids from a coordinator descriptor, replacing
@@ -1286,12 +2252,12 @@ impl DecisionMakers {
 }
 
 /// Creates an empty decision-maker registry for a relay with no sessions yet,
-/// and no departure notifier installed (a standalone relay, or before startup
-/// wiring calls [`DecisionMakers::set_departure_notifier`]).
+/// and no notice notifier installed (a standalone relay, or before startup
+/// wiring calls [`DecisionMakers::set_notice_notifier`]).
 pub fn new_decision_makers() -> DecisionMakers {
     DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
-        departures: OnceLock::new(),
+        notices: OnceLock::new(),
         refs: parking_lot::Mutex::new(HashMap::new()),
     }
 }
@@ -1330,6 +2296,42 @@ fn departure_notice(
         leave_seq: leave.leave_seq,
         external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
         external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+    }
+}
+
+/// Builds the desync notice for a divergence the comparator just confirmed:
+/// carries the sync ordinal + confirming frame, the majority/minority verdict,
+/// and a wall-clock detection timestamp (unix epoch ms). Stamps the session's
+/// `external_id` and each diverged slot's `external_ref` the same way (and from
+/// the same store) as [`departure_notice`], so the notice is self-describing
+/// across a coordinator restart. The timestamp is read here rather than in the
+/// pure comparator, which holds no clock.
+fn desync_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    divergence: &SyncDivergence,
+) -> DesyncNotice {
+    let refs = registry.session_refs(key);
+    let detected_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    DesyncNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        sync_ordinal: divergence.sync_ordinal,
+        game_frame: divergence.game_frame,
+        detected_at_ms,
+        no_majority: divergence.no_majority,
+        diverged: divergence
+            .diverged
+            .iter()
+            .map(|slot| DivergedSlot {
+                slot: *slot,
+                external_ref: refs.as_ref().and_then(|r| r.slots.get(slot).cloned()),
+            })
+            .collect(),
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
     }
 }
 
@@ -1509,6 +2511,43 @@ pub fn observe_frame(
     }
 }
 
+/// Records the session's observer slots (from the coordinator descriptor) into
+/// the decision-maker, if the relay has one. Excludes them from the desync
+/// comparator. A no-op when no maker exists. Called on every descriptor apply.
+pub fn set_observers(registry: &DecisionMakers, key: &SessionKey, observers: HashSet<SlotId>) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.set_observers(observers);
+    }
+}
+
+/// Feeds one forwarded turn's commands into the session's desync comparator, if
+/// the relay has a maker, and fires a [`DesyncNotice`] up the coordinator
+/// connection when a divergence is confirmed. Called at the same turn choke
+/// points as [`observe_frame`], for every turn (client edge, mesh hop, oversize
+/// divert). A cheap no-op unless this relay is the session authority: the maker's
+/// [`observe_sync`](DecisionMaker::observe_sync) returns immediately for a
+/// non-authority relay before walking any bytes.
+///
+/// `game_frame` is the turn's `game_frame_count`; `commands` its raw command
+/// bytes (already validated at the ingress edge — this walk is the authority's
+/// own independent parse, not a trust in a peer's).
+pub fn observe_sync(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    game_frame: Option<u32>,
+    commands: &[u8],
+) {
+    let divergence = match registry.lock().get_mut(key) {
+        Some(maker) => maker.observe_sync(slot, game_frame, commands),
+        None => None,
+    };
+    if let Some(divergence) = divergence {
+        log_desync(key, &divergence);
+        registry.notify_desync(desync_notice(registry, key, &divergence));
+    }
+}
+
 /// Feeds one home-client `conditions` sample into the session's decision-maker
 /// if the relay has one, logging any decision it fires. Returns the
 /// [`Decision`], if any — the broadcast the decision queues is emitted later by
@@ -1605,6 +2644,22 @@ fn log_leave(key: &SessionKey, leave: &LeaveDirective) {
         apply_at_frame = leave.apply_at_frame,
         leave_seq = leave.leave_seq,
         "synced player-leave decision",
+    );
+}
+
+/// Logs a desync the comparator just confirmed — the observable that the relay
+/// detected a divergence, at which sync ordinal/frame, and who diverged. A warn
+/// because a desync is an abnormal, result-affecting event.
+fn log_desync(key: &SessionKey, divergence: &SyncDivergence) {
+    let diverged: Vec<u8> = divergence.diverged.iter().map(|slot| slot.0).collect();
+    tracing::warn!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        sync_ordinal = divergence.sync_ordinal,
+        game_frame = divergence.game_frame,
+        no_majority = divergence.no_majority,
+        ?diverged,
+        "relay-side desync detected",
     );
 }
 
@@ -2256,6 +3311,18 @@ mod tests {
 
     // -- Departure notifier --
 
+    /// Unwraps the next queued notice as a departure, panicking on anything else.
+    /// The leave-path tests only ever expect departures on the shared notice
+    /// channel, so this keeps their assertions reading against `DepartureNotice`.
+    fn recv_departure(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<RelayNotice>,
+    ) -> DepartureNotice {
+        match rx.try_recv().expect("a queued notice") {
+            RelayNotice::Departure(notice) => notice,
+            RelayNotice::Desync(_) => panic!("expected a departure notice, got a desync"),
+        }
+    }
+
     /// Deciding a leave on the authority fires exactly one departure notice for
     /// the slot, classified from the reason; a duplicate signal for the same slot
     /// decides nothing and so fires no second notice.
@@ -2265,13 +3332,13 @@ mod tests {
         let k = key();
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
 
         // A framed turn from slot 0 gives decide_leave a basis to schedule.
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(50));
 
         let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("a leave is decided");
-        let notice = rx.try_recv().expect("exactly one departure notice");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.tenant, k.tenant);
         assert_eq!(notice.session, k.session);
         assert_eq!(notice.slot, SlotId(1));
@@ -2299,7 +3366,7 @@ mod tests {
         let k = key();
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
 
         let leave = LeaveDirective {
             slot: 2,
@@ -2308,7 +3375,7 @@ mod tests {
             leave_seq: 7,
         };
         observe_leave(&registry, &k, &leave);
-        let notice = rx.try_recv().expect("one notice on the first insert");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.slot, SlotId(2));
         assert_eq!(
             notice.kind,
@@ -2349,7 +3416,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
 
         // Starts as a peer: it records a departure off a mesh `SlotDeparted` but
         // never decides (not the authority), so nothing is cached and nothing
@@ -2366,9 +3433,7 @@ mod tests {
         let leaves = set_authority(&registry, &k, Authority::SelfRelay);
         assert_eq!(leaves.len(), 1, "the re-derived leave still broadcasts");
 
-        let notice = rx
-            .try_recv()
-            .expect("exactly one departure notice fires on the re-derivation");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.slot, SlotId(1));
         assert_eq!(
             notice.kind,
@@ -2389,7 +3454,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
 
         // Authored while the authority: decide_leave fires the one notice.
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
@@ -2418,7 +3483,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
         registry.set_session_refs(
@@ -2430,7 +3495,7 @@ mod tests {
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
 
-        let notice = rx.try_recv().expect("one notice");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.external_id, Some("game-99".to_owned()));
         assert_eq!(notice.external_ref, Some("sb-user-7".to_owned()));
     }
@@ -2441,7 +3506,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
 
         registry.set_session_refs(
@@ -2458,7 +3523,7 @@ mod tests {
         };
         observe_leave(&registry, &k, &leave);
 
-        let notice = rx.try_recv().expect("one notice");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.external_id, Some("game-1".to_owned()));
         assert_eq!(notice.external_ref, Some("sb-user-2".to_owned()));
     }
@@ -2472,7 +3537,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
 
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
         registry.set_session_refs(
@@ -2485,7 +3550,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
         let _ = set_authority(&registry, &k, Authority::SelfRelay);
-        let notice = rx.try_recv().expect("one notice on the re-derivation");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.external_id, Some("game-2".to_owned()));
         assert_eq!(notice.external_ref, Some("sb-user-9".to_owned()));
     }
@@ -2498,13 +3563,13 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
 
-        let notice = rx.try_recv().expect("one notice");
+        let notice = recv_departure(&mut rx);
         assert!(notice.external_id.is_none());
         assert!(notice.external_ref.is_none());
     }
@@ -2517,7 +3582,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_departure_notifier(tx);
+        registry.set_notice_notifier(tx);
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
         registry.set_session_refs(
@@ -2534,7 +3599,7 @@ mod tests {
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
-        let notice = rx.try_recv().expect("one notice");
+        let notice = recv_departure(&mut rx);
         assert_eq!(notice.external_id, Some("game-new".to_owned()));
         assert_eq!(notice.external_ref, Some("sb-user-new".to_owned()));
 
@@ -2544,7 +3609,7 @@ mod tests {
         let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
-        let notice2 = rx.try_recv().expect("one notice");
+        let notice2 = recv_departure(&mut rx);
         assert!(
             notice2.external_id.is_none(),
             "deregistering forgot the old session's refs",
@@ -3015,6 +4080,771 @@ mod tests {
         assert!(
             fresh.is_empty(),
             "already cached via observe_leave — not a fresh insert on promotion",
+        );
+    }
+
+    // -- Desync comparator (SyncTracker via DecisionMaker::observe_sync) --
+
+    /// The two `hash16` bytes stand in for a sim state hash; distinct arrays
+    /// are distinct sims.
+    const SYNC_A: SyncValue = [1, 2];
+    const SYNC_B: SyncValue = [9, 8];
+    const SYNC_C: SyncValue = [4, 4];
+
+    /// Builds a 7-byte `0x37` sync command: opcode, `(ring << 4) | kind`, the
+    /// 2-byte `hash16`, then fixed zero filler for `[4..7]` (the per-sender
+    /// fog/vision bytes the comparator never reads — see `SyncValue`; a value
+    /// here is irrelevant to the code under test except in the dedicated
+    /// `sync_command_with_fog` regression test below).
+    fn sync_command(ring: u8, kind: u8, value: SyncValue) -> Vec<u8> {
+        sync_command_with_fog(ring, kind, value, [0, 0, 0])
+    }
+
+    /// [`sync_command`], but with explicit `[4..7]` filler — for the
+    /// regression test proving those bytes are never compared.
+    fn sync_command_with_fog(ring: u8, kind: u8, value: SyncValue, fog: [u8; 3]) -> Vec<u8> {
+        let mut command = vec![SYNC_COMMAND, ((ring & 0x0F) << 4) | (kind & 0x0F)];
+        command.extend_from_slice(&value);
+        command.extend_from_slice(&fog);
+        command
+    }
+
+    /// Feeds one slot's sync command at a chosen ring nibble, kind, and frame.
+    /// Returns the divergence if this feed confirmed one.
+    fn feed_ring_kind(
+        maker: &mut DecisionMaker,
+        slot: u8,
+        ring: u8,
+        kind: u8,
+        value: SyncValue,
+        frame: u32,
+    ) -> Option<SyncDivergence> {
+        maker.observe_sync(SlotId(slot), Some(frame), &sync_command(ring, kind, value))
+    }
+
+    /// [`feed_ring_kind`] with the kind SC:R's native check ties to `ring`'s
+    /// parity (even → 1, odd → 2) — what an honest client always sends.
+    fn feed_ring(
+        maker: &mut DecisionMaker,
+        slot: u8,
+        ring: u8,
+        value: SyncValue,
+        frame: u32,
+    ) -> Option<SyncDivergence> {
+        let kind = expected_kind_for_ordinal(u64::from(ring));
+        feed_ring_kind(maker, slot, ring, kind, value, frame)
+    }
+
+    /// Feeds one slot's sync command with the ring nibble its true ordinal
+    /// expects (`ordinal % 16`) and the kind that ordinal's parity implies.
+    /// The frame is a distinct-per-ordinal marker. Feeding a slot's ordinals
+    /// out of order (or interleaved with another slot's) exercises the same
+    /// nibble-corrected placement a real reordered or racing-ahead slot would.
+    fn feed(
+        maker: &mut DecisionMaker,
+        slot: u8,
+        ordinal: u8,
+        value: SyncValue,
+    ) -> Option<SyncDivergence> {
+        feed_ring(maker, slot, ordinal % 16, value, 1000 + u32::from(ordinal))
+    }
+
+    /// Advances `slot`'s ordinal from 0 up to (but not including) `through`,
+    /// reporting `value` at every step. Used to push the tracker's frontier
+    /// past the evaluation margin without needing every compared slot to
+    /// individually advance — the margin only cares about the single furthest
+    /// member's progress, so racing one slot ahead is enough to make earlier
+    /// ordinals eligible for evaluation. Returns the last divergence observed,
+    /// if any (there is at most one, since the comparator fires exactly one
+    /// notice per event).
+    fn advance(
+        maker: &mut DecisionMaker,
+        slot: u8,
+        value: SyncValue,
+        through: u8,
+    ) -> Option<SyncDivergence> {
+        let mut divergence = None;
+        for ordinal in 0..through {
+            if let Some(d) = feed(maker, slot, ordinal, value) {
+                divergence = Some(d);
+            }
+        }
+        divergence
+    }
+
+    /// A representative buffer policy, well under [`SYNC_ABSURD_BUFFER_MAX`],
+    /// so these tests exercise the comparator exactly as it runs with
+    /// detection live.
+    fn authority_maker() -> DecisionMaker {
+        DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay)
+    }
+
+    /// The evaluation margin [`authority_maker`]'s bounds (`max = 6`) implies
+    /// — computed via the real formula ([`sync_eval_margin`]) so these tests
+    /// can't silently drift from it.
+    fn authority_margin() -> u64 {
+        sync_eval_margin(6)
+    }
+
+    #[test]
+    fn all_agree_retires_the_ordinal_silently() {
+        let mut m = authority_maker();
+        feed(&mut m, 1, 0, SYNC_A);
+        // Slot 0 alone races ahead; ordinal 0 isn't evaluated until the
+        // frontier clears the margin, at which point it retires silently
+        // (matching values).
+        let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8);
+        assert_eq!(divergence, None, "matching values retire silently");
+        assert_eq!(m.sync.base_ordinal, 1, "ordinal 0 retired");
+        assert!(!m.sync.pending.contains_key(&0));
+    }
+
+    #[test]
+    fn three_slot_majority_identifies_the_diverged_minority() {
+        let mut m = authority_maker();
+        feed(&mut m, 1, 0, SYNC_A);
+        feed(&mut m, 2, 0, SYNC_B); // slot 2's sim diverged
+        // Slot 0 alone races ahead to clear the evaluation margin for ordinal 0.
+        let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+            .expect("clearing the margin evaluates ordinal 0");
+        assert_eq!(divergence.sync_ordinal, 0);
+        assert!(!divergence.no_majority);
+        assert_eq!(divergence.diverged, vec![SlotId(2)]);
+        assert_eq!(divergence.game_frame, Some(1000), "ordinal 0's frame");
+        // The minority is dropped from the compare set.
+        assert!(!m.sync.members.contains_key(&SlotId(2)));
+        assert!(m.sync.members.contains_key(&SlotId(0)));
+        assert!(!m.sync.dormant, "survivors keep being watched");
+    }
+
+    #[test]
+    fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
+        let mut m = authority_maker();
+        feed(&mut m, 1, 0, SYNC_B);
+        let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+            .expect("clearing the margin evaluates ordinal 0");
+        assert_eq!(divergence.sync_ordinal, 0);
+        assert!(divergence.no_majority, "1v1 has no majority");
+        assert!(divergence.diverged.is_empty(), "no minority named");
+        assert!(
+            m.sync.dormant,
+            "truth is unrecoverable — dormant for the session"
+        );
+        assert_eq!(
+            feed(&mut m, 1, 1, SYNC_B),
+            None,
+            "a dormant comparator no-ops"
+        );
+    }
+
+    #[test]
+    fn even_split_is_no_majority() {
+        let mut m = authority_maker();
+        feed(&mut m, 1, 0, SYNC_A);
+        feed(&mut m, 2, 0, SYNC_B);
+        feed(&mut m, 3, 0, SYNC_B);
+        let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+            .expect("clearing the margin evaluates ordinal 0");
+        assert!(divergence.no_majority, "2-2 has no strict majority");
+        assert!(divergence.diverged.is_empty());
+        assert!(m.sync.dormant);
+    }
+
+    #[test]
+    fn a_second_divergence_fires_again_at_its_own_ordinal() {
+        let mut m = authority_maker();
+        // Ordinal 0: slot 3 diverges from the 0/1/2 majority.
+        feed(&mut m, 1, 0, SYNC_A);
+        feed(&mut m, 2, 0, SYNC_A);
+        feed(&mut m, 3, 0, SYNC_B);
+        let first =
+            advance(&mut m, 0, SYNC_A, 8).expect("slot 0 clearing the margin fires the first");
+        assert_eq!(first.sync_ordinal, 0);
+        assert_eq!(first.diverged, vec![SlotId(3)]);
+
+        // Survivors {0,1,2} continue. Ordinal 1: slot 2 now diverges. Slot 0's
+        // ordinal-1 report already landed during the `advance` above.
+        feed(&mut m, 1, 1, SYNC_A);
+        feed(&mut m, 2, 1, SYNC_C);
+        let second = feed(&mut m, 0, 8, SYNC_A).expect("a second divergence at ordinal 1");
+        assert_eq!(second.sync_ordinal, 1, "a distinct, later ordinal");
+        assert!(!second.no_majority);
+        assert_eq!(second.diverged, vec![SlotId(2)]);
+        assert!(!m.sync.members.contains_key(&SlotId(2)));
+    }
+
+    #[test]
+    fn an_observer_slot_is_excluded_from_comparison() {
+        let mut m = authority_maker();
+        m.set_observers(HashSet::from([SlotId(1)]));
+        // Slot 1 is an observer with a wildly different checksum; it must never
+        // join the compare set, so no divergence ever fires from it.
+        feed(&mut m, 0, 0, SYNC_A);
+        assert_eq!(feed(&mut m, 1, 0, SYNC_B), None, "observer feed is a no-op");
+        assert!(
+            !m.sync.members.contains_key(&SlotId(1)),
+            "observer never joins"
+        );
+        assert!(!m.sync.dormant);
+    }
+
+    #[test]
+    fn a_departed_slot_is_no_longer_required() {
+        let mut m = authority_maker();
+        feed(&mut m, 1, 0, SYNC_A);
+        feed(&mut m, 2, 0, SYNC_A);
+        // Slot 0 alone clears the margin for ordinal 0; all three agree.
+        assert_eq!(
+            advance(&mut m, 0, SYNC_A, 8),
+            None,
+            "all agree at ordinal 0"
+        );
+        assert_eq!(m.sync.base_ordinal, 1);
+
+        // Ordinal 1: slot 1 reports, slot 2 departs before ever reporting it.
+        feed(&mut m, 1, 1, SYNC_A);
+        m.record_departure(SlotId(2), None, DROPPED);
+        assert!(!m.sync.members.contains_key(&SlotId(2)));
+
+        // Slot 0 continues; ordinal 1 completes on the two survivors once the
+        // frontier clears the margin for base = 1 (slot 0's own ordinal-1
+        // report already landed during the `advance` above).
+        let divergence = feed(&mut m, 0, 8, SYNC_A);
+        assert_eq!(divergence, None, "no mismatch — retires silently");
+        assert_eq!(m.sync.base_ordinal, 2, "ordinal 1 retired without slot 2");
+    }
+
+    /// Hole 3 (reordering): two adjacent turns from the same slot arrive
+    /// swapped. Nibble-corrected placement lands each at its true ordinal
+    /// regardless, so the honest agreement across slots never looks like a
+    /// mismatch — and the correction is flagged for observability.
+    #[test]
+    fn a_reordered_adjacent_pair_is_placed_correctly_and_warns() {
+        let mut m = authority_maker();
+        // Slot 1 reports ordinals 0..5 normally, matching slot 0's values.
+        for ordinal in 0..6 {
+            feed(&mut m, 1, ordinal, SYNC_A);
+        }
+        // Slot 0 reports 0..3 normally, but 4 and 5 arrive swapped — 5 first.
+        for ordinal in 0..4 {
+            feed(&mut m, 0, ordinal, SYNC_A);
+        }
+        feed_ring(&mut m, 0, 5, SYNC_A, 1005); // ordinal 5 arrives first
+        feed_ring(&mut m, 0, 4, SYNC_A, 1004); // ordinal 4 arrives late
+        assert!(
+            m.sync.correction_warns >= 1,
+            "the out-of-order arrival was corrected and flagged",
+        );
+
+        // Slot 0 races on so the margin clears every ordinal through 5.
+        let divergence = (6..14)
+            .filter_map(|ordinal| feed(&mut m, 0, ordinal, SYNC_A))
+            .last();
+        assert_eq!(
+            divergence, None,
+            "the reordered pair still compares equal at its true ordinal — no false divergence",
+        );
+        assert_eq!(m.sync.base_ordinal, 6, "ordinals 0..5 all retired cleanly");
+    }
+
+    /// Hole 2, the exact production failure: at sync activation, one slot's
+    /// early turns beat the other's first-ever arrival to the relay (routine
+    /// under asymmetric latency + buffer depth, invisible on a symmetric
+    /// loopback test). The old frontier-floor scheme landed the late slot's
+    /// true ordinal 0 at whatever the frontier happened to be (here, 4) — a
+    /// permanent misalignment that turns every later honest turn into a false
+    /// mismatch. Nibble-corrected placement anchors the late slot at its true
+    /// ordinal instead. Two slots only, so this is also the 1v1 shape of the
+    /// production failure.
+    #[test]
+    fn a_late_joining_slot_lands_at_its_true_ordinal_not_the_frontier() {
+        let mut m = authority_maker();
+        for ordinal in 0..4 {
+            feed(&mut m, 0, ordinal, SYNC_A);
+        }
+        // Slot 1's first-ever report is genuinely ordinal 0 (ring 0), arriving
+        // only now. Nibble-corrected placement anchors it there, not at 4.
+        feed_ring(&mut m, 1, 0, SYNC_A, 2000);
+        assert_eq!(
+            m.sync.members[&SlotId(1)].since,
+            0,
+            "slot 1's join ordinal is its true ordinal 0, not the frontier it joined at",
+        );
+
+        feed(&mut m, 1, 1, SYNC_A);
+        feed(&mut m, 1, 2, SYNC_A);
+        feed(&mut m, 1, 3, SYNC_A);
+
+        // Both slots continue in lockstep agreement; nothing should ever look
+        // like a divergence.
+        let mut divergence = None;
+        for ordinal in 4u8..12 {
+            if let Some(d) = feed(&mut m, 0, ordinal, SYNC_A) {
+                divergence = Some(d);
+            }
+            if let Some(d) = feed(&mut m, 1, ordinal, SYNC_A) {
+                divergence = Some(d);
+            }
+        }
+        assert_eq!(
+            divergence, None,
+            "the late join aligned correctly — no false desync"
+        );
+    }
+
+    /// The exact case the round-2 nibble-only join placement got wrong past
+    /// ±7: slot 0 races ten ordinals ahead of slot 1's first-ever report — a
+    /// gap the shipped dev-tenant policy (1..=12) allows, and one the ±7
+    /// nibble-only correction cannot resolve on its own (nearest-mod-16 to a
+    /// frontier of 10 lands at ordinal 16, not 0). Frame-anchored join
+    /// placement still lands slot 1 at its true ordinal, because lockstep
+    /// keeps the frame skew between the two slots' turns for the same
+    /// interval small regardless of how far the ordinals themselves have
+    /// drifted apart.
+    #[test]
+    fn a_join_at_depth_past_the_nibble_ceiling_still_lands_on_the_true_ordinal() {
+        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let margin = sync_eval_margin(12);
+        assert_eq!(margin, 14);
+
+        // Slot 0 alone advances ten ordinals at ~2 frames/turn (a realistic
+        // frames-per-turn rate), establishing a calibration point ten
+        // ordinals ahead of where slot 1 will join.
+        for ordinal in 0u8..10 {
+            feed_ring(&mut m, 0, ordinal, SYNC_A, 5000 + 2 * u32::from(ordinal));
+        }
+        assert_eq!(m.sync.members[&SlotId(0)].next_expected, 10);
+
+        // Slot 1's first-ever report is genuinely ordinal 0 (ring 0), with a
+        // frame close to slot 0's own ordinal-0 frame (5000) — lockstep's
+        // small cross-client skew, not the ten-ordinal gap in arrival order.
+        feed_ring(&mut m, 1, 0, SYNC_A, 5001);
+        assert_eq!(
+            m.sync.members[&SlotId(1)].since,
+            0,
+            "the frame anchor placed slot 1 at its true ordinal 0, not the frontier (10)",
+        );
+
+        // Both slots agree at every ordinal; racing slot 0 on to clear the
+        // deeper (depth-12) margin must retire ordinal 0 silently — no false
+        // divergence from the join.
+        let mut divergence = None;
+        for ordinal in 10..(margin as u8) {
+            if let Some(d) = feed(&mut m, 0, ordinal, SYNC_A) {
+                divergence = Some(d);
+            }
+        }
+        assert_eq!(divergence, None, "no false divergence from the deep join");
+    }
+
+    /// When a joining report carries no `game_frame` at all, the frame anchor
+    /// is unavailable and join placement falls back to frontier+nibble (the
+    /// round-2 behavior) — exercised within the ±7 range where that fallback
+    /// is still sound on its own.
+    #[test]
+    fn a_join_with_no_frame_falls_back_to_frontier_and_nibble() {
+        let mut m = authority_maker();
+        for ordinal in 0u8..4 {
+            feed(&mut m, 0, ordinal, SYNC_A);
+        }
+        let divergence = m.observe_sync(
+            SlotId(1),
+            None,
+            &sync_command(4, expected_kind_for_ordinal(4), SYNC_A),
+        );
+        assert_eq!(divergence, None);
+        assert_eq!(
+            m.sync.members[&SlotId(1)].since,
+            4,
+            "no frame to anchor on — falls back to the frontier, nibble-corrected",
+        );
+    }
+
+    /// A joining report carries a frame, but the tracker doesn't have a rate
+    /// yet (only one calibration point exists) — falls back to
+    /// frontier+nibble exactly like the no-frame case, ignoring the frame
+    /// entirely rather than projecting from an unreliable single point.
+    #[test]
+    fn a_join_with_a_frame_but_no_rate_yet_falls_back_to_frontier_and_nibble() {
+        let mut m = authority_maker();
+        // Slot 0 reports exactly once — one calibration point, not enough to
+        // compute a rate.
+        feed(&mut m, 0, 0, SYNC_A);
+        // Slot 1 joins with a frame that would, under any rate assumption,
+        // suggest a wildly different ordinal — but with no rate to project
+        // from, this still falls back to the frontier (1), nibble-corrected.
+        let divergence = feed_ring(&mut m, 1, 1, SYNC_A, 999_999);
+        assert_eq!(divergence, None);
+        assert_eq!(
+            m.sync.members[&SlotId(1)].since,
+            1,
+            "no rate yet — falls back to the frontier, nibble-corrected, ignoring the frame",
+        );
+    }
+
+    #[test]
+    fn an_ordinal_is_not_evaluated_until_the_frontier_clears_the_margin() {
+        let mut m = authority_maker();
+        feed(&mut m, 0, 0, SYNC_A);
+        feed(&mut m, 1, 0, SYNC_A);
+        assert_eq!(m.sync.base_ordinal, 0, "not yet evaluated");
+        assert!(m.sync.pending.contains_key(&0));
+
+        let margin = authority_margin() as u8;
+        for ordinal in 1..(margin - 1) {
+            feed(&mut m, 0, ordinal, SYNC_A);
+            assert_eq!(m.sync.base_ordinal, 0, "still short of the margin");
+        }
+        feed(&mut m, 0, margin - 1, SYNC_A);
+        assert_eq!(
+            m.sync.base_ordinal, 1,
+            "the margin cleared — ordinal 0 retired"
+        );
+    }
+
+    /// The margin scales with the session's negotiated buffer bounds (not a
+    /// fixed constant): with the shipped dev-tenant policy (1..=12), ordinal
+    /// `k` isn't evaluated until the frontier reaches `k + 14`
+    /// (`max(8, 12 + 2)`), not the shallow-policy 8.
+    #[test]
+    fn the_evaluation_margin_scales_with_the_session_s_buffer_bounds() {
+        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let margin = sync_eval_margin(12);
+        assert_eq!(
+            margin, 14,
+            "max(8, 12 + 2) -- the shipped dev-tenant policy"
+        );
+
+        feed(&mut m, 0, 0, SYNC_A);
+        feed(&mut m, 1, 0, SYNC_A);
+        // One short of the margin: still held.
+        for ordinal in 1..(margin as u8 - 1) {
+            feed(&mut m, 0, ordinal, SYNC_A);
+            assert_eq!(m.sync.base_ordinal, 0, "still short of the deeper margin");
+        }
+        // The margin clears: ordinal 0 retires.
+        feed(&mut m, 0, margin as u8 - 1, SYNC_A);
+        assert_eq!(
+            m.sync.base_ordinal, 1,
+            "the deeper margin cleared — ordinal 0 retired"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_joins_mid_stream_anchors_its_join_ordinal_to_where_it_actually_joined() {
+        let mut m = authority_maker();
+        // The very first sync command this tracker ever sees anchors the
+        // frontier at the ring's face value — the promotion-mid-stream case,
+        // where the authority has no earlier context to correct against.
+        feed_ring(&mut m, 0, 10, SYNC_A, 3000);
+        assert_eq!(m.sync.members[&SlotId(0)].since, 10);
+
+        // Slot 0 advances a few more ordinals, moving the frontier forward.
+        for ring in 11..14 {
+            feed_ring(&mut m, 0, ring, SYNC_A, 3000 + u32::from(ring));
+        }
+        assert_eq!(m.sync.members[&SlotId(0)].next_expected, 14);
+
+        // Slot 1 joins for the first time now: nibble-corrected placement
+        // lands it at the current frontier (14), not retroactively at ordinal
+        // 0 or at slot 0's own anchor (10) — it was never present for those.
+        feed_ring(&mut m, 1, 14, SYNC_A, 4000);
+        assert_eq!(
+            m.sync.members[&SlotId(1)].since,
+            14,
+            "slot 1's join ordinal is where it actually joined",
+        );
+        assert!(
+            m.sync.members[&SlotId(1)].since > 10,
+            "not required for ordinals before its true join",
+        );
+    }
+
+    /// The belt-and-suspenders path: even if a duplicate somehow reached the
+    /// tracker itself (the mesh-level dedup in `deliver_turn_to_locals` is
+    /// what should normally prevent this), a repeated report at the same
+    /// placed ordinal must not be double-counted.
+    #[test]
+    fn a_duplicate_report_at_the_same_ordinal_is_ignored_not_double_counted() {
+        let mut m = authority_maker();
+        feed_ring(&mut m, 0, 0, SYNC_A, 1000);
+        feed_ring(&mut m, 0, 0, SYNC_A, 1000);
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            1,
+            "a repeated report at the same ordinal must not advance the count twice",
+        );
+        assert_eq!(m.sync.pending.get(&0).map(HashMap::len), Some(1));
+    }
+
+    #[test]
+    fn a_non_authority_relay_does_not_compare() {
+        let mut m = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer);
+        assert_eq!(feed(&mut m, 0, 0, SYNC_A), None);
+        assert_eq!(feed(&mut m, 1, 0, SYNC_B), None);
+        assert_eq!(feed(&mut m, 0, 1, SYNC_A), None);
+        assert!(m.sync.members.is_empty(), "a peer records nothing");
+    }
+
+    #[test]
+    fn promotion_resets_the_comparator_state() {
+        let mut m = authority_maker();
+        feed(&mut m, 0, 0, SYNC_A);
+        feed(&mut m, 1, 0, SYNC_A);
+        assert!(
+            !m.sync.members.is_empty(),
+            "state accumulated while authority"
+        );
+
+        // Demote (state kept, comparator inert), then promote — which starts the
+        // comparator fresh, no per-ordinal state carried across the handoff.
+        let _ = m.set_authority(Authority::Peer);
+        let _ = m.set_authority(Authority::SelfRelay);
+        assert!(m.sync.members.is_empty(), "promotion reset the compare set");
+        assert_eq!(m.sync.base_ordinal, 0, "and the frontier");
+    }
+
+    #[test]
+    fn the_in_flight_window_is_bounded_by_eviction() {
+        let mut m = authority_maker();
+        // Slot 1 reports only ordinal 0, then stalls; slot 0 races far ahead. The
+        // ordinals slot 1 never reports can't complete, so the oldest are evicted
+        // rather than accumulating without bound.
+        feed(&mut m, 1, 0, SYNC_A);
+        for ordinal in 0..(SYNC_WINDOW as u8 + 6) {
+            feed(&mut m, 0, ordinal, SYNC_A);
+        }
+        assert!(m.sync.evict_warns > 0, "a stalled slot triggered eviction");
+        assert!(
+            m.sync.pending.len() <= SYNC_WINDOW,
+            "the in-flight window stays bounded ({} pending)",
+            m.sync.pending.len(),
+        );
+    }
+
+    #[test]
+    fn a_turn_without_a_sync_command_is_ignored() {
+        let mut m = authority_maker();
+        // A non-sync command stream (a Vision 0x0D, 3 bytes) records nothing.
+        assert_eq!(m.observe_sync(SlotId(0), Some(1), &[0x0D, 0, 0]), None);
+        assert!(m.sync.members.is_empty());
+        // A truncated/garbage tail after a valid command stops the walk without
+        // panicking.
+        let mut stream = sync_command(0, expected_kind_for_ordinal(0), SYNC_A);
+        stream.push(0xFF); // an opcode the table rejects
+        assert_eq!(m.observe_sync(SlotId(0), Some(1), &stream), None);
+        assert_eq!(
+            m.sync
+                .members
+                .get(&SlotId(0))
+                .map(|member| member.next_expected),
+            Some(1),
+            "the sync command counted",
+        );
+    }
+
+    /// A session whose negotiated buffer bounds reach the absurd-bounds
+    /// backstop disables desync detection outright — a defensive ceiling far
+    /// above any real policy, not a live constraint (depth itself no longer
+    /// threatens correctness; see the module docs and
+    /// [`BufferBounds`](rally_point_proto::control::BufferBounds)).
+    #[test]
+    fn absurd_buffer_bounds_disable_the_comparator() {
+        let mut m = DecisionMaker::new(
+            key(),
+            bounds(0, SYNC_ABSURD_BUFFER_MAX),
+            law(),
+            Authority::SelfRelay,
+        );
+        // A first sync command trips the check and disables the comparator —
+        // even from two slots that would otherwise plainly disagree.
+        assert_eq!(feed(&mut m, 0, 0, SYNC_A), None);
+        assert!(m.sync.dormant, "absurd bounds disable detection outright");
+        assert_eq!(feed(&mut m, 1, 0, SYNC_B), None, "still a no-op");
+    }
+
+    /// End-to-end through the registry: a divergence fires a `DesyncNotice` on the
+    /// notice channel, stamped with the session's correlation ids.
+    #[test]
+    fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 6), Authority::SelfRelay);
+        registry.set_session_refs(
+            &k,
+            Some("game-77".to_owned()),
+            HashMap::from([(SlotId(2), "sb-user-diverged".to_owned())]),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        // 0,1 agree, 2 diverges, all at ordinal 0.
+        observe_sync(
+            &registry,
+            &k,
+            SlotId(0),
+            Some(500),
+            &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
+        );
+        observe_sync(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(500),
+            &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
+        );
+        observe_sync(
+            &registry,
+            &k,
+            SlotId(2),
+            Some(500),
+            &sync_command(0, expected_kind_for_ordinal(0), SYNC_B),
+        );
+        assert!(rx.try_recv().is_err(), "held until the margin clears");
+
+        // Slot 0 alone races ahead to clear the margin.
+        for ordinal in 1u8..(sync_eval_margin(6) as u8) {
+            observe_sync(
+                &registry,
+                &k,
+                SlotId(0),
+                Some(500 + u32::from(ordinal)),
+                &sync_command(
+                    ordinal,
+                    expected_kind_for_ordinal(u64::from(ordinal)),
+                    SYNC_A,
+                ),
+            );
+        }
+
+        let RelayNotice::Desync(notice) = rx.try_recv().expect("a desync notice fires") else {
+            panic!("a desync notice");
+        };
+        assert_eq!(notice.tenant, k.tenant);
+        assert_eq!(notice.session, k.session);
+        assert_eq!(notice.sync_ordinal, 0);
+        assert_eq!(notice.game_frame, Some(500));
+        assert!(!notice.no_majority);
+        assert_eq!(notice.external_id, Some("game-77".to_owned()));
+        assert_eq!(notice.diverged.len(), 1);
+        assert_eq!(notice.diverged[0].slot, SlotId(2));
+        assert_eq!(
+            notice.diverged[0].external_ref,
+            Some("sb-user-diverged".to_owned()),
+        );
+        assert!(notice.detected_at_ms > 0);
+    }
+
+    /// SC:R's initial latency-depth flush burst emits several `0x37`s all
+    /// stamped identically (same ring, same content) before the first
+    /// per-turn record advances the ring — the same-ordinal duplicate-ignore
+    /// already absorbs this without any special-casing (live-relay
+    /// confirmed): each repeat lands back at the same placed ordinal via
+    /// ordinary nibble correction.
+    #[test]
+    fn a_startup_burst_of_identical_ring_1_reports_causes_no_false_divergence() {
+        let mut m = authority_maker();
+        // Slot 0's burst: four identical ring-1 reports (kind 2 — ring 1 is
+        // odd), exactly the shape the enable path + flush burst produces.
+        for _ in 0..4 {
+            feed_ring(&mut m, 0, 1, SYNC_A, 1000);
+        }
+        // Slot 1's own burst, three copies.
+        for _ in 0..3 {
+            feed_ring(&mut m, 1, 1, SYNC_A, 1000);
+        }
+        assert_eq!(
+            m.sync.members[&SlotId(0)].next_expected,
+            2,
+            "the repeated burst never advanced past its true ordinal",
+        );
+        assert_eq!(m.sync.members[&SlotId(1)].next_expected, 2);
+
+        // Both slots continue normally in lockstep agreement, racing the
+        // margin far enough to retire the burst's ordinal.
+        let margin = authority_margin() as u8;
+        let mut divergence = None;
+        for ring in 2..(margin + 2) {
+            if let Some(d) = feed_ring(&mut m, 0, ring, SYNC_A, 1000 + u32::from(ring)) {
+                divergence = Some(d);
+            }
+            if let Some(d) = feed_ring(&mut m, 1, ring, SYNC_A, 1000 + u32::from(ring)) {
+                divergence = Some(d);
+            }
+        }
+        assert_eq!(
+            divergence, None,
+            "the burst absorbed cleanly — no false divergence",
+        );
+    }
+
+    /// The exact live false positive this fix repairs: SC:R's fog/vision
+    /// bytes (`[4..7]`) are per-sender, vision-masked values the native check
+    /// only ever compares pairwise against the receiver's own local fog
+    /// buffer — they legitimately differ between honest players in the same
+    /// game. The relay must never treat that difference as a desync: only
+    /// `hash16` (`[2:3]`) feeds the comparison.
+    #[test]
+    fn fog_byte_divergence_with_matching_hash16_is_not_a_divergence() {
+        let mut m = authority_maker();
+        // Two slots whose hash16 always agrees, but whose fog/vision filler
+        // bytes never do — exactly the shape a healthy game produces.
+        for ordinal in 0u8..(authority_margin() as u8) {
+            let ring = ordinal % 16;
+            let kind = expected_kind_for_ordinal(u64::from(ordinal));
+            let frame = 1000 + u32::from(ordinal);
+            let a = sync_command_with_fog(ring, kind, SYNC_A, [1, 2, 3]);
+            let b = sync_command_with_fog(ring, kind, SYNC_A, [9, 8, 7]);
+            assert_eq!(m.observe_sync(SlotId(0), Some(frame), &a), None);
+            assert_eq!(m.observe_sync(SlotId(1), Some(frame), &b), None);
+        }
+        assert_eq!(
+            m.sync.base_ordinal, 1,
+            "ordinal 0 retired — the differing fog bytes never entered the comparison",
+        );
+    }
+
+    /// A report whose kind disagrees with its placed ordinal's expected
+    /// parity is an alignment-drift anomaly, not a desync: it's excluded from
+    /// the `hash16` comparison entirely and just warned about.
+    #[test]
+    fn a_kind_parity_mismatch_is_an_anomaly_not_a_divergence() {
+        let mut m = authority_maker();
+        // Slot 1 agrees with slot 0's hash16 at ordinal 0, but reports kind 2
+        // for an even ordinal (should be 1) — excluded from the comparison
+        // rather than treated as a mismatch (there is no majority/minority
+        // split here; a real one is covered by the malformed-kind and
+        // ordinary-divergence tests).
+        feed_ring_kind(&mut m, 1, 0, SYNC_KIND_HEADER, SYNC_A, 1000);
+        let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8);
+        assert_eq!(
+            divergence, None,
+            "the kind-mismatched report is excluded, not compared",
+        );
+        assert!(
+            m.sync.kind_parity_warns >= 1,
+            "the parity mismatch was flagged",
+        );
+    }
+
+    /// A `0x37` whose low nibble is neither 1 nor 2 is a malformed sync
+    /// command — defensive rejection, since validated bytes shouldn't produce
+    /// this. The report is skipped entirely: no member bookkeeping, no
+    /// calibration, nothing.
+    #[test]
+    fn a_malformed_kind_is_skipped_not_recorded() {
+        let mut m = authority_maker();
+        for bad_kind in [0u8, 3, 7, 15] {
+            let divergence = feed_ring_kind(&mut m, 0, 0, bad_kind, SYNC_A, 1000);
+            assert_eq!(divergence, None);
+        }
+        assert!(
+            m.sync.members.is_empty(),
+            "a malformed kind never creates a member",
+        );
+        assert!(
+            m.sync.malformed_kind_warns >= 1,
+            "the malformed kind was flagged",
         );
     }
 }

@@ -450,7 +450,11 @@ pub(crate) fn fan_out_slot_departed(
     last_frame: Option<u32>,
     reason: u32,
 ) {
-    fan_out_control(links, key, slot_departed_frame(key.session, slot, last_frame, reason));
+    fan_out_control(
+        links,
+        key,
+        slot_departed_frame(key.session, slot, last_frame, reason),
+    );
 }
 
 /// Propagates a synced leave the authority decided to every peer relay serving
@@ -528,7 +532,8 @@ pub fn forward_turn(
     slot: SlotId,
     payload: Payload,
 ) {
-    if let Some(payload) = deliver_turn_to_locals(sessions, seen, decision_makers, key, slot, payload)
+    if let Some(payload) =
+        deliver_turn_to_locals(sessions, seen, decision_makers, key, slot, payload)
     {
         fan_out_to_mesh(mesh_links, key, payload);
     }
@@ -556,6 +561,23 @@ fn deliver_turn_to_locals(
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
         return None;
     }
+    // The desync comparator's one and only feed point. Every turn-delivery
+    // path — client edge (datagram and oversize-control), mesh datagram, and
+    // mesh oversize-control — funnels through here, and this is placed right
+    // after the `mark_seen` dedup above: the mesh legitimately delivers the
+    // same turn to the authority via more than one path (that's exactly what
+    // `mark_seen` exists to catch), and the comparator's per-slot ordinal
+    // count is not idempotent the way `observe_frame`'s monotone max is — a
+    // duplicate walked twice would silently drift the count and misalign
+    // every later comparison. A no-op unless this relay is the session
+    // authority.
+    crate::consensus::observe_sync(
+        decision_makers,
+        key,
+        slot,
+        payload.game_frame_count,
+        &payload.commands,
+    );
     match crate::consensus::active_directive(decision_makers, key) {
         Some(directive) => payload.buffer_directive = Some(directive),
         // Preserving an upstream stamp also records its seq: every directive
@@ -699,7 +721,8 @@ pub async fn run_mesh_link(
     // One sender is cloned into the mesh-links registry per session (alongside the
     // forward sender); the driver owns the receiver and holds the original sender
     // for the loop's life, so `recv()` returns `None` only on a genuine shutdown.
-    let (control_forward_tx, mut control_forward_rx) = mpsc::unbounded_channel::<MeshControlFrame>();
+    let (control_forward_tx, mut control_forward_rx) =
+        mpsc::unbounded_channel::<MeshControlFrame>();
 
     // The live-player count last pushed to the peer, per session — presence is
     // pushed on change (reconciled against the local slot roster on every
@@ -810,6 +833,14 @@ pub async fn run_mesh_link(
                                     rally_point_proto::ids::GameFrameCount(frame),
                                 );
                             }
+                            // NOTE: no desync-comparator call here. This relay
+                            // may also reach the same turn via a different
+                            // mesh path (or the client edge, if it's local),
+                            // so counting it here — before dedup — would
+                            // double-count it. `forward_turn` below funnels
+                            // into `deliver_turn_to_locals`, which feeds the
+                            // comparator exactly once, right after its
+                            // mark_seen check.
                             forward_turn(
                                 &sessions,
                                 &mesh_links,
@@ -1200,7 +1231,9 @@ fn dispatch_mesh_control(
                 decision_makers,
                 &key,
                 slot,
-                departed.last_frame.map(rally_point_proto::ids::GameFrameCount),
+                departed
+                    .last_frame
+                    .map(rally_point_proto::ids::GameFrameCount),
                 departed.reason,
             );
             // Only the authority turns a departure into the one synced leave;
@@ -1232,12 +1265,19 @@ fn dispatch_mesh_control(
                     rally_point_proto::ids::GameFrameCount(frame),
                 );
             }
+            // NOTE: no desync-comparator call here — `deliver_turn_to_locals`
+            // below feeds it, after its own mark_seen dedup, so a redundant
+            // control-stream copy (or an echo also seen via a datagram path)
+            // isn't double-counted.
             let _ = deliver_turn_to_locals(sessions, seen, decision_makers, &key, slot, payload);
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
         None => {
-            tracing::debug!(session = session_id.0, "unknown mesh control frame kind; skipping");
+            tracing::debug!(
+                session = session_id.0,
+                "unknown mesh control frame kind; skipping"
+            );
         }
     }
 }
@@ -1537,7 +1577,10 @@ mod tests {
     fn register_link_channels(
         links: &MeshLinks,
         key: &SessionKey,
-    ) -> (mpsc::Receiver<(SessionId, Payload)>, mpsc::UnboundedReceiver<MeshControlFrame>) {
+    ) -> (
+        mpsc::Receiver<(SessionId, Payload)>,
+        mpsc::UnboundedReceiver<MeshControlFrame>,
+    ) {
         let (forward, forward_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
         let (control, control_rx) = mpsc::unbounded_channel();
         links
@@ -1561,7 +1604,10 @@ mod tests {
         fan_out_slot_departed(&links, &key, SlotId(2), Some(41), 3);
         for rx in [&mut ctl1, &mut ctl2] {
             let frame = rx.try_recv().expect("every link is told");
-            assert_eq!(frame.session, 1, "the frame is stamped with the key's session");
+            assert_eq!(
+                frame.session, 1,
+                "the frame is stamped with the key's session"
+            );
             match frame.kind {
                 Some(mesh_control_frame::Kind::SlotDeparted(sd)) => {
                     assert_eq!(sd.slot, 2);
@@ -1633,7 +1679,11 @@ mod tests {
         }
         departed.sort_unstable();
         assert_eq!(departed, vec![1, 2], "both departures re-announced");
-        assert_eq!(directives, vec![leave], "the cached leave re-announced verbatim");
+        assert_eq!(
+            directives,
+            vec![leave],
+            "the cached leave re-announced verbatim"
+        );
     }
 
     /// An oversize turn arriving over the mesh control stream folds back into
@@ -1708,5 +1758,108 @@ mod tests {
         // to the mesh.
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// Builds a single-command turn payload carrying one `0x37` sync command
+    /// (`ring` = the ordinal mod 16), plus a made-up `game_frame_count`.
+    fn sync_payload(seq: u64, slot: u8, ordinal: u8, value: [u8; 5]) -> Payload {
+        let mut commands = vec![0x37u8, (slot << 4) | (ordinal % 16)];
+        commands.extend_from_slice(&value);
+        Payload {
+            seq,
+            slot: u32::from(slot),
+            commands: commands.into(),
+            game_frame_count: Some(1000 + u32::from(ordinal)),
+            ..Default::default()
+        }
+    }
+
+    /// The desync comparator must observe each distinct `(slot, seq)` turn
+    /// exactly once, even though the mesh legitimately delivers the same turn
+    /// to the authority via more than one path. `deliver_turn_to_locals` is
+    /// the one choke point every turn-delivery path funnels through (client
+    /// edge, mesh datagram, mesh oversize), so the comparator's feed lives
+    /// there, right after the `mark_seen` dedup — this proves a redelivered
+    /// duplicate doesn't reach it twice (which would silently drift the
+    /// slot's ordinal count and eventually misalign an otherwise-honest
+    /// comparison into a false desync).
+    #[test]
+    fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+
+        let sessions = routing::Sessions::default();
+        let seen = new_seen_registries();
+        let decision_makers = Arc::new(consensus::new_decision_makers());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        decision_makers.set_notice_notifier(tx);
+        let key = control_key();
+        let _ = consensus::sync_maker(
+            &decision_makers,
+            &key,
+            BufferBounds::new(1, 6).unwrap(),
+            Authority::SelfRelay,
+        );
+
+        // Slot 0's very first turn (seq 0, sync ordinal 0), delivered TWICE at
+        // the exact choke point every mesh path funnels through — simulating
+        // the legitimate multi-relay redundant flood, not a sender bug.
+        let value = [1, 2, 3, 4, 5];
+        let first = sync_payload(0, 0, 0, value);
+        assert!(
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &key,
+                SlotId(0),
+                first.clone()
+            )
+            .is_some(),
+            "the first delivery is fresh",
+        );
+        assert!(
+            deliver_turn_to_locals(&sessions, &seen, &decision_makers, &key, SlotId(0), first)
+                .is_none(),
+            "the redelivery is caught by mark_seen and never reaches the comparator",
+        );
+
+        // Slot 1 agrees at ordinal 0, then both slots race forward in
+        // lockstep agreement far enough to clear the comparator's evaluation
+        // margin. If the duplicate above had been double-counted, slot 0's
+        // internal ordinal count would run one ahead of its true progress and
+        // this honest agreement would eventually misalign into a false
+        // mismatch.
+        deliver_turn_to_locals(
+            &sessions,
+            &seen,
+            &decision_makers,
+            &key,
+            SlotId(1),
+            sync_payload(0, 1, 0, value),
+        );
+        for ordinal in 1..12u8 {
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &key,
+                SlotId(0),
+                sync_payload(u64::from(ordinal), 0, ordinal, value),
+            );
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &key,
+                SlotId(1),
+                sync_payload(u64::from(ordinal), 1, ordinal, value),
+            );
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no desync notice: the duplicate delivery did not perturb ordinal alignment",
+        );
     }
 }

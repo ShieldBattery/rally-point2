@@ -54,7 +54,7 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::RelayId;
 use serde::Serialize;
 
-use crate::notify::{self, DepartureDedup};
+use crate::notify::{self, NoticeDedup};
 use crate::registry;
 use crate::session::{self, SessionSetup};
 use crate::tenant;
@@ -126,10 +126,10 @@ pub struct CoordinatorState {
     /// The session-setup context — relay registry, tenant store, session→relay
     /// membership, and the per-relay descriptor outbox.
     pub setup: SessionSetup,
-    /// Dedup set for player-departure notices: every relay serving a session
-    /// reports the same departure, and this collapses them to one webhook per
-    /// `(tenant, session, slot)`. Shared across all relay control connections.
-    pub departures: DepartureDedup,
+    /// Dedup sets for relay notices (departures + desyncs): redundant reports of
+    /// one event collapse to a single webhook. Shared across all relay control
+    /// connections.
+    pub notices: NoticeDedup,
     /// How a relay authenticates to open its control connection.
     pub control_auth: ControlAuth,
     /// How long a connection has to send its enroll `Hello` before it is dropped
@@ -243,11 +243,11 @@ async fn relay_control(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let setup = state.setup.clone();
-    let departures = state.departures.clone();
+    let notices = state.notices.clone();
     let hello_timeout = state.hello_timeout;
     let liveness_timeout = state.liveness_timeout;
     ws.on_upgrade(move |socket| {
-        serve_relay_control(socket, setup, departures, hello_timeout, liveness_timeout)
+        serve_relay_control(socket, setup, notices, hello_timeout, liveness_timeout)
     })
 }
 
@@ -270,7 +270,7 @@ async fn relay_control(
 async fn serve_relay_control(
     mut socket: WebSocket,
     setup: SessionSetup,
-    departures: DepartureDedup,
+    notices: NoticeDedup,
     hello_timeout: Duration,
     liveness_timeout: Duration,
 ) {
@@ -293,7 +293,7 @@ async fn serve_relay_control(
         "relay enrolled over control connection"
     );
 
-    push_and_watch(&mut socket, &setup, &departures, relay_id, liveness_timeout).await;
+    push_and_watch(&mut socket, &setup, &notices, relay_id, liveness_timeout).await;
 
     if registry::remove_if_current(registry, relay_id, generation) {
         tracing::info!(
@@ -320,7 +320,7 @@ async fn serve_relay_control(
 async fn push_and_watch(
     socket: &mut WebSocket,
     setup: &SessionSetup,
-    departures: &DepartureDedup,
+    notices: &NoticeDedup,
     relay_id: RelayId,
     liveness_timeout: Duration,
 ) {
@@ -354,7 +354,7 @@ async fn push_and_watch(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        note_inbound(setup, departures, relay_id, &message);
+                        note_inbound(setup, notices, relay_id, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                     }
@@ -407,15 +407,11 @@ async fn send_before_deadline(
 }
 
 /// Handles an inbound relay frame: any frame already counts as the liveness
-/// signal, and a [`RelayToCoordinator::Departure`] additionally drives the
-/// departure-webhook path (dedup across relays, then a per-tenant webhook). A
-/// heartbeat is just liveness; anything undecodable is flagged.
-fn note_inbound(
-    setup: &SessionSetup,
-    departures: &DepartureDedup,
-    relay_id: RelayId,
-    message: &Message,
-) {
+/// signal, and a [`RelayToCoordinator::Departure`] or
+/// [`RelayToCoordinator::Desync`] additionally drives its webhook path (dedup,
+/// then a per-tenant webhook). A heartbeat is just liveness; anything undecodable
+/// is flagged.
+fn note_inbound(setup: &SessionSetup, notices: &NoticeDedup, relay_id: RelayId, message: &Message) {
     let Message::Text(text) = message else {
         return; // a ping/pong/binary frame: a liveness signal with nothing to read
     };
@@ -424,7 +420,10 @@ fn note_inbound(
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
-            notify::handle_departure(setup, departures, notice);
+            notify::handle_departure(setup, &notices.departures, notice);
+        }
+        Ok(RelayToCoordinator::Desync(notice)) => {
+            notify::handle_desync(setup, &notices.desyncs, notice);
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => {}
@@ -449,11 +448,13 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat, a departure, or any future up-frame before the
-                    // enroll Hello is a protocol violation: enrollment comes first.
+                    // A heartbeat, a departure, a desync, or any future up-frame
+                    // before the enroll Hello is a protocol violation: enrollment
+                    // comes first.
                     Ok(
                         RelayToCoordinator::Heartbeat
                         | RelayToCoordinator::Departure(_)
+                        | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Unknown,
                     ) => {
                         tracing::warn!("first control frame was not a Hello; closing");
@@ -565,7 +566,7 @@ mod tests {
         let setup = crate::session::SessionSetup::new(reg, tenants);
         CoordinatorState {
             setup,
-            departures: notify::new_dedup(),
+            notices: notify::new_dedup(),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -578,11 +579,13 @@ mod tests {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,
+                observer: false,
             },
             PlayerHandoff {
                 slot: SlotId(1),
                 client_pubkey: ClientPublicKey([0xBB; 32]),
                 external_ref: None,
+                observer: false,
             },
         ]
     }
@@ -685,7 +688,7 @@ mod tests {
                 registry::new_registry(),
                 crate::tenant::new_store(),
             ),
-            departures: notify::new_dedup(),
+            notices: notify::new_dedup(),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
@@ -751,7 +754,7 @@ mod tests {
         let setup = crate::session::SessionSetup::new(reg, tenants);
         let state = CoordinatorState {
             setup,
-            departures: notify::new_dedup(),
+            notices: notify::new_dedup(),
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,

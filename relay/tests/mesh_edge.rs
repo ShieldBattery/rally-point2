@@ -261,7 +261,16 @@ fn spawn_mesh_link_timed(
             tx: control_send,
             rx: control_rx,
         };
-        mesh::run_mesh_link(link, presence_io, control_io, rx, sessions, mesh, idle_timeout).await
+        mesh::run_mesh_link(
+            link,
+            presence_io,
+            control_io,
+            rx,
+            sessions,
+            mesh,
+            idle_timeout,
+        )
+        .await
     });
     (tx, handle)
 }

@@ -240,18 +240,24 @@ pub async fn run_mesh_accept(
             // the same deadline as the hello so a peer that connects but never
             // opens it (e.g. one predating this ALPN version) can't pin the task —
             // failing to establish it drops the connection, like the hello.
-            let (control_send, control_recv) =
-                match tokio::time::timeout(MESH_HELLO_TIMEOUT, connection.accept_bi()).await {
-                    Ok(Ok(halves)) => halves,
-                    Ok(Err(error)) => {
-                        tracing::info!(%error, "mesh control stream accept failed; dropping connection");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::info!("mesh control stream not established within the deadline; dropping connection");
-                        return;
-                    }
-                };
+            let (control_send, control_recv) = match tokio::time::timeout(
+                MESH_HELLO_TIMEOUT,
+                connection.accept_bi(),
+            )
+            .await
+            {
+                Ok(Ok(halves)) => halves,
+                Ok(Err(error)) => {
+                    tracing::info!(%error, "mesh control stream accept failed; dropping connection");
+                    return;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        "mesh control stream not established within the deadline; dropping connection"
+                    );
+                    return;
+                }
+            };
             let peer_control_rx =
                 rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
 
@@ -267,8 +273,16 @@ pub async fn run_mesh_accept(
                 tx: control_send,
                 rx: peer_control_rx,
             };
-            mesh::run_mesh_link(link, presence_io, control_io, rx, sessions, mesh, mesh::IDLE_TIMEOUT)
-                .await;
+            mesh::run_mesh_link(
+                link,
+                presence_io,
+                control_io,
+                rx,
+                sessions,
+                mesh,
+                mesh::IDLE_TIMEOUT,
+            )
+            .await;
         });
     }
 }
