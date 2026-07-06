@@ -53,19 +53,21 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{LeaveDirective, Payload};
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::control::{
-    ControlInbound, ControlSendError, send_control_game_result, send_control_leave_intent,
-    send_control_turn, spawn_control_reader,
+    ControlInbound, ControlSendError, send_control_game_result, send_control_turn,
+    spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
+
+use crate::leave_announcer::LeaveAnnouncer;
 
 /// Default depth of each turn channel between the game thread and the driver.
 /// Turns are small and drained every tick, so this is a generous backstop against
@@ -364,16 +366,14 @@ impl LinkDriver {
         let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
         let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
 
-        // `None` until the game signals its own departure; `Some(deadline)` from
-        // that point until the intent is actually written, where `deadline` is
-        // the safety-timeout instant past which the driver sends regardless of
-        // drain state. Cleared back to `None` once the frame goes out so the
-        // announce path fires exactly once.
-        let mut leave_deadline_at: Option<Instant> = None;
-        // Whether the LeaveIntent frame has already been written. Once true, the
-        // relay closing this link is the expected confirmation it processed the
-        // leave, not a failure — `run` returns `Ok(())` instead of a `DriverError`.
-        let mut leave_intent_sent = false;
+        // Owns this client's clean-departure announcement: it stays dormant until
+        // the game signals its own leave, then holds the `LeaveIntent` frame until
+        // the outbound queue and unacked window have drained (and any expected
+        // result has been sent) or a safety timeout fires, and classifies the
+        // relay's subsequent link close as the expected confirmation rather than a
+        // failure. It also latches whether the result report has been written, so
+        // a second result payload is dropped.
+        let mut announcer = LeaveAnnouncer::new(result_expected);
         // Mirrors `beacon_alive`/`control_alive`: the game signals at most once, so
         // this disarms on the channel's first resolution (the real signal, or the
         // sender dropping without one) rather than only on `None` — either way
@@ -382,11 +382,6 @@ impl LinkDriver {
         // will never produce anything else.
         let mut leave_intent_alive = true;
 
-        // Whether the game's result report has been written to the control
-        // stream. Latched on the first send so a second payload is dropped, and
-        // read by `maybe_send_leave_intent` (with `result_expected`) to hold a
-        // pending intent until the result frame has preceded it on the wire.
-        let mut result_sent = false;
         // Mirrors `leave_intent_alive`: the game hands over a result at most
         // once, so this disarms on the channel's first resolution — the payload,
         // or the sender dropping without one — rather than spinning on a closed
@@ -394,25 +389,22 @@ impl LinkDriver {
         let mut result_alive = true;
 
         loop {
-            // Armed only once the game has signaled its departure
-            // (`leave_deadline_at` is `Some`); the day-out fallback keeps the
-            // branch dormant, and the type checker satisfied, otherwise.
-            let leave_deadline =
-                leave_deadline_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            // Armed only once the game has signaled its departure (the announcer
+            // has a `deadline`); the day-out fallback keeps the branch dormant,
+            // and the type checker satisfied, otherwise.
+            let leave_deadline = announcer
+                .deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
 
             tokio::select! {
                 received = link.recv() => {
                     let received = match received {
                         Ok(received) => received,
-                        Err(error) => {
-                            // Once the intent is written, the relay closing this
-                            // link is the expected confirmation it processed the
-                            // leave, not a link failure.
-                            if leave_intent_sent {
-                                return Ok(());
-                            }
-                            return Err(error.into());
-                        }
+                        // Once the intent is written, the relay closing this link
+                        // is the expected confirmation it processed the leave, not
+                        // a link failure — `absorb_link_close` turns it into a
+                        // clean stop; before that it is a real failure.
+                        Err(error) => return announcer.absorb_link_close(Err(error.into())),
                     };
                     // Only a payload-bearing packet needs an ack in return; owing one
                     // for the relay's ack-only flush would just bounce ack-only packets
@@ -421,7 +413,18 @@ impl LinkDriver {
                         acks_owed = true;
                     }
                     for payload in received.fresh {
-                        let slot = SlotId(payload.slot as u8);
+                        // A slot id past `u8` range names no real slot; a
+                        // truncating cast would alias it onto `slot % 256` and
+                        // corrupt another player's turn stream. Drop it (defensive
+                        // — the wire values are validated upstream).
+                        let Ok(slot_id) = u8::try_from(payload.slot) else {
+                            tracing::warn!(
+                                slot = payload.slot,
+                                "received turn names a slot id out of range; dropping it",
+                            );
+                            continue;
+                        };
+                        let slot = SlotId(slot_id);
                         let slot_next = next_seq.entry(slot).or_insert(0);
                         if payload.seq >= *slot_next {
                             pending
@@ -445,16 +448,7 @@ impl LinkDriver {
                     }
                     // An ack folded into the manager above may be the last one
                     // a pending leave intent was waiting on.
-                    maybe_send_leave_intent(
-                        &mut control_send,
-                        &mut leave_deadline_at,
-                        &mut leave_intent_sent,
-                        &outbound,
-                        &link,
-                        &result_expected,
-                        result_sent,
-                    )
-                    .await?;
+                    announcer.maybe_send(&mut control_send, &outbound, &link).await?;
                 }
                 // An oversize turn from the relay, delivered over the reliable
                 // control stream because no datagram could carry it. Folding it
@@ -492,7 +486,18 @@ impl LinkDriver {
                             );
                         }
                         Some(ControlInbound::OversizeTurn(payload)) => {
-                            let slot = SlotId(payload.slot as u8);
+                            // As on the datagram path: a slot id past `u8` range
+                            // names no real slot, and a truncating cast would alias
+                            // it onto another player's stream. Drop it rather than
+                            // deliver it.
+                            let Ok(slot_id) = u8::try_from(payload.slot) else {
+                                tracing::warn!(
+                                    slot = payload.slot,
+                                    "oversize turn names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            let slot = SlotId(slot_id);
                             if link.deliver_external(slot, payload.seq)? {
                                 next_seq.entry(slot).or_insert(0);
                                 pending
@@ -543,8 +548,9 @@ impl LinkDriver {
                                     // relay closing the link out from under this
                                     // send is the expected confirmation, not a
                                     // failure.
-                                    Err(DriverError::Link(_)) if leave_intent_sent => return Ok(()),
-                                    Err(error) => return Err(error),
+                                    Err(error) => {
+                                        return announcer.absorb_link_close(Err(error));
+                                    }
                                 };
                                 acks_owed = false;
                                 if carried_redundancy {
@@ -561,38 +567,35 @@ impl LinkDriver {
                                 // reliable control stream, whose QUIC-level
                                 // reliability replaces redundancy for this turn
                                 // — it never enters the unacked window and no
-                                // ack retires it. A write failure is fatal
-                                // (`?`): unlike a lost datagram, nothing
-                                // re-carries this turn, and dropping it would
-                                // desync lockstep.
-                                send_control_turn(&mut control_send, payload).await?;
+                                // ack retires it. A write failure is normally
+                                // fatal (nothing re-carries this turn, and
+                                // dropping it would desync lockstep) — but once
+                                // the leave intent is out, the relay closing the
+                                // stream under this write is the expected
+                                // confirmation, not a failure.
+                                if let Err(error) = send_control_turn(&mut control_send, payload).await
+                                {
+                                    return announcer
+                                        .absorb_link_close(Err(DriverError::from(error)));
+                                }
                             }
                             // The turn just sent may have been the last one
                             // outstanding, in which case a pending leave intent
                             // is now ready to go out.
-                            maybe_send_leave_intent(
-                                &mut control_send,
-                                &mut leave_deadline_at,
-                                &mut leave_intent_sent,
-                                &outbound,
-                                &link,
-                                &result_expected,
-                                result_sent,
-                            )
-                            .await?;
+                            announcer.maybe_send(&mut control_send, &outbound, &link).await?;
                         }
                         // The game dropped its sender: a clean stop.
                         None => return Ok(()),
                     }
                 }
                 // The game signaling its own clean departure (F10 quit, game
-                // over). This branch only records the signal — it never sends
-                // the frame itself, since the relay must still see every turn
-                // this client already produced. `maybe_send_leave_intent` below
-                // (and after every other branch that can change drain state)
-                // does the actual write once the outbound queue and unacked
-                // window are both empty, and the safety-timeout branch below
-                // covers the case where they never drain. Disarmed after this
+                // over). This branch only arms the announcer — it never sends the
+                // frame itself, since the relay must still see every turn this
+                // client already produced. The announcer's `maybe_send` below (and
+                // after every other branch that can change drain state) does the
+                // actual write once the outbound queue and unacked window are both
+                // empty, and the safety-timeout branch below covers the case where
+                // they never drain. Disarmed after this
                 // resolves once, whether or not the game actually signaled —
                 // the game signals at most once, so there is nothing further to
                 // receive either way, and leaving the branch armed on a `None`
@@ -601,17 +604,8 @@ impl LinkDriver {
                 signal = leave_intent.recv(), if leave_intent_alive => {
                     leave_intent_alive = false;
                     if signal.is_some() {
-                        leave_deadline_at = Some(Instant::now() + LEAVE_INTENT_TIMEOUT);
-                        maybe_send_leave_intent(
-                            &mut control_send,
-                            &mut leave_deadline_at,
-                            &mut leave_intent_sent,
-                            &outbound,
-                            &link,
-                            &result_expected,
-                            result_sent,
-                        )
-                        .await?;
+                        announcer.arm(LEAVE_INTENT_TIMEOUT);
+                        announcer.maybe_send(&mut control_send, &outbound, &link).await?;
                     }
                     // A `None` (the game dropped its sender without ever
                     // signaling — an unclean teardown) needs no further action:
@@ -630,11 +624,11 @@ impl LinkDriver {
                 payload = result.recv(), if result_alive => {
                     match payload {
                         Some(payload) => {
-                            if result_sent {
+                            if announcer.result_sent() {
                                 tracing::debug!(
                                     "dropping extra game-result payload; one already sent"
                                 );
-                            } else if leave_intent_sent {
+                            } else if announcer.sent() {
                                 tracing::debug!(
                                     "dropping game-result payload arriving after leave intent"
                                 );
@@ -655,19 +649,10 @@ impl LinkDriver {
                                         "game-result send failed; dropping the report"
                                     );
                                 }
-                                result_sent = true;
+                                announcer.note_result_sent();
                                 // Sending the result may have been the last thing
                                 // a pending leave intent was holding for.
-                                maybe_send_leave_intent(
-                                    &mut control_send,
-                                    &mut leave_deadline_at,
-                                    &mut leave_intent_sent,
-                                    &outbound,
-                                    &link,
-                                    &result_expected,
-                                    result_sent,
-                                )
-                                .await?;
+                                announcer.maybe_send(&mut control_send, &outbound, &link).await?;
                             }
                         }
                         // The game dropped its result sender without ever handing
@@ -684,10 +669,8 @@ impl LinkDriver {
                 // the link is fine — the relay stops forwarding this slot's
                 // turns the moment it sees the intent, so a few turns still
                 // technically unacked changes nothing.
-                _ = sleep_until(leave_deadline), if leave_deadline_at.is_some() => {
-                    send_control_leave_intent(&mut control_send).await?;
-                    leave_intent_sent = true;
-                    leave_deadline_at = None;
+                _ = sleep_until(leave_deadline), if announcer.deadline().is_some() => {
+                    announcer.force_send(&mut control_send).await?;
                 }
                 // The peer pushed a per-slot delivered-through cursor over the beacon
                 // stream. The reader task already assembled the complete frame off a
@@ -710,16 +693,7 @@ impl LinkDriver {
                             // The beacon force-retiring turns may have just
                             // emptied the unacked window a pending leave intent
                             // was waiting on.
-                            maybe_send_leave_intent(
-                                &mut control_send,
-                                &mut leave_deadline_at,
-                                &mut leave_intent_sent,
-                                &outbound,
-                                &link,
-                                &result_expected,
-                                result_sent,
-                            )
-                            .await?;
+                            announcer.maybe_send(&mut control_send, &outbound, &link).await?;
                         }
                         // The reader task ended (peer's beacon stream closed or
                         // errored). Stop polling it: the real link failure, if any,
@@ -744,8 +718,9 @@ impl LinkDriver {
                     if acks_owed || link.payloads_in_flight() > 0 {
                         match send_packet(&mut link, None) {
                             Ok(_) => {}
-                            Err(DriverError::Link(_)) if leave_intent_sent => return Ok(()),
-                            Err(error) => return Err(error),
+                            // Post-announce, the relay closing the link under this
+                            // flush is the expected confirmation, not a failure.
+                            Err(error) => return announcer.absorb_link_close(Err(error)),
                         }
                         acks_owed = false;
                     }
@@ -754,42 +729,6 @@ impl LinkDriver {
             }
         }
     }
-}
-
-/// Writes the `LeaveIntent` control frame the moment the game has signaled its
-/// departure *and* both the outbound queue and the unacked window have drained
-/// — every turn the game produced has been sent, and the relay has acked every
-/// one of them, so its view of our last frame is final. A no-op before the
-/// game has signaled (`leave_deadline_at` is `None`) or once the frame has
-/// already gone out (`leave_intent_sent`), so callers can invoke this
-/// unconditionally after anything that might have changed drain state.
-///
-/// When the game marked a result report expected (`result_expected`), the intent
-/// is additionally held until that report has been sent (`result_sent`), so the
-/// result frame precedes the intent on the single ordered control stream. The
-/// hold is bounded: the caller's [`LEAVE_INTENT_TIMEOUT`] path sends the intent
-/// regardless once it fires, since a missing or late result is harmless.
-async fn maybe_send_leave_intent(
-    control_send: &mut quinn::SendStream,
-    leave_deadline_at: &mut Option<Instant>,
-    leave_intent_sent: &mut bool,
-    outbound: &mpsc::Receiver<Payload>,
-    link: &Link,
-    result_expected: &AtomicBool,
-    result_sent: bool,
-) -> Result<(), ControlSendError> {
-    let awaiting_result = result_expected.load(Ordering::Relaxed) && !result_sent;
-    if leave_deadline_at.is_some()
-        && !*leave_intent_sent
-        && !awaiting_result
-        && outbound.is_empty()
-        && link.payloads_in_flight() == 0
-    {
-        send_control_leave_intent(control_send).await?;
-        *leave_intent_sent = true;
-        *leave_deadline_at = None;
-    }
-    Ok(())
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -888,6 +827,7 @@ fn check_cap(in_flight: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
 
     use rally_point_proto::beacon;
     use rally_point_transport::quic::{client_config, server_config};
@@ -1077,6 +1017,45 @@ mod tests {
         let second = inbound.recv().await.unwrap();
         assert_eq!((first.seq, first.commands[0]), (0, 0xB0));
         assert_eq!((second.seq, second.commands[0]), (1, 0xB1));
+
+        drop(chan_a.outbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_inbound_turn_with_an_out_of_range_slot_is_dropped() {
+        use prost::Message;
+        use rally_point_proto::messages::Packet;
+
+        // A payload whose slot id overflows `u8` names no real slot; a truncating
+        // cast would alias it onto `slot % 256` and corrupt that player's turn
+        // stream. The driver must drop it, handing the game nothing — this covers
+        // both inbound paths' guard by exercising the datagram one.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut inbound = chan_a.inbound;
+
+        let raw = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![Payload {
+                seq: 0,
+                slot: 256,
+                commands: vec![0xEE].into(),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        link_b.connection().send_datagram(raw.into()).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), inbound.recv())
+                .await
+                .is_err(),
+            "an out-of-range inbound slot must not be delivered to the game"
+        );
 
         drop(chan_a.outbound);
         let _ = task.await;

@@ -47,6 +47,7 @@ mod directive;
 mod driver;
 mod identity;
 mod leave;
+mod leave_announcer;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
