@@ -93,6 +93,18 @@ impl LeaveTracker {
     /// Safe to call with every stamp the redundant, out-of-order turn stream
     /// delivers, in whatever order they arrive.
     pub fn observe(&mut self, directive: &LeaveDirective) {
+        if u8::try_from(directive.slot).is_err() {
+            // A slot id past `u8` range can't name any real slot; letting it into
+            // the tracker would truncate to a valid slot id in `take_due` and
+            // apply the leave to the wrong player. Drop it here so it never
+            // enters (defensive — the wire values are validated upstream, so
+            // this shouldn't occur).
+            tracing::warn!(
+                slot = directive.slot,
+                "leave directive names a slot id out of range; ignoring",
+            );
+            return;
+        }
         if let Some(existing) = self
             .leaves
             .iter()
@@ -138,6 +150,8 @@ impl LeaveTracker {
         for leave in &mut self.leaves {
             if !leave.surfaced && next_frame >= leave.directive.apply_at_frame {
                 leave.surfaced = true;
+                // `observe` already rejected any directive whose slot doesn't
+                // fit in a `u8`, so every tracked entry casts back losslessly.
                 due.push((SlotId(leave.directive.slot as u8), leave.directive.reason));
             }
         }
@@ -265,6 +279,30 @@ mod tests {
         let mut tracker = LeaveTracker::new();
         tracker.observe(&leave(2, DROPPED, 100, 1));
         assert_eq!(tracker.take_due(140), vec![(SlotId(2), DROPPED)]);
+    }
+
+    #[test]
+    fn an_out_of_range_slot_is_dropped_instead_of_aliasing() {
+        // A relay bug (or a rogue/buggy relay) sending slot 256 must not alias
+        // onto slot 0 via a truncating cast -- it must be rejected outright.
+        let mut tracker = LeaveTracker::new();
+        tracker.observe(&leave(256, DROPPED, 100, 1));
+        assert!(
+            !tracker.contains(0),
+            "an out-of-range slot must not alias onto slot 0"
+        );
+        assert!(
+            !tracker.contains(256),
+            "the out-of-range directive must not be tracked at all"
+        );
+        assert!(
+            tracker.take_due(100).is_empty(),
+            "no leave should surface for a rejected out-of-range directive"
+        );
+
+        // A legitimate slot 0 leave still applies normally afterward.
+        tracker.observe(&leave(0, DROPPED, 100, 2));
+        assert_eq!(tracker.take_due(100), vec![(SlotId(0), DROPPED)]);
     }
 
     #[test]
