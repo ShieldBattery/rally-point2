@@ -787,6 +787,47 @@ struct Member {
     since: u64,
 }
 
+/// A rate-limited occurrence counter: tracks how many times one anomaly class
+/// has fired and says whether *this* occurrence is worth logging. Fires on
+/// the first occurrence, then again at every power of two, so a persistent
+/// anomaly's log volume grows as O(log n) instead of once per turn while
+/// never going fully silent. [`SyncTracker`] keeps one of these per anomaly
+/// class it distinguishes, replacing what would otherwise be a `count += 1;
+/// if <threshold check> { warn!(...) }` triplet duplicated at every call
+/// site.
+///
+/// Comparable directly against a `u64` (`counter == 1`, `counter >= 1`, …) so
+/// call sites and tests can read the running total without an accessor; use
+/// [`Self::count`] when the value needs to be handed to a `tracing` field.
+#[derive(Debug, Default, Clone, Copy)]
+struct RateLimitedCounter(u64);
+
+impl RateLimitedCounter {
+    /// Records one occurrence and returns whether it should be logged: the
+    /// first occurrence, then every power of two thereafter.
+    fn observe(&mut self) -> bool {
+        self.0 += 1;
+        self.0 == 1 || self.0.is_power_of_two()
+    }
+
+    /// The total number of occurrences recorded so far.
+    fn count(self) -> u64 {
+        self.0
+    }
+}
+
+impl PartialEq<u64> for RateLimitedCounter {
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<u64> for RateLimitedCounter {
+    fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
 /// The per-session sync-checksum comparator. Lives on the authority relay's
 /// [`DecisionMaker`] and is fed one call per turn (via
 /// [`DecisionMaker::observe_sync`], called exactly once per distinct
@@ -929,31 +970,35 @@ struct SyncTracker {
     /// Rate-limit counter for the placement-correction debug log (a nonzero
     /// nibble correction — a reorder, a lead, or a join). Routine (every game
     /// start corrects the first ordinal after a join), so it logs at debug.
-    corrections: u64,
+    corrections: RateLimitedCounter,
     /// Rate-limit counter for the same-ordinal conflicting-value warn (a slot
     /// reporting two different checksums for the same placed ordinal — an
     /// honest client never does this).
-    duplicate_warns: u64,
+    duplicate_warns: RateLimitedCounter,
     /// Rate-limit counter for the malformed-hash-kind warn (the `0x37`'s low
     /// nibble is neither 1 nor 2 — validated bytes shouldn't produce this;
     /// see [`SyncTracker::record`]).
-    malformed_kind_warns: u64,
+    malformed_kind_warns: RateLimitedCounter,
     /// Rate-limit counter for the kind/parity-mismatch warn (a report's hash
     /// kind disagrees with its placed ordinal's expected parity — an
     /// alignment-drift indicator, not a desync; see [`SyncTracker::evaluate`]).
-    kind_parity_warns: u64,
+    kind_parity_warns: RateLimitedCounter,
     /// Rate-limit counter for the window-eviction (stalled-slot) warn.
-    evict_warns: u64,
+    evict_warns: RateLimitedCounter,
     /// Rate-limit counter for the multiple-sync-commands-in-one-turn warn (an
     /// honest client emits exactly one `0x37` per outgoing turn; more than one
     /// is the flooding lever a malicious client would use to inflate its own
     /// frontier and seed join-placement calibration — see
     /// [`DecisionMaker::observe_sync`]).
-    multi_sync_warns: u64,
+    multi_sync_warns: RateLimitedCounter,
     /// Rate-limit counter for the deferred-join-placement warn (a joining slot
     /// that can't be safely placed yet — no corroborated rate and the frontier is
     /// more than a ring cycle ahead; its report is dropped and retried).
-    defer_warns: u64,
+    defer_warns: RateLimitedCounter,
+    /// Scratch buffer for [`Self::update_corroboration`]'s per-ordinal median:
+    /// cleared and refilled on every call rather than reallocated, since it
+    /// runs on every accepted sync report (the per-turn path).
+    frame_scratch: Vec<u32>,
 }
 
 /// The number of **distinct** slots that must report the same ordinal (each with
@@ -1012,14 +1057,13 @@ impl SyncTracker {
         margin: u64,
     ) -> Option<SyncDivergence> {
         if kind != SYNC_KIND_UNITS && kind != SYNC_KIND_HEADER {
-            self.malformed_kind_warns += 1;
-            if should_warn(self.malformed_kind_warns) {
+            if self.malformed_kind_warns.observe() {
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     slot = slot.0,
                     kind,
-                    count = self.malformed_kind_warns,
+                    count = self.malformed_kind_warns.count(),
                     "sync command's hash-kind nibble is neither 1 nor 2; \
                      skipping this report as malformed",
                 );
@@ -1069,22 +1113,19 @@ impl SyncTracker {
             return self.defer_join(key, slot);
         }
 
-        if diff != 0 {
-            self.corrections += 1;
-            if should_warn(self.corrections) {
-                tracing::debug!(
-                    tenant = key.tenant.as_ref(),
-                    session = key.session.0,
-                    slot = slot.0,
-                    expected,
-                    ring,
-                    placed,
-                    count = self.corrections,
-                    "sync ordinal placement corrected from the ring nibble; \
-                     the turn arrived out of order, the slot is running ahead, \
-                     or it just joined the compare set",
-                );
-            }
+        if diff != 0 && self.corrections.observe() {
+            tracing::debug!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                expected,
+                ring,
+                placed,
+                count = self.corrections.count(),
+                "sync ordinal placement corrected from the ring nibble; \
+                 the turn arrived out of order, the slot is running ahead, \
+                 or it just joined the compare set",
+            );
         }
 
         // Advance this member's bookkeeping regardless of whether the
@@ -1112,21 +1153,18 @@ impl SyncTracker {
 
         match self.pending.entry(ordinal).or_default().entry(slot) {
             std::collections::hash_map::Entry::Occupied(existing) => {
-                if existing.get().value != value {
+                if existing.get().value != value && self.duplicate_warns.observe() {
                     // An honest client never emits two different checksums for
                     // the same turn; keep the first and just flag it.
-                    self.duplicate_warns += 1;
-                    if should_warn(self.duplicate_warns) {
-                        tracing::warn!(
-                            tenant = key.tenant.as_ref(),
-                            session = key.session.0,
-                            slot = slot.0,
-                            ordinal,
-                            count = self.duplicate_warns,
-                            "conflicting sync value for a slot already reported \
-                             at this ordinal; keeping the first",
-                        );
-                    }
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = key.session.0,
+                        slot = slot.0,
+                        ordinal,
+                        count = self.duplicate_warns.count(),
+                        "conflicting sync value for a slot already reported \
+                         at this ordinal; keeping the first",
+                    );
                 }
                 // Same value: a harmless duplicate (the belt-and-suspenders
                 // case — the caller is expected to already dedup turns, but
@@ -1222,13 +1260,12 @@ impl SyncTracker {
     /// Missing a possible desync for this slot is an acceptable false negative;
     /// framing an honest slot by misplacing it a full ring cycle is not.
     fn defer_join(&mut self, key: &SessionKey, slot: SlotId) -> Option<SyncDivergence> {
-        self.defer_warns += 1;
-        if should_warn(self.defer_warns) {
+        if self.defer_warns.observe() {
             tracing::warn!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
                 slot = slot.0,
-                count = self.defer_warns,
+                count = self.defer_warns.count(),
                 "deferring a joining slot's sync placement: no corroborated rate \
                  yet and the join is more than a ring cycle from the frontier — \
                  dropping this report, will retry on the slot's next one",
@@ -1247,12 +1284,17 @@ impl SyncTracker {
         let Some(reports) = self.pending.get(&ordinal) else {
             return;
         };
-        let mut frames: Vec<u32> = reports.values().filter_map(|r| r.game_frame).collect();
-        if frames.len() < SYNC_CORROBORATION_MIN {
+        // Reused across calls (cleared, not reallocated) since this runs on
+        // every accepted sync report and the common case never needs the sort
+        // below at all.
+        self.frame_scratch.clear();
+        self.frame_scratch
+            .extend(reports.values().filter_map(|r| r.game_frame));
+        if self.frame_scratch.len() < SYNC_CORROBORATION_MIN {
             return;
         }
-        frames.sort_unstable();
-        let median = frames[frames.len() / 2];
+        self.frame_scratch.sort_unstable();
+        let median = self.frame_scratch[self.frame_scratch.len() / 2];
         if self.corroborated_first.is_none_or(|(o, _)| ordinal < o) {
             self.corroborated_first = Some((ordinal, median));
         }
@@ -1277,13 +1319,22 @@ impl SyncTracker {
                 return None; // not enough lead yet to trust completeness
             }
 
-            let required: Vec<SlotId> = self
-                .members
-                .iter()
-                .filter(|(_, m)| m.since <= base)
-                .map(|(slot, _)| *slot)
-                .collect();
-            if required.is_empty() {
+            // Which members are required (their `since` at or before `base`)
+            // and whether every one of them has reported `base`, computed in
+            // one pass with no allocation — both are cheap membership checks
+            // against `self.pending`, never stored past this iteration.
+            let reports_at_base = self.pending.get(&base);
+            let mut any_required = false;
+            let mut complete = true;
+            for (slot, member) in &self.members {
+                if member.since <= base {
+                    any_required = true;
+                    if !reports_at_base.is_some_and(|reports| reports.contains_key(slot)) {
+                        complete = false;
+                    }
+                }
+            }
+            if !any_required {
                 // No member was active this far back -- vacuously nothing to
                 // compare (only reachable right after a promotion anchors the
                 // frontier ahead of ordinal 0, or once every once-required
@@ -1292,11 +1343,6 @@ impl SyncTracker {
                 self.base_ordinal += 1;
                 continue;
             }
-
-            let complete = self
-                .pending
-                .get(&base)
-                .is_some_and(|reports| required.iter().all(|slot| reports.contains_key(slot)));
             if !complete {
                 // Should be rare given the margin; a genuinely stalled member
                 // is bounded by window eviction instead of blocking here.
@@ -1353,12 +1399,18 @@ impl SyncTracker {
     ) -> Option<SyncDivergence> {
         let expected_kind = expected_kind_for_ordinal(ordinal);
 
-        let mut groups: HashMap<SyncValue, Vec<SlotId>> = HashMap::new();
+        // Common case first: every comparable report agrees on the same
+        // value (the honest, no-desync turn). A single zero-allocation pass
+        // confirms this without ever building the value groups below —
+        // those only matter once there's an actual disagreement to resolve,
+        // which is the rare path. Also counts `comparable` and fires the
+        // kind/parity warn, both needed again below only on that rare path.
         let mut comparable = 0usize;
+        let mut agreed_value: Option<SyncValue> = None;
+        let mut diverges = false;
         for (slot, report) in reports {
             if report.kind != expected_kind {
-                self.kind_parity_warns += 1;
-                if should_warn(self.kind_parity_warns) {
+                if self.kind_parity_warns.observe() {
                     tracing::warn!(
                         tenant = key.tenant.as_ref(),
                         session = key.session.0,
@@ -1366,7 +1418,7 @@ impl SyncTracker {
                         ordinal,
                         kind = report.kind,
                         expected_kind,
-                        count = self.kind_parity_warns,
+                        count = self.kind_parity_warns.count(),
                         "sync kind disagrees with this ordinal's expected parity; \
                          excluding this report from the desync comparison as a \
                          likely alignment drift, not a desync",
@@ -1375,10 +1427,25 @@ impl SyncTracker {
                 continue;
             }
             comparable += 1;
-            groups.entry(report.value).or_default().push(*slot);
+            match agreed_value {
+                None => agreed_value = Some(report.value),
+                Some(value) if value == report.value => {}
+                Some(_) => diverges = true,
+            }
         }
-        if groups.len() <= 1 {
+        if !diverges {
             return None; // every comparable report agreed (or fewer than 2 were comparable)
+        }
+
+        // A genuine mismatch: fall back to grouping by value to find the
+        // majority and the minority to prune. Rare enough that the
+        // allocation here doesn't matter. `comparable` and the kind/parity
+        // warn were already handled in the pass above, so this only groups.
+        let mut groups: HashMap<SyncValue, Vec<SlotId>> = HashMap::new();
+        for (slot, report) in reports {
+            if report.kind == expected_kind {
+                groups.entry(report.value).or_default().push(*slot);
+            }
         }
 
         // The frame the mismatch was confirmed at. In lockstep every report at
@@ -1455,14 +1522,13 @@ impl SyncTracker {
                 .map(|slot| slot.0)
                 .collect();
             missing.sort_unstable();
-            self.evict_warns += 1;
-            if should_warn(self.evict_warns) {
+            if self.evict_warns.observe() {
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     ordinal,
                     ?missing,
-                    count = self.evict_warns,
+                    count = self.evict_warns.count(),
                     "evicting an incomplete sync ordinal over the window cap; \
                      a slot's sync stream is lagging or stopped",
                 );
@@ -1482,13 +1548,6 @@ impl SyncTracker {
             reports.remove(&slot);
         }
     }
-}
-
-/// Whether a rate-limited warn should fire at occurrence `count`: on the first,
-/// then at every power of two. Bounds log volume to O(log n) for a persistent
-/// anomaly while never fully going silent.
-fn should_warn(count: u64) -> bool {
-    count == 1 || count.is_power_of_two()
 }
 
 impl DecisionMaker {
@@ -2606,19 +2665,16 @@ impl DecisionMaker {
             }
             offset += len;
         }
-        if extra_syncs > 0 {
-            self.sync.multi_sync_warns += 1;
-            if should_warn(self.sync.multi_sync_warns) {
-                tracing::warn!(
-                    tenant = self.key.tenant.as_ref(),
-                    session = self.key.session.0,
-                    slot = slot.0,
-                    extra_syncs,
-                    count = self.sync.multi_sync_warns,
-                    "turn carried more than one sync command; an honest client emits exactly \
-                     one per turn — fed only the first to the comparator and ignored the rest",
-                );
-            }
+        if extra_syncs > 0 && self.sync.multi_sync_warns.observe() {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                slot = slot.0,
+                extra_syncs,
+                count = self.sync.multi_sync_warns.count(),
+                "turn carried more than one sync command; an honest client emits exactly \
+                 one per turn — fed only the first to the comparator and ignored the rest",
+            );
         }
         divergence
     }
