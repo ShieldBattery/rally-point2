@@ -38,15 +38,16 @@
 //! dedup/idempotency check.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper_rustls::HttpsConnectorBuilder;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
 use rally_point_proto::control::{
@@ -106,6 +107,38 @@ const MAX_ATTEMPTS: u32 = 6;
 const BACKOFF_START: Duration = Duration::from_secs(2);
 /// The retry-backoff ceiling.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// How long one webhook attempt (connect through response headers) is allowed
+/// to run before it counts as failed. `drain_queue` delivers one job at a time
+/// per `(tenant, session)` queue, so an endpoint that accepts the connection
+/// but never responds would otherwise hang the attempt forever — parking that
+/// session's whole queue (every later notice, including `sessionClosed`)
+/// behind it permanently, since neither [`MAX_ATTEMPTS`] nor the backoff ever
+/// gets a chance to run. A timeout here is treated exactly like a transport
+/// error or a non-2xx response: it counts as one failed attempt and feeds the
+/// same retry/backoff path.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A hyper client built once and shared by every dispatch, rather than
+/// constructed fresh per delivery. hyper/hyper-util clients pool connections
+/// and are cheap to share (an internal `Arc`), so reusing one avoids a fresh
+/// TCP+TLS handshake — and a re-parse of the webpki root store — for every
+/// notice, including repeated ones to the same tenant endpoint.
+///
+/// The connector negotiates rustls (ring provider, webpki public-CA roots) for
+/// an `https://` notify URL and falls through to plain HTTP for `http://` (the
+/// dev/loopback flow). Webpki roots are sufficient because the prod app server
+/// sits behind an HTTPS reverse proxy with a publicly-trusted certificate, not
+/// a private/internal CA — no custom root store to provision.
+static WEBHOOK_CLIENT: LazyLock<Client<HttpsConnector<HttpConnector>, Full<Bytes>>> =
+    LazyLock::new(|| {
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        Client::builder(TokioExecutor::new()).build(https)
+    });
 
 /// The JSON body POSTed to the tenant for a departure. camelCase, matching the
 /// *consumer's* API conventions rather than the relay control plane's snake_case
@@ -593,19 +626,6 @@ pub(crate) async fn dispatch(
     body: Bytes,
     kind: &'static str,
 ) {
-    // An http/https-capable client: the connector negotiates rustls (ring
-    // provider, webpki public-CA roots) for an `https://` notify URL and
-    // falls through to plain HTTP for `http://` (the dev/loopback flow).
-    // Webpki roots are sufficient because the prod app server sits behind an
-    // HTTPS reverse proxy with a publicly-trusted certificate, not a
-    // private/internal CA — no custom root store to provision.
-    let https = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .build();
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-
     let mut backoff = BACKOFF_START;
     for attempt in 1..=MAX_ATTEMPTS {
         let request = match build_request(&tenants, &tenant, &config, body.clone()) {
@@ -629,18 +649,24 @@ pub(crate) async fn dispatch(
             }
         };
 
-        match client.request(request).await {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                // Drain the body so the connection returns to the pool cleanly.
-                let _ = response.into_body().collect().await;
+        match send_attempt(request, ATTEMPT_TIMEOUT).await {
+            Ok(status) => {
                 if (200..300).contains(&status) {
                     tracing::debug!(url = %config.url, status, kind, "webhook delivered");
                     return;
                 }
                 tracing::debug!(url = %config.url, status, attempt, kind, "webhook non-2xx; retrying");
             }
-            Err(error) => {
+            Err(AttemptError::TimedOut) => {
+                tracing::debug!(
+                    url = %config.url,
+                    attempt,
+                    kind,
+                    timeout = ?ATTEMPT_TIMEOUT,
+                    "webhook attempt timed out; retrying",
+                );
+            }
+            Err(AttemptError::Transport(error)) => {
                 tracing::debug!(url = %config.url, %error, attempt, kind, "webhook attempt failed; retrying");
             }
         }
@@ -657,6 +683,39 @@ pub(crate) async fn dispatch(
         kind,
         "gave up delivering a webhook; the consumer's result-based fallback covers it",
     );
+}
+
+/// Why one webhook attempt produced no usable response. Both variants are
+/// treated identically by the caller (a failed attempt, retried like a
+/// non-2xx status) but are logged distinctly so a hung endpoint is
+/// distinguishable from a refused/reset connection in traces.
+enum AttemptError {
+    /// The attempt did not complete within [`ATTEMPT_TIMEOUT`].
+    TimedOut,
+    /// A transport-level error below the HTTP response (connect failure,
+    /// reset, etc).
+    Transport(hyper_util::client::legacy::Error),
+}
+
+/// Sends one webhook request on the shared [`WEBHOOK_CLIENT`], bounding the
+/// whole attempt (connect through response headers) by `attempt_timeout`. On
+/// a timely response, drains the body so the connection returns to the
+/// client's pool cleanly and returns its status. Split out of `dispatch`'s
+/// retry loop so the timeout behavior is unit-testable without waiting out
+/// the full multi-attempt retry budget.
+async fn send_attempt(
+    request: hyper::Request<Full<Bytes>>,
+    attempt_timeout: Duration,
+) -> Result<u16, AttemptError> {
+    match tokio::time::timeout(attempt_timeout, WEBHOOK_CLIENT.request(request)).await {
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            let _ = response.into_body().collect().await;
+            Ok(status)
+        }
+        Ok(Err(error)) => Err(AttemptError::Transport(error)),
+        Err(_elapsed) => Err(AttemptError::TimedOut),
+    }
 }
 
 /// Builds one webhook request: `POST` to the notify URL with the JSON body,
@@ -722,7 +781,7 @@ mod tests {
     use rally_point_proto::version::ProtocolVersion;
     use ring::signature::{ED25519, UnparsedPublicKey};
     use tokio::sync::mpsc;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout};
 
     use super::*;
     use crate::registry;
@@ -1441,6 +1500,44 @@ mod tests {
                 .await
                 .is_err(),
             "no gameId from the notice or the stored session -> dropped",
+        );
+    }
+
+    // -- Attempt timeout --
+
+    #[tokio::test]
+    async fn a_hung_endpoint_times_out_the_attempt_instead_of_hanging_forever() {
+        // A listener that accepts the TCP connection but never sends a response
+        // headers back — the pathological case the attempt timeout exists to
+        // bound. Accepted sockets are stashed in a `Vec` owned by the spawned
+        // task rather than dropped, so the connection stays open (no FIN/RST)
+        // without the handler ever completing a response.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let started = Instant::now();
+        let outcome = send_attempt(request, Duration::from_millis(300)).await;
+        assert!(
+            matches!(outcome, Err(AttemptError::TimedOut)),
+            "a hung endpoint must time out the attempt, not hang forever",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the attempt was bounded by its own timeout, not left to hang",
         );
     }
 }
