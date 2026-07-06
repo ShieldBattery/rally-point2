@@ -22,11 +22,11 @@
 //! frame cap before any allocation, and the caller does its own dispatch off the
 //! decoded frames the reader forwards.
 
-use rally_point_proto::control_stream::{
-    CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
-};
+use rally_point_proto::control_stream::{ControlStreamError, encode_frame};
 use rally_point_proto::messages::MeshControlFrame;
 use tokio::sync::mpsc;
+
+use crate::control::read_one_frame;
 
 /// Depth of the reader-task → driver channel. Mesh control frames are rare (one
 /// per player departure, plus a re-announce on a redialed link), and the driver
@@ -85,31 +85,9 @@ pub fn spawn_mesh_control_reader_accepting(
 /// forwarded.
 async fn read_mesh_control_frames(mut recv: quinn::RecvStream, tx: mpsc::Sender<MeshControlFrame>) {
     loop {
-        let mut prefix = [0u8; CONTROL_LEN_PREFIX];
-        if recv.read_exact(&mut prefix).await.is_err() {
-            // Stream ended (peer closed it) or the connection died.
+        let Some(frame) = read_one_frame::<MeshControlFrame>(&mut recv, "mesh control").await
+        else {
             return;
-        }
-        let len = match frame_len(prefix) {
-            Ok(len) => len,
-            Err(error) => {
-                // An over-cap length is a protocol violation; the framing can't
-                // be trusted past it, so stop reading. Never an allocation: the
-                // cap check precedes the buffer.
-                tracing::warn!(%error, "mesh control stream framing violation; ignoring stream");
-                return;
-            }
-        };
-        let mut body = vec![0u8; len];
-        if recv.read_exact(&mut body).await.is_err() {
-            return;
-        }
-        let frame: MeshControlFrame = match decode_frame(&body) {
-            Ok(frame) => frame,
-            Err(error) => {
-                tracing::warn!(%error, "mesh control frame did not decode; ignoring stream");
-                return;
-            }
         };
         // The empty establishment/keepalive frame (zero session, no kind) exists
         // only to make the peer's `accept_bi` complete; there is nothing to

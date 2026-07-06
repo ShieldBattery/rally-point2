@@ -18,6 +18,7 @@
 //! report. The reader skips a frame kind it doesn't know, so the channel can
 //! grow chat/resync frames without a wire break.
 
+use prost::Message;
 use prost::bytes::Bytes;
 use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
@@ -61,6 +62,49 @@ pub enum ControlInbound {
 /// is a backstop against a brief scheduling hiccup, not a tuned buffer.
 const CONTROL_CHANNEL_CAPACITY: usize = 64;
 
+/// Reads one length-prefixed, decoded frame of type `M` off `recv`: the length
+/// prefix (validated against the frame cap *before* any allocation), then the
+/// body, then [`decode_frame`]. Shared by this module's client ↔ relay reader
+/// and [`mesh_control_stream`](crate::mesh_control_stream)'s relay ↔ relay
+/// reader — both frame their stream identically and differ only in the
+/// message type and in what they do with the result.
+///
+/// Returns `None` whenever the caller's read loop must stop: the stream ended
+/// (the peer closed it or the connection died), a length prefix violated the
+/// frame cap, or the body failed to decode. The latter two are protocol
+/// violations the framing can't recover from, so they are `warn!`-logged here
+/// (tagged with `label`, e.g. `"control"` or `"mesh control"`) before
+/// returning `None` — the caller has nothing more useful to add and only needs
+/// to know reading is over, not why.
+pub(crate) async fn read_one_frame<M: Message + Default>(
+    recv: &mut quinn::RecvStream,
+    label: &str,
+) -> Option<M> {
+    let mut prefix = [0u8; CONTROL_LEN_PREFIX];
+    if recv.read_exact(&mut prefix).await.is_err() {
+        return None;
+    }
+    let len = match frame_len(prefix) {
+        Ok(len) => len,
+        Err(error) => {
+            // Never an allocation: the cap check precedes the buffer.
+            tracing::warn!(%error, "{label} stream framing violation; ignoring stream");
+            return None;
+        }
+    };
+    let mut body = vec![0u8; len];
+    if recv.read_exact(&mut body).await.is_err() {
+        return None;
+    }
+    match decode_frame(&body) {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            tracing::warn!(%error, "{label} frame did not decode; ignoring stream");
+            None
+        }
+    }
+}
+
 /// Spawns a dedicated task that accepts the peer's control stream, reads its
 /// length-prefixed `ControlFrame`s, and forwards each oversize-turn payload
 /// over the returned channel.
@@ -92,46 +136,26 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
         // resets a direction the peer never reads.
 
         loop {
-            let mut prefix = [0u8; CONTROL_LEN_PREFIX];
-            if recv.read_exact(&mut prefix).await.is_err() {
-                // Stream ended (peer closed it) or the connection died.
+            let Some(frame) = read_one_frame::<ControlFrame>(&mut recv, "control").await else {
                 return;
-            }
-            let len = match frame_len(prefix) {
-                Ok(len) => len,
-                Err(error) => {
-                    // An over-cap length is a protocol violation; the framing
-                    // can't be trusted past it, so stop reading. Never an
-                    // allocation: the cap check precedes the buffer.
-                    tracing::warn!(%error, "control stream framing violation; ignoring stream");
-                    return;
-                }
             };
-            let mut body = vec![0u8; len];
-            if recv.read_exact(&mut body).await.is_err() {
-                return;
-            }
-            let inbound = match decode_frame(&body) {
-                Ok(ControlFrame {
+            let inbound = match frame {
+                ControlFrame {
                     kind: Some(control_frame::Kind::OversizeTurn(payload)),
-                }) => ControlInbound::OversizeTurn(payload),
-                Ok(ControlFrame {
+                } => ControlInbound::OversizeTurn(payload),
+                ControlFrame {
                     kind: Some(control_frame::Kind::LeaveDirective(leave)),
-                }) => ControlInbound::Leave(leave),
-                Ok(ControlFrame {
+                } => ControlInbound::Leave(leave),
+                ControlFrame {
                     kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
-                }) => ControlInbound::LeaveIntent,
-                Ok(ControlFrame {
+                } => ControlInbound::LeaveIntent,
+                ControlFrame {
                     kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
-                }) => ControlInbound::GameResult(payload),
+                } => ControlInbound::GameResult(payload),
                 // A frame kind this build predates: skip it, keep the stream.
-                Ok(ControlFrame { kind: None }) => {
+                ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
                     continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "control frame did not decode; ignoring stream");
-                    return;
                 }
             };
             if tx.send(inbound).await.is_err() {
