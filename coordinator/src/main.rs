@@ -158,9 +158,13 @@ async fn main() -> Result<()> {
     }
 
     let lifecycle = Lifecycle::new(setup.clone());
+    let notices = notify::new_dedup();
+    // Let the lifecycle prune these dedup sets when it removes a session's state,
+    // so they don't grow for the process lifetime.
+    lifecycle.attach_dedup(notices.clone());
     let state = CoordinatorState {
         setup,
-        notices: notify::new_dedup(),
+        notices,
         lifecycle,
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,

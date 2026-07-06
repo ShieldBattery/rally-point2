@@ -100,6 +100,25 @@ pub fn new_dedup() -> NoticeDedup {
     }
 }
 
+impl NoticeDedup {
+    /// Drops every dedup entry for one `(tenant, session)`, called when the
+    /// session's lifecycle state is removed — the point the coordinator declares
+    /// it is done with the session. Without this the three sets are insert-only
+    /// and grow for the process lifetime (a few tuples per session that ever ran).
+    ///
+    /// Pruning at removal means a late or replayed notice arriving *after* the
+    /// session was reaped is no longer recognized as a duplicate, so it would
+    /// re-deliver its webhook. That is acceptable: delivery is at-least-once by
+    /// design and the consumer is idempotent, and removal only happens well after
+    /// a session's activity has quiesced.
+    pub fn prune_session(&self, tenant: &TenantId, session: SessionId) {
+        let matches = |t: &TenantId, s: SessionId| t == tenant && s == session;
+        self.departures.lock().retain(|(t, s, _)| !matches(t, *s));
+        self.desyncs.lock().retain(|(t, s, _)| !matches(t, *s));
+        self.results.lock().retain(|(t, s, _)| !matches(t, *s));
+    }
+}
+
 /// How many webhook attempts before giving up. With [`BACKOFF_START`] doubling to
 /// [`BACKOFF_CAP`], six attempts span roughly a minute of retries.
 const MAX_ATTEMPTS: u32 = 6;

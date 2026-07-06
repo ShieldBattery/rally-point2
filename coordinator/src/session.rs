@@ -236,8 +236,18 @@ pub fn create_session(
     // slots. That is the primary, plus the secondary when at least one slot homes
     // there — a serving relay always homes at least one slot. `descriptor_for`
     // reads this to build per-relay mesh-peer lists.
+    //
+    // Every slot not moved to the secondary homes on the primary, so the primary
+    // is serving unless the split moved *every* slot off it (a degenerate dev
+    // split naming all slots). Recording a relay that homes no slot would break
+    // the "every serving relay homes a slot" invariant: it would never register a
+    // slot, so never report `SessionClosed`, and the session's lifecycle would
+    // never close.
     let relay_ids: Vec<RelayId> = {
-        let mut ids = vec![home.relay_id];
+        let mut ids = Vec::new();
+        if slot_homes.len() < request.players.len() {
+            ids.push(home.relay_id);
+        }
         if let Some(secondary) = &secondary
             && !slot_homes.is_empty()
             && secondary.relay_id != home.relay_id
@@ -627,6 +637,54 @@ mod tests {
         assert_eq!(
             lone.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
             vec![RelayId(5)],
+        );
+    }
+
+    #[test]
+    fn dev_split_covering_every_slot_does_not_serve_the_slotless_home() {
+        // A degenerate dev split naming every player slot moves them all onto the
+        // secondary relay; the primary then homes no slot. It must not be recorded
+        // as serving — a slotless serving relay would never register a slot, never
+        // report `SessionClosed`, and the session's lifecycle would never close.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(0), SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        // Every slot moved to the secondary (relay 2); only it serves.
+        assert_eq!(
+            setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
+            vec![RelayId(2)],
+            "the slotless primary is not recorded as serving",
+        );
+        assert_eq!(resp.slot_homes.len(), 2, "both slots home on the secondary");
+        assert!(
+            resp.slot_homes
+                .iter()
+                .all(|h| h.relay.relay_id == RelayId(2)),
+        );
+
+        // The descriptor built for the sole serving relay ranks only itself in the
+        // authority order — the empty home never appears.
+        let desc = descriptor_for(
+            &setup,
+            &TenantId("sb-test".to_owned()),
+            resp.session,
+            RelayId(2),
+        )
+        .unwrap();
+        assert_eq!(desc.authority_order, vec![RelayId(2)]);
+        assert!(
+            desc.peers.is_empty(),
+            "the slotless home is not a mesh peer"
         );
     }
 

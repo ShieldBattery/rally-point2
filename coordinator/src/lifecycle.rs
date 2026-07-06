@@ -32,7 +32,7 @@
 //! probe is the backstop for those.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::descriptors::SlotClose;
-use crate::notify;
+use crate::notify::{self, NoticeDedup};
 use crate::session::SessionSetup;
 use crate::tenant::{NotifyConfig, TenantStore};
 
@@ -55,6 +55,16 @@ pub const HOLDOUT_REAP_GRACE: Duration = Duration::from_secs(60);
 /// still open (`sessionClosed` not yet fired) — before the coordinator closes the
 /// slots with no departure record.
 pub const LINGER_REAP_GRACE: Duration = Duration::from_secs(60);
+
+/// How long a webhook-only lifecycle state — one lazily created for a session
+/// this coordinator lifetime never registered (restart amnesia), so it has no
+/// serving relays and never receives a `SessionClosed` — may sit idle before it
+/// is reaped. Measured from the last webhook enqueued onto it, so a burst of a
+/// game's tail notices keeps it alive until they quiesce. Comfortably longer than
+/// a single webhook's whole retry span, so the entry's ordered queue has drained
+/// before it is removed. Without this such an entry (and its parked drain task)
+/// would leak for the process lifetime, one per in-flight game across a restart.
+pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// A `(tenant, session)` key for the per-session lifecycle map.
 type SessionRef = (TenantId, SessionId);
@@ -96,6 +106,11 @@ struct SessionState {
     holdout_timer: Option<AbortHandle>,
     /// The armed linger-reap timer, if any.
     linger_timer: Option<AbortHandle>,
+    /// The armed webhook-only reap timer, if any — set only while this is a
+    /// webhook-only state (empty serving set). Reset on every webhook enqueued, so
+    /// it measures idle time since the last one; disarmed if the state ever gains a
+    /// serving relay (it then has the normal all-relays-closed removal path).
+    webhook_timer: Option<AbortHandle>,
 }
 
 impl SessionState {
@@ -131,12 +146,22 @@ struct Inner {
     sessions: Mutex<HashMap<SessionRef, SessionState>>,
     holdout_grace: Duration,
     linger_grace: Duration,
+    webhook_grace: Duration,
+    /// The notice dedup sets to prune when a session's state is removed, wired in
+    /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
+    /// built without one (a test that never exercises dedup) simply skips pruning.
+    dedup: OnceLock<NoticeDedup>,
 }
 
 impl Lifecycle {
     /// Creates a lifecycle tracker over `setup` with the production reap graces.
     pub fn new(setup: SessionSetup) -> Self {
-        Self::with_graces(setup, HOLDOUT_REAP_GRACE, LINGER_REAP_GRACE)
+        Self::with_graces(
+            setup,
+            HOLDOUT_REAP_GRACE,
+            LINGER_REAP_GRACE,
+            WEBHOOK_ONLY_REAP_GRACE,
+        )
     }
 
     /// Creates a lifecycle tracker with the reap graces injected, so a test need
@@ -145,6 +170,7 @@ impl Lifecycle {
         setup: SessionSetup,
         holdout_grace: Duration,
         linger_grace: Duration,
+        webhook_grace: Duration,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -152,8 +178,17 @@ impl Lifecycle {
                 sessions: Mutex::new(HashMap::new()),
                 holdout_grace,
                 linger_grace,
+                webhook_grace,
+                dedup: OnceLock::new(),
             }),
         }
+    }
+
+    /// Wires in the notice dedup sets this lifecycle prunes when it removes a
+    /// session's state, so they don't grow for the process lifetime. Called once
+    /// at startup, after both are constructed; a second call is ignored.
+    pub fn attach_dedup(&self, dedup: NoticeDedup) {
+        let _ = self.inner.dedup.set(dedup);
     }
 
     /// Records a freshly created session's serving relays and its player/observer
@@ -175,6 +210,14 @@ impl Lifecycle {
         state.serving_relays = serving_relays;
         state.player_slots = player_slots;
         state.observer_slots = observer_slots;
+        // If this state existed only as a webhook-only entry (a departure/result
+        // arrived before its registration), it now has the normal all-relays-
+        // closed removal path, so its idle reap no longer applies.
+        if !state.serving_relays.is_empty()
+            && let Some(timer) = state.webhook_timer.take()
+        {
+            timer.abort();
+        }
     }
 
     /// Records a slot's departure: accounts the slot (if a player), notes it
@@ -191,6 +234,7 @@ impl Lifecycle {
             state.accounted.insert(slot);
         }
         self.reevaluate_reaps(&tenant, session, state);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
     /// Records a slot's result: accounts the slot (if a player) and re-evaluates
@@ -205,6 +249,7 @@ impl Lifecycle {
             state.accounted.insert(slot);
         }
         self.reevaluate_reaps(&tenant, session, state);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
     /// Records a relay's `SessionClosed`. When every assigned serving relay has
@@ -235,12 +280,11 @@ impl Lifecycle {
             });
         }
         let state = sessions.remove(&key).expect("just held it");
-        if let Some(timer) = state.holdout_timer {
-            timer.abort();
-        }
-        if let Some(timer) = state.linger_timer {
-            timer.abort();
-        }
+        drop(sessions);
+        abort_timers(&state);
+        // The session is done: drop its dedup entries so they don't accumulate for
+        // the process lifetime.
+        self.prune_dedup(&tenant, session);
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -264,11 +308,12 @@ impl Lifecycle {
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
         let _ = state.queue.send(WebhookJob {
-            tenant,
+            tenant: tenant.clone(),
             config,
             body,
             kind,
         });
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
     /// Whether the coordinator currently holds live state for `session` — it was
@@ -301,7 +346,83 @@ impl Lifecycle {
             queue: tx,
             holdout_timer: None,
             linger_timer: None,
+            webhook_timer: None,
         }
+    }
+
+    /// Arms (or re-arms) a webhook-only state's idle reap, but only while it is
+    /// webhook-only — a state with a serving relay has the normal all-relays-closed
+    /// removal path and needs no idle reap. Called after every webhook enqueued, so
+    /// the grace measures idle time since the last one and a game's tail notices
+    /// keep the entry alive until they stop arriving.
+    fn arm_webhook_reap_if_orphan(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        state: &mut SessionState,
+    ) {
+        if !state.serving_relays.is_empty() {
+            return;
+        }
+        if let Some(timer) = state.webhook_timer.take() {
+            timer.abort();
+        }
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let grace = self.inner.webhook_grace;
+        state.webhook_timer = Some(
+            tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                this.fire_webhook_reap(tenant, session);
+            })
+            .abort_handle(),
+        );
+    }
+
+    /// The webhook-only reap timer firing: if the state is still webhook-only (no
+    /// serving relay was recorded during the grace), remove it. Removing it drops
+    /// the ordered queue's sender, so its detached drain task delivers whatever is
+    /// still queued and then exits — no parked task is left behind — and its dedup
+    /// entries are pruned.
+    fn fire_webhook_reap(&self, tenant: TenantId, session: SessionId) {
+        let key = (tenant.clone(), session);
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get(&key) else {
+            return;
+        };
+        if !state.serving_relays.is_empty() {
+            return; // it gained a serving set: the normal close path owns it now
+        }
+        let state = sessions.remove(&key).expect("just held it");
+        drop(sessions);
+        abort_timers(&state);
+        // Dropping `state` drops the queue sender; the drain task finishes any
+        // buffered job, then exits.
+        drop(state);
+        self.prune_dedup(&tenant, session);
+        tracing::debug!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            "webhook-only session state reaped after its idle grace",
+        );
+    }
+
+    /// Drops the notice dedup entries for `(tenant, session)`, if a dedup set was
+    /// wired in. A no-op for a lifecycle built without one.
+    fn prune_dedup(&self, tenant: &TenantId, session: SessionId) {
+        if let Some(dedup) = self.inner.dedup.get() {
+            dedup.prune_session(tenant, session);
+        }
+    }
+
+    /// Whether a lifecycle state currently exists for `(tenant, session)` — a test
+    /// hook for asserting a state was reaped (its map entry removed).
+    #[cfg(test)]
+    fn contains_state(&self, tenant: &TenantId, session: SessionId) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .contains_key(&(tenant.clone(), session))
     }
 
     /// Re-arms or disarms the two reap timers for `state` after its accounting
@@ -441,6 +562,20 @@ impl Lifecycle {
     }
 }
 
+/// Aborts every armed reap timer on a state being removed, so no timer fires
+/// against a session id that no longer exists.
+fn abort_timers(state: &SessionState) {
+    if let Some(timer) = &state.holdout_timer {
+        timer.abort();
+    }
+    if let Some(timer) = &state.linger_timer {
+        timer.abort();
+    }
+    if let Some(timer) = &state.webhook_timer {
+        timer.abort();
+    }
+}
+
 /// Drains one session's ordered dispatch queue, delivering each webhook to
 /// completion (its full retry span) before the next. Exits when every sender is
 /// dropped — the session state was reaped — after the last job is delivered.
@@ -550,7 +685,7 @@ mod tests {
     async fn holdout_reap_closes_the_silent_slot_after_grace_not_before() {
         let setup = bare_setup();
         let mut reaps = setup.reaps().subscribe(RelayId(1));
-        let lc = Lifecycle::with_graces(setup, SHORT, HOUR);
+        let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -578,7 +713,7 @@ mod tests {
     async fn holdout_reap_disarms_when_the_holdout_reports() {
         let setup = bare_setup();
         let mut reaps = setup.reaps().subscribe(RelayId(1));
-        let lc = Lifecycle::with_graces(setup, SHORT, HOUR);
+        let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -604,7 +739,7 @@ mod tests {
         let setup = bare_setup();
         let mut r1 = setup.reaps().subscribe(RelayId(1));
         let mut r2 = setup.reaps().subscribe(RelayId(2));
-        let lc = Lifecycle::with_graces(setup, HOUR, SHORT);
+        let lc = Lifecycle::with_graces(setup, HOUR, SHORT, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -640,7 +775,7 @@ mod tests {
     async fn session_closed_fires_only_after_all_serving_relays_closed() {
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
-        let lc = Lifecycle::with_graces(setup, HOUR, HOUR);
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -682,7 +817,7 @@ mod tests {
         let gate = StdArc::new(TokioNotify::new());
         let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
         let setup = setup_with_notify(url.clone());
-        let lc = Lifecycle::with_graces(setup, HOUR, HOUR);
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -729,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn is_alive_reports_live_gone_and_unknown() {
         let setup = bare_setup();
-        let lc = Lifecycle::with_graces(setup, HOUR, HOUR);
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
         let live = SessionId(1);
         lc.register_session(
             tid(),
@@ -749,5 +884,143 @@ mod tests {
         // Fully closed reads as not alive.
         lc.on_session_closed(tid(), live, RelayId(1));
         assert!(!lc.is_alive(&tid(), live), "a closed session is not alive");
+    }
+
+    #[tokio::test]
+    async fn a_webhook_only_state_is_reaped_and_prunes_its_dedup_after_the_idle_grace() {
+        // A departure/result webhook for a session this lifetime never registered
+        // (restart amnesia) lazily creates a webhook-only state — no serving relays,
+        // so it never receives a `SessionClosed` and the all-relays-closed removal
+        // never fires. Its own idle reap must remove it (ending its drain task) and
+        // prune its dedup entries, else it leaks for the process lifetime.
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url.clone());
+        // Only the webhook-only idle grace is short; the others don't apply here.
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, SHORT);
+        let dedup = notify::new_dedup();
+        lc.attach_dedup(dedup.clone());
+        let s = SessionId(1);
+
+        // Seed a dedup entry for this session, as the notice handler would have.
+        dedup.departures.lock().insert((tid(), s, SlotId(0)));
+
+        lc.enqueue_webhook(
+            tid(),
+            s,
+            NotifyConfig { url },
+            bytes::Bytes::from_static(br#"{"event":"departure"}"#),
+            "departure",
+        );
+        assert!(
+            lc.contains_state(&tid(), s),
+            "the webhook-only state exists after the lazy insert",
+        );
+
+        // Its queued webhook still delivers before the state is reaped.
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the webhook-only queue delivers its job")
+            .unwrap();
+        assert_eq!(got.event, "departure");
+
+        // After the idle grace with no further webhooks, the state is removed and
+        // its dedup entry pruned.
+        timeout(SHORT * 20, async {
+            loop {
+                if !lc.contains_state(&tid(), s) {
+                    break;
+                }
+                tokio::time::sleep(SHORT / 4).await;
+            }
+        })
+        .await
+        .expect("the webhook-only state is reaped after its idle grace");
+        assert!(
+            !dedup.departures.lock().contains(&(tid(), s, SlotId(0))),
+            "the reaped session's dedup entry was pruned",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_webhook_re_arms_the_idle_reap() {
+        // The idle reap measures from the last webhook, so a later webhook pushes
+        // it out — a game's tail notices keep the webhook-only state alive until
+        // they stop arriving, rather than a fixed window from the first one.
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url.clone());
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, SHORT * 4);
+        let s = SessionId(1);
+
+        let enqueue = |lc: &Lifecycle| {
+            lc.enqueue_webhook(
+                tid(),
+                s,
+                NotifyConfig { url: url.clone() },
+                bytes::Bytes::from_static(br#"{"event":"departure"}"#),
+                "departure",
+            );
+        };
+
+        enqueue(&lc);
+        // Half a grace later, a second webhook re-arms the timer.
+        tokio::time::sleep(SHORT * 2).await;
+        enqueue(&lc);
+        // Past the *original* grace but inside the re-armed one: still present.
+        tokio::time::sleep(SHORT * 3).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a fresh webhook re-armed the idle reap, so the state is still held",
+        );
+
+        // Drain the two delivered webhooks so the receiver doesn't wedge on drop.
+        let _ = timeout(Duration::from_secs(1), rx.recv()).await;
+        let _ = timeout(Duration::from_secs(1), rx.recv()).await;
+
+        // Eventually, with no more webhooks, it is reaped.
+        timeout(SHORT * 20, async {
+            loop {
+                if !lc.contains_state(&tid(), s) {
+                    break;
+                }
+                tokio::time::sleep(SHORT / 4).await;
+            }
+        })
+        .await
+        .expect("the state is reaped once the idle grace elapses with no new webhook");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_prunes_its_dedup_entries_only() {
+        // The normal all-relays-closed removal must also prune the session's dedup
+        // entries (across all three sets), without touching another session's.
+        let setup = bare_setup();
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let dedup = notify::new_dedup();
+        lc.attach_dedup(dedup.clone());
+        let s = SessionId(1);
+        let other = SessionId(2);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+
+        dedup.departures.lock().insert((tid(), s, SlotId(0)));
+        dedup.results.lock().insert((tid(), s, SlotId(0)));
+        dedup.desyncs.lock().insert((tid(), s, 7));
+        // A different session's entry, which must survive.
+        dedup.departures.lock().insert((tid(), other, SlotId(0)));
+
+        lc.on_session_closed(tid(), s, RelayId(1));
+
+        assert!(!dedup.departures.lock().contains(&(tid(), s, SlotId(0))));
+        assert!(!dedup.results.lock().contains(&(tid(), s, SlotId(0))));
+        assert!(!dedup.desyncs.lock().contains(&(tid(), s, 7)));
+        assert!(
+            dedup.departures.lock().contains(&(tid(), other, SlotId(0))),
+            "another session's dedup entry is untouched",
+        );
     }
 }
