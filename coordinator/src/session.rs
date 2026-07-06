@@ -93,8 +93,9 @@ pub struct SessionSetup {
     /// its mesh links. Populated by `create_session`; read by the relay's
     /// descriptor-fetch endpoint.
     descriptors: RelayDescriptors,
-    /// Per-relay reap outbox — the one-shot `CloseSlot` directives the reap
-    /// policies arm. Drained by the relay's control connection alongside the
+    /// Per-relay reap outbox — the pending `CloseSlot` directives the reap
+    /// policies arm, held as declarative per-relay state and re-synced on
+    /// reconnect. Drained by the relay's control connection alongside the
     /// descriptor set.
     reaps: RelayReaps,
     /// The session-id counter, seeded from wall-clock time at construction.

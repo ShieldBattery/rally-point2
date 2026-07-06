@@ -283,8 +283,10 @@ impl Lifecycle {
         drop(sessions);
         abort_timers(&state);
         // The session is done: drop its dedup entries so they don't accumulate for
-        // the process lifetime.
+        // the process lifetime, and retire any pending reap directives so they are
+        // not replayed to a relay that reconnects after this.
         self.prune_dedup(&tenant, session);
+        self.inner.setup.reaps().retire(&tenant, session);
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -400,6 +402,9 @@ impl Lifecycle {
         // buffered job, then exits.
         drop(state);
         self.prune_dedup(&tenant, session);
+        // Retire any pending reap directives for the removed session (a webhook-only
+        // state normally has none, but this keeps the pending set bounded either way).
+        self.inner.setup.reaps().retire(&tenant, session);
         tracing::debug!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -987,6 +992,42 @@ mod tests {
         })
         .await
         .expect("the state is reaped once the idle grace elapses with no new webhook");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_retires_its_pending_reap_directives() {
+        // A reap armed for a session must not linger in the reap outbox after the
+        // session fully closes: a relay reconnecting afterward would otherwise be
+        // re-synced with a stale close for a session it no longer serves.
+        let setup = bare_setup();
+        let reaps = setup.reaps().clone();
+        let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        // Arm and fire the holdout reap so a directive is pending for relay 1.
+        lc.on_departure(tid(), s, SlotId(0));
+        let mut rx = reaps.subscribe(RelayId(1));
+        let close = timeout(SHORT * 4, rx.recv())
+            .await
+            .expect("the holdout is reaped")
+            .unwrap();
+        assert_eq!(close.slots, vec![SlotId(1)]);
+
+        // The session fully closes → its pending reap is retired. A relay
+        // reconnecting after the close gets no stale directive replayed.
+        lc.on_session_closed(tid(), s, RelayId(1));
+        let mut reconnect = reaps.subscribe(RelayId(1));
+        assert!(
+            reconnect.try_recv().is_err(),
+            "a closed session's reap is not replayed to a reconnecting relay",
+        );
     }
 
     #[tokio::test]
