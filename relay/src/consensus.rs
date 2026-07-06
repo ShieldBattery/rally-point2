@@ -178,6 +178,26 @@ use crate::routing::SessionKey;
 /// value, so the one source of truth lives here alongside the leave decision.
 pub const LEAVE_REASON_DROPPED: u32 = 0x4000_0006;
 
+/// The largest end-of-game result payload a session's decision-maker will
+/// retain. The bytes are the tenant's opaque serialized result, forwarded
+/// unparsed; this cap bounds what one slot's report can cost, independent of
+/// which path admitted it — a client's own report on the control stream, or a
+/// peer relay's `SlotDeparted` fold-in over the mesh. Owned here, next to the
+/// state it bounds, so every admission point can enforce it without a
+/// dependency on the routing layer.
+pub const MAX_GAME_RESULT_PAYLOAD_LEN: usize = 4096;
+
+/// Whether a result payload is one the relay should retain: non-empty (an
+/// empty payload is the wire sentinel for "no result reported" -- see
+/// `SlotDeparted.result_payload` -- so a real report can never be zero bytes)
+/// and no larger than [`MAX_GAME_RESULT_PAYLOAD_LEN`]. Shared by every point
+/// that admits a result into a decision-maker's state, so the bound holds no
+/// matter which path -- a client's own report or a peer's mesh fold-in --
+/// produced the payload.
+fn result_payload_is_valid(payload: &[u8]) -> bool {
+    !payload.is_empty() && payload.len() <= MAX_GAME_RESULT_PAYLOAD_LEN
+}
+
 /// The buffer size in turns. StarCraft's `net_user_latency` is the added
 /// user latency (0/1/2 in the native game); the decision-maker may widen past
 /// 2 via the same synced mechanism, so this is a plain `u32` rather than the
@@ -2236,8 +2256,26 @@ impl DecisionMaker {
     /// leaves. The report does not retire the slot's live state — a result is not
     /// a departure — so the caller's frame stamps still read the slot's framed
     /// history.
+    ///
+    /// An empty or over-cap payload is rejected here regardless of what the
+    /// caller already checked — this map is the sole owner of the retained-result
+    /// invariant, so the check lives where the state lives rather than trusting
+    /// every call site to have done it. Also returns `false`, so a rejected
+    /// report fires no notice and is indistinguishable to the caller from a
+    /// duplicate: either way, nothing new was recorded.
     #[must_use]
     pub fn record_result(&mut self, slot: SlotId, echo: ResultEcho) -> bool {
+        if !result_payload_is_valid(&echo.payload) {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                slot = slot.0,
+                len = echo.payload.len(),
+                cap = MAX_GAME_RESULT_PAYLOAD_LEN,
+                "rejecting invalid end-of-game result payload",
+            );
+            return false;
+        }
         use std::collections::hash_map::Entry;
         match self.results.entry(slot) {
             Entry::Occupied(_) => false,
@@ -2375,7 +2413,12 @@ impl DecisionMaker {
     /// single-sourced and kept the same first-non-`None`-wins way as `reachable`
     /// (the home seeds it from the report it retained; a peer receives it in the
     /// `SlotDeparted` frame). A result can never arrive after a slot's departure,
-    /// so once seeded it never changes.
+    /// so once seeded it never changes. An invalid `result` — empty or over-cap —
+    /// is dropped before it can be folded in: the home relay's own report already
+    /// went through [`record_result`](Self::record_result)'s check, but a peer's
+    /// `SlotDeparted` fold-in reaches this map without passing through that
+    /// method, so the check is repeated here to hold the same bound regardless of
+    /// path.
     ///
     /// Removing the slot from `slots` here — on *every* relay, not just the
     /// slot's home — is what lets `session_frame()` follow the survivors: a
@@ -2393,6 +2436,20 @@ impl DecisionMaker {
         reason: u32,
     ) {
         use std::collections::hash_map::Entry;
+        let result = result.filter(|echo| {
+            let valid = result_payload_is_valid(&echo.payload);
+            if !valid {
+                tracing::warn!(
+                    tenant = self.key.tenant.as_ref(),
+                    session = self.key.session.0,
+                    slot = slot.0,
+                    len = echo.payload.len(),
+                    cap = MAX_GAME_RESULT_PAYLOAD_LEN,
+                    "rejecting invalid end-of-game result payload folded in from a peer relay",
+                );
+            }
+            valid
+        });
         let own = self.slots.remove(&slot).and_then(|s| s.frame);
         let merged = match (last_frame, own) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -2992,9 +3049,13 @@ pub fn record_departure(
 /// Records a client's end-of-game result report into the session's
 /// decision-maker, firing exactly one result notice up the coordinator connection
 /// on the first report from `slot`. A repeat from the same slot inserts nothing
-/// and fires nothing. A no-op when no maker exists (a session this relay does not
-/// serve). `slot` is the authenticated connection's slot the report arrived on,
-/// never a value from the payload; `payload` is forwarded opaque.
+/// and fires nothing; an empty or over-cap payload is rejected by
+/// [`DecisionMaker::record_result`] the same way, so it also inserts and fires
+/// nothing (the caller cannot tell a rejection from a duplicate, which is fine —
+/// both mean the retained state didn't change). A no-op when no maker exists (a
+/// session this relay does not serve). `slot` is the authenticated connection's
+/// slot the report arrived on, never a value from the payload; `payload` is
+/// forwarded opaque.
 ///
 /// The retained result echo captures the relay's own view of *when* the report
 /// landed — a wall-clock arrival stamp plus the session's consensus frame and the
@@ -4466,6 +4527,89 @@ mod tests {
 
         record_result(&registry, &k, SlotId(0), vec![0x01]);
         assert!(rx.try_recv().is_err(), "no maker, so no notice");
+    }
+
+    /// An empty payload is the wire sentinel `SlotDeparted` uses for "no result
+    /// reported" -- see `wire.proto` -- so a real report can never be zero
+    /// bytes. `record_result` rejects it: nothing is retained and no notice
+    /// fires, the same outcome as a duplicate report.
+    #[test]
+    fn record_result_rejects_an_empty_payload() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        record_result(&registry, &k, SlotId(0), Vec::new());
+        assert!(rx.try_recv().is_err(), "an empty payload fires no notice");
+        assert!(
+            result_for(&registry, &k, SlotId(0)).is_none(),
+            "an empty payload is never retained",
+        );
+    }
+
+    /// A payload over [`MAX_GAME_RESULT_PAYLOAD_LEN`] is an ill-formed report.
+    /// `record_result` rejects it the same way as an empty one.
+    #[test]
+    fn record_result_rejects_an_oversize_payload() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        let oversize = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1];
+        record_result(&registry, &k, SlotId(0), oversize);
+        assert!(
+            rx.try_recv().is_err(),
+            "an oversize payload fires no notice"
+        );
+        assert!(
+            result_for(&registry, &k, SlotId(0)).is_none(),
+            "an oversize payload is never retained",
+        );
+    }
+
+    /// A peer relay's `SlotDeparted` can carry a payload up to the control
+    /// stream's 64 KiB frame cap -- far past `MAX_GAME_RESULT_PAYLOAD_LEN` --
+    /// since nothing on the wire enforces the per-result cap between relays.
+    /// `record_departure` rejects an over-cap folded-in result the same way
+    /// `record_result` rejects one reported directly: it never enters the
+    /// decision-maker's retained state, so the slot's later departure notice
+    /// embeds `None` rather than the oversize payload.
+    #[test]
+    fn record_departure_rejects_an_oversize_mesh_folded_result() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+
+        let folded = ResultEcho {
+            payload: vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1],
+            arrival_ms: 123,
+            session_frame: Some(40),
+            slot_frame: Some(40),
+        };
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            Some(GameFrameCount(40)),
+            None,
+            Some(folded),
+            DROPPED,
+        );
+
+        assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+        let departure = recv_departure(&mut rx);
+        assert!(
+            departure.result.is_none(),
+            "the oversize folded-in result is never embedded",
+        );
     }
 
     /// The retained result is embedded into the slot's departure notice: after a

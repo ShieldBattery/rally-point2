@@ -66,7 +66,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 
 use crate::consensus;
-use crate::consensus::LEAVE_REASON_DROPPED;
+use crate::consensus::{LEAVE_REASON_DROPPED, MAX_GAME_RESULT_PAYLOAD_LEN};
 use crate::validation::validate_turn;
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
@@ -139,13 +139,24 @@ const LEAVE_REASON_LEFT: u32 = 3;
 /// waits for once it has sent its intent.
 const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 
-/// The largest end-of-game result payload the relay accepts on the control
-/// stream. The bytes are the tenant's opaque serialized result, forwarded
-/// unparsed; this cap bounds what one report can cost. A payload over it is an
-/// ill-formed report, not an attack on the framing (the control stream's own
-/// frame cap already bounds the whole frame), so it is dropped without closing
-/// the link — the game's outcome is still reasoned from the departure.
-const MAX_GAME_RESULT_PAYLOAD_LEN: usize = 4096;
+/// Whether a client's `GameResult` control frame should be forwarded to
+/// `consensus::record_result`, or dropped at ingress before it ever reaches the
+/// decision-maker. A zero-length payload is the wire sentinel a `SlotDeparted`
+/// uses to mean "no result reported" (see `wire.proto`), so recording one as a
+/// genuine report would make a real empty result indistinguishable from no
+/// result at all once the slot departs; an over-cap payload is simply an
+/// ill-formed report. Pulled out as its own predicate — returning the reason
+/// for a caller to log — so the ingress rule is unit-testable without standing
+/// up the control-stream serve loop.
+fn game_result_admissible(payload: &[u8]) -> Result<(), &'static str> {
+    if payload.is_empty() {
+        Err("empty")
+    } else if payload.len() > MAX_GAME_RESULT_PAYLOAD_LEN {
+        Err("oversize")
+    } else {
+        Ok(())
+    }
+}
 
 /// The largest client turn the relay will accept on the oversize-turn divert path.
 ///
@@ -912,20 +923,21 @@ pub async fn run_slot_link(
                     // before a leave-intent is handled before the intent closes the
                     // link — and, unlike the intent, it does not end the link: the
                     // client keeps playing (a mid-game defeat report). The bytes are
-                    // opaque; the relay only enforces the size cap and forwards them
-                    // up the coordinator pipeline. The reporting slot is this
+                    // opaque; the relay only enforces the ingress rule and forwards
+                    // them up the coordinator pipeline. The reporting slot is this
                     // authenticated connection's slot, never a value from the
-                    // payload. An over-cap payload is an ill-formed report, dropped
-                    // without closing the link.
+                    // payload. An inadmissible payload is dropped without closing
+                    // the link.
                     Some(ControlInbound::GameResult(payload)) => {
-                        if payload.len() > MAX_GAME_RESULT_PAYLOAD_LEN {
+                        if let Err(reason) = game_result_admissible(&payload) {
                             tracing::debug!(
                                 tenant = key.tenant.as_ref(),
                                 session = key.session.0,
                                 slot = slot.0,
                                 len = payload.len(),
                                 cap = MAX_GAME_RESULT_PAYLOAD_LEN,
-                                "dropping oversize game-result payload",
+                                reason,
+                                "dropping inadmissible game-result payload",
                             );
                         } else {
                             consensus::record_result(&decision_makers, &key, slot, payload.to_vec());
@@ -1414,5 +1426,30 @@ mod tests {
             inbox.forward_rx.try_recv().is_err(),
             "the topological duplicate is dropped",
         );
+    }
+
+    // -- GameResult ingress --
+
+    /// An empty payload is the wire sentinel for "no result reported", never a
+    /// real report, so it is inadmissible regardless of the size cap.
+    #[test]
+    fn empty_game_result_is_inadmissible() {
+        assert_eq!(game_result_admissible(&[]), Err("empty"));
+    }
+
+    /// A payload over the cap is an ill-formed report.
+    #[test]
+    fn oversize_game_result_is_inadmissible() {
+        let payload = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1];
+        assert_eq!(game_result_admissible(&payload), Err("oversize"));
+    }
+
+    /// A non-empty, within-cap payload -- including one sized exactly at the
+    /// cap -- is admissible.
+    #[test]
+    fn well_formed_game_result_is_admissible() {
+        assert_eq!(game_result_admissible(&[0xDE, 0xAD]), Ok(()));
+        let at_cap = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN];
+        assert_eq!(game_result_admissible(&at_cap), Ok(()));
     }
 }

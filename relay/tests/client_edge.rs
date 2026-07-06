@@ -953,6 +953,80 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
 }
 
 #[tokio::test]
+async fn an_empty_result_report_is_dropped_without_closing_the_link() {
+    // A zero-length result payload is the wire sentinel `SlotDeparted` uses for
+    // "no result reported" (see wire.proto), never a genuine report, so the relay
+    // must never record one: doing so would make a real empty result
+    // indistinguishable from no result once the slot departs. The relay drops it
+    // (no notice) but keeps the link, exactly like an oversize report.
+    use rally_point_relay::consensus::{self, Authority, RelayNotice};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::send_control_game_result;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(205);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+    );
+    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
+    makers.set_notice_notifier(notice_tx);
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+
+    let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    send_control_game_result(&mut ctrl0_send, Vec::new().into())
+        .await
+        .unwrap();
+
+    // No result notice fires for the empty report.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), notice_rx.recv())
+            .await
+            .is_err(),
+        "an empty result payload must fire no notice",
+    );
+    assert!(
+        consensus::result_for(&makers, &key, SlotId(0)).is_none(),
+        "an empty result payload must never be retained",
+    );
+
+    // The link is still up: a real report on the same stream is still accepted
+    // and fires its notice — the first record for the slot, since the empty one
+    // was dropped rather than recorded.
+    send_control_game_result(&mut ctrl0_send, vec![0x1u8, 0x2, 0x3].into())
+        .await
+        .unwrap();
+    let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
+        .await
+        .expect("the real result never fired a notice — the link was torn down")
+        .expect("the notice channel closed early");
+    let RelayNotice::Result(result) = notice else {
+        panic!("expected a result notice, got {notice:?}");
+    };
+    assert_eq!(result.slot, SlotId(0));
+    assert_eq!(result.payload, vec![0x1, 0x2, 0x3]);
+
+    // And the relay never closed the connection over the empty report.
+    assert!(
+        slot0.connection().close_reason().is_none(),
+        "an empty result must not close the link",
+    );
+}
+
+#[tokio::test]
 async fn an_over_cap_oversize_turn_is_rejected_and_never_reaches_the_peer() {
     // The oversize-turn divert path fans a client's control-stream turn out to the
     // other slots' count-bounded forward queues, so a turn far larger than any real
