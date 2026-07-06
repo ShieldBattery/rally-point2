@@ -25,6 +25,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
@@ -309,10 +310,22 @@ type MeshControlTx = mpsc::UnboundedSender<MeshControlFrame>;
 /// governs both. Public only because it appears in the [`MeshLinks`] alias; its
 /// fields are private, so the registry is built and read solely through this module.
 pub struct MeshLinkTx {
+    /// Distinguishes this entry from every other peer relay's entry in the same
+    /// session's fan-out vec, so a driver deregisters only its own on teardown.
+    id: u64,
     /// Bounded per-turn forward channel (turns, redundancy re-carried on drop).
     forward: MeshForwardTx,
     /// Unbounded control-frame channel (synced-leave propagation, never dropped).
     control: MeshControlTx,
+}
+
+/// Hands out a process-unique id for each mesh-link registration. A session's
+/// [`MeshLinks`] entry is a vec with one element per connected peer relay; the id
+/// tags each element so its owning driver can remove exactly that element when it
+/// winds down, without disturbing the other peers still serving the session.
+fn next_mesh_link_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 /// Creates the command channel for one mesh-link driver — the `Join`/`Leave`
 /// stream the test (today) or the coordinator's session-descriptor push drives.
@@ -382,11 +395,46 @@ pub enum MeshLinkExit {
     CommandChannelClosed,
 }
 
-/// Removes all mesh forward channels for `key` (the peer-relay link for that
-/// session has closed). Idempotent.
-pub fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey) {
+/// Registers one peer-relay link's `(forward, control)` senders for `key`,
+/// appending them as a new element in that session's fan-out vec, and returns the
+/// RAII guard that removes *only this* element when dropped. Each session's entry
+/// holds one element per connected peer relay, so registering must never clobber
+/// the peers already serving the session.
+fn register_mesh_link(
+    links: &MeshLinks,
+    key: SessionKey,
+    forward: MeshForwardTx,
+    control: MeshControlTx,
+) -> MeshLinkRegistration {
+    let id = next_mesh_link_id();
+    links
+        .lock()
+        .entry(key.clone())
+        .or_default()
+        .push(MeshLinkTx {
+            id,
+            forward,
+            control,
+        });
+    MeshLinkRegistration {
+        links: links.clone(),
+        key,
+        id,
+    }
+}
+
+/// Removes the single mesh forward channel `id` registered for `key` (that one
+/// peer-relay link has closed), leaving every other peer's channel for the
+/// session in place. The whole `key` is dropped only once its last channel is
+/// gone. Idempotent: an id already removed (or a key already empty) is a no-op.
+fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
     let mut roster = links.lock();
-    roster.remove(key);
+    if let Some(mesh_txs) = roster.get_mut(key) {
+        mesh_txs.retain(|tx| tx.id != id);
+        if mesh_txs.is_empty() {
+            roster.remove(key);
+        }
+    }
 }
 
 /// Delivers `payload` to every peer-relay mesh link serving `key`, without ever
@@ -1122,13 +1170,12 @@ pub async fn run_mesh_link(
                             continue;
                         }
                         link.open_session(session_id);
-                        {
-                            let mut roster = mesh_links.lock();
-                            roster.entry(key.clone()).or_default().push(MeshLinkTx {
-                                forward: forward_tx.clone(),
-                                control: control_forward_tx.clone(),
-                            });
-                        }
+                        let registration = register_mesh_link(
+                            &mesh_links,
+                            key.clone(),
+                            forward_tx.clone(),
+                            control_forward_tx.clone(),
+                        );
                         // Re-send this relay's known leave state for the session
                         // down the fresh registration, so a link that died and
                         // redialed (its `joined` empty again) reconverges. All of
@@ -1137,12 +1184,9 @@ pub async fn run_mesh_link(
                         joined.insert(
                             session_id,
                             SessionState {
-                                key: key.clone(),
+                                key,
                                 flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
-                                _registration: MeshLinkRegistration {
-                                    links: mesh_links.clone(),
-                                    key,
-                                },
+                                _registration: registration,
                             },
                         );
                         idle_since = None;
@@ -1443,11 +1487,14 @@ struct SessionState {
 struct MeshLinkRegistration {
     links: MeshLinks,
     key: SessionKey,
+    /// The registered channel's id, so the guard removes only this link's entry
+    /// from the session's fan-out vec — never the peers still serving it.
+    id: u64,
 }
 
 impl Drop for MeshLinkRegistration {
     fn drop(&mut self) {
-        deregister_mesh_link(&self.links, &self.key);
+        deregister_mesh_link(&self.links, &self.key, self.id);
     }
 }
 
@@ -1662,8 +1709,71 @@ mod tests {
             .lock()
             .entry(key.clone())
             .or_default()
-            .push(MeshLinkTx { forward, control });
+            .push(MeshLinkTx {
+                id: next_mesh_link_id(),
+                forward,
+                control,
+            });
         (forward_rx, control_rx)
+    }
+
+    /// Deregistering one peer relay's mesh link for a session must leave every
+    /// other peer's registration for that session intact. Regression: a session's
+    /// whole fan-out vec was once removed on any single link's teardown, so a
+    /// `Leave` to (or cancellation of) one peer's driver silently cut turns and
+    /// synced-leave frames to every *other* peer's clients.
+    #[test]
+    fn deregister_one_mesh_link_leaves_the_other_peers_registration() {
+        let links = new_mesh_links();
+        let key = control_key();
+
+        // Two peer relays mesh the same session: each registers its own fan-out
+        // entry, so the session's vec holds one element per peer.
+        let (peer_b_fwd, mut peer_b_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
+        let (peer_b_ctl, _peer_b_ctl_rx) = mpsc::unbounded_channel();
+        let reg_b = register_mesh_link(&links, key.clone(), peer_b_fwd, peer_b_ctl);
+
+        let (peer_c_fwd, mut peer_c_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
+        let (peer_c_ctl, _peer_c_ctl_rx) = mpsc::unbounded_channel();
+        let reg_c = register_mesh_link(&links, key.clone(), peer_c_fwd, peer_c_ctl);
+
+        assert_eq!(
+            links.lock().get(&key).map(Vec::len),
+            Some(2),
+            "both peers registered for the session",
+        );
+
+        // Peer B's driver winds down (a `Leave`, or the task being cancelled):
+        // its RAII guard drops and deregisters — but only its own entry.
+        drop(reg_b);
+        assert_eq!(
+            links.lock().get(&key).map(Vec::len),
+            Some(1),
+            "only peer B's entry was removed; peer C survives",
+        );
+
+        // Fan-out still reaches the surviving peer C, and not the removed peer B.
+        let payload = Payload {
+            seq: 7,
+            slot: 1,
+            ..Default::default()
+        };
+        fan_out_to_mesh(&links, &key, payload);
+        let (session, got) = peer_c_rx.try_recv().expect("peer C is still reached");
+        assert_eq!(session, key.session);
+        assert_eq!(got.seq, 7);
+        assert!(
+            peer_b_rx.try_recv().is_err(),
+            "peer B was deregistered and gets nothing",
+        );
+
+        // Dropping the last registration empties the key entirely — no stale
+        // empty vec left behind.
+        drop(reg_c);
+        assert!(
+            links.lock().get(&key).is_none(),
+            "the session key is removed once its last link deregisters",
+        );
     }
 
     /// `fan_out_control` reaches every link serving the session (with the frame's
@@ -1801,6 +1911,7 @@ mod tests {
                 _registration: MeshLinkRegistration {
                     links: mesh_links.clone(),
                     key: key.clone(),
+                    id: next_mesh_link_id(),
                 },
             },
         );
