@@ -3,35 +3,49 @@
 This is the reference for **how netcode v2 works and why it is shaped this way**. It describes the
 **final design** — the target the implementation is being built toward, not only what runs today.
 
-> **Implementation status — temporary note, delete once complete.** What exists today is the
-> single-relay core: `client–relay–client` with the per-link transport, the relay's validating client
-> edge, the client's forward-recovery driver, the mesh-edge connection half + idle teardown, the
-> consensus decision core, and the coordinator MVP (relay registry, per-tenant token issuance,
-> session setup, and the HTTP control-plane API). The **coordinator→relay descriptor push** is now
-> wired end-to-end: each relay holds a persistent, bootstrap-secret-authenticated control connection
-> to the coordinator, **enrolls itself** over it (its identity and address ride the first frame, into the registry), and
-> receives the session descriptors the coordinator pushes back down to drive mesh `Join`/`Leave`.
-> The relay also **reports liveness** up that same connection — a periodic heartbeat — so a relay whose
-> connection drops or goes silent is **deregistered** (a generation fencing token makes the eviction safe
-> against a relay that has already reconnected). The **latency-buffer decision-maker is now wired into the
-> runtime**: each relay feeds its home clients' link stats (and peer relays' stats off the mesh sidecar)
-> into a per-session decision-maker the coordinator's descriptor creates, and the authority relay
-> broadcasts a buffer change by stamping it onto the turns it forwards — an envelope `buffer_directive` the
-> game applies out of band, not a command in the byte stream. The client half of that application — the
-> state machine that collapses the redundant out-of-order stamp stream into at-most-one change per
-> decision, surfaced exactly at its apply frame — is built (`client::DirectiveTracker`); what remains is
-> the game seam in `shieldbattery/game/` that owns one and resizes the actual turn buffer with it.
-> Authority now follows the **coordinator-assigned priority order** in each session descriptor (home
-> relay first; relay-id order remains only as the fallback for a descriptor without one), and **handoff
-> is presence-driven**: relays exchange per-session live-player counts over reliable mesh presence
-> streams, and the verdict falls to the next relay in the order the moment the deciding relay's players
-> leave — no coordinator re-push needed. The client ↔ relay **reliable control stream** is built (one
-> bidirectional stream per side, extensible length-prefixed frames): a turn too large to ever ride a
-> datagram diverts onto it end-to-end — client to relay, validated, and relay to each recipient — and
-> rejoins the ordered turn stream at the receiver; chat/resync are future frame kinds on the same
-> channel, and the mesh's equivalent divert path (a cross-relay oversize turn today is dropped with a
-> warning rather than killing the shared link) is a follow-up. Resilience/failover and dual-stack
-> advertise addresses remain designed but not yet built.
+> **Implementation status — temporary note, delete once complete.** What runs today is the single-relay
+> core end-to-end — `client–relay–client` with the per-link transport, the relay's validating client edge,
+> and the client's forward-recovery driver — plus most of the multi-relay mesh and the coordinator control
+> plane. Built and wired:
+>
+> - **Mesh core.** The mesh-edge connection half (dial / accept with an identity hello, on-demand dialing,
+>   idle teardown + reconnect supervision), topological turn dedup, and per-session `Join`/`Leave` driven by
+>   coordinator descriptors. Mesh peer certs are now **pinned from the session descriptor** — the coordinator
+>   carries each relay's leaf cert and the dialer trusts exactly that, mirroring how a client pins its
+>   relay's cert — with a fallback to configured roots for a descriptor that predates carrying them.
+> - **Coordinator↔relay control connection.** Each relay holds one persistent, bootstrap-secret-authenticated
+>   connection; it **enrolls itself** over the first frame, **reports liveness** on a heartbeat (a drop or
+>   silence past the deadline deregisters it, made safe against a racing reconnect by a generation fencing
+>   token), and applies the **declarative descriptor set** the coordinator pushes down to drive mesh
+>   membership.
+> - **Latency-buffer consensus.** The per-session decision-maker is wired into the runtime: each relay feeds
+>   its home clients' link stats (and peer relays' stats off the mesh) into it, and the **authority** relay —
+>   first in the coordinator-assigned order still serving live players, with handoff **presence-driven** over
+>   reliable mesh streams and no coordinator round-trip — stamps a `buffer_directive` onto the turns it
+>   forwards, applied out of band, not a command in the byte stream. The client-side `DirectiveTracker`
+>   collapses the redundant out-of-order stamp stream into at-most-one change at its apply frame; the
+>   remaining seam is the game-side owner in `shieldbattery/game/` that resizes the real turn buffer.
+> - **Relay-side desync detection.** The authority relay compares clients' `0x37` sync checksums off the same
+>   turn stream and reports a divergence, hardened so a malicious client can only get its own game disputed,
+>   never frame an honest player (see [Relay-side desync detection](#relay-side-desync-detection)).
+> - **Synced player-leaves.** A clean quit sends a leave-intent up the reliable control stream; the authority
+>   decides a `LeaveDirective` at a survivor-reachable apply frame — a departing client cannot inflate its own
+>   leave past what survivors can reach — broadcast to clients and propagated across the mesh so every client
+>   applies the same leave at the same simulated step (see [Synced player-leaves](#synced-player-leaves)).
+> - **Reliable control stream, both edges.** Client↔relay and relay↔relay (one bidirectional stream per side,
+>   extensible length-prefixed frames). A turn too large to ever ride a datagram diverts onto it end-to-end
+>   and rejoins the ordered turn stream at the receiver — the mesh divert is now built, no longer
+>   dropped-with-a-warning. Chat/resync are future frame kinds on the same channel.
+> - **Coordinator control plane.** The relay registry, per-tenant connection-bound **token** issuance, session
+>   setup + descriptor assignment, and the tenant-facing HTTP API. The API now **authenticates inbound tenant
+>   requests** with a per-tenant Ed25519 signature (fail-closed), a **coordinator→tenant webhook** leg reports
+>   player departures, desyncs, and game results (signed with the tenant's key, deduped, retried), and a
+>   **session-lifecycle** layer emits a final `sessionClosed` and reaps dangling sessions (see
+>   [Control plane](#control-plane-the-coordinator)).
+>
+> Still designed but not built: **resilience/failover and coordinated reconnect** (the biggest open piece),
+> **dual-stack advertise addresses**, **per-relay identity binding** on the control connection, and
+> production mesh **mTLS / an internal CA**.
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -269,18 +283,22 @@ from a dropped connection: it redials a failed connection (after a short delay, 
 link so the Join source re-syncs its sessions onto it) and leaves an idle teardown or a
 relay-initiated shutdown alone.
 
-**Mesh trust today vs. production.** Today the dial trusts the peer's cert against the same roots a
-client would — a dev/loopback pair with self-signed certs just works (each relay trusts its own leaf
-as the peer's root). Self-signed doesn't scale to production: with scale-to-zero, relays churn
-constantly, so pre-distributing each relay's cert to every potential peer is operationally infeasible.
-The production approach is an **internal CA** (AWS Private CA, or a simple CA the coordinator runs):
-one CA root signs every relay cert on startup; each relay trusts the CA root; any two relays can mesh
-without pre-sharing certs. The current `mesh_client_config` does server-auth only
-(`with_no_client_auth`); production mTLS — both sides present certs — is a transport-level change
-that lands with the coordinator (Phase 3), alongside the open `S===S` inter-relay auth question
-(mutual certs vs. a coordinator-issued shared secret). Client → relay trust is simpler: it's 1:1 (one
-relay per client), so self-signed *with pinning* (the coordinator hands the client the relay's cert
-in the session descriptor) or an internal CA both work; direct IPs (D3) rule out public CA.
+**Mesh trust today vs. production.** Today the dial **pins the peer's cert from the session descriptor**:
+the coordinator carries each relay's leaf cert in the descriptor, and the dialer trusts exactly that cert
+for the connection — the same way a game client pins `RelayEndpoint::cert_der` for its own relay dial. A
+descriptor that predates carrying peer certs (or a pin rustls can't parse) falls back to the configured
+mesh roots, logged — reproducing the earlier dev/loopback behavior where a self-signed pair just works
+(each relay trusting its own leaf). Pinning removes the pre-distribution problem — with scale-to-zero
+relays churn constantly, so shipping every relay's cert to every potential peer ahead of time is
+infeasible — but it still trusts *whatever cert the coordinator vouches for*. The longer-term production
+approach is an **internal CA** (AWS Private CA, or a simple CA the coordinator runs): one CA root signs
+every relay cert on startup, each relay trusts the CA root, and any two relays mesh without the
+coordinator brokering each cert. The current `mesh_client_config` does server-auth only
+(`with_no_client_auth`); production mTLS — both sides present certs — is a transport-level change that
+lands with the internal-CA work, alongside the open `S===S` inter-relay auth question (mutual certs vs. a
+coordinator-issued shared secret). Client → relay trust is the same descriptor-pinning story: it's 1:1
+(one relay per client), cert pinned from the session descriptor, with an internal CA as the scale
+alternative; direct IPs (D3) rule out public CA.
 
 ### Failover and reconnect (open)
 
@@ -350,6 +368,52 @@ connection. So those per-client conditions travel **with the turns**: a relay at
 link stats to what it forwards across the mesh, and the decision-maker combines them into the game-wide
 picture (loss rate, latency, …) it decides on. The same conditions flow down to the clients, where they
 can drive an in-game netgraph or other debugging output.
+
+### Relay-side desync detection
+
+SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the command
+stream: each client emits one `0x37` sync command per network turn once its sync check is active, and
+because every client's Nth sync command covers the same simulated interval, two clients whose sims have
+diverged produce a *different* checksum at the same ordinal. Natively each client compares its peers'
+checksums and drops a mismatching peer itself — but netcode v2's transport is inert under that seam (the
+relay owns the wire, and the game's own peer-drop path never fires), so a desync would be **invisible to
+everyone** unless something that sees every slot's turns compares the checksums. The **authority relay
+does**, off the same validated turn stream the buffer and leave consensus already read: it extracts each
+slot's `hash16` (the sim-state bytes of the `0x37`, not the per-sender fog/vision bytes that legitimately
+differ), places it at the right ordinal using the command's 16-entry ring index, and once every compared
+slot has reported that ordinal and the frontier has advanced past it, compares them. A divergence is
+reported up the coordinator webhook leg, keyed on the sync ordinal so a re-detection after an authority
+handoff isn't counted twice. Observers are excluded — they don't reliably emit sync commands, so requiring
+their checksums would stall the cross-check.
+
+The comparator is **attacker-facing**, and hardened so a malicious client can only get its *own* game
+disputed, never frame an honest player. The frame-anchored placement that positions a joining slot is
+derived only from a corroborated median of **≥3 distinct slots'** `(ordinal, frame)` points — a lone
+attacker can neither reach the threshold nor move the median — and a join with no corroborated rate is
+placed only within one ring cycle of the frontier, else deferred rather than misplaced. Exactly one `0x37`
+per `(slot, turn)` is enforced, removing the flooding lever both the placement-poisoning and
+window-eviction attacks depended on.
+
+### Synced player-leaves
+
+When a player leaves mid-game, every *other* client must apply that leave at the **same simulated frame**
+or their sims diverge — the same identical-application problem the latency buffer has, solved the same
+way: one authority decides, and the decision rides the turn stream as envelope metadata, not a forged
+command. Two paths reach a leave. A **clean quit** sends a **leave-intent** up the client's reliable
+control stream before it goes, and the relay decides a leave that renders on peers as "player left." A
+**drop** — the client's link simply ending, whether a quit without intent, network death, or isolation
+for lagging — is decided as "player was dropped." Either way the authority relay emits a **`LeaveDirective`**
+naming the slot, the reason, and the apply frame; it is broadcast to clients (idempotent, ordered by a
+decision seq exactly like the buffer directive) and carried across the mesh in a **`SlotDeparted`** record
+so every relay, and any relay promoted to authority afterward, derives the identical leave.
+
+The apply frame is the subtle part. A departing client's own `game_frame_count` cannot be trusted to set
+it — a malicious client could name an unreachable future frame and stall every honest survivor forever — so
+the leave's apply frame is **clamped to a survivor-reachable ceiling**: the highest frame the survivors have
+provably executed, computed on the departing slot's home relay from turns it validated and carried in the
+`SlotDeparted` record so every relay agrees on it, never a frame the departing client merely claimed. On the
+client, a `LeaveTracker` collapses the redundant directive stamps into **at-most-one leave per slot**,
+surfaced at its apply frame — the leave-side mirror of the buffer `DirectiveTracker`.
 
 ### Control plane: the coordinator
 
@@ -431,12 +495,62 @@ same cert work; until then the connection is for trusted (internal / loopback) d
 relay→coordinator heartbeat now rides this channel — it doubles as the keepalive that surfaces a connection
 that died without a close — so per-relay identity binding is the channel's main remaining hardening.
 
+### Tenant → coordinator requests (the app-server API)
+
+The coordinator's tenant-facing HTTP API — `POST /session/create`, `POST /sessions/alive`, and so on — is
+how a tenant's app server drives sessions. Every mutating request is **authenticated by a per-tenant
+Ed25519 signature**, fail-closed. The app server signs an `x-rp2-signature` header over a domain-separated
+message binding the request timestamp, HTTP method, path, and exact body bytes
+(`rp2-request-v1:<ts>:<METHOD>:<path>:<body>`), and the coordinator verifies it against that tenant's
+enrolled request-verifying key before doing any work. A missing, malformed, stale (outside a ±5-minute
+window), or wrong-key signature all map to the same `401`, so a probe learns nothing about which check
+failed, and a tenant with no enrolled key cannot make an authenticated request at all. This is a **separate
+keypair from the tenant's token-signing key**: the app server holds a request-signing seed and the
+coordinator stores only its public half (tenant→coordinator), while the token/webhook key signs the other
+direction (coordinator→tenant). The handler reads the raw body rather than a JSON extractor precisely so
+the signature covers the exact bytes on the wire. A small `GET /tenant/:tenant/pubkey` endpoint serves the
+tenant's token-*verifying* key and its `kid`, so a consumer can key its verifying-key cache by the same
+`kid` a webhook is signed under.
+
+### Coordinator → tenant notifications (webhooks)
+
+The coordinator tells a tenant about three per-game facts its relays report up their control connections — a
+player **departure**, a **desync**, and a slot's end-of-game **result** — by POSTing a signed webhook to the
+tenant's configured URL. Each POST is **signed with the tenant's own key** (the same key that mints tokens,
+domain-separated `rp2-webhook-v1:`), not a shared secret, so there is nothing extra to provision or rotate.
+Because every relay serving a session reports the same fact independently — redundancy against any one
+relay's coordinator link being down — the pipeline **dedups** on first sight; it prefers the correlation
+ids the relay stamped into the notice (from the descriptor it applied) over the coordinator's own in-memory
+session refs, which is what lets a departure webhook survive a coordinator restart that wiped those refs.
+Delivery is **at-least-once with capped-backoff retry** and eventual give-up, because the webhook is an
+**optimization feed, not a correctness signal**: the app server already holds a game's terminal result and
+ignores a departure for a game it has a result for, so a never-delivered webhook degrades to result-based
+behavior, and the idempotent consumer absorbs the duplicate a restart-forgets-the-dedup-set redelivery
+produces.
+
+### Session lifecycle and reaps
+
+The coordinator holds the global picture of a game's end and drives three things off it. **Ordered
+dispatch:** every webhook for one `(tenant, session)` drains from a single FIFO queue, one at a time, so a
+delivered `sessionClosed` implies every earlier notice for the session was delivered or exhausted.
+**`sessionClosed`:** the coordinator assigned each session's serving-relay set, and when every one of them
+has reported `SessionClosed` (its last local slot deregistered), the final `sessionClosed` webhook fires
+and the session state is reaped. **Reaps:** two grace timers keep a session from dangling — a **holdout
+reap** (all-but-one player accounted, the last silent on a live link) and a **linger reap** (all accounted
+but links still open) — each closing the offending slot with a `CloseSlot` directive down the relay control
+connection, which then flows through the normal link-death path, so the reap is self-resolving rather than a
+second teardown mechanism. This state is in-memory: a coordinator restart forgets a session's accounting, so
+a departure/result webhook for a forgotten session still delivers (a webhook-only queue is created lazily)
+but its `sessionClosed` and reaps do not re-arm — the tenant's **batch liveness probe** (`POST
+/sessions/alive`, asking which of a set of sessions the coordinator still holds) is the backstop that
+force-reconciles the ones it no longer does.
+
 ## Components
 
 | Crate | Role |
 |---|---|
 | `proto` | Frozen wire contracts: `Packet`/`Payload` framing, control-plane messages, tokens, protocol version, the SC:R command table. Anything crossing a component boundary is defined here first. |
 | `transport` | The per-link redundancy + ack + dedup machinery above, shared by `client` and `relay`. |
-| `client` | Portable client endpoint + link driver; linked into the game DLL. |
-| `relay` | Validating client edge + per-session routing, the relay mesh, the replicated turn log, and the flight recorder. |
-| `coordinator` | Multi-tenant control plane: per-tenant token issuance, the relay registry, region assignment, and provisioning. |
+| `client` | Portable client endpoint + link driver: per-slot ordering restoration and the buffer/leave directive trackers; linked into the game DLL. |
+| `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, topological dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves. (A replicated turn log and flight recorder are planned, not yet built.) |
+| `coordinator` | Multi-tenant control plane: per-tenant token issuance + inbound request-signature auth, the relay registry and descriptor push, session setup, region assignment/provisioning, and the tenant-notification (webhook) + session-lifecycle layer. |

@@ -31,13 +31,15 @@
 //! when the authority relay drops out -- its players have all left -- and
 //! authority falls to the next relay in the order, with no coordinator
 //! round-trip.) Authority is an **injected input** to this core: the caller
-//! (`MeshControl`) computes the verdict from each coordinator descriptor --
-//! today by relay-id order, an interim rule until the coordinator assigns an
-//! explicit priority order and a presence signal drives handoff -- and
-//! re-injects it via [`DecisionMaker::sync`] on every push, so the verdict
-//! follows the relay set as players come and go. A promoted relay's decisions
-//! must outrank everything the previous authority broadcast; that is what
-//! [`observe_directive`](DecisionMaker::observe_directive) is for.
+//! (`MeshControl`) computes the verdict from the coordinator descriptor's
+//! priority order (relay-id order is only the fallback for a descriptor that
+//! carries none) and the live-player presence the relays track among
+//! themselves -- the first relay in that order still serving players wins --
+//! and re-injects it via [`DecisionMaker::sync`] on every descriptor push and
+//! every presence change, so the verdict follows the relay set as players come
+//! and go with no coordinator round-trip for handoff. A promoted relay's
+//! decisions must outrank everything the previous authority broadcast; that is
+//! what [`observe_directive`](DecisionMaker::observe_directive) is for.
 //!
 //! # The target formula
 //!
