@@ -636,13 +636,43 @@ fn note_inbound(
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    slot = notice.slot.0,
+                    "departure notice from a relay not serving the session; rejecting",
+                );
+                return;
+            }
             lifecycle.on_departure(notice.tenant.clone(), notice.session, notice.slot);
             notify::handle_departure(setup, &notices.departures, lifecycle, notice);
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    sync_ordinal = notice.sync_ordinal,
+                    "desync notice from a relay not serving the session; rejecting",
+                );
+                return;
+            }
             notify::handle_desync(setup, &notices.desyncs, lifecycle, notice);
         }
         Ok(RelayToCoordinator::Result(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    slot = notice.slot.0,
+                    "result notice from a relay not serving the session; rejecting",
+                );
+                return;
+            }
             lifecycle.on_result(notice.tenant.clone(), notice.session, notice.slot);
             notify::handle_result(setup, &notices.results, lifecycle, notice);
         }
@@ -655,6 +685,36 @@ fn note_inbound(
             tracing::debug!(%error, relay_id = relay_id.0, "undecodable relay control frame")
         }
     }
+}
+
+/// Whether `relay_id` — the relay identity this control connection enrolled as —
+/// is allowed to report a departure/desync/result for `(tenant, session)`. A
+/// notice carries attacker-influenceable `tenant`/`session`/payload, and each one
+/// drives a webhook signed with the tenant's own key; without this gate any
+/// connected relay could name a victim tenant + session and have the coordinator
+/// sign and deliver forged bytes to that tenant's webhook.
+///
+/// The rule: the reporting relay must be one of the session's serving relays.
+/// When the coordinator holds **no** serving-relay record for the session, the
+/// notice is allowed through — this is the routine post-restart tail case, where a
+/// relay still holds a session created in a previous coordinator lifetime and
+/// reports its closing events, but the in-memory serving set was wiped, so there
+/// is nothing to check the reporter against. Enforcement therefore applies only
+/// when serving-relay information exists this lifetime.
+///
+/// Residual gap: the unverifiable no-record path still trusts the reporter, and
+/// the shared bootstrap secret authenticates "a relay," not a specific relay id,
+/// so a secret holder could forge a tail notice for a session with no live serving
+/// record. Fully closing that needs per-relay identity — the same work that binds
+/// a control connection to its claimed relay id — and is out of scope here.
+fn relay_serves_session(
+    setup: &SessionSetup,
+    relay_id: RelayId,
+    tenant: &TenantId,
+    session: SessionId,
+) -> bool {
+    let serving = setup.serving_relays(tenant, session);
+    serving.is_empty() || serving.contains(&relay_id)
 }
 
 /// Reads the relay's opening [`RelayToCoordinator::Hello`] from a freshly
@@ -1341,5 +1401,193 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- Notice reporter authorization (cross-tenant forgery guard) --
+
+    /// A stand-in tenant webhook receiver: an axum server that signals on a
+    /// channel each time it receives a POST (the body is irrelevant here — the
+    /// test only cares whether a webhook was signed and delivered at all).
+    /// Returns the hook URL and the receive end.
+    async fn spawn_webhook_receiver() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let app = Router::new()
+            .route(
+                "/hook",
+                post(
+                    move |State(tx): State<tokio::sync::mpsc::UnboundedSender<()>>,
+                          _body: Bytes| async move {
+                        let _ = tx.send(());
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/hook"), rx)
+    }
+
+    /// A setup with one relay (id 1) and a tenant enrolled, a notify config
+    /// pointed at `url`, and a session created — so the session's serving set is
+    /// exactly `[RelayId(1)]`. Returns the setup, a fresh dedup, a lifecycle over
+    /// it, and the created session id.
+    fn setup_with_session_and_notify(
+        url: String,
+    ) -> (SessionSetup, NoticeDedup, Lifecycle, SessionId) {
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            ),
+        );
+        let tenants = crate::tenant::new_store();
+        crate::tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        crate::tenant::set_notify(
+            &tenants,
+            &TenantId("sb-test".to_owned()),
+            Some(crate::tenant::NotifyConfig { url }),
+        );
+        let setup = session::SessionSetup::new(reg, tenants);
+        let resp = session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: Some("sb-user-0".to_owned()),
+                    observer: false,
+                }],
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            rally_point_proto::token::ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let lifecycle = Lifecycle::new(setup.clone());
+        (setup, notify::new_dedup(), lifecycle, resp.session)
+    }
+
+    /// A `Result` notice framed as an inbound control message, carrying its own
+    /// correlation ids so it would sign and deliver a webhook if accepted.
+    fn result_message(session: SessionId, slot: u8) -> Message {
+        let notice = rally_point_proto::control::ResultNotice {
+            tenant: TenantId("sb-test".to_owned()),
+            session,
+            slot: SlotId(slot),
+            external_id: Some("game-1".to_owned()),
+            external_ref: Some("sb-user-0".to_owned()),
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            arrival_ms: 1_700_000_000_000,
+            session_frame: Some(1),
+            slot_frame: Some(1),
+        };
+        let json = serde_json::to_string(&RelayToCoordinator::Result(notice)).unwrap();
+        Message::Text(json.into())
+    }
+
+    #[test]
+    fn relay_serves_session_enforces_membership_only_when_a_serving_set_exists() {
+        let (setup, _notices, _lifecycle, session) =
+            setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
+        let tenant = TenantId("sb-test".to_owned());
+        // The session's serving set is [RelayId(1)].
+        assert!(
+            relay_serves_session(&setup, RelayId(1), &tenant, session),
+            "the session's serving relay may report",
+        );
+        assert!(
+            !relay_serves_session(&setup, RelayId(2), &tenant, session),
+            "a relay outside the serving set may not report",
+        );
+        // A session the coordinator never recorded a serving set for: unverifiable
+        // (the post-restart tail case), so the reporter is allowed through.
+        assert!(
+            relay_serves_session(&setup, RelayId(2), &tenant, SessionId(999_999)),
+            "with no serving record there is nothing to check against, so allow",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_from_a_relay_not_serving_the_session_signs_no_webhook() {
+        // The cross-tenant forgery guard: relay 2 never served this session, so a
+        // result it reports for the victim tenant + session must not be signed with
+        // the tenant's key and delivered to its webhook.
+        let (url, mut rx) = spawn_webhook_receiver().await;
+        let (setup, notices, lifecycle, session) = setup_with_session_and_notify(url);
+
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(2),
+            &result_message(session, 0),
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a result from a relay outside the serving set delivers no webhook",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_from_a_serving_relay_delivers_its_webhook() {
+        let (url, mut rx) = spawn_webhook_receiver().await;
+        let (setup, notices, lifecycle, session) = setup_with_session_and_notify(url);
+
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            &result_message(session, 0),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a result from the serving relay delivers its webhook")
+            .expect("the receiver got it");
+    }
+
+    #[tokio::test]
+    async fn a_notice_for_a_session_with_no_serving_record_still_delivers() {
+        // Post-restart tail: the coordinator holds no serving-relay record for the
+        // session (created in a previous lifetime), so there is nothing to check the
+        // reporter against and the notice must still be honored.
+        let (url, mut rx) = spawn_webhook_receiver().await;
+        let (setup, notices, lifecycle, _created) = setup_with_session_and_notify(url);
+
+        // A session id the coordinator never created this lifetime -> empty serving
+        // set, so even an arbitrary relay id is allowed through.
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(2),
+            &result_message(SessionId(4242), 0),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a notice for a session with no serving record still delivers")
+            .expect("the receiver got it");
     }
 }
