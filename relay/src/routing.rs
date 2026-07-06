@@ -477,6 +477,10 @@ pub async fn run_slot_link(
         mut leave_push_rx,
         shutdown,
     } = inbox;
+    // Cloned (cheap — every field is an `Arc`) before the destructure below
+    // pulls `mesh` apart, so every exit path can hand the whole bundle to
+    // `end_slot_link` without ballooning that function's argument count.
+    let mesh_for_teardown = mesh.clone();
     let crate::mesh::MeshState {
         links: mesh_links,
         seen: seen_registries,
@@ -504,8 +508,11 @@ pub async fn run_slot_link(
         Ok(send) => send,
         Err(error) => {
             log_link_closed(&key, slot, &LinkError::from(error));
-            deregister(&sessions, &key, slot);
-            report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+            // The slot registered but never got a stream up, so it forwarded
+            // nothing — still run the full departure/close protocol below so
+            // peers and the coordinator hear about it now rather than only
+            // after the coordinator's holdout reap.
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
             return;
         }
     };
@@ -520,8 +527,10 @@ pub async fn run_slot_link(
         Ok(halves) => halves,
         Err(error) => {
             log_link_closed(&key, slot, &LinkError::from(error));
-            deregister(&sessions, &key, slot);
-            report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+            // Same rationale as the open_uni failure above: the beacon stream
+            // came up but the control stream didn't, so this slot still never
+            // forwarded a turn and gets the same full teardown.
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
             return;
         }
     };
@@ -1007,8 +1016,30 @@ pub async fn run_slot_link(
         }
     }
 
-    let session_emptied = deregister(&sessions, &key, slot);
-    crate::mesh::unpublish_conditions(&conditions, &key, slot);
+    end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+}
+
+/// Runs the full departure/close protocol for a slot link that has ended,
+/// however far it got: deregisters the slot, drops its condition history,
+/// announces its departure to the mesh (unless a clean leave-intent already
+/// announced it with the "left" reason), re-derives this relay's presence
+/// verdict, and — if that deregistration emptied the session's local roster —
+/// tells the coordinator the session is closed.
+///
+/// This is the single teardown path for every way `run_slot_link` can end: a
+/// link that dies before its streams even come up has registered a slot and
+/// forwarded nothing, but peers and the coordinator still need to hear it left
+/// — skipping this would only delay that news to the coordinator's holdout
+/// reap, not avoid the need for it.
+fn end_slot_link(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+    leave_announced: bool,
+) {
+    let session_emptied = deregister(sessions, key, slot);
+    crate::mesh::unpublish_conditions(&mesh.conditions, key, slot);
     // Trigger A (synced player-leave): this client's link ended, so it has left
     // the game. Announce the departure — unless a clean leave-intent already did,
     // with the "left" reason — as a "dropped" one: record it, tell the peer relays
@@ -1025,10 +1056,10 @@ pub async fn run_slot_link(
     // stopped for them, so the reliable stream is the only channel that unstalls.
     if !leave_announced {
         announce_departure(
-            &decision_makers,
-            &sessions,
-            &mesh_links,
-            &key,
+            &mesh.decision_makers,
+            sessions,
+            &mesh.links,
+            key,
             slot,
             LEAVE_REASON_DROPPED,
         );
@@ -1039,14 +1070,20 @@ pub async fn run_slot_link(
     // where no maker-side departure applies. The maker itself lives until the
     // session ends (the coordinator drops the descriptor); the departure record
     // and any cached leave are kept, so a promotion can still re-derive the leave.
-    if let Some(maker) = decision_makers.lock().get_mut(&key) {
+    if let Some(maker) = mesh.decision_makers.lock().get_mut(key) {
         maker.remove_slot(slot);
     }
     // This client leaving may hand the session's buffer authority to the next
     // relay in the order — the presence-driven half of the handoff. The local
     // verdict moves here; the peers hear the emptied roster from the mesh
     // drivers' presence reconcile.
-    report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+    report_own_presence(
+        &mesh.presence,
+        &mesh.decision_makers,
+        sessions,
+        &mesh.links,
+        key,
+    );
     // This was the relay's last local slot for the session: it has torn down its
     // serving state, so tell the coordinator. Fired here, after `announce_departure`
     // already put this slot's departure on the same ordered notice channel, so the
@@ -1054,7 +1091,7 @@ pub async fn run_slot_link(
     // for the session is still in flight — the ordering the final `sessionClosed`
     // webhook rests on.
     if session_emptied {
-        consensus::session_closed(&decision_makers, &key);
+        consensus::session_closed(&mesh.decision_makers, key);
     }
 }
 
