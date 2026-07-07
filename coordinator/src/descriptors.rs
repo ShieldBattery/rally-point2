@@ -283,6 +283,7 @@ mod tests {
             external_id: None,
             slot_refs: vec![],
             observer_slots: vec![],
+            expected_slots: vec![],
         }
     }
 

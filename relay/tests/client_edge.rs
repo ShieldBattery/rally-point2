@@ -274,6 +274,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
@@ -327,6 +328,130 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     // The command bytes are untouched — the directive is envelope metadata, not a
     // command the game parses.
     assert_eq!(&turn.commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+#[tokio::test]
+async fn fires_session_start_when_every_expected_slot_connects() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{ControlInbound, spawn_control_reader};
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(88);
+
+    // Seed the session's maker as the authority with two expected slots, before
+    // any client connects — exactly as a coordinator descriptor would.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    // Slot 0 connects; it does not cover {0, 1}, so no directive is sent yet.
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut reader0 = spawn_control_reader(slot0.connection().clone());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), reader0.recv())
+            .await
+            .is_err(),
+        "no session-start until every expected slot has connected",
+    );
+
+    // Slot 1 connects, completing the expected set: every slot receives the
+    // session-start directive over its reliable control stream.
+    let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut reader1 = spawn_control_reader(slot1.connection().clone());
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), reader0.recv())
+                .await
+                .expect("slot 0 is not timed out")
+                .expect("slot 0's control stream stays open"),
+            ControlInbound::SessionStart,
+        ),
+        "slot 0 receives the session-start directive once slot 1 completes the set",
+    );
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), reader1.recv())
+                .await
+                .expect("slot 1 is not timed out")
+                .expect("slot 1's control stream stays open"),
+            ControlInbound::SessionStart,
+        ),
+        "the slot that completed the set receives the directive too",
+    );
+}
+
+#[tokio::test]
+async fn a_late_slot_receives_session_start_on_register() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{ControlInbound, spawn_control_reader};
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(89);
+
+    // A one-slot expected set: slot 0 alone starts the session. A later slot then
+    // registers after start and must be re-pushed the directive on register.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    // Slot 0 covers the expected set on its own: the session starts immediately.
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut reader0 = spawn_control_reader(slot0.connection().clone());
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), reader0.recv())
+                .await
+                .expect("slot 0 is not timed out")
+                .expect("slot 0's control stream stays open"),
+            ControlInbound::SessionStart,
+        ),
+        "the sole expected slot starts the session on connect",
+    );
+
+    // A second slot registers well after the session has already started, and is
+    // re-pushed the directive on register rather than left waiting.
+    let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut reader1 = spawn_control_reader(slot1.connection().clone());
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), reader1.recv())
+                .await
+                .expect("slot 1 is not timed out")
+                .expect("slot 1's control stream stays open"),
+            ControlInbound::SessionStart,
+        ),
+        "a slot that registers after start still receives the directive",
+    );
 }
 
 #[tokio::test]
@@ -568,6 +693,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -645,6 +771,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -710,6 +837,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
 
@@ -800,6 +928,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
     // Watch the notices the relay would send up its coordinator connection.
@@ -911,6 +1040,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -983,6 +1113,7 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -31,7 +31,7 @@ use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
     GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload,
-    SlotConditions, SlotDeparted, mesh_control_frame,
+    SessionStart, SlotConditions, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -556,6 +556,41 @@ pub(crate) fn fan_out_lobby_command(links: &MeshLinks, key: &SessionKey, command
 /// minus the replay-log side effect (chat keeps none).
 pub(crate) fn fan_out_chat(links: &MeshLinks, key: &SessionKey, chat: GameChat) {
     fan_out_control(links, key, chat_frame(key.session, chat));
+}
+
+/// Announces a freshly registered slot to every peer relay serving `key`, so
+/// each accumulates it into the session's live-slot set and the authority can
+/// decide when every expected slot has connected. A duplicate (a re-announce) is
+/// idempotent — the accumulated set is a set.
+pub(crate) fn fan_out_slot_present(links: &MeshLinks, key: &SessionKey, slot: SlotId) {
+    fan_out_control(links, key, slot_present_frame(key.session, slot));
+}
+
+/// Broadcasts the session-start directive the authority decided to every peer
+/// relay serving `key`, so each fans it down its own local slots. A relay that
+/// receives this latches the session started and fans it locally but does not
+/// re-broadcast it — the authority already sent it to every relay — so there is
+/// no echo.
+pub(crate) fn fan_out_session_start(links: &MeshLinks, key: &SessionKey) {
+    fan_out_control(links, key, session_start_frame(key.session));
+}
+
+/// Builds a `SlotPresent` mesh control frame for `session`.
+fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SlotPresent(SlotPresent {
+            slot: u32::from(slot.0),
+        })),
+    }
+}
+
+/// Builds a `SessionStart` mesh control frame for `session`.
+fn session_start_frame(session: SessionId) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {})),
+    }
 }
 
 /// Broadcasts a batch of synced leaves — the ones a fresh authority promotion
@@ -1193,6 +1228,16 @@ pub async fn run_mesh_link(
                                 &state.key,
                             );
                             broadcast_leaves(&sessions, &mesh_links, &state.key, leaves);
+                            // A promotion here may also make this relay the one to
+                            // observe full slot presence: re-evaluate and fire the
+                            // session-start directive if it now covers the expected
+                            // set (idempotent for already-started sessions).
+                            routing::maybe_start_session(
+                                &sessions,
+                                &decision_makers,
+                                &mesh_links,
+                                &state.key,
+                            );
                         }
                     }
                     None => presence_alive = false,
@@ -1483,6 +1528,35 @@ fn dispatch_mesh_control(
             // mesh, exactly as the lobby command and oversize turn above.
             crate::chat::deliver(&mesh.chat, &key, chat_msg);
         }
+        Some(mesh_control_frame::Kind::SlotPresent(present)) => {
+            let Ok(slot) = u8::try_from(present.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = present.slot,
+                    "mesh SlotPresent names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // Accumulate the reported slot into this session's live-slot set. On
+            // the authority, full coverage of the expected set fires the one
+            // `SessionStart` — fanned to this relay's local slots and broadcast to
+            // every peer (including the origin, harmlessly: it latches started and
+            // fans to its own locals, but the frame is idempotent). A non-authority
+            // relay just records it, for a later promotion.
+            if crate::consensus::note_slot_present(&mesh.decision_makers, &key, slot) {
+                routing::fan_out_session_start(sessions, &key);
+                fan_out_session_start(&mesh.links, &key);
+            }
+        }
+        Some(mesh_control_frame::Kind::SessionStart(_)) => {
+            // The authority's session-start directive. Latch the session started —
+            // so this relay's own late-registering local slots still get a re-push
+            // — and fan it down every current local slot. Deliberately NOT
+            // re-broadcast across the mesh: the authority already sent a copy to
+            // every link serving the session, so re-flooding would only echo.
+            crate::consensus::mark_session_started(&mesh.decision_makers, &key);
+            routing::fan_out_session_start(sessions, &key);
+        }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
         None => {
@@ -1522,6 +1596,13 @@ fn reconcile_leaves_on_join(
     }
     for leave in directives {
         let _ = control_tx.send(leave_directive_frame(key.session, leave));
+    }
+    // If the session already started, re-send the directive down the fresh link
+    // too: a peer relay that dialed in (or redialed) after the authority fired
+    // would otherwise never hear it, stranding its local slots. Idempotent — a
+    // relay that already started latches it again and re-fans to its own locals.
+    if crate::consensus::session_started(decision_makers, key) {
+        let _ = control_tx.send(session_start_frame(key.session));
     }
 }
 
@@ -1953,6 +2034,7 @@ mod tests {
             BufferBounds::new(0, 20).unwrap(),
             crate::consensus::Authority::SelfRelay,
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         // The authority decided one slot's leave (caches a directive and records a
         // departure), and separately recorded a bare departure for another slot.
@@ -2013,6 +2095,7 @@ mod tests {
             &key,
             BufferBounds::new(0, 20).unwrap(),
             crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
 
@@ -2221,6 +2304,7 @@ mod tests {
             &key,
             BufferBounds::new(1, 6).unwrap(),
             Authority::SelfRelay,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
 

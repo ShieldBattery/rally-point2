@@ -205,6 +205,14 @@ pub struct SlotEntry {
     /// `forward` (datagram turns) because a leave must reach a stalled client,
     /// whose datagram turn flow has stopped — only the reliable stream still does.
     leave_push: mpsc::Sender<LeaveDirective>,
+    /// Session-start directives to push down THIS client's reliable control
+    /// stream. Fed by [`fan_out_session_start`] when the session's authority
+    /// decides every expected slot has connected, and by
+    /// [`deliver_session_start_to_slot`] for a slot that registers after the
+    /// session already started; drained by this slot's link task, which writes a
+    /// `SessionStart` frame to its control stream. Fieldless — a unit per
+    /// directive, carrying nothing but the fact.
+    start_push: mpsc::Sender<()>,
     shutdown: Arc<Notify>,
 }
 
@@ -214,6 +222,9 @@ pub struct SlotInbox {
     forward_rx: mpsc::Receiver<Payload>,
     /// Leaves to push down this client's control stream (see [`SlotEntry::leave_push`]).
     leave_push_rx: mpsc::Receiver<LeaveDirective>,
+    /// Session-start directives to push down this client's control stream (see
+    /// [`SlotEntry::start_push`]).
+    start_push_rx: mpsc::Receiver<()>,
     shutdown: Arc<Notify>,
 }
 
@@ -291,6 +302,9 @@ pub fn register(
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
     // Leaves are rare (one per departing peer), so a small channel is ample.
     let (leave_tx, leave_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    // Session-start directives are rarer still (the fire, plus any re-push on a
+    // late register or an authority handoff); the same small channel suits them.
+    let (start_tx, start_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     {
         let mut roster = sessions.lock();
@@ -303,6 +317,7 @@ pub fn register(
             SlotEntry {
                 forward: tx,
                 leave_push: leave_tx,
+                start_push: start_tx,
                 shutdown: Arc::clone(&shutdown),
             },
         );
@@ -316,6 +331,7 @@ pub fn register(
     let inbox = SlotInbox {
         forward_rx: rx,
         leave_push_rx: leave_rx,
+        start_push_rx: start_rx,
         shutdown,
     };
     Some((registration, inbox))
@@ -425,6 +441,114 @@ pub(crate) fn fan_out_leave(
     }
 }
 
+/// Pushes the session-start directive down every slot's control stream in the
+/// `key` group — every currently-registered local slot, with no exclusion (unlike
+/// [`fan_out_leave`], a start is for everyone). Senders are cloned under the lock
+/// and the lock dropped before delivery, as in [`fan_out`]. A slot whose start
+/// queue is full is unexpected (starts are rare and the queue is drained
+/// promptly); it is logged rather than dropped silently.
+pub(crate) fn fan_out_session_start(sessions: &Sessions, key: &SessionKey) {
+    let targets: Vec<(SlotId, mpsc::Sender<()>)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => slots
+                .iter()
+                .map(|(slot, entry)| (*slot, entry.start_push.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for (slot, tx) in targets {
+        match tx.try_send(()) {
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                "session-start queue full; the start directive may be delayed for this slot",
+            ),
+            // The slot's task already ended; it needs no start.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Pushes the session-start directive down a single slot's control stream — the
+/// re-push a slot gets when it registers after the session already started. A
+/// slot absent from the roster (already gone) is skipped.
+pub(crate) fn deliver_session_start_to_slot(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
+    let sender = {
+        let roster = sessions.lock();
+        roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .map(|entry| entry.start_push.clone())
+    };
+    if let Some(tx) = sender {
+        let _ = tx.try_send(());
+    }
+}
+
+/// Delivers the session-start directive session-wide: fans it to every local
+/// slot ([`fan_out_session_start`]) and broadcasts it across the mesh so every
+/// peer relay fans it to its own local slots ([`crate::mesh::fan_out_session_start`]).
+/// The one call the authority makes when full slot presence is reached, and the
+/// same one an authority-churn re-evaluation makes.
+pub(crate) fn deliver_session_start(
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+) {
+    fan_out_session_start(sessions, key);
+    crate::mesh::fan_out_session_start(mesh_links, key);
+}
+
+/// Re-evaluates a session's start condition after an authority change and, if the
+/// newly-promoted authority now covers the expected set, delivers the directive
+/// session-wide. The authority-churn path (point where a promotion may fire a
+/// start the previous authority never got to). A no-op when the condition is not
+/// met — a non-authority relay, an already-started session, or an incomplete set.
+pub fn maybe_start_session(
+    sessions: &Sessions,
+    decision_makers: &consensus::DecisionMakers,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+) {
+    if consensus::reevaluate_session_start(decision_makers, key) {
+        deliver_session_start(sessions, mesh_links, key);
+    }
+}
+
+/// Announces a freshly registered slot's presence and, if the session has already
+/// started, re-delivers the start directive to it.
+///
+/// Broadcasts a `SlotPresent` to the session's mesh peers, records the slot into
+/// the session's live-slot set, and — when that completes the authority's expected
+/// set — delivers the `SessionStart` directive session-wide (every local slot plus
+/// every peer relay). If the session already started before this slot arrived (a
+/// late or reconnecting slot), pushes `SessionStart` straight down this slot's own
+/// control stream so it is not left waiting. A session run without descriptors (no
+/// maker, no expected set) does nothing here.
+pub fn announce_slot_present(
+    sessions: &Sessions,
+    decision_makers: &consensus::DecisionMakers,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+) {
+    // Tell every peer relay this slot is here, so the authority (wherever it is)
+    // can accumulate it toward the expected set.
+    crate::mesh::fan_out_slot_present(mesh_links, key, slot);
+    // Record it locally. On the authority, completing the expected set fires the
+    // directive session-wide; otherwise, if the session already started, this
+    // late slot still needs the directive pushed to it directly.
+    if consensus::note_slot_present(decision_makers, key, slot) {
+        deliver_session_start(sessions, mesh_links, key);
+    } else if consensus::session_started(decision_makers, key) {
+        deliver_session_start_to_slot(sessions, key, slot);
+    }
+}
+
 /// Fires the shutdown signal for each of `slots` in the `key` routing group, so
 /// each named slot's link task closes its connection and leaves — the coordinator's
 /// reap directive. A slot this relay does not currently hold (never homed it, or it
@@ -475,6 +599,7 @@ pub async fn run_slot_link(
     let SlotInbox {
         mut forward_rx,
         mut leave_push_rx,
+        mut start_push_rx,
         shutdown,
     } = inbox;
     // Cloned (cheap — every field is an `Arc`) before the destructure below
@@ -498,6 +623,15 @@ pub async fn run_slot_link(
     // report it and re-derive. The peers learn the new count from the mesh
     // drivers' presence reconcile, off the same roster.
     report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+
+    // Announce this slot's presence to the mesh and record it into the session's
+    // live-slot set. On the authority relay, this slot completing the descriptor's
+    // expected set fires the session-start directive to every slot (local and
+    // across the mesh); if the session already started before this slot arrived (a
+    // late or reconnecting slot), the directive is re-pushed straight to it. The
+    // roster already includes this slot (registration preceded this task), so
+    // `fan_out_session_start` reaches it too.
+    announce_slot_present(&sessions, &decision_makers, &mesh_links, &key, slot);
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -545,6 +679,10 @@ pub async fn run_slot_link(
     // roster while the slot is registered, so `None` is unreachable during the
     // loop; the flag disarms the branch defensively so a closed channel can't spin.
     let mut leave_push_alive = true;
+    // Mirrors `leave_push_alive` for the session-start push channel: it lives in
+    // the roster while the slot is registered, so `None` is unreachable during the
+    // loop; the flag disarms the branch defensively.
+    let mut start_push_alive = true;
     // Register this member for lobby fan-out now that its control stream is up:
     // it starts receiving other members' lobby commands, and — crucially — the
     // per-session replay log is snapshotted into `lobby_rx` under the lobby lock
@@ -733,6 +871,34 @@ pub async fn run_slot_link(
                     None => leave_push_alive = false,
                 }
             }
+            // The session-start directive for this client, to push down its
+            // reliable control stream. Fired session-wide when the authority
+            // decides every expected slot has connected, or re-pushed to this slot
+            // alone if it registered after the session already started. A write
+            // failure ends the link like every other control-stream write here —
+            // the stream is dead regardless of which frame kind hit it.
+            pushed = start_push_rx.recv(), if start_push_alive => {
+                match pushed {
+                    Some(()) => {
+                        if let Err(error) =
+                            rally_point_transport::control::send_control_session_start(
+                                &mut control_send,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "session-start control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => start_push_alive = false,
+                }
+            }
             // A lobby command another member authored (or the replay of an earlier
             // one), to push down this client's reliable control stream. Like a
             // leave, it rides the reliable stream because a lobby has no datagram
@@ -881,6 +1047,17 @@ pub async fn run_slot_link(
                             session = key.session.0,
                             slot = slot.0,
                             "ignoring unexpected client-sent leave control frame",
+                        );
+                    }
+                    // Likewise the session-start directive is relay → client only;
+                    // a client never sends one up. Ignore a stray one, mirroring the
+                    // leave case above.
+                    Some(ControlInbound::SessionStart) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent session-start control frame",
                         );
                     }
                     // The client announcing its own clean departure. The
@@ -1310,6 +1487,10 @@ fn report_own_presence(
     if crate::presence::record_own(presence, key, live) {
         let leaves = crate::presence::recompute(presence, decision_makers, key);
         crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
+        // A recompute that promotes this relay to authority may make it the one
+        // to observe full slot presence: re-evaluate and fire the session-start
+        // directive if the accumulated live slots already cover the expected set.
+        maybe_start_session(sessions, decision_makers, mesh_links, key);
     }
 }
 
@@ -1513,6 +1694,7 @@ mod tests {
             &k,
             BufferBounds::new(0, 20).unwrap(),
             Authority::Peer,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
 

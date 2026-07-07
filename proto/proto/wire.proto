@@ -259,6 +259,16 @@ message ControlFrame {
     // `LobbyCommand`. Relay to client it is relay-stamped and authoritative,
     // naming WHICH member authored the text. See `GameChat`.
     GameChat game_chat = 6;
+
+    // The session-start directive (relay → client only): every slot the
+    // coordinator listed as expected has connected somewhere in the session's
+    // mesh, so the game may begin. The relay fans it to every local slot over
+    // the reliable stream the moment the session's authority relay observes full
+    // presence, replacing the tenant app server's out-of-band start signal. The
+    // client applies it idempotently -- the relay may deliver it more than once
+    // (a re-push on a late/reconnecting slot, a duplicate across an authority
+    // handoff). See `SessionStart`.
+    SessionStart session_start = 7;
   }
 }
 
@@ -577,6 +587,22 @@ message MeshControlFrame {
     // across the mesh: the origin already sent a copy to every link serving the
     // session, so re-flooding would only echo. See `GameChat`.
     GameChat game_chat = 6;
+
+    // One of the sending relay's home clients registered for the session — a
+    // slot-presence announcement. Every relay accumulates the reported slots
+    // into a per-session live-slot set; the session's authority relay fires the
+    // one `SessionStart` once that set covers the descriptor's expected slots. A
+    // duplicate (a re-announce on a redialed link) is idempotent — the set is a
+    // set. See `SlotPresent`.
+    SlotPresent slot_present = 7;
+
+    // The session-start directive the authority decided, propagated to the other
+    // relays so each fans it down its own local slots. A relay that receives this
+    // latches the session started (so its own late-registering slots still get
+    // it) and fans it to its local slots; it does not re-broadcast it across the
+    // mesh — the authority already sent it to every relay — so there is no echo.
+    // See `SessionStart`.
+    SessionStart session_start = 8;
   }
 }
 
@@ -648,4 +674,33 @@ message SlotDeparted {
   // The reporting slot's own newest observed frame when the result arrived.
   // Absent when there is no result, or the report predated any framed turn.
   optional uint32 result_slot_frame = 8;
+}
+
+// A relay's directive that a session may begin: every slot the coordinator
+// listed in `SessionDescriptor.expected_slots` (its players and observers) has
+// connected to some relay serving the session. The session's authority relay is
+// the one component that observes every client's dial + authentication — its own
+// registrations plus its peers' `SlotPresent` announcements — so it authors this
+// once the accumulated live-slot set covers the expected set, and it is fanned
+// to every client over the reliable control stream, replacing the tenant app
+// server's out-of-band start signal.
+//
+// Fieldless: the whole signal is "start". Identity is the connection (on the
+// client edge) or the framed session id (on the mesh). Delivered at least once —
+// a late or reconnecting slot is re-pushed on register, and an authority handoff
+// can re-fire — so the client dedups (applying it a second time is a no-op).
+message SessionStart {}
+
+// A relay's announcement to its mesh peers that one of its home clients has
+// registered for the session — its authenticated connection joined the relay's
+// roster. Carried in a `MeshControlFrame`. Every relay accumulates the reported
+// slots into a per-session live-slot set; the session's authority relay turns
+// full coverage of the descriptor's expected slots into the one `SessionStart`.
+// A duplicate (a re-announce on a redialed link) is idempotent — the accumulated
+// set is a set.
+message SlotPresent {
+  // The slot that registered, authoritative at its home relay (never a
+  // client-asserted value — the home relay binds it to the authenticated
+  // connection's token slot).
+  uint32 slot = 1;
 }

@@ -562,6 +562,25 @@ pub struct DecisionMaker {
     /// authority; reset wholesale on promotion (a real desync re-diverges every
     /// interval, so no state need transfer across a handoff).
     sync: SyncTracker,
+    /// The slots the coordinator expects to connect before the session may start
+    /// (every player and observer, from the session descriptor). Empty disables
+    /// the session-start directive — a session whose descriptor carried no
+    /// expected set (a standalone relay, a coordinator that predates the field)
+    /// never fires one. Descriptor-driven, so it survives authority changes
+    /// (like `observers`).
+    expected_slots: HashSet<SlotId>,
+    /// The slots this relay has seen registered anywhere in the session: its own
+    /// registered slots plus the ones peer relays reported via `SlotPresent`.
+    /// Every relay accumulates it (not just the authority) so a relay promoted
+    /// mid-startup can evaluate coverage against the fullest view. A slot's
+    /// departure removes it here, but the `started` latch, once set, stays set.
+    live_slots: HashSet<SlotId>,
+    /// Whether the session-start directive has been emitted for this session — a
+    /// one-shot latch. Set when the authority first sees `live_slots` cover
+    /// `expected_slots`, or when a peer relay's `SessionStart` arrives, so a set
+    /// re-covering after churn never re-fires and a late-registering local slot
+    /// still gets a re-push.
+    started: bool,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -1587,6 +1606,9 @@ impl DecisionMaker {
             observers,
             results: HashMap::new(),
             sync: SyncTracker::default(),
+            expected_slots: HashSet::new(),
+            live_slots: HashSet::new(),
+            started: false,
         }
     }
 
@@ -2548,6 +2570,11 @@ impl DecisionMaker {
         // complete on the survivors. Harmless on a non-authority relay (the
         // comparator is empty there) and idempotent for a slot never seen.
         self.sync.remove_member(slot);
+        // Drop it from the live-slot set too: a slot that left is no longer
+        // present. A start decision already made stays made (the `started` latch
+        // is untouched); this only keeps a not-yet-started session from counting a
+        // departed slot toward coverage.
+        self.live_slots.remove(&slot);
     }
 
     /// Removes a slot's condition history (the client disconnected). Called
@@ -2574,6 +2601,74 @@ impl DecisionMaker {
             self.sync.remove_member(*slot);
         }
         self.observers = observers;
+    }
+
+    /// Replaces the session's expected-slot set from the coordinator descriptor —
+    /// the slots that must connect before the session may start. Descriptor-driven
+    /// like [`set_observers`](Self::set_observers): the first descriptor seeds it,
+    /// a later one carrying a changed set replaces it. Never clears the `started`
+    /// latch: a session that already started stays started even if a re-push
+    /// reshaped the expected set.
+    pub fn set_expected_slots(&mut self, expected: HashSet<SlotId>) {
+        self.expected_slots = expected;
+    }
+
+    /// Records that `slot` is present — registered on some relay serving the
+    /// session (this relay's own roster, or a peer's `SlotPresent`) — and returns
+    /// whether the session-start directive should now be emitted session-wide.
+    ///
+    /// The live-slot set accumulates on every relay so a mid-startup promotion can
+    /// evaluate coverage, but only the **authority** returns `true`, and only
+    /// once: when the expected set is non-empty and the accumulated live slots
+    /// cover it, this latches `started` and returns `true`. A slot arriving on a
+    /// non-authority relay, before coverage, or after the latch is set returns
+    /// `false`.
+    #[must_use]
+    pub fn note_slot_present(&mut self, slot: SlotId) -> bool {
+        self.live_slots.insert(slot);
+        self.maybe_start()
+    }
+
+    /// Re-evaluates the start condition without a new presence report — the
+    /// authority-churn path. A relay just promoted to `SelfRelay` may already hold
+    /// a covering live-slot set (accumulated while it was a peer), so it fires the
+    /// directive the previous authority never got to. Same one-shot latch as
+    /// [`note_slot_present`](Self::note_slot_present); returns `false` on a
+    /// non-authority relay, before coverage, or once already started.
+    #[must_use]
+    pub fn reevaluate_start(&mut self) -> bool {
+        self.maybe_start()
+    }
+
+    /// Latches the session started without firing — used when a peer relay's
+    /// `SessionStart` arrives, so this relay's own late-registering local slots
+    /// still get a re-push even though it never made the decision itself. A relay
+    /// that receives the directive fans it to its current local slots separately;
+    /// this only records that the session has begun.
+    pub fn mark_started(&mut self) {
+        self.started = true;
+    }
+
+    /// Whether the session-start directive has already been emitted — the guard a
+    /// relay checks to re-push it to a slot that registers after start.
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
+    /// The one-shot start decision: fires (latching `started`, returning `true`)
+    /// exactly when this relay is the authority, the expected set is non-empty,
+    /// and the accumulated live slots cover it. Every other case returns `false`
+    /// and changes nothing.
+    fn maybe_start(&mut self) -> bool {
+        if self.started || self.authority != Authority::SelfRelay || self.expected_slots.is_empty()
+        {
+            return false;
+        }
+        if self.expected_slots.is_subset(&self.live_slots) {
+            self.started = true;
+            return true;
+        }
+        false
     }
 
     /// Feeds one turn's commands into the desync comparator, returning a
@@ -3038,6 +3133,7 @@ pub fn sync_maker(
     bounds: BufferBounds,
     authority: Authority,
     observers: HashSet<SlotId>,
+    expected_slots: HashSet<SlotId>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let (leaves, fresh) = {
@@ -3046,16 +3142,22 @@ pub fn sync_maker(
             Entry::Occupied(mut existing) => {
                 let maker = existing.get_mut();
                 maker.set_observers(observers);
+                maker.set_expected_slots(expected_slots);
                 maker.sync(bounds, authority)
             }
             Entry::Vacant(vacant) => {
-                vacant.insert(DecisionMaker::new(
+                let maker = vacant.insert(DecisionMaker::new(
                     key.clone(),
                     bounds,
                     ControlLaw::default(),
                     authority,
                     observers,
                 ));
+                // Seed the expected-slot set as part of creation — a maker created
+                // by this descriptor starts with it, so a single-relay session (one
+                // push, before any client dials) never loses it, exactly as the
+                // observer set is seeded above.
+                maker.set_expected_slots(expected_slots);
                 (Vec::new(), Vec::new())
             }
         }
@@ -3064,6 +3166,53 @@ pub fn sync_maker(
         registry.notify_departure(departure_notice(registry, key, leave));
     }
     leaves
+}
+
+/// Records that `slot` is present for `key` — registered on some relay serving
+/// the session — and returns whether the session-start directive should now be
+/// emitted session-wide (fanned to every local slot and broadcast across the
+/// mesh). Only the authority relay ever returns `true`, and only once the
+/// accumulated live slots cover the descriptor's expected set (see
+/// [`DecisionMaker::note_slot_present`]). A no-op returning `false` when no maker
+/// exists (a session this relay does not serve, or one run without descriptors).
+#[must_use]
+pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_some_and(|maker| maker.note_slot_present(slot))
+}
+
+/// Re-evaluates `key`'s session-start condition after an authority change,
+/// returning whether the directive should now fire — the authority-churn path
+/// ([`DecisionMaker::reevaluate_start`]). A relay just promoted to authority may
+/// already hold a covering live-slot set. A no-op returning `false` when no maker
+/// exists.
+#[must_use]
+pub fn reevaluate_session_start(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_some_and(|maker| maker.reevaluate_start())
+}
+
+/// Whether `key`'s session-start directive has already been emitted — the guard
+/// a relay checks to re-push it to a slot that registers after start. `false`
+/// when no maker exists.
+pub fn session_started(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(DecisionMaker::is_started)
+}
+
+/// Latches `key`'s session started without firing — used when a peer relay's
+/// `SessionStart` arrives over the mesh, so this relay's own late-registering
+/// local slots still get a re-push. A no-op when no maker exists.
+pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.mark_started();
+    }
 }
 
 /// Applies a fresh authority verdict to a session's decision-maker, if the
@@ -4387,6 +4536,7 @@ mod tests {
             bounds(0, 5),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         {
             let makers = registry.lock();
@@ -4403,6 +4553,7 @@ mod tests {
             bounds(0, 99),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -4427,6 +4578,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         {
             let mut makers = registry.lock();
@@ -4441,6 +4593,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         assert_eq!(
             active_directive(&registry, &k),
@@ -4465,6 +4618,7 @@ mod tests {
             bounds(0, 5),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
@@ -4502,6 +4656,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4542,6 +4697,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4581,6 +4737,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -4611,6 +4768,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         record_departure(
@@ -4661,6 +4819,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -4694,6 +4853,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -4723,6 +4883,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -4761,6 +4922,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         registry.set_session_refs(
             &k,
@@ -4800,6 +4962,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -4835,6 +4998,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4881,6 +5045,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4924,6 +5089,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4948,6 +5114,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -4981,6 +5148,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5026,6 +5194,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5073,6 +5242,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5101,6 +5271,7 @@ mod tests {
             bounds(0, 20),
             Authority::Peer,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
@@ -5187,6 +5358,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -5216,6 +5388,7 @@ mod tests {
             bounds(0, 20),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -6201,6 +6374,7 @@ mod tests {
             bounds(0, 6),
             Authority::SelfRelay,
             HashSet::from([SlotId(2)]),
+            std::collections::HashSet::new(),
         );
         assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -6230,6 +6404,140 @@ mod tests {
             "the observer never joins the compare set",
         );
         assert!(!m.sync.dormant, "the compared survivors keep being watched");
+    }
+
+    // -- Relay-driven session start --
+
+    #[test]
+    fn session_start_fires_once_when_live_slots_cover_expected() {
+        // A single-relay session: the descriptor lists three expected slots, the
+        // relay is the authority, and slots register one at a time.
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(0), SlotId(1), SlotId(2)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            expected,
+        );
+
+        // No directive until the last expected slot completes the set.
+        assert!(!note_slot_present(&registry, &k, SlotId(0)));
+        assert!(!note_slot_present(&registry, &k, SlotId(1)));
+        assert!(
+            !session_started(&registry, &k),
+            "not yet — slot 2 is missing"
+        );
+        assert!(
+            note_slot_present(&registry, &k, SlotId(2)),
+            "the last expected slot fires the directive exactly once",
+        );
+        assert!(session_started(&registry, &k));
+
+        // Churn after start never re-fires: a re-announce, or a slot not in the
+        // expected set, returns false and the latch stays set.
+        assert!(!note_slot_present(&registry, &k, SlotId(2)));
+        assert!(!note_slot_present(&registry, &k, SlotId(5)));
+        assert!(session_started(&registry, &k));
+    }
+
+    #[test]
+    fn empty_expected_slots_never_fires_session_start() {
+        // A descriptor without an expected set (the feature off, or a coordinator
+        // that predates it): no amount of presence triggers a directive.
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+        );
+        assert!(!note_slot_present(&registry, &k, SlotId(0)));
+        assert!(!note_slot_present(&registry, &k, SlotId(1)));
+        assert!(!session_started(&registry, &k));
+    }
+
+    #[test]
+    fn a_non_authority_accumulates_presence_and_fires_on_promotion() {
+        // A peer relay records presence but never decides; a promotion re-evaluates
+        // and fires the directive the previous authority never got to (point:
+        // authority churn during startup).
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::Peer,
+            HashSet::new(),
+            expected,
+        );
+
+        // Both expected slots register, but a peer relay never fires.
+        assert!(!note_slot_present(&registry, &k, SlotId(0)));
+        assert!(!note_slot_present(&registry, &k, SlotId(1)));
+        assert!(!session_started(&registry, &k));
+
+        // Promote it: the accumulated live slots already cover the expected set,
+        // so the re-evaluation fires now — and only once.
+        let _ = set_authority(&registry, &k, Authority::SelfRelay);
+        assert!(reevaluate_session_start(&registry, &k));
+        assert!(session_started(&registry, &k));
+        assert!(!reevaluate_session_start(&registry, &k));
+    }
+
+    #[test]
+    fn a_departure_uncovers_a_not_yet_started_session() {
+        // A slot that connects then leaves before everyone is present no longer
+        // counts toward coverage; the start waits for the full set again.
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            expected,
+        );
+        assert!(!note_slot_present(&registry, &k, SlotId(0)));
+        // Slot 0 departs, retiring it from the live-slot set.
+        record_departure(&registry, &k, SlotId(0), None, None, None, DROPPED);
+        // Slot 1 arrives: coverage is still incomplete (slot 0 left), so no fire.
+        assert!(!note_slot_present(&registry, &k, SlotId(1)));
+        assert!(!session_started(&registry, &k));
+    }
+
+    #[test]
+    fn mark_session_started_latches_without_firing() {
+        // A non-authority relay that receives a peer's SessionStart latches the
+        // session started (so its own late slots get re-pushed) without ever
+        // deciding one itself.
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::Peer,
+            HashSet::new(),
+            expected,
+        );
+        assert!(!session_started(&registry, &k));
+        mark_session_started(&registry, &k);
+        assert!(session_started(&registry, &k));
+        // Even a later promotion never re-fires: the latch is already set.
+        let _ = set_authority(&registry, &k, Authority::SelfRelay);
+        assert!(!reevaluate_session_start(&registry, &k));
     }
 
     #[test]
@@ -6790,6 +7098,7 @@ mod tests {
             bounds(0, 6),
             Authority::SelfRelay,
             HashSet::new(),
+            std::collections::HashSet::new(),
         );
         registry.set_session_refs(
             &k,

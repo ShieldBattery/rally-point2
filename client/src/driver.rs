@@ -238,6 +238,13 @@ pub struct TurnChannels {
     /// a member whose stream comes up after a message already flowed simply
     /// never sees it.
     pub chat_in: mpsc::Receiver<(SlotId, ChatOut)>,
+    /// The relay-driven session-start directive, delivered once every expected
+    /// slot has connected somewhere in the session's mesh. The driver forwards a
+    /// unit here each time the relay pushes a `SessionStart` down the reliable
+    /// control stream; the game begins on the first and treats any repeat as a
+    /// no-op (the relay may re-deliver on a late slot's register or an authority
+    /// handoff). Fieldless — the whole signal is that it arrived.
+    pub session_start: mpsc::Receiver<()>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -272,6 +279,9 @@ pub struct LinkDriver {
     /// Chat messages other members authored (relay-stamped with their author
     /// slot), to hand to the game thread.
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    /// The relay-driven session-start directive, to hand to the game thread when
+    /// the relay pushes a `SessionStart` down the control stream.
+    session_start: mpsc::Sender<()>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -333,6 +343,9 @@ impl LinkDriver {
         // Chat flows in both directions for the whole game, unlike lobby.
         let (chat_out_tx, chat_out_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
         let (chat_in_tx, chat_in_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        // The session-start directive arrives at most a handful of times (the
+        // fire, plus any re-push on late register or authority handoff).
+        let (session_start_tx, session_start_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
         let driver = Self {
             link,
             outbound: outbound_rx,
@@ -345,6 +358,7 @@ impl LinkDriver {
             lobby_in: lobby_in_tx,
             chat_out: chat_out_rx,
             chat_in: chat_in_tx,
+            session_start: session_start_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -357,6 +371,7 @@ impl LinkDriver {
             lobby_in: lobby_in_rx,
             chat_out: chat_out_tx,
             chat_in: chat_in_rx,
+            session_start: session_start_rx,
         };
         (driver, channels)
     }
@@ -391,6 +406,7 @@ impl LinkDriver {
             lobby_in,
             mut chat_out,
             chat_in,
+            session_start,
         } = self;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -639,6 +655,16 @@ impl LinkDriver {
                                 text: chat.text,
                             };
                             if chat_in.send((SlotId(slot_id), out)).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        // The relay-driven session-start directive: every expected
+                        // slot has connected, so the game may begin. Hand it to the
+                        // game thread; a repeat (a re-push on late register or an
+                        // authority handoff) is idempotent for the game. Dropping it
+                        // (game gone) is a clean shutdown.
+                        Some(ControlInbound::SessionStart) => {
+                            if session_start.send(()).await.is_err() {
                                 return Ok(());
                             }
                         }

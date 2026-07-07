@@ -282,8 +282,20 @@ impl MeshControl {
             descriptor.bounds,
             authority,
             descriptor.observer_slots.iter().copied().collect(),
+            descriptor.expected_slots.iter().copied().collect(),
         );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
+        // A descriptor push that promotes this relay to authority (the
+        // coordinator dropped the former authority from the order) may make this
+        // relay the one to observe full slot presence — re-evaluate and fire the
+        // session-start directive if the accumulated live slots already cover the
+        // expected set.
+        crate::routing::maybe_start_session(
+            &self.sessions,
+            &self.decision_makers,
+            &self.mesh_links,
+            &key,
+        );
 
         let mut inner = self.inner.lock();
 
@@ -484,6 +496,7 @@ mod tests {
             external_id: None,
             slot_refs: vec![],
             observer_slots: vec![],
+            expected_slots: vec![],
         }
     }
 

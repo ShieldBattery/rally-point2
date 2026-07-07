@@ -72,6 +72,12 @@ pub struct SessionRefs {
     /// excludes them. Recorded here, alongside the correlation ids, so it
     /// survives the same restart/persistence paths those do.
     pub observers: Vec<SlotId>,
+    /// Every slot the request listed — players and observers alike. Carried into
+    /// every relay's [`SessionDescriptor::expected_slots`] so the session's
+    /// authority relay knows the full set that must connect before it fires the
+    /// session-start directive. Recorded here, alongside the other correlation
+    /// state, so it survives the same restart/persistence paths.
+    pub expected: Vec<SlotId>,
 }
 
 use std::sync::Arc;
@@ -278,6 +284,7 @@ pub fn create_session(
             .filter(|p| p.observer)
             .map(|p| p.slot)
             .collect(),
+        expected: request.players.iter().map(|p| p.slot).collect(),
     };
     setup
         .session_refs
@@ -388,6 +395,7 @@ pub fn descriptor_for(
             .map(|(slot, external_ref)| SlotExternalRef { slot, external_ref })
             .collect(),
         observer_slots: refs.observers,
+        expected_slots: refs.expected,
     })
 }
 
@@ -911,6 +919,12 @@ mod tests {
             vec![SlotId(1)],
             "the observer-flagged slot is carried into the descriptor",
         );
+        // Every slot the request listed — the competitor and the observer alike —
+        // is carried as an expected slot so the authority relay knows the full set
+        // that must connect before it fires the session-start directive.
+        let mut expected = desc.expected_slots.clone();
+        expected.sort_by_key(|s| s.0);
+        assert_eq!(expected, vec![SlotId(0), SlotId(1)]);
     }
 
     #[test]
@@ -943,6 +957,11 @@ mod tests {
             desc.observer_slots.is_empty(),
             "no observer-flagged players -> empty observer_slots",
         );
+        // Expected slots track the request's players even when no correlation ids
+        // were sent: the two competitors must both connect before start.
+        let mut expected = desc.expected_slots.clone();
+        expected.sort_by_key(|s| s.0);
+        assert_eq!(expected, vec![SlotId(0), SlotId(1)]);
     }
 
     #[test]

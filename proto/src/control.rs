@@ -492,6 +492,17 @@ pub struct SessionDescriptor {
     /// descriptor from a coordinator that predates the field.
     #[serde(default)]
     pub observer_slots: Vec<SlotId>,
+    /// The slots the coordinator expects to connect before the session may
+    /// start — every player and observer in the [`SessionRequest`]. The
+    /// session's authority relay accumulates the slots that have registered
+    /// anywhere in the mesh (its own plus peers' presence announcements) and,
+    /// once they cover this set, emits the one session-start directive to every
+    /// client — the relay-driven replacement for an out-of-band start signal.
+    /// Empty disables the feature: a descriptor from a coordinator that predates
+    /// the field (or a session that opts out) never triggers a start directive,
+    /// exactly like `observer_slots`. Defaults empty for backward compatibility.
+    #[serde(default)]
+    pub expected_slots: Vec<SlotId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +913,7 @@ mod tests {
                 external_id: None,
                 slot_refs: vec![],
                 observer_slots: vec![],
+                expected_slots: vec![],
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -1020,6 +1032,7 @@ mod tests {
                 external_ref: "sb-user-7".to_owned(),
             }],
             observer_slots: vec![SlotId(1)],
+            expected_slots: vec![SlotId(0), SlotId(1)],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
@@ -1041,11 +1054,13 @@ mod tests {
             external_id: None,
             slot_refs: vec![],
             observer_slots: vec![],
+            expected_slots: vec![],
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("external_id"));
         assert!(json.contains("\"slot_refs\":[]"));
         assert!(json.contains("\"observer_slots\":[]"));
+        assert!(json.contains("\"expected_slots\":[]"));
     }
 
     #[test]
@@ -1077,6 +1092,27 @@ mod tests {
             "a descriptor that predates the observer field decodes to no \
              observer_slots, not a decode error",
         );
+        assert!(
+            back.expected_slots.is_empty(),
+            "a descriptor that predates the expected-slots field decodes to no \
+             expected_slots, not a decode error — the start directive is simply off",
+        );
+    }
+
+    #[test]
+    fn session_descriptor_with_expected_slots_decodes_the_set() {
+        // A descriptor from a coordinator that carries the expected-slot set:
+        // every player and observer that must connect before the session starts
+        // decodes back verbatim, so the relay's authority can size its coverage
+        // check against it.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6},
+            "expected_slots":[0,1,2]
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(back.expected_slots, vec![SlotId(0), SlotId(1), SlotId(2)]);
     }
 
     #[test]

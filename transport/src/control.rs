@@ -25,7 +25,7 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    control_frame,
+    SessionStart, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -74,6 +74,11 @@ pub enum ControlInbound {
     /// surfaced so both directions can read `slot`, `target_kind`, and
     /// `target_slot`.
     Chat(GameChat),
+    /// The relay-driven session-start directive (relay → client only): every
+    /// expected slot has connected, so the game may begin. A relay never receives
+    /// this from a client, so the relay edge ignores a stray one just as it does a
+    /// `Leave`. Fieldless — its whole meaning is that it arrived.
+    SessionStart,
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -177,6 +182,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::GameChat(chat)),
                 } => ControlInbound::Chat(chat),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
+                } => ControlInbound::SessionStart,
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -297,6 +305,22 @@ pub async fn send_control_chat(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameChat(chat)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Pushes the session-start directive down the control stream (relay → client).
+/// Reliable and un-redundant like a leave: an error means the stream is gone,
+/// which the caller treats as that client having left. The relay may send it
+/// more than once (a re-push on a late slot, an authority handoff); the client
+/// dedups, so a repeat costs only a frame.
+pub async fn send_control_session_start(
+    control_send: &mut quinn::SendStream,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

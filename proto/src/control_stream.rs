@@ -331,6 +331,51 @@ mod tests {
     }
 
     #[test]
+    fn session_start_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::SessionStart;
+
+        // The relay-driven session-start directive rides the client-edge control
+        // frame — fieldless, its whole meaning is the frame kind.
+        let frame = ControlFrame {
+            kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
+
+        // And it rides the mesh control frame the same way, for the authority's
+        // cross-relay broadcast.
+        let mesh = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {})),
+        };
+        let encoded = encode_frame(&mesh).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, mesh);
+    }
+
+    #[test]
+    fn slot_present_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::SlotPresent;
+
+        // A slot-presence announcement rides only the mesh control frame — it is
+        // relay ↔ relay, never sent to a client.
+        let mesh = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::SlotPresent(SlotPresent {
+                slot: 3,
+            })),
+        };
+        let encoded = encode_frame(&mesh).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, mesh);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::SlotPresent(sp)) => assert_eq!(sp.slot, 3),
+            other => panic!("expected SlotPresent, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unknown_mesh_control_kind_decodes_with_the_oneof_unset() {
         // The empty establishment/keepalive frame (and any future kind a peer
         // predates) decodes with kind = None so the reader skips it.
