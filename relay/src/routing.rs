@@ -1513,6 +1513,7 @@ mod tests {
             &k,
             BufferBounds::new(0, 20).unwrap(),
             Authority::Peer,
+            std::collections::HashSet::new(),
         );
 
         // A local client to fan out to.

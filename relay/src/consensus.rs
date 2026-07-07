@@ -1559,11 +1559,15 @@ impl DecisionMaker {
     /// Creates a new decision-maker for `key`, starting at the coordinator's
     /// minimum buffer. `authority` is the injected input: `SelfRelay` to run
     /// the decision core, `Peer` to forward conditions without deciding.
+    /// `observers` is the descriptor's observer-slot set: a maker created by a
+    /// descriptor starts with that set, so those slots are never required
+    /// reporters in the desync comparator from the maker's first turn onward.
     pub fn new(
         key: SessionKey,
         bounds: BufferBounds,
         law: ControlLaw,
         authority: Authority,
+        observers: HashSet<SlotId>,
     ) -> Self {
         Self {
             key,
@@ -1580,7 +1584,7 @@ impl DecisionMaker {
             decided_leaves: HashMap::new(),
             departures: HashMap::new(),
             next_leave_seq: 0,
-            observers: HashSet::new(),
+            observers,
             results: HashMap::new(),
             sync: SyncTracker::default(),
         }
@@ -2558,11 +2562,13 @@ impl DecisionMaker {
         self.slots.remove(&slot);
     }
 
-    /// Sets the session's observer slots (from the coordinator descriptor),
-    /// replacing whatever was recorded before. Any newly-observer slot is dropped
-    /// from the desync compare set — an observer must never be a required
-    /// reporter. Called on every descriptor apply, so a changed observer set
-    /// replaces rather than accumulates.
+    /// Replaces the session's observer slots (from the coordinator descriptor)
+    /// on a re-push, dropping any newly-observer slot from the desync compare
+    /// set — an observer must never be a required reporter. The first descriptor
+    /// seeds the observer set at maker creation instead (see
+    /// [`DecisionMaker::new`]); this re-applies it when a later descriptor
+    /// carries a changed set, so the observer set follows the descriptor rather
+    /// than accumulating.
     pub fn set_observers(&mut self, observers: HashSet<SlotId>) {
         for slot in &observers {
             self.sync.remove_member(*slot);
@@ -3012,6 +3018,13 @@ fn now_ms() -> u64 {
 /// a frozen verdict could leave a session with two authorities or none.
 /// Condition history survives a re-push (see [`DecisionMaker::sync`]).
 ///
+/// `observers` is the descriptor's observer-slot set, applied as part of maker
+/// creation/sync rather than through a separately-ordered call: a maker created
+/// by this descriptor starts with that set (so its observer slots are excluded
+/// from the desync comparator from the first turn — a single-relay session that
+/// only ever receives one push therefore never loses them), and an existing
+/// maker has its set replaced to follow a changed descriptor.
+///
 /// A promotion can *freshly derive* a leave for a departure no relay ever
 /// cached before (the directive never escaped the dead authority) -- that is
 /// as much a first insert into this relay's cache as `decide_leave`/
@@ -3024,18 +3037,24 @@ pub fn sync_maker(
     key: &SessionKey,
     bounds: BufferBounds,
     authority: Authority,
+    observers: HashSet<SlotId>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let (leaves, fresh) = {
         let mut makers = registry.lock();
         match makers.entry(key.clone()) {
-            Entry::Occupied(mut existing) => existing.get_mut().sync(bounds, authority),
+            Entry::Occupied(mut existing) => {
+                let maker = existing.get_mut();
+                maker.set_observers(observers);
+                maker.sync(bounds, authority)
+            }
             Entry::Vacant(vacant) => {
                 vacant.insert(DecisionMaker::new(
                     key.clone(),
                     bounds,
                     ControlLaw::default(),
                     authority,
+                    observers,
                 ));
                 (Vec::new(), Vec::new())
             }
@@ -3280,15 +3299,6 @@ pub fn observe_turn_frame(
     }
 }
 
-/// Records the session's observer slots (from the coordinator descriptor) into
-/// the decision-maker, if the relay has one. Excludes them from the desync
-/// comparator. A no-op when no maker exists. Called on every descriptor apply.
-pub fn set_observers(registry: &DecisionMakers, key: &SessionKey, observers: HashSet<SlotId>) {
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.set_observers(observers);
-    }
-}
-
 /// Feeds one forwarded turn's commands into the session's desync comparator, if
 /// the relay has a maker, and fires a [`DesyncNotice`] up the coordinator
 /// connection when a divergence is confirmed. Called at the same turn choke
@@ -3507,7 +3517,13 @@ mod tests {
     /// At 150ms RTT, 0% loss: target == ceil(150000/41666.67) + 0 = 4.
     #[test]
     fn target_at_150ms_zero_loss() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(4));
     }
@@ -3516,7 +3532,13 @@ mod tests {
     /// Separated: ceil(150000/41666.67) + ceil(7500/41666.67) = 4 + 1 = 5.
     #[test]
     fn target_loss_recovery_is_quantized_to_whole_turns() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         let _ = ingest_at(&mut maker, &conditions(0, 150_000, 5, 200), 2);
         assert_eq!(maker.target(), Some(5));
@@ -3525,7 +3547,13 @@ mod tests {
     /// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.
     #[test]
     fn target_at_low_latency() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(2));
     }
@@ -3534,7 +3562,13 @@ mod tests {
     /// gives 1 for any positive RTT -- no separate floor.
     #[test]
     fn target_floor_falls_out_of_ceil() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
         assert_eq!(maker.target(), Some(1));
     }
@@ -3542,7 +3576,13 @@ mod tests {
     /// No RTT measurement (rtt_us == 0): target is None (hold).
     #[test]
     fn target_none_when_no_rtt() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 0, 0, 100), 1);
         assert_eq!(maker.target(), None);
     }
@@ -3552,7 +3592,13 @@ mod tests {
     /// Two slots at 100ms and 200ms: path = (200000 + 100000) / 2 = 150000.
     #[test]
     fn worst_pair_path_uses_two_highest_rtts() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(
             &mut maker,
             &multi_conditions(&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]),
@@ -3564,7 +3610,13 @@ mod tests {
     /// One outlier at 300ms, rest at 20ms: path = (300000 + 20000) / 2 = 160000.
     #[test]
     fn single_outlier_does_not_over_provision() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(
             &mut maker,
             &multi_conditions(&[
@@ -3582,7 +3634,13 @@ mod tests {
     /// A remote slot's effective RTT includes the mesh hop.
     #[test]
     fn mesh_hop_increases_target_for_cross_relay_paths() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
         ingest_remote_at(&mut maker, &conditions(1, 50_000, 0, 100), 100_000, 2);
         // eff_local = 50000, eff_remote = 150000.
@@ -3593,7 +3651,13 @@ mod tests {
     /// Without the mesh hop, two 50ms slots would give target 2.
     #[test]
     fn mesh_hop_adds_turns_above_same_relay_baseline() {
-        let mut local = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut local = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(
             &mut local,
             &multi_conditions(&[(0, 50_000, 0, 100), (1, 50_000, 0, 100)]),
@@ -3601,7 +3665,13 @@ mod tests {
         );
         let local_target = local.target().unwrap();
 
-        let mut meshed = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut meshed = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut meshed, &conditions(0, 50_000, 0, 100), 1);
         ingest_remote_at(&mut meshed, &conditions(1, 50_000, 0, 100), 100_000, 2);
         let meshed_target = meshed.target().unwrap();
@@ -3614,12 +3684,24 @@ mod tests {
     /// Same 20% loss on 50ms vs 300ms: the high-latency link needs more turns.
     #[test]
     fn loss_on_high_latency_link_adds_more_turns() {
-        let mut low = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut low = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut low, &conditions(0, 50_000, 0, 100), 1);
         ingest_at(&mut low, &conditions(0, 50_000, 20, 200), 2);
         let low_target = low.target().unwrap();
 
-        let mut high = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut high = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut high, &conditions(0, 300_000, 0, 100), 1);
         ingest_at(&mut high, &conditions(0, 300_000, 20, 200), 2);
         let high_target = high.target().unwrap();
@@ -3634,7 +3716,13 @@ mod tests {
     /// The decision-maker uses the recent max RTT, not the smoothed mean.
     #[test]
     fn jitter_uses_recent_max_rtt() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         for frame in 1..=4 {
             ingest_at(&mut maker, &conditions(0, 100_000, 0, 100), frame);
         }
@@ -3646,13 +3734,25 @@ mod tests {
     /// Without the spike, the target would be lower.
     #[test]
     fn jitter_spike_raises_target_above_baseline() {
-        let mut spiky = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut spiky = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         for frame in 1..=4 {
             ingest_at(&mut spiky, &conditions(0, 100_000, 0, 100), frame);
         }
         ingest_at(&mut spiky, &conditions(0, 200_000, 0, 100), 5);
 
-        let mut stable = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut stable = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         for frame in 1..=5 {
             ingest_at(&mut stable, &conditions(0, 100_000, 0, 100), frame);
         }
@@ -3665,7 +3765,13 @@ mod tests {
     /// Raise jumps to the target immediately, not incrementally.
     #[test]
     fn raise_jumps_to_target() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
         assert_eq!(maker.buffer(), BufferSize(4));
@@ -3676,7 +3782,13 @@ mod tests {
     fn lower_decrements_by_one_step() {
         let mut maker = DecisionMaker {
             buffer: BufferSize(5),
-            ..DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay)
+            ..DecisionMaker::new(
+                key(),
+                bounds(0, 20),
+                law(),
+                Authority::SelfRelay,
+                HashSet::new(),
+            )
         };
         let d = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
@@ -3689,7 +3801,13 @@ mod tests {
     /// through a stall. A lower is suppressed until the dwell elapses.
     #[test]
     fn raise_fires_immediately_lower_gated_by_dwell() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // 150ms -> target 4. Raise to 4 at frame 1.
         let d1 = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d1.unwrap().buffer, BufferSize(4));
@@ -3729,7 +3847,13 @@ mod tests {
     /// holds (lowers suppressed) through the dwell.
     #[test]
     fn anti_flap_raises_on_worsening_holds_on_improvement() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // 150ms -> target 4. Raise to 4 at frame 1.
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(4));
@@ -3755,7 +3879,13 @@ mod tests {
     /// Target exceeds max -> clamped to max.
     #[test]
     fn raise_clamps_to_max() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 3), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 3),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let d = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(3));
         assert_eq!(maker.buffer(), BufferSize(3));
@@ -3766,7 +3896,13 @@ mod tests {
     fn lower_clamps_to_min() {
         let mut maker = DecisionMaker {
             buffer: BufferSize(3),
-            ..DecisionMaker::new(key(), bounds(2, 20), law(), Authority::SelfRelay)
+            ..DecisionMaker::new(
+                key(),
+                bounds(2, 20),
+                law(),
+                Authority::SelfRelay,
+                HashSet::new(),
+            )
         };
         let d = ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(2));
@@ -3778,7 +3914,8 @@ mod tests {
     /// A non-authority relay ingests conditions but makes no decision.
     #[test]
     fn non_authority_ingests_but_does_not_decide() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(d, None, "non-authority makes no decision");
         assert_eq!(maker.session_frame(), Some(GameFrameCount(1)));
@@ -3792,7 +3929,13 @@ mod tests {
     /// Each slot's own observation is monotonic.
     #[test]
     fn session_frame_is_the_minimum_across_slots() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         assert_eq!(maker.session_frame(), None, "no framed turn yet");
 
         maker.observe_frame(SlotId(0), GameFrameCount(10));
@@ -3823,7 +3966,13 @@ mod tests {
     /// dwell clock are unaffected by a hostile client's `game_frame_count`.
     #[test]
     fn an_inflated_frame_claim_does_not_move_the_session_frame() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(100));
         maker.observe_frame(SlotId(1), GameFrameCount(u32::MAX));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(100)));
@@ -3839,7 +3988,13 @@ mod tests {
     /// with the cushion) plus the fixed delivery margin.
     #[test]
     fn applied_frame_is_a_buffer_spanned_horizon_ahead() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Raise 0 -> 4 at frame 50: span = max(0, 4) = 4.
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 50).unwrap();
         assert_eq!(d.applied_frame, GameFrameCount(50 + 4 + APPLY_HORIZON));
@@ -3851,7 +4006,13 @@ mod tests {
     /// A stale sidecar (non-monotonic counters) produces no negative loss.
     #[test]
     fn stale_sidecar_no_spurious_loss() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 50), 2);
         assert_eq!(maker.target(), Some(4));
@@ -3862,7 +4023,13 @@ mod tests {
     /// Raises fire immediately; the lower waits for the dwell.
     #[test]
     fn lossy_then_clean_interval_drops_target() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Baseline at frame 1 (raises to 4, sets the dwell clock).
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
 
@@ -3891,7 +4058,13 @@ mod tests {
     /// is applied (or moot) everywhere.
     #[test]
     fn a_directive_is_stamped_until_the_session_passes_its_apply_frame() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // No decision yet: nothing to stamp.
         assert_eq!(maker.active_directive(), None);
 
@@ -3922,7 +4095,13 @@ mod tests {
     /// stalled slot is back and past the apply frame.
     #[test]
     fn a_directive_outlives_a_one_sided_stall() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(10));
         maker.observe_frame(SlotId(1), GameFrameCount(10));
         // Slot 1's link degrades (300ms): raise to 8, applied at 10 + 8 + 3.
@@ -3945,7 +4124,13 @@ mod tests {
     /// higher `decision_seq` is what lets clients rank interleaved copies.
     #[test]
     fn a_new_decision_supersedes_a_still_broadcasting_one() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         let first = maker.active_directive().expect("the first raise queues");
         assert_eq!(first.buffer_turns, 4);
@@ -3967,7 +4152,8 @@ mod tests {
     /// stamp -- it only forwards the authority's already-stamped turns.
     #[test]
     fn a_non_authority_never_stamps_a_directive() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         // It ingests conditions (and would compute a target) but makes no decision.
         ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 1);
         assert!(maker.target().is_some(), "it still tracks conditions");
@@ -3978,7 +4164,13 @@ mod tests {
     /// no directive -- only an actual buffer change is broadcast.
     #[test]
     fn a_held_decision_queues_no_directive() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Raise to 4, then let the session pass the apply frame so the
         // directive retires and nothing is pending.
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
@@ -4003,7 +4195,13 @@ mod tests {
     /// the target sits at the minimum. It fires exactly once.
     #[test]
     fn the_first_framed_turn_broadcasts_the_current_buffer_when_the_law_holds() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // A framed turn with no RTT measurement (rtt_us = 0): the law has no
         // target and holds, so the unconditional initial broadcast fires.
         let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 5).expect("initial directive");
@@ -4028,7 +4226,13 @@ mod tests {
     /// to schedule an apply against.
     #[test]
     fn no_initial_directive_before_the_first_framed_turn() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Conditions but no `observe_frame`: session_frame stays None.
         let d = maker.ingest_local(&conditions(0, 150_000, 0, 100));
         assert_eq!(d, None, "no broadcast without a framed turn");
@@ -4039,7 +4243,8 @@ mod tests {
     /// decisions at all, even once the session is framed.
     #[test]
     fn a_non_authority_broadcasts_no_initial_directive() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 5);
         assert_eq!(d, None, "a peer decides nothing");
         assert_eq!(maker.active_directive(), None);
@@ -4050,7 +4255,13 @@ mod tests {
     /// raise numbers as decision 1, not 2.
     #[test]
     fn a_first_turn_decision_serves_as_the_initial_broadcast() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
         assert_eq!(d.buffer, BufferSize(4));
         let stamp = maker.active_directive().expect("queued");
@@ -4066,7 +4277,8 @@ mod tests {
     /// rather than being slammed down to the minimum.
     #[test]
     fn promotion_re_affirms_the_committed_buffer() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         // As a peer it forwarded the authority's directive, tracking the committed
         // buffer (5) and its decision seq (7).
         maker.observe_directive(&BufferDirective {
@@ -4109,7 +4321,13 @@ mod tests {
     /// only when at least that much has elapsed since the last trace.
     #[test]
     fn the_input_trace_is_rate_limited_by_session_frame_progress() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // First framed turn with a target: the trace fires and records the frame.
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert_eq!(maker.last_trace_frame, Some(1));
@@ -4139,7 +4357,13 @@ mod tests {
     /// `remove_slot` clears a departing client's history.
     #[test]
     fn remove_slot_clears_history() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         assert!(maker.slots.contains_key(&SlotId(0)));
         assert!(maker.target().is_some());
@@ -4157,7 +4381,13 @@ mod tests {
     fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 5),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         {
             let makers = registry.lock();
             let maker = makers.get(&k).unwrap();
@@ -4167,7 +4397,13 @@ mod tests {
 
         // A lower-id relay joined the session: this relay is no longer the
         // authority, and the coordinator widened the bounds.
-        let _ = sync_maker(&registry, &k, bounds(0, 99), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 99),
+            Authority::Peer,
+            HashSet::new(),
+        );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
         assert_eq!(maker.bounds, bounds(0, 99), "bounds follow the descriptor");
@@ -4185,7 +4421,13 @@ mod tests {
     fn losing_authority_drops_the_pending_directive_but_keeps_history() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         {
             let mut makers = registry.lock();
             let maker = makers.get_mut(&k).unwrap();
@@ -4193,7 +4435,13 @@ mod tests {
         }
         assert!(active_directive(&registry, &k).is_some());
 
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
         assert_eq!(
             active_directive(&registry, &k),
             None,
@@ -4211,7 +4459,13 @@ mod tests {
     fn deregister_maker_removes_session() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 5), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 5),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
         assert!(!registry.lock().contains_key(&k));
@@ -4242,7 +4496,13 @@ mod tests {
     fn decide_leave_fires_one_departure_notice_on_the_authority() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4276,7 +4536,13 @@ mod tests {
     fn observe_leave_fires_one_departure_notice_on_first_insert() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4309,7 +4575,13 @@ mod tests {
     fn a_standalone_relay_decides_leaves_without_a_notifier() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
     }
@@ -4333,7 +4605,13 @@ mod tests {
         // Starts as a peer: it records a departure off a mesh `SlotDeparted` but
         // never decides (not the authority), so nothing is cached and nothing
         // fires yet.
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         record_departure(
             &registry,
@@ -4377,7 +4655,13 @@ mod tests {
         registry.set_notice_notifier(tx);
 
         // Authored while the authority: decide_leave fires the one notice.
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -4404,7 +4688,13 @@ mod tests {
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
 
         registry.set_session_refs(
             &k,
@@ -4427,7 +4717,13 @@ mod tests {
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
 
         registry.set_session_refs(
             &k,
@@ -4459,7 +4755,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
         registry.set_session_refs(
             &k,
             Some("game-2".to_owned()),
@@ -4492,7 +4794,13 @@ mod tests {
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -4521,7 +4829,13 @@ mod tests {
     fn record_result_fires_one_notice_per_slot() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4561,7 +4875,13 @@ mod tests {
     fn record_result_stamps_session_refs_into_the_notice() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4598,7 +4918,13 @@ mod tests {
     fn record_result_rejects_an_empty_payload() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4616,7 +4942,13 @@ mod tests {
     fn record_result_rejects_an_oversize_payload() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4643,7 +4975,13 @@ mod tests {
     fn record_departure_rejects_an_oversize_mesh_folded_result() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4682,7 +5020,13 @@ mod tests {
     fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4723,7 +5067,13 @@ mod tests {
     fn a_departure_without_a_reported_result_embeds_none() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
@@ -4745,7 +5095,13 @@ mod tests {
     fn an_embedded_result_folds_first_non_none_wins() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::Peer);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+        );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
         // A peer's `SlotDeparted` carries the home-authored result first.
@@ -4825,7 +5181,13 @@ mod tests {
         let k = key();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
 
         registry.set_session_refs(
             &k,
@@ -4848,7 +5210,13 @@ mod tests {
         // Deregistering the maker also forgets the refs: a later decide_leave
         // on a freshly re-created maker for the same key sees none.
         deregister_maker(&registry, &k);
-        let _ = sync_maker(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
         let notice2 = recv_departure(&mut rx);
@@ -4865,7 +5233,13 @@ mod tests {
     /// The apply frame is one past the departing slot's last observed frame.
     #[test]
     fn decide_leave_schedules_one_past_the_departed_slots_last_frame() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Two slots; the departing slot (1) is the furthest ahead.
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
@@ -4888,7 +5262,13 @@ mod tests {
     /// leave past a frame the stalled ones can reach.
     #[test]
     fn decide_leave_schedules_from_the_departed_slot_not_the_survivors() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
         maker.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
         let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
@@ -4901,7 +5281,13 @@ mod tests {
     /// No framed turn observed anywhere (pre-game / lobby): nothing to schedule.
     #[test]
     fn decide_leave_holds_without_a_frame_basis() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
     }
 
@@ -4909,7 +5295,13 @@ mod tests {
     /// session frame (the survivors' slowest) is the fallback basis.
     #[test]
     fn decide_leave_falls_back_to_the_session_frame_for_a_never_framed_slot() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(40)); // a framed survivor
         // Slot 1 departs having never framed a turn.
         let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
@@ -4947,7 +5339,13 @@ mod tests {
     /// regression from the pre-clamp behavior).
     #[test]
     fn decide_leave_does_not_clamp_an_honest_lead_ahead_departure() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Survivor slot 0 has run 6 turns (the buffer depth) past the departing
         // slot's last frame before stalling: seqs 0..=21 (frames 100..=121).
         feed_turns(&mut maker, 0, 0..=21);
@@ -4968,7 +5366,13 @@ mod tests {
     /// `u32::MAX` (which would have stalled every survivor forever).
     #[test]
     fn decide_leave_clamps_an_inflated_departing_frame_to_a_reachable_ceiling() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         feed_turns(&mut maker, 0, 0..=21); // honest survivor, leads by the buffer
         feed_turns(&mut maker, 1, 0..=14); // the malicious slot's honest prefix
         maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(u32::MAX)); // the lie
@@ -4993,7 +5397,13 @@ mod tests {
     /// depend on how large the lie is.
     #[test]
     fn decide_leave_clamps_a_moderate_inflation_too() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         feed_turns(&mut maker, 0, 0..=21);
         feed_turns(&mut maker, 1, 0..=14);
         maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(230)); // ~2x the real ~115
@@ -5010,7 +5420,13 @@ mod tests {
     /// — the leave is clamped, never left unclamped at `u32::MAX` (a stall).
     #[test]
     fn decide_leave_clamps_an_early_game_inflation_no_stall() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         feed_turns(&mut maker, 0, 0..=3); // only a few turns in (< buffer_max = 6)
         feed_turns(&mut maker, 1, 0..=2);
         maker.observe_turn_frame(SlotId(1), 3, GameFrameCount(u32::MAX));
@@ -5032,7 +5448,13 @@ mod tests {
     /// stall point, so every survivor can reach it.
     #[test]
     fn decide_leave_early_game_honest_departure_is_a_bounded_early_drop_no_stall() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         feed_turns(&mut maker, 0, 0..=3);
         feed_turns(&mut maker, 1, 0..=3); // honest last frame 103
         let d = home_decide_leave(&mut maker, 1);
@@ -5056,7 +5478,13 @@ mod tests {
         let ceiling = Some(115u32);
 
         // The authority deciding directly from the record.
-        let mut authority = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay);
+        let mut authority = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         authority.record_departure(SlotId(1), last, ceiling, None, DROPPED);
         let a = authority
             .decide_leave(SlotId(1), DROPPED)
@@ -5065,7 +5493,8 @@ mod tests {
 
         // A peer that only recorded the carried departure, then is promoted: the
         // handoff re-derivation reproduces the identical apply frame.
-        let mut peer = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer);
+        let mut peer =
+            DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
         peer.record_departure(SlotId(1), last, ceiling, None, DROPPED);
         let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay);
         let p = leaves
@@ -5081,7 +5510,8 @@ mod tests {
     /// A non-authority relay never decides a leave (only the authority does).
     #[test]
     fn decide_leave_is_a_no_op_on_a_non_authority() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
     }
@@ -5090,7 +5520,13 @@ mod tests {
     /// trigger — e.g. a duplicate drop signal).
     #[test]
     fn decide_leave_ignores_a_slot_already_leaving() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert!(maker.decide_leave(SlotId(1), DROPPED).is_some());
         assert_eq!(
@@ -5104,7 +5540,13 @@ mod tests {
     /// relay pushes each down its own control-stream frame.
     #[test]
     fn decide_leave_handles_multiple_slots_independently() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(55));
         maker.observe_frame(SlotId(1), GameFrameCount(60));
         maker.observe_frame(SlotId(2), GameFrameCount(70));
@@ -5121,7 +5563,13 @@ mod tests {
     /// already applied it did so at that exact frame, so it must not move.
     #[test]
     fn promotion_re_broadcasts_a_cached_leave_verbatim() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         let first = maker.decide_leave(SlotId(1), DROPPED).unwrap();
@@ -5160,7 +5608,8 @@ mod tests {
     /// `session + 1` (a frame they would never reach).
     #[test]
     fn re_derivation_does_not_overshoot_when_survivors_ran_ahead() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         // The survivor's stamps run ahead of the departed slot's last frame.
         maker.observe_frame(SlotId(0), GameFrameCount(55));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
@@ -5186,7 +5635,8 @@ mod tests {
     fn promotion_re_derives_a_departure_with_no_cached_directive() {
         // This relay was never the authority: it recorded a peer's SlotDeparted
         // but decided nothing (decide_leave is a no-op on a non-authority).
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
@@ -5216,7 +5666,8 @@ mod tests {
     /// drives a later promotion's re-derivation.
     #[test]
     fn promotion_re_derivation_survives_the_slots_retirement() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         // The trigger site reads the frame, records the departure (which merges
@@ -5249,7 +5700,13 @@ mod tests {
     /// push missed. Re-delivery to survivors that did apply it is deduped by slot.
     #[test]
     fn promotion_re_broadcasts_even_when_survivor_stamps_pass_apply() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
@@ -5276,7 +5733,13 @@ mod tests {
     /// later promotion re-broadcasts.
     #[test]
     fn demotion_keeps_the_cached_leaves() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert!(maker.decided_leaves.contains_key(&SlotId(1)));
@@ -5296,7 +5759,8 @@ mod tests {
     /// collides. A conflicting duplicate keeps the first (and warns).
     #[test]
     fn observe_leave_caches_and_advances_the_seq() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let observed = LeaveDirective {
             slot: 2,
             reason: DROPPED,
@@ -5340,7 +5804,13 @@ mod tests {
     /// schedules from the carried frame when our own observation lags it.
     #[test]
     fn slot_departed_ingest_uses_the_carried_frame_when_our_observation_lags() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // Our own view of the departing slot lags (frame 30); a survivor is at 45.
         maker.observe_frame(SlotId(0), GameFrameCount(45));
         maker.observe_frame(SlotId(1), GameFrameCount(30));
@@ -5359,7 +5829,13 @@ mod tests {
     /// the max-merge keeps our higher value, so the apply frame reflects it.
     #[test]
     fn slot_departed_ingest_keeps_a_higher_own_frame_over_a_lower_carried_one() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(1), GameFrameCount(70)); // our fuller view
         maker.observe_frame(SlotId(0), GameFrameCount(80));
 
@@ -5375,7 +5851,8 @@ mod tests {
     /// A non-authority relay records a departure but decides nothing.
     #[test]
     fn slot_departed_ingest_records_without_deciding_on_a_non_authority() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         assert_eq!(
@@ -5397,7 +5874,8 @@ mod tests {
     /// departed slot's frozen last frame.
     #[test]
     fn a_departure_retires_the_slot_from_the_session_frame() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(60));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
@@ -5415,7 +5893,8 @@ mod tests {
     /// re-created entry would re-pin the session frame at the departed slot.
     #[test]
     fn observe_frame_ignores_a_departed_slot() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(60));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
 
@@ -5432,7 +5911,13 @@ mod tests {
     /// raced the departure) must not re-create its condition state either.
     #[test]
     fn conditions_ingest_does_not_resurrect_a_departed_slot() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::SelfRelay);
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         maker.observe_frame(SlotId(0), GameFrameCount(60));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
 
@@ -5453,7 +5938,8 @@ mod tests {
     /// unconditionally and receipt dedups by slot.
     #[test]
     fn reconcile_always_includes_a_cached_leave() {
-        let mut maker = DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer);
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
@@ -5580,7 +6066,13 @@ mod tests {
     /// so these tests exercise the comparator exactly as it runs with
     /// detection live.
     fn authority_maker() -> DecisionMaker {
-        DecisionMaker::new(key(), bounds(0, 6), law(), Authority::SelfRelay)
+        DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        )
     }
 
     /// The evaluation margin [`authority_maker`]'s bounds (`max = 6`) implies
@@ -5690,6 +6182,54 @@ mod tests {
             "observer never joins"
         );
         assert!(!m.sync.dormant);
+    }
+
+    /// A maker created by a descriptor starts with that descriptor's observer
+    /// set. This is the single-relay session's whole story: it receives exactly
+    /// one descriptor push (at session create, before any client dials), so the
+    /// push finds no maker and inserts one seeded with the descriptor's observer
+    /// slots -- there is no later re-push to carry the set in after the fact.
+    /// The observer must therefore be excluded from the desync comparator from
+    /// that maker's first turn onward.
+    #[test]
+    fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
+        let registry = new_decision_makers();
+        // One descriptor push naming slot 2 an observer, with no maker yet.
+        let leaves = sync_maker(
+            &registry,
+            &key(),
+            bounds(0, 6),
+            Authority::SelfRelay,
+            HashSet::from([SlotId(2)]),
+        );
+        assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
+
+        let mut guard = registry.lock();
+        let m = guard.get_mut(&key()).expect("the push created the maker");
+        assert!(
+            m.observers.contains(&SlotId(2)),
+            "the observer set is seeded at creation, not on a later push",
+        );
+
+        // Two players agree; the observer reports a different checksum. Racing a
+        // compared slot ahead clears the evaluation margin for ordinal 0.
+        feed(m, 0, 0, SYNC_A);
+        feed(m, 1, 0, SYNC_A);
+        assert_eq!(
+            feed(m, 2, 0, SYNC_B),
+            None,
+            "the observer's disagreeing report is a no-op",
+        );
+        let divergence = advance(m, 0, SYNC_A, authority_margin() as u8);
+        assert!(
+            divergence.is_none(),
+            "the observer is never a required reporter, so no divergence fires",
+        );
+        assert!(
+            !m.sync.members.contains_key(&SlotId(2)),
+            "the observer never joins the compare set",
+        );
+        assert!(!m.sync.dormant, "the compared survivors keep being watched");
     }
 
     #[test]
@@ -5805,7 +6345,13 @@ mod tests {
     /// deferred.
     #[test]
     fn a_deep_join_lands_on_its_true_ordinal_once_three_slots_corroborate_the_rate() {
-        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let mut m = DecisionMaker::new(
+            key(),
+            bounds(1, 12),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let margin = sync_eval_margin(12);
         assert_eq!(margin, 14);
 
@@ -5859,7 +6405,13 @@ mod tests {
     /// — never placed a full ring cycle ahead at ~16 and never named diverged.
     #[test]
     fn an_attacker_cannot_frame_a_joining_victim_by_seeding_calibration_alone() {
-        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let mut m = DecisionMaker::new(
+            key(),
+            bounds(1, 12),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // The attacker (slot 0) races ten ordinals ahead, stamping a frame
         // sequence designed to project a low-frame joiner up near ordinal 16.
         for ordinal in 0u8..10 {
@@ -5900,7 +6452,13 @@ mod tests {
     /// forms from two reporters at all.
     #[test]
     fn a_two_reporter_ordinal_with_an_attacker_outlier_does_not_corroborate() {
-        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let mut m = DecisionMaker::new(
+            key(),
+            bounds(1, 12),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         // One honest slot and one attacker stamping wild frames report ordinals
         // 0..6 — two reporters each, below the ≥3 corroboration threshold.
         for ordinal in 0u8..6 {
@@ -6058,7 +6616,13 @@ mod tests {
     /// (`max(8, 12 + 2)`), not the shallow-policy 8.
     #[test]
     fn the_evaluation_margin_scales_with_the_session_s_buffer_bounds() {
-        let mut m = DecisionMaker::new(key(), bounds(1, 12), law(), Authority::SelfRelay);
+        let mut m = DecisionMaker::new(
+            key(),
+            bounds(1, 12),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         let margin = sync_eval_margin(12);
         assert_eq!(
             margin, 14,
@@ -6129,7 +6693,7 @@ mod tests {
 
     #[test]
     fn a_non_authority_relay_does_not_compare() {
-        let mut m = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer);
+        let mut m = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
         assert_eq!(feed(&mut m, 0, 0, SYNC_A), None);
         assert_eq!(feed(&mut m, 1, 0, SYNC_B), None);
         assert_eq!(feed(&mut m, 0, 1, SYNC_A), None);
@@ -6205,6 +6769,7 @@ mod tests {
             bounds(0, SYNC_ABSURD_BUFFER_MAX),
             law(),
             Authority::SelfRelay,
+            HashSet::new(),
         );
         // A first sync command trips the check and disables the comparator —
         // even from two slots that would otherwise plainly disagree.
@@ -6219,7 +6784,13 @@ mod tests {
     fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(&registry, &k, bounds(0, 6), Authority::SelfRelay);
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
         registry.set_session_refs(
             &k,
             Some("game-77".to_owned()),

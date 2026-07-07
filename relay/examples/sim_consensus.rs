@@ -131,6 +131,7 @@ fn run(scenario: &Scenario) -> Vec<Row> {
         scenario.bounds,
         ControlLaw::default(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
 
     let mut rows = Vec::with_capacity(scenario.samples.len());

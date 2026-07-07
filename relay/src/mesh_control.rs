@@ -227,15 +227,6 @@ impl MeshControl {
                 .collect(),
         );
 
-        // Record the session's observer slots so the desync comparator excludes
-        // them (observers don't reliably emit sync commands). Descriptor-driven,
-        // so it is re-applied on every push, replacing any prior set.
-        consensus::set_observers(
-            &self.decision_makers,
-            &key,
-            descriptor.observer_slots.iter().copied().collect(),
-        );
-
         let new_peers: HashSet<RelayId> = descriptor
             .peers
             .iter()
@@ -280,9 +271,18 @@ impl MeshControl {
         // A verdict that promotes this relay (e.g. the coordinator dropped the
         // former authority from the order because it crashed — a case presence
         // alone can't catch, since a crashed relay sends no zero report) yields
-        // the synced leaves it must re-broadcast so no leave is lost.
-        let leaves =
-            consensus::sync_maker(&self.decision_makers, &key, descriptor.bounds, authority);
+        // the synced leaves it must re-broadcast so no leave is lost. The
+        // descriptor's observer slots are seeded into the maker here — a maker
+        // created by this push starts with them excluded from the desync
+        // comparator, so a single-relay session (one push, before any client
+        // dials) never loses its observer set; a re-push replaces the set.
+        let leaves = consensus::sync_maker(
+            &self.decision_makers,
+            &key,
+            descriptor.bounds,
+            authority,
+            descriptor.observer_slots.iter().copied().collect(),
+        );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
 
         let mut inner = self.inner.lock();

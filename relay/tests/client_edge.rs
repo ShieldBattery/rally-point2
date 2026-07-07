@@ -273,6 +273,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
@@ -566,6 +567,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -642,6 +644,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -707,6 +710,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -796,6 +800,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
     // Watch the notices the relay would send up its coordinator connection.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -905,6 +910,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -977,6 +983,7 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
