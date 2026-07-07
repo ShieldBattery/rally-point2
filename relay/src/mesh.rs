@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
-    LeaveDirective, LinkConditions, MeshControlFrame, Payload, SlotConditions, SlotDeparted,
-    mesh_control_frame,
+    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload,
+    SlotConditions, SlotDeparted, mesh_control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -271,6 +271,20 @@ pub struct MeshState {
     /// reports, and `MeshControl` sets the order from each descriptor. Same
     /// per-session lifecycle and task-threading as the registries above.
     pub presence: Arc<crate::presence::PresenceRegistry>,
+    /// Per-session lobby-command fan-out and its ordered replay log. The
+    /// slot-link tasks deliver their clients' lobby commands into it (and register
+    /// each member for replay), and the mesh-link drivers deliver peers' lobby
+    /// commands into it. Bundled here, not because it is a mesh concern, but
+    /// because it has the same per-session lifecycle and is threaded through the
+    /// same two tasks as the registries above. See [`crate::lobby`].
+    pub lobby: crate::lobby::LobbyRegistry,
+    /// Per-session game-chat fan-out. The mid-game counterpart to `lobby`: the
+    /// slot-link tasks deliver their clients' chat messages into it (and
+    /// register each member to receive others'), and the mesh-link drivers
+    /// deliver peers' messages into it. No replay log — chat is ephemeral —
+    /// but the same per-session lifecycle and task-threading as `lobby`. See
+    /// [`crate::chat`].
+    pub chat: crate::chat::ChatRegistry,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -282,6 +296,8 @@ pub fn new_mesh_state() -> MeshState {
         conditions: new_conditions_registry(),
         decision_makers: Arc::new(crate::consensus::new_decision_makers()),
         presence: Arc::new(crate::presence::new_presence_registry()),
+        lobby: crate::lobby::new_lobby_registry(),
+        chat: crate::chat::new_chat_registry(),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -522,6 +538,26 @@ pub(crate) fn fan_out_leave_directive(links: &MeshLinks, key: &SessionKey, leave
     fan_out_control(links, key, leave_directive_frame(key.session, leave));
 }
 
+/// Propagates a member's lobby command to every peer relay serving `key`, so each
+/// fans it out to its own local members and appends it to its own replay log. The
+/// origin relay stamps the authoring slot onto `command` before this call, so a
+/// peer copy already carries the authoritative author. A relay that receives this
+/// delivers it locally but does not re-broadcast it — no echo — mirroring the
+/// oversize-turn divert.
+pub(crate) fn fan_out_lobby_command(links: &MeshLinks, key: &SessionKey, command: LobbyCommand) {
+    fan_out_control(links, key, lobby_command_frame(key.session, command));
+}
+
+/// Propagates one member's game-chat message to every peer relay serving `key`,
+/// so each fans it out to its own local members. The origin relay stamps the
+/// authoring slot onto `chat` before this call, so a peer copy already carries
+/// the authoritative author. A relay that receives this delivers it locally but
+/// does not re-broadcast it — no echo — mirroring [`fan_out_lobby_command`]
+/// minus the replay-log side effect (chat keeps none).
+pub(crate) fn fan_out_chat(links: &MeshLinks, key: &SessionKey, chat: GameChat) {
+    fan_out_control(links, key, chat_frame(key.session, chat));
+}
+
 /// Broadcasts a batch of synced leaves — the ones a fresh authority promotion
 /// must (re)deliver — to both local survivors ([`routing::fan_out_leave`]) and
 /// every peer relay ([`fan_out_leave_directive`]). All are idempotent: clients
@@ -584,6 +620,22 @@ fn leave_directive_frame(session: SessionId, leave: LeaveDirective) -> MeshContr
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::LeaveDirective(leave)),
+    }
+}
+
+/// Builds a `LobbyCommand` mesh control frame for `session`.
+fn lobby_command_frame(session: SessionId, command: LobbyCommand) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::LobbyCommand(command)),
+    }
+}
+
+/// Builds a `GameChat` mesh control frame for `session`.
+fn chat_frame(session: SessionId, chat: GameChat) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::GameChat(chat)),
     }
 }
 
@@ -775,12 +827,20 @@ pub async fn run_mesh_link(
     mesh: MeshState,
     idle_timeout: std::time::Duration,
 ) -> MeshLinkExit {
+    // Cloned (cheap — every field is an `Arc`) before the destructure below
+    // pulls `mesh` apart, so `dispatch_mesh_control` can take the whole bundle
+    // as one argument rather than a growing list of its individual registries
+    // (mirroring `run_slot_link`'s `mesh_for_teardown`). `lobby` and `chat` are
+    // used only inside that dispatch, via the clone, so this destructure omits
+    // them (`..`) rather than binding two names this function never reads.
+    let mesh_for_dispatch = mesh.clone();
     let MeshState {
         links: mesh_links,
         seen: seen_registries,
         conditions,
         decision_makers,
         presence,
+        ..
     } = mesh;
     let crate::presence::PresenceIo {
         peer_id,
@@ -981,9 +1041,7 @@ pub async fn run_mesh_link(
                         frame,
                         &joined,
                         &sessions,
-                        &seen_registries,
-                        &mesh_links,
-                        &decision_makers,
+                        &mesh_for_dispatch,
                     ),
                     None => peer_control_alive = false,
                 }
@@ -1271,18 +1329,30 @@ pub async fn run_mesh_link(
 ///   client edge, never re-validated at a mesh hop). It too is not re-broadcast
 ///   to other mesh links: the origin diverted a copy to every link serving the
 ///   session itself.
+/// - **`LobbyCommand`**: a lobby command a peer relay's member authored, already
+///   slot-stamped by the origin. Delivered to this relay's local members and
+///   appended to this relay's replay log — so a late-dialing local member still
+///   gets it — but, like the oversize turn, not re-broadcast across the mesh:
+///   the origin already sent a copy to every link serving the session.
+/// - **`GameChat`**: a chat message a peer relay's member authored, already
+///   slot-stamped by the origin. Delivered to this relay's local members — no
+///   log to append to, chat is ephemeral — and, like the lobby command, not
+///   re-broadcast across the mesh.
 ///
 /// Kept defensive like the datagram path: a zero session id is malformed and a
 /// session this link has not joined has no key to act under; both are logged at
 /// debug and skipped (a race with `Join`/`Leave` is possible and benign given the
 /// Join-time reconcile).
+///
+/// Takes the whole `mesh` bundle rather than its individual registries so this
+/// signature doesn't grow a new parameter every time a control-frame kind needs
+/// another per-session registry (`seen`, `lobby`, and `chat` all live inside it
+/// already); `sessions` stays separate because it is not part of `MeshState`.
 fn dispatch_mesh_control(
     frame: MeshControlFrame,
     joined: &HashMap<SessionId, SessionState>,
     sessions: &routing::Sessions,
-    seen: &SeenRegistries,
-    mesh_links: &MeshLinks,
-    decision_makers: &crate::consensus::DecisionMakers,
+    mesh: &MeshState,
 ) {
     if frame.session == 0 {
         tracing::debug!("mesh control frame with zero session id; dropping");
@@ -1325,7 +1395,7 @@ fn dispatch_mesh_control(
                 slot_frame: departed.result_slot_frame,
             });
             crate::consensus::record_departure(
-                decision_makers,
+                &mesh.decision_makers,
                 &key,
                 slot,
                 departed
@@ -1339,14 +1409,14 @@ fn dispatch_mesh_control(
             // `decide_leave` returns `None` on a non-authority (having recorded
             // the departure) and on a duplicate for an already-decided slot.
             if let Some(leave) =
-                crate::consensus::decide_leave(decision_makers, &key, slot, departed.reason)
+                crate::consensus::decide_leave(&mesh.decision_makers, &key, slot, departed.reason)
             {
                 routing::fan_out_leave(sessions, &key, slot, leave);
-                fan_out_leave_directive(mesh_links, &key, leave);
+                fan_out_leave_directive(&mesh.links, &key, leave);
             }
         }
         Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
-            crate::consensus::observe_leave(decision_makers, &key, &leave);
+            crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave);
             let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
                 // Out of `u8` range: `observe_leave` above already ignored it
                 // (its own checked conversion); nothing to fan out either.
@@ -1375,7 +1445,7 @@ fn dispatch_mesh_control(
             // turn diverts it onto that client's own control stream.
             if let Some(frame) = payload.game_frame_count {
                 crate::consensus::observe_turn_frame(
-                    decision_makers,
+                    &mesh.decision_makers,
                     &key,
                     slot,
                     payload.seq,
@@ -1386,7 +1456,32 @@ fn dispatch_mesh_control(
             // below feeds it, after its own mark_seen dedup, so a redundant
             // control-stream copy (or an echo also seen via a datagram path)
             // isn't double-counted.
-            let _ = deliver_turn_to_locals(sessions, seen, decision_makers, &key, slot, payload);
+            let _ = deliver_turn_to_locals(
+                sessions,
+                &mesh.seen,
+                &mesh.decision_makers,
+                &key,
+                slot,
+                payload,
+            );
+        }
+        Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
+            // A lobby command a peer relay's member authored, already slot-stamped
+            // by the origin. Fold it into this relay's local delivery (append to
+            // the replay log, fan out to local members — the remote author is not
+            // one of them, so every local member receives it). Deliberately NOT
+            // re-broadcast across the mesh: the origin already sent a copy to every
+            // link serving the session, exactly as with the oversize turn above.
+            crate::lobby::deliver(&mesh.lobby, &key, command);
+        }
+        Some(mesh_control_frame::Kind::GameChat(chat_msg)) => {
+            // A chat message a peer relay's member authored, already
+            // slot-stamped by the origin — its size and rate caps already
+            // applied there, so a mesh copy is trusted, not re-checked (mirrors
+            // how a mesh-received lobby command's bytes are not re-validated).
+            // No log to append to; deliberately NOT re-broadcast across the
+            // mesh, exactly as the lobby command and oversize turn above.
+            crate::chat::deliver(&mesh.chat, &key, chat_msg);
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -1717,6 +1812,28 @@ mod tests {
         (forward_rx, control_rx)
     }
 
+    /// Bundles the registries a `dispatch_mesh_control` test already built
+    /// (so it can register members and observe echoes against them) into the
+    /// `MeshState` its signature now takes. `conditions` and `presence` are not
+    /// under test here, so fresh empty ones are enough.
+    fn test_mesh_state(
+        mesh_links: &MeshLinks,
+        seen: &SeenRegistries,
+        makers: &Arc<crate::consensus::DecisionMakers>,
+        lobby: &crate::lobby::LobbyRegistry,
+        chat: &crate::chat::ChatRegistry,
+    ) -> MeshState {
+        MeshState {
+            links: mesh_links.clone(),
+            seen: seen.clone(),
+            conditions: new_conditions_registry(),
+            decision_makers: makers.clone(),
+            presence: Arc::new(crate::presence::new_presence_registry()),
+            lobby: lobby.clone(),
+            chat: chat.clone(),
+        }
+    }
+
     /// Deregistering one peer relay's mesh link for a session must leave every
     /// other peer's registration for that session intact. Regression: a session's
     /// whole fan-out vec was once removed on any single link's teardown, so a
@@ -1927,7 +2044,10 @@ mod tests {
             session: key.session.0,
             kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
         };
-        dispatch_mesh_control(frame, &joined, &sessions, &seen, &mesh_links, &makers);
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
 
         // The remote slot's frame fed the consensus coordinate, exactly as a
         // datagram-delivered turn's would.
@@ -1944,6 +2064,118 @@ mod tests {
         );
         // No echo: neither a datagram forward nor a control frame went back out
         // to the mesh.
+        assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
+        assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// A lobby command arriving over the mesh control stream is folded into this
+    /// relay's local delivery — appended to the replay log and fanned to local
+    /// members — and NOT re-broadcast to other mesh links: the origin relay
+    /// already sent a copy to every link serving the session, so re-flooding would
+    /// only echo. Mirrors the oversize-turn dispatch test.
+    #[test]
+    fn a_lobby_command_dispatch_delivers_locally_and_never_echoes() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+
+        // A local member on this relay (slot 5) that must receive the mesh command.
+        let mut member = crate::lobby::register_member(&lobby, &key, SlotId(5));
+        // A peer mesh link that must NOT hear an echo of the received command.
+        let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        // A command a remote member (slot 0) authored, already slot-stamped.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
+                slot: 0,
+                payload: vec![0xAB].into(),
+            })),
+        };
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        // The local member received the command with the origin's authoritative slot.
+        let delivered = member.try_recv().expect("the local member received it");
+        assert_eq!(delivered.slot, 0);
+        assert_eq!(delivered.payload.as_ref(), &[0xAB]);
+        // No echo back out to the mesh on either path.
+        assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
+        assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// A game-chat message arriving over the mesh control stream is folded into
+    /// this relay's local delivery — fanned to local members, no log to append
+    /// to — and NOT re-broadcast to other mesh links: the origin relay already
+    /// sent a copy to every link serving the session, so re-flooding would only
+    /// echo. Mirrors the lobby-command dispatch test.
+    #[test]
+    fn a_game_chat_dispatch_delivers_locally_and_never_echoes() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+
+        // A local member on this relay (slot 5) that must receive the mesh message.
+        let mut member = crate::chat::register_member(&chat, &key, SlotId(5));
+        // A peer mesh link that must NOT hear an echo of the received message.
+        let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        // A message a remote member (slot 0) authored, already slot-stamped.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::GameChat(GameChat {
+                slot: 0,
+                target_kind: 2,
+                target_slot: 0,
+                text: "hi from relay A".to_owned(),
+            })),
+        };
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        // The local member received the message with the origin's authoritative
+        // slot, and its scope fields intact — the relay never interprets them.
+        let delivered = member.try_recv().expect("the local member received it");
+        assert_eq!(delivered.slot, 0);
+        assert_eq!(delivered.target_kind, 2);
+        assert_eq!(delivered.text, "hi from relay A");
+        // No echo back out to the mesh on either path.
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }

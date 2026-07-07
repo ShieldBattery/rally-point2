@@ -24,20 +24,25 @@ use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
 };
 use rally_point_proto::messages::{
-    ControlFrame, GameResult, LeaveDirective, LeaveIntent, Payload, control_frame,
+    ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
+    control_frame,
 };
 use tokio::sync::mpsc;
 
 /// A frame surfaced from the reliable control stream to its consumer.
 ///
 /// The stream carries more than one kind now, so the reader hands back a tagged
-/// value rather than a bare payload. On the client edge both `OversizeTurn` and
-/// `Leave` arrive (the relay forwards oversize turns and pushes leaves down),
-/// but never `LeaveIntent` — a client never receives its own intent back, so
-/// the client edge ignores one, mirroring how the relay edge ignores a stray
-/// `Leave`. On the relay edge, `OversizeTurn`, `LeaveIntent`, and `GameResult`
-/// arrive (a client sends all three up); a relay never receives a `Leave` from
-/// another relay on this stream, so the relay edge ignores one.
+/// value rather than a bare payload. On the client edge `OversizeTurn`, `Leave`,
+/// `Lobby`, and `Chat` arrive (the relay forwards oversize turns, pushes leaves
+/// down, and fans lobby commands and chat messages from other members down), but
+/// never `LeaveIntent` — a client never receives its own intent back, so the
+/// client edge ignores one, mirroring how the relay edge ignores a stray `Leave`.
+/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`, `Lobby`, and
+/// `Chat` arrive (a client sends all five up); a relay never receives a `Leave`
+/// from another relay on this stream, so the relay edge ignores one. Unlike
+/// every other kind, `Lobby` and `Chat` are legitimate in *both* directions —
+/// their `slot` field's authority just flips with direction (see
+/// [`LobbyCommand`] and [`GameChat`]'s docs).
 #[derive(Debug)]
 pub enum ControlInbound {
     /// An oversize turn to fold back into the ordered turn stream.
@@ -55,6 +60,20 @@ pub enum ControlInbound {
     /// opaque here; the relay reading a client's stream stamps and forwards them,
     /// and any other edge ignores a stray one just as it does a `LeaveIntent`.
     GameResult(Bytes),
+    /// A lobby command one member authored, in both directions. Client → relay
+    /// carries this client's own lobby command (the relay ignores the frame's
+    /// `slot` and stamps the authenticated one); relay → client carries another
+    /// member's command with the relay's authoritative `slot` naming the author.
+    /// The whole message is surfaced so both directions can read the `slot`.
+    Lobby(LobbyCommand),
+    /// An in-game chat message one member authored, in both directions — the
+    /// mid-game counterpart to `Lobby`. Client → relay carries this client's own
+    /// message (the relay ignores the frame's `slot` and stamps the
+    /// authenticated one); relay → client carries another member's message with
+    /// the relay's authoritative `slot` naming the author. The whole message is
+    /// surfaced so both directions can read `slot`, `target_kind`, and
+    /// `target_slot`.
+    Chat(GameChat),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -152,6 +171,12 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
                 } => ControlInbound::GameResult(payload),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::LobbyCommand(command)),
+                } => ControlInbound::Lobby(command),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::GameChat(chat)),
+                } => ControlInbound::Chat(chat),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -231,6 +256,47 @@ pub async fn send_control_game_result(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a lobby command on the control stream, in either direction: a client
+/// pushes its own authored command up (leaving `slot` at 0 — the relay stamps
+/// the authenticated slot and never trusts a client value), and a relay fans a
+/// member's command down with `slot` stamped to the author. Reliable and
+/// un-redundant like an oversize turn: an error means the stream (and almost
+/// certainly the connection) is gone, so the caller treats it as a link failure
+/// — a dropped setup command would leave a member's pre-game state incomplete,
+/// so it cannot be silently dropped.
+pub async fn send_control_lobby(
+    control_send: &mut quinn::SendStream,
+    command: LobbyCommand,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LobbyCommand(command)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends an in-game chat message on the control stream, in either direction: a
+/// client pushes its own authored message up (leaving `slot` at 0 — the relay
+/// stamps the authenticated slot and never trusts a client value), and a relay
+/// fans a member's message down with `slot` stamped to the author. Unlike a
+/// lobby command, a failed send here is not correctness-critical for the caller
+/// to treat as a link failure — chat has no pre-game state a lost message could
+/// leave incomplete — so the client-edge driver logs and continues on an
+/// `Err` here rather than propagating it as a fatal error, the same treatment
+/// it gives a failed `GameResult` send.
+pub async fn send_control_chat(
+    control_send: &mut quinn::SendStream,
+    chat: GameChat,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::GameChat(chat)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

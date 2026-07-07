@@ -799,19 +799,24 @@ struct Member {
 /// Comparable directly against a `u64` (`counter == 1`, `counter >= 1`, …) so
 /// call sites and tests can read the running total without an accessor; use
 /// [`Self::count`] when the value needs to be handed to a `tracing` field.
+///
+/// `pub(crate)` (rather than private to this module) so other relay modules
+/// with their own rate-limited-warn needs — e.g. `chat`'s size- and rate-cap
+/// warnings — reuse the one counter rather than each growing its own copy of
+/// this `count += 1; if <threshold> { warn!(...) }` triplet.
 #[derive(Debug, Default, Clone, Copy)]
-struct RateLimitedCounter(u64);
+pub(crate) struct RateLimitedCounter(u64);
 
 impl RateLimitedCounter {
     /// Records one occurrence and returns whether it should be logged: the
     /// first occurrence, then every power of two thereafter.
-    fn observe(&mut self) -> bool {
+    pub(crate) fn observe(&mut self) -> bool {
         self.0 += 1;
         self.0 == 1 || self.0.is_power_of_two()
     }
 
     /// The total number of occurrences recorded so far.
-    fn count(self) -> u64 {
+    pub(crate) fn count(self) -> u64 {
         self.0
     }
 }

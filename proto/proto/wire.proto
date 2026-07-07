@@ -241,6 +241,24 @@ message ControlFrame {
     // parsing it. Unlike a leave intent, this rides out mid-game the moment the
     // game produces it, ahead of any final-turn drain. See `GameResult`.
     GameResult game_result = 4;
+
+    // A native lobby setup/request command one session member authored, carried
+    // between members before the game starts. Client → relay the `slot` is
+    // IGNORED — the relay stamps the authenticated connection's slot, never a
+    // client-asserted value. Relay → client the `slot` is relay-stamped and
+    // authoritative, naming WHICH member authored the bytes so the receiving
+    // game attributes them to that member's lobby turn. See `LobbyCommand`.
+    LobbyCommand lobby_command = 5;
+
+    // An in-game chat message one session member authored, carried between
+    // members over the reliable stream rather than the datagram turn path: chat
+    // has no simulated step to key a turn on, and unlike a lobby command it must
+    // still flow mid-game, after the lobby channel has fallen silent. Client to
+    // relay the `slot` is IGNORED -- the relay stamps the authenticated
+    // connection's slot, never a client-asserted value, mirroring
+    // `LobbyCommand`. Relay to client it is relay-stamped and authoritative,
+    // naming WHICH member authored the text. See `GameChat`.
+    GameChat game_chat = 6;
   }
 }
 
@@ -354,6 +372,136 @@ message GameResult {
   bytes payload = 1;
 }
 
+// One native SC:R lobby command a session member authored, carried on the
+// reliable control stream so every other member receives and applies it before
+// the game starts. During setup the host's game generates the lobby's setup
+// commands — slot and color assignments, the game-init that seeds the synced
+// RNG — as bare command bytes, and every other member must apply that exact
+// byte stream, in the exact order the host emitted it, or their pre-game state
+// diverges before the first turn. Members also author their own small requests
+// (a join, a ready toggle, a race change) that must reach the host and the
+// other members. This is the lobby-phase counterpart to the datagram turn
+// stream: once the game starts commands move to the datagram path, and this
+// channel falls silent.
+//
+// It rides the reliable control stream, not a datagram, because a lobby has no
+// lockstep turn clock to pace redundancy against and no frame to key a turn on
+// — there is nothing to re-carry a lost setup command against and no later turn
+// to fold it back into. QUIC's stream reliability carries it instead, exactly
+// as an oversize turn chooses the stream because no bundle could re-carry it.
+//
+// `slot` names the member that authored the bytes, and its authority differs by
+// direction, matching `GameResult`'s convention. Client → relay the field is
+// IGNORED: the relay binds the command to the authenticated connection's slot,
+// never a value the client asserts, so a client cannot forge another member's
+// lobby command. Relay → client the field is relay-stamped and authoritative:
+// the receiving game needs to know WHICH member authored the bytes to attribute
+// them to that member's lobby turn, and a mesh copy carries the origin relay's
+// stamp already (the origin stamps before the command ever leaves its client
+// edge).
+//
+// Delivery is a per-session ordered log the relay replays to late arrivals, not
+// a fire-and-forget fan-out, because setup runs while members are still dialing
+// in with real clock skew: the host's lobby machine can emit its setup commands
+// before a given member's link exists, and nothing back-pressures it (the
+// host's local turn barrier is already satisfied). So the relay appends every
+// lobby command it delivers to a per-session log and, when a member's control
+// stream comes up after commands already flowed, replays the log to that member
+// in arrival order before it begins tailing live commands — every member ends
+// up with the identical ordered sequence regardless of when it joined. A member
+// never receives its own authored command back (the relay never echoes to the
+// author; the game applies its own locally), and the replay/live handoff is
+// exact: each command reaches a member exactly once, in order.
+message LobbyCommand {
+  // The session slot that authored the command bytes. Client → relay this is
+  // ignored and the relay overwrites it with the authenticated connection's
+  // slot; relay → client it is the relay-stamped, authoritative author, so the
+  // receiving game attributes the bytes to that member's lobby turn.
+  uint32 slot = 1;
+
+  // The opaque native SC:R lobby command bytes, carried verbatim. The relay
+  // frames nothing of its own around them beyond this message and forwards them
+  // byte-for-byte — like a `GameResult` payload, they are the game's own bytes,
+  // not something the relay parses. Bounded by the control frame's size cap;
+  // lobby commands are tens of bytes in practice.
+  bytes payload = 2;
+}
+
+// One in-game chat message a session member authored, carried on the reliable
+// control stream so every other member receives it before the game's in-game
+// chat UI shows it. Unlike `LobbyCommand`, this is the channel's *mid-game*
+// counterpart: it stays live once the game starts and the lobby channel falls
+// silent, and it carries a small amount of structure -- a scope hint -- rather
+// than opaque bytes.
+//
+// It rides the reliable control stream, not a datagram, for the same reason an
+// oversize turn and a lobby command do: chat has no simulated step to key a
+// turn on and no later turn to fold a lost message back into, so there is
+// nothing for the datagram path's redundancy to re-carry it against. QUIC's
+// stream reliability delivers it instead.
+//
+// `slot` names the member that authored the message, with the same
+// direction-dependent authority as `LobbyCommand` and `GameResult`: client to
+// relay the field is IGNORED (the relay binds it to the authenticated
+// connection's slot, never a client-asserted value, so a client cannot forge a
+// message from another member); relay to client it is relay-stamped and
+// authoritative; and a mesh copy already carries the origin relay's stamp,
+// applied before the message ever left its client edge.
+//
+// Delivery is a bare fan-out, not an ordered replay log like `LobbyCommand`'s:
+// chat is ephemeral, so a member whose control stream comes up after a message
+// already flowed simply never sees it -- there is no pre-game setup state a
+// missed message could leave incomplete, so there is nothing worth replaying.
+// The relay does not echo a message back to its own author (the sender's own
+// chat UI echoes locally) and fans a client-authored message to every other
+// local member plus every peer relay serving the session; a mesh-received
+// message is fanned to this relay's local members only (not re-broadcast
+// across the mesh -- the origin already sent a copy to every link serving the
+// session).
+//
+// The relay also enforces two caps on a client-authored message before
+// forwarding it: `text` may not exceed the control frame's opaque-payload
+// convention (rejected, not truncated, past a size cap far more generous than
+// any real chat line), and an authoring slot is rate-limited (a token bucket
+// allowing short bursts) so a misbehaving client cannot flood the channel. Both
+// caps drop the offending frame without closing the connection -- a chat
+// message is not correctness-critical the way a turn or a lobby command is, so
+// losing one costs nothing more than a dropped line.
+message GameChat {
+  // The session slot that authored the message. Client → relay this is ignored
+  // and the relay overwrites it with the authenticated connection's slot; relay
+  // → client it is the relay-stamped, authoritative author, so the receiving
+  // game attributes the text to that member's chat line.
+  uint32 slot = 1;
+
+  // A scope hint for which members should display this message: 0 = all, 1 =
+  // allies (of the author), 2 = observers, 3 = a single named player (see
+  // `target_slot`). The relay does NOT interpret this field -- it fans the
+  // message out to every other local member and across the mesh regardless of
+  // scope, and each receiving client decides locally whether to display the
+  // line. This mirrors native SC:R's own channel-based chat, where scope
+  // filtering has always been receiver-side: a modified client can already
+  // choose to display every channel it receives, so server-side filtering
+  // would add complexity without closing a real trust boundary. The relay
+  // carries the hint verbatim in both directions and across a mesh hop.
+  uint32 target_kind = 2;
+
+  // The recipient slot a `target_kind` of 3 (a single named player) names.
+  // Meaningless for every other `target_kind` and left at 0 in that case,
+  // exactly as `Payload.game_frame_count`'s absence-vs-zero distinction is
+  // drawn elsewhere with an `optional` field -- but here 0 is always a valid
+  // "unused" sentinel because a `target_kind` other than 3 makes the receiving
+  // client ignore this field entirely, so no ambiguity with a real slot 0
+  // arises. Carried verbatim like `target_kind`; the relay never reads it.
+  uint32 target_slot = 3;
+
+  // The chat line's text, UTF-8, carried verbatim. Bounded by the relay's own
+  // size cap (well under the control frame's own cap) -- an over-cap message is
+  // dropped, not truncated, so no member ever sees a different message than the
+  // one another member sent by seeing a silently shortened copy of it.
+  string text = 4;
+}
+
 // One message on the relay ↔ relay reliable mesh control stream — the channel a
 // relay-pair uses for what its datagram path cannot carry: synced player-leave
 // propagation and oversize-turn divert. Each mesh link carries one
@@ -408,6 +556,27 @@ message MeshControlFrame {
     // re-broadcast it to other mesh links: the origin relay already diverted a
     // copy to every link serving the session, so re-flooding would only echo.
     Payload oversize_turn = 4;
+
+    // A lobby command one member authored, propagated to the other relays so
+    // each fans it out to its own local members. The origin relay stamps the
+    // authoring `slot` onto the `LobbyCommand` before it ever leaves that relay's
+    // client edge, so a mesh copy already carries the authoritative slot. A relay
+    // that receives this appends it to its own per-session lobby log — so its
+    // late-dialing local members still get it on replay — and fans it out to its
+    // local members, but does not re-broadcast it across the mesh: the origin
+    // already sent a copy to every link serving the session, so re-flooding would
+    // only echo (mirroring the oversize-turn divert). See `LobbyCommand`.
+    LobbyCommand lobby_command = 5;
+
+    // A game-chat message one member authored, propagated to the other relays
+    // so each fans it out to its own local members. The origin relay stamps the
+    // authoring `slot` before the message ever leaves that relay's client edge,
+    // so a mesh copy already carries the authoritative slot. A relay that
+    // receives this fans it out to its local members, but appends it to no log
+    // (chat is ephemeral, unlike a lobby command) and does not re-broadcast it
+    // across the mesh: the origin already sent a copy to every link serving the
+    // session, so re-flooding would only echo. See `GameChat`.
+    GameChat game_chat = 6;
   }
 }
 

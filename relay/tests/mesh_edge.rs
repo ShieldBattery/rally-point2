@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
-use rally_point_proto::messages::Payload;
+use rally_point_proto::messages::{GameChat, LobbyCommand, Payload};
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ClientPublicKey,
     ConnectionChallenge, ExpiresAt, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, Signature, SignedToken,
@@ -308,6 +308,300 @@ async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoi
         client,
         server,
     )
+}
+
+/// Connects a client to `relay` for `slot`, runs the authorization handshake,
+/// and returns the live connection plus the client endpoint (kept alive by the
+/// caller so the connection is not torn down when the endpoint drops).
+async fn connect_client(
+    relay: &Relay,
+    tenant: &Tenant,
+    session: SessionId,
+    slot: SlotId,
+) -> Result<(quinn::Connection, quinn::Endpoint), AnyError> {
+    let client_key = keypair();
+    let token = mint_token(tenant, session, slot, client_key.public);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay.ca.clone()).unwrap();
+    let client_cfg = client_config(roots).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut endpoint = quinn::Endpoint::client(bind).unwrap();
+    endpoint.set_default_client_config(client_cfg);
+    let connection = endpoint.connect(relay.addr, "localhost")?.await?;
+    handshake(&connection, &token, &client_key).await?;
+    Ok((connection, endpoint))
+}
+
+/// Opens a client's reliable control-stream halves: the send half it writes its
+/// own lobby commands on, and the reader that surfaces the frames the relay
+/// pushes down (lobby commands from the other members). Mirrors what a real
+/// `LinkDriver` sets up on the control stream.
+async fn open_lobby_streams(
+    connection: &quinn::Connection,
+) -> (
+    quinn::SendStream,
+    mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) {
+    let (send, _our_recv) = connection.open_bi().await.unwrap();
+    let rx = rally_point_transport::control::spawn_control_reader(connection.clone());
+    (send, rx)
+}
+
+/// Reads the next lobby command off a client's control reader within a short
+/// timeout, returning `(slot, payload_bytes)` — panicking on any other frame kind
+/// or on timeout, so a test asserts against a clean tuple.
+async fn next_lobby(
+    rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) -> (u32, Vec<u8>) {
+    let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no lobby command arrived within 2s")
+        .expect("control reader ended early");
+    match inbound {
+        rally_point_transport::control::ControlInbound::Lobby(command) => {
+            (command.slot, command.payload.to_vec())
+        }
+        other => panic!("expected a lobby command, got {other:?}"),
+    }
+}
+
+/// Reads the next game-chat message off a client's control reader within a
+/// short timeout, returning `(slot, target_kind, target_slot, text)` —
+/// panicking on any other frame kind or on timeout. Mirrors [`next_lobby`].
+async fn next_chat(
+    rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) -> (u32, u32, u32, String) {
+    let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no chat message arrived within 2s")
+        .expect("control reader ended early");
+    match inbound {
+        rally_point_transport::control::ControlInbound::Chat(chat) => {
+            (chat.slot, chat.target_kind, chat.target_slot, chat.text)
+        }
+        other => panic!("expected a chat message, got {other:?}"),
+    }
+}
+
+/// Dials relay A → relay B on the mesh ALPN, spawns a mesh-link driver on each
+/// side, joins `key` on both, and returns the two command senders plus the mesh
+/// client endpoint (kept alive by the caller). Factors the two-relay mesh setup
+/// the cross-relay tests share.
+async fn mesh_two_relays(
+    relay_a: &Relay,
+    relay_b: &mut Relay,
+    key: &SessionKey,
+) -> (
+    mpsc::UnboundedSender<mesh::MeshCommand>,
+    mpsc::UnboundedSender<mesh::MeshCommand>,
+    quinn::Endpoint,
+) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    mesh_ep.set_default_client_config(mesh_cfg);
+    let conn_a = mesh_ep
+        .connect(relay_b.addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let conn_b = relay_b
+        .mesh_rx
+        .recv()
+        .await
+        .expect("B dispatched mesh conn");
+
+    let cmds_a = spawn_mesh_link(
+        MeshLink::new(conn_a),
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+    );
+    let cmds_b = spawn_mesh_link(
+        MeshLink::new(conn_b),
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+    );
+    cmds_a.send(mesh::MeshCommand::Join(key.clone())).unwrap();
+    cmds_b.send(mesh::MeshCommand::Join(key.clone())).unwrap();
+    (cmds_a, cmds_b, mesh_ep)
+}
+
+/// A lobby command a member authors on relay A reaches both a same-relay peer and
+/// a cross-relay peer, in order and stamped with the author's slot; and a peer's
+/// own lobby command reaches the author. The full pre-game fan-out path across
+/// the mesh, driven by real relays and real client control streams.
+#[tokio::test]
+async fn lobby_commands_reach_same_relay_and_cross_relay_peers_in_order() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(1);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+
+    // Host (slot 0) and a same-relay peer (slot 2) on A; a cross-relay peer
+    // (slot 1) on B. All three are connected before any command flows, so each
+    // receives its peers' commands live.
+    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (peer_a, _ep2) = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
+    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+
+    let (mut host_send, mut host_rx) = open_lobby_streams(&host).await;
+    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(&peer_a).await;
+    let (mut peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+
+    // Let the mesh drivers open their sessions and every slot link register.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The host authors three setup commands (the wire slot is ignored — the relay
+    // stamps the authenticated slot 0).
+    for byte in [0x01u8, 0x02, 0x03] {
+        rally_point_transport::control::send_control_lobby(
+            &mut host_send,
+            LobbyCommand {
+                slot: 99,
+                payload: vec![byte].into(),
+            },
+        )
+        .await?;
+    }
+
+    // The same-relay peer receives all three, in order, stamped with the host's
+    // authoritative slot.
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x01]));
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x02]));
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x03]));
+
+    // The cross-relay peer receives all three across the mesh, in order, same
+    // slot stamp.
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x01]));
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x02]));
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x03]));
+
+    // A peer authors its own command; it reaches the host stamped with the
+    // peer's slot (1) — the relay never trusts the wire slot.
+    rally_point_transport::control::send_control_lobby(
+        &mut peer_b_send,
+        LobbyCommand {
+            slot: 42,
+            payload: vec![0xAA].into(),
+        },
+    )
+    .await?;
+    assert_eq!(next_lobby(&mut host_rx).await, (1, vec![0xAA]));
+
+    Ok(())
+}
+
+/// A member that dials in AFTER the host already sent its setup commands still
+/// receives the whole sequence, in order — the per-session replay log catches it
+/// up. Covers both a same-relay late dial (replayed from A's log) and a
+/// cross-relay one (replayed from B's log, fed by the mesh).
+#[tokio::test]
+async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(1);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+
+    // Only the host is connected. It sends its setup commands before any peer
+    // exists — the relay logs them (and fans copies across the mesh, which relay
+    // B logs too).
+    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    for byte in [0x01u8, 0x02, 0x03] {
+        rally_point_transport::control::send_control_lobby(
+            &mut host_send,
+            LobbyCommand {
+                slot: 0,
+                payload: vec![byte].into(),
+            },
+        )
+        .await?;
+    }
+    // Give the commands time to reach and append to both relays' logs.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // A same-relay peer dials late: it replays A's log in order.
+    let (peer_a, _ep2) = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
+    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(&peer_a).await;
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x01]));
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x02]));
+    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x03]));
+
+    // A cross-relay peer dials late: it replays B's log (fed by the mesh) in order.
+    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x01]));
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x02]));
+    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x03]));
+
+    Ok(())
+}
+
+/// A game-chat message a member authors on relay A reaches a cross-relay peer on
+/// relay B, in order, stamped with the author's slot and with its scope fields
+/// (`target_kind`/`target_slot`) preserved verbatim across the mesh hop — the
+/// relay never interprets them. The full mid-game chat fan-out path across the
+/// mesh, driven by real relays and real client control streams, mirroring the
+/// lobby-command cross-relay test.
+#[tokio::test]
+async fn game_chat_reaches_a_cross_relay_peer_through_the_mesh() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(2);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+
+    // The sender (slot 0) is on A; the receiver (slot 1) is on B.
+    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+
+    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+
+    // Let the mesh drivers open their sessions and both slot links register.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The host authors a scoped chat message (the wire slot is ignored — the
+    // relay stamps the authenticated slot 0).
+    rally_point_transport::control::send_control_chat(
+        &mut host_send,
+        GameChat {
+            slot: 99,
+            target_kind: 1,
+            target_slot: 4,
+            text: "flanking from the north".to_owned(),
+        },
+    )
+    .await?;
+
+    // The cross-relay peer receives it across the mesh, stamped with the host's
+    // authoritative slot, its scope fields intact.
+    assert_eq!(
+        next_chat(&mut peer_b_rx).await,
+        (0, 1, 4, "flanking from the north".to_owned()),
+    );
+
+    Ok(())
 }
 
 /// A link that served a session, went empty, and stayed empty past

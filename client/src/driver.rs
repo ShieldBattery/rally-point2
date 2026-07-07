@@ -40,6 +40,15 @@
 //! result has gone out first, so the result frame precedes the intent on the one
 //! ordered control stream; the leave-intent safety timeout still bounds the hold.
 //!
+//! The driver also carries the game's in-game chat, the mid-game counterpart to
+//! lobby commands: the game authors a message on [`TurnChannels::chat_out`] and
+//! the driver writes it up the control stream at once — no drain to wait behind,
+//! unlike a turn; other members' messages arrive on [`TurnChannels::chat_in`],
+//! tagged with the author's slot. Unlike a lobby command, a failed chat send is
+//! not correctness-critical: the driver logs it and keeps running rather than
+//! treating it as a link failure, the same best-effort treatment the result
+//! report gets.
+//!
 //! Delivery to the game is **in seq order**. The link dedups and orders within a
 //! datagram but follows arrival order across datagrams, so the driver buffers
 //! received turns by transport seq and releases only the contiguous prefix — the
@@ -57,11 +66,11 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload};
+use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payload};
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::control::{
-    ControlInbound, ControlSendError, send_control_game_result, send_control_turn,
-    spawn_control_reader,
+    ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
+    send_control_lobby, send_control_turn, spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
@@ -88,6 +97,17 @@ const LEAVE_INTENT_CHANNEL_CAPACITY: usize = 1;
 /// end-of-game report at most once, so capacity 1 is enough; the driver sends
 /// the first payload and drops any extra.
 const RESULT_CHANNEL_CAPACITY: usize = 1;
+
+/// Depth of each lobby-command channel between the game thread and the driver.
+/// Lobby commands flow only during pre-game setup — a burst of slot/color
+/// assignments and the game-init, then silence — so a generous backstop against
+/// a scheduling hiccup is ample; it is not a tuned buffer.
+const LOBBY_CHANNEL_CAPACITY: usize = 256;
+
+/// Depth of each chat channel between the game thread and the driver. Chat is
+/// bursty but small (a human typing), so a generous backstop against a
+/// scheduling hiccup is ample here too; it is not a tuned buffer.
+const CHAT_CHANNEL_CAPACITY: usize = 256;
 
 /// How long the driver waits, after the game signals its departure, for the
 /// outbound queue and unacked window to drain before announcing the leave
@@ -127,6 +147,23 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 /// reject, with margin for the packets in flight between the trip and any
 /// retirement the beacon could still deliver.
 const UNACKED_WINDOW_CAP: usize = 1024;
+
+/// One in-game chat message the game authored, to send up to the relay for the
+/// other members. Mirrors `GameChat`'s wire shape minus the author `slot` —
+/// the relay stamps that, exactly as it does for a lobby command, so the caller
+/// never sets it. `target_kind`/`target_slot` are opaque scope hints the relay
+/// never interprets (see `GameChat` in wire.proto); the driver just carries
+/// them through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatOut {
+    /// A scope hint for which members should display this message: 0 = all,
+    /// 1 = allies, 2 = observers, 3 = a single named player (see `target_slot`).
+    pub target_kind: u32,
+    /// The recipient slot a `target_kind` of 3 names; meaningless otherwise.
+    pub target_slot: u32,
+    /// The chat line's text, UTF-8.
+    pub text: String,
+}
 
 /// The game thread's end of the turn channels to a running [`LinkDriver`].
 ///
@@ -172,6 +209,35 @@ pub struct TurnChannels {
     /// intent frame on the wire. Left `false` when no result is expected, and the
     /// intent is not held at all.
     pub result_expected: Arc<AtomicBool>,
+    /// Lobby commands this game authored, to send up to the relay for the other
+    /// members. The driver wraps each in a `LobbyCommand` and writes it up the
+    /// reliable control stream at once — the relay stamps the authoring slot, so
+    /// the caller leaves that to the relay and just hands over the bytes. Used
+    /// only during pre-game setup; once the game starts, commands move to
+    /// `outbound` (the datagram turn path).
+    pub lobby_out: mpsc::Sender<Vec<u8>>,
+    /// Lobby commands other members authored, as the relay fanned them down the
+    /// reliable control stream, each tagged with its authoring slot. The game
+    /// applies each to that member's lobby turn. The relay never echoes this
+    /// client's own commands back (the game echoes those locally), and a member
+    /// whose stream comes up after commands already flowed receives the relay's
+    /// replay of the earlier ones here, in order, before the live ones.
+    pub lobby_in: mpsc::Receiver<(SlotId, Vec<u8>)>,
+    /// In-game chat messages this game authored, to send up to the relay for
+    /// the other members. The driver wraps each in a `GameChat` and writes it
+    /// up the reliable control stream at once — no drain to wait behind, unlike
+    /// a turn — and the relay stamps the authoring slot, so the caller leaves
+    /// that to the relay. Unlike [`lobby_out`](Self::lobby_out), this stays live
+    /// for the whole game, not just pre-game setup. A send failure is
+    /// best-effort: the driver logs it and continues rather than surfacing a
+    /// [`DriverError`], since a lost chat line is not correctness-critical.
+    pub chat_out: mpsc::Sender<ChatOut>,
+    /// Chat messages other members authored, as the relay fanned them down the
+    /// reliable control stream, each tagged with its authoring slot. There is no
+    /// replay here (unlike [`lobby_in`](Self::lobby_in)) — chat is ephemeral, so
+    /// a member whose stream comes up after a message already flowed simply
+    /// never sees it.
+    pub chat_in: mpsc::Receiver<(SlotId, ChatOut)>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -196,6 +262,16 @@ pub struct LinkDriver {
     /// Whether the game will produce a result report; holds a pending leave
     /// intent until the result is sent so the result frame precedes it.
     result_expected: Arc<AtomicBool>,
+    /// Lobby commands the game authored, to send up the control stream.
+    lobby_out: mpsc::Receiver<Vec<u8>>,
+    /// Lobby commands other members authored (relay-stamped with their author
+    /// slot), to hand to the game thread.
+    lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
+    /// Chat messages the game authored, to send up the control stream.
+    chat_out: mpsc::Receiver<ChatOut>,
+    /// Chat messages other members authored (relay-stamped with their author
+    /// slot), to hand to the game thread.
+    chat_in: mpsc::Sender<(SlotId, ChatOut)>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -251,6 +327,12 @@ impl LinkDriver {
         // The game hands over its result report at most once.
         let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let result_expected = Arc::new(AtomicBool::new(false));
+        // Lobby commands flow in both directions during pre-game setup.
+        let (lobby_out_tx, lobby_out_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
+        let (lobby_in_tx, lobby_in_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
+        // Chat flows in both directions for the whole game, unlike lobby.
+        let (chat_out_tx, chat_out_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        let (chat_in_tx, chat_in_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
         let driver = Self {
             link,
             outbound: outbound_rx,
@@ -259,6 +341,10 @@ impl LinkDriver {
             leave_intent: leave_intent_rx,
             result: result_rx,
             result_expected: Arc::clone(&result_expected),
+            lobby_out: lobby_out_rx,
+            lobby_in: lobby_in_tx,
+            chat_out: chat_out_rx,
+            chat_in: chat_in_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -267,6 +353,10 @@ impl LinkDriver {
             leave_intent: leave_intent_tx,
             result: result_tx,
             result_expected,
+            lobby_out: lobby_out_tx,
+            lobby_in: lobby_in_rx,
+            chat_out: chat_out_tx,
+            chat_in: chat_in_rx,
         };
         (driver, channels)
     }
@@ -297,6 +387,10 @@ impl LinkDriver {
             mut leave_intent,
             mut result,
             result_expected,
+            mut lobby_out,
+            lobby_in,
+            mut chat_out,
+            chat_in,
         } = self;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -387,6 +481,19 @@ impl LinkDriver {
         // or the sender dropping without one — rather than spinning on a closed
         // channel.
         let mut result_alive = true;
+
+        // Whether the game's lobby-command sender is still live. Unlike the
+        // single-shot channels above, lobby commands stream during setup, so this
+        // disarms only on the sender dropping (a `None`) — the game finished
+        // authoring lobby commands (the game started, or it left) — after which
+        // `recv()` is an always-ready `None` that would spin the loop.
+        let mut lobby_out_alive = true;
+
+        // Whether the game's chat sender is still live. Unlike lobby, chat
+        // streams for the whole game, not just pre-game setup, but the disarm
+        // rule is the same: only on the sender dropping (a `None`), after which
+        // `recv()` is an always-ready `None` that would spin the loop.
+        let mut chat_out_alive = true;
 
         loop {
             // Armed only once the game has signaled its departure (the announcer
@@ -484,6 +591,56 @@ impl LinkDriver {
                             tracing::warn!(
                                 "ignoring unexpected relay-sent game-result control frame"
                             );
+                        }
+                        // A lobby command another member authored, relay-stamped
+                        // with the author's slot. Hand it to the game tagged with
+                        // that slot so it applies the bytes to that member's lobby
+                        // turn. Replayed earlier commands and live ones arrive on
+                        // this one path, in order. Dropping it (game gone) is a
+                        // clean shutdown.
+                        Some(ControlInbound::Lobby(command)) => {
+                            // A slot id past `u8` range names no real member; a
+                            // truncating cast would misattribute the command. Drop
+                            // it (defensive — the relay stamps a real slot).
+                            let Ok(slot_id) = u8::try_from(command.slot) else {
+                                tracing::warn!(
+                                    slot = command.slot,
+                                    "lobby command names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            if lobby_in
+                                .send((SlotId(slot_id), command.payload.to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        // An in-game chat message another member authored,
+                        // relay-stamped with the author's slot — the mid-game
+                        // counterpart to the lobby branch above. No replay here
+                        // (chat keeps no log): every message that arrives on
+                        // this path is live. Dropping it (game gone) is a clean
+                        // shutdown.
+                        Some(ControlInbound::Chat(chat)) => {
+                            // As above: a slot id past `u8` range names no real
+                            // member; drop it rather than misattribute it.
+                            let Ok(slot_id) = u8::try_from(chat.slot) else {
+                                tracing::warn!(
+                                    slot = chat.slot,
+                                    "game-chat message names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            let out = ChatOut {
+                                target_kind: chat.target_kind,
+                                target_slot: chat.target_slot,
+                                text: chat.text,
+                            };
+                            if chat_in.send((SlotId(slot_id), out)).await.is_err() {
+                                return Ok(());
+                            }
                         }
                         Some(ControlInbound::OversizeTurn(payload)) => {
                             // As on the datagram path: a slot id past `u8` range
@@ -659,6 +816,64 @@ impl LinkDriver {
                         // one over: nothing to send, and the leave-intent hold is
                         // still bounded by the safety timeout.
                         None => result_alive = false,
+                    }
+                }
+                // A lobby command the game authored during setup. Send it up the
+                // reliable control stream at once — setup runs before any turn
+                // barrier exists, so there is nothing to drain behind. The relay
+                // stamps this client's authenticated slot (the `0` here is
+                // ignored) and fans it to the other members. Disarmed when the
+                // game drops its sender (setup finished). A send failure means the
+                // stream (and almost certainly the connection) is gone; a dropped
+                // setup command would leave a member's pre-game state incomplete,
+                // so it is the same reconnect trigger as an undeliverable oversize
+                // turn — except once our leave intent is out, the relay closing
+                // the stream under this write is the expected confirmation.
+                bytes = lobby_out.recv(), if lobby_out_alive => {
+                    match bytes {
+                        Some(bytes) => {
+                            let command = LobbyCommand {
+                                slot: 0,
+                                payload: bytes.into(),
+                            };
+                            if let Err(error) =
+                                send_control_lobby(&mut control_send, command).await
+                            {
+                                return announcer
+                                    .absorb_link_close(Err(DriverError::from(error)));
+                            }
+                        }
+                        None => lobby_out_alive = false,
+                    }
+                }
+                // A chat message the game authored — the mid-game counterpart to
+                // the lobby branch above. Sent at once, same as a lobby command:
+                // chat has no turn barrier or drain to wait behind either. Unlike
+                // a lobby command, though, a send failure here is NOT treated as
+                // a link failure: chat has no pre-game state a lost message
+                // could leave incomplete, so this is best-effort like a
+                // `GameResult` send — log it and keep the driver running rather
+                // than tearing the session down over a dropped chat line.
+                // Disarmed only when the game drops its sender (chat streams for
+                // the whole game, unlike lobby).
+                chat = chat_out.recv(), if chat_out_alive => {
+                    match chat {
+                        Some(ChatOut { target_kind, target_slot, text }) => {
+                            let message = GameChat {
+                                slot: 0,
+                                target_kind,
+                                target_slot,
+                                text,
+                            };
+                            if let Err(error) = send_control_chat(&mut control_send, message).await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    "game-chat send failed; dropping the message"
+                                );
+                            }
+                        }
+                        None => chat_out_alive = false,
                     }
                 }
                 // Safety timeout: the game signaled its departure but the

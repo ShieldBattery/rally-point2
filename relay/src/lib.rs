@@ -10,6 +10,12 @@
 //!   control commands.
 //! - **routing** ([`routing`]) — group authorized connections by session and fan
 //!   each validated turn out to that session's other slots.
+//! - **lobby** ([`lobby`]) — fan pre-game lobby commands out to a session's local
+//!   members and keep the per-session ordered replay log a late-joining member
+//!   catches up from.
+//! - **chat** ([`chat`]) — fan in-game chat messages out to a session's local
+//!   members. The mid-game counterpart to `lobby`: no replay log (chat is
+//!   ephemeral), plus a per-slot size and rate cap enforced at the relay.
 //! - **server** ([`server`]) — the client-facing accept loop tying the three
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
@@ -44,8 +50,10 @@
 //! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
+pub mod chat;
 pub mod config;
 pub mod coordinator_client;
+pub mod lobby;
 pub mod mesh;
 pub mod mesh_control;
 pub mod mesh_dialer;

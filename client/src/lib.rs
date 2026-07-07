@@ -27,11 +27,11 @@
 //! synced player-leave directives that ride the same envelope: at-most-one leave
 //! per slot, surfaced at its apply frame.
 //!
-//! TODO: chat/resync frame kinds on the control stream (the stream and its
-//! extensible `ControlFrame` framing exist; oversize turns are its first
-//! resident); reconnect + resync-from-cursor (the unacked-window cap that
-//! triggers it is in place, the mechanism is gated on the open failover
-//! design).
+//! TODO: resync frame kinds on the control stream (the stream and its
+//! extensible `ControlFrame` framing exist; oversize turns, lobby commands, and
+//! in-game chat are residents already); reconnect + resync-from-cursor (the
+//! unacked-window cap that triggers it is in place, the mechanism is gated on
+//! the open failover design).
 
 /// Re-export of the shared protocol contracts, so consumers depend on a single
 /// `rally_point_client` surface rather than pulling in `rally-point-proto`
@@ -51,6 +51,6 @@ mod leave_announcer;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
-pub use driver::{DriverError, LinkDriver, TurnChannels};
+pub use driver::{ChatOut, DriverError, LinkDriver, TurnChannels};
 pub use identity::{Identity, IdentityError};
 pub use leave::LeaveTracker;

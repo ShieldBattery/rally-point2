@@ -487,6 +487,8 @@ pub async fn run_slot_link(
         conditions,
         decision_makers,
         presence,
+        lobby,
+        chat,
     } = mesh;
 
     // This client joining may change who decides the session's buffer — most
@@ -543,6 +545,27 @@ pub async fn run_slot_link(
     // roster while the slot is registered, so `None` is unreachable during the
     // loop; the flag disarms the branch defensively so a closed channel can't spin.
     let mut leave_push_alive = true;
+    // Register this member for lobby fan-out now that its control stream is up:
+    // it starts receiving other members' lobby commands, and — crucially — the
+    // per-session replay log is snapshotted into `lobby_rx` under the lobby lock
+    // right here, so a member that joined after the host already sent its setup
+    // commands catches up on every earlier command, in order, before any live
+    // one. The exactly-once handoff is the lobby module's (append + fan-out and
+    // register + snapshot share one lock); this task just drains `lobby_rx` in the
+    // branch below and writes each command down its own control stream.
+    let mut lobby_rx = crate::lobby::register_member(&lobby, &key, slot);
+    // Mirrors `leave_push_alive`: this member's lobby sender lives in the lobby
+    // registry until its own teardown drops it, so a `None` is unreachable during
+    // the loop; the flag disarms the branch defensively.
+    let mut lobby_alive = true;
+    // Register this member for chat fan-out too — the mid-game counterpart to
+    // the lobby registration above. No log to snapshot: chat keeps none, so this
+    // member simply starts tailing whatever other members send from here on.
+    let mut chat_rx = crate::chat::register_member(&chat, &key, slot);
+    // Mirrors `lobby_alive`: this member's chat sender lives in the chat
+    // registry until its own teardown drops it, so a `None` is unreachable
+    // during the loop; the flag disarms the branch defensively.
+    let mut chat_alive = true;
     // The highest cursor the relay has pushed to the client, per slot. Push only
     // on advance.
     let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
@@ -708,6 +731,70 @@ pub async fn run_slot_link(
                         }
                     }
                     None => leave_push_alive = false,
+                }
+            }
+            // A lobby command another member authored (or the replay of an earlier
+            // one), to push down this client's reliable control stream. Like a
+            // leave, it rides the reliable stream because a lobby has no datagram
+            // turn flow to piggyback on; unlike a leave, this branch also drains
+            // the per-session replay log that `register_member` queued here, so an
+            // early command and a live one write down the stream on one ordered
+            // path. The `slot` is the relay-stamped author, so the receiving game
+            // attributes the bytes correctly.
+            pushed = lobby_rx.recv(), if lobby_alive => {
+                match pushed {
+                    Some(command) => {
+                        if let Err(error) = rally_point_transport::control::send_control_lobby(
+                            &mut control_send,
+                            command,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "lobby control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => lobby_alive = false,
+                }
+            }
+            // A game-chat message another member authored (or a mesh-forwarded
+            // one), to push down this client's reliable control stream — the
+            // mid-game counterpart to the lobby branch above. Unlike lobby, there
+            // is no replay log to drain first: this branch only ever tails live
+            // messages, so a member whose stream comes up after a message
+            // already flowed simply never sees it. A write failure here ends the
+            // link exactly like every other control-stream write in this loop —
+            // the underlying stream is dead regardless of which frame kind hit
+            // it — which is a different call than the client-edge driver makes
+            // for its own *outbound* chat sends (best-effort, logged and
+            // ignored): there, the link may still be otherwise healthy; here,
+            // the failure *is* evidence the link is not.
+            pushed = chat_rx.recv(), if chat_alive => {
+                match pushed {
+                    Some(chat_msg) => {
+                        if let Err(error) = rally_point_transport::control::send_control_chat(
+                            &mut control_send,
+                            chat_msg,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "chat control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => chat_alive = false,
                 }
             }
             forwarded = forward_rx.recv() => {
@@ -952,6 +1039,37 @@ pub async fn run_slot_link(
                             consensus::record_result(&decision_makers, &key, slot, payload.to_vec());
                         }
                     }
+                    // The client's lobby command. Bind it to the authenticated
+                    // slot — never the client-asserted `slot` on the wire, exactly
+                    // as `validate_turn` rebinds a turn's slot — then deliver it to
+                    // local members (appended to the per-session replay log and
+                    // fanned to every other local member; the author is not echoed,
+                    // its own game echoes locally) and forward one copy across each
+                    // mesh link serving the session so peer relays fan it to their
+                    // locals. The bytes are opaque; the relay frames nothing of its
+                    // own around them.
+                    Some(ControlInbound::Lobby(mut command)) => {
+                        command.slot = u32::from(slot.0);
+                        crate::lobby::deliver(&lobby, &key, command.clone());
+                        crate::mesh::fan_out_lobby_command(&mesh_links, &key, command);
+                    }
+                    // The client's in-game chat message. Admit it against the
+                    // relay's size and rate caps first — either failure drops
+                    // the message without closing the link, since a lost chat
+                    // line is not correctness-critical the way a turn or lobby
+                    // command is. An admitted message is bound to the
+                    // authenticated slot — never the client-asserted `slot` on
+                    // the wire, exactly as a lobby command is — then delivered
+                    // to local members (no replay log; the author is not
+                    // echoed) and forwarded once across each mesh link serving
+                    // the session.
+                    Some(ControlInbound::Chat(mut chat_msg)) => {
+                        if crate::chat::admit(&chat, &key, slot, chat_msg.text.len()) {
+                            chat_msg.slot = u32::from(slot.0);
+                            crate::chat::deliver(&chat, &key, chat_msg.clone());
+                            crate::mesh::fan_out_chat(&mesh_links, &key, chat_msg);
+                        }
+                    }
                     None => control_alive = false,
                 }
             }
@@ -1038,6 +1156,15 @@ fn end_slot_link(
     slot: SlotId,
     leave_announced: bool,
 ) {
+    // Drop this member's lobby-push channel before the roster deregister below.
+    // The roster refuses a duplicate slot, so a reconnecting slot cannot register
+    // (and re-register its lobby member) until this deregister frees the roster
+    // slot — doing the lobby deregister first keeps a fresh connection's
+    // `register_member` from being clobbered by this one's cleanup.
+    crate::lobby::deregister_member(&mesh.lobby, key, slot);
+    // Same rationale for chat: deregister before the roster frees the slot, so
+    // a reconnect can't clobber this connection's cleanup.
+    crate::chat::deregister_member(&mesh.chat, key, slot);
     let session_emptied = deregister(sessions, key, slot);
     crate::mesh::unpublish_conditions(&mesh.conditions, key, slot);
     // Trigger A (synced player-leave): this client's link ended, so it has left
@@ -1092,6 +1219,12 @@ fn end_slot_link(
     // webhook rests on.
     if session_emptied {
         consensus::session_closed(&mesh.decision_makers, key);
+        // The relay's last local member for the session is gone, so its lobby log
+        // and (now-empty) member set can be dropped — mirroring how the roster
+        // group is dropped when its last slot leaves.
+        crate::lobby::end_session(&mesh.lobby, key);
+        // Same for chat's (log-free) per-session state.
+        crate::chat::end_session(&mesh.chat, key);
     }
 }
 
