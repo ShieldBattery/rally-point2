@@ -62,6 +62,7 @@ pub mod mesh_edge;
 pub mod presence;
 pub mod routing;
 pub mod server;
+pub mod turn_ring;
 pub mod validation;
 
 pub mod consensus;

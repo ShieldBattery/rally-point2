@@ -136,6 +136,10 @@ async fn handshake(
         signing_key.sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(&response).await?;
 
+    // A fresh dial presents no resume cursors: an empty (zero-count) frame.
+    let cursor_frame = rally_point_proto::handshake::encode_resume_cursors(&[])?;
+    send.write_all(&cursor_frame).await?;
+
     let mut ack = [0u8; 1];
     recv.read_exact(&mut ack).await?;
     if ack[0] != HANDSHAKE_OK {
@@ -871,6 +875,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
         &relay_a.mesh.links,
         &relay_a.mesh.seen,
         &relay_a.mesh.decision_makers,
+        &relay_a.mesh.turn_ring,
         &key,
         SlotId(0),
         oversize.clone(),

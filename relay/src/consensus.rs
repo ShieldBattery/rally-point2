@@ -2443,6 +2443,14 @@ impl DecisionMaker {
         self.slots.get(&slot).and_then(|s| s.frame)
     }
 
+    /// Whether a departure has been recorded for `slot` — its link ended (a drop or
+    /// a clean leave), which retired it from the live slot set. Distinguishes a slot
+    /// the game has moved on from (or is holding a grace over) from one that never
+    /// departed, so a re-register can tell a resumable reconnect from a decided one.
+    pub fn has_departure(&self, slot: SlotId) -> bool {
+        self.departures.contains_key(&slot)
+    }
+
     /// This relay's known leave state for re-announcing to a freshly (re)joined
     /// mesh link: every recorded departure (slot, last frame, reachable ceiling,
     /// embedded result, reason) and every cached leave, unconditionally. A redialed
@@ -3370,6 +3378,17 @@ pub fn slot_frame(
         .lock()
         .get(key)
         .and_then(|maker| maker.slot_frame(slot))
+}
+
+/// Whether a departure has been recorded for `slot` in `key`'s decision-maker (see
+/// [`DecisionMaker::has_departure`]). `false` when no maker exists for the session.
+/// Read at re-register time to tell a resumable reconnect (a departure held under a
+/// live drop grace) from a decided one (a departure whose grace already fired).
+pub fn slot_departed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.has_departure(slot))
 }
 
 /// Fires a session-closed notice up the coordinator connection: this relay has

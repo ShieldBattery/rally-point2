@@ -128,9 +128,11 @@ impl LeaveGrace {
         self.pending.lock().remove(&(key.clone(), slot));
     }
 
-    /// Whether a hold is currently running for `(key, slot)` — for tests that
-    /// assert a drop armed a grace and a clean leave cancelled it.
-    #[cfg(test)]
+    /// Whether a hold is currently running for `(key, slot)`. Read at re-register
+    /// time to tell a client returning within its drop grace (a hold is pending, so
+    /// cancel it and resume) from one whose leave was already decided (no hold, so
+    /// refuse), and in tests that assert a drop armed a grace and a clean leave
+    /// cancelled it.
     pub fn is_pending(&self, key: &SessionKey, slot: SlotId) -> bool {
         self.pending.lock().contains_key(&(key.clone(), slot))
     }

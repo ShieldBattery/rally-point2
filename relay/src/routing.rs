@@ -672,6 +672,7 @@ pub async fn run_slot_link(
     mut link: Link,
     key: SessionKey,
     slot: SlotId,
+    resume_cursors: std::collections::HashMap<SlotId, u64>,
     inbox: SlotInbox,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
@@ -696,6 +697,7 @@ pub async fn run_slot_link(
         lobby,
         chat,
         leave_grace,
+        turn_ring,
     } = mesh;
 
     // This client joining may change who decides the session's buffer — most
@@ -824,6 +826,32 @@ pub async fn run_slot_link(
     // fresh packets can't re-carry is still retransmitted.
     let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
 
+    // Replay to a reconnecting client the turns it missed while it was gone. A fresh
+    // dial presents no resume cursors, so this replays nothing; a reconnect presents
+    // its per-peer-slot delivery position, and every recorded turn at or past a
+    // slot's cursor is written down the reliable control stream, oldest-first. They
+    // ride the stream as ordinary oversize-turn frames — the same path the client
+    // already folds back into its per-slot reorder buffer — so the replayed turns
+    // splice ahead of the live datagram turns that resume once this loop runs, and
+    // the client's per-slot seq ordering holds regardless of which path delivered
+    // each turn. Done before the serve loop so no live forward can outrun the
+    // replay on the control stream.
+    for payload in turn_ring.replay(&key, &resume_cursors) {
+        if let Err(error) =
+            rally_point_transport::control::send_control_turn(&mut control_send, payload).await
+        {
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                %error,
+                "replaying a missed turn to a reconnecting client failed; closing slot link",
+            );
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            return;
+        }
+    }
+
     'serve: loop {
         tokio::select! {
             received = link.recv() => {
@@ -893,6 +921,7 @@ pub async fn run_slot_link(
                                 &mesh_links,
                                 &seen_registries,
                                 &decision_makers,
+                                &turn_ring,
                                 &key,
                                 slot,
                                 payload,
@@ -1306,6 +1335,7 @@ pub async fn run_slot_link(
                                     &mesh_links,
                                     &seen_registries,
                                     &decision_makers,
+                                    &turn_ring,
                                     &key,
                                     slot,
                                     payload,
@@ -1542,6 +1572,9 @@ fn end_slot_link(
         crate::lobby::end_session(&mesh.lobby, key);
         // Same for chat's (log-free) per-session state.
         crate::chat::end_session(&mesh.chat, key);
+        // Same for the forwarded-turn replay ring: no local slot remains to resume,
+        // so nothing more will be replayed from it.
+        mesh.turn_ring.end_session(key);
     }
 }
 
@@ -1899,6 +1932,7 @@ mod tests {
         let mesh_links = crate::mesh::new_mesh_links();
         let seen = crate::mesh::new_seen_registries();
         let makers = Arc::new(consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
         let k = key();
 
         // This relay is not the session's authority: its own maker never has a
@@ -1932,6 +1966,7 @@ mod tests {
             &mesh_links,
             &seen,
             &makers,
+            &turn_ring,
             &k,
             SlotId(0),
             stamped,
@@ -1985,6 +2020,7 @@ mod tests {
             &mesh_links,
             &seen,
             &makers,
+            &turn_ring,
             &k,
             SlotId(0),
             duplicate,

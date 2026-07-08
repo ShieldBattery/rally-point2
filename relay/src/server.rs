@@ -19,11 +19,21 @@ use rally_point_transport::quinn::{self, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry};
+use crate::consensus;
 use crate::routing::{self, SessionKey, Sessions};
 
 /// QUIC application close code for a connection whose authorized slot is already
 /// connected by another client.
 const SLOT_TAKEN_CLOSE: u32 = 0x02;
+
+/// QUIC application close code for a re-register the relay refuses because the
+/// slot's leave was already decided — its drop grace expired, or it left cleanly —
+/// so the game has moved on without it. Distinct from every transport-error close
+/// so a reconnecting client can tell "you were dropped, the session is over for
+/// you" from a mere connection failure and stop retrying. Contrast
+/// [`SLOT_TAKEN_CLOSE`], which means the slot is *still connected* by a live
+/// connection (a genuine double-connect), not gone.
+pub const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
@@ -57,6 +67,15 @@ enum ConnError {
     /// The authorized slot was already taken by another live connection.
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} is already connected")]
     SlotTaken {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// The authorized slot re-registered after its leave was already decided (the
+    /// drop grace expired, or it left cleanly) — too late to resume, so the
+    /// re-register is refused terminally.
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} already departed the game")]
+    SlotDeparted {
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
@@ -203,17 +222,17 @@ async fn serve_connection(
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
     let handshake = auth::authenticate(&connection, registry, unix_now());
-    let (authorized, mut handshake_send) = match tokio::time::timeout(AUTH_TIMEOUT, handshake).await
-    {
-        Ok(result) => result?,
-        Err(_elapsed) => {
-            connection.close(
-                VarInt::from_u32(AUTH_TIMEOUT_CLOSE),
-                b"authorization timed out",
-            );
-            return Err(ConnError::AuthTimeout);
-        }
-    };
+    let (authorized, resume_cursors, mut handshake_send) =
+        match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                connection.close(
+                    VarInt::from_u32(AUTH_TIMEOUT_CLOSE),
+                    b"authorization timed out",
+                );
+                return Err(ConnError::AuthTimeout);
+            }
+        };
 
     drop(handshake_permit);
 
@@ -221,6 +240,34 @@ async fn serve_connection(
         tenant: authorized.tenant.clone(),
         session: authorized.session,
     };
+
+    // Classify a re-register against the slot's departure state before touching the
+    // roster. A slot whose link died is deregistered before its drop grace is armed,
+    // so its roster seat is free either way — the departure record and the grace,
+    // not the roster, tell a resumable reconnect apart from a decided one:
+    //   - a departure recorded AND its drop grace still in flight → the client is
+    //     returning within the grace: cancel the grace below and register it as a
+    //     normal reconnection (the session-start re-push and connectivity fan-out
+    //     that a register already fires are exactly what a resume needs);
+    //   - a departure recorded AND no grace pending → the leave was already decided
+    //     (grace expired, or a clean leave): the game has moved on without this
+    //     slot, so refuse the re-register terminally with a close the client can
+    //     distinguish from a transport error;
+    //   - no departure recorded → a fresh dial (or a still-live double-connect the
+    //     roster refuses below): the ordinary path.
+    let departed = consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot);
+    let grace_pending = mesh.leave_grace.is_pending(&key, authorized.slot);
+    if departed && !grace_pending {
+        connection.close(
+            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+            b"slot already departed",
+        );
+        return Err(ConnError::SlotDeparted {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    }
 
     let Some((mut registration, inbox)) = routing::register(&sessions, &key, authorized.slot)
     else {
@@ -234,6 +281,21 @@ async fn serve_connection(
             slot: authorized.slot,
         });
     };
+
+    // The slot is ours now, so cancel any in-flight drop grace: this client came
+    // back within the window, so its held leave must never fire. The mesh half of
+    // the cancel — a peer-homed authority holding its own grace — rides the
+    // connectivity(true) that `run_slot_link` broadcasts on register (see the mesh
+    // `SlotConnectivity` handler); this call covers this relay's own hold.
+    if departed && grace_pending {
+        mesh.leave_grace.cancel(&key, authorized.slot);
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = authorized.slot.0,
+            "client re-registered within its drop grace; cancelling the held leave",
+        );
+    }
 
     handshake_send
         .write_all(&[HANDSHAKE_OK])
@@ -253,6 +315,7 @@ async fn serve_connection(
         Link::new(connection),
         key,
         authorized.slot,
+        resume_cursors,
         inbox,
         sessions,
         mesh,

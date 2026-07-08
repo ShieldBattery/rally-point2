@@ -153,6 +153,10 @@ async fn authorize(
         signing_key.sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(response.as_ref()).await?;
 
+    // A fresh dial presents no resume cursors: an empty (zero-count) frame.
+    let cursor_frame = rally_point_proto::handshake::encode_resume_cursors(&[])?;
+    send.write_all(&cursor_frame).await?;
+
     let mut ack = [0u8; 1];
     recv.read_exact(&mut ack).await?;
     if ack[0] != HANDSHAKE_OK {

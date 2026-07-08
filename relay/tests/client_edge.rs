@@ -161,14 +161,18 @@ fn registry_for(tenants: &[&Tenant]) -> Registry {
 }
 
 /// Runs the client side of the handshake on `connection`: present `token`, answer
-/// the relay's challenge with `signing_key`, and confirm the acknowledgement.
+/// the relay's challenge with `signing_key`, present `resume_cursors`, and confirm
+/// the acknowledgement.
 ///
 /// `signing_key` is passed separately from the token's embedded public key so a
-/// test can deliberately answer with the wrong key.
+/// test can deliberately answer with the wrong key. `resume_cursors` is the
+/// per-peer-slot delivery position a reconnecting client resumes from; a fresh dial
+/// passes an empty slice.
 async fn handshake(
     connection: &quinn::Connection,
     token: &SignedToken,
     signing_key: &Keypair,
+    resume_cursors: &[(SlotId, u64)],
 ) -> Result<(), AnyError> {
     let (mut send, mut recv) = connection.open_bi().await?;
 
@@ -187,6 +191,9 @@ async fn handshake(
         signing_key.sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(&response).await?;
 
+    let cursor_frame = rally_point_proto::handshake::encode_resume_cursors(resume_cursors)?;
+    send.write_all(&cursor_frame).await?;
+
     let mut ack = [0u8; 1];
     recv.read_exact(&mut ack).await?;
     if ack[0] != HANDSHAKE_OK {
@@ -195,8 +202,9 @@ async fn handshake(
     Ok(())
 }
 
-/// Connects a client for `slot`, completes the handshake, and returns the
-/// connection wrapped as a transport link ready to carry turns.
+/// Connects a client for `slot`, completes the handshake as a fresh dial (no resume
+/// cursors), and returns the connection wrapped as a transport link ready to carry
+/// turns.
 async fn connect_slot(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
@@ -204,10 +212,25 @@ async fn connect_slot(
     session: SessionId,
     slot: SlotId,
 ) -> Link {
+    connect_slot_resuming(endpoint, addr, tenant, session, slot, &[]).await
+}
+
+/// [`connect_slot`] presenting `resume_cursors`, so a reconnect test can ask the
+/// relay to replay the turns it missed from each named peer slot.
+async fn connect_slot_resuming(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+    tenant: &Tenant,
+    session: SessionId,
+    slot: SlotId,
+    resume_cursors: &[(SlotId, u64)],
+) -> Link {
     let client_key = keypair();
     let token = mint_token(tenant, session, slot, client_key.public);
     let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-    handshake(&connection, &token, &client_key).await.unwrap();
+    handshake(&connection, &token, &client_key, resume_cursors)
+        .await
+        .unwrap();
     Link::new(connection)
 }
 
@@ -525,7 +548,11 @@ async fn rejects_a_bad_connection_binding_proof() {
     let token = mint_token(&tenant, SessionId(1), SlotId(0), client_key.public);
     let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
-    assert!(handshake(&connection, &token, &wrong_key).await.is_err());
+    assert!(
+        handshake(&connection, &token, &wrong_key, &[])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -582,7 +609,11 @@ async fn rejects_a_token_from_an_unknown_tenant_key() {
     let token = mint_token(&impostor, SessionId(1), SlotId(0), client_key.public);
     let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
-    assert!(handshake(&connection, &token, &client_key).await.is_err());
+    assert!(
+        handshake(&connection, &token, &client_key, &[])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -601,7 +632,11 @@ async fn rejects_a_second_client_on_the_same_slot() {
     let token = mint_token(&tenant, session, SlotId(0), client_key.public);
     let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
-    assert!(handshake(&connection, &token, &client_key).await.is_err());
+    assert!(
+        handshake(&connection, &token, &client_key, &[])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -700,7 +735,10 @@ async fn frees_the_slot_when_a_client_disconnects() {
         let client_key = keypair();
         let token = mint_token(&tenant, session, SlotId(0), client_key.public);
         let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-        if handshake(&connection, &token, &client_key).await.is_ok() {
+        if handshake(&connection, &token, &client_key, &[])
+            .await
+            .is_ok()
+        {
             reclaimed = true;
             break;
         }
@@ -1301,4 +1339,238 @@ async fn acks_a_one_way_sender_with_no_peer_traffic() {
         "relay never acked the one-way sender; {} payloads still in flight",
         solo.payloads_in_flight()
     );
+}
+
+/// Reads control frames until one is a `SlotConnectivity` naming `(slot, connected)`,
+/// skipping every other frame kind. Panics on timeout. A reconnect test uses this
+/// to synchronize on the relay having observed a drop (the disconnect fan-out) before
+/// it acts further.
+async fn wait_for_connectivity(
+    reader: &mut tokio::sync::mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+    slot: SlotId,
+    connected: bool,
+) {
+    use rally_point_transport::control::ControlInbound;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a connectivity frame arrives before the timeout")
+            .expect("the control stream stays open");
+        if let ControlInbound::Connectivity(change) = frame
+            && change.slot == u32::from(slot.0)
+            && change.connected == connected
+        {
+            return;
+        }
+    }
+}
+
+/// Collects the next `n` oversize-turn payloads pushed down a control stream,
+/// skipping the session-start and connectivity frames that a register also fans.
+/// Panics on timeout. A reconnect test uses this to read the turns the relay replays
+/// from the ring.
+async fn collect_oversize_turns(
+    reader: &mut tokio::sync::mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+    n: usize,
+) -> Vec<Payload> {
+    use rally_point_transport::control::ControlInbound;
+    let mut turns = Vec::new();
+    while turns.len() < n {
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a replayed turn arrives before the timeout")
+            .expect("the control stream stays open");
+        if let ControlInbound::OversizeTurn(payload) = frame {
+            turns.push(payload);
+        }
+    }
+    turns
+}
+
+#[tokio::test]
+async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{ControlInbound, spawn_control_reader};
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(300);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // A short drop grace so the test can wait past it to prove no leave fired,
+    // without the production 10-second hold. Seed this relay as the authority over
+    // an expected {0, 1} set: the session then starts (turns are ring-buffered only
+    // once started), and a slot-1 drop's leave would actually be decided — against
+    // the session frame slot 0's framed turns establish — if it were not cancelled.
+    let grace = Duration::from_millis(1000);
+    let mesh = rally_point_relay::mesh::new_mesh_state_with_grace(grace);
+    let makers = mesh.decision_makers.clone();
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut ctrl0 = spawn_control_reader(slot0.connection().clone());
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    // Both connected, so the session started. Slot 0's first framed turn reaches
+    // slot 1 live and gives the session a frame basis.
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let mut got = Vec::new();
+    while got.is_empty() {
+        got = slot1.recv().await.unwrap().fresh;
+    }
+    assert_eq!(got[0].seq, 0);
+
+    // Slot 1's link dies. Wait until slot 0 hears the disconnect — proof the relay
+    // has run the departure path and armed the drop grace for slot 1.
+    drop(slot1);
+    wait_for_connectivity(&mut ctrl0, SlotId(1), false).await;
+
+    // While slot 1 is gone, slot 0 produces two more framed turns. They fan to no
+    // peer (slot 1 is deregistered) but are recorded into the session's replay ring.
+    for (seq, frame, byte) in [(1u64, 11u32, 2u8), (2, 12, 3)] {
+        slot0
+            .send(Some(Payload {
+                seq,
+                slot: 0,
+                game_frame_count: Some(frame),
+                commands: vec![0x0C, byte, 2, 3, 4, 5, 6, 7].into(),
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+    // Let the relay validate and record the two turns before the reconnect reads the
+    // ring.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Slot 1 re-dials within the grace, resuming from slot 0 seq 1 (it already has
+    // seq 0). The relay accepts it (the grace is still pending), cancels the held
+    // leave, and replays the two missed turns on the reliable control stream.
+    let slot1b = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(0), 1)],
+    )
+    .await;
+    let mut ctrl1 = spawn_control_reader(slot1b.connection().clone());
+
+    let replayed = collect_oversize_turns(&mut ctrl1, 2).await;
+    assert_eq!(
+        replayed.iter().map(|p| p.seq).collect::<Vec<_>>(),
+        vec![1, 2],
+        "exactly the missed turns, in seq order",
+    );
+    assert_eq!(&replayed[0].commands[..], &[0x0C, 2, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(&replayed[1].commands[..], &[0x0C, 3, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(replayed[0].slot, 0, "a replayed turn keeps its origin slot");
+
+    // The grace was cancelled: even well past when it would have fired, slot 0 never
+    // receives a synced leave for slot 1 (it only hears slot 1 reconnect).
+    let deadline = tokio::time::Instant::now() + grace + Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout_at(deadline, ctrl0.recv()).await {
+            Ok(Some(ControlInbound::Leave(leave))) => {
+                panic!("the cancelled grace still decided a leave: {leave:?}")
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("slot 0's control stream closed early"),
+            Err(_) => break,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::server::SLOT_DEPARTED_CLOSE;
+    use rally_point_transport::control::send_control_leave_intent;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(301);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Authority over {0, 1} so the session starts and a decided leave is real.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let _slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    // A framed turn gives the leave a basis (realistic, though not required for the
+    // reject to fire). Authored by slot 1 itself — fan-out excludes the source, so
+    // slot 1 never receives its own turn back and `expect_closed` below sees only
+    // the eventual close, not a stray pending datagram.
+    slot1
+        .send(Some(Payload {
+            seq: 0,
+            slot: 1,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Slot 1 leaves cleanly: a clean leave is decided immediately, no grace, so the
+    // slot's departure is final. The relay closes slot 1's link as confirmation.
+    let (mut leave_send, _unused) = slot1.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+    expect_closed(&mut slot1).await;
+
+    // Re-dialing that slot is now too late — its leave is decided and the game has
+    // moved on. The relay refuses the re-register with the terminal "departed" close,
+    // distinct from any transport error, before ever acknowledging the handshake.
+    let client_key = keypair();
+    let token = mint_token(&tenant, session, SlotId(1), client_key.public);
+    let redial = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    assert!(
+        handshake(&redial, &token, &client_key, &[]).await.is_err(),
+        "a decided-departure re-register is never acknowledged",
+    );
+    match redial.closed().await {
+        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+            u32::try_from(u64::from(app.error_code)).unwrap(),
+            SLOT_DEPARTED_CLOSE,
+            "the re-register is refused with the terminal departed close code",
+        ),
+        other => panic!("expected the terminal departed application close, got {other:?}"),
+    }
 }

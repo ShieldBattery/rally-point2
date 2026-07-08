@@ -238,16 +238,24 @@ pub fn verify_challenge(
 }
 
 /// Runs the full authorization handshake on `connection` and returns the
-/// authorized client together with the still-open send stream.
+/// authorized client, the per-slot resume cursors it presented, and the still-open
+/// send stream.
 ///
 /// The caller writes [`HANDSHAKE_OK`] on the returned stream once it has wired the
 /// client into routing, so a client only learns it's accepted after its slot can
 /// receive turns. On any failure the connection is left for the caller to close.
+///
+/// The resume cursors are the reconnecting client's per-peer-slot delivery
+/// position: the seq it next needs from each slot, so a re-register can replay only
+/// the turns the client missed while it was gone. A fresh dial presents an empty
+/// map. They are read after — and only after — the challenge-response proof
+/// succeeds, so only an authenticated client's cursors are ever parsed; the count
+/// is bounded, so a hostile client cannot make the relay read an unbounded frame.
 pub async fn authenticate(
     connection: &quinn::Connection,
     registry: &Registry,
     now_unix_secs: u64,
-) -> Result<(AuthorizedClient, quinn::SendStream), AuthError> {
+) -> Result<(AuthorizedClient, HashMap<SlotId, u64>, quinn::SendStream), AuthError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
     let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
@@ -283,7 +291,29 @@ pub async fn authenticate(
         &ChallengeResponse(response),
     )?;
 
-    Ok((authorized, send))
+    let resume_cursors = read_resume_cursors(&mut recv).await?;
+
+    Ok((authorized, resume_cursors, send))
+}
+
+/// Reads the client's resume-cursor frame off the authenticated handshake stream:
+/// a bounded entry count, then that many `(slot, cursor)` entries. Every length is
+/// checked before it is read, so a hostile count cannot force an unbounded read.
+async fn read_resume_cursors(
+    recv: &mut quinn::RecvStream,
+) -> Result<HashMap<SlotId, u64>, AuthError> {
+    let mut count_buf = [0u8; handshake::RESUME_CURSOR_COUNT_PREFIX_LEN];
+    recv.read_exact(&mut count_buf).await?;
+    let count = handshake::decode_resume_cursor_count(count_buf)?;
+
+    let mut cursors = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let mut entry = [0u8; handshake::RESUME_CURSOR_ENTRY_LEN];
+        recv.read_exact(&mut entry).await?;
+        let (slot, cursor) = handshake::decode_resume_cursor_entry(entry);
+        cursors.insert(slot, cursor);
+    }
+    Ok(cursors)
 }
 
 /// Verifies an Ed25519 signature, collapsing ring's opaque error to `()` so the

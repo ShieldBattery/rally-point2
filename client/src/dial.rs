@@ -236,6 +236,15 @@ async fn authorize(connection: &quinn::Connection, identity: &Identity) -> Resul
         .sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(response.as_ref()).await?;
 
+    // Present the resume cursors: on a first dial there are none, so this is an
+    // empty (zero-count) frame. A mid-game reconnect will fill it with the seq this
+    // client next needs from each peer slot, so the relay replays only the turns it
+    // missed; that client-side re-dial path is a later increment, but the relay
+    // already reads this frame, so every dial must send it to keep the handshake
+    // byte-aligned.
+    let cursor_frame = handshake::encode_resume_cursors(&[])?;
+    send.write_all(&cursor_frame).await?;
+
     // The relay acknowledges only once our slot is routable.
     let mut ack = [0u8; 1];
     recv.read_exact(&mut ack).await?;

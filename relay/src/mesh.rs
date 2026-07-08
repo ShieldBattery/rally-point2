@@ -293,11 +293,25 @@ pub struct MeshState {
     /// registries only because it shares their per-session task-threading, not
     /// because it is a mesh concern. See [`crate::leave_grace`].
     pub leave_grace: crate::leave_grace::LeaveGrace,
+    /// Per-session bounded record of the turns this relay has forwarded, so a
+    /// client that dropped and re-dialed within its grace can be replayed the turns
+    /// it missed and catch its sim up. Local and ephemeral like `leave_grace`, and
+    /// threaded through the same per-session tasks (the turn forward path records
+    /// into it; a re-register reads from it). See [`crate::turn_ring`].
+    pub turn_ring: crate::turn_ring::TurnRing,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
 /// links, no sessions, and no local clients yet.
 pub fn new_mesh_state() -> MeshState {
+    new_mesh_state_with_grace(crate::leave_grace::DISCONNECT_GRACE)
+}
+
+/// [`new_mesh_state`] with an explicit drop-grace window, so a test can inject a
+/// short hold and observe the cancel-on-reconnect (and the leave-after-expiry)
+/// path without waiting out the production 10-second grace. Production builds it
+/// through [`new_mesh_state`] with [`crate::leave_grace::DISCONNECT_GRACE`].
+pub fn new_mesh_state_with_grace(grace: std::time::Duration) -> MeshState {
     MeshState {
         links: new_mesh_links(),
         seen: new_seen_registries(),
@@ -306,7 +320,8 @@ pub fn new_mesh_state() -> MeshState {
         presence: Arc::new(crate::presence::new_presence_registry()),
         lobby: crate::lobby::new_lobby_registry(),
         chat: crate::chat::new_chat_registry(),
-        leave_grace: crate::leave_grace::LeaveGrace::new(crate::leave_grace::DISCONNECT_GRACE),
+        leave_grace: crate::leave_grace::LeaveGrace::new(grace),
+        turn_ring: crate::turn_ring::TurnRing::new(),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -733,18 +748,32 @@ fn chat_frame(session: SessionId, chat: GameChat) -> MeshControlFrame {
 /// the outgoing payload; when it has none — every non-authority relay, always
 /// — a stamp already on the turn is left untouched, so the authority's
 /// broadcast survives the hop across relays that merely forward it.
+// `turn_ring` is the 8th argument (the replay record, alongside the mesh flood's
+// existing registries); bundling into a struct would touch every call site
+// (production and test) for one more reference, so this follows the same
+// escape hatch already used elsewhere in the crate (`SyncTracker::record` in
+// `consensus.rs`, `connect_and_stream` in `coordinator_client.rs`) rather than
+// that churn.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_turn(
     sessions: &routing::Sessions,
     mesh_links: &MeshLinks,
     seen: &SeenRegistries,
     decision_makers: &crate::consensus::DecisionMakers,
+    turn_ring: &crate::turn_ring::TurnRing,
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
 ) {
-    if let Some(payload) =
-        deliver_turn_to_locals(sessions, seen, decision_makers, key, slot, payload)
-    {
+    if let Some(payload) = deliver_turn_to_locals(
+        sessions,
+        seen,
+        decision_makers,
+        turn_ring,
+        key,
+        slot,
+        payload,
+    ) {
         fan_out_to_mesh(mesh_links, key, payload);
     }
 }
@@ -764,6 +793,7 @@ fn deliver_turn_to_locals(
     sessions: &routing::Sessions,
     seen: &SeenRegistries,
     decision_makers: &crate::consensus::DecisionMakers,
+    turn_ring: &crate::turn_ring::TurnRing,
     key: &SessionKey,
     slot: SlotId,
     mut payload: Payload,
@@ -806,6 +836,16 @@ fn deliver_turn_to_locals(
     // the turn envelope — a drop stops the turn stream, so an envelope stamp would
     // never reach the survivors it must unstall. See `routing`'s leave trigger.
     routing::fan_out(sessions, key, slot, payload.clone());
+    // Record the fanned turn into the session's replay ring so a client that drops
+    // and re-dials within its grace can be replayed what it missed. This is the one
+    // choke point every turn-delivery path funnels through, placed right after the
+    // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
+    // even when the mesh delivers it by more than one path. Buffered only once the
+    // session has started: pre-start lobby traffic has its own ordered replay log
+    // and must not be double-buffered here.
+    if crate::consensus::session_started(decision_makers, key) {
+        turn_ring.record(key, &payload);
+    }
     Some(payload)
 }
 
@@ -1066,6 +1106,7 @@ pub async fn run_mesh_link(
                                 &mesh_links,
                                 &seen_registries,
                                 &decision_makers,
+                                &mesh_for_dispatch.turn_ring,
                                 &key,
                                 slot,
                                 payload,
@@ -1555,6 +1596,7 @@ fn dispatch_mesh_control(
                 sessions,
                 &mesh.seen,
                 &mesh.decision_makers,
+                &mesh.turn_ring,
                 &key,
                 slot,
                 payload,
@@ -1621,6 +1663,16 @@ fn dispatch_mesh_control(
             // NOT re-broadcast across the mesh: the origin already sent a copy to
             // every peer, so re-flooding would only echo (mirroring chat above).
             routing::fan_out_connectivity(sessions, &key, slot, change.connected);
+            // A `connected` of true is a slot coming *back* — a client that
+            // re-registered on the origin relay within its drop grace. This relay
+            // armed its own hold on the slot's earlier `SlotDeparted`, so cancel it:
+            // the symmetric "it's back" signal that reaches a peer-homed authority
+            // (or any peer holding a grace) so the held leave never fires. A
+            // no-op when no hold is pending — a fresh connect, or a slot this relay
+            // never graced.
+            if change.connected {
+                mesh.leave_grace.cancel(&key, slot);
+            }
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -1978,6 +2030,7 @@ mod tests {
             lobby: lobby.clone(),
             chat: chat.clone(),
             leave_grace: crate::leave_grace::LeaveGrace::new(crate::leave_grace::DISCONNECT_GRACE),
+            turn_ring: crate::turn_ring::TurnRing::new(),
         }
     }
 
@@ -2391,6 +2444,64 @@ mod tests {
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }
 
+    /// A `SlotConnectivity{connected: true}` arriving over the mesh is a slot coming
+    /// back: a client that re-registered on a peer relay within its drop grace. This
+    /// relay armed its own hold on the earlier `SlotDeparted`, so the "it's back"
+    /// signal must cancel that hold — the symmetric mesh half of the reconnect
+    /// grace-cancel, which is what stops a peer-homed authority from firing the
+    /// held leave for a slot that has already resumed elsewhere.
+    #[tokio::test]
+    async fn a_mesh_slot_connectivity_true_cancels_a_local_drop_grace() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+
+        // This relay observed slot 0 drop and armed a hold on its leave (a long grace
+        // so the timer never fires during the test — the cancel is what clears it).
+        mesh_state.leave_grace.arm(key.clone(), SlotId(0), || {});
+        assert!(
+            mesh_state.leave_grace.is_pending(&key, SlotId(0)),
+            "the drop armed a hold",
+        );
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        // The peer relay reports slot 0 back — it re-registered there within grace.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: true,
+                },
+            )),
+        };
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        assert!(
+            !mesh_state.leave_grace.is_pending(&key, SlotId(0)),
+            "the it's-back signal cancelled the held leave",
+        );
+    }
+
     /// Builds a single-command turn payload carrying one `0x37` sync command
     /// (`ring` = the ordinal mod 16), plus a made-up `game_frame_count`.
     fn sync_payload(seq: u64, slot: u8, ordinal: u8, value: [u8; 5]) -> Payload {
@@ -2422,6 +2533,7 @@ mod tests {
         let sessions = routing::Sessions::default();
         let seen = new_seen_registries();
         let decision_makers = Arc::new(consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
         decision_makers.set_notice_notifier(tx);
         let key = control_key();
@@ -2444,6 +2556,7 @@ mod tests {
                 &sessions,
                 &seen,
                 &decision_makers,
+                &turn_ring,
                 &key,
                 SlotId(0),
                 first.clone()
@@ -2452,8 +2565,16 @@ mod tests {
             "the first delivery is fresh",
         );
         assert!(
-            deliver_turn_to_locals(&sessions, &seen, &decision_makers, &key, SlotId(0), first)
-                .is_none(),
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &turn_ring,
+                &key,
+                SlotId(0),
+                first
+            )
+            .is_none(),
             "the redelivery is caught by mark_seen and never reaches the comparator",
         );
 
@@ -2467,6 +2588,7 @@ mod tests {
             &sessions,
             &seen,
             &decision_makers,
+            &turn_ring,
             &key,
             SlotId(1),
             sync_payload(0, 1, 0, value),
@@ -2476,6 +2598,7 @@ mod tests {
                 &sessions,
                 &seen,
                 &decision_makers,
+                &turn_ring,
                 &key,
                 SlotId(0),
                 sync_payload(u64::from(ordinal), 0, ordinal, value),
@@ -2484,6 +2607,7 @@ mod tests {
                 &sessions,
                 &seen,
                 &decision_makers,
+                &turn_ring,
                 &key,
                 SlotId(1),
                 sync_payload(u64::from(ordinal), 1, ordinal, value),
