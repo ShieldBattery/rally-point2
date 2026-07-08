@@ -25,7 +25,7 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    SessionStart, control_frame,
+    SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -79,6 +79,12 @@ pub enum ControlInbound {
     /// this from a client, so the relay edge ignores a stray one just as it does a
     /// `Leave`. Fieldless — its whole meaning is that it arrived.
     SessionStart,
+    /// A relay-pushed slot-connectivity change (relay → client only): a member's
+    /// link died (`connected` false) or (re)registered (`connected` true). A relay
+    /// never receives this from a client, so the relay edge ignores a stray one
+    /// just as it does a `Leave`. The whole message is surfaced so the consumer
+    /// reads both `slot` and `connected`.
+    Connectivity(SlotConnectivity),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -185,6 +191,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
                 } => ControlInbound::SessionStart,
+                ControlFrame {
+                    kind: Some(control_frame::Kind::SlotConnectivity(connectivity)),
+                } => ControlInbound::Connectivity(connectivity),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -321,6 +330,28 @@ pub async fn send_control_session_start(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Pushes a slot-connectivity change down the control stream (relay → client):
+/// `slot` either lost its link (`connected` false) or (re)registered one
+/// (`connected` true). Best-effort and informational — an error means the stream
+/// is gone, which the caller treats as that client having left, exactly like a
+/// leave or session-start push. The relay may send several over a game (a slot
+/// can flip more than once), and a client that missed one simply never sees it.
+pub async fn send_control_connectivity(
+    control_send: &mut quinn::SendStream,
+    slot: u8,
+    connected: bool,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
+            slot: u32::from(slot),
+            connected,
+        })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

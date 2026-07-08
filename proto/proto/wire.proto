@@ -269,6 +269,18 @@ message ControlFrame {
     // (a re-push on a late/reconnecting slot, a duplicate across an authority
     // handoff). See `SessionStart`.
     SessionStart session_start = 7;
+
+    // A slot's link-connectivity change (relay → client only): a session member
+    // either lost its link (`connected` false) or (re)registered one
+    // (`connected` true). Best-effort and purely informational — the relay fans
+    // it to every local slot the moment it learns of the change, so a surviving
+    // client can show a "player X disconnected" overlay ~instantly, while the
+    // synced player-leave that actually removes the slot from lockstep is decided
+    // separately (and, for a disconnect, only after a grace window). Carries no
+    // delivery guarantee beyond the reliable stream's own, no ordering against
+    // the leave path, and no replay: a receiver treats an unknown slot as a no-op
+    // and may ignore a pre-start frame entirely. See `SlotConnectivity`.
+    SlotConnectivity slot_connectivity = 8;
   }
 }
 
@@ -603,6 +615,17 @@ message MeshControlFrame {
     // mesh — the authority already sent it to every relay — so there is no echo.
     // See `SessionStart`.
     SessionStart session_start = 8;
+
+    // A slot's link-connectivity change one relay observed on its own home
+    // client, propagated so every relay can inform its local slots. The origin
+    // relay broadcasts it the moment a home client's link dies (`connected`
+    // false) or (re)registers (`connected` true); a relay that receives this fans
+    // it to its own local slots and does NOT re-broadcast it across the mesh (the
+    // origin already sent a copy to every peer, so re-flooding would only echo).
+    // Best-effort and informational, exactly like its client-edge sibling — no
+    // log, no delivery guarantee beyond the reliable stream, unknown slots are
+    // no-ops. See `SlotConnectivity`.
+    SlotConnectivity slot_connectivity = 9;
   }
 }
 
@@ -703,4 +726,35 @@ message SlotPresent {
   // client-asserted value — the home relay binds it to the authenticated
   // connection's token slot).
   uint32 slot = 1;
+}
+
+// A slot's link-connectivity change: a session member's link to a relay either
+// died or came up. It rides the client-edge `ControlFrame` (relay → the local
+// slots) and the relay ↔ relay `MeshControlFrame` (origin relay → its peers, so
+// every relay can inform its own local slots). Purely informational: it lets a
+// surviving client show WHO disconnected the instant the link dies — well before
+// the synced player-leave that actually removes the slot from lockstep, which is
+// decided separately and, for a disconnect, only after a grace window.
+//
+// Best-effort by design. There is no replay log and no delivery guarantee beyond
+// the reliable stream it rides: a client whose stream comes up after a change
+// simply never sees that change, exactly like `GameChat`. A receiver treats a
+// slot it does not recognize as a no-op, and may ignore a frame that arrives
+// before the session has started (a `connected` true at initial dial is such a
+// pre-start frame). The frame carries no game frame and keys nothing on
+// determinism — every client acting on it or ignoring it stays in lockstep,
+// because the leave that changes simulation state is the separate, synced one.
+message SlotConnectivity {
+  // The slot whose connectivity changed, authoritative at its home relay (never
+  // a client-asserted value — the home relay knows which connection died or
+  // registered). A receiver that does not recognize the slot ignores the frame.
+  uint32 slot = 1;
+
+  // The new connectivity: `false` when the slot's link died (a deregister
+  // without a clean leave — a disconnect), `true` when the slot registered a
+  // link (its initial dial, or a future re-register). A slot can flip more than
+  // once over a game; the newest frame reflects the current state, and there is
+  // no ordering guarantee against the synced-leave path, so a client uses this
+  // only for its own connectivity display.
+  bool connected = 2;
 }

@@ -353,15 +353,30 @@ async fn open_lobby_streams(
 async fn next_lobby(
     rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) -> (u32, Vec<u8>) {
-    let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("no lobby command arrived within 2s")
-        .expect("control reader ended early");
-    match inbound {
+    match next_non_connectivity(rx).await {
         rally_point_transport::control::ControlInbound::Lobby(command) => {
             (command.slot, command.payload.to_vec())
         }
         other => panic!("expected a lobby command, got {other:?}"),
+    }
+}
+
+/// Reads the next control frame that isn't a `SlotConnectivity` change, skipping
+/// the informational connectivity frames the relay fans on every register and
+/// disconnect. Panics on timeout or a closed stream. The mesh tests read the
+/// substantive frame their setup produced past those.
+async fn next_non_connectivity(
+    rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) -> rally_point_transport::control::ControlInbound {
+    use rally_point_transport::control::ControlInbound;
+    loop {
+        let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a control frame arrived within 2s")
+            .expect("control reader ended early");
+        if !matches!(inbound, ControlInbound::Connectivity(_)) {
+            return inbound;
+        }
     }
 }
 
@@ -371,11 +386,7 @@ async fn next_lobby(
 async fn next_chat(
     rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) -> (u32, u32, u32, String) {
-    let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("no chat message arrived within 2s")
-        .expect("control reader ended early");
-    match inbound {
+    match next_non_connectivity(rx).await {
         rally_point_transport::control::ControlInbound::Chat(chat) => {
             (chat.slot, chat.target_kind, chat.target_slot, chat.text)
         }
@@ -866,11 +877,9 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
     );
 
     // Client B receives the turn on its control stream: two divert hops (mesh
-    // control stream, then the client's own), one identical payload.
-    let received = tokio::time::timeout(Duration::from_secs(2), ctrl_b.recv())
-        .await
-        .expect("client B did not receive the oversize turn within 2s")
-        .expect("client B control reader ended early");
+    // control stream, then the client's own), one identical payload. Read past any
+    // connectivity frame the client's own register fanned.
+    let received = next_non_connectivity(&mut ctrl_b).await;
     let ControlInbound::OversizeTurn(delivered) = received else {
         panic!("expected an oversize turn, got {received:?}");
     };

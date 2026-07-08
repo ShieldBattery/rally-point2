@@ -211,6 +211,26 @@ async fn connect_slot(
     Link::new(connection)
 }
 
+/// Reads the next control frame that carries real meaning, skipping the
+/// informational `SlotConnectivity` frames the relay now fans on every register
+/// and disconnect. Panics on timeout or a closed stream. Tests asserting on a
+/// leave or session-start frame use this so a connectivity frame that legitimately
+/// precedes it does not fail the match.
+async fn recv_meaningful(
+    reader: &mut tokio::sync::mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) -> rally_point_transport::control::ControlInbound {
+    use rally_point_transport::control::ControlInbound;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a control frame arrives before the timeout")
+            .expect("the control stream stays open");
+        if !matches!(frame, ControlInbound::Connectivity(_)) {
+            return frame;
+        }
+    }
+}
+
 #[tokio::test]
 async fn fans_a_validated_turn_to_the_other_slot() {
     let tenant = make_tenant(KID, TENANT);
@@ -359,37 +379,39 @@ async fn fires_session_start_when_every_expected_slot_connects() {
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);
 
-    // Slot 0 connects; it does not cover {0, 1}, so no directive is sent yet.
+    // Slot 0 connects; it does not cover {0, 1}, so no session-start is sent yet.
+    // The relay does fan slot 0 its own connectivity(true), which is fine to see —
+    // what must NOT arrive is a session-start.
     let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
     let mut reader0 = spawn_control_reader(slot0.connection().clone());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), reader0.recv())
-            .await
-            .is_err(),
-        "no session-start until every expected slot has connected",
-    );
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), reader0.recv()).await {
+            Ok(Some(ControlInbound::Connectivity(_))) => continue,
+            Ok(Some(other)) => {
+                panic!("no session-start until every expected slot connects, got {other:?}")
+            }
+            Ok(None) => panic!("slot 0's control stream closed early"),
+            // Timed out with no session-start — the correct outcome.
+            Err(_) => break,
+        }
+    }
 
     // Slot 1 connects, completing the expected set: every slot receives the
-    // session-start directive over its reliable control stream.
+    // session-start directive over its reliable control stream (past any
+    // connectivity frame slot 1's own register fanned).
     let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
     let mut reader1 = spawn_control_reader(slot1.connection().clone());
     assert!(
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), reader0.recv())
-                .await
-                .expect("slot 0 is not timed out")
-                .expect("slot 0's control stream stays open"),
-            ControlInbound::SessionStart,
+            recv_meaningful(&mut reader0).await,
+            ControlInbound::SessionStart
         ),
         "slot 0 receives the session-start directive once slot 1 completes the set",
     );
     assert!(
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), reader1.recv())
-                .await
-                .expect("slot 1 is not timed out")
-                .expect("slot 1's control stream stays open"),
-            ControlInbound::SessionStart,
+            recv_meaningful(&mut reader1).await,
+            ControlInbound::SessionStart
         ),
         "the slot that completed the set receives the directive too",
     );
@@ -424,16 +446,14 @@ async fn a_late_slot_receives_session_start_on_register() {
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);
 
-    // Slot 0 covers the expected set on its own: the session starts immediately.
+    // Slot 0 covers the expected set on its own: the session starts immediately
+    // (past slot 0's own connectivity(true) frame).
     let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
     let mut reader0 = spawn_control_reader(slot0.connection().clone());
     assert!(
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), reader0.recv())
-                .await
-                .expect("slot 0 is not timed out")
-                .expect("slot 0's control stream stays open"),
-            ControlInbound::SessionStart,
+            recv_meaningful(&mut reader0).await,
+            ControlInbound::SessionStart
         ),
         "the sole expected slot starts the session on connect",
     );
@@ -444,13 +464,51 @@ async fn a_late_slot_receives_session_start_on_register() {
     let mut reader1 = spawn_control_reader(slot1.connection().clone());
     assert!(
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), reader1.recv())
-                .await
-                .expect("slot 1 is not timed out")
-                .expect("slot 1's control stream stays open"),
-            ControlInbound::SessionStart,
+            recv_meaningful(&mut reader1).await,
+            ControlInbound::SessionStart
         ),
         "a slot that registers after start still receives the directive",
+    );
+}
+
+#[tokio::test]
+async fn a_slots_connect_fans_a_connectivity_up_to_the_other_slots() {
+    use rally_point_transport::control::{ControlInbound, spawn_control_reader};
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(90);
+
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+
+    // Slot 0 connects first and opens its control reader.
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut reader0 = spawn_control_reader(slot0.connection().clone());
+
+    // Slot 1 then connects: its registration broadcasts a `connected = true`
+    // connectivity change to every slot in the session, so slot 0 hears that
+    // slot 1 is connected over its reliable control stream. (Slot 0 also receives
+    // its own `connected = true` frame; read past it to the one naming slot 1.)
+    let _slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut saw_slot1_connected = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(5), reader0.recv()).await {
+            Ok(Some(ControlInbound::Connectivity(change))) => {
+                if change.slot == 1 {
+                    assert!(change.connected, "slot 1's link is up");
+                    saw_slot1_connected = true;
+                    break;
+                }
+                // Slot 0's own `connected = true` frame — keep reading.
+            }
+            Ok(Some(other)) => panic!("unexpected control frame: {other:?}"),
+            Ok(None) => panic!("slot 0's control stream closed early"),
+            Err(_) => panic!("timed out waiting for slot 1's connectivity frame"),
+        }
+    }
+    assert!(
+        saw_slot1_connected,
+        "slot 0 learns slot 1 connected via a fanned connectivity frame",
     );
 }
 
@@ -725,10 +783,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
     send_control_leave_intent(&mut leave_send).await.unwrap();
 
-    let frame = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
-        .await
-        .expect("leave directive never arrived at the survivor")
-        .expect("control reader ended early");
+    let frame = recv_meaningful(&mut ctrl1).await;
     let ControlInbound::Leave(leave) = frame else {
         panic!("expected a LeaveDirective, got {frame:?}");
     };
@@ -795,15 +850,14 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
     let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
     send_control_leave_intent(&mut leave_send).await.unwrap();
 
-    let first = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
-        .await
-        .expect("leave directive never arrived at the survivor")
-        .expect("control reader ended early");
+    let first = recv_meaningful(&mut ctrl1).await;
     assert!(matches!(first, ControlInbound::Leave(_)));
 
     // Let the slot's task finish tearing down (deregister, the post-loop
     // Trigger-A decide_leave, remove_slot, presence) well past when it would
-    // have run, then confirm no second leave push ever follows.
+    // have run, then confirm no second leave push ever follows. A clean leave
+    // fans no connectivity(false) frame (that is the disconnect path only), so
+    // the stream is silent from here — any frame at all would be a regression.
     expect_closed(&mut slot0).await;
     let second = tokio::time::timeout(Duration::from_millis(300), ctrl1.recv()).await;
     assert!(
@@ -998,11 +1052,8 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
     );
 
     // The surviving second client is unaffected: it still receives the synced
-    // leave for slot 0 over its own control stream.
-    let pushed = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
-        .await
-        .expect("the survivor never got the leave directive")
-        .expect("control reader ended early");
+    // leave for slot 0 over its own control stream (past any connectivity frame).
+    let pushed = recv_meaningful(&mut ctrl1).await;
     let ControlInbound::Leave(leave) = pushed else {
         panic!("expected a LeaveDirective at the survivor, got {pushed:?}");
     };

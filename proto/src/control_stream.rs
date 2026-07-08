@@ -376,6 +376,65 @@ mod tests {
     }
 
     #[test]
+    fn slot_connectivity_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::SlotConnectivity;
+
+        // A disconnect signal rides the client-edge control frame (relay → its
+        // local slots), carrying the slot and its new connectivity verbatim.
+        let down = ControlFrame {
+            kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
+                slot: 2,
+                connected: false,
+            })),
+        };
+        let encoded = encode_frame(&down).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, down);
+        match decoded.kind {
+            Some(control_frame::Kind::SlotConnectivity(sc)) => {
+                assert_eq!(sc.slot, 2);
+                assert!(!sc.connected);
+            }
+            other => panic!("expected SlotConnectivity, got {other:?}"),
+        }
+
+        // And a (re)connect signal rides the mesh control frame the same way, for
+        // the origin relay's cross-relay broadcast.
+        let up = MeshControlFrame {
+            session: 9,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 5,
+                    connected: true,
+                },
+            )),
+        };
+        let encoded = encode_frame(&up).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, up);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::SlotConnectivity(sc)) => {
+                assert_eq!(sc.slot, 5);
+                assert!(sc.connected);
+            }
+            other => panic!("expected SlotConnectivity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_control_frame_kind_a_peer_predates_decodes_with_the_oneof_unset() {
+        // Forward/backward compatibility, mirroring the mesh-side test below: a
+        // build that predates a newer `ControlFrame.kind` (the slot-connectivity
+        // addition is the current such kind) sees the unknown oneof arm decode to
+        // `kind: None` and skips the frame rather than tearing the stream down.
+        // Simulated with a hand-built body carrying only an unknown oneof field
+        // (tag 99, length-delimited, empty) — the tag no ControlFrame arm claims.
+        let unknown_oneof_body: &[u8] = &[0x9A, 0x06, 0x00];
+        let decoded: ControlFrame = decode_frame(unknown_oneof_body).unwrap();
+        assert_eq!(decoded.kind, None);
+    }
+
+    #[test]
     fn an_unknown_mesh_control_kind_decodes_with_the_oneof_unset() {
         // The empty establishment/keepalive frame (and any future kind a peer
         // predates) decodes with kind = None so the reader skips it.

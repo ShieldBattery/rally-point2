@@ -245,6 +245,15 @@ pub struct TurnChannels {
     /// no-op (the relay may re-deliver on a late slot's register or an authority
     /// handoff). Fieldless — the whole signal is that it arrived.
     pub session_start: mpsc::Receiver<()>,
+    /// Slot-connectivity changes the relay pushed down the control stream, each
+    /// carrying `(slot, connected)`: a member's link died (`false`) or
+    /// (re)registered (`true`). Best-effort and informational — the game uses it
+    /// to drive a "player X disconnected" display, independent of the synced
+    /// player-leave that actually removes a slot from lockstep (which arrives on
+    /// [`leaves`](Self::leaves)). No replay and no ordering guarantee against the
+    /// leave path: a change that flowed before this stream came up is simply
+    /// never seen, and an unknown slot is a no-op for the game.
+    pub connectivity: mpsc::Receiver<(SlotId, bool)>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -282,6 +291,9 @@ pub struct LinkDriver {
     /// The relay-driven session-start directive, to hand to the game thread when
     /// the relay pushes a `SessionStart` down the control stream.
     session_start: mpsc::Sender<()>,
+    /// Slot-connectivity changes, to hand to the game thread when the relay
+    /// pushes a `SlotConnectivity` down the control stream.
+    connectivity: mpsc::Sender<(SlotId, bool)>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -346,6 +358,9 @@ impl LinkDriver {
         // The session-start directive arrives at most a handful of times (the
         // fire, plus any re-push on late register or authority handoff).
         let (session_start_tx, session_start_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Connectivity changes are rare (a slot flips a small number of times over
+        // a game); the leave-sized channel is ample.
+        let (connectivity_tx, connectivity_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
         let driver = Self {
             link,
             outbound: outbound_rx,
@@ -359,6 +374,7 @@ impl LinkDriver {
             chat_out: chat_out_rx,
             chat_in: chat_in_tx,
             session_start: session_start_tx,
+            connectivity: connectivity_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -372,6 +388,7 @@ impl LinkDriver {
             chat_out: chat_out_tx,
             chat_in: chat_in_rx,
             session_start: session_start_rx,
+            connectivity: connectivity_rx,
         };
         (driver, channels)
     }
@@ -407,6 +424,7 @@ impl LinkDriver {
             mut chat_out,
             chat_in,
             session_start,
+            connectivity,
         } = self;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -665,6 +683,31 @@ impl LinkDriver {
                         // (game gone) is a clean shutdown.
                         Some(ControlInbound::SessionStart) => {
                             if session_start.send(()).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        // A relay-pushed slot-connectivity change: a member's link
+                        // died or (re)registered. Hand it to the game thread tagged
+                        // with the slot; the game drives its "player X disconnected"
+                        // display off it, independent of the synced leave. Best-
+                        // effort — an unknown slot is the game's no-op, and dropping
+                        // it (game gone) is a clean shutdown.
+                        Some(ControlInbound::Connectivity(change)) => {
+                            // A slot id past `u8` range names no real member; a
+                            // truncating cast would misattribute the change. Drop it
+                            // (defensive — the relay stamps a real slot).
+                            let Ok(slot_id) = u8::try_from(change.slot) else {
+                                tracing::warn!(
+                                    slot = change.slot,
+                                    "slot-connectivity names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            if connectivity
+                                .send((SlotId(slot_id), change.connected))
+                                .await
+                                .is_err()
+                            {
                                 return Ok(());
                             }
                         }

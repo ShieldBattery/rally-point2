@@ -213,6 +213,13 @@ pub struct SlotEntry {
     /// `SessionStart` frame to its control stream. Fieldless — a unit per
     /// directive, carrying nothing but the fact.
     start_push: mpsc::Sender<()>,
+    /// Slot-connectivity changes to push down THIS client's reliable control
+    /// stream. Fed by [`fan_out_connectivity`] when any slot's link dies or
+    /// (re)registers; drained by this slot's link task, which writes a
+    /// `SlotConnectivity` frame. Rides the reliable stream like a leave so it
+    /// still reaches a client whose datagram turn flow has stalled behind the
+    /// very disconnect being reported. Carries `(slot, connected)`.
+    conn_push: mpsc::Sender<(SlotId, bool)>,
     shutdown: Arc<Notify>,
 }
 
@@ -225,6 +232,9 @@ pub struct SlotInbox {
     /// Session-start directives to push down this client's control stream (see
     /// [`SlotEntry::start_push`]).
     start_push_rx: mpsc::Receiver<()>,
+    /// Slot-connectivity changes to push down this client's control stream (see
+    /// [`SlotEntry::conn_push`]).
+    conn_push_rx: mpsc::Receiver<(SlotId, bool)>,
     shutdown: Arc<Notify>,
 }
 
@@ -234,6 +244,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn shutdown_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// Non-blockingly pulls the next slot-connectivity change pushed to this slot,
+    /// for a cross-module test asserting a connectivity frame fanned to a local
+    /// slot. `None` when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_connectivity(&mut self) -> Option<(SlotId, bool)> {
+        self.conn_push_rx.try_recv().ok()
     }
 }
 
@@ -305,6 +323,9 @@ pub fn register(
     // Session-start directives are rarer still (the fire, plus any re-push on a
     // late register or an authority handoff); the same small channel suits them.
     let (start_tx, start_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    // Connectivity changes are rare (a slot flips a small number of times over a
+    // game); the same small channel suits them.
+    let (conn_tx, conn_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     {
         let mut roster = sessions.lock();
@@ -318,6 +339,7 @@ pub fn register(
                 forward: tx,
                 leave_push: leave_tx,
                 start_push: start_tx,
+                conn_push: conn_tx,
                 shutdown: Arc::clone(&shutdown),
             },
         );
@@ -332,6 +354,7 @@ pub fn register(
         forward_rx: rx,
         leave_push_rx: leave_rx,
         start_push_rx: start_rx,
+        conn_push_rx: conn_rx,
         shutdown,
     };
     Some((registration, inbox))
@@ -473,6 +496,63 @@ pub(crate) fn fan_out_session_start(sessions: &Sessions, key: &SessionKey) {
     }
 }
 
+/// Pushes a slot-connectivity change down every currently-registered local
+/// slot's control stream in the `key` group, with no exclusion — a connectivity
+/// change is informational for everyone, and a client receiving its own slot's
+/// change treats it as a no-op. Senders are cloned under the lock and the lock
+/// dropped before delivery, as in [`fan_out`]. A full queue is logged rather than
+/// dropped silently, though a lost connectivity frame costs only a stale display,
+/// not correctness (the synced leave is the authoritative removal).
+pub(crate) fn fan_out_connectivity(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connected: bool,
+) {
+    let targets: Vec<(SlotId, mpsc::Sender<(SlotId, bool)>)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => slots
+                .iter()
+                .map(|(s, entry)| (*s, entry.conn_push.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for (target, tx) in targets {
+        match tx.try_send((slot, connected)) {
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = target.0,
+                subject = slot.0,
+                "connectivity queue full; a slot-connectivity frame may be dropped for this slot",
+            ),
+            // The slot's task already ended; it needs no connectivity update.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Broadcasts a slot-connectivity change session-wide: fans it to every local
+/// slot ([`fan_out_connectivity`]) and across the mesh so every peer relay fans
+/// it to its own local slots ([`crate::mesh::fan_out_slot_connectivity`]). Sent
+/// the moment a slot's link dies (`connected` false) or (re)registers
+/// (`connected` true). Independent of the synced-leave path and of any grace: a
+/// disconnect signal goes out immediately so survivors learn who dropped ~at
+/// once, while the leave that removes the slot is decided separately.
+pub(crate) fn broadcast_connectivity(
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    connected: bool,
+) {
+    fan_out_connectivity(sessions, key, slot, connected);
+    crate::mesh::fan_out_slot_connectivity(mesh_links, key, slot, connected);
+}
+
 /// Pushes the session-start directive down a single slot's control stream — the
 /// re-push a slot gets when it registers after the session already started. A
 /// slot absent from the roster (already gone) is skipped.
@@ -600,6 +680,7 @@ pub async fn run_slot_link(
         mut forward_rx,
         mut leave_push_rx,
         mut start_push_rx,
+        mut conn_push_rx,
         shutdown,
     } = inbox;
     // Cloned (cheap — every field is an `Arc`) before the destructure below
@@ -614,6 +695,7 @@ pub async fn run_slot_link(
         presence,
         lobby,
         chat,
+        leave_grace,
     } = mesh;
 
     // This client joining may change who decides the session's buffer — most
@@ -632,6 +714,14 @@ pub async fn run_slot_link(
     // roster already includes this slot (registration preceded this task), so
     // `fan_out_session_start` reaches it too.
     announce_slot_present(&sessions, &decision_makers, &mesh_links, &key, slot);
+
+    // Announce this slot's link as connected to every slot in the session (local
+    // and across the mesh), so survivors' connectivity displays reflect it. A
+    // pre-start frame (this is the initial dial for most slots) is harmless — a
+    // client ignores connectivity until it cares — and a re-register (a later
+    // reconnect feature) reuses this same signal. Independent of the session-start
+    // and leave paths.
+    broadcast_connectivity(&sessions, &mesh_links, &key, slot, true);
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -683,6 +773,9 @@ pub async fn run_slot_link(
     // the roster while the slot is registered, so `None` is unreachable during the
     // loop; the flag disarms the branch defensively.
     let mut start_push_alive = true;
+    // Mirrors `leave_push_alive` for the connectivity push channel, disarmed
+    // defensively the same way.
+    let mut conn_push_alive = true;
     // Register this member for lobby fan-out now that its control stream is up:
     // it starts receiving other members' lobby commands, and — crucially — the
     // per-session replay log is snapshotted into `lobby_rx` under the lobby lock
@@ -899,6 +992,36 @@ pub async fn run_slot_link(
                     None => start_push_alive = false,
                 }
             }
+            // A slot-connectivity change for this client, to push down its reliable
+            // control stream: some member's link died or (re)registered. Rides the
+            // reliable stream like a leave, so it still reaches a client whose
+            // datagram turn flow has stalled behind the very disconnect being
+            // reported. A write failure ends the link like every other
+            // control-stream write here.
+            pushed = conn_push_rx.recv(), if conn_push_alive => {
+                match pushed {
+                    Some((subject, connected)) => {
+                        if let Err(error) =
+                            rally_point_transport::control::send_control_connectivity(
+                                &mut control_send,
+                                subject.0,
+                                connected,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "connectivity control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => conn_push_alive = false,
+                }
+            }
             // A lobby command another member authored (or the replay of an earlier
             // one), to push down this client's reliable control stream. Like a
             // leave, it rides the reliable stream because a lobby has no datagram
@@ -1060,6 +1183,16 @@ pub async fn run_slot_link(
                             "ignoring unexpected client-sent session-start control frame",
                         );
                     }
+                    // Connectivity frames are relay → client only; a client never
+                    // sends one up. Ignore a stray one, mirroring the cases above.
+                    Some(ControlInbound::Connectivity(_)) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent connectivity control frame",
+                        );
+                    }
                     // The client announcing its own clean departure. The
                     // client already flushed its outstanding turns and waited
                     // for their acks before sending this, so nothing of its
@@ -1096,6 +1229,7 @@ pub async fn run_slot_link(
                             "client announced clean leave",
                         );
                         announce_departure(
+                            &leave_grace,
                             &decision_makers,
                             &sessions,
                             &mesh_links,
@@ -1359,7 +1493,13 @@ fn end_slot_link(
     // survivors) and across the mesh to peer survivors — the turn stream has
     // stopped for them, so the reliable stream is the only channel that unstalls.
     if !leave_announced {
+        // The link died without a clean leave — a disconnect. Tell every slot
+        // (local and across the mesh) this one is no longer connected, immediately
+        // and independent of the grace below, so survivors' displays reflect the
+        // disconnect ~at once even while their turn stream stalls waiting on it.
+        broadcast_connectivity(sessions, &mesh.links, key, slot, false);
         announce_departure(
+            &mesh.leave_grace,
             &mesh.decision_makers,
             sessions,
             &mesh.links,
@@ -1418,7 +1558,8 @@ fn end_slot_link(
 /// into its record — the leave's apply-frame basis — and retires the slot's live
 /// state in the decision-maker.
 fn announce_departure(
-    decision_makers: &crate::consensus::DecisionMakers,
+    leave_grace: &crate::leave_grace::LeaveGrace,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
@@ -1453,10 +1594,83 @@ fn announce_departure(
         result,
         reason,
     );
-    // Decide locally: `Some` only on the authority (and only once per slot). The
-    // leave unstalls local survivors and, broadcast across the mesh, peer
-    // survivors — the departing slot is already off the roster, so `fan_out_leave`
-    // reaches only survivors.
+    // Turn the recorded departure into the synced leave — but hold a *drop* for
+    // the grace window before deciding, so survivors are not permanently removed
+    // on a link blip; a *clean* leave decides at once. See
+    // `decide_leave_maybe_graced`. The departure above is already recorded and
+    // announced, so a promoted authority can re-derive the leave if this relay is
+    // lost during the grace.
+    decide_leave_maybe_graced(
+        leave_grace,
+        decision_makers,
+        sessions,
+        mesh_links,
+        key,
+        slot,
+        reason,
+    );
+}
+
+/// Turns a recorded departure into the one synced leave, gating a *drop* on the
+/// disconnect grace while deciding a *clean* leave immediately.
+///
+/// A drop (`reason` == [`LEAVE_REASON_DROPPED`]) arms a hold: after the grace,
+/// the decision-and-broadcast step runs (a no-op on a relay that is not the
+/// authority, or for a slot already decided). A clean leave cancels any hold this
+/// slot's earlier drop observation armed — the ordering where a clean-leave intent
+/// arrives during a drop's grace — and decides at once, so the "left" outcome
+/// supersedes the held "dropped" one. Every relay that observes the departure
+/// arms its own hold, so the decision survives an authority handoff: a promotion
+/// re-derives the leave from the shared departure record, and any leftover hold's
+/// eventual `decide_leave` is a no-op once the slot is decided.
+pub(crate) fn decide_leave_maybe_graced(
+    leave_grace: &crate::leave_grace::LeaveGrace,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    reason: u32,
+) {
+    if reason == LEAVE_REASON_DROPPED {
+        // Own clones for the timer task: it fires after the grace with no borrowed
+        // state, so it holds the shared registries by `Arc`.
+        let decision_makers = Arc::clone(decision_makers);
+        let sessions = Arc::clone(sessions);
+        let mesh_links = Arc::clone(mesh_links);
+        let key_for_expire = key.clone();
+        leave_grace.arm(key.clone(), slot, move || {
+            decide_and_broadcast_leave(
+                &decision_makers,
+                &sessions,
+                &mesh_links,
+                &key_for_expire,
+                slot,
+                reason,
+            );
+        });
+    } else {
+        // A clean leave supersedes any in-flight drop hold for this slot, then
+        // decides immediately.
+        leave_grace.cancel(key, slot);
+        decide_and_broadcast_leave(decision_makers, sessions, mesh_links, key, slot, reason);
+    }
+}
+
+/// Decides `slot`'s synced leave and broadcasts it session-wide — to local
+/// survivors ([`fan_out_leave`]) and every peer relay
+/// ([`crate::mesh::fan_out_leave_directive`]). `Some` only on the authority, and
+/// only once per slot (`decide_leave` dedups), so a hold's expiry and a racing
+/// clean decision cannot double-broadcast. The departing slot is already off the
+/// roster, so `fan_out_leave` reaches only survivors.
+fn decide_and_broadcast_leave(
+    decision_makers: &crate::consensus::DecisionMakers,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    reason: u32,
+) {
     if let Some(leave) = consensus::decide_leave(decision_makers, key, slot, reason) {
         fan_out_leave(sessions, key, slot, leave);
         crate::mesh::fan_out_leave_directive(mesh_links, key, leave);
@@ -1804,5 +2018,202 @@ mod tests {
         assert_eq!(game_result_admissible(&[0xDE, 0xAD]), Ok(()));
         let at_cap = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN];
         assert_eq!(game_result_admissible(&at_cap), Ok(()));
+    }
+
+    // -- disconnect grace and connectivity fan-out --
+
+    use crate::leave_grace::LeaveGrace;
+
+    /// A short interim grace for tests, so the drop-hold path can be driven with a
+    /// real (tiny) sleep rather than the production 10-second window.
+    const TEST_GRACE: Duration = Duration::from_millis(40);
+
+    /// Stands up a single-relay authority maker for `key` with a frame basis, plus
+    /// a survivor slot registered so a decided leave has somewhere to fan out. The
+    /// departing slot is given an observed frame too, so `decide_leave` schedules
+    /// against it. Returns the shared registries and the survivor's inbox.
+    fn drop_grace_harness(
+        key: &SessionKey,
+        survivor: SlotId,
+        departing: SlotId,
+    ) -> (
+        Sessions,
+        crate::mesh::MeshLinks,
+        Arc<crate::consensus::DecisionMakers>,
+        SlotInbox,
+    ) {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+
+        let sessions: Sessions = Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let _ = consensus::sync_maker(
+            &makers,
+            key,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        // Both slots have framed history: the survivor pins a session frame and the
+        // departing slot gives the leave its apply-frame basis.
+        consensus::observe_frame(
+            &makers,
+            key,
+            survivor,
+            rally_point_proto::ids::GameFrameCount(40),
+        );
+        consensus::observe_frame(
+            &makers,
+            key,
+            departing,
+            rally_point_proto::ids::GameFrameCount(50),
+        );
+
+        let (mut guard, inbox) = register(&sessions, key, survivor).expect("survivor registers");
+        guard.disarm();
+        (sessions, mesh_links, makers, inbox)
+    }
+
+    /// A dropped departure holds the synced-leave decision for the grace window:
+    /// no leave reaches survivors immediately, and one arrives only after the grace
+    /// elapses. This is the whole disconnect-grace behavior at the routing level.
+    #[tokio::test]
+    async fn a_dropped_departure_schedules_the_leave_only_after_the_grace() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) =
+            drop_grace_harness(&k, SlotId(0), SlotId(1));
+        let grace = LeaveGrace::new(TEST_GRACE);
+
+        decide_leave_maybe_graced(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+
+        // The decision is held: nothing has reached the survivor yet, and a hold is
+        // pending for the dropped slot.
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "the drop's leave is held for the grace, not decided immediately",
+        );
+        assert!(grace.is_pending(&k, SlotId(1)));
+
+        // After the grace elapses, the leave is decided and fanned to the survivor.
+        tokio::time::sleep(TEST_GRACE + Duration::from_millis(40)).await;
+        let leave = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("the leave fires once the grace elapses");
+        assert_eq!(leave.slot, 1);
+        assert_eq!(leave.reason, LEAVE_REASON_DROPPED);
+        assert!(
+            !grace.is_pending(&k, SlotId(1)),
+            "the hold cleared on firing"
+        );
+    }
+
+    /// A clean leave (a client's announced intent) decides immediately — no grace —
+    /// so an F10 quit unstalls survivors at once.
+    #[tokio::test]
+    async fn a_clean_departure_decides_immediately() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) =
+            drop_grace_harness(&k, SlotId(0), SlotId(1));
+        let grace = LeaveGrace::new(TEST_GRACE);
+
+        decide_leave_maybe_graced(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_LEFT,
+        );
+
+        let leave = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("a clean leave fires without waiting on any grace");
+        assert_eq!(leave.slot, 1);
+        assert_eq!(leave.reason, LEAVE_REASON_LEFT);
+        assert!(!grace.is_pending(&k, SlotId(1)), "no hold was armed");
+    }
+
+    /// A clean-leave intent arriving during a drop's in-flight grace cancels the
+    /// hold and decides immediately with the "left" reason — the ordering where a
+    /// client's clean quit races its own link-death observation.
+    #[tokio::test]
+    async fn a_clean_intent_during_a_drop_grace_cancels_the_hold_and_proceeds() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) =
+            drop_grace_harness(&k, SlotId(0), SlotId(1));
+        let grace = LeaveGrace::new(TEST_GRACE);
+
+        // A drop arms the hold.
+        decide_leave_maybe_graced(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+        assert!(grace.is_pending(&k, SlotId(1)));
+        assert!(inbox.leave_push_rx.try_recv().is_err(), "still held");
+
+        // Before the grace elapses, the clean intent arrives: it cancels the hold
+        // and decides at once with the "left" reason.
+        decide_leave_maybe_graced(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_LEFT,
+        );
+        assert!(
+            !grace.is_pending(&k, SlotId(1)),
+            "the clean intent cancelled the hold"
+        );
+        let leave = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("the clean leave decided immediately");
+        assert_eq!(leave.reason, LEAVE_REASON_LEFT, "the left outcome wins");
+
+        // And the cancelled drop hold never fires a second leave.
+        tokio::time::sleep(TEST_GRACE + Duration::from_millis(40)).await;
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "the cancelled hold produced no further leave",
+        );
+    }
+
+    /// A connectivity change fans to every currently-registered local slot, each
+    /// receiving `(subject, connected)` — the local half of a disconnect signal.
+    #[tokio::test]
+    async fn connectivity_fans_to_every_local_slot() {
+        let k = key();
+        let sessions: Sessions = Arc::default();
+        let (mut g0, mut inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(3)).expect("slot 3 registers");
+        g0.disarm();
+        g1.disarm();
+
+        fan_out_connectivity(&sessions, &k, SlotId(3), false);
+
+        let a = inbox0.conn_push_rx.try_recv().expect("slot 0 hears it");
+        assert_eq!(a, (SlotId(3), false));
+        let b = inbox1.conn_push_rx.try_recv().expect("slot 3 hears it too");
+        assert_eq!(b, (SlotId(3), false));
     }
 }

@@ -31,7 +31,7 @@ use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
     GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload,
-    SessionStart, SlotConditions, SlotDeparted, SlotPresent, mesh_control_frame,
+    SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -285,6 +285,14 @@ pub struct MeshState {
     /// but the same per-session lifecycle and task-threading as `lobby`. See
     /// [`crate::chat`].
     pub chat: crate::chat::ChatRegistry,
+    /// Per-relay holds on dropped slots' synced-leave decisions. A slot that
+    /// dropped (its link died) has its departure recorded and announced
+    /// immediately, but the authority's decision to remove it from lockstep is
+    /// held here for the grace window before firing; a clean leave bypasses it.
+    /// Local and ephemeral — not replicated — so it lives beside the other
+    /// registries only because it shares their per-session task-threading, not
+    /// because it is a mesh concern. See [`crate::leave_grace`].
+    pub leave_grace: crate::leave_grace::LeaveGrace,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -298,6 +306,7 @@ pub fn new_mesh_state() -> MeshState {
         presence: Arc::new(crate::presence::new_presence_registry()),
         lobby: crate::lobby::new_lobby_registry(),
         chat: crate::chat::new_chat_registry(),
+        leave_grace: crate::leave_grace::LeaveGrace::new(crate::leave_grace::DISCONNECT_GRACE),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -575,6 +584,27 @@ pub(crate) fn fan_out_session_start(links: &MeshLinks, key: &SessionKey) {
     fan_out_control(links, key, session_start_frame(key.session));
 }
 
+/// Broadcasts a slot-connectivity change to every peer relay serving `key`, so
+/// each fans it down its own local slots. Sent the moment the origin relay's
+/// home client's link dies (`connected` false) or (re)registers (`connected`
+/// true). A relay that receives this delivers it to its local slots but does not
+/// re-broadcast it — the origin already sent a copy to every peer, so re-flooding
+/// would only echo (mirroring the chat/oversize-turn divert). Best-effort and
+/// informational; it rides the reliable mesh control stream but carries no
+/// delivery guarantee of its own.
+pub(crate) fn fan_out_slot_connectivity(
+    links: &MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    connected: bool,
+) {
+    fan_out_control(
+        links,
+        key,
+        slot_connectivity_frame(key.session, slot, connected),
+    );
+}
+
 /// Builds a `SlotPresent` mesh control frame for `session`.
 fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
     MeshControlFrame {
@@ -590,6 +620,19 @@ fn session_start_frame(session: SessionId) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {})),
+    }
+}
+
+/// Builds a `SlotConnectivity` mesh control frame for `session`.
+fn slot_connectivity_frame(session: SessionId, slot: SlotId, connected: bool) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+            SlotConnectivity {
+                slot: u32::from(slot.0),
+                connected,
+            },
+        )),
     }
 }
 
@@ -1450,15 +1493,22 @@ fn dispatch_mesh_control(
                 result,
                 departed.reason,
             );
-            // Only the authority turns a departure into the one synced leave;
-            // `decide_leave` returns `None` on a non-authority (having recorded
-            // the departure) and on a duplicate for an already-decided slot.
-            if let Some(leave) =
-                crate::consensus::decide_leave(&mesh.decision_makers, &key, slot, departed.reason)
-            {
-                routing::fan_out_leave(sessions, &key, slot, leave);
-                fan_out_leave_directive(&mesh.links, &key, leave);
-            }
+            // Turn the departure into the one synced leave — holding a *drop* for
+            // the grace window before deciding, and deciding a *clean* leave at
+            // once (which also cancels any hold this slot's earlier drop armed, the
+            // clean-intent-during-grace ordering). A no-op on a non-authority
+            // (`decide_leave` returns `None` there) and for an already-decided
+            // slot; the departure is recorded above regardless, so a promotion can
+            // still re-derive it.
+            routing::decide_leave_maybe_graced(
+                &mesh.leave_grace,
+                &mesh.decision_makers,
+                sessions,
+                &mesh.links,
+                &key,
+                slot,
+                departed.reason,
+            );
         }
         Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
             crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave);
@@ -1556,6 +1606,21 @@ fn dispatch_mesh_control(
             // every link serving the session, so re-flooding would only echo.
             crate::consensus::mark_session_started(&mesh.decision_makers, &key);
             routing::fan_out_session_start(sessions, &key);
+        }
+        Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
+            let Ok(slot) = u8::try_from(change.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = change.slot,
+                    "mesh SlotConnectivity names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // A peer relay's home client's link changed. Fan it down this relay's
+            // local slots so their connectivity displays reflect it. Deliberately
+            // NOT re-broadcast across the mesh: the origin already sent a copy to
+            // every peer, so re-flooding would only echo (mirroring chat above).
+            routing::fan_out_connectivity(sessions, &key, slot, change.connected);
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -1912,6 +1977,7 @@ mod tests {
             presence: Arc::new(crate::presence::new_presence_registry()),
             lobby: lobby.clone(),
             chat: chat.clone(),
+            leave_grace: crate::leave_grace::LeaveGrace::new(crate::leave_grace::DISCONNECT_GRACE),
         }
     }
 
@@ -2260,6 +2326,66 @@ mod tests {
         assert_eq!(delivered.slot, 0);
         assert_eq!(delivered.target_kind, 2);
         assert_eq!(delivered.text, "hi from relay A");
+        // No echo back out to the mesh on either path.
+        assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
+        assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// A slot-connectivity change arriving over the mesh control stream is fanned
+    /// to this relay's local slots and NOT re-broadcast to other mesh links: the
+    /// origin relay already sent a copy to every peer, so re-flooding would only
+    /// echo. Mirrors the lobby/chat dispatch tests, but the local recipient is a
+    /// routing slot (connectivity is a client-edge concern, not a lobby/chat one).
+    #[test]
+    fn a_slot_connectivity_dispatch_fans_to_local_slots_and_never_echoes() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+
+        // A local routing slot (slot 5) that must receive the fanned change.
+        let (mut guard, mut inbox) =
+            routing::register(&sessions, &key, SlotId(5)).expect("slot 5 registers");
+        guard.disarm();
+        // A peer mesh link that must NOT hear an echo of the received change.
+        let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        // A remote relay reports its home client (slot 0) lost its link.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: false,
+                },
+            )),
+        };
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        // The local slot heard the change, naming the disconnected subject slot.
+        assert_eq!(
+            inbox.try_recv_connectivity(),
+            Some((SlotId(0), false)),
+            "the mesh connectivity change fanned to the local slot",
+        );
         // No echo back out to the mesh on either path.
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
