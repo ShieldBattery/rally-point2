@@ -113,6 +113,29 @@ fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
     start_relay_on((Ipv4Addr::LOCALHOST, 0).into(), registry)
 }
 
+/// Binds an ephemeral IPv4-loopback relay serving `registry` over a caller-supplied
+/// mesh state, so a test can seed the session's decision-maker (marking it started
+/// with an expected-slot set) before any client connects — which is what makes the
+/// relay fire session-start and record forwarded turns in its per-session replay
+/// ring, exactly as a coordinator descriptor would in production.
+fn start_relay_with_mesh(
+    registry: Registry,
+    mesh: rally_point_relay::mesh::MeshState,
+) -> (SocketAddr, CertificateDer<'static>) {
+    let (chain, key, ca) = self_signed();
+    let server_cfg = server_config(chain, key).unwrap();
+    let endpoint = quinn::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(server::serve(
+        endpoint,
+        Arc::new(registry),
+        std::sync::Arc::default(),
+        mesh,
+        None,
+    ));
+    (addr, ca)
+}
+
 /// A registry trusting each of `tenants`.
 fn registry_for(tenants: &[&Tenant]) -> Registry {
     let mut registry = Registry::new();
@@ -570,6 +593,149 @@ async fn a_burst_of_game_chat_past_the_rate_cap_is_dropped_then_recovers() {
     assert_eq!(msg.text, "recovered");
 
     drop(chan0.outbound);
+    drop(chan1.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+}
+
+/// Awaits one forwarded turn on `inbound`, bounded so a stall fails rather than
+/// hangs.
+async fn recv_turn(inbound: &mut tokio::sync::mpsc::Receiver<Payload>) -> Payload {
+    tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("a turn never arrived")
+        .expect("the inbound channel closed")
+}
+
+/// Drains the connectivity channel until the wanted `(slot, connected)` shows,
+/// ignoring the relay's own peer-connectivity frames that share the channel.
+async fn wait_connectivity(
+    rx: &mut tokio::sync::mpsc::Receiver<(SlotId, bool)>,
+    want: (SlotId, bool),
+) {
+    loop {
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("connectivity signal never arrived")
+            .expect("connectivity channel closed");
+        if got == want {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once() {
+    use std::collections::HashSet;
+
+    use rally_point_client::{LinkDriver, Reconnect};
+    use rally_point_proto::control::BufferBounds;
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    // The full reconnect path against a real relay: a client's link drops mid-game,
+    // its driver re-dials itself within the disconnect grace presenting resume
+    // cursors, the relay cancels the pending leave and replays the turns missed
+    // during the outage, and the driver folds them into the ordered stream exactly
+    // once — while signalling its own disconnect then reconnect on the connectivity
+    // channel, the channels staying alive throughout.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(70);
+
+    // Seed the session as started with the two expected slots, so the relay records
+    // forwarded turns in its replay ring.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+
+    // Slot 0 runs with reconnection. Keep a handle to its connection so the test can
+    // sever it, simulating a network drop (not a clean leave), which arms the
+    // relay's grace and keeps the session alive.
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let conn0 = link0.connection().clone();
+    let (driver0, mut chan0) = LinkDriver::new(link0);
+    let reconnect0 = Reconnect {
+        endpoint: ClientEndpoint::from_endpoint(endpoint.endpoint().clone()),
+        relay_addr: addr,
+        server_name: "localhost".to_owned(),
+        identity: id0,
+    };
+    let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
+
+    // Slot 1 runs plainly; it is the peer whose turns slot 0 will miss and replay.
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let (driver1, chan1) = LinkDriver::new(link1);
+    let task1 = tokio::spawn(driver1.run());
+
+    // Both slots connected: session-start fires, so the ring now records turns.
+    tokio::time::timeout(Duration::from_secs(5), chan0.session_start.recv())
+        .await
+        .expect("session start never fired")
+        .expect("slot 0's session-start channel closed");
+
+    // A valid SC:R build command the relay's turn validator accepts; the four turns
+    // are told apart by the origin seq the sender's driver assigns (0..3), not by
+    // their bytes.
+    let turn = || Payload {
+        commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+        ..Default::default()
+    };
+
+    // Slot 1 sends two turns; slot 0 receives them, advancing its cursor to seq 2.
+    chan1.outbound.send(turn()).await.unwrap();
+    chan1.outbound.send(turn()).await.unwrap();
+    assert_eq!(recv_turn(&mut chan0.inbound).await.seq, 0);
+    assert_eq!(recv_turn(&mut chan0.inbound).await.seq, 1);
+
+    // Sever slot 0's link. Its driver must surface its own disconnect, not close the
+    // channels.
+    conn0.close(quinn::VarInt::from_u32(0), b"simulated network drop");
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), false)).await;
+
+    // While slot 0 is away, slot 1 produces two more turns; the relay records them
+    // for replay.
+    chan1.outbound.send(turn()).await.unwrap();
+    chan1.outbound.send(turn()).await.unwrap();
+
+    // Slot 0 re-establishes its link within the grace.
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), true)).await;
+
+    // The relay replays the two missed turns (seq 2, 3); the driver folds them back
+    // into the ordered stream, in order, each exactly once.
+    let third = recv_turn(&mut chan0.inbound).await;
+    let fourth = recv_turn(&mut chan0.inbound).await;
+    assert_eq!(third.seq, 2);
+    assert_eq!(fourth.seq, 3);
+    assert_eq!(&third.commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+
+    // No duplicate delivery: the dedup absorbed any overlap between the replay and
+    // the resumed live stream.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), chan0.inbound.recv())
+            .await
+            .is_err(),
+        "the missed turns must be delivered exactly once",
+    );
+
+    drop(chan0.outbound);
+    drop(chan0.inbound);
     drop(chan1.outbound);
     let _ = task0.await;
     let _ = task1.await;

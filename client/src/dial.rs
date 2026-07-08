@@ -21,6 +21,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_proto::handshake::{self, HandshakeError};
+use rally_point_proto::ids::SlotId;
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
 };
@@ -41,6 +42,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// QUIC application close code the client uses when it abandons a dial because the
 /// authorization exchange did not finish within the deadline.
 const CONNECT_TIMEOUT_CLOSE: u32 = 0x01;
+
+/// QUIC application close code the relay uses to refuse a re-dial whose slot has
+/// already departed — its disconnect grace expired, or it left cleanly — so the
+/// game has moved on without it. Mirrors the relay's `SLOT_DEPARTED_CLOSE` (a wire
+/// contract); a client that sees it on a reconnect must stop retrying, since no
+/// later dial can bring the slot back. Distinct from the relay's slot-taken close
+/// (a still-live double-connect) and from any transport-level failure, both of
+/// which are worth retrying.
+const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 
 /// A QUIC client endpoint for dialing relays.
 ///
@@ -102,6 +112,15 @@ pub enum DialError {
     /// rejecting it. The connection has been closed.
     #[error("dial timed out after {timeout:?}")]
     TimedOut { timeout: Duration },
+    /// The relay refused a re-dial because this slot's leave was already decided —
+    /// its disconnect grace expired or it left cleanly — so the game has moved on
+    /// without it (the relay's slot-departed close). Terminal for a reconnecting
+    /// client: retrying cannot bring the slot back. Only ever produced by
+    /// [`reconnect_with_timeout`](ClientEndpoint::reconnect_with_timeout); a fresh
+    /// dial surfaces the same close as a plain [`Connection`](DialError::Connection)
+    /// error, unchanged.
+    #[error("relay refused the re-dial: slot already departed")]
+    SlotDeparted,
 }
 
 impl ClientEndpoint {
@@ -198,8 +217,62 @@ impl ClientEndpoint {
             Err(_elapsed) => return Err(DialError::TimedOut { timeout }),
         };
 
-        match timeout_at(deadline, authorize(&connection, identity)).await {
+        // A fresh dial presents no resume cursors: the relay replays nothing.
+        match timeout_at(deadline, authorize(&connection, identity, &[])).await {
             Ok(result) => result.map(|()| Link::new(connection)),
+            Err(_elapsed) => {
+                connection.close(
+                    quinn::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
+                    b"authorization timed out",
+                );
+                Err(DialError::TimedOut { timeout })
+            }
+        }
+    }
+
+    /// Re-dials the same relay to resume a session whose link dropped, presenting
+    /// per-slot resume `cursors` so the relay replays only the turns this client
+    /// missed. Each cursor is `(slot, next_needed_seq)`: the relay replays every
+    /// recorded turn for that slot at or past the seq, on the reliable control
+    /// stream, before live turns resume.
+    ///
+    /// The dial is bounded by `timeout` like [`connect_with_timeout`](Self::connect_with_timeout),
+    /// but classifies one refusal specially: if the relay closes the connection with
+    /// its slot-departed code, this returns [`DialError::SlotDeparted`] so the
+    /// reconnect loop can stop rather than retry a slot the game has already moved
+    /// past. Every other failure (a timeout, a lost connection, a slot still held by
+    /// a not-yet-reaped previous connection) surfaces unchanged, for the caller to
+    /// retry.
+    pub async fn reconnect_with_timeout(
+        &self,
+        relay_addr: SocketAddr,
+        server_name: &str,
+        identity: &Identity,
+        cursors: &[(SlotId, u64)],
+        timeout: Duration,
+    ) -> Result<Link, DialError> {
+        let deadline = Instant::now() + timeout;
+
+        let target = mapped_target(self.endpoint.local_addr().ok(), relay_addr);
+        let connecting = self.endpoint.connect(target, server_name)?;
+        let connection = match timeout_at(deadline, connecting).await {
+            Ok(result) => result?,
+            Err(_elapsed) => return Err(DialError::TimedOut { timeout }),
+        };
+
+        match timeout_at(deadline, authorize(&connection, identity, cursors)).await {
+            Ok(Ok(())) => Ok(Link::new(connection)),
+            Ok(Err(error)) => {
+                // A read/write failure during the handshake may be the relay closing
+                // the connection to refuse the re-dial. Prefer its application close
+                // code, which names *why* — a departed slot is terminal — over the
+                // transport-level error the failed I/O surfaced.
+                if refused_as_departed(&connection) {
+                    Err(DialError::SlotDeparted)
+                } else {
+                    Err(error)
+                }
+            }
             Err(_elapsed) => {
                 connection.close(
                     quinn::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
@@ -211,10 +284,25 @@ impl ClientEndpoint {
     }
 }
 
+/// Whether the relay closed `connection` with its slot-departed application code —
+/// the terminal "the game moved on without you" refusal, as opposed to a live
+/// double-connect refusal or any transport-level failure.
+fn refused_as_departed(connection: &quinn::Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(ref close))
+            if close.error_code == quinn::VarInt::from_u32(SLOT_DEPARTED_CLOSE)
+    )
+}
+
 /// Runs the client side of the authorization handshake on an established
 /// connection: present the token, answer the relay's challenge, and confirm the
 /// acknowledgement.
-async fn authorize(connection: &quinn::Connection, identity: &Identity) -> Result<(), DialError> {
+async fn authorize(
+    connection: &quinn::Connection,
+    identity: &Identity,
+    cursors: &[(SlotId, u64)],
+) -> Result<(), DialError> {
     let (mut send, mut recv) = connection.open_bi().await?;
 
     // Present the token: a length-prefixed frame the relay reads in two reads.
@@ -236,13 +324,12 @@ async fn authorize(connection: &quinn::Connection, identity: &Identity) -> Resul
         .sign(&ConnectionChallenge(challenge).signed_message(&channel_binding));
     send.write_all(response.as_ref()).await?;
 
-    // Present the resume cursors: on a first dial there are none, so this is an
-    // empty (zero-count) frame. A mid-game reconnect will fill it with the seq this
-    // client next needs from each peer slot, so the relay replays only the turns it
-    // missed; that client-side re-dial path is a later increment, but the relay
-    // already reads this frame, so every dial must send it to keep the handshake
-    // byte-aligned.
-    let cursor_frame = handshake::encode_resume_cursors(&[])?;
+    // Present the resume cursors: a first dial passes none, so this is an empty
+    // (zero-count) frame that asks the relay to replay nothing. A mid-game reconnect
+    // passes the seq this client next needs from each peer slot, so the relay replays
+    // only the turns it missed. Either way the relay reads this frame, so every dial
+    // sends it to keep the handshake byte-aligned.
+    let cursor_frame = handshake::encode_resume_cursors(cursors)?;
     send.write_all(&cursor_frame).await?;
 
     // The relay acknowledges only once our slot is routable.

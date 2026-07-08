@@ -80,6 +80,25 @@ impl AckManager {
         }
     }
 
+    /// Resets the state bound to one QUIC connection, keeping the still-unacked
+    /// payloads, for a re-dial that resumed the same session on a fresh connection.
+    ///
+    /// The packet seq space, the record of our sent packets, and the peer's
+    /// received-packet history all belong to the old connection and start over: the
+    /// new connection assigns packet seqs from zero and has its own ack history. The
+    /// unacked payloads are deliberately *kept* — the redundancy pass re-carries them
+    /// over the new connection, and every hop dedups by each turn's origin
+    /// `(slot, seq)`, so a turn the peer already received before the drop is dropped
+    /// as a duplicate while one it missed still arrives. Losing them here would drop
+    /// any turn in flight at the moment the link failed, desyncing lockstep.
+    pub fn reset_connection(&mut self) {
+        self.packet_seq = 0;
+        self.sent_packets = SequenceBuffer::with_capacity(SENT_PACKETS_SIZE);
+        self.received_packets = SequenceBuffer::with_capacity(RECEIVED_PACKETS_SIZE);
+        // unacked_payloads intentionally preserved for re-carry over the new
+        // connection.
+    }
+
     /// The peer's most recently received packet seq, or `None` if we've seen
     /// nothing from the peer yet.
     fn last_seen_remote(&self) -> Option<u64> {

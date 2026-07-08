@@ -97,6 +97,25 @@ impl Link {
         &self.connection
     }
 
+    /// Rebinds this link to a freshly dialed connection after the previous one
+    /// failed, resuming the same session rather than starting a new one.
+    ///
+    /// The per-connection send/ack state resets (see
+    /// [`AckManager::reset_connection`](crate::ack_manager::AckManager::reset_connection)),
+    /// but the still-unacked payloads carry over so redundancy re-delivers any turn
+    /// that was in flight when the link dropped. The receive-side dedup is preserved
+    /// whole: its per-slot delivered prefix keeps anchoring the receive window — so
+    /// the relay's post-reconnect replay of mid-game seqs is not rejected as beyond
+    /// the window that a fresh dedup, starting from seq 0, would impose — and it
+    /// dedups that replay against turns already delivered. Payload seqs are origin
+    /// identities carried end-to-end, so the dedup keyed on them stays valid across
+    /// the connection swap.
+    pub fn rebind(&mut self, connection: quinn::Connection) {
+        self.connection = connection;
+        self.acks.reset_connection();
+        // dedup preserved: it is what makes the reconnect a resume, not a restart.
+    }
+
     /// Payloads sent but not yet known-delivered — the in-flight depth, and the
     /// overflow signal the driver watches under sustained loss.
     pub fn payloads_in_flight(&self) -> usize {

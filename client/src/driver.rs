@@ -60,7 +60,8 @@
 //! re-dial and resume from the last delivered turn — or when the game stalls (stops
 //! draining, so the inbound buffer fills) or hands over an undeliverable turn.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -76,6 +77,8 @@ use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
+use crate::dial::{ClientEndpoint, DialError};
+use crate::identity::Identity;
 use crate::leave_announcer::LeaveAnnouncer;
 
 /// Default depth of each turn channel between the game thread and the driver.
@@ -245,14 +248,28 @@ pub struct TurnChannels {
     /// no-op (the relay may re-deliver on a late slot's register or an authority
     /// handoff). Fieldless — the whole signal is that it arrived.
     pub session_start: mpsc::Receiver<()>,
-    /// Slot-connectivity changes the relay pushed down the control stream, each
-    /// carrying `(slot, connected)`: a member's link died (`false`) or
-    /// (re)registered (`true`). Best-effort and informational — the game uses it
-    /// to drive a "player X disconnected" display, independent of the synced
-    /// player-leave that actually removes a slot from lockstep (which arrives on
-    /// [`leaves`](Self::leaves)). No replay and no ordering guarantee against the
-    /// leave path: a change that flowed before this stream came up is simply
-    /// never seen, and an unknown slot is a no-op for the game.
+    /// Slot-connectivity changes, each carrying `(slot, connected)`: a member's
+    /// link died (`false`) or (re)registered (`true`). Best-effort and
+    /// informational — the game uses it to drive a "player X disconnected" display,
+    /// independent of the synced player-leave that actually removes a slot from
+    /// lockstep (which arrives on [`leaves`](Self::leaves)). No replay and no
+    /// ordering guarantee against the leave path: a change that flowed before this
+    /// stream came up is simply never seen, and an unknown slot is a no-op for the
+    /// game.
+    ///
+    /// Two sources feed this one channel:
+    ///
+    /// - **Peer slots** — the relay pushes these down the control stream as it does
+    ///   the other directives.
+    /// - **This client's own slot** — when the driver runs with reconnection
+    ///   ([`run_reconnecting`](LinkDriver::run_reconnecting)) it emits
+    ///   `(own_slot, false)` the moment its own link drops and `(own_slot, true)`
+    ///   once it has re-established one, so the game learns of *its own*
+    ///   disconnect/reconnect from an explicit signal rather than from these
+    ///   channels closing (they now stay open across the outage). The driver knows
+    ///   its own slot from its authorization token; the game tells its own slot from
+    ///   a peer's by comparing against its local slot. This keeps the channel's
+    ///   `(SlotId, bool)` shape unchanged.
     pub connectivity: mpsc::Receiver<(SlotId, bool)>,
 }
 
@@ -329,6 +346,17 @@ pub enum DriverError {
     /// window bounded would desync lockstep, so the driver stops instead.
     #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
     UnackedWindowExhausted { in_flight: usize, cap: usize },
+    /// The relay refused a re-dial because this slot's leave was already decided
+    /// (its disconnect grace expired, or it left cleanly), so the game has moved on
+    /// without this client. Terminal for the reconnect loop — no dial can bring the
+    /// slot back — so the driver ends and its channels close, which the game reads
+    /// as end-of-session.
+    #[error("relay refused the re-dial: slot already departed")]
+    SlotDeparted,
+    /// The authorization token expired while reconnecting, so no re-dial could ever
+    /// be authorized. Terminal for the reconnect loop, like [`SlotDeparted`](Self::SlotDeparted).
+    #[error("authorization token expired; cannot reconnect")]
+    TokenExpired,
 }
 
 impl LinkDriver {
@@ -393,39 +421,174 @@ impl LinkDriver {
         (driver, channels)
     }
 
-    /// Runs the link until the game seam closes (a clean stop → `Ok`) or the link
-    /// fails (→ [`DriverError`], the signal for the reconnect path to re-dial).
+    /// Runs the link over one connection until the game seam closes (a clean stop →
+    /// `Ok`) or the link fails (→ [`DriverError`]). No reconnection: a link failure
+    /// ends the driver and drops every channel, leaving the caller to re-dial and
+    /// rebuild. Use [`run_reconnecting`](Self::run_reconnecting) to have the driver
+    /// re-dial itself and keep the channels alive across a drop.
+    pub async fn run(self) -> Result<(), DriverError> {
+        let LinkDriver {
+            mut link,
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            result_expected,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            session_start,
+            connectivity,
+        } = self;
+        let mut seam = GameSeam {
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            session_start,
+            connectivity,
+        };
+        let mut state = LoopState::new(result_expected);
+        Self::session(&mut link, &mut seam, &mut state).await
+    }
+
+    /// Runs the link and, on a mid-session link failure, re-dials the home relay
+    /// *itself* — keeping every game channel alive — instead of ending.
+    ///
+    /// Across a drop the driver: emits its own slot's connectivity as `false` then
+    /// `true` on [`connectivity`](TurnChannels::connectivity) (so the game learns of
+    /// its own disconnect/reconnect from an explicit signal, not from the channels
+    /// closing); re-dials with capped exponential backoff, presenting per-slot
+    /// resume cursors so the relay replays the turns missed during the outage; and
+    /// rebinds the link in place, so the receive-side dedup and per-slot reorder
+    /// buffers survive and the replay dedups against turns already delivered. Turns
+    /// the game produces during the outage are buffered and flushed in order once
+    /// the link is back; turns already sent but unacked at the drop re-carry
+    /// themselves over the new connection.
+    ///
+    /// The loop ends — dropping the channels, which the game reads as end-of-session
+    /// — on a clean game shutdown (→ `Ok`), a terminal relay refusal
+    /// ([`DriverError::SlotDeparted`]), an expired token
+    /// ([`DriverError::TokenExpired`]), or a non-link failure the loop can't fix (a
+    /// stalled game, an exhausted unacked window).
+    pub async fn run_reconnecting(self, reconnect: Reconnect) -> Result<(), DriverError> {
+        // The driver knows its own slot from its token; it labels the
+        // self-connectivity signal with it.
+        let own_slot = reconnect.identity.token().claims.slot;
+        let LinkDriver {
+            mut link,
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            result_expected,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            session_start,
+            connectivity,
+        } = self;
+        let mut seam = GameSeam {
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            session_start,
+            connectivity,
+        };
+        let mut state = LoopState::new(result_expected);
+        let mut backoff = Backoff::new();
+
+        loop {
+            match Self::session(&mut link, &mut seam, &mut state).await {
+                // A clean game shutdown, or a link close absorbed after our own
+                // leave intent went out: the session is over, not to be resumed.
+                Ok(()) => return Ok(()),
+                // A link/stream failure: keep the channels alive and re-dial.
+                Err(error) if is_link_failure(&error) => {
+                    let _ = seam.connectivity.send((own_slot, false)).await;
+                    match reconnect_link(&reconnect, &mut link, &mut seam, &mut state, &mut backoff)
+                        .await
+                    {
+                        Reconnected::Resumed => {
+                            let _ = seam.connectivity.send((own_slot, true)).await;
+                            // Loop: run the next session over the rebound link.
+                        }
+                        Reconnected::Terminal(error) => return Err(error),
+                        Reconnected::GameGone => return Ok(()),
+                    }
+                }
+                // A non-link failure (stalled game, exhausted window) or a terminal
+                // relay refusal surfaced from within the session: reconnecting can't
+                // help, so end.
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Runs one connection's worth of the turn loop, over the already-established
+    /// [`link`](Link) and the game [`seam`](GameSeam), threading the state that must
+    /// survive a reconnect ([`LoopState`]). Returns a clean stop as `Ok`, and a link
+    /// or terminal failure as [`DriverError`] for the caller to re-dial through or
+    /// end on.
     ///
     /// Multiplexes over one task: receiving the client's peers' turns and handing
     /// them to the game, sending the turns the game produced, flushing ack-only
     /// packets during outbound silence, driving the ack-beacon side-channel that
-    /// keeps the unacked window bounded under loss, sending the game's
-    /// end-of-game result report the moment it arrives, and — once the game
-    /// signals its own departure — announcing that leave to the relay after the
-    /// outbound queue and unacked window have drained (and the result, if one was
-    /// expected, has been sent).
+    /// keeps the unacked window bounded under loss, sending the game's end-of-game
+    /// result report the moment it arrives, and — once the game signals its own
+    /// departure — announcing that leave to the relay after the outbound queue and
+    /// unacked window have drained (and the result, if one was expected, has been
+    /// sent).
+    ///
     /// The beacon is two uni-streams — one each direction — and its read half runs
     /// in a dedicated task so a partial stream read is never dropped mid-frame
     /// inside a `select!` branch (which would desync the framing and hand a
     /// garbage `(slot, cursor)` to `retire_through`); the task forwards each
     /// complete `(slot, cursor)` over an mpsc channel, whose `recv` *is*
     /// cancel-safe.
-    pub async fn run(self) -> Result<(), DriverError> {
-        let Self {
-            mut link,
-            mut outbound,
+    async fn session(
+        link: &mut Link,
+        seam: &mut GameSeam,
+        state: &mut LoopState,
+    ) -> Result<(), DriverError> {
+        let GameSeam {
+            outbound,
             inbound,
             leaves,
-            mut leave_intent,
-            mut result,
-            result_expected,
-            mut lobby_out,
+            leave_intent,
+            result,
+            lobby_out,
             lobby_in,
-            mut chat_out,
+            chat_out,
             chat_in,
             session_start,
             connectivity,
-        } = self;
+        } = seam;
+        // The reorder/dedup cursors, the outbound seq counter, the leave announcer,
+        // and any turns buffered during a prior outage all persist across a
+        // reconnect, so they come from the caller's state, not fresh locals.
+        let LoopState {
+            next_seq,
+            pending,
+            next_outbound_seq,
+            announcer,
+            outbound_buffer,
+        } = state;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
         // (open_uni completes locally, no peer round-trip); the peer's stream is
@@ -478,30 +641,41 @@ impl LinkDriver {
         // fire when a send carries no redundancy or the link is idle, so a turn the
         // fresh packets can't re-carry is still retransmitted.
         let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
-        // The client's own outbound payload seq counter. Under the origin-identity
-        // model the client assigns the seq for its own slot's turn stream — it alone
-        // knows production order — and every hop honors it untouched. Monotonic from
-        // 0, one counter since the client sends a single slot.
-        let mut next_outbound_seq: u64 = 0;
-
-        // Each peer slot carries its own monotonic seq space starting at 0, so
-        // the per-slot reorder buffer restores game order independently per slot.
-        // `next_seq[slot]` is the lowest seq not yet handed to the game for that
-        // slot; `pending[slot]` holds turns that arrived ahead of it until the gaps
-        // below them fill, so the game is handed a strictly in-order stream per slot
-        // — the lockstep contract — rather than raw arrival order. The receive
-        // window bounds how far ahead a seq can be, so each stays small.
-        let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
-        let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
-
-        // Owns this client's clean-departure announcement: it stays dormant until
-        // the game signals its own leave, then holds the `LeaveIntent` frame until
-        // the outbound queue and unacked window have drained (and any expected
-        // result has been sent) or a safety timeout fires, and classifies the
-        // relay's subsequent link close as the expected confirmation rather than a
-        // failure. It also latches whether the result report has been written, so
-        // a second result payload is dropped.
-        let mut announcer = LeaveAnnouncer::new(result_expected);
+        // Flush any turns the game produced while the link was down, in seq order,
+        // before live turns resume. On a fresh dial the buffer is empty; on a
+        // reconnect these are the turns buffered during the outage. Each goes out
+        // exactly like a live outbound turn: assigned its origin seq from the
+        // persistent counter, sent on the datagram path when it fits or diverted to
+        // the control stream when it cannot, and able to release a pending leave
+        // intent it was the last thing holding. `next_outbound_seq`, the reorder
+        // cursors, and the announcer all live in the persistent `state`, so a
+        // resumed session continues the seq stream rather than rewinding it.
+        for mut buffered in std::mem::take(outbound_buffer) {
+            buffered.seq = *next_outbound_seq;
+            *next_outbound_seq += 1;
+            if link.payload_fits(&buffered)? {
+                match send_packet(link, Some(buffered)) {
+                    Ok(carried_redundancy) => {
+                        if carried_redundancy {
+                            flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                        }
+                    }
+                    Err(error) => return announcer.absorb_link_close(Err(error)),
+                }
+                acks_owed = false;
+                if check_cap(link.payloads_in_flight()) {
+                    return Err(DriverError::UnackedWindowExhausted {
+                        in_flight: link.payloads_in_flight(),
+                        cap: UNACKED_WINDOW_CAP,
+                    });
+                }
+            } else if let Err(error) = send_control_turn(&mut control_send, buffered).await {
+                return announcer.absorb_link_close(Err(DriverError::from(error)));
+            }
+            announcer
+                .maybe_send(&mut control_send, outbound, link)
+                .await?;
+        }
         // Mirrors `beacon_alive`/`control_alive`: the game signals at most once, so
         // this disarms on the channel's first resolution (the real signal, or the
         // sender dropping without one) rather than only on `None` — either way
@@ -574,12 +748,12 @@ impl LinkDriver {
                                 .insert(payload.seq, payload);
                         }
                     }
-                    match release_ready(&mut next_seq, &mut pending, &inbound) {
+                    match release_ready(next_seq, pending, inbound) {
                         Release::Delivered => {}
                         Release::GameClosed => return Ok(()),
                         Release::GameStalled => return Err(DriverError::GameStalled),
                     }
-                    flush_delivered_cursors(&link, &mut beacon_send, &mut last_beacon_sent, &next_seq)
+                    flush_delivered_cursors(link, &mut beacon_send, &mut last_beacon_sent, next_seq)
                         .await;
                     if check_cap(link.payloads_in_flight()) {
                         return Err(DriverError::UnackedWindowExhausted {
@@ -589,7 +763,7 @@ impl LinkDriver {
                     }
                     // An ack folded into the manager above may be the last one
                     // a pending leave intent was waiting on.
-                    announcer.maybe_send(&mut control_send, &outbound, &link).await?;
+                    announcer.maybe_send(&mut control_send, outbound, link).await?;
                 }
                 // An oversize turn from the relay, delivered over the reliable
                 // control stream because no datagram could carry it. Folding it
@@ -730,16 +904,16 @@ impl LinkDriver {
                                     .entry(slot)
                                     .or_default()
                                     .insert(payload.seq, payload);
-                                match release_ready(&mut next_seq, &mut pending, &inbound) {
+                                match release_ready(next_seq, pending, inbound) {
                                     Release::Delivered => {}
                                     Release::GameClosed => return Ok(()),
                                     Release::GameStalled => return Err(DriverError::GameStalled),
                                 }
                                 flush_delivered_cursors(
-                                    &link,
+                                    link,
                                     &mut beacon_send,
                                     &mut last_beacon_sent,
-                                    &next_seq,
+                                    next_seq,
                                 )
                                 .await;
                             }
@@ -764,10 +938,10 @@ impl LinkDriver {
                         Some(mut payload) => {
                             // Assign this turn its origin seq — the client is the
                             // sole authority for its own slot's production order.
-                            payload.seq = next_outbound_seq;
-                            next_outbound_seq += 1;
+                            payload.seq = *next_outbound_seq;
+                            *next_outbound_seq += 1;
                             if link.payload_fits(&payload)? {
-                                let carried_redundancy = match send_packet(&mut link, Some(payload)) {
+                                let carried_redundancy = match send_packet(link, Some(payload)) {
                                     Ok(carried_redundancy) => carried_redundancy,
                                     // The connection went down while sending this
                                     // turn. If we already announced our leave, the
@@ -808,7 +982,7 @@ impl LinkDriver {
                             // The turn just sent may have been the last one
                             // outstanding, in which case a pending leave intent
                             // is now ready to go out.
-                            announcer.maybe_send(&mut control_send, &outbound, &link).await?;
+                            announcer.maybe_send(&mut control_send, outbound, link).await?;
                         }
                         // The game dropped its sender: a clean stop.
                         None => return Ok(()),
@@ -831,7 +1005,7 @@ impl LinkDriver {
                     leave_intent_alive = false;
                     if signal.is_some() {
                         announcer.arm(LEAVE_INTENT_TIMEOUT);
-                        announcer.maybe_send(&mut control_send, &outbound, &link).await?;
+                        announcer.maybe_send(&mut control_send, outbound, link).await?;
                     }
                     // A `None` (the game dropped its sender without ever
                     // signaling — an unclean teardown) needs no further action:
@@ -878,7 +1052,7 @@ impl LinkDriver {
                                 announcer.note_result_sent();
                                 // Sending the result may have been the last thing
                                 // a pending leave intent was holding for.
-                                announcer.maybe_send(&mut control_send, &outbound, &link).await?;
+                                announcer.maybe_send(&mut control_send, outbound, link).await?;
                             }
                         }
                         // The game dropped its result sender without ever handing
@@ -977,7 +1151,7 @@ impl LinkDriver {
                             // The beacon force-retiring turns may have just
                             // emptied the unacked window a pending leave intent
                             // was waiting on.
-                            announcer.maybe_send(&mut control_send, &outbound, &link).await?;
+                            announcer.maybe_send(&mut control_send, outbound, link).await?;
                         }
                         // The reader task ended (peer's beacon stream closed or
                         // errored). Stop polling it: the real link failure, if any,
@@ -1000,7 +1174,7 @@ impl LinkDriver {
                     // the near-MTU fresh packets did not) and folds in any acks owed.
                     // It stays silent when nothing is unacked and nothing is owed.
                     if acks_owed || link.payloads_in_flight() > 0 {
-                        match send_packet(&mut link, None) {
+                        match send_packet(link, None) {
                             Ok(_) => {}
                             // Post-announce, the relay closing the link under this
                             // flush is the expected confirmation, not a failure.
@@ -1106,6 +1280,296 @@ async fn flush_delivered_cursors(
 /// the open failover design (D11).
 fn check_cap(in_flight: usize) -> bool {
     in_flight > UNACKED_WINDOW_CAP
+}
+
+/// The first reconnect backoff delay, doubled each attempt up to
+/// [`RECONNECT_BACKOFF_CAP`].
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+
+/// The ceiling on the reconnect backoff delay.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// Per-attempt bound on one reconnect dial. Short enough that several attempts fit
+/// inside the relay's disconnect grace, so a recoverable drop reconnects before the
+/// slot is decided departed.
+const RECONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Ceiling on turns buffered while the link is down. Under lockstep the game stalls
+/// within a couple turns of losing the link — it can't advance without its peers'
+/// turns — so this is a safety bound, not a tuned depth; past it the oldest buffered
+/// turn is dropped (with a warning) rather than let the buffer grow without bound.
+const OUTAGE_OUTBOUND_BUFFER_CAP: usize = 256;
+
+/// The driver's half of the game seam: the channels a [`LinkDriver`] owns to
+/// exchange turns and control with the game thread. Bundled so a session runs over
+/// them by reference and they outlive a reconnect that swaps the underlying link.
+struct GameSeam {
+    outbound: mpsc::Receiver<Payload>,
+    inbound: mpsc::Sender<Payload>,
+    leaves: mpsc::Sender<LeaveDirective>,
+    leave_intent: mpsc::Receiver<()>,
+    result: mpsc::Receiver<Vec<u8>>,
+    lobby_out: mpsc::Receiver<Vec<u8>>,
+    lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
+    chat_out: mpsc::Receiver<ChatOut>,
+    chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    session_start: mpsc::Sender<()>,
+    connectivity: mpsc::Sender<(SlotId, bool)>,
+}
+
+/// The driver state that must persist across a reconnect so a re-dialed session
+/// resumes rather than restarts.
+struct LoopState {
+    /// Per peer slot, the lowest seq not yet handed to the game — the reorder
+    /// cursor. This *is* the authoritative per-slot delivery high-water mark: it is
+    /// the top of the contiguous run delivered to the game, and thus the "next
+    /// needed" seq presented as the resume cursor on a reconnect, so the relay
+    /// replays exactly the turns missed and the reorder buffer/dedup absorb any
+    /// overlap the replay carries.
+    next_seq: HashMap<SlotId, u64>,
+    /// Per peer slot, turns that arrived ahead of `next_seq`, held until the gap
+    /// below them fills. Preserved across a reconnect so turns received but not yet
+    /// released aren't re-asked-for or lost.
+    pending: HashMap<SlotId, BTreeMap<u64, Payload>>,
+    /// The client's own outbound payload seq counter. An origin identity every hop
+    /// honors, so it is monotonic across reconnects and never rewinds.
+    next_outbound_seq: u64,
+    /// The client's clean-departure announcer, persisted so a leave signaled before
+    /// a drop is still honored after the reconnect.
+    announcer: LeaveAnnouncer,
+    /// Turns the game produced while the link was down, flushed in order when the
+    /// next session comes up.
+    outbound_buffer: VecDeque<Payload>,
+}
+
+impl LoopState {
+    fn new(result_expected: Arc<AtomicBool>) -> Self {
+        Self {
+            next_seq: HashMap::new(),
+            pending: HashMap::new(),
+            next_outbound_seq: 0,
+            announcer: LeaveAnnouncer::new(result_expected),
+            outbound_buffer: VecDeque::new(),
+        }
+    }
+}
+
+/// What a [`LinkDriver`] needs to re-dial its home relay itself, so
+/// [`run_reconnecting`](LinkDriver::run_reconnecting) can resume a dropped session
+/// without tearing the game seam down.
+pub struct Reconnect {
+    /// The endpoint to re-dial from — the one that made the initial connection, its
+    /// UDP socket held open for the session's life. If it is also dialing other
+    /// slots, clone the caller's via [`ClientEndpoint::from_endpoint`].
+    pub endpoint: ClientEndpoint,
+    /// The home relay's address.
+    pub relay_addr: SocketAddr,
+    /// The relay's TLS server name, checked against its certificate.
+    pub server_name: String,
+    /// The credentials to re-authorize with. Its token names this client's slot (the
+    /// subject of the self-connectivity signal) and bounds how long reconnection is
+    /// attempted — an expired token ends the loop.
+    pub identity: Identity,
+}
+
+/// The per-slot resume cursors to present on a reconnect: for each peer slot the
+/// driver has received from, the seq it next needs (`next_seq`). The relay replays
+/// every recorded turn at or past the cursor and nothing below it, and the client's
+/// dedup absorbs any overlap. An empty map (no peer turns yet) asks for no replay,
+/// exactly like a fresh dial.
+fn resume_cursors(next_seq: &HashMap<SlotId, u64>) -> Vec<(SlotId, u64)> {
+    next_seq.iter().map(|(&slot, &next)| (slot, next)).collect()
+}
+
+/// Whether a session ended on a link/stream failure the reconnect loop should
+/// re-dial through, as opposed to a terminal condition (a stalled game, an
+/// exhausted window, a relay refusal) reconnecting cannot fix.
+fn is_link_failure(error: &DriverError) -> bool {
+    matches!(error, DriverError::Link(_) | DriverError::ControlStream(_))
+}
+
+/// Whether the identity's authorization token has expired against the wall clock —
+/// the relay would reject any re-dial, so reconnection stops. Matches the relay's
+/// boundary: the expiry instant itself counts as expired.
+fn token_expired(identity: &Identity) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    now >= identity.token().claims.expires_at.0
+}
+
+/// The outcome of the reconnect loop for one dropped link.
+enum Reconnected {
+    /// The relay accepted the re-dial and the link was rebound in place; the caller
+    /// resumes the session over it.
+    Resumed,
+    /// Reconnection can't proceed (the slot departed, or the token expired); the
+    /// caller ends the driver with this error.
+    Terminal(DriverError),
+    /// The game tore down its seam during the outage; end cleanly.
+    GameGone,
+}
+
+/// Re-dials the home relay until the link is re-established, the game leaves, or a
+/// terminal refusal. Backs off between attempts (buffering any turns the game
+/// produces meanwhile and noticing a teardown), presents the resume cursors, and on
+/// success rebinds `link` in place so the receive dedup and unacked window carry
+/// over. A slot-departed refusal or an expired token ends it terminally; every other
+/// dial failure is retried under a growing backoff.
+async fn reconnect_link(
+    reconnect: &Reconnect,
+    link: &mut Link,
+    seam: &mut GameSeam,
+    state: &mut LoopState,
+    backoff: &mut Backoff,
+) -> Reconnected {
+    loop {
+        // An expired token can never re-authorize: stop before wasting a dial.
+        if token_expired(&reconnect.identity) {
+            return Reconnected::Terminal(DriverError::TokenExpired);
+        }
+        match wait_backoff(backoff, seam, state).await {
+            WaitOutcome::Elapsed => {}
+            WaitOutcome::GameGone => return Reconnected::GameGone,
+        }
+        let cursors = resume_cursors(&state.next_seq);
+        match reconnect
+            .endpoint
+            .reconnect_with_timeout(
+                reconnect.relay_addr,
+                &reconnect.server_name,
+                &reconnect.identity,
+                &cursors,
+                RECONNECT_DIAL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(fresh) => {
+                // Adopt only the new connection; the old link's receive dedup and
+                // unacked window carry over, turning the re-dial into a resume.
+                link.rebind(fresh.connection().clone());
+                backoff.reset();
+                return Reconnected::Resumed;
+            }
+            // The game moved on without us: no dial can bring the slot back.
+            Err(DialError::SlotDeparted) => {
+                return Reconnected::Terminal(DriverError::SlotDeparted);
+            }
+            // Any transient failure (a timeout, a lost connection, a slot still held
+            // by a not-yet-reaped previous connection): back off further and retry.
+            Err(error) => {
+                tracing::info!(%error, "re-dial attempt failed; backing off");
+            }
+        }
+    }
+}
+
+/// The outcome of a backoff wait between reconnect attempts.
+enum WaitOutcome {
+    /// The backoff delay elapsed; time to (re)dial.
+    Elapsed,
+    /// The game tore down its seam; abandon reconnection.
+    GameGone,
+}
+
+/// Waits the next backoff delay before a reconnect attempt, while still servicing
+/// the game's outbound turns — buffering them (bounded, drop-oldest) so a resumed
+/// session can flush them — and watching for the game tearing down (its outbound
+/// sender or inbound receiver dropped). Other game→driver channels park in their
+/// own buffers during the brief outage and are drained when the session resumes.
+async fn wait_backoff(
+    backoff: &mut Backoff,
+    seam: &mut GameSeam,
+    state: &mut LoopState,
+) -> WaitOutcome {
+    let deadline = Instant::now() + backoff.next_delay();
+    loop {
+        tokio::select! {
+            _ = sleep_until(deadline) => return WaitOutcome::Elapsed,
+            // The game dropped its inbound receiver: a teardown.
+            _ = seam.inbound.closed() => return WaitOutcome::GameGone,
+            produced = seam.outbound.recv() => match produced {
+                Some(turn) => {
+                    state.outbound_buffer.push_back(turn);
+                    if state.outbound_buffer.len() > OUTAGE_OUTBOUND_BUFFER_CAP {
+                        state.outbound_buffer.pop_front();
+                        tracing::warn!(
+                            "outbound outage buffer full; dropping the oldest produced turn"
+                        );
+                    }
+                }
+                // The game dropped its outbound sender: a teardown.
+                None => return WaitOutcome::GameGone,
+            },
+        }
+    }
+}
+
+/// Capped exponential backoff with jitter for the reconnect dial.
+///
+/// The base schedule doubles from [`RECONNECT_BACKOFF_INITIAL`] to
+/// [`RECONNECT_BACKOFF_CAP`]; each delay is then jittered down into `[base/2, base]`
+/// so many clients that dropped together don't re-dial in lockstep. The base
+/// schedule is a pure function of the attempt count, so its shape is unit-testable
+/// independently of the jitter.
+struct Backoff {
+    attempt: u32,
+    rng: u64,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        // Seed the jitter PRNG from the clock; only that separate clients diverge
+        // matters, not the exact value. Force non-zero for the xorshift.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+            | 1;
+        Self {
+            attempt: 0,
+            rng: seed,
+        }
+    }
+
+    /// Resets to the initial delay after a successful reconnect.
+    fn reset(&mut self) {
+        self.attempt = 0;
+    }
+
+    /// The base (un-jittered) delay for `attempt`: the initial delay doubled
+    /// `attempt` times, capped. Pure, so the schedule shape is unit-testable.
+    fn base_delay(attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        RECONNECT_BACKOFF_INITIAL
+            .saturating_mul(factor)
+            .min(RECONNECT_BACKOFF_CAP)
+    }
+
+    /// The next delay: the current attempt's base jittered into `[base/2, base]`,
+    /// advancing the attempt counter (saturating, so it stays at the cap).
+    fn next_delay(&mut self) -> Duration {
+        let base = Self::base_delay(self.attempt).as_millis() as u64;
+        self.attempt = self.attempt.saturating_add(1);
+        let half = base / 2;
+        let jitter = if half == 0 {
+            0
+        } else {
+            self.next_rand() % (half + 1)
+        };
+        Duration::from_millis(base - jitter)
+    }
+
+    /// One xorshift64 step — a tiny PRNG for jitter, with no external dependency.
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
 }
 
 #[cfg(test)]
@@ -2007,5 +2471,115 @@ mod tests {
         drop(chan_a.outbound);
         drop(chan_a.inbound);
         let _ = task.await;
+    }
+
+    /// Mirrors the driver's datagram-branch inbound ingest for a single slot:
+    /// buffer a turn only at or above the next-needed seq, then release the
+    /// contiguous prefix to the game. This is the exact bookkeeping the resume
+    /// cursor is read from.
+    fn ingest_turn(
+        slot: SlotId,
+        seq: u64,
+        next_seq: &mut HashMap<SlotId, u64>,
+        pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+        inbound: &mpsc::Sender<Payload>,
+    ) {
+        let slot_next = *next_seq.entry(slot).or_insert(0);
+        if seq >= slot_next {
+            pending
+                .entry(slot)
+                .or_default()
+                .insert(seq, turn(seq, &[seq as u8]));
+        }
+        assert!(matches!(
+            release_ready(next_seq, pending, inbound),
+            Release::Delivered
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_cursor_is_the_contiguous_high_water_and_absorbs_replayed_turns() {
+        // The reconnect path derives its resume cursor from `next_seq` — the top of
+        // the contiguous run delivered to the game, per slot. Drive the driver's
+        // exact inbound ingest and confirm the cursor tracks that high-water and
+        // that a replayed already-delivered turn neither advances it nor re-reaches
+        // the game (the reorder buffer dedups the overlap a replay carries).
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Payload>(64);
+        let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
+        let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
+        let slot = SlotId(0);
+
+        ingest_turn(slot, 0, &mut next_seq, &mut pending, &inbound_tx);
+        ingest_turn(slot, 1, &mut next_seq, &mut pending, &inbound_tx);
+        // A gap at 2: seq 3 is held, so the cursor stays at the next-needed 2.
+        ingest_turn(slot, 3, &mut next_seq, &mut pending, &inbound_tx);
+        assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
+
+        // A replay of an already-delivered turn (seq 1 < cursor 2) is dropped: the
+        // cursor is unchanged and nothing new reaches the game.
+        ingest_turn(slot, 1, &mut next_seq, &mut pending, &inbound_tx);
+        assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
+
+        // Seq 2 fills the gap: 2 and the held 3 both release, the cursor jumps to 4.
+        ingest_turn(slot, 2, &mut next_seq, &mut pending, &inbound_tx);
+        assert_eq!(resume_cursors(&next_seq), vec![(slot, 4)]);
+
+        // The game saw 0,1,2,3 once each, in order — no duplicate from the replay.
+        let mut delivered = Vec::new();
+        while let Ok(payload) = inbound_rx.try_recv() {
+            delivered.push((payload.seq, payload.commands[0]));
+        }
+        assert_eq!(delivered, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn resume_cursors_map_every_received_peer_slot_to_its_next_needed_seq() {
+        let mut next_seq = HashMap::new();
+        next_seq.insert(SlotId(0), 5);
+        next_seq.insert(SlotId(2), 0);
+        let mut cursors = resume_cursors(&next_seq);
+        cursors.sort();
+        assert_eq!(cursors, vec![(SlotId(0), 5), (SlotId(2), 0)]);
+
+        // No peer turns received yet → no cursors → the relay replays nothing, the
+        // same as a fresh dial.
+        assert!(resume_cursors(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn backoff_base_schedule_doubles_from_the_initial_delay_then_caps() {
+        assert_eq!(Backoff::base_delay(0), RECONNECT_BACKOFF_INITIAL);
+        assert_eq!(Backoff::base_delay(1), Duration::from_secs(1));
+        assert_eq!(Backoff::base_delay(2), Duration::from_secs(2));
+        assert_eq!(Backoff::base_delay(3), Duration::from_secs(4));
+        // 500ms << 4 = 8s would exceed the 5s cap, so it clamps there.
+        assert_eq!(Backoff::base_delay(4), RECONNECT_BACKOFF_CAP);
+        assert_eq!(Backoff::base_delay(5), RECONNECT_BACKOFF_CAP);
+        // A far-out attempt saturates at the cap rather than overflowing the shift.
+        assert_eq!(Backoff::base_delay(1_000), RECONNECT_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn backoff_next_delay_jitters_within_half_of_base_and_advances_each_attempt() {
+        let mut backoff = Backoff::new();
+        // `next_delay` uses the current attempt's base then advances, so the base for
+        // attempt N is what the Nth draw must fall within.
+        for attempt in 0..8u32 {
+            let base = Backoff::base_delay(attempt);
+            let delay = backoff.next_delay();
+            assert!(
+                delay <= base,
+                "attempt {attempt}: {delay:?} exceeds its base {base:?}"
+            );
+            assert!(
+                delay >= base / 2,
+                "attempt {attempt}: {delay:?} is below half its base {base:?}"
+            );
+        }
+
+        // A reset returns to the initial delay's jitter band.
+        backoff.reset();
+        let first = backoff.next_delay();
+        assert!(first >= RECONNECT_BACKOFF_INITIAL / 2 && first <= RECONNECT_BACKOFF_INITIAL);
     }
 }

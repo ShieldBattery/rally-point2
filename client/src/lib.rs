@@ -51,6 +51,6 @@ mod leave_announcer;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
-pub use driver::{ChatOut, DriverError, LinkDriver, TurnChannels};
+pub use driver::{ChatOut, DriverError, LinkDriver, Reconnect, TurnChannels};
 pub use identity::{Identity, IdentityError};
 pub use leave::LeaveTracker;
