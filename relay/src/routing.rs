@@ -1603,9 +1603,15 @@ fn end_slot_link(
         // Same for the forwarded-turn replay ring: no local slot remains to resume,
         // so nothing more will be replayed from it.
         mesh.turn_ring.end_session(key);
-        // Same for any drop holds and request limiters: a held drop never fires on
-        // its own, so without this its marker would outlive the session forever.
-        mesh.drop_holds.end_session(key);
+        // Same for request limiters, and for any hold whose slot's leave is already
+        // decided — but NOT for an undecided hold: the disconnect just above may
+        // itself have marked one (this relay's own last local slot leaving is
+        // exactly what both creates its hold and empties the roster, on a session
+        // split across relays this happens on every single disconnect), and that
+        // hold is still the reconnect-admission token and unlock clock for a drop
+        // nobody has decided yet. See `crate::drop_hold` module docs.
+        let decided = consensus::decided_slots(&mesh.decision_makers, key);
+        mesh.drop_holds.end_session(key, &decided);
     }
 }
 
@@ -1949,13 +1955,18 @@ pub(crate) fn reconcile_abandon(
         && consensus::has_undecided_departure(decision_makers, key);
     if abandoned {
         // Owned clones for the timer task: it fires after the window with no
-        // borrowed state, holding the shared registries by `Arc`.
+        // borrowed state, holding the shared registries by `Arc` (`DropHolds`
+        // clones cheaply too — an `Arc` around each of its own maps). Named
+        // distinctly from `drop_holds` itself, which stays the `&self` receiver of
+        // `arm_abandon` below.
+        let drop_holds_for_expire = drop_holds.clone();
         let decision_makers = Arc::clone(decision_makers);
         let sessions = Arc::clone(sessions);
         let mesh_links = Arc::clone(mesh_links);
         let key_for_expire = key.clone();
         drop_holds.arm_abandon(key.clone(), move || {
             decide_and_broadcast_abandoned(
+                &drop_holds_for_expire,
                 &decision_makers,
                 &sessions,
                 &mesh_links,
@@ -1973,7 +1984,16 @@ pub(crate) fn reconcile_abandon(
 /// [`consensus::decide_abandoned_departures`]) and fires one departure notice per
 /// slot as a side effect; the broadcast reaches no local survivor (the roster is
 /// empty) but re-syncs any peer relay's cached leave state (dedup by slot).
+///
+/// Releases each freshly decided slot's drop hold — the decision is made now, so
+/// the hold has nothing further to gate; without this it would sit "pending"
+/// forever (a session-emptied teardown only sweeps a hold once it is decided, and
+/// this session's already ran). A slot [`consensus::decide_abandoned_departures`]
+/// dedups away (already decided) has no directive here, so its hold — if somehow
+/// still present — is left for the next teardown's decided-sweep, not touched
+/// twice for no reason.
 fn decide_and_broadcast_abandoned(
+    drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &crate::consensus::DecisionMakers,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
@@ -1987,6 +2007,11 @@ fn decide_and_broadcast_abandoned(
             count = leaves.len(),
             "abandoned session timed out with no live slots; deciding its held departures",
         );
+        for leave in &leaves {
+            if let Ok(slot) = u8::try_from(leave.slot) {
+                drop_holds.release(key, SlotId(slot));
+            }
+        }
         crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
     }
 }

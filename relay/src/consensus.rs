@@ -2488,15 +2488,39 @@ impl DecisionMaker {
         };
         let inserted = match self.decided_leaves.entry(slot) {
             Entry::Occupied(existing) => {
-                if existing.get() != leave {
-                    tracing::warn!(
-                        tenant = self.key.tenant.as_ref(),
-                        session = self.key.session.0,
-                        slot = leave.slot,
-                        cached_apply = existing.get().apply_at_frame,
-                        observed_apply = leave.apply_at_frame,
-                        "conflicting synced leave for a slot already cached; keeping the first",
-                    );
+                let cached = *existing.get();
+                if cached != *leave {
+                    // `leave_seq` is assigned locally by whichever relay decides
+                    // (`next_leave_seq += 1`), so two relays independently
+                    // force-deciding the same fully-abandoned slot (see
+                    // `force_decide_leave`) can agree completely on the decision
+                    // itself — `reason` and `apply_at_frame` — while disagreeing on
+                    // this purely-local numbering. That is not a conflict, just two
+                    // relays labeling the identical decision differently, so it is
+                    // logged at debug. A disagreement on the decision's substance
+                    // (a different reason or apply frame) is the real
+                    // authority-bug signal and still warns.
+                    if cached.reason == leave.reason
+                        && cached.apply_at_frame == leave.apply_at_frame
+                    {
+                        tracing::debug!(
+                            tenant = self.key.tenant.as_ref(),
+                            session = self.key.session.0,
+                            slot = leave.slot,
+                            cached_leave_seq = cached.leave_seq,
+                            observed_leave_seq = leave.leave_seq,
+                            "same synced leave decided independently with a different leave_seq; keeping the first",
+                        );
+                    } else {
+                        tracing::warn!(
+                            tenant = self.key.tenant.as_ref(),
+                            session = self.key.session.0,
+                            slot = leave.slot,
+                            cached_apply = cached.apply_at_frame,
+                            observed_apply = leave.apply_at_frame,
+                            "conflicting synced leave for a slot already cached; keeping the first",
+                        );
+                    }
                 }
                 false
             }
@@ -2539,11 +2563,36 @@ impl DecisionMaker {
     /// Only the departure record is dropped; the slot's live frame state is
     /// re-created from its resumed turns (the `observe_frame`/`ingest` guards stop
     /// ignoring it the moment the record is gone), and its presence is re-asserted
-    /// by the register's own `note_slot_present`. A cached *decided* leave is never
-    /// touched — a re-register while the drop is held only reaches an undecided
-    /// departure, so there is none to conflict with.
+    /// by the register's own `note_slot_present`.
+    ///
+    /// A no-op — returns `false`, the departure record untouched — when the slot's
+    /// leave is **already decided**. Ordinarily a re-register only reaches an
+    /// undecided departure (its hold is what the caller checked to get here), so
+    /// there is nothing to conflict with; but the fully-abandoned-session path can
+    /// force-decide a slot without a hold ever being released first (its hold
+    /// survives until this relay's own local roster next empties — see
+    /// [`crate::drop_hold::DropHolds::end_session`]), so a reconnect racing a
+    /// force-decide on this exact slot could otherwise land here. This check is
+    /// what keeps that race safe under the registry's single-mutex serialization:
+    /// [`crate::consensus::decide_abandoned_departures`] holds the same lock for
+    /// its entire read-then-decide sequence, so this call either runs entirely
+    /// before it (nothing decided yet — clears normally) or entirely after (the
+    /// leave is already cached — a no-op that leaves the decided state, and the
+    /// broadcast it already produced, standing rather than silently erasing it).
     pub fn reinstate_slot(&mut self, slot: SlotId) -> bool {
+        if self.decided_leaves.contains_key(&slot) {
+            return false;
+        }
         self.departures.remove(&slot).is_some()
+    }
+
+    /// The slots whose leave this relay has already decided or cached for this
+    /// session (the keys of `decided_leaves`). Read at a session-emptied teardown
+    /// so the drop-hold sweep can tell a hold that already reflects a decided leave
+    /// (safe to discard) from one that still gates an undecided drop (must survive
+    /// — see [`crate::drop_hold::DropHolds::end_session`]).
+    fn decided_slots(&self) -> HashSet<SlotId> {
+        self.decided_leaves.keys().copied().collect()
     }
 
     /// This relay's known leave state for re-announcing to a freshly (re)joined
@@ -3509,14 +3558,29 @@ pub fn slot_departed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) 
 
 /// Discards `slot`'s departure record for `key` because the client re-registered
 /// while its drop was still held (see [`DecisionMaker::reinstate_slot`]). A no-op
-/// when no maker exists or the slot had no departure recorded. Called alongside the
-/// hold release at a re-register, so a subsequent authority promotion does not
+/// when no maker exists, the slot had no departure recorded, or the slot's leave
+/// is already decided (see [`DecisionMaker::reinstate_slot`] for why that last case
+/// matters: it is the abandoned-session force-decide race guard). Called alongside
+/// the hold release at a re-register, so a subsequent authority promotion does not
 /// re-derive a leave for a slot that has already come back.
 pub fn reinstate_slot(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
     registry
         .lock()
         .get_mut(key)
         .is_some_and(|maker| maker.reinstate_slot(slot))
+}
+
+/// The slots whose leave `key`'s decision-maker has already decided or cached (see
+/// [`DecisionMaker::decided_slots`]). Empty when no maker exists. Read at a
+/// session-emptied teardown to filter the drop-hold sweep: a hold for a decided
+/// slot is safe to discard, one for an undecided slot must survive (see
+/// [`crate::drop_hold::DropHolds::end_session`]).
+pub fn decided_slots(registry: &DecisionMakers, key: &SessionKey) -> HashSet<SlotId> {
+    registry
+        .lock()
+        .get(key)
+        .map(DecisionMaker::decided_slots)
+        .unwrap_or_default()
 }
 
 /// Fires a session-closed notice up the coordinator connection: this relay has
@@ -3709,6 +3773,16 @@ pub fn has_undecided_departure(registry: &DecisionMakers, key: &SessionKey) -> b
 /// and dedups by slot, so a duplicate call — or several relays' abandoned-session
 /// timers firing at once — decides each slot at most once. A no-op (empty) when no
 /// maker exists or every departure is already decided.
+///
+/// The read of every undecided departure and every one of the force-decides that
+/// follow all run inside one acquisition of `registry`'s lock, so a concurrent
+/// [`reinstate_slot`] for the same slot cannot interleave with this — it either
+/// runs entirely before this call starts (nothing to decide is left out from under
+/// it) or entirely after (it finds the slot's leave already decided and, per
+/// [`DecisionMaker::reinstate_slot`]'s guard, no-ops instead of erasing a departure
+/// this call already broadcast). The caller is responsible for releasing each
+/// decided slot's drop hold (see [`crate::drop_hold::DropHolds::release`]) — this
+/// function only touches the decision-maker.
 pub fn decide_abandoned_departures(
     registry: &DecisionMakers,
     key: &SessionKey,
@@ -6259,6 +6333,49 @@ mod tests {
         assert!(
             own.leave_seq > 7,
             "own numbering continues above the observed seq"
+        );
+    }
+
+    /// Two relays independently force-deciding the same fully-abandoned slot (see
+    /// `force_decide_leave`) agree on `reason` and `apply_at_frame` — the decision
+    /// itself — but assign `leave_seq` from their own local counters, so the two
+    /// directives can disagree on it alone. That is not a genuine conflict (the
+    /// blemish an adversarial review flagged: it used to warn as if it were one),
+    /// so the outcome here is identical to any other duplicate: the first cached
+    /// directive wins and the observation is not a fresh insert. This test can't
+    /// assert the log level directly (no tracing-capture harness in this crate),
+    /// but pins the behavioral half of the fix.
+    #[test]
+    fn observe_leave_agreeing_on_substance_but_not_leave_seq_is_not_a_conflict() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let first = LeaveDirective {
+            slot: 3,
+            reason: DROPPED,
+            apply_at_frame: 51,
+            leave_seq: 4,
+        };
+        assert!(maker.observe_leave(&first), "first insert for the slot");
+
+        // A second relay's independent force-decide of the identical drop: same
+        // slot, reason, and apply frame, but its own local leave_seq.
+        let same_decision_different_seq = LeaveDirective {
+            leave_seq: 9,
+            ..first
+        };
+        assert!(
+            !maker.observe_leave(&same_decision_different_seq),
+            "agreeing on substance is still not a fresh insert",
+        );
+        assert_eq!(
+            maker.decided_leaves.get(&SlotId(3)),
+            Some(&first),
+            "the first cached directive wins",
+        );
+        assert_eq!(
+            maker.next_leave_seq, 9,
+            "the higher observed seq is still adopted so this relay's own numbering \
+             never collides, even though the directive itself wasn't cached",
         );
     }
 

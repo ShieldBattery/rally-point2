@@ -35,11 +35,29 @@
 //! [`end_session`](DropHolds::end_session)), where the old timed hold's expiry
 //! would once have removed them.
 //!
-//! Release covers two orderings. A clean-leave intent arriving while a drop's
+//! **The sweep must not discard a hold that is still the reconnect-admission
+//! token for an undecided drop.** A relay's local roster can empty — and
+//! [`end_session`](DropHolds::end_session) fire — at the very moment a hold is
+//! freshly marked (the last local slot disconnecting *is* what both creates its
+//! own hold and empties the roster, in the same teardown): a session split across
+//! relays hits this on every single disconnect, since each relay's local roster
+//! only ever holds the slots it is home to. So the sweep removes only holds whose
+//! slot's leave is **already decided** (an earlier honored request, or an earlier
+//! abandoned-session force-decide); an undecided hold survives to keep serving as
+//! the re-register admission check and the unlock clock, no matter how many times
+//! the local roster empties and refills around it. It is still memory-bounded: the
+//! abandoned-session timer decides every session-wide-empty session's remaining
+//! holds within [`ABANDONED_SESSION_TIMEOUT`], and deciding one there releases its
+//! hold too (see `routing::decide_and_broadcast_abandoned`), so nothing here
+//! outlives that window undecided.
+//!
+//! Release covers three orderings. A clean-leave intent arriving while a drop's
 //! hold for the same slot is still pending releases the hold and decides
 //! immediately, so the "left" outcome wins over the held "dropped" one. A client
-//! that re-registers within its hold releases it too, reinstating the slot rather
-//! than removing it.
+//! that re-registers while its drop is held releases it too, reinstating the slot
+//! rather than removing it. An honored manual request — whether from a live
+//! survivor's `RequestDrop` or the abandoned-session timer's force-decide —
+//! releases the hold it just decided.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -276,23 +294,37 @@ impl DropHolds {
         self.abandon_timers.lock().remove(key);
     }
 
-    /// Whether an abandoned-session timer is currently armed for `key` — for tests.
-    #[cfg(test)]
+    /// Whether an abandoned-session timer is currently armed for `key` — for tests
+    /// (including this crate's own integration tests, which link against this
+    /// crate as an external dependency and so cannot see a `#[cfg(test)]` item).
     pub fn abandon_armed(&self, key: &SessionKey) -> bool {
         self.abandon_timers.lock().contains_key(key)
     }
 
-    /// Drops all holds and request limiters for `key`, called when the relay's last
-    /// local slot for the session leaves — mirroring how the roster group, lobby,
-    /// chat, and turn-ring state are dropped then. Without this a held drop's marker
-    /// would outlive its session forever, since no timer removes it. Idempotent.
+    /// Drops request limiters for `key` unconditionally, and holds whose slot's
+    /// leave is in `decided` — called when the relay's last local slot for the
+    /// session leaves, mirroring how the roster group, lobby, chat, and turn-ring
+    /// state are dropped then. Idempotent.
     ///
-    /// The abandoned-session timer is deliberately **not** swept here: it arms at the
-    /// very moment this relay's last local slot leaves (a fully-empty session), so
-    /// cancelling it in the same teardown would defeat its whole purpose. It
-    /// self-removes when it fires, or is cancelled by a re-register.
-    pub fn end_session(&self, key: &SessionKey) {
-        self.holds.lock().retain(|(hold_key, _), _| hold_key != key);
+    /// **Deliberately does not sweep a hold for a slot not in `decided`.** Every
+    /// disconnect on a session split across relays empties that relay's *local*
+    /// roster (each relay is home to only its own slots), which is exactly the
+    /// moment this fires — including the disconnect that just marked the hold this
+    /// call would otherwise erase before anything ever decided it. `decided` is the
+    /// caller's read of which slots' leaves are already committed (see
+    /// [`crate::consensus::decided_slots`]); a hold outside that set still gates an
+    /// undecided drop and must survive to keep serving as the reconnect-admission
+    /// check and the unlock clock. See the module docs for why this is still
+    /// memory-bounded rather than a leak.
+    ///
+    /// The abandoned-session timer is, separately, never swept here either: it
+    /// arms at the very moment this relay's last local slot leaves (a fully-empty
+    /// session), so cancelling it in the same teardown would defeat its whole
+    /// purpose. It self-removes when it fires, or is cancelled by a re-register.
+    pub fn end_session(&self, key: &SessionKey, decided: &HashSet<SlotId>) {
+        self.holds
+            .lock()
+            .retain(|(hold_key, slot), _| hold_key != key || !decided.contains(slot));
         self.limiters
             .lock()
             .retain(|(limiter_key, _), _| limiter_key != key);
@@ -417,8 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn end_session_sweeps_every_hold_for_the_session() {
+    fn end_session_sweeps_only_decided_holds_keeping_undecided_ones_and_other_sessions() {
         let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        // Slot 0's drop is undecided (the common case: the last local slot's own
+        // hold, freshly marked in the very teardown that empties the roster and
+        // triggers this sweep). Slot 1's was already decided elsewhere (an earlier
+        // honored request or force-decide) and its hold should have been released
+        // then, but this proves the sweep is still correct as a defensive backstop
+        // if it somehow wasn't.
         holds.hold(key(), SlotId(0));
         holds.hold(key(), SlotId(1));
         let other = SessionKey {
@@ -427,14 +465,36 @@ mod tests {
         };
         holds.hold(other.clone(), SlotId(0));
 
-        holds.end_session(&key());
+        let decided = [SlotId(1)].into_iter().collect();
+        holds.end_session(&key(), &decided);
         assert!(
-            holds.pending_slots(&key()).is_empty(),
-            "the session's holds are swept"
+            holds.is_pending(&key(), SlotId(0)),
+            "the undecided hold survives the sweep -- it's still the reconnect token",
+        );
+        assert!(
+            !holds.is_pending(&key(), SlotId(1)),
+            "the already-decided hold is swept",
         );
         assert!(
             holds.is_pending(&other, SlotId(0)),
             "another session's holds are untouched",
+        );
+    }
+
+    #[test]
+    fn end_session_with_no_decided_slots_keeps_every_hold_for_the_session() {
+        // The common case: nothing decided yet, so a session-emptied teardown must
+        // not erase any hold -- every one of them is still the sole path back to
+        // this drop being resolved.
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        holds.hold(key(), SlotId(0));
+        holds.hold(key(), SlotId(1));
+
+        holds.end_session(&key(), &HashSet::new());
+        assert_eq!(
+            holds.pending_slots(&key()),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+            "no undecided hold is swept when nothing is decided",
         );
     }
 
