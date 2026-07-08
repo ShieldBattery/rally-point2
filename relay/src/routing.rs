@@ -2810,7 +2810,7 @@ mod tests {
     // -- fully-abandoned session teardown --
 
     /// A short abandoned-session window for tests, so the timer path can be driven
-    /// with a real (tiny) sleep rather than the production two minutes.
+    /// with a real (tiny) sleep rather than the production 45 seconds.
     const TINY_ABANDON: Duration = Duration::from_millis(80);
 
     /// A started, single-relay authority session over slots {0, 1} with a frame

@@ -125,10 +125,16 @@ const DROP_REQUEST_REFILL_INTERVAL: Duration = Duration::from_secs(2);
 /// session torn down rather than held forever. An occupied session never
 /// auto-decides — only a request does — no matter how long a slot has been gone.
 ///
-/// Set generously so a *mass* blip — a shared uplink hiccup that drops every player
-/// at once — has a wide window to reconnect (any slot re-registering cancels the
-/// timer) before the session is written off.
-pub const ABANDONED_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Unlike a single-player drop, there is no surviving human here to deliberately
+/// keep waiting, so the window only has to outlast a realistic *shared* or
+/// *transient* blip — a relay restart, a common uplink hiccup — not a genuine
+/// decision to hold out. A reconnect completes within seconds of connectivity
+/// actually returning (and any slot re-registering cancels the timer outright), so
+/// 45 s is ample margin for that case while cleaning up a truly abandoned session
+/// well before it would otherwise sit idle for minutes; it also lines up with the
+/// game client's own 45 s drop-unlock, so no session outlives what a player at the
+/// keyboard could have decided for it anyway.
+pub const ABANDONED_SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Per-relay registry of undecided drop holds and the per-requester rate cap on
 /// the manual requests that resolve them, keyed by the session and slot each
@@ -156,8 +162,8 @@ pub struct DropHolds {
     unlock: Duration,
     /// How long a session may stay empty session-wide with undecided departures
     /// before they are decided automatically. A field for the same reason `unlock`
-    /// is — a test injects a tiny window rather than waiting the production two
-    /// minutes; production builds it with [`ABANDONED_SESSION_TIMEOUT`].
+    /// is — a test injects a tiny window rather than waiting the production 45 s;
+    /// production builds it with [`ABANDONED_SESSION_TIMEOUT`].
     abandon_timeout: Duration,
 }
 

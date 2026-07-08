@@ -1702,7 +1702,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     };
 
     // Tiny unlock and abandon windows so the test doesn't wait the production 30s
-    // / 120s. Authority over the full {0, 1} expected set so the session actually
+    // / 45s. Authority over the full {0, 1} expected set so the session actually
     // starts (the abandon condition requires it) and set this relay first in its
     // own presence order so its own roster count drives the authority verdict.
     let unlock = Duration::from_millis(200);
