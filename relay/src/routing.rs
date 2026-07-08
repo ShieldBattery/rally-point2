@@ -706,7 +706,14 @@ pub async fn run_slot_link(
     // roster already includes this slot (registration preceded this task), so
     // report it and re-derive. The peers learn the new count from the mesh
     // drivers' presence reconcile, off the same roster.
-    report_own_presence(&presence, &decision_makers, &sessions, &mesh_links, &key);
+    report_own_presence(
+        &presence,
+        &decision_makers,
+        &sessions,
+        &mesh_links,
+        &leave_grace,
+        &key,
+    );
 
     // Announce this slot's presence to the mesh and record it into the session's
     // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -1556,6 +1563,7 @@ fn end_slot_link(
         &mesh.decision_makers,
         sessions,
         &mesh.links,
+        &mesh.leave_grace,
         key,
     );
     // This was the relay's last local slot for the session: it has torn down its
@@ -1725,6 +1733,7 @@ fn report_own_presence(
     decision_makers: &crate::consensus::DecisionMakers,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
+    leave_grace: &crate::leave_grace::LeaveGrace,
     key: &SessionKey,
 ) {
     let live = {
@@ -1732,7 +1741,10 @@ fn report_own_presence(
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
     if crate::presence::record_own(presence, key, live) {
-        let leaves = crate::presence::recompute(presence, decision_makers, key);
+        // Slots still inside their drop grace on this relay must not be decided by
+        // the promotion a re-derive may trigger: their holds remain the deciders.
+        let grace_pending = leave_grace.pending_slots(key);
+        let leaves = crate::presence::recompute(presence, decision_makers, key, &grace_pending);
         crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
         // A recompute that promotes this relay to authority may make it the one
         // to observe full slot presence: re-evaluate and fire the session-start
@@ -2231,6 +2243,128 @@ mod tests {
         assert!(
             inbox.leave_push_rx.try_recv().is_err(),
             "the cancelled hold produced no further leave",
+        );
+    }
+
+    /// The reconnection race caught live: on a single relay, both clients' links
+    /// blip and both re-dial. As the roster empties and refills, presence flaps the
+    /// buffer authority to `Peer` and back — and the promotion on the way back must
+    /// not decide the leaves of slots that are still graced (away) or already
+    /// reinstated (returned). No leave is ever decided, and the game continues with
+    /// both slots back.
+    ///
+    /// Removing either half of the fix breaks this: without the promotion's
+    /// grace-pending skip, the still-away slot's leave fires; without the
+    /// re-register's departure reinstatement, the just-returned slot's does.
+    #[tokio::test]
+    async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
+        use crate::consensus::{self, Authority};
+        use crate::presence::{self, Candidate};
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let k = key();
+        let sessions: Sessions = Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let presence = presence::new_presence_registry();
+        // A long grace so no hold fires during the test; the re-registers cancel
+        // both holds explicitly, exactly as the server's re-register path does.
+        let grace = LeaveGrace::new(Duration::from_secs(30));
+
+        // A started single-relay session of two framed slots, this relay authority.
+        let _ = consensus::sync_maker(
+            &makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+        );
+        consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
+        consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
+        presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
+
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        g0.disarm();
+        g1.disarm();
+        let _ = consensus::note_slot_present(&makers, &k, SlotId(0));
+        let _ = consensus::note_slot_present(&makers, &k, SlotId(1));
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        assert!(
+            makers.lock().get(&k).unwrap().is_authority(),
+            "the relay starts as the session authority",
+        );
+
+        // Both links die: deregister, announce a dropped departure (arming a grace),
+        // then report the changed roster — the end-of-link path, in order.
+        deregister(&sessions, &k, SlotId(0));
+        announce_departure(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(0),
+            LEAVE_REASON_DROPPED,
+        );
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        deregister(&sessions, &k, SlotId(1));
+        announce_departure(
+            &grace,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+
+        assert!(
+            grace.is_pending(&k, SlotId(0)) && grace.is_pending(&k, SlotId(1)),
+            "both drops armed a grace",
+        );
+        assert!(
+            !makers.lock().get(&k).unwrap().is_authority(),
+            "the emptied roster demoted the relay to a peer",
+        );
+
+        // Slot 0 re-registers within its grace: register, then cancel + reinstate as
+        // the server does, then report presence — which re-promotes the relay.
+        let (mut r0, _ri0) = register(&sessions, &k, SlotId(0)).expect("slot 0 re-registers");
+        r0.disarm();
+        grace.cancel(&k, SlotId(0));
+        assert!(consensus::reinstate_slot(&makers, &k, SlotId(0)));
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        assert!(
+            makers.lock().get(&k).unwrap().is_authority(),
+            "the first return re-promoted the relay — the flap the fix must survive",
+        );
+
+        // Slot 1 re-registers too.
+        let (mut r1, _ri1) = register(&sessions, &k, SlotId(1)).expect("slot 1 re-registers");
+        r1.disarm();
+        grace.cancel(&k, SlotId(1));
+        assert!(consensus::reinstate_slot(&makers, &k, SlotId(1)));
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+
+        // The whole flap decided no leave, and the session continues with both slots.
+        let (departures, directives) = consensus::leave_reconcile(&makers, &k);
+        assert!(
+            directives.is_empty(),
+            "no leave was ever decided across the flap",
+        );
+        assert!(
+            departures.is_empty(),
+            "both departures were reinstated on reconnect",
+        );
+        let roster = sessions.lock();
+        let slots = roster.get(&k).expect("the session still has its roster");
+        assert!(
+            slots.contains_key(&SlotId(0)) && slots.contains_key(&SlotId(1)),
+            "both slots are back",
         );
     }
 

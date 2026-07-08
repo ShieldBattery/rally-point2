@@ -958,7 +958,12 @@ mod tests {
             RelayId(2),
             0
         ));
-        let _ = presence::recompute(&presence_registry, &makers, &key(1));
+        let _ = presence::recompute(
+            &presence_registry,
+            &makers,
+            &key(1),
+            &std::collections::HashSet::new(),
+        );
         assert!(
             makers.lock().get(&key(1)).unwrap().is_authority(),
             "the authority's players leaving promotes the next relay in order",

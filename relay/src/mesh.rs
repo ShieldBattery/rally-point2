@@ -958,6 +958,7 @@ pub async fn run_mesh_link(
         conditions,
         decision_makers,
         presence,
+        leave_grace,
         ..
     } = mesh;
     let crate::presence::PresenceIo {
@@ -1306,10 +1307,15 @@ pub async fn run_mesh_link(
                             // this relay is next in the order) yields any synced
                             // leave the departed authority never delivered; push
                             // each to local survivors and across the mesh.
+                            // Skip slots still inside their drop grace on this
+                            // relay: a promotion here must not decide a departure a
+                            // reconnecting client could still return from.
+                            let grace_pending = leave_grace.pending_slots(&state.key);
                             let leaves = crate::presence::recompute(
                                 &presence,
                                 &decision_makers,
                                 &state.key,
+                                &grace_pending,
                             );
                             broadcast_leaves(&sessions, &mesh_links, &state.key, leaves);
                             // A promotion here may also make this relay the one to
@@ -1672,6 +1678,11 @@ fn dispatch_mesh_control(
             // never graced.
             if change.connected {
                 mesh.leave_grace.cancel(&key, slot);
+                // The slot is back, so discard the departure this relay recorded
+                // from its earlier `SlotDeparted` — otherwise a later promotion
+                // here would re-derive a leave for a slot that has returned. The
+                // symmetric local step runs at the home relay's own re-register.
+                crate::consensus::reinstate_slot(&mesh.decision_makers, &key, slot);
             }
         }
         // A kind this build predates (or the empty keepalive, already dropped by

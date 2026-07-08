@@ -24,7 +24,7 @@
 //! cancels the pending hold and decides immediately, so the "left" outcome wins
 //! over the held "dropped" one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +135,21 @@ impl LeaveGrace {
     /// cancelled it.
     pub fn is_pending(&self, key: &SessionKey, slot: SlotId) -> bool {
         self.pending.lock().contains_key(&(key.clone(), slot))
+    }
+
+    /// The slots of `key` whose drop grace is currently in flight on this relay.
+    /// Read at an authority promotion so it re-derives leaves only for *ungraced*
+    /// undecided departures, leaving each graced drop to its own hold — the sole
+    /// decider for a graced drop. Every relay arms its own hold when it observes a
+    /// departure, so this relay's local holds answer "is this slot still within its
+    /// grace" without consulting any peer.
+    pub fn pending_slots(&self, key: &SessionKey) -> HashSet<SlotId> {
+        self.pending
+            .lock()
+            .keys()
+            .filter(|(hold_key, _)| hold_key == key)
+            .map(|(_, slot)| *slot)
+            .collect()
     }
 }
 

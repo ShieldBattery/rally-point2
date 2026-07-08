@@ -170,14 +170,20 @@ pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authorit
 /// session with no presence entry, or no decision-maker, is left untouched and
 /// yields no leaves. The caller pushes any returned leaves down local survivors
 /// and across the mesh (see [`crate::mesh::broadcast_leaves`]).
+///
+/// `grace_pending` is the set of this relay's slots whose drop grace is still in
+/// flight (read from the grace registry by the caller, which holds it). A
+/// promotion skips those slots so a presence flap does not collapse a grace a
+/// reconnecting client is still inside of; see [`crate::consensus::set_authority`].
 #[must_use]
 pub fn recompute(
     registry: &PresenceRegistry,
     makers: &DecisionMakers,
     key: &SessionKey,
+    grace_pending: &std::collections::HashSet<rally_point_proto::ids::SlotId>,
 ) -> Vec<rally_point_proto::messages::LeaveDirective> {
     match verdict(registry, key) {
-        Some(authority) => crate::consensus::set_authority(makers, key, authority),
+        Some(authority) => crate::consensus::set_authority(makers, key, authority, grace_pending),
         None => Vec::new(),
     }
 }

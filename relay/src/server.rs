@@ -289,6 +289,12 @@ async fn serve_connection(
     // `SlotConnectivity` handler); this call covers this relay's own hold.
     if departed && grace_pending {
         mesh.leave_grace.cancel(&key, authorized.slot);
+        // Discard the departure record too: the client is back, so the slot is no
+        // longer gone. This must happen before the promotion that `run_slot_link`
+        // may trigger below — a re-registered slot's grace is already cancelled, so
+        // the promotion's grace-pending skip cannot protect it; clearing the record
+        // is what keeps the promotion from re-deriving its leave.
+        consensus::reinstate_slot(&mesh.decision_makers, &key, authorized.slot);
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
