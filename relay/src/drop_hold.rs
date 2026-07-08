@@ -87,14 +87,19 @@ type RequestLimiters = Arc<Mutex<HashMap<(SessionKey, SlotId), RequestBucket>>>;
 type AbandonTimers = Arc<Mutex<HashMap<SessionKey, oneshot::Sender<()>>>>;
 
 /// How long a dropped slot's hold must stand before the session's authority relay
-/// will honor a manual request to drop it. The game client only offers its drop
-/// button at 45 s from when *it* learned of the disconnect; the relay floor is set
-/// deliberately a little lower so a survivor's click is never refused by
-/// sub-second observation skew between the client and the relay. A real sustained
-/// disconnection has already run ~13 s longer than the hold by the time the button
-/// appears anyway — QUIC's idle detection precedes the hold — so honoring at this
-/// floor never removes a slot that was merely blipping.
-pub const DROP_UNLOCK: Duration = Duration::from_secs(40);
+/// will honor a manual request to drop it.
+///
+/// This is the anti-grief *minimum*, not the normal-play experience: even a
+/// modified or malicious client cannot force a slot's removal before 30 s of
+/// sustained disconnection, no matter how fast it fires `RequestDrop`. The game
+/// client's own Drop button is a separate, higher bar — disabled and greyed out
+/// until 45 s from when *it* learned of the disconnect — so in ordinary play a
+/// legitimate click always lands comfortably past this floor. The 15 s gap between
+/// the two is deliberate margin, not slack this floor is tuned against: it exists
+/// so observation skew or a clock difference between the client and the relay can
+/// never make an already-enabled button's click bounce off a floor it should
+/// already have cleared.
+pub const DROP_UNLOCK: Duration = Duration::from_secs(30);
 
 /// The drop-request rate cap's burst size: a requesting slot may send this many
 /// requests back-to-back before the limiter starts rejecting. Small, because a
@@ -146,7 +151,7 @@ pub struct DropHolds {
     abandon_timers: AbandonTimers,
     /// How long a hold must stand before the authority will honor a request to
     /// drop it. A field rather than a bare use of [`DROP_UNLOCK`] so a test can
-    /// inject a tiny floor and drive the honor path without a real 40-second wait;
+    /// inject a tiny floor and drive the honor path without a real 30-second wait;
     /// production builds it with [`DROP_UNLOCK`].
     unlock: Duration,
     /// How long a session may stay empty session-wide with undecided departures

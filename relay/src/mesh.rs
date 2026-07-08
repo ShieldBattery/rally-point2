@@ -314,7 +314,7 @@ pub fn new_mesh_state() -> MeshState {
 
 /// [`new_mesh_state`] with an explicit drop-unlock floor, so a test can inject a
 /// tiny floor and drive the honor-a-drop-request path without waiting out the
-/// production 40-second window. The abandoned-session window keeps its production
+/// production 30-second window. The abandoned-session window keeps its production
 /// value.
 pub fn new_mesh_state_with_drop_unlock(unlock: std::time::Duration) -> MeshState {
     new_mesh_state_with_timings(unlock, crate::drop_hold::ABANDONED_SESSION_TIMEOUT)
