@@ -539,7 +539,7 @@ pub(crate) fn fan_out_connectivity(
 /// slot ([`fan_out_connectivity`]) and across the mesh so every peer relay fans
 /// it to its own local slots ([`crate::mesh::fan_out_slot_connectivity`]). Sent
 /// the moment a slot's link dies (`connected` false) or (re)registers
-/// (`connected` true). Independent of the synced-leave path and of any grace: a
+/// (`connected` true). Independent of the synced-leave path and of any hold: a
 /// disconnect signal goes out immediately so survivors learn who dropped ~at
 /// once, while the leave that removes the slot is decided separately.
 pub(crate) fn broadcast_connectivity(
@@ -696,7 +696,7 @@ pub async fn run_slot_link(
         presence,
         lobby,
         chat,
-        leave_grace,
+        drop_holds,
         turn_ring,
     } = mesh;
 
@@ -711,7 +711,7 @@ pub async fn run_slot_link(
         &decision_makers,
         &sessions,
         &mesh_links,
-        &leave_grace,
+        &drop_holds,
         &key,
     );
 
@@ -1265,7 +1265,7 @@ pub async fn run_slot_link(
                             "client announced clean leave",
                         );
                         announce_departure(
-                            &leave_grace,
+                            &drop_holds,
                             &decision_makers,
                             &sessions,
                             &mesh_links,
@@ -1418,6 +1418,26 @@ pub async fn run_slot_link(
                             crate::mesh::fan_out_chat(&mesh_links, &key, chat_msg);
                         }
                     }
+                    // The client's manual request to drop a disconnected slot. The
+                    // requester is this authenticated connection's slot, never a
+                    // value from the wire. Reject silently (log at info, never close
+                    // the link — a mis-click must not disconnect the requester) when
+                    // it names itself or a slot this relay has no reason to believe is
+                    // gone; rate-limit per requester so a double-click storm can't
+                    // flood the mesh. An accepted request is handled locally (this
+                    // relay may be the authority) and broadcast to every peer so a
+                    // peer-homed authority honors it too.
+                    Some(ControlInbound::RequestDrop(wire_target)) => {
+                        handle_drop_request(
+                            &drop_holds,
+                            &decision_makers,
+                            &sessions,
+                            &mesh_links,
+                            &key,
+                            slot,
+                            wire_target,
+                        );
+                    }
                     None => control_alive = false,
                 }
             }
@@ -1532,11 +1552,11 @@ fn end_slot_link(
     if !leave_announced {
         // The link died without a clean leave — a disconnect. Tell every slot
         // (local and across the mesh) this one is no longer connected, immediately
-        // and independent of the grace below, so survivors' displays reflect the
+        // and independent of the hold below, so survivors' displays reflect the
         // disconnect ~at once even while their turn stream stalls waiting on it.
         broadcast_connectivity(sessions, &mesh.links, key, slot, false);
         announce_departure(
-            &mesh.leave_grace,
+            &mesh.drop_holds,
             &mesh.decision_makers,
             sessions,
             &mesh.links,
@@ -1563,7 +1583,7 @@ fn end_slot_link(
         &mesh.decision_makers,
         sessions,
         &mesh.links,
-        &mesh.leave_grace,
+        &mesh.drop_holds,
         key,
     );
     // This was the relay's last local slot for the session: it has torn down its
@@ -1583,6 +1603,9 @@ fn end_slot_link(
         // Same for the forwarded-turn replay ring: no local slot remains to resume,
         // so nothing more will be replayed from it.
         mesh.turn_ring.end_session(key);
+        // Same for any drop holds and request limiters: a held drop never fires on
+        // its own, so without this its marker would outlive the session forever.
+        mesh.drop_holds.end_session(key);
     }
 }
 
@@ -1599,7 +1622,7 @@ fn end_slot_link(
 /// into its record — the leave's apply-frame basis — and retires the slot's live
 /// state in the decision-maker.
 fn announce_departure(
-    leave_grace: &crate::leave_grace::LeaveGrace,
+    drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
@@ -1635,14 +1658,15 @@ fn announce_departure(
         result,
         reason,
     );
-    // Turn the recorded departure into the synced leave — but hold a *drop* for
-    // the grace window before deciding, so survivors are not permanently removed
-    // on a link blip; a *clean* leave decides at once. See
-    // `decide_leave_maybe_graced`. The departure above is already recorded and
-    // announced, so a promoted authority can re-derive the leave if this relay is
-    // lost during the grace.
-    decide_leave_maybe_graced(
-        leave_grace,
+    // Turn the recorded departure into the synced leave — but a *drop* is only
+    // marked as an undecided hold, never decided here: survivors are removed on a
+    // disconnect only when a human's `RequestDrop` is honored past the unlock
+    // floor, or never. A *clean* leave decides at once. See `hold_or_decide_leave`.
+    // The departure above is already recorded and announced, so a promoted
+    // authority can re-derive the leave (or leave the hold standing) if this relay
+    // is lost.
+    hold_or_decide_leave(
+        drop_holds,
         decision_makers,
         sessions,
         mesh_links,
@@ -1652,20 +1676,21 @@ fn announce_departure(
     );
 }
 
-/// Turns a recorded departure into the one synced leave, gating a *drop* on the
-/// disconnect grace while deciding a *clean* leave immediately.
+/// Turns a recorded departure into the one synced leave — but only for a *clean*
+/// leave. A *drop* is marked as an undecided hold and decided by nothing here:
+/// there is no timer and no automatic firing, so a disconnected slot stays held
+/// (survivors stalled but alive) until a surviving member's `RequestDrop` is
+/// honored past the unlock floor, or forever.
 ///
-/// A drop (`reason` == [`LEAVE_REASON_DROPPED`]) arms a hold: after the grace,
-/// the decision-and-broadcast step runs (a no-op on a relay that is not the
-/// authority, or for a slot already decided). A clean leave cancels any hold this
-/// slot's earlier drop observation armed — the ordering where a clean-leave intent
-/// arrives during a drop's grace — and decides at once, so the "left" outcome
-/// supersedes the held "dropped" one. Every relay that observes the departure
-/// arms its own hold, so the decision survives an authority handoff: a promotion
-/// re-derives the leave from the shared departure record, and any leftover hold's
-/// eventual `decide_leave` is a no-op once the slot is decided.
-pub(crate) fn decide_leave_maybe_graced(
-    leave_grace: &crate::leave_grace::LeaveGrace,
+/// A clean leave (`reason` != [`LEAVE_REASON_DROPPED`]) releases any hold this
+/// slot's earlier drop observation marked — the ordering where a clean-leave
+/// intent arrives while a drop is still held — and decides at once, so the "left"
+/// outcome supersedes the held "dropped" one. Every relay that observes the
+/// departure marks its own hold, so the decision survives an authority handoff: a
+/// promotion re-derives the leave from the shared departure record (skipping still
+/// held drops), and an honored request on any relay decides against that record.
+pub(crate) fn hold_or_decide_leave(
+    drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
@@ -1674,27 +1699,162 @@ pub(crate) fn decide_leave_maybe_graced(
     reason: u32,
 ) {
     if reason == LEAVE_REASON_DROPPED {
-        // Own clones for the timer task: it fires after the grace with no borrowed
-        // state, so it holds the shared registries by `Arc`.
-        let decision_makers = Arc::clone(decision_makers);
-        let sessions = Arc::clone(sessions);
-        let mesh_links = Arc::clone(mesh_links);
-        let key_for_expire = key.clone();
-        leave_grace.arm(key.clone(), slot, move || {
-            decide_and_broadcast_leave(
-                &decision_makers,
-                &sessions,
-                &mesh_links,
-                &key_for_expire,
-                slot,
-                reason,
-            );
-        });
+        // Mark the drop as undecided and stop. Nothing here removes the slot — only
+        // an honored manual request ever does.
+        drop_holds.hold(key.clone(), slot);
     } else {
-        // A clean leave supersedes any in-flight drop hold for this slot, then
+        // A clean leave supersedes any pending drop hold for this slot, then
         // decides immediately.
-        leave_grace.cancel(key, slot);
+        drop_holds.release(key, slot);
         decide_and_broadcast_leave(decision_makers, sessions, mesh_links, key, slot, reason);
+    }
+}
+
+/// Validates and acts on a client's manual `RequestDrop` at the relay's client
+/// edge. `requester` is the authenticated connection's slot (never a wire value);
+/// `wire_target` is the slot the requester asked to drop.
+///
+/// Rejects silently — an info log, never a link close, because a mis-click must
+/// not disconnect the survivor who made it — when the request names the requester
+/// itself, names a slot this relay has no reason to believe is disconnected
+/// (neither a pending hold nor a departure record), or exceeds the requester's
+/// rate cap. A valid, admitted request is honored locally (this relay may be the
+/// authority — see [`honor_drop_request`]) and broadcast to every peer so a
+/// peer-homed authority honors it too.
+fn handle_drop_request(
+    drop_holds: &crate::drop_hold::DropHolds,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    requester: SlotId,
+    wire_target: u32,
+) {
+    let Ok(target) = u8::try_from(wire_target).map(SlotId) else {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            requester = requester.0,
+            target = wire_target,
+            "ignoring drop request for a slot id out of range",
+        );
+        return;
+    };
+    if target == requester {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = requester.0,
+            "ignoring drop request that names its own requester",
+        );
+        return;
+    }
+    // A cheap sanity check at the edge — the authoritative gate is at the
+    // authority, which alone holds the unlock timer. A request for a slot this
+    // relay sees as neither held nor departed is nonsense (a stale or hostile
+    // client), so drop it before spending a mesh broadcast on it.
+    if !drop_holds.is_pending(key, target)
+        && !consensus::slot_departed(decision_makers, key, target)
+    {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            requester = requester.0,
+            target = target.0,
+            "ignoring drop request for a slot that is not disconnected",
+        );
+        return;
+    }
+    // Rate-limit per requester so a double-click (or a hostile flood) cannot spray
+    // the mesh with request broadcasts. Over-limit requests are dropped silently —
+    // never a link close.
+    if !drop_holds.admit_request(key, requester) {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            requester = requester.0,
+            target = target.0,
+            "dropping drop request; requester exceeded its request rate cap",
+        );
+        return;
+    }
+    // Honor it here (this relay may be the authority) and broadcast to every peer
+    // so a peer-homed authority honors it too. The broadcast carries the
+    // relay-stamped requester for logging/attribution.
+    honor_drop_request(
+        drop_holds,
+        decision_makers,
+        sessions,
+        mesh_links,
+        key,
+        target,
+        u32::from(requester.0),
+    );
+    crate::mesh::fan_out_request_drop(mesh_links, key, target, requester);
+}
+
+/// Honors a manual drop request against `target` if this relay is the session
+/// authority and the target's drop has stood past the unlock floor. `requester` is
+/// carried only for logging/attribution — the decision never keys on who asked.
+///
+/// Called both from the client edge (this relay's own local request) and from a
+/// mesh `RequestDrop` frame (a peer's request). A non-authority does nothing: the
+/// request was broadcast to every relay, so the one authority among the receivers
+/// is the single relay that acts. On the authority, a hold past the floor is
+/// released and the synced leave decided with the DROPPED reason; the decide path
+/// dedups, so a duplicate request after the decide is a harmless no-op. A hold
+/// short of the floor, or no hold at all (the slot reconnected or left cleanly), is
+/// ignored — logged with the elapsed-vs-floor so a refused click is diagnosable.
+pub(crate) fn honor_drop_request(
+    drop_holds: &crate::drop_hold::DropHolds,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+    target: SlotId,
+    requester: u32,
+) {
+    if !consensus::is_authority(decision_makers, key) {
+        // Not the authority — the authority is among the broadcast's receivers and
+        // will act. Nothing to do, and the hold stays for a possible promotion.
+        return;
+    }
+    match drop_holds.held_for(key, target) {
+        Some(elapsed) if elapsed >= drop_holds.unlock() => {
+            drop_holds.release(key, target);
+            decide_and_broadcast_leave(
+                decision_makers,
+                sessions,
+                mesh_links,
+                key,
+                target,
+                LEAVE_REASON_DROPPED,
+            );
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                target = target.0,
+                requester,
+                held_ms = elapsed.as_millis(),
+                "honoring manual drop request",
+            );
+        }
+        Some(elapsed) => tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            target = target.0,
+            requester,
+            held_ms = elapsed.as_millis(),
+            floor_ms = drop_holds.unlock().as_millis(),
+            "ignoring drop request; the target's drop has not stood past the unlock floor",
+        ),
+        None => tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            target = target.0,
+            requester,
+            "ignoring drop request; the target has no pending drop hold",
+        ),
     }
 }
 
@@ -1730,10 +1890,10 @@ fn decide_and_broadcast_leave(
 /// pushed to local survivors and across the mesh via [`crate::mesh::broadcast_leaves`].
 fn report_own_presence(
     presence: &crate::presence::PresenceRegistry,
-    decision_makers: &crate::consensus::DecisionMakers,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
-    leave_grace: &crate::leave_grace::LeaveGrace,
+    drop_holds: &crate::drop_hold::DropHolds,
     key: &SessionKey,
 ) {
     let live = {
@@ -1741,15 +1901,93 @@ fn report_own_presence(
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
     if crate::presence::record_own(presence, key, live) {
-        // Slots still inside their drop grace on this relay must not be decided by
-        // the promotion a re-derive may trigger: their holds remain the deciders.
-        let grace_pending = leave_grace.pending_slots(key);
-        let leaves = crate::presence::recompute(presence, decision_makers, key, &grace_pending);
+        // Slots whose drop is still held on this relay must not be decided by the
+        // promotion a re-derive may trigger: a held drop is decided only by an
+        // honored manual request, never by a promotion.
+        let held = drop_holds.pending_slots(key);
+        let leaves = crate::presence::recompute(presence, decision_makers, key, &held);
         crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
         // A recompute that promotes this relay to authority may make it the one
         // to observe full slot presence: re-evaluate and fire the session-start
         // directive if the accumulated live slots already cover the expected set.
         maybe_start_session(sessions, decision_makers, mesh_links, key);
+        // This liveness change may have emptied the session session-wide (arming
+        // the abandoned-session timer) or refilled it (cancelling any armed timer).
+        reconcile_abandon(
+            drop_holds,
+            decision_makers,
+            sessions,
+            mesh_links,
+            presence,
+            key,
+        );
+    }
+}
+
+/// Arms or cancels `key`'s abandoned-session timer against the current presence and
+/// departure state. Called after every presence liveness change (this relay's own
+/// roster flip, or a peer's report), so the timer tracks session-wide emptiness.
+///
+/// A *started* session that is empty session-wide ([`crate::presence::all_empty`])
+/// with at least one undecided departure ([`consensus::has_undecided_departure`]) is
+/// abandoned: nobody is left to request the held drops, so a timer is armed that, on
+/// expiry, decides them all (see [`decide_and_broadcast_abandoned`]). Any other
+/// state — a slot still live, or nothing undecided — cancels any armed timer, so a
+/// re-registering slot inside the window calls it off. Arming is idempotent (the
+/// registry keeps the first timer), and every relay observing the abandonment arms
+/// its own; the force-decide dedups, so a promotion mid-window loses nothing.
+pub(crate) fn reconcile_abandon(
+    drop_holds: &crate::drop_hold::DropHolds,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    presence: &crate::presence::PresenceRegistry,
+    key: &SessionKey,
+) {
+    let abandoned = consensus::session_started(decision_makers, key)
+        && crate::presence::all_empty(presence, key)
+        && consensus::has_undecided_departure(decision_makers, key);
+    if abandoned {
+        // Owned clones for the timer task: it fires after the window with no
+        // borrowed state, holding the shared registries by `Arc`.
+        let decision_makers = Arc::clone(decision_makers);
+        let sessions = Arc::clone(sessions);
+        let mesh_links = Arc::clone(mesh_links);
+        let key_for_expire = key.clone();
+        drop_holds.arm_abandon(key.clone(), move || {
+            decide_and_broadcast_abandoned(
+                &decision_makers,
+                &sessions,
+                &mesh_links,
+                &key_for_expire,
+            );
+        });
+    } else {
+        drop_holds.cancel_abandon(key);
+    }
+}
+
+/// Decides every undecided departure for a fully-abandoned session and broadcasts
+/// the leaves, funnelling the session into its normal close cascade. Force-decides
+/// past the authority gate (an empty session names no authority; see
+/// [`consensus::decide_abandoned_departures`]) and fires one departure notice per
+/// slot as a side effect; the broadcast reaches no local survivor (the roster is
+/// empty) but re-syncs any peer relay's cached leave state (dedup by slot).
+fn decide_and_broadcast_abandoned(
+    decision_makers: &crate::consensus::DecisionMakers,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
+    key: &SessionKey,
+) {
+    let leaves = consensus::decide_abandoned_departures(decision_makers, key);
+    if !leaves.is_empty() {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            count = leaves.len(),
+            "abandoned session timed out with no live slots; deciding its held departures",
+        );
+        crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
     }
 }
 
@@ -2068,19 +2306,23 @@ mod tests {
         assert_eq!(game_result_admissible(&at_cap), Ok(()));
     }
 
-    // -- disconnect grace and connectivity fan-out --
+    // -- drop holds, manual drop requests, and connectivity fan-out --
 
-    use crate::leave_grace::LeaveGrace;
+    use crate::drop_hold::DropHolds;
 
-    /// A short interim grace for tests, so the drop-hold path can be driven with a
-    /// real (tiny) sleep rather than the production 10-second window.
-    const TEST_GRACE: Duration = Duration::from_millis(40);
+    /// A drop-unlock floor a test can never reach by waiting, so a `RequestDrop`
+    /// before it is provably refused.
+    const UNREACHABLE_UNLOCK: Duration = Duration::from_secs(3600);
+
+    /// A zero unlock floor, so a held drop is "past the floor" from the first
+    /// instant and a `RequestDrop` is honored without any wait.
+    const IMMEDIATE_UNLOCK: Duration = Duration::ZERO;
 
     /// Stands up a single-relay authority maker for `key` with a frame basis, plus
     /// a survivor slot registered so a decided leave has somewhere to fan out. The
     /// departing slot is given an observed frame too, so `decide_leave` schedules
     /// against it. Returns the shared registries and the survivor's inbox.
-    fn drop_grace_harness(
+    fn drop_hold_harness(
         key: &SessionKey,
         survivor: SlotId,
         departing: SlotId,
@@ -2124,18 +2366,19 @@ mod tests {
         (sessions, mesh_links, makers, inbox)
     }
 
-    /// A dropped departure holds the synced-leave decision for the grace window:
-    /// no leave reaches survivors immediately, and one arrives only after the grace
-    /// elapses. This is the whole disconnect-grace behavior at the routing level.
+    /// A dropped departure is never decided on its own: it marks an undecided hold
+    /// and no leave ever reaches survivors without an explicit request, no matter
+    /// how long passes. This is the no-auto-drop policy at the routing level.
     #[tokio::test]
-    async fn a_dropped_departure_schedules_the_leave_only_after_the_grace() {
+    async fn a_dropped_departure_is_never_decided_on_its_own() {
         let k = key();
-        let (sessions, mesh_links, makers, mut inbox) =
-            drop_grace_harness(&k, SlotId(0), SlotId(1));
-        let grace = LeaveGrace::new(TEST_GRACE);
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        // Even a zero unlock floor — "past the floor from the first instant" —
+        // decides nothing without a request; only an honored `RequestDrop` does.
+        let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
 
-        decide_leave_maybe_graced(
-            &grace,
+        hold_or_decide_leave(
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2144,39 +2387,36 @@ mod tests {
             LEAVE_REASON_DROPPED,
         );
 
-        // The decision is held: nothing has reached the survivor yet, and a hold is
-        // pending for the dropped slot.
+        // The drop is held, and nothing has reached the survivor.
+        assert!(holds.is_pending(&k, SlotId(1)), "the drop marked a hold");
         assert!(
             inbox.leave_push_rx.try_recv().is_err(),
-            "the drop's leave is held for the grace, not decided immediately",
+            "a drop is never decided on its own",
         );
-        assert!(grace.is_pending(&k, SlotId(1)));
 
-        // After the grace elapses, the leave is decided and fanned to the survivor.
-        tokio::time::sleep(TEST_GRACE + Duration::from_millis(40)).await;
-        let leave = inbox
-            .leave_push_rx
-            .try_recv()
-            .expect("the leave fires once the grace elapses");
-        assert_eq!(leave.slot, 1);
-        assert_eq!(leave.reason, LEAVE_REASON_DROPPED);
+        // Well past any window a timer could ever have used, still no leave — the
+        // survivor stays stalled but alive, waiting on a human's decision.
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(
-            !grace.is_pending(&k, SlotId(1)),
-            "the hold cleared on firing"
+            inbox.leave_push_rx.try_recv().is_err(),
+            "no auto-drop ever fires",
+        );
+        assert!(
+            holds.is_pending(&k, SlotId(1)),
+            "the hold still stands, undecided",
         );
     }
 
-    /// A clean leave (a client's announced intent) decides immediately — no grace —
+    /// A clean leave (a client's announced intent) decides immediately — no hold —
     /// so an F10 quit unstalls survivors at once.
     #[tokio::test]
     async fn a_clean_departure_decides_immediately() {
         let k = key();
-        let (sessions, mesh_links, makers, mut inbox) =
-            drop_grace_harness(&k, SlotId(0), SlotId(1));
-        let grace = LeaveGrace::new(TEST_GRACE);
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
-        decide_leave_maybe_graced(
-            &grace,
+        hold_or_decide_leave(
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2188,25 +2428,24 @@ mod tests {
         let leave = inbox
             .leave_push_rx
             .try_recv()
-            .expect("a clean leave fires without waiting on any grace");
+            .expect("a clean leave fires without any hold");
         assert_eq!(leave.slot, 1);
         assert_eq!(leave.reason, LEAVE_REASON_LEFT);
-        assert!(!grace.is_pending(&k, SlotId(1)), "no hold was armed");
+        assert!(!holds.is_pending(&k, SlotId(1)), "no hold was marked");
     }
 
-    /// A clean-leave intent arriving during a drop's in-flight grace cancels the
-    /// hold and decides immediately with the "left" reason — the ordering where a
-    /// client's clean quit races its own link-death observation.
+    /// A clean-leave intent arriving while a drop for the same slot is still held
+    /// releases the hold and decides immediately with the "left" reason — the
+    /// ordering where a client's clean quit races its own link-death observation.
     #[tokio::test]
-    async fn a_clean_intent_during_a_drop_grace_cancels_the_hold_and_proceeds() {
+    async fn a_clean_intent_during_a_drop_hold_releases_it_and_proceeds() {
         let k = key();
-        let (sessions, mesh_links, makers, mut inbox) =
-            drop_grace_harness(&k, SlotId(0), SlotId(1));
-        let grace = LeaveGrace::new(TEST_GRACE);
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
-        // A drop arms the hold.
-        decide_leave_maybe_graced(
-            &grace,
+        // A drop marks the hold.
+        hold_or_decide_leave(
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2214,13 +2453,13 @@ mod tests {
             SlotId(1),
             LEAVE_REASON_DROPPED,
         );
-        assert!(grace.is_pending(&k, SlotId(1)));
+        assert!(holds.is_pending(&k, SlotId(1)));
         assert!(inbox.leave_push_rx.try_recv().is_err(), "still held");
 
-        // Before the grace elapses, the clean intent arrives: it cancels the hold
-        // and decides at once with the "left" reason.
-        decide_leave_maybe_graced(
-            &grace,
+        // The clean intent arrives: it releases the hold and decides at once with
+        // the "left" reason.
+        hold_or_decide_leave(
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2229,33 +2468,189 @@ mod tests {
             LEAVE_REASON_LEFT,
         );
         assert!(
-            !grace.is_pending(&k, SlotId(1)),
-            "the clean intent cancelled the hold"
+            !holds.is_pending(&k, SlotId(1)),
+            "the clean intent released the hold"
         );
         let leave = inbox
             .leave_push_rx
             .try_recv()
             .expect("the clean leave decided immediately");
         assert_eq!(leave.reason, LEAVE_REASON_LEFT, "the left outcome wins");
+    }
 
-        // And the cancelled drop hold never fires a second leave.
-        tokio::time::sleep(TEST_GRACE + Duration::from_millis(40)).await;
+    /// A `RequestDrop` before the unlock floor is refused: the target's drop has
+    /// not stood long enough, so no leave is decided and the hold still stands.
+    #[tokio::test]
+    async fn a_request_before_the_unlock_is_refused() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+        hold_or_decide_leave(
+            &holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+
+        // A request while the hold is fresh (well before the unreachable floor) is
+        // refused: no leave, and the hold is untouched.
+        honor_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(1), 0);
         assert!(
             inbox.leave_push_rx.try_recv().is_err(),
-            "the cancelled hold produced no further leave",
+            "a pre-unlock request decides no leave",
+        );
+        assert!(
+            holds.is_pending(&k, SlotId(1)),
+            "the refused request left the hold standing",
+        );
+    }
+
+    /// A `RequestDrop` past the unlock floor decides the leave exactly once with the
+    /// DROPPED reason, and a duplicate request after the decide is a harmless no-op.
+    #[tokio::test]
+    async fn a_request_past_the_unlock_decides_once_then_dedups() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
+        hold_or_decide_leave(
+            &holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+
+        honor_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(1), 0);
+        let leave = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("the request past the unlock decides the leave");
+        assert_eq!(leave.slot, 1);
+        assert_eq!(
+            leave.reason, LEAVE_REASON_DROPPED,
+            "a manual drop uses the dropped reason",
+        );
+        assert!(
+            !holds.is_pending(&k, SlotId(1)),
+            "honoring the request released the hold",
+        );
+
+        // A duplicate request after the decide does nothing — the hold is gone and
+        // the decision dedups.
+        honor_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(1), 0);
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "a duplicate request after the decide is a no-op",
+        );
+    }
+
+    /// A `RequestDrop` targeting a slot that already left cleanly (decided, no hold)
+    /// is a no-op, and one targeting the requester itself is rejected at the edge.
+    #[tokio::test]
+    async fn a_request_for_a_decided_or_self_slot_is_a_no_op() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
+
+        // Slot 1 leaves cleanly: decided immediately, no hold left behind.
+        hold_or_decide_leave(
+            &holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_LEFT,
+        );
+        let _ = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("the clean leave decided");
+
+        // A drop request for that already-decided slot finds no hold: no-op.
+        honor_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(1), 0);
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "a request for an already-decided slot decides nothing further",
+        );
+
+        // A request naming the requester itself is rejected at the edge before any
+        // hold check or fan-out — the survivor (slot 0) here is not disconnected.
+        handle_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(0), 0);
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "a self-targeting request is rejected, deciding nothing",
+        );
+    }
+
+    /// The client-edge validation rejects a request for a slot this relay has no
+    /// reason to believe is disconnected (neither held nor departed), without a
+    /// decide — the cheap sanity check before spending a mesh broadcast.
+    #[tokio::test]
+    async fn a_request_for_a_connected_slot_is_rejected_at_the_edge() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
+
+        // Slot 1 is fully connected (no departure, no hold). A request to drop it is
+        // nonsense and is dropped at the edge.
+        handle_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(0), 1);
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "a request for a connected slot decides nothing",
+        );
+    }
+
+    /// The per-requester rate cap bounds how many requests one requester can spend a
+    /// mesh broadcast on, and — crucially — an over-limit burst never multi-decides:
+    /// the decision dedups regardless, so a double-click storm removes the slot at
+    /// most once.
+    #[tokio::test]
+    async fn a_burst_of_requests_decides_at_most_once() {
+        let k = key();
+        let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
+        hold_or_decide_leave(
+            &holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+
+        // A burst of requests from the same survivor: the first decides, and every
+        // later one — whether rate-admitted or not — finds the hold already gone.
+        for _ in 0..8 {
+            handle_drop_request(&holds, &makers, &sessions, &mesh_links, &k, SlotId(0), 1);
+        }
+        let leave = inbox
+            .leave_push_rx
+            .try_recv()
+            .expect("the burst decided the leave once");
+        assert_eq!(leave.slot, 1);
+        assert!(
+            inbox.leave_push_rx.try_recv().is_err(),
+            "the burst decided the leave at most once",
         );
     }
 
     /// The reconnection race caught live: on a single relay, both clients' links
     /// blip and both re-dial. As the roster empties and refills, presence flaps the
     /// buffer authority to `Peer` and back — and the promotion on the way back must
-    /// not decide the leaves of slots that are still graced (away) or already
+    /// not decide the leaves of slots whose drop is still held (away) or already
     /// reinstated (returned). No leave is ever decided, and the game continues with
     /// both slots back.
     ///
     /// Removing either half of the fix breaks this: without the promotion's
-    /// grace-pending skip, the still-away slot's leave fires; without the
-    /// re-register's departure reinstatement, the just-returned slot's does.
+    /// held-slot skip, the still-away slot's leave fires; without the re-register's
+    /// departure reinstatement, the just-returned slot's does.
     #[tokio::test]
     async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
         use crate::consensus::{self, Authority};
@@ -2268,9 +2663,9 @@ mod tests {
         let mesh_links = crate::mesh::new_mesh_links();
         let makers = Arc::new(consensus::new_decision_makers());
         let presence = presence::new_presence_registry();
-        // A long grace so no hold fires during the test; the re-registers cancel
-        // both holds explicitly, exactly as the server's re-register path does.
-        let grace = LeaveGrace::new(Duration::from_secs(30));
+        // A hold never fires on its own; the re-registers release both holds
+        // explicitly, exactly as the server's re-register path does.
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
         // A started single-relay session of two framed slots, this relay authority.
         let _ = consensus::sync_maker(
@@ -2291,17 +2686,17 @@ mod tests {
         g1.disarm();
         let _ = consensus::note_slot_present(&makers, &k, SlotId(0));
         let _ = consensus::note_slot_present(&makers, &k, SlotId(1));
-        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
         assert!(
             makers.lock().get(&k).unwrap().is_authority(),
             "the relay starts as the session authority",
         );
 
-        // Both links die: deregister, announce a dropped departure (arming a grace),
+        // Both links die: deregister, announce a dropped departure (marking a hold),
         // then report the changed roster — the end-of-link path, in order.
         deregister(&sessions, &k, SlotId(0));
         announce_departure(
-            &grace,
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2309,10 +2704,10 @@ mod tests {
             SlotId(0),
             LEAVE_REASON_DROPPED,
         );
-        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
         deregister(&sessions, &k, SlotId(1));
         announce_departure(
-            &grace,
+            &holds,
             &makers,
             &sessions,
             &mesh_links,
@@ -2320,24 +2715,24 @@ mod tests {
             SlotId(1),
             LEAVE_REASON_DROPPED,
         );
-        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
 
         assert!(
-            grace.is_pending(&k, SlotId(0)) && grace.is_pending(&k, SlotId(1)),
-            "both drops armed a grace",
+            holds.is_pending(&k, SlotId(0)) && holds.is_pending(&k, SlotId(1)),
+            "both drops marked a hold",
         );
         assert!(
             !makers.lock().get(&k).unwrap().is_authority(),
             "the emptied roster demoted the relay to a peer",
         );
 
-        // Slot 0 re-registers within its grace: register, then cancel + reinstate as
-        // the server does, then report presence — which re-promotes the relay.
+        // Slot 0 re-registers while its drop is still held: register, then release +
+        // reinstate as the server does, then report presence — which re-promotes.
         let (mut r0, _ri0) = register(&sessions, &k, SlotId(0)).expect("slot 0 re-registers");
         r0.disarm();
-        grace.cancel(&k, SlotId(0));
+        holds.release(&k, SlotId(0));
         assert!(consensus::reinstate_slot(&makers, &k, SlotId(0)));
-        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
         assert!(
             makers.lock().get(&k).unwrap().is_authority(),
             "the first return re-promoted the relay — the flap the fix must survive",
@@ -2346,9 +2741,9 @@ mod tests {
         // Slot 1 re-registers too.
         let (mut r1, _ri1) = register(&sessions, &k, SlotId(1)).expect("slot 1 re-registers");
         r1.disarm();
-        grace.cancel(&k, SlotId(1));
+        holds.release(&k, SlotId(1));
         assert!(consensus::reinstate_slot(&makers, &k, SlotId(1)));
-        report_own_presence(&presence, &makers, &sessions, &mesh_links, &grace, &k);
+        report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
 
         // The whole flap decided no leave, and the session continues with both slots.
         let (departures, directives) = consensus::leave_reconcile(&makers, &k);
@@ -2385,5 +2780,189 @@ mod tests {
         assert_eq!(a, (SlotId(3), false));
         let b = inbox1.conn_push_rx.try_recv().expect("slot 3 hears it too");
         assert_eq!(b, (SlotId(3), false));
+    }
+
+    // -- fully-abandoned session teardown --
+
+    /// A short abandoned-session window for tests, so the timer path can be driven
+    /// with a real (tiny) sleep rather than the production two minutes.
+    const TINY_ABANDON: Duration = Duration::from_millis(80);
+
+    /// A started, single-relay authority session over slots {0, 1} with a frame
+    /// basis for each and this relay's presence order set to itself. No departures
+    /// are recorded — each test records exactly the ones it needs and drives the
+    /// own-roster presence count. Returns the registries the abandoned-session tests
+    /// reconcile against.
+    fn abandoned_harness() -> (
+        crate::presence::PresenceRegistry,
+        Sessions,
+        crate::mesh::MeshLinks,
+        Arc<crate::consensus::DecisionMakers>,
+        SessionKey,
+    ) {
+        use crate::consensus::{self, Authority};
+        use crate::presence::Candidate;
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let k = key();
+        let sessions: Sessions = Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let presence = crate::presence::new_presence_registry();
+        let _ = consensus::sync_maker(
+            &makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+        );
+        consensus::mark_session_started(&makers, &k);
+        consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
+        consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
+        crate::presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
+        (presence, sessions, mesh_links, makers, k)
+    }
+
+    /// Records `slot` as a dropped departure and marks its hold — the maker/hold
+    /// state `announce_departure` leaves behind for a disconnected slot.
+    fn drop_slot(
+        makers: &Arc<crate::consensus::DecisionMakers>,
+        holds: &DropHolds,
+        k: &SessionKey,
+        slot: SlotId,
+    ) {
+        crate::consensus::record_departure(
+            makers,
+            k,
+            slot,
+            Some(rally_point_proto::ids::GameFrameCount(50)),
+            None,
+            None,
+            LEAVE_REASON_DROPPED,
+        );
+        holds.hold(k.clone(), slot);
+    }
+
+    /// Every player dropping leaves the session empty session-wide with undecided
+    /// departures; past the abandoned-session window, they are all decided so the
+    /// session can proceed to its normal teardown.
+    #[tokio::test]
+    async fn all_players_dropping_decides_every_departure_after_the_abandon_timeout() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        drop_slot(&makers, &holds, &k, SlotId(0));
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        // The session goes empty session-wide.
+        crate::presence::record_own(&presence, &k, 0);
+
+        assert!(crate::consensus::has_undecided_departure(&makers, &k));
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        assert!(
+            holds.abandon_armed(&k),
+            "an empty session with undecided departures arms the timer",
+        );
+
+        // Past the window, every departure is decided — nothing is left held.
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert!(
+            !crate::consensus::has_undecided_departure(&makers, &k),
+            "the abandoned session's departures are all decided",
+        );
+        assert!(!holds.abandon_armed(&k), "the fired timer removed itself");
+    }
+
+    /// A slot re-registering inside the window cancels the timer: nothing is decided,
+    /// the returning slot is reinstated, and the other slot's drop stays held
+    /// (undecided) — now requestable by that slot once it returns, or never.
+    #[tokio::test]
+    async fn a_re_register_inside_the_window_cancels_the_timer_and_decides_nothing() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        drop_slot(&makers, &holds, &k, SlotId(0));
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        assert!(holds.abandon_armed(&k));
+
+        // Slot 0 re-registers: release its hold, reinstate its departure, and report
+        // the roster live again — the server's re-register path — then reconcile.
+        holds.release(&k, SlotId(0));
+        assert!(crate::consensus::reinstate_slot(&makers, &k, SlotId(0)));
+        crate::presence::record_own(&presence, &k, 1);
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        assert!(
+            !holds.abandon_armed(&k),
+            "the re-register cancelled the abandoned-session timer",
+        );
+
+        // Past the original window, nothing was decided.
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert!(
+            !crate::consensus::slot_departed(&makers, &k, SlotId(0)),
+            "the reconnected slot is reinstated",
+        );
+        assert!(
+            holds.is_pending(&k, SlotId(1)),
+            "the other slot's drop is still held, undecided",
+        );
+        assert!(
+            crate::consensus::has_undecided_departure(&makers, &k),
+            "no departure was decided",
+        );
+    }
+
+    /// The timer never arms while at least one slot is live session-wide, no matter
+    /// how many others have dropped.
+    #[tokio::test]
+    async fn the_timer_never_arms_while_a_slot_is_live() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        // Slot 0 is still connected: the session is not empty session-wide.
+        crate::presence::record_own(&presence, &k, 1);
+
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        assert!(
+            !holds.abandon_armed(&k),
+            "a session with a live slot never arms the timer",
+        );
+
+        // Well past the window, the still-held slot 1 is not decided.
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert!(
+            crate::consensus::has_undecided_departure(&makers, &k),
+            "no departure is decided while a slot remains live",
+        );
+    }
+
+    /// A duplicate arm leaves a single timer, and a duplicate decide after expiry
+    /// finds nothing left — the abandoned close is idempotent.
+    #[tokio::test]
+    async fn duplicate_arm_and_expiry_decide_at_most_once() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        drop_slot(&makers, &holds, &k, SlotId(0));
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+
+        // Arm twice: the second is idempotent, leaving a single timer.
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
+        assert!(holds.abandon_armed(&k));
+
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert!(
+            !crate::consensus::has_undecided_departure(&makers, &k),
+            "the departures decided once",
+        );
+
+        // A duplicate decide after the fact is a no-op — all already decided.
+        let again = crate::consensus::decide_abandoned_departures(&makers, &k);
+        assert!(
+            again.is_empty(),
+            "a duplicate abandoned-decide finds nothing left to decide",
+        );
     }
 }

@@ -53,7 +53,7 @@ pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod coordinator_client;
-pub mod leave_grace;
+pub mod drop_hold;
 pub mod lobby;
 pub mod mesh;
 pub mod mesh_control;

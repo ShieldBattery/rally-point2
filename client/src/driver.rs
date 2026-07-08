@@ -71,7 +71,7 @@ use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payloa
 use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
-    send_control_lobby, send_control_turn, spawn_control_reader,
+    send_control_lobby, send_control_request_drop, send_control_turn, spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
@@ -111,6 +111,12 @@ const LOBBY_CHANNEL_CAPACITY: usize = 256;
 /// bursty but small (a human typing), so a generous backstop against a
 /// scheduling hiccup is ample here too; it is not a tuned buffer.
 const CHAT_CHANNEL_CAPACITY: usize = 256;
+
+/// Depth of the manual-drop-request channel from the game thread to the driver.
+/// A human clicks the drop button a handful of times at most; the relay
+/// rate-limits the requests regardless, so a small backstop against a scheduling
+/// hiccup is ample.
+const REQUEST_DROP_CHANNEL_CAPACITY: usize = 16;
 
 /// How long the driver waits, after the game signals its departure, for the
 /// outbound queue and unacked window to drain before announcing the leave
@@ -241,6 +247,21 @@ pub struct TurnChannels {
     /// a member whose stream comes up after a message already flowed simply
     /// never sees it.
     pub chat_in: mpsc::Receiver<(SlotId, ChatOut)>,
+    /// Manual drop requests this game authored: the game submits the `SlotId` of a
+    /// disconnected member it wants dropped, and the driver writes a `RequestDrop`
+    /// up the reliable control stream naming that slot (the relay binds the
+    /// requester to this client's authenticated slot, so the caller never sets it).
+    /// A disconnection never removes a player on its own — a dropped slot stalls
+    /// the game until a human asks for it to be dropped — so this is the game's
+    /// escape from a stalled session. Fire-and-forget and best-effort: there is no
+    /// ack (the [`leaves`](Self::leaves) `LeaveDirective` for the target is the
+    /// only confirmation), a request the authority refuses (too early) can simply
+    /// be submitted again, and a send failure is logged and swallowed rather than
+    /// surfaced — losing one request costs nothing more than a click. Survives the
+    /// driver's own reconnection like the other senders: the survivor making the
+    /// request has a healthy link, so a request submitted mid-session goes out on
+    /// the live stream.
+    pub request_drop: mpsc::Sender<SlotId>,
     /// The relay-driven session-start directive, delivered once every expected
     /// slot has connected somewhere in the session's mesh. The driver forwards a
     /// unit here each time the relay pushes a `SessionStart` down the reliable
@@ -305,6 +326,9 @@ pub struct LinkDriver {
     /// Chat messages other members authored (relay-stamped with their author
     /// slot), to hand to the game thread.
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    /// Manual drop requests the game authored, to send up the control stream as
+    /// `RequestDrop` frames.
+    request_drop: mpsc::Receiver<SlotId>,
     /// The relay-driven session-start directive, to hand to the game thread when
     /// the relay pushes a `SessionStart` down the control stream.
     session_start: mpsc::Sender<()>,
@@ -347,8 +371,8 @@ pub enum DriverError {
     #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
     UnackedWindowExhausted { in_flight: usize, cap: usize },
     /// The relay refused a re-dial because this slot's leave was already decided
-    /// (its disconnect grace expired, or it left cleanly), so the game has moved on
-    /// without this client. Terminal for the reconnect loop — no dial can bring the
+    /// (a survivor's drop request was honored, or it left cleanly), so the game has
+    /// moved on without this client. Terminal for the reconnect loop — no dial can bring the
     /// slot back — so the driver ends and its channels close, which the game reads
     /// as end-of-session.
     #[error("relay refused the re-dial: slot already departed")]
@@ -383,6 +407,8 @@ impl LinkDriver {
         // Chat flows in both directions for the whole game, unlike lobby.
         let (chat_out_tx, chat_out_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
         let (chat_in_tx, chat_in_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        // Manual drop requests flow game → driver only, for the whole game.
+        let (request_drop_tx, request_drop_rx) = mpsc::channel(REQUEST_DROP_CHANNEL_CAPACITY);
         // The session-start directive arrives at most a handful of times (the
         // fire, plus any re-push on late register or authority handoff).
         let (session_start_tx, session_start_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
@@ -401,6 +427,7 @@ impl LinkDriver {
             lobby_in: lobby_in_tx,
             chat_out: chat_out_rx,
             chat_in: chat_in_tx,
+            request_drop: request_drop_rx,
             session_start: session_start_tx,
             connectivity: connectivity_tx,
         };
@@ -415,6 +442,7 @@ impl LinkDriver {
             lobby_in: lobby_in_rx,
             chat_out: chat_out_tx,
             chat_in: chat_in_rx,
+            request_drop: request_drop_tx,
             session_start: session_start_rx,
             connectivity: connectivity_rx,
         };
@@ -439,6 +467,7 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            request_drop,
             session_start,
             connectivity,
         } = self;
@@ -452,6 +481,7 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            request_drop,
             session_start,
             connectivity,
         };
@@ -494,6 +524,7 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            request_drop,
             session_start,
             connectivity,
         } = self;
@@ -507,6 +538,7 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            request_drop,
             session_start,
             connectivity,
         };
@@ -576,6 +608,7 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            request_drop,
             session_start,
             connectivity,
         } = seam;
@@ -703,6 +736,12 @@ impl LinkDriver {
         // `recv()` is an always-ready `None` that would spin the loop.
         let mut chat_out_alive = true;
 
+        // Whether the game's drop-request sender is still live. Like chat it
+        // streams for the whole game, with the same disarm rule: only on the
+        // sender dropping (a `None`), after which `recv()` is an always-ready
+        // `None` that would spin the loop.
+        let mut request_drop_alive = true;
+
         loop {
             // Armed only once the game has signaled its departure (the announcer
             // has a `deadline`); the day-out fallback keeps the branch dormant,
@@ -798,6 +837,13 @@ impl LinkDriver {
                         Some(ControlInbound::GameResult(_)) => {
                             tracing::warn!(
                                 "ignoring unexpected relay-sent game-result control frame"
+                            );
+                        }
+                        // A drop request only ever travels client → relay; a client
+                        // never receives one back, so ignore a stray one.
+                        Some(ControlInbound::RequestDrop(_)) => {
+                            tracing::warn!(
+                                "ignoring unexpected relay-sent drop-request control frame"
                             );
                         }
                         // A lobby command another member authored, relay-stamped
@@ -1119,6 +1165,32 @@ impl LinkDriver {
                         None => chat_out_alive = false,
                     }
                 }
+                // A manual drop request the game authored: the survivor asked to
+                // drop a disconnected member. Send it up the reliable control stream
+                // at once — no drain to wait behind, like chat — naming the target
+                // slot; the relay stamps this client's authenticated slot as the
+                // requester. Best-effort, exactly like chat: a send failure is
+                // logged and swallowed rather than treated as a link failure, since
+                // a lost request is not correctness-critical — the survivor can
+                // simply click again, and the `LeaveDirective` for the target is the
+                // only confirmation. Disarmed only when the game drops its sender.
+                target = request_drop.recv(), if request_drop_alive => {
+                    match target {
+                        Some(target) => {
+                            if let Err(error) =
+                                send_control_request_drop(&mut control_send, u32::from(target.0))
+                                    .await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    target = target.0,
+                                    "drop-request send failed; dropping the request"
+                                );
+                            }
+                        }
+                        None => request_drop_alive = false,
+                    }
+                }
                 // Safety timeout: the game signaled its departure but the
                 // outbound queue or unacked window hadn't drained within
                 // `LEAVE_INTENT_TIMEOUT`. If acks aren't coming the link is
@@ -1290,8 +1362,8 @@ const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 /// Per-attempt bound on one reconnect dial. Short enough that several attempts fit
-/// inside the relay's disconnect grace, so a recoverable drop reconnects before the
-/// slot is decided departed.
+/// well inside the window before a survivor could request the drop, so a
+/// recoverable drop reconnects before the slot could be decided departed.
 const RECONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Ceiling on turns buffered while the link is down. Under lockstep the game stalls
@@ -1313,6 +1385,7 @@ struct GameSeam {
     lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
     chat_out: mpsc::Receiver<ChatOut>,
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    request_drop: mpsc::Receiver<SlotId>,
     session_start: mpsc::Sender<()>,
     connectivity: mpsc::Sender<(SlotId, bool)>,
 }

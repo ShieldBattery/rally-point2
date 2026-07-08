@@ -1388,7 +1388,7 @@ async fn collect_oversize_turns(
 }
 
 #[tokio::test]
-async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns() {
+async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_missed_turns() {
     use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
@@ -1400,13 +1400,12 @@ async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns
         session,
     };
 
-    // A short drop grace so the test can wait past it to prove no leave fired,
-    // without the production 10-second hold. Seed this relay as the authority over
-    // an expected {0, 1} set: the session then starts (turns are ring-buffered only
-    // once started), and a slot-1 drop's leave would actually be decided — against
-    // the session frame slot 0's framed turns establish — if it were not cancelled.
-    let grace = Duration::from_millis(1000);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_grace(grace);
+    // Seed this relay as the authority over an expected {0, 1} set: the session then
+    // starts (turns are ring-buffered only once started). A dropped slot is never
+    // auto-decided regardless of the unlock floor, so the floor here matters only to
+    // bound how long the test waits before asserting no leave ever fired.
+    let unlock = Duration::from_millis(1000);
+    let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
     let makers = mesh.decision_makers.clone();
     let _ = consensus::sync_maker(
         &makers,
@@ -1442,7 +1441,7 @@ async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns
     assert_eq!(got[0].seq, 0);
 
     // Slot 1's link dies. Wait until slot 0 hears the disconnect — proof the relay
-    // has run the departure path and armed the drop grace for slot 1.
+    // has run the departure path and marked the drop hold for slot 1.
     drop(slot1);
     wait_for_connectivity(&mut ctrl0, SlotId(1), false).await;
 
@@ -1463,9 +1462,9 @@ async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns
     // ring.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Slot 1 re-dials within the grace, resuming from slot 0 seq 1 (it already has
-    // seq 0). The relay accepts it (the grace is still pending), cancels the held
-    // leave, and replays the two missed turns on the reliable control stream.
+    // Slot 1 re-dials while its drop is still held, resuming from slot 0 seq 1 (it
+    // already has seq 0). The relay accepts it (the hold is still pending), releases
+    // the hold, and replays the two missed turns on the reliable control stream.
     let slot1b = connect_slot_resuming(
         &endpoint,
         addr,
@@ -1487,13 +1486,14 @@ async fn a_reconnect_within_the_grace_cancels_the_leave_and_replays_missed_turns
     assert_eq!(&replayed[1].commands[..], &[0x0C, 3, 2, 3, 4, 5, 6, 7]);
     assert_eq!(replayed[0].slot, 0, "a replayed turn keeps its origin slot");
 
-    // The grace was cancelled: even well past when it would have fired, slot 0 never
-    // receives a synced leave for slot 1 (it only hears slot 1 reconnect).
-    let deadline = tokio::time::Instant::now() + grace + Duration::from_millis(500);
+    // The hold was released and the slot reinstated: even well past the unlock floor
+    // (past which a drop would only ever be honored on request, never automatically),
+    // slot 0 never receives a synced leave for slot 1 (it only hears slot 1 reconnect).
+    let deadline = tokio::time::Instant::now() + unlock + Duration::from_millis(500);
     loop {
         match tokio::time::timeout_at(deadline, ctrl0.recv()).await {
             Ok(Some(ControlInbound::Leave(leave))) => {
-                panic!("the cancelled grace still decided a leave: {leave:?}")
+                panic!("a reinstated slot still had a leave decided: {leave:?}")
             }
             Ok(Some(_)) => continue,
             Ok(None) => panic!("slot 0's control stream closed early"),
@@ -1549,7 +1549,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Slot 1 leaves cleanly: a clean leave is decided immediately, no grace, so the
+    // Slot 1 leaves cleanly: a clean leave is decided immediately, no hold, so the
     // slot's departure is final. The relay closes slot 1's link as confirmation.
     let (mut leave_send, _unused) = slot1.connection().open_bi().await.unwrap();
     send_control_leave_intent(&mut leave_send).await.unwrap();

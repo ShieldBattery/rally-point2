@@ -1791,13 +1791,13 @@ impl DecisionMaker {
         authority: Authority,
     ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         self.bounds = bounds;
-        // The descriptor-push promotion path has no local drop-grace registry in
+        // The descriptor-push promotion path has no local drop-hold registry in
         // hand (it is driven from the mesh control plane, which does not carry the
-        // per-relay grace state), so it treats every undecided departure as
+        // per-relay hold state), so it treats every undecided departure as
         // immediately decidable — today's behavior. The promotion that races a
         // reconnection on a single relay is the presence-driven one
         // ([`set_authority`](Self::set_authority)), which is handed the real
-        // grace-pending set; a descriptor that drops the former authority is a
+        // held-slot set; a descriptor that drops the former authority is a
         // coordinator membership decision, not a link blip.
         self.set_authority(authority, &HashSet::new())
     }
@@ -1834,22 +1834,22 @@ impl DecisionMaker {
     /// slot, by whichever path (`decide_leave`, `observe_leave`, or this one)
     /// first grows the cache.
     ///
-    /// `grace_pending` is the set of this relay's slots whose *drop grace* is still
-    /// in flight for the session — a departure recorded and announced, but whose
-    /// synced leave has neither expired into a decision nor been discarded by the
-    /// slot's return. A promotion **must not** decide such a slot: the hold's own
-    /// expiry (or its cancellation when the client re-registers) is the sole
-    /// decider for a graced drop, and a promotion re-deriving it here would
-    /// broadcast a leave the grace has not committed — defeating reconnection when
-    /// a total-presence blip flips authority away and back on one relay. The caller
-    /// (which owns the grace registry) passes the pending set in; an undecided
-    /// departure *not* in it (a clean leave that never got decided, or a grace that
-    /// already expired-but-undecided) still re-derives, so no departure is lost.
+    /// `held_slots` is the set of this relay's slots whose *drop is still held
+    /// undecided* for the session — a departure recorded and announced, but whose
+    /// synced leave has neither been decided (by an honored manual request) nor
+    /// discarded by the slot's return. A promotion **must not** decide such a slot:
+    /// a held drop is decided only by an honored `RequestDrop`, or released when the
+    /// client re-registers, so a promotion re-deriving it here would broadcast a
+    /// leave no one asked for — defeating reconnection when a total-presence blip
+    /// flips authority away and back on one relay. The caller (which owns the
+    /// drop-hold registry) passes the held set in; an undecided departure *not* in
+    /// it (a clean leave that never got decided) still re-derives, so no departure
+    /// is lost.
     #[must_use]
     pub fn set_authority(
         &mut self,
         authority: Authority,
-        grace_pending: &HashSet<SlotId>,
+        held_slots: &HashSet<SlotId>,
     ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         if self.authority == authority {
             return (Vec::new(), Vec::new());
@@ -1878,7 +1878,7 @@ impl DecisionMaker {
             // Trace the new authority's control inputs promptly rather than
             // waiting out the interval from the previous authority's cadence.
             self.last_trace_frame = None;
-            self.drain_handoff_leaves(grace_pending)
+            self.drain_handoff_leaves(held_slots)
         } else {
             (Vec::new(), Vec::new())
         }
@@ -1915,15 +1915,15 @@ impl DecisionMaker {
     /// must fire the same one notice.
     fn drain_handoff_leaves(
         &mut self,
-        grace_pending: &HashSet<SlotId>,
+        held_slots: &HashSet<SlotId>,
     ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         let mut leaves = Vec::new();
         let mut fresh = Vec::new();
 
         // Cached directives (authored or observed): re-broadcast verbatim. Never
         // "fresh" -- the cache already held these, so whichever relay first
-        // cached them already reported the departure. A grace-pending slot is
-        // undecided by construction, so it is never in this map.
+        // cached them already reported the departure. A held slot is undecided by
+        // construction, so it is never in this map.
         leaves.extend(self.decided_leaves.values().copied());
 
         // Departures with no cached directive: the previous authority never got
@@ -1931,16 +1931,16 @@ impl DecisionMaker {
         // `decide_leave`. Collect first to avoid holding an immutable borrow
         // across the mutation.
         //
-        // A slot whose drop grace is still pending is skipped entirely — not
-        // decided here at all. Its hold is the sole decider for the graced drop:
-        // it either expires into the decision or is cancelled when the client
-        // returns. Deciding it here (which would also mark it decided, making the
-        // later hold's `decide_leave` a no-op) would lose the reconnection window.
+        // A slot whose drop is still held undecided is skipped entirely — not
+        // decided here at all. A held drop is decided only by an honored manual
+        // request, or released when the client returns. Deciding it here (which
+        // would also mark it decided) would remove a slot no one asked to drop and
+        // lose the reconnection window.
         let to_derive: Vec<(SlotId, u32)> = self
             .departures
             .iter()
             .filter(|(slot, _)| {
-                !self.decided_leaves.contains_key(slot) && !grace_pending.contains(*slot)
+                !self.decided_leaves.contains_key(slot) && !held_slots.contains(*slot)
             })
             .map(|(slot, departure)| (*slot, departure.reason))
             .collect();
@@ -2321,6 +2321,29 @@ impl DecisionMaker {
         if self.authority != Authority::SelfRelay {
             return None;
         }
+        self.commit_leave(slot, reason)
+    }
+
+    /// Decides `slot`'s leave **without** the authority gate, used only to close out
+    /// a fully-abandoned session (see [`decide_abandoned_departures`]). With every
+    /// slot session-wide disconnected, presence names no authority — the verdict is
+    /// [`Authority::Peer`] on every relay — so an authority-gated decide would leave
+    /// the departures undecided forever. There are no clients left to desync, so
+    /// whichever relay's abandoned-session timer fires decides its own record; the
+    /// same per-slot dedup ([`commit_leave`] / [`observe_leave`] / the coordinator's
+    /// notice dedup) that makes an ordinary decide idempotent makes this safe even
+    /// when several relays' timers fire at once. Records the departure first, like
+    /// [`decide_leave`].
+    pub fn force_decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
+        self.note_departure(slot, None, None, None, reason);
+        self.commit_leave(slot, reason)
+    }
+
+    /// The decision-and-cache step shared by [`decide_leave`] (behind the authority
+    /// gate) and [`force_decide_leave`] (a fully-abandoned session, no authority).
+    /// Dedups by slot — a `None` return means the slot's leave was already decided
+    /// or cached, or no framed turn has been observed to schedule against yet.
+    fn commit_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
         if self.decided_leaves.contains_key(&slot) {
             return None; // already decided or cached this slot's leave
         }
@@ -2329,7 +2352,7 @@ impl DecisionMaker {
         let reachable = record.and_then(|d| d.reachable_frame);
         let session = self.session_frame().map(|f| f.0);
         // No framed turn observed anywhere yet (pre-game / lobby): nothing to
-        // schedule against, so hold — a `None` short-circuits decide_leave.
+        // schedule against, so hold — a `None` short-circuits the decision.
         let base = leave_base_frame(slot_last, session)?;
         // Clamp only a framed departure's base, and only when the home supplied a
         // ceiling; the session-frame fallback has no client-inflatable basis.
@@ -2346,6 +2369,26 @@ impl DecisionMaker {
         };
         self.decided_leaves.insert(slot, directive);
         Some(directive)
+    }
+
+    /// The `(slot, reason)` of every recorded departure that has not yet had its
+    /// leave decided. Read to close out a fully-abandoned session — each is
+    /// force-decided (see [`force_decide_leave`]). A slot whose leave is already
+    /// decided or cached is excluded, so a duplicate close is a no-op.
+    fn undecided_departures(&self) -> Vec<(SlotId, u32)> {
+        self.departures
+            .iter()
+            .filter(|(slot, _)| !self.decided_leaves.contains_key(slot))
+            .map(|(slot, departure)| (*slot, departure.reason))
+            .collect()
+    }
+
+    /// Whether any recorded departure still has no decided leave — the "at least one
+    /// undecided departure" half of the abandoned-session condition.
+    pub fn has_undecided_departure(&self) -> bool {
+        self.departures
+            .keys()
+            .any(|slot| !self.decided_leaves.contains_key(slot))
     }
 
     /// Records a slot departure without deciding a leave for it, and retires the
@@ -2478,27 +2521,27 @@ impl DecisionMaker {
 
     /// Whether a departure has been recorded for `slot` — its link ended (a drop or
     /// a clean leave), which retired it from the live slot set. Distinguishes a slot
-    /// the game has moved on from (or is holding a grace over) from one that never
+    /// the game has moved on from (or is holding a drop over) from one that never
     /// departed, so a re-register can tell a resumable reconnect from a decided one.
     pub fn has_departure(&self, slot: SlotId) -> bool {
         self.departures.contains_key(&slot)
     }
 
-    /// Discards `slot`'s departure record because the client returned within its
-    /// drop grace — the slot is live again, not gone. Returns whether a record was
-    /// actually cleared. Called at the re-register that cancels the slot's held
-    /// leave: the cancellation is the graced drop's decision to *not* leave, so the
-    /// record it was holding over must go, or a later authority promotion would
-    /// re-derive the leave from a departure that no longer describes reality (a
-    /// re-registered slot's grace is already cancelled, so the promotion's
-    /// grace-pending skip cannot protect it — clearing the record is what does).
+    /// Discards `slot`'s departure record because the client returned while its drop
+    /// was still held — the slot is live again, not gone. Returns whether a record
+    /// was actually cleared. Called at the re-register that releases the slot's drop
+    /// hold: the return is the held drop's resolution to *not* leave, so the record
+    /// it was holding over must go, or a later authority promotion would re-derive
+    /// the leave from a departure that no longer describes reality (a re-registered
+    /// slot's hold is already released, so the promotion's held-slot skip cannot
+    /// protect it — clearing the record is what does).
     ///
     /// Only the departure record is dropped; the slot's live frame state is
     /// re-created from its resumed turns (the `observe_frame`/`ingest` guards stop
     /// ignoring it the moment the record is gone), and its presence is re-asserted
     /// by the register's own `note_slot_present`. A cached *decided* leave is never
-    /// touched — a re-register within grace only reaches an undecided departure, so
-    /// there is none to conflict with.
+    /// touched — a re-register while the drop is held only reaches an undecided
+    /// departure, so there is none to conflict with.
     pub fn reinstate_slot(&mut self, slot: SlotId) -> bool {
         self.departures.remove(&slot).is_some()
     }
@@ -3289,18 +3332,18 @@ pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
 /// same as `decide_leave`/`observe_leave`; a verbatim re-broadcast of an
 /// already-cached directive fires nothing.
 ///
-/// `grace_pending` is the set of slots whose drop grace is still in flight on this
-/// relay — the caller reads it from the grace registry the maker cannot see. A
-/// promotion skips them, leaving each graced drop's decision to its own hold; see
-/// [`DecisionMaker::set_authority`]. This is what keeps a single-relay presence
-/// flap (authority to `Peer` and back when the roster momentarily empties) from
-/// collapsing the graces of slots that are reconnecting.
+/// `held_slots` is the set of slots whose drop is still held undecided on this
+/// relay — the caller reads it from the drop-hold registry the maker cannot see. A
+/// promotion skips them, leaving each held drop to be decided only by an honored
+/// manual request; see [`DecisionMaker::set_authority`]. This is what keeps a
+/// single-relay presence flap (authority to `Peer` and back when the roster
+/// momentarily empties) from deciding drops of slots that are reconnecting.
 #[must_use]
 pub fn set_authority(
     registry: &DecisionMakers,
     key: &SessionKey,
     authority: Authority,
-    grace_pending: &HashSet<SlotId>,
+    held_slots: &HashSet<SlotId>,
 ) -> Vec<LeaveDirective> {
     let (leaves, fresh) = {
         let mut guard = registry.lock();
@@ -3310,7 +3353,7 @@ pub fn set_authority(
         if maker.authority == authority {
             return Vec::new();
         }
-        maker.set_authority(authority, grace_pending)
+        maker.set_authority(authority, held_slots)
     };
     tracing::info!(
         tenant = key.tenant.as_ref(),
@@ -3440,10 +3483,23 @@ pub fn slot_frame(
         .and_then(|maker| maker.slot_frame(slot))
 }
 
+/// Whether this relay is the decision-making authority for `key` (see
+/// [`DecisionMaker::is_authority`]). `false` when no maker exists for the session.
+/// Read before honoring a manual drop request: only the authority may decide a
+/// leave, so a non-authority (including one that received the request broadcast
+/// over the mesh) ignores it and leaves the decision to whichever relay is
+/// authority among the receivers.
+pub fn is_authority(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(DecisionMaker::is_authority)
+}
+
 /// Whether a departure has been recorded for `slot` in `key`'s decision-maker (see
 /// [`DecisionMaker::has_departure`]). `false` when no maker exists for the session.
 /// Read at re-register time to tell a resumable reconnect (a departure held under a
-/// live drop grace) from a decided one (a departure whose grace already fired).
+/// live drop hold) from a decided one (a departure whose leave was already made).
 pub fn slot_departed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
     registry
         .lock()
@@ -3452,10 +3508,10 @@ pub fn slot_departed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) 
 }
 
 /// Discards `slot`'s departure record for `key` because the client re-registered
-/// within its drop grace (see [`DecisionMaker::reinstate_slot`]). A no-op when no
-/// maker exists or the slot had no departure recorded. Called alongside the grace
-/// cancel at a re-register, so a subsequent authority promotion does not re-derive
-/// a leave for a slot that has already come back.
+/// while its drop was still held (see [`DecisionMaker::reinstate_slot`]). A no-op
+/// when no maker exists or the slot had no departure recorded. Called alongside the
+/// hold release at a re-register, so a subsequent authority promotion does not
+/// re-derive a leave for a slot that has already come back.
 pub fn reinstate_slot(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
     registry
         .lock()
@@ -3628,6 +3684,54 @@ pub fn decide_leave(
     // authoring relay sends for it.
     registry.notify_departure(departure_notice(registry, key, &directive));
     Some(directive)
+}
+
+/// Whether `key`'s decision-maker holds at least one recorded departure whose leave
+/// has not been decided (see [`DecisionMaker::has_undecided_departure`]). `false`
+/// when no maker exists. One half of the fully-abandoned-session condition: a
+/// session with no undecided departure has nothing for the abandoned-session timer
+/// to close out.
+pub fn has_undecided_departure(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(DecisionMaker::has_undecided_departure)
+}
+
+/// Force-decides every undecided departure for a fully-abandoned session — one
+/// with zero live slots session-wide — bypassing the authority gate, and returns
+/// the freshly decided directives for the caller to broadcast. With every slot
+/// disconnected, presence names no authority (the verdict is [`Authority::Peer`]
+/// everywhere), so [`decide_leave`] would decide nothing; but there are no clients
+/// left to desync, so the departures must simply be committed to funnel the session
+/// into its normal close cascade (departure notices, coordinator lifecycle). Fires
+/// exactly one departure notice per freshly decided slot, like [`decide_leave`],
+/// and dedups by slot, so a duplicate call — or several relays' abandoned-session
+/// timers firing at once — decides each slot at most once. A no-op (empty) when no
+/// maker exists or every departure is already decided.
+pub fn decide_abandoned_departures(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+) -> Vec<LeaveDirective> {
+    // Force-decide under the lock, collecting the fresh directives; release the lock
+    // before firing notices (`departure_notice` re-locks the registry to read the
+    // slot's retained result).
+    let decided: Vec<LeaveDirective> = {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return Vec::new();
+        };
+        maker
+            .undecided_departures()
+            .into_iter()
+            .filter_map(|(slot, reason)| maker.force_decide_leave(slot, reason))
+            .collect()
+    };
+    for directive in &decided {
+        log_leave(key, directive);
+        registry.notify_departure(departure_notice(registry, key, directive));
+    }
+    decided
 }
 
 /// Records an authority-stamped directive this relay is forwarding, if the relay
@@ -5924,34 +6028,34 @@ mod tests {
         );
     }
 
-    /// A promotion must not decide a departure whose drop grace is still pending on
-    /// this relay: the hold is the sole decider for a graced drop. The record is
-    /// left undecided (not cached), so the grace's own later expiry decides it —
-    /// exactly once — and no departure is lost.
+    /// A promotion must not decide a departure whose drop is still held on this
+    /// relay: a held drop is decided only by an honored manual request. The record
+    /// is left undecided (not cached), so a later honored request can still decide
+    /// it — exactly once — and no departure is lost.
     #[test]
-    fn a_promotion_skips_a_grace_pending_departure_and_the_grace_still_decides_it() {
+    fn a_promotion_skips_a_held_departure_and_a_request_still_decides_it() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
 
-        // Promote while slot 1's drop grace is pending: the promotion decides nothing.
-        let grace_pending = HashSet::from([SlotId(1)]);
-        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &grace_pending);
+        // Promote while slot 1's drop is still held: the promotion decides nothing.
+        let held_slots = HashSet::from([SlotId(1)]);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &held_slots);
         assert!(
             leaves.is_empty() && fresh.is_empty(),
-            "a grace-pending departure is not decided by the promotion",
+            "a held departure is not decided by the promotion",
         );
         assert!(
             maker.has_departure(SlotId(1)),
-            "the departure record is kept for the grace to decide from",
+            "the departure record is kept for a manual request to decide from",
         );
 
-        // The grace's later expiry (the hold's own decision) still decides it — the
-        // record was never marked decided, so it is not lost — and only once.
+        // An honored manual request (which calls `decide_leave`) still decides it —
+        // the record was never marked decided, so it is not lost — and only once.
         let decided = maker
             .decide_leave(SlotId(1), DROPPED)
-            .expect("the grace expiry decides the held leave");
+            .expect("an honored request decides the held leave");
         assert_eq!(decided.slot, 1);
         assert_eq!(decided.apply_at_frame, 51, "one past the stored last frame");
         assert_eq!(
@@ -5961,40 +6065,37 @@ mod tests {
         );
     }
 
-    /// With two undecided departures on a promoting relay, only the one whose grace
-    /// is *not* pending is decided; the graced one is left to its hold. This is the
-    /// crux that keeps a presence flap from collapsing a reconnecting slot's grace
+    /// With two undecided departures on a promoting relay, only the one whose drop
+    /// is *not* held is decided; the held one is left for a manual request. This is
+    /// the crux that keeps a presence flap from deciding a reconnecting slot's drop
     /// while a genuinely-gone slot is still cleaned up.
     #[test]
-    fn a_promotion_derives_only_the_ungraced_departure() {
+    fn a_promotion_derives_only_the_unheld_departure() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
         maker.record_departure(SlotId(2), Some(GameFrameCount(60)), None, None, DROPPED);
 
-        // Slot 1 is still within its grace; slot 2 is ungraced (its hold already
-        // expired-but-undecided, or it never had one) — only slot 2 is decided.
-        let grace_pending = HashSet::from([SlotId(1)]);
-        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &grace_pending);
-        assert_eq!(leaves.len(), 1, "only the ungraced departure is decided");
+        // Slot 1's drop is still held; slot 2 is not held (it left cleanly, or its
+        // hold was already released) — only slot 2 is decided.
+        let held_slots = HashSet::from([SlotId(1)]);
+        let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &held_slots);
+        assert_eq!(leaves.len(), 1, "only the unheld departure is decided");
         assert_eq!(leaves[0].slot, 2);
-        assert_eq!(
-            fresh, leaves,
-            "the ungraced re-derivation is a fresh insert"
-        );
+        assert_eq!(fresh, leaves, "the unheld re-derivation is a fresh insert");
         assert!(
             maker.has_departure(SlotId(1)),
-            "the graced slot stays undecided"
+            "the held slot stays undecided"
         );
         assert!(
             maker.decide_leave(SlotId(1), DROPPED).is_some(),
-            "its own hold can still decide it later",
+            "an honored request can still decide it later",
         );
     }
 
-    /// A slot that returned within its grace has its departure discarded, so even an
-    /// ungraced promotion (its grace already cancelled by the return) does not
+    /// A slot that returned while its drop was held has its departure discarded, so
+    /// even an unheld promotion (its hold already released by the return) does not
     /// re-derive a leave for it.
     #[test]
     fn reinstate_slot_clears_the_departure_so_a_promotion_does_not_re_derive_it() {
@@ -6013,7 +6114,7 @@ mod tests {
             "reinstating a slot with no departure is a no-op",
         );
 
-        // Promote with an empty grace set (the return already cancelled the grace):
+        // Promote with an empty held set (the return already released the hold):
         // there is no departure left to re-derive, so no leave is decided.
         let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &HashSet::new());
         assert!(

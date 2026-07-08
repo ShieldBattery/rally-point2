@@ -164,6 +164,32 @@ pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authorit
     Some(Authority::Peer)
 }
 
+/// Whether every relay serving `key` has explicitly reported zero live slots — the
+/// session is empty session-wide, nobody is connected anywhere. Read to decide
+/// whether to arm the abandoned-session timer.
+///
+/// Uses the same accumulated live-slot knowledge as [`verdict`]: this relay's own
+/// roster count ([`record_own`]) plus each peer's reported count ([`record_peer`]).
+/// Unlike `verdict`, a candidate that has **never** reported is treated as *not*
+/// empty — the module's "assumed live until it says otherwise" rule — so this is
+/// deliberately conservative: it returns `true` only when every relay in the order
+/// has an explicit zero on record, never on the strength of silence. A session with
+/// no presence entry (no descriptor set an order — a harness that injects its
+/// verdict by hand) is never abandoned.
+pub fn all_empty(registry: &PresenceRegistry, key: &SessionKey) -> bool {
+    let sessions = registry.lock();
+    let Some(entry) = sessions.get(key) else {
+        return false;
+    };
+    if entry.order.is_empty() {
+        return false;
+    }
+    entry.order.iter().all(|candidate| match candidate {
+        Candidate::SelfRelay => entry.own_report == Some(0),
+        Candidate::Peer(id) => entry.peer_reports.get(id) == Some(&0),
+    })
+}
+
 /// Re-derives `key`'s verdict and applies it to the session's decision-maker,
 /// returning the synced leaves a promotion must (re)broadcast (empty otherwise).
 /// The presence-change hooks call this so authority follows the reports; a
@@ -171,19 +197,20 @@ pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authorit
 /// yields no leaves. The caller pushes any returned leaves down local survivors
 /// and across the mesh (see [`crate::mesh::broadcast_leaves`]).
 ///
-/// `grace_pending` is the set of this relay's slots whose drop grace is still in
-/// flight (read from the grace registry by the caller, which holds it). A
-/// promotion skips those slots so a presence flap does not collapse a grace a
-/// reconnecting client is still inside of; see [`crate::consensus::set_authority`].
+/// `held_slots` is the set of this relay's slots whose drop is still held
+/// undecided (read from the drop-hold registry by the caller, which holds it). A
+/// promotion skips those slots so a presence flap does not decide a drop a
+/// reconnecting client could still return from — and a held drop is decided only
+/// by an honored manual request; see [`crate::consensus::set_authority`].
 #[must_use]
 pub fn recompute(
     registry: &PresenceRegistry,
     makers: &DecisionMakers,
     key: &SessionKey,
-    grace_pending: &std::collections::HashSet<rally_point_proto::ids::SlotId>,
+    held_slots: &std::collections::HashSet<rally_point_proto::ids::SlotId>,
 ) -> Vec<rally_point_proto::messages::LeaveDirective> {
     match verdict(registry, key) {
-        Some(authority) => crate::consensus::set_authority(makers, key, authority, grace_pending),
+        Some(authority) => crate::consensus::set_authority(makers, key, authority, held_slots),
         None => Vec::new(),
     }
 }
@@ -398,5 +425,39 @@ mod tests {
         forget(&registry, &key());
         assert_eq!(verdict(&registry, &key()), None);
         forget(&registry, &key()); // idempotent
+    }
+
+    #[test]
+    fn all_empty_is_true_only_when_every_relay_explicitly_reported_zero() {
+        let registry = new_presence_registry();
+        // No entry yet: not abandoned.
+        assert!(!all_empty(&registry, &key()));
+
+        set_order(&registry, &key(), order_self_then_peer(2));
+        // Nobody has reported: silence is assumed live, so not abandoned — a peer
+        // that never reported could still be serving players.
+        assert!(!all_empty(&registry, &key()));
+
+        // Only self reported zero; the peer is still silent (assumed live).
+        record_own(&registry, &key(), 0);
+        assert!(!all_empty(&registry, &key()));
+
+        // The peer reports zero too: now every relay is explicitly empty.
+        record_peer(&registry, &key(), RelayId(2), 0);
+        assert!(all_empty(&registry, &key()));
+
+        // The peer's players return: no longer abandoned.
+        record_peer(&registry, &key(), RelayId(2), 1);
+        assert!(!all_empty(&registry, &key()));
+    }
+
+    #[test]
+    fn all_empty_ignores_a_peer_not_in_the_current_order() {
+        let registry = new_presence_registry();
+        // A single-relay session: the order names only this relay.
+        set_order(&registry, &key(), vec![Candidate::SelfRelay]);
+        record_own(&registry, &key(), 0);
+        // Every relay in the order (just us) reported zero → abandoned.
+        assert!(all_empty(&registry, &key()));
     }
 }

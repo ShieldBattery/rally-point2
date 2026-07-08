@@ -634,8 +634,8 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     use rally_point_relay::routing::SessionKey;
 
     // The full reconnect path against a real relay: a client's link drops mid-game,
-    // its driver re-dials itself within the disconnect grace presenting resume
-    // cursors, the relay cancels the pending leave and replays the turns missed
+    // its driver re-dials itself while its drop is still held (undecided) presenting
+    // resume cursors, the relay releases the hold and replays the turns missed
     // during the outage, and the driver folds them into the ordered stream exactly
     // once — while signalling its own disconnect then reconnect on the connectivity
     // channel, the channels staying alive throughout.
@@ -666,8 +666,8 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     let id1 = identity_for(&tenant, session, SlotId(1));
 
     // Slot 0 runs with reconnection. Keep a handle to its connection so the test can
-    // sever it, simulating a network drop (not a clean leave), which arms the
-    // relay's grace and keeps the session alive.
+    // sever it, simulating a network drop (not a clean leave), which marks the
+    // relay's drop hold and keeps the session alive.
     let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
     let conn0 = link0.connection().clone();
     let (driver0, mut chan0) = LinkDriver::new(link0);
@@ -714,7 +714,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     chan1.outbound.send(turn()).await.unwrap();
     chan1.outbound.send(turn()).await.unwrap();
 
-    // Slot 0 re-establishes its link within the grace.
+    // Slot 0 re-establishes its link while its drop is still held.
     wait_connectivity(&mut chan0.connectivity, (SlotId(0), true)).await;
 
     // The relay replays the two missed turns (seq 2, 3); the driver folds them back
@@ -736,6 +736,129 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
 
     drop(chan0.outbound);
     drop(chan0.inbound);
+    drop(chan1.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+}
+
+#[tokio::test]
+async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
+    use std::collections::HashSet;
+
+    use rally_point_client::LinkDriver;
+    use rally_point_proto::control::BufferBounds;
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    // The full manual-drop path against a real relay: one client's link dies, and
+    // the surviving client asks the relay to drop it. Before the unlock floor the
+    // request is refused (the drop may still be a blip); past it, the relay honors
+    // the request and pushes the synced leave down the survivor's stream — the
+    // dropped slot is never removed on its own, only on this human decision. The
+    // dropped client's later re-dial is then refused terminally.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(71);
+
+    // A tiny drop-unlock floor so the test can cross it quickly. Seed this relay as
+    // the authority over an expected {0, 1} set so the session starts and a decided
+    // leave is real.
+    let unlock = Duration::from_millis(300);
+    let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+
+    // Slot 0 is the client that will disconnect; keep its connection handle so the
+    // test can sever it. It runs plainly (no reconnection) — its link death is the
+    // disconnect the survivor then resolves manually.
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let conn0 = link0.connection().clone();
+    let (driver0, chan0) = LinkDriver::new(link0);
+    let task0 = tokio::spawn(driver0.run());
+
+    // Slot 1 is the survivor who requests the drop.
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let (driver1, mut chan1) = LinkDriver::new(link1);
+    let task1 = tokio::spawn(driver1.run());
+
+    // Both connected: the session started.
+    tokio::time::timeout(Duration::from_secs(5), chan1.session_start.recv())
+        .await
+        .expect("session start never fired")
+        .expect("slot 1's session-start channel closed");
+
+    // A framed turn from slot 0 gives its leave an apply-frame basis; slot 1
+    // receives it, so the relay has observed slot 0's frame before it disconnects.
+    chan0
+        .outbound
+        .send(Payload {
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            game_frame_count: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(recv_turn(&mut chan1.inbound).await.seq, 0);
+
+    // Sever slot 0's link — a network drop, not a clean leave. Slot 1 hears the
+    // disconnect; the relay records the departure and marks the drop hold.
+    conn0.close(quinn::VarInt::from_u32(0), b"simulated network drop");
+    wait_connectivity(&mut chan1.connectivity, (SlotId(0), false)).await;
+
+    // Pre-unlock: the survivor requests the drop, but the hold has not stood past
+    // the floor, so no leave is decided — the slot could still be a blip.
+    chan1.request_drop.send(SlotId(0)).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), chan1.leaves.recv())
+            .await
+            .is_err(),
+        "a pre-unlock request must not remove the disconnected slot",
+    );
+
+    // Past the unlock floor, the survivor requests again — now the authority honors
+    // it and pushes the synced leave for slot 0 down the survivor's stream.
+    tokio::time::sleep(unlock).await;
+    chan1.request_drop.send(SlotId(0)).await.unwrap();
+    let leave = tokio::time::timeout(Duration::from_secs(5), chan1.leaves.recv())
+        .await
+        .expect("the leave arrives once the request is honored past the unlock")
+        .expect("slot 1's leaves channel stays open");
+    assert_eq!(leave.slot, 0);
+    assert_eq!(
+        leave.reason, 0x4000_0006,
+        "a manual drop uses the native dropped reason",
+    );
+
+    // Slot 0's later re-dial is refused terminally with the slot-departed close: its
+    // leave was decided, so the game has moved on without it. This is the same
+    // re-dial path the driver's own reconnection uses, which classifies that close
+    // code as terminal rather than a retryable transport error.
+    match endpoint
+        .reconnect_with_timeout(addr, "localhost", &id0, &[], Duration::from_secs(5))
+        .await
+    {
+        Err(DialError::SlotDeparted) => {}
+        Err(other) => panic!("expected a slot-departed refusal, got {other:?}"),
+        Ok(_) => panic!("the re-dial was accepted even though the slot had departed"),
+    }
+
+    drop(chan0);
     drop(chan1.outbound);
     let _ = task0.await;
     let _ = task1.await;

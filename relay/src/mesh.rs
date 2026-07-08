@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
-    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload,
+    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, RequestDrop,
     SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use tokio::sync::mpsc;
@@ -285,17 +285,19 @@ pub struct MeshState {
     /// but the same per-session lifecycle and task-threading as `lobby`. See
     /// [`crate::chat`].
     pub chat: crate::chat::ChatRegistry,
-    /// Per-relay holds on dropped slots' synced-leave decisions. A slot that
-    /// dropped (its link died) has its departure recorded and announced
-    /// immediately, but the authority's decision to remove it from lockstep is
-    /// held here for the grace window before firing; a clean leave bypasses it.
+    /// Per-relay holds on dropped slots' synced-leave decisions, plus the
+    /// per-requester rate cap on the manual drop requests that resolve them. A slot
+    /// that dropped (its link died) has its departure recorded and announced
+    /// immediately, but the decision to remove it from lockstep is held here
+    /// indefinitely — made only when a surviving member's `RequestDrop` is honored
+    /// past the unlock floor, never on a timer; a clean leave bypasses the hold.
     /// Local and ephemeral — not replicated — so it lives beside the other
     /// registries only because it shares their per-session task-threading, not
-    /// because it is a mesh concern. See [`crate::leave_grace`].
-    pub leave_grace: crate::leave_grace::LeaveGrace,
+    /// because it is a mesh concern. See [`crate::drop_hold`].
+    pub drop_holds: crate::drop_hold::DropHolds,
     /// Per-session bounded record of the turns this relay has forwarded, so a
-    /// client that dropped and re-dialed within its grace can be replayed the turns
-    /// it missed and catch its sim up. Local and ephemeral like `leave_grace`, and
+    /// client that dropped and re-dialed while its drop was undecided can be replayed
+    /// the turns it missed and catch its sim up. Local and ephemeral like `drop_holds`, and
     /// threaded through the same per-session tasks (the turn forward path records
     /// into it; a re-register reads from it). See [`crate::turn_ring`].
     pub turn_ring: crate::turn_ring::TurnRing,
@@ -304,14 +306,28 @@ pub struct MeshState {
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
 /// links, no sessions, and no local clients yet.
 pub fn new_mesh_state() -> MeshState {
-    new_mesh_state_with_grace(crate::leave_grace::DISCONNECT_GRACE)
+    new_mesh_state_with_timings(
+        crate::drop_hold::DROP_UNLOCK,
+        crate::drop_hold::ABANDONED_SESSION_TIMEOUT,
+    )
 }
 
-/// [`new_mesh_state`] with an explicit drop-grace window, so a test can inject a
-/// short hold and observe the cancel-on-reconnect (and the leave-after-expiry)
-/// path without waiting out the production 10-second grace. Production builds it
-/// through [`new_mesh_state`] with [`crate::leave_grace::DISCONNECT_GRACE`].
-pub fn new_mesh_state_with_grace(grace: std::time::Duration) -> MeshState {
+/// [`new_mesh_state`] with an explicit drop-unlock floor, so a test can inject a
+/// tiny floor and drive the honor-a-drop-request path without waiting out the
+/// production 40-second window. The abandoned-session window keeps its production
+/// value.
+pub fn new_mesh_state_with_drop_unlock(unlock: std::time::Duration) -> MeshState {
+    new_mesh_state_with_timings(unlock, crate::drop_hold::ABANDONED_SESSION_TIMEOUT)
+}
+
+/// [`new_mesh_state`] with both drop-decision windows injected — the manual-drop
+/// unlock floor and the fully-abandoned-session timeout — so a test can drive
+/// either auto-decision path on a tiny window rather than the production waits.
+/// Production builds it through [`new_mesh_state`] with the real constants.
+pub fn new_mesh_state_with_timings(
+    unlock: std::time::Duration,
+    abandon_timeout: std::time::Duration,
+) -> MeshState {
     MeshState {
         links: new_mesh_links(),
         seen: new_seen_registries(),
@@ -320,7 +336,7 @@ pub fn new_mesh_state_with_grace(grace: std::time::Duration) -> MeshState {
         presence: Arc::new(crate::presence::new_presence_registry()),
         lobby: crate::lobby::new_lobby_registry(),
         chat: crate::chat::new_chat_registry(),
-        leave_grace: crate::leave_grace::LeaveGrace::new(grace),
+        drop_holds: crate::drop_hold::DropHolds::new(unlock, abandon_timeout),
         turn_ring: crate::turn_ring::TurnRing::new(),
     }
 }
@@ -620,6 +636,38 @@ pub(crate) fn fan_out_slot_connectivity(
     );
 }
 
+/// Broadcasts a manual drop request to every peer relay serving `key`, so the
+/// session's authority relay — which may be a peer, not this one — can honor it.
+/// `requester` is the authenticated slot that authored the request, stamped here
+/// for logging and abuse attribution; `target` is the disconnected slot it wants
+/// dropped. A relay that receives this honors it only if it is the authority and
+/// the target's drop is past the unlock floor, and does not re-broadcast it — the
+/// origin already sent a copy to every peer, so re-flooding would only echo.
+pub(crate) fn fan_out_request_drop(
+    links: &MeshLinks,
+    key: &SessionKey,
+    target: SlotId,
+    requester: SlotId,
+) {
+    fan_out_control(
+        links,
+        key,
+        request_drop_frame(key.session, target, requester),
+    );
+}
+
+/// Builds a `RequestDrop` mesh control frame for `session`, carrying the target
+/// slot and the relay-stamped requester.
+fn request_drop_frame(session: SessionId, target: SlotId, requester: SlotId) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::RequestDrop(RequestDrop {
+            slot: u32::from(target.0),
+            requester: u32::from(requester.0),
+        })),
+    }
+}
+
 /// Builds a `SlotPresent` mesh control frame for `session`.
 fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
     MeshControlFrame {
@@ -837,7 +885,7 @@ fn deliver_turn_to_locals(
     // never reach the survivors it must unstall. See `routing`'s leave trigger.
     routing::fan_out(sessions, key, slot, payload.clone());
     // Record the fanned turn into the session's replay ring so a client that drops
-    // and re-dials within its grace can be replayed what it missed. This is the one
+    // and re-dials while its drop is undecided can be replayed what it missed. This is the one
     // choke point every turn-delivery path funnels through, placed right after the
     // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
     // even when the mesh delivers it by more than one path. Buffered only once the
@@ -958,7 +1006,7 @@ pub async fn run_mesh_link(
         conditions,
         decision_makers,
         presence,
-        leave_grace,
+        drop_holds,
         ..
     } = mesh;
     let crate::presence::PresenceIo {
@@ -1307,15 +1355,16 @@ pub async fn run_mesh_link(
                             // this relay is next in the order) yields any synced
                             // leave the departed authority never delivered; push
                             // each to local survivors and across the mesh.
-                            // Skip slots still inside their drop grace on this
-                            // relay: a promotion here must not decide a departure a
-                            // reconnecting client could still return from.
-                            let grace_pending = leave_grace.pending_slots(&state.key);
+                            // Skip slots whose drop is still held on this relay: a
+                            // promotion here must not decide a departure a
+                            // reconnecting client could still return from, and a held
+                            // drop is only ever decided by a manual request.
+                            let held = drop_holds.pending_slots(&state.key);
                             let leaves = crate::presence::recompute(
                                 &presence,
                                 &decision_makers,
                                 &state.key,
-                                &grace_pending,
+                                &held,
                             );
                             broadcast_leaves(&sessions, &mesh_links, &state.key, leaves);
                             // A promotion here may also make this relay the one to
@@ -1326,6 +1375,18 @@ pub async fn run_mesh_link(
                                 &sessions,
                                 &decision_makers,
                                 &mesh_links,
+                                &state.key,
+                            );
+                            // The peer's report may have emptied the session
+                            // session-wide (the last live relay reporting zero),
+                            // arming the abandoned-session timer — or refilled it,
+                            // cancelling it.
+                            routing::reconcile_abandon(
+                                &drop_holds,
+                                &decision_makers,
+                                &sessions,
+                                &mesh_links,
+                                &presence,
                                 &state.key,
                             );
                         }
@@ -1473,6 +1534,11 @@ pub async fn run_mesh_link(
 ///   slot-stamped by the origin. Delivered to this relay's local members — no
 ///   log to append to, chat is ephemeral — and, like the lobby command, not
 ///   re-broadcast across the mesh.
+/// - **`RequestDrop`**: a manual drop request a peer relay's member authored,
+///   already `requester`-stamped by the origin. Honored only if this relay is the
+///   session authority and the target slot's drop has stood past the unlock floor;
+///   a non-authority ignores it (the authority is among the broadcast's
+///   receivers). Not re-broadcast across the mesh — no echo, like the arms above.
 ///
 /// Kept defensive like the datagram path: a zero session id is malformed and a
 /// session this link has not joined has no key to act under; both are logged at
@@ -1540,15 +1606,16 @@ fn dispatch_mesh_control(
                 result,
                 departed.reason,
             );
-            // Turn the departure into the one synced leave — holding a *drop* for
-            // the grace window before deciding, and deciding a *clean* leave at
-            // once (which also cancels any hold this slot's earlier drop armed, the
-            // clean-intent-during-grace ordering). A no-op on a non-authority
-            // (`decide_leave` returns `None` there) and for an already-decided
-            // slot; the departure is recorded above regardless, so a promotion can
-            // still re-derive it.
-            routing::decide_leave_maybe_graced(
-                &mesh.leave_grace,
+            // Turn the departure into the one synced leave — marking a *drop* as an
+            // undecided hold (decided later only by an honored `RequestDrop`, or
+            // never) and deciding a *clean* leave at once (which also releases any
+            // hold this slot's earlier drop marked, the clean-intent-during-hold
+            // ordering). A drop decides nothing here; a clean leave is a no-op on a
+            // non-authority (`decide_leave` returns `None` there) and for an
+            // already-decided slot. The departure is recorded above regardless, so a
+            // promotion can still re-derive it.
+            routing::hold_or_decide_leave(
+                &mesh.drop_holds,
                 &mesh.decision_makers,
                 sessions,
                 &mesh.links,
@@ -1670,20 +1737,46 @@ fn dispatch_mesh_control(
             // every peer, so re-flooding would only echo (mirroring chat above).
             routing::fan_out_connectivity(sessions, &key, slot, change.connected);
             // A `connected` of true is a slot coming *back* — a client that
-            // re-registered on the origin relay within its drop grace. This relay
-            // armed its own hold on the slot's earlier `SlotDeparted`, so cancel it:
-            // the symmetric "it's back" signal that reaches a peer-homed authority
-            // (or any peer holding a grace) so the held leave never fires. A
-            // no-op when no hold is pending — a fresh connect, or a slot this relay
-            // never graced.
+            // re-registered on the origin relay while its drop was still undecided.
+            // This relay marked its own hold on the slot's earlier `SlotDeparted`, so
+            // release it: the symmetric "it's back" signal that reaches a peer-homed
+            // authority (or any peer holding a marker) so the drop can never later be
+            // honored. A no-op when no hold is pending — a fresh connect, or a slot
+            // this relay never held.
             if change.connected {
-                mesh.leave_grace.cancel(&key, slot);
+                mesh.drop_holds.release(&key, slot);
                 // The slot is back, so discard the departure this relay recorded
                 // from its earlier `SlotDeparted` — otherwise a later promotion
                 // here would re-derive a leave for a slot that has returned. The
                 // symmetric local step runs at the home relay's own re-register.
                 crate::consensus::reinstate_slot(&mesh.decision_makers, &key, slot);
             }
+        }
+        Some(mesh_control_frame::Kind::RequestDrop(request)) => {
+            let Ok(target) = u8::try_from(request.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = request.slot,
+                    "mesh RequestDrop names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // A manual drop request one peer relay's surviving member authored,
+            // already `requester`-stamped by the origin. Honor it only if this relay
+            // is the session authority and the target's drop has stood past the
+            // unlock floor; otherwise ignore it. Deliberately NOT re-broadcast across
+            // the mesh — the origin already sent a copy to every peer, so the
+            // authority is among the receivers and re-flooding would only echo (the
+            // same no-echo rule the chat and leave arms follow).
+            routing::honor_drop_request(
+                &mesh.drop_holds,
+                &mesh.decision_makers,
+                sessions,
+                &mesh.links,
+                &key,
+                target,
+                request.requester,
+            );
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -2040,7 +2133,15 @@ mod tests {
             presence: Arc::new(crate::presence::new_presence_registry()),
             lobby: lobby.clone(),
             chat: chat.clone(),
-            leave_grace: crate::leave_grace::LeaveGrace::new(crate::leave_grace::DISCONNECT_GRACE),
+            // A zero unlock floor so a held drop is "past the floor" from the first
+            // instant, letting a `RequestDrop` dispatch test drive the honor path
+            // without a real wait. Tests that only hold and release a drop are
+            // unaffected by the floor. The abandoned-session window keeps its
+            // production value — no dispatch test drives that path.
+            drop_holds: crate::drop_hold::DropHolds::new(
+                std::time::Duration::ZERO,
+                crate::drop_hold::ABANDONED_SESSION_TIMEOUT,
+            ),
             turn_ring: crate::turn_ring::TurnRing::new(),
         }
     }
@@ -2456,13 +2557,13 @@ mod tests {
     }
 
     /// A `SlotConnectivity{connected: true}` arriving over the mesh is a slot coming
-    /// back: a client that re-registered on a peer relay within its drop grace. This
-    /// relay armed its own hold on the earlier `SlotDeparted`, so the "it's back"
-    /// signal must cancel that hold — the symmetric mesh half of the reconnect
-    /// grace-cancel, which is what stops a peer-homed authority from firing the
-    /// held leave for a slot that has already resumed elsewhere.
+    /// back: a client that re-registered on a peer relay while its drop was still
+    /// undecided. This relay marked its own hold on the earlier `SlotDeparted`, so
+    /// the "it's back" signal must release that hold — the symmetric mesh half of
+    /// the reconnect release, which is what stops a peer-homed authority from ever
+    /// honoring a drop for a slot that has already resumed elsewhere.
     #[tokio::test]
-    async fn a_mesh_slot_connectivity_true_cancels_a_local_drop_grace() {
+    async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
         let sessions: routing::Sessions = Arc::default();
         let mesh_links = new_mesh_links();
         let seen = new_seen_registries();
@@ -2473,12 +2574,12 @@ mod tests {
 
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
 
-        // This relay observed slot 0 drop and armed a hold on its leave (a long grace
-        // so the timer never fires during the test — the cancel is what clears it).
-        mesh_state.leave_grace.arm(key.clone(), SlotId(0), || {});
+        // This relay observed slot 0 drop and marked a hold on its leave. A hold
+        // never fires on its own — the release is what clears it.
+        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
         assert!(
-            mesh_state.leave_grace.is_pending(&key, SlotId(0)),
-            "the drop armed a hold",
+            mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            "the drop marked a hold",
         );
 
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
@@ -2495,7 +2596,8 @@ mod tests {
             },
         );
 
-        // The peer relay reports slot 0 back — it re-registered there within grace.
+        // The peer relay reports slot 0 back — it re-registered there while its drop
+        // was still undecided.
         let frame = MeshControlFrame {
             session: key.session.0,
             kind: Some(mesh_control_frame::Kind::SlotConnectivity(
@@ -2508,8 +2610,165 @@ mod tests {
         dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
 
         assert!(
-            !mesh_state.leave_grace.is_pending(&key, SlotId(0)),
-            "the it's-back signal cancelled the held leave",
+            !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            "the it's-back signal released the held drop",
+        );
+    }
+
+    /// Registers a single joined-session state for a mesh dispatch test, resolving
+    /// the frame's bare session id to `key` exactly as a post-`Join` driver would.
+    fn joined_state(mesh_links: &MeshLinks, key: &SessionKey) -> HashMap<SessionId, SessionState> {
+        let mut joined = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        joined
+    }
+
+    /// A `RequestDrop` arriving over the mesh at the session authority, for a slot
+    /// whose drop is past the unlock floor, decides the leave: the hold is released
+    /// and a `LeaveDirective` for the target is broadcast to the peer links — and
+    /// the request itself is NOT re-broadcast (no echo).
+    #[tokio::test]
+    async fn a_mesh_request_drop_at_the_authority_decides_the_leave_and_never_echoes() {
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        // The target slot dropped: a frame basis for its leave, a recorded departure,
+        // and a hold this relay marked. `test_mesh_state` uses a zero unlock floor,
+        // so the hold is "past the floor" from the first instant.
+        crate::consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(50));
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(0),
+            Some(GameFrameCount(50)),
+            None,
+            None,
+            0x4000_0006,
+        );
+
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+
+        // A peer mesh link, to observe the decided leave broadcast and prove the
+        // request was not re-broadcast.
+        let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+        let joined = joined_state(&mesh_links, &key);
+
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::RequestDrop(RequestDrop {
+                slot: 0,
+                requester: 3,
+            })),
+        };
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        assert!(
+            !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            "the honored request released the hold",
+        );
+        let mut saw_leave = false;
+        while let Ok(frame) = echo_ctl_rx.try_recv() {
+            match frame.kind {
+                Some(mesh_control_frame::Kind::LeaveDirective(directive)) => {
+                    assert_eq!(directive.slot, 0);
+                    assert_eq!(
+                        directive.reason, 0x4000_0006,
+                        "a manual drop uses the dropped reason"
+                    );
+                    saw_leave = true;
+                }
+                Some(mesh_control_frame::Kind::RequestDrop(_)) => {
+                    panic!("the request must not be re-broadcast across the mesh")
+                }
+                other => panic!("unexpected mesh frame {other:?}"),
+            }
+        }
+        assert!(saw_leave, "the authority decided and broadcast the leave");
+    }
+
+    /// A `RequestDrop` arriving over the mesh at a non-authority relay does nothing:
+    /// the hold stays, no leave is decided, and nothing is echoed back out — the
+    /// authority is a different relay among the broadcast's receivers.
+    #[tokio::test]
+    async fn a_mesh_request_drop_at_a_non_authority_does_nothing() {
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        crate::consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(50));
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(0),
+            Some(GameFrameCount(50)),
+            None,
+            None,
+            0x4000_0006,
+        );
+
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+
+        let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+        let joined = joined_state(&mesh_links, &key);
+
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::RequestDrop(RequestDrop {
+                slot: 0,
+                requester: 3,
+            })),
+        };
+        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+
+        assert!(
+            mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            "a non-authority leaves the hold standing",
+        );
+        assert!(
+            echo_ctl_rx.try_recv().is_err(),
+            "a non-authority decides nothing and echoes nothing",
         );
     }
 

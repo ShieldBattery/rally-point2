@@ -25,7 +25,7 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    SessionStart, SlotConnectivity, control_frame,
+    RequestDrop, SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -85,6 +85,14 @@ pub enum ControlInbound {
     /// just as it does a `Leave`. The whole message is surfaced so the consumer
     /// reads both `slot` and `connected`.
     Connectivity(SlotConnectivity),
+    /// A survivor's manual request to drop a disconnected slot (client → relay
+    /// only). Carries only the target slot the requester wants dropped — the
+    /// requester itself is bound by the relay to the authenticated connection the
+    /// frame arrived on, never read from the wire, so the frame's `requester`
+    /// field is deliberately not surfaced here. A client never receives one back
+    /// (the relay is the only recipient), so the client edge ignores a stray one
+    /// just as it does a `LeaveIntent`.
+    RequestDrop(u32),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -194,6 +202,11 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::SlotConnectivity(connectivity)),
                 } => ControlInbound::Connectivity(connectivity),
+                ControlFrame {
+                    // Only the target `slot` is surfaced; the wire `requester` is
+                    // never trusted (the relay stamps the authenticated slot).
+                    kind: Some(control_frame::Kind::RequestDrop(RequestDrop { slot, .. })),
+                } => ControlInbound::RequestDrop(slot),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -351,6 +364,30 @@ pub async fn send_control_connectivity(
         kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
             slot: u32::from(slot),
             connected,
+        })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a manual drop request up the control stream (client → relay). `slot` is
+/// the disconnected slot the requester wants dropped; the requester is left for
+/// the relay to bind to the authenticated connection, so the frame's `requester`
+/// field is unset here. Best-effort and un-acked: an error means the stream (and
+/// almost certainly the connection) is gone, but a drop request is not
+/// correctness-critical the way a turn or lobby command is — a survivor whose
+/// request never lands can simply send another once its link is back — so the
+/// caller logs and continues rather than treating an error as a link failure,
+/// the same treatment a `GameChat` send gets.
+pub async fn send_control_request_drop(
+    control_send: &mut quinn::SendStream,
+    slot: u32,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::RequestDrop(RequestDrop {
+            slot,
+            requester: 0,
         })),
     };
     let encoded = encode_frame(&frame)?;

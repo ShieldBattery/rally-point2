@@ -276,11 +276,27 @@ message ControlFrame {
     // it to every local slot the moment it learns of the change, so a surviving
     // client can show a "player X disconnected" overlay ~instantly, while the
     // synced player-leave that actually removes the slot from lockstep is decided
-    // separately (and, for a disconnect, only after a grace window). Carries no
-    // delivery guarantee beyond the reliable stream's own, no ordering against
-    // the leave path, and no replay: a receiver treats an unknown slot as a no-op
-    // and may ignore a pre-start frame entirely. See `SlotConnectivity`.
+    // separately (and, for a disconnect, only when a surviving member requests the
+    // drop, never automatically). Carries no delivery guarantee beyond the reliable
+    // stream's own, no ordering against the leave path, and no replay: a receiver
+    // treats an unknown slot as a no-op and may ignore a pre-start frame entirely.
+    // See `SlotConnectivity`.
     SlotConnectivity slot_connectivity = 8;
+
+    // A surviving member's manual request that a disconnected slot be dropped
+    // (client → relay only). A disconnection never removes a player on its own —
+    // a dropped slot stalls the game in lockstep until a human decides to remove
+    // it — so once a slot has been gone long enough, any single surviving member
+    // may ask for it to be dropped, and the session's authority relay honors the
+    // request only past an unlock floor. `slot` names the disconnected slot the
+    // requester wants dropped. The requester itself is never carried up from the
+    // client — the relay binds it to the authenticated connection the frame
+    // arrived on, exactly as it stamps a `LobbyCommand` or `GameChat` author, so
+    // a client cannot attribute a request to another member. Fire-and-forget:
+    // there is no ack, the `LeaveDirective` that arrives when the drop is honored
+    // is the only confirmation, and a refused request can simply be sent again.
+    // See `RequestDrop`.
+    RequestDrop request_drop = 9;
   }
 }
 
@@ -380,6 +396,44 @@ message LeaveDirective {
 // the client's confirmation that the relay processed this is the relay closing
 // the link, not a reply frame.
 message LeaveIntent {}
+
+// A surviving member's manual request that the session drop a disconnected slot,
+// carried client -> relay and then relay -> relay across the mesh. A
+// disconnection is never resolved into a player removal on its own: a dropped
+// slot stalls the game in lockstep until a human decides to remove it. Any
+// single surviving member may make that decision by sending this -- naming the
+// disconnected `slot` it wants dropped -- and the session's authority relay
+// honors it only once that slot has been held undecided past an unlock floor, so
+// a momentary blip cannot be turned into a permanent drop while a genuinely
+// sustained disconnection can always be escaped.
+//
+// `requester` is relay-stamped, never client-asserted. On the client -> relay
+// frame it is left unset: the relay binds the request to the authenticated
+// connection's slot the frame arrived on, exactly as it stamps a `LobbyCommand`
+// or `GameChat` author, so a client cannot attribute a request to another
+// member. The origin relay stamps `requester` before it broadcasts the request
+// across the mesh, where the field rides purely for logging and abuse
+// attribution -- the honor decision keys only on `slot` and the authority
+// relay's own hold state, never on who asked.
+//
+// Fire-and-forget: there is no ack frame. The `LeaveDirective` the authority
+// broadcasts when it honors the request is the only confirmation, and a request
+// that is refused -- sent before the unlock floor, or received by a relay that
+// is not the session authority -- is simply dropped; the requester can send
+// another.
+message RequestDrop {
+  // The disconnected slot the requester wants removed from the game. The relay
+  // validates it against the slot's departure/hold state; a request naming a
+  // slot that is not disconnected is ignored.
+  uint32 slot = 1;
+
+  // The slot that authored the request, relay-stamped at the origin's client
+  // edge. Unset (0) on the client -> relay frame -- the relay never trusts a
+  // client-asserted requester -- and meaningful only on the mesh-carried copy,
+  // where it rides for logging and abuse attribution. The honor decision never
+  // reads it.
+  uint32 requester = 2;
+}
 
 // A client's end-of-game result report (client → relay only), sent on the
 // reliable control stream. The relay never parses `payload`: it is the tenant's
@@ -626,6 +680,17 @@ message MeshControlFrame {
     // log, no delivery guarantee beyond the reliable stream, unknown slots are
     // no-ops. See `SlotConnectivity`.
     SlotConnectivity slot_connectivity = 9;
+
+    // A manual drop request one relay's surviving member authored, propagated so
+    // the session's authority relay -- which may be a peer, not the origin -- can
+    // honor it. The origin relay stamps the authoring `requester` slot onto the
+    // `RequestDrop` before it leaves that relay's client edge (for logging and
+    // abuse attribution), then broadcasts it to every peer. A relay that receives
+    // this acts on it only if it is the session authority and the target slot's
+    // drop is past the unlock floor; it does NOT re-broadcast it -- the origin
+    // already sent a copy to every peer, so re-flooding would only echo, the same
+    // no-echo rule `SlotDeparted` and `GameChat` follow. See `RequestDrop`.
+    RequestDrop request_drop = 10;
   }
 }
 
@@ -734,7 +799,8 @@ message SlotPresent {
 // every relay can inform its own local slots). Purely informational: it lets a
 // surviving client show WHO disconnected the instant the link dies — well before
 // the synced player-leave that actually removes the slot from lockstep, which is
-// decided separately and, for a disconnect, only after a grace window.
+// decided separately and, for a disconnect, only when a surviving member requests
+// the drop, never automatically.
 //
 // Best-effort by design. There is no replay log and no delivery guarantee beyond
 // the reliable stream it rides: a client whose stream comes up after a change

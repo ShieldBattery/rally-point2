@@ -1,6 +1,6 @@
 //! A bounded per-session record of the turns the relay has forwarded, kept so a
-//! client that dropped and re-dialed within its disconnect grace can be replayed
-//! the turns it missed and catch its lockstep sim back up.
+//! client that dropped and re-dialed while its drop was still undecided can be
+//! replayed the turns it missed and catch its lockstep sim back up.
 //!
 //! Every turn the relay fans out to a session's slots is also recorded here, once
 //! per distinct `(slot, seq)` (the recording sits at the same single fan-out choke
@@ -12,17 +12,19 @@
 //!
 //! The ring is bounded two ways — a turn *count* and a total *byte* budget,
 //! whichever binds first — and drops oldest-first on overflow. The count bound is
-//! derived from the grace window: a client can be gone at most one full grace, and
-//! over that window a session of the most slots SC:R allows produces at most
-//! `grace_secs × turns/s × slots` turns, so a ring sized to that (with headroom)
-//! always covers a within-grace reconnect. The byte bound is the backstop against
-//! a spray of maximum-size oversize turns, which the count bound alone would let
-//! occupy far more memory than an ordinary game's tiny turns.
+//! sized to a nominal outage window (see [`RING_WINDOW_SECS`]): over that window a
+//! session of the most slots SC:R allows produces at most `window_secs × turns/s ×
+//! slots` turns, so a ring sized to that (with headroom) covers the reconnect. An
+//! outage can outlast that window — a disconnect is no longer bounded by any timer
+//! — but during it the survivors stall in lockstep waiting on the disconnected
+//! slot, so few new turns are produced regardless of how long it runs; the ring's
+//! growth is bounded by lockstep, not by the outage length. The byte bound is the
+//! backstop against a spray of maximum-size oversize turns, which the count bound
+//! alone would let occupy far more memory than an ordinary game's tiny turns.
 //!
-//! The record is **local and ephemeral**, like the disconnect grace it serves: it
-//! is not replicated, and it is dropped when the relay's last local slot for the
-//! session leaves. A client gone longer than the ring holds simply cannot be
-//! caught up from it — but the ring is sized so that never happens within a grace.
+//! The record is **local and ephemeral**, like the drop holds it serves: it is not
+//! replicated, and it is dropped when the relay's last local slot for the session
+//! leaves.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -40,19 +42,28 @@ const NOMINAL_TURNS_PER_SEC_PER_SLOT: usize = 24;
 /// The most slots a single SC:R game can hold (8 players + up to 4 observers).
 const MAX_GAME_SLOTS: usize = 12;
 
-/// The grace window, in whole seconds, over which a dropped client can return —
-/// the longest a reconnecting client can have been absent, and so the span of
-/// turns the ring must be able to replay. Read from the one grace constant so the
-/// ring can never be sized smaller than the window it exists to cover.
-const GRACE_SECS: usize = crate::leave_grace::DISCONNECT_GRACE.as_secs() as usize;
+/// The nominal outage window, in whole seconds, the replay ring is sized to
+/// cover — keyed to the drop-unlock floor, since a survivor cannot request a
+/// disconnected slot's removal until its hold has stood that long, so an outage
+/// shorter than this always ends in a reconnect the ring must be able to replay.
+///
+/// A disconnect is no longer bounded by any timer — a held slot can, in
+/// principle, be absent far longer than this before a human either drops it or it
+/// reconnects. That does not force the ring larger, because a slot's absence
+/// stalls the whole game in lockstep: the survivors block waiting for the
+/// disconnected slot's turns, so almost no new turns are produced no matter how
+/// long the outage runs. The ring's growth is bounded by lockstep itself, not by
+/// the outage length, so sizing it for this nominal window covers the reconnect
+/// case with ample headroom in practice.
+const RING_WINDOW_SECS: usize = crate::drop_hold::DROP_UNLOCK.as_secs() as usize;
 
-/// The turn-count ceiling: every slot's turns across a full grace window, times a
-/// ~1.5× headroom. A client that returns within the grace missed at most the
-/// turns produced over that window (`GRACE_SECS × turns/s × slots`), so a ring
-/// this deep always holds them; the headroom absorbs a faster-than-nominal turn
-/// rate. Drop-oldest past it.
+/// The turn-count ceiling: every slot's turns across a full nominal window, times
+/// a ~1.5× headroom. A client that returns after such an outage missed at most the
+/// turns produced over that window (`RING_WINDOW_SECS × turns/s × slots`), so a
+/// ring this deep always holds them; the headroom absorbs a faster-than-nominal
+/// turn rate. Drop-oldest past it.
 const TURN_RING_MAX_TURNS: usize =
-    GRACE_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS * 3 / 2;
+    RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS * 3 / 2;
 
 /// The byte ceiling on one session's recorded turns, counting each turn's command
 /// bytes (the variable, dominant cost; the fixed envelope fields are negligible).
@@ -196,16 +207,17 @@ mod tests {
     }
 
     #[test]
-    fn the_count_bound_is_at_least_the_full_grace_window() {
-        // The whole point of deriving the bound from the grace is that the ring can
-        // always hold a full grace's worth of turns for every slot. Both sides are
-        // compile-time constants, so this is checked in a `const` block (a plain
-        // runtime `assert!` on two constants is itself a clippy lint) — it still
-        // catches a future edit to the derivation that breaks the invariant, just
-        // at compile time instead of test time.
+    fn the_count_bound_is_at_least_the_full_nominal_window() {
+        // The whole point of deriving the bound from the nominal window is that the
+        // ring can always hold that window's worth of turns for every slot. Both
+        // sides are compile-time constants, so this is checked in a `const` block (a
+        // plain runtime `assert!` on two constants is itself a clippy lint) — it
+        // still catches a future edit to the derivation that breaks the invariant,
+        // just at compile time instead of test time.
         const {
             assert!(
-                TURN_RING_MAX_TURNS >= GRACE_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS
+                TURN_RING_MAX_TURNS
+                    >= RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS
             );
         }
     }

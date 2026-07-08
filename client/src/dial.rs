@@ -44,8 +44,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT_CLOSE: u32 = 0x01;
 
 /// QUIC application close code the relay uses to refuse a re-dial whose slot has
-/// already departed — its disconnect grace expired, or it left cleanly — so the
-/// game has moved on without it. Mirrors the relay's `SLOT_DEPARTED_CLOSE` (a wire
+/// already departed — a survivor's drop request was honored, or it left cleanly —
+/// so the game has moved on without it. Mirrors the relay's `SLOT_DEPARTED_CLOSE` (a wire
 /// contract); a client that sees it on a reconnect must stop retrying, since no
 /// later dial can bring the slot back. Distinct from the relay's slot-taken close
 /// (a still-live double-connect) and from any transport-level failure, both of
@@ -113,8 +113,8 @@ pub enum DialError {
     #[error("dial timed out after {timeout:?}")]
     TimedOut { timeout: Duration },
     /// The relay refused a re-dial because this slot's leave was already decided —
-    /// its disconnect grace expired or it left cleanly — so the game has moved on
-    /// without it (the relay's slot-departed close). Terminal for a reconnecting
+    /// a survivor's drop request was honored, or it left cleanly — so the game has
+    /// moved on without it (the relay's slot-departed close). Terminal for a reconnecting
     /// client: retrying cannot bring the slot back. Only ever produced by
     /// [`reconnect_with_timeout`](ClientEndpoint::reconnect_with_timeout); a fresh
     /// dial surfaces the same close as a plain [`Connection`](DialError::Connection)

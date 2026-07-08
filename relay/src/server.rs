@@ -27,8 +27,8 @@ use crate::routing::{self, SessionKey, Sessions};
 const SLOT_TAKEN_CLOSE: u32 = 0x02;
 
 /// QUIC application close code for a re-register the relay refuses because the
-/// slot's leave was already decided — its drop grace expired, or it left cleanly —
-/// so the game has moved on without it. Distinct from every transport-error close
+/// slot's leave was already decided — a survivor's drop request was honored, or it
+/// left cleanly — so the game has moved on without it. Distinct from every transport-error close
 /// so a reconnecting client can tell "you were dropped, the session is over for
 /// you" from a mere connection failure and stop retrying. Contrast
 /// [`SLOT_TAKEN_CLOSE`], which means the slot is *still connected* by a live
@@ -71,8 +71,8 @@ enum ConnError {
         session: SessionId,
         slot: SlotId,
     },
-    /// The authorized slot re-registered after its leave was already decided (the
-    /// drop grace expired, or it left cleanly) — too late to resume, so the
+    /// The authorized slot re-registered after its leave was already decided (a
+    /// drop request was honored, or it left cleanly) — too late to resume, so the
     /// re-register is refused terminally.
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} already departed the game")]
     SlotDeparted {
@@ -242,22 +242,22 @@ async fn serve_connection(
     };
 
     // Classify a re-register against the slot's departure state before touching the
-    // roster. A slot whose link died is deregistered before its drop grace is armed,
-    // so its roster seat is free either way — the departure record and the grace,
+    // roster. A slot whose link died is deregistered before its drop hold is marked,
+    // so its roster seat is free either way — the departure record and the hold,
     // not the roster, tell a resumable reconnect apart from a decided one:
-    //   - a departure recorded AND its drop grace still in flight → the client is
-    //     returning within the grace: cancel the grace below and register it as a
+    //   - a departure recorded AND its drop still held → the client is returning
+    //     while the drop is undecided: release the hold below and register it as a
     //     normal reconnection (the session-start re-push and connectivity fan-out
     //     that a register already fires are exactly what a resume needs);
-    //   - a departure recorded AND no grace pending → the leave was already decided
-    //     (grace expired, or a clean leave): the game has moved on without this
-    //     slot, so refuse the re-register terminally with a close the client can
-    //     distinguish from a transport error;
+    //   - a departure recorded AND no hold pending → the leave was already decided
+    //     (an honored drop request, or a clean leave): the game has moved on without
+    //     this slot, so refuse the re-register terminally with a close the client
+    //     can distinguish from a transport error;
     //   - no departure recorded → a fresh dial (or a still-live double-connect the
     //     roster refuses below): the ordinary path.
     let departed = consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot);
-    let grace_pending = mesh.leave_grace.is_pending(&key, authorized.slot);
-    if departed && !grace_pending {
+    let hold_pending = mesh.drop_holds.is_pending(&key, authorized.slot);
+    if departed && !hold_pending {
         connection.close(
             VarInt::from_u32(SLOT_DEPARTED_CLOSE),
             b"slot already departed",
@@ -282,24 +282,24 @@ async fn serve_connection(
         });
     };
 
-    // The slot is ours now, so cancel any in-flight drop grace: this client came
-    // back within the window, so its held leave must never fire. The mesh half of
-    // the cancel — a peer-homed authority holding its own grace — rides the
-    // connectivity(true) that `run_slot_link` broadcasts on register (see the mesh
-    // `SlotConnectivity` handler); this call covers this relay's own hold.
-    if departed && grace_pending {
-        mesh.leave_grace.cancel(&key, authorized.slot);
+    // The slot is ours now, so release any pending drop hold: this client came
+    // back while its drop was still undecided, so it must never be dropped. The
+    // mesh half of the release — a peer-homed authority holding its own marker —
+    // rides the connectivity(true) that `run_slot_link` broadcasts on register (see
+    // the mesh `SlotConnectivity` handler); this call covers this relay's own hold.
+    if departed && hold_pending {
+        mesh.drop_holds.release(&key, authorized.slot);
         // Discard the departure record too: the client is back, so the slot is no
         // longer gone. This must happen before the promotion that `run_slot_link`
-        // may trigger below — a re-registered slot's grace is already cancelled, so
-        // the promotion's grace-pending skip cannot protect it; clearing the record
-        // is what keeps the promotion from re-deriving its leave.
+        // may trigger below — a re-registered slot's hold is already released, so
+        // the promotion's held-slot skip cannot protect it; clearing the record is
+        // what keeps the promotion from re-deriving its leave.
         consensus::reinstate_slot(&mesh.decision_makers, &key, authorized.slot);
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
             slot = authorized.slot.0,
-            "client re-registered within its drop grace; cancelling the held leave",
+            "client re-registered while its drop was undecided; releasing the hold",
         );
     }
 
