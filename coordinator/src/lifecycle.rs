@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use rally_point_proto::control::TenantId;
+use rally_point_proto::control::{DepartedSlot, DepartureKind, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -95,6 +95,12 @@ struct SessionState {
     /// Slots (player or observer) that have a departure record. The linger reap
     /// closes the slots *not* in this set.
     departed: HashSet<SlotId>,
+    /// Each departed slot's left-vs-dropped classification, retained so a
+    /// coordinator-mediated re-home can seed a fresh relay's consensus with the
+    /// already-decided departures ([`Lifecycle::departed_slots`]). Grows with
+    /// `departed`; the first classification for a slot wins (a slot never departs
+    /// twice with a different kind).
+    departed_kinds: HashMap<SlotId, DepartureKind>,
     /// Serving relays that have reported `SessionClosed`.
     closed_relays: HashSet<RelayId>,
     /// Whether the final `sessionClosed` webhook has been enqueued, so it fires
@@ -221,20 +227,48 @@ impl Lifecycle {
     }
 
     /// Records a slot's departure: accounts the slot (if a player), notes it
-    /// departed, and re-evaluates the reap timers. `relay_id` is unused here (a
-    /// departure names the slot, not who closes) but kept for call-site symmetry
-    /// with [`on_session_closed`](Self::on_session_closed).
-    pub fn on_departure(&self, tenant: TenantId, session: SessionId, slot: SlotId) {
+    /// departed with its left-vs-dropped classification, and re-evaluates the reap
+    /// timers. The `kind` is retained so a coordinator-mediated re-home can seed a
+    /// fresh relay with the already-decided departure ([`departed_slots`](Self::departed_slots)).
+    pub fn on_departure(
+        &self,
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+        kind: DepartureKind,
+    ) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
         state.departed.insert(slot);
+        // First classification for a slot wins — a slot never departs twice.
+        state.departed_kinds.entry(slot).or_insert(kind);
         if state.player_slots.contains(&slot) {
             state.accounted.insert(slot);
         }
         self.reevaluate_reaps(&tenant, session, state);
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// The slots this coordinator has recorded as departed for `session`, each
+    /// with its left-vs-dropped classification — the seed a coordinator-mediated
+    /// re-home carries in the rebuilt descriptors so a fresh relay's consensus
+    /// treats the departures as already decided. Empty for a session with no
+    /// recorded departures (or one this coordinator lifetime never registered).
+    pub fn departed_slots(&self, tenant: &TenantId, session: SessionId) -> Vec<DepartedSlot> {
+        self.inner
+            .sessions
+            .lock()
+            .get(&(tenant.clone(), session))
+            .map(|state| {
+                state
+                    .departed_kinds
+                    .iter()
+                    .map(|(&slot, &kind)| DepartedSlot { slot, kind })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Records a slot's result: accounts the slot (if a player) and re-evaluates
@@ -287,6 +321,7 @@ impl Lifecycle {
         // not replayed to a relay that reconnects after this.
         self.prune_dedup(&tenant, session);
         self.inner.setup.reaps().retire(&tenant, session);
+        self.inner.setup.forget_rehomes(&tenant, session);
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -343,6 +378,7 @@ impl Lifecycle {
             observer_slots: HashSet::new(),
             accounted: HashSet::new(),
             departed: HashSet::new(),
+            departed_kinds: HashMap::new(),
             closed_relays: HashSet::new(),
             session_closed_enqueued: false,
             queue: tx,
@@ -405,6 +441,7 @@ impl Lifecycle {
         // Retire any pending reap directives for the removed session (a webhook-only
         // state normally has none, but this keeps the pending set bounded either way).
         self.inner.setup.reaps().retire(&tenant, session);
+        self.inner.setup.forget_rehomes(&tenant, session);
         tracing::debug!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -701,7 +738,7 @@ mod tests {
         );
 
         // Slot 0 accounts (departs); slot 1 is the lone holdout → holdout timer arms.
-        lc.on_departure(tid(), s, SlotId(0));
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped);
         assert!(reaps.try_recv().is_err(), "nothing closes before the grace");
         tokio::time::sleep(SHORT / 2).await;
         assert!(reaps.try_recv().is_err(), "still nothing mid-grace");
@@ -728,8 +765,8 @@ mod tests {
             HashSet::new(),
         );
 
-        lc.on_departure(tid(), s, SlotId(0)); // arms holdout for slot 1
-        lc.on_departure(tid(), s, SlotId(1)); // the holdout reports → disarm
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped); // arms holdout for slot 1
+        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped); // the holdout reports → disarm
 
         // Past the holdout grace, nothing was reaped (the linger grace is an hour).
         tokio::time::sleep(SHORT * 2).await;
@@ -1012,7 +1049,7 @@ mod tests {
         );
 
         // Arm and fire the holdout reap so a directive is pending for relay 1.
-        lc.on_departure(tid(), s, SlotId(0));
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped);
         let mut rx = reaps.subscribe(RelayId(1));
         let close = timeout(SHORT * 4, rx.recv())
             .await

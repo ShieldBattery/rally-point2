@@ -66,7 +66,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 
 use crate::consensus;
-use crate::consensus::{LEAVE_REASON_DROPPED, MAX_GAME_RESULT_PAYLOAD_LEN};
+use crate::consensus::{LEAVE_REASON_DROPPED, LEAVE_REASON_LEFT, MAX_GAME_RESULT_PAYLOAD_LEN};
 use crate::validation::validate_turn;
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
@@ -122,15 +122,6 @@ const UNACKED_WINDOW_CAP: usize = 1024;
 // client's link ending (quit, network death, or isolation for lagging) surfaces
 // as a drop; a clean quit sends a leave-intent first, decided under
 // `LEAVE_REASON_LEFT` so survivors see "player left".
-
-/// The native SC:R `pending_leave_reason` value a voluntary quit produces on
-/// every other client natively (shows "player left"): this is exactly what
-/// SC:R's own quit path writes into a peer's leave mailbox, so a synced leave
-/// decided from a client's leave-intent renders with the identical wording a
-/// native (non-networked) game would already show. Any nonzero value other
-/// than [`LEAVE_REASON_DROPPED`]'s `0x40000006` renders "player left", but this
-/// one is chosen to match the native value rather than an arbitrary nonzero.
-const LEAVE_REASON_LEFT: u32 = 3;
 
 /// QUIC application close code for a connection the relay closes on its own
 /// initiative after processing a client's leave-intent. Not an error: the

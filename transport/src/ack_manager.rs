@@ -311,6 +311,32 @@ impl AckManager {
         before - self.unacked_payloads.len()
     }
 
+    /// Re-registers a payload as still-unacked so the redundancy pass re-carries
+    /// it, **without** sending a packet — the re-inject half of a coordinator-
+    /// mediated re-home.
+    ///
+    /// After a client re-homes onto a replacement relay, that relay's turn ring is
+    /// empty: turns the client sent that the *old* relay had already acked (and so
+    /// were retired from this window) would otherwise never reach the new relay to
+    /// be fanned out to peers. Re-injecting them here puts them back in the unacked
+    /// set so the next packet's redundancy carries them over the new connection,
+    /// where peers dedup by origin `(slot, seq)`. A payload already unacked (one in
+    /// flight at the drop, kept by [`reset_connection`](Self::reset_connection)) is
+    /// left untouched, so a re-inject never resets its `send_count` or double-tracks
+    /// it.
+    pub fn reinject_unacked(&mut self, payload: Payload) {
+        use std::collections::btree_map::Entry;
+        let key = (SlotId(payload.slot as u8), payload.seq);
+        if let Entry::Vacant(vacant) = self.unacked_payloads.entry(key) {
+            let encoded_len = payload.encoded_len();
+            vacant.insert(SentPayload {
+                send_count: 0,
+                encoded_len,
+                payload,
+            });
+        }
+    }
+
     /// Marks one of our sent packets as acked, retiring every payload it carried.
     fn retire_packet(&mut self, packet_seq: u64) {
         if let Some(packet) = self.sent_packets.remove(packet_seq) {
@@ -585,6 +611,41 @@ mod tests {
             .map(|p| (p.slot as u8, p.seq))
             .collect();
         assert_eq!(keys, vec![(0, 3), (0, 4)]);
+    }
+
+    #[test]
+    fn reinject_re_carries_an_already_retired_payload() {
+        // The rehome re-inject: a payload that was acked (retired) is put back in
+        // the unacked set so the next packet's redundancy re-carries it — the case
+        // where the old relay acked a turn but never fanned it out before dying.
+        let mut manager = AckManager::new();
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU);
+        // Ack it: it retires from the window.
+        manager.handle_incoming(&incoming(1, Some(0), &[])).unwrap();
+        assert_eq!(manager.payloads_in_flight(), 0);
+
+        // Re-inject it (as after a rehome rebind). It is unacked again and the next
+        // packet re-carries it.
+        manager.reinject_unacked(test_payload(0, 0));
+        assert_eq!(manager.payloads_in_flight(), 1);
+        let packet = manager.build_outgoing(None, MTU);
+        let seqs: Vec<(u8, u64)> = packet
+            .payloads
+            .iter()
+            .map(|p| (p.slot as u8, p.seq))
+            .collect();
+        assert_eq!(seqs, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn reinject_does_not_double_track_a_still_unacked_payload() {
+        // A payload still in flight (kept across a reset) must not be re-tracked by
+        // a re-inject — the window stays at one, not two.
+        let mut manager = AckManager::new();
+        manager.build_outgoing(Some(test_payload(0, 0)), MTU);
+        assert_eq!(manager.payloads_in_flight(), 1);
+        manager.reinject_unacked(test_payload(0, 0));
+        assert_eq!(manager.payloads_in_flight(), 1);
     }
 
     #[test]

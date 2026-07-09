@@ -107,6 +107,7 @@ async fn serve_bare_coordinator(
         control_auth: ControlAuth::Open,
         hello_timeout,
         liveness_timeout,
+        rehome_limiter: rally_point_coordinator::rehome::RehomeLimiter::default(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -179,6 +180,7 @@ async fn coordinator_with_session(
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
+        rehome_limiter: rally_point_coordinator::rehome::RehomeLimiter::default(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

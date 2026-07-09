@@ -39,6 +39,7 @@ pub mod descriptors;
 pub mod lifecycle;
 pub mod notify;
 pub mod registry;
+pub mod rehome;
 pub mod session;
 pub mod tenant;
 

@@ -178,6 +178,13 @@ use crate::routing::SessionKey;
 /// value, so the one source of truth lives here alongside the leave decision.
 pub const LEAVE_REASON_DROPPED: u32 = 0x4000_0006;
 
+/// The native SC:R `pending_leave_reason` value a voluntary quit produces — any
+/// value other than [`LEAVE_REASON_DROPPED`] renders "player left", so this is the
+/// canonical "left" reason the relay uses when it must synthesize a left departure
+/// (a coordinator-seeded rehome departure whose kind is `Left`). The single source
+/// of truth, re-used by `routing`.
+pub const LEAVE_REASON_LEFT: u32 = 3;
+
 /// The largest end-of-game result payload a session's decision-maker will
 /// retain. The bytes are the tenant's opaque serialized result, forwarded
 /// unparsed; this cap bounds what one slot's report can cost, independent of
@@ -2413,6 +2420,35 @@ impl DecisionMaker {
         self.note_departure(slot, last_frame, reachable, result, reason);
     }
 
+    /// Seeds a coordinator-known departure as **already decided** on a rehome (see
+    /// the free [`seed_departed`]). Records the departure — retiring the slot from
+    /// the comparator, coverage, and live set — then caches a decided leave for it
+    /// so a promotion re-broadcasts it verbatim rather than re-deriving it (which
+    /// would fire a redundant notice) or re-waiting on it. The leave's apply frame
+    /// is only cosmetic here — the survivors that carried into the rehome already
+    /// applied this leave on the old relay, and the client's `LeaveTracker` dedups a
+    /// re-broadcast by slot — so it is scheduled one past the current session frame
+    /// (or 0 before any framed turn). Idempotent: a slot already decided is left as
+    /// is.
+    pub fn seed_departed(&mut self, slot: SlotId, kind: DepartureKind) {
+        let reason = match kind {
+            DepartureKind::Dropped => LEAVE_REASON_DROPPED,
+            DepartureKind::Left => LEAVE_REASON_LEFT,
+        };
+        self.note_departure(slot, None, None, None, reason);
+        if !self.decided_leaves.contains_key(&slot) {
+            self.next_leave_seq += 1;
+            let base = self.session_frame().map(|f| f.0).unwrap_or(0);
+            let directive = LeaveDirective {
+                slot: u32::from(slot.0),
+                reason,
+                apply_at_frame: base.saturating_add(1),
+                leave_seq: self.next_leave_seq,
+            };
+            self.decided_leaves.insert(slot, directive);
+        }
+    }
+
     /// Records the end-of-game result `slot` reported, returning whether this was
     /// the **first** report from the slot. A repeat returns `false` and keeps the
     /// first `echo`, so the caller fires at most one result notice per slot
@@ -3435,6 +3471,26 @@ pub fn record_departure(
     }
 }
 
+/// Seeds a coordinator-known departure into a session's decision-maker on a
+/// **rehome**: a fresh relay taking over a running session has no mesh peer to
+/// replay a `SlotDeparted` from, so the coordinator carries the already-decided
+/// departures in the descriptor and this records each as *already decided*. The
+/// slot is retired from the comparator, the coverage set, and the live set (like
+/// any departure), and a decided leave is cached so a later authority promotion
+/// re-broadcasts it verbatim (firing no fresh notice) and never re-waits or
+/// re-derives it. A no-op when no maker exists (a session this relay does not
+/// serve). Idempotent — seeding a slot already departed leaves it decided.
+pub fn seed_departed(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    kind: DepartureKind,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.seed_departed(slot, kind);
+    }
+}
+
 /// Records a client's end-of-game result report into the session's
 /// decision-maker, firing exactly one result notice up the coordinator connection
 /// on the first report from `slot`. A repeat from the same slot inserts nothing
@@ -3960,6 +4016,52 @@ mod tests {
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         let _ = ingest_at(&mut maker, &conditions(0, 150_000, 5, 200), 2);
         assert_eq!(maker.target(), Some(5));
+    }
+
+    #[test]
+    fn seed_departed_is_decided_and_re_broadcast_verbatim_on_promotion() {
+        // A rehome-seeded departure on a non-authority relay is already decided (not
+        // "undecided"), and a later promotion re-broadcasts it verbatim — firing no
+        // fresh departure notice, since a fresh relay resuming a session must not
+        // re-report a departure the mesh already reported.
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.seed_departed(SlotId(1), DepartureKind::Dropped);
+        assert!(
+            !maker.has_undecided_departure(),
+            "a seeded departure is already decided, never left undecided",
+        );
+
+        let (all, fresh) = maker.set_authority(Authority::SelfRelay, &HashSet::new());
+        assert!(
+            all.iter()
+                .any(|l| l.slot == 1 && l.reason == LEAVE_REASON_DROPPED),
+            "the seeded dropped leave is re-broadcast verbatim on promotion",
+        );
+        assert!(
+            fresh.is_empty(),
+            "a seeded (already decided) leave fires no fresh departure notice",
+        );
+    }
+
+    #[test]
+    fn seed_departed_maps_the_kind_to_the_native_reason() {
+        // A left departure seeds the native "player left" reason, a dropped one the
+        // dropped reason — so a promotion re-broadcast renders the correct wording.
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.seed_departed(SlotId(1), DepartureKind::Left);
+        maker.seed_departed(SlotId(2), DepartureKind::Dropped);
+        assert_eq!(maker.decided_leaves[&SlotId(1)].reason, LEAVE_REASON_LEFT);
+        assert_eq!(
+            maker.decided_leaves[&SlotId(2)].reason,
+            LEAVE_REASON_DROPPED
+        );
     }
 
     /// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.

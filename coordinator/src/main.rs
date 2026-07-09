@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
+        rehome_limiter: rally_point_coordinator::rehome::RehomeLimiter::default(),
     };
 
     let app = api::router(state);

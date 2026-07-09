@@ -43,9 +43,17 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 >   **session-lifecycle** layer emits a final `sessionClosed` and reaps dangling sessions (see
 >   [Control plane](#control-plane-the-coordinator)).
 >
-> Still designed but not built: **resilience/failover and coordinated reconnect** (the biggest open piece),
-> **dual-stack advertise addresses**, **per-relay identity binding** on the control connection, and
-> production mesh **mTLS / an internal CA**.
+> - **Relay-death failover (coordinator-mediated re-home).** In-game, whole-group failover onto a
+>   replacement relay: the coordinator's client-authenticated `POST /session/rehome` moves every slot homed
+>   on a dead relay to one live relay and rebuilds the serving relays' descriptors as **resumed** (seeding
+>   the already-decided departures so a fresh relay resumes rather than waits), and the client driver
+>   escalates a dead home relay to an embedder-supplied re-home provider, re-dials the replacement with its
+>   existing token + resume cursors, and re-injects a retained ring of its own sent turns so the new relay's
+>   empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
+>
+> Still designed but not built: **dual-stack advertise addresses**, **per-relay identity binding** on the
+> control connection, production mesh **mTLS / an internal CA**, and coordinator **HA / persistence** (a
+> restart still forgets the registry, tenant keys, and session accounting).
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -133,7 +141,7 @@ redundantly-packed payloads.
     trips (`UnackedWindowExhausted` on the client, slot isolation on the relay) rather than let seqs
     race ahead until the peer's receive window rejects them and drops the link. Surfacing the condition
     is the buildable half; the resync it triggers (reconnect + replay-from-cursor) is gated on the open
-    failover design (see [Failover](#failover-and-reconnect-open)).
+    failover design (see [Failover](#failover-and-reconnect)).
 
   The beacon's read half runs in a dedicated task that assembles complete `(slot, cursor)` frames over
   an `mpsc` channel — a `read_exact` dropped mid-frame inside a `select!` would desync the framing and
@@ -177,7 +185,7 @@ receives turns in per slot is the relay's forward order for that slot — which 
 order in the common case (redundancy plus per-packet sorting keep the relay receiving each slot's
 turns in order). The rare reordering that slips through (a client at near-MTU whose datagrams reorder
 past what redundancy covers) is a known edge: the common case is correct, and a higher-layer resync
-would also recover it (see [Failover](#failover-and-reconnect-open)) — the per-hop transport doesn't
+would also recover it (see [Failover](#failover-and-reconnect)) — the per-hop transport doesn't
 try to guarantee order.
 
 ## The client
@@ -300,31 +308,65 @@ coordinator-issued shared secret). Client → relay trust is the same descriptor
 (one relay per client), cert pinned from the session descriptor, with an internal CA as the scale
 alternative; direct IPs (D3) rule out public CA.
 
-### Failover and reconnect (open)
+### Failover and reconnect
 
-A relay dying mid-game stalls lockstep for every client it serves, so a production deployment needs a
-real failover and reconnect story: moving affected clients to another relay and recovering the turns
-they missed in the gap. How a replacement relay would have those missed turns to replay — and at what
-storage and replication cost — is **not yet designed**, and the obvious answer (persisting and
-replicating a full per-game turn log) is not obviously affordable. Treat this as an open question, not a
-settled part of the architecture. (The client reconnect infrastructure this needs would also cover a
-client's own transient disconnects.)
+A relay dying mid-game stalls lockstep for every client it serves, so failover moves the affected clients to
+another relay and recovers the turns they missed. The design is **coordinator-mediated re-home**: the
+coordinator, which already knows relay liveness from the control connections, authoritatively picks the
+replacement, and the clients themselves are the turn log — so nothing needs a replicated relay-side turn
+store. Scope is **in-game, whole-group** failover: every slot homed on the dead relay moves together to one
+replacement.
 
-**Client-side turn retention (design note for D11).** The relay-side turn
-log that D4 calls "open" may not be needed at all: each client already has
-every turn it sent (it generated them) and every turn it received (it
-executed them), so the clients *are* the turn log. A replacement relay asks
-each client to replay from a target turn. The retention window a client must
-keep is `executing_turn - buffer_size` through `executing_turn + buffer_size`
-— roughly `2 * buffer_size` turns (typically 4–10, a few hundred bytes). The
-lower bound is `E - B` because the slowest client can be at most `buffer_size`
-turns behind before they stall (the buffer is exactly the cushion that absorbs
-that), so `E - B` is the oldest turn the slowest client might still be
-executing — and thus the oldest a replacement relay might need re-sent. The
-upper bound is `E + B` (the client's own send pipe). This sidesteps the
-relay-side storage/replication cost question entirely; the open work is the
-coordinated resync protocol itself (how clients re-send simultaneously, how
-the replacement distributes turns in lockstep order before anyone advances).
+**The clients are the turn log.** Each client already holds every turn it sent (it generated them) and every
+turn it received (it executed them), so a replacement relay never needs a persisted log — it asks the
+returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
+
+- **Resume cursors** (the same infrastructure a same-relay reconnect uses): on re-dial the client presents,
+  per peer slot, the seq it next needs, and the relay replays from its turn ring at or past it. A fresh
+  replacement relay's ring is empty, so this alone recovers nothing from it — which is what the retention
+  ring below is for.
+- **The outbound retention ring.** Each client retains a ring of *its own* recently-sent turns (capped at 512
+  turns / 256 KiB), independent of ack retirement — a turn the dead relay had already acked is dropped from
+  the unacked window but kept here. On a re-home dial (only), the client re-injects the retained turns as
+  unacked into the fresh link, so the replacement relay's empty ring re-carries them to peers, which dedup by
+  origin `(slot, seq)`. This closes the window where the dead relay acked a turn but died before fanning it
+  out. An undecided drop-hold at relay death is deliberately lost — survivors re-wait the fresh 30s floor on
+  the new relay.
+
+**Coordinator `POST /session/rehome`.** A client-authenticated endpoint, distinct from the tenant-signed
+`/session/create` scheme: the request carries the client's own token, a timestamp, the relay id it believes
+dead, and an Ed25519 signature by the client's session key over
+`rp2-rehome-v1:<ts>:<session>:<slot>:<relay_id>`. The coordinator verifies the token exactly as a relay would
+(tenant key + expiry), then the signature against the token's *embedded* client pubkey — so only the client a
+token was minted for can ask, and only about its own session + slot (both read from the verified token, never
+the body) — under a lenient per-`(session, slot)` rate limit. The decision: a relay **still enrolled** →
+`stay` (the coordinator overrules a false alarm); **dead** → move the whole group to a replacement — a live
+relay already serving the session (earliest in the authority order) if one exists, else the lowest-id live
+relay, else `unavailable` — updating the serving set (which is also the descriptors' authority order) in
+place, rebuilding every serving relay's descriptor as **resumed**, and pushing R_new's first so it is staged
+before the response returns (the client's backoff absorbs the residual descriptor/dial race). The decision is
+idempotent per `(session, dead_relay)`, so concurrent or repeated asks return the same target without
+re-mutating. An unknown session (a coordinator restart wiped its membership) is `unavailable`; the client
+keeps its token throughout.
+
+**Resumed descriptors.** A `resumed` descriptor additionally carries the session's already-decided
+`departed_slots` (slot + left/dropped kind, seeded from the coordinator's lifecycle accounting). A fresh relay
+taking over has no mesh peer to replay `SlotDeparted` records from, so it seeds these as decided leaves — its
+desync comparator, coverage check, and any later promotion re-broadcast then treat a coordinator-seeded
+departure exactly like a mesh-learned one — and latches the session **started**, so it never waits on the full
+expected set (which still lists the departed slots that will never dial) and never re-fires the session-start
+machinery session-wide. Both fields are additive with serde defaults, so an old descriptor still parses.
+
+**Client-side escalation.** The link driver's reconnect loop retries the same relay first, and escalates to an
+embedder-supplied `RehomeProvider` only once the game has started (it tracks the relay's `SessionStart`
+itself) and the relay stays unreachable — immediately on a TLS cert/pin rejection (a restarted relay serves a
+fresh cert, which no same-relay retry can pass), otherwise after ~10s of failed attempts. The provider is
+where the embedder does the coordinator round-trip and builds a fresh endpoint pinning the replacement relay's
+cert — the driver never touches certs. `Stay` resumes same-relay backoff; `Unavailable` keeps it and
+re-escalates periodically; `NewTarget` re-dials the replacement with the same identity and resume cursors,
+rebinds the link in place (preserving the receive dedup so the re-home is a resume, not a restart), re-injects
+the retention ring, and points subsequent drops at the new relay. This same reconnect infrastructure also
+covers a client's own transient disconnects (a same-relay resume, no re-home).
 
 ### Latency buffer
 

@@ -136,6 +136,28 @@ fn start_relay_with_mesh(
     (addr, ca)
 }
 
+/// Binds an ephemeral IPv4-loopback relay over a caller-supplied mesh state,
+/// returning its address, CA, *and* the endpoint — so a test can `close()` the
+/// endpoint to simulate the relay dying (client links drop and re-dials fail),
+/// which is what forces the driver to escalate to re-home.
+fn start_relay_killable(
+    registry: Registry,
+    mesh: rally_point_relay::mesh::MeshState,
+) -> (SocketAddr, CertificateDer<'static>, quinn::Endpoint) {
+    let (chain, key, ca) = self_signed();
+    let server_cfg = server_config(chain, key).unwrap();
+    let endpoint = quinn::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(server::serve(
+        endpoint.clone(),
+        Arc::new(registry),
+        std::sync::Arc::default(),
+        mesh,
+        None,
+    ));
+    (addr, ca, endpoint)
+}
+
 /// A registry trusting each of `tenants`.
 fn registry_for(tenants: &[&Tenant]) -> Registry {
     let mut registry = Registry::new();
@@ -676,6 +698,9 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
         relay_addr: addr,
         server_name: "localhost".to_owned(),
         identity: id0,
+        rehome: None,
+        escalate_after: None,
+        escalate_retry: None,
     };
     let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
 
@@ -860,6 +885,165 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
 
     drop(chan0);
     drop(chan1.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+}
+
+/// A re-home provider that always hands back a fixed replacement relay's target,
+/// building a fresh client endpoint that pins the replacement's cert on each call —
+/// standing in for the embedder's coordinator round-trip + cert pinning.
+struct FixedTarget {
+    ca: CertificateDer<'static>,
+    addr: SocketAddr,
+}
+
+impl rally_point_client::RehomeProvider for FixedTarget {
+    fn rehome(&self) -> rally_point_client::RehomeFuture<'_> {
+        let ca = self.ca.clone();
+        let addr = self.addr;
+        Box::pin(async move {
+            rally_point_client::RehomeOutcome::NewTarget {
+                endpoint: client_endpoint(&ca),
+                relay_addr: addr,
+                server_name: "localhost".to_owned(),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
+    use std::collections::HashSet;
+
+    use rally_point_client::{LinkDriver, Reconnect};
+    use rally_point_proto::control::BufferBounds;
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    // The full coordinator-mediated failover path against two real relays: both
+    // slots home on relay A; A dies; each driver escalates to its re-home provider,
+    // which hands relay B's target; both re-home onto B (which the coordinator would
+    // have pushed a `resumed` descriptor to — here seeded as already-started); a turn
+    // slot 0 sent before the death reaches slot 1 exactly once (the retention ring's
+    // re-injection deduped against what slot 1 already had), and a fresh turn after
+    // the re-home flows over B.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(80);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Relay A (the home). Seed its maker started with the two expected slots so it
+    // records forwarded turns and fires session-start.
+    let mesh_a = rally_point_relay::mesh::new_mesh_state();
+    let _ = consensus::sync_maker(
+        &mesh_a.decision_makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+    let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
+
+    // Relay B (the replacement). Seed it as a resumed session (already started), as a
+    // rehome descriptor from the coordinator would.
+    let mesh_b = rally_point_relay::mesh::new_mesh_state();
+    let _ = consensus::sync_maker(
+        &mesh_b.decision_makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+    consensus::mark_session_started(&mesh_b.decision_makers, &key);
+    let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+
+    // Per-slot client endpoints trusting relay A, used for the initial connect and
+    // then moved into each `Reconnect` for same-relay re-dials.
+    let ep0 = client_endpoint(&ca_a);
+    let ep1 = client_endpoint(&ca_a);
+
+    let link0 = ep0.connect(addr_a, "localhost", &id0).await.unwrap();
+    let (driver0, mut chan0) = LinkDriver::new(link0);
+    let link1 = ep1.connect(addr_a, "localhost", &id1).await.unwrap();
+    let (driver1, mut chan1) = LinkDriver::new(link1);
+
+    // Both drivers re-home to relay B when A stays unreachable. A short escalation
+    // window keeps the test fast (a cert/pin rejection would escalate at once; here
+    // the dead relay just stops responding, so the timed window drives it).
+    let reconnect0 = Reconnect {
+        endpoint: ep0,
+        relay_addr: addr_a,
+        server_name: "localhost".to_owned(),
+        identity: id0,
+        rehome: Some(Arc::new(FixedTarget {
+            ca: ca_b.clone(),
+            addr: addr_b,
+        })),
+        escalate_after: Some(Duration::from_millis(50)),
+        escalate_retry: Some(Duration::from_millis(50)),
+    };
+    let reconnect1 = Reconnect {
+        endpoint: ep1,
+        relay_addr: addr_a,
+        server_name: "localhost".to_owned(),
+        identity: id1,
+        rehome: Some(Arc::new(FixedTarget {
+            ca: ca_b.clone(),
+            addr: addr_b,
+        })),
+        escalate_after: Some(Duration::from_millis(50)),
+        escalate_retry: Some(Duration::from_millis(50)),
+    };
+    let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
+    let task1 = tokio::spawn(driver1.run_reconnecting(reconnect1));
+
+    // Both connected to A: session-start fires.
+    tokio::time::timeout(Duration::from_secs(5), chan0.session_start.recv())
+        .await
+        .expect("session start never fired on slot 0")
+        .expect("slot 0's session-start channel closed");
+
+    let turn = || Payload {
+        commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+        ..Default::default()
+    };
+
+    // Slot 0 sends a turn over relay A; slot 1 receives it (seq 0).
+    chan0.outbound.send(turn()).await.unwrap();
+    assert_eq!(recv_turn(&mut chan1.inbound).await.seq, 0);
+
+    // Relay A dies: closing its endpoint drops both client links and makes re-dials
+    // to A fail, so each driver escalates to its re-home provider.
+    endpoint_a.close(quinn::VarInt::from_u32(0), b"relay A down");
+
+    // Each driver surfaces its own disconnect, then re-homes onto relay B.
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), false)).await;
+    wait_connectivity(&mut chan1.connectivity, (SlotId(1), false)).await;
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), true)).await;
+    wait_connectivity(&mut chan1.connectivity, (SlotId(1), true)).await;
+
+    // A fresh turn slot 0 sends after the re-home flows over relay B to slot 1 —
+    // and it is the very next turn slot 1 sees, so the pre-death turn (which slot 0's
+    // retention ring re-injected onto B) was deduped, delivered exactly once.
+    chan0.outbound.send(turn()).await.unwrap();
+    let after = recv_turn(&mut chan1.inbound).await;
+    assert_eq!(
+        after.seq, 1,
+        "slot 1 sees the post-rehome turn next; the re-injected seq 0 was deduped, not re-delivered",
+    );
+    assert_eq!(&after.commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+
+    drop(chan0.outbound);
+    drop(chan0.inbound);
+    drop(chan1.outbound);
+    drop(chan1.inbound);
     let _ = task0.await;
     let _ = task1.await;
 }

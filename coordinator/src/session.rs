@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest, SessionResponse,
-    SlotExternalRef, SlotHome,
+    DepartedSlot, PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest,
+    SessionResponse, SlotExternalRef, SlotHome, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
@@ -110,7 +110,16 @@ pub struct SessionSetup {
     /// tenants can both share a session id) — the relay keys its routing
     /// groups on `SessionKey` (tenant + session) for exactly this reason.
     next_session: Arc<AtomicU64>,
+    /// Idempotency record for coordinator-mediated re-homes: maps a
+    /// `(tenant, session, dead_relay)` to the replacement relay chosen for it, so
+    /// a concurrent or repeated `rehome` naming the same dead relay returns the
+    /// same target without re-mutating the session's relay set. Retired with the
+    /// session's other state (see [`forget_rehomes`]).
+    rehomes: Arc<Mutex<HashMap<RehomeKey, RelayId>>>,
 }
+
+/// The key of a recorded rehome decision: which dead relay, for which session.
+type RehomeKey = (rally_point_proto::control::TenantId, SessionId, RelayId);
 
 impl SessionSetup {
     /// Creates a session-setup context from the coordinator's registries.
@@ -123,6 +132,7 @@ impl SessionSetup {
             descriptors: RelayDescriptors::new(),
             reaps: RelayReaps::new(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
+            rehomes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -165,6 +175,148 @@ impl SessionSetup {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Forgets any recorded rehome decisions for `session` — called when the
+    /// session's lifecycle state is removed, so the idempotency record stays
+    /// bounded by the coordinator's live sessions (the sibling of
+    /// [`RelayReaps::retire`](crate::descriptors::RelayReaps::retire)).
+    pub fn forget_rehomes(&self, tenant: &TenantId, session: SessionId) {
+        self.rehomes
+            .lock()
+            .retain(|(t, s, _), _| !(t == tenant && *s == session));
+    }
+}
+
+/// The outcome of a coordinator-mediated re-home request (`POST /session/rehome`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RehomeOutcome {
+    /// The named relay is still live in the registry — the client should keep
+    /// dialing it rather than move, resuming its same-relay reconnect backoff.
+    Stay,
+    /// No live relay could take the session over (none registered, or the session
+    /// is unknown to this coordinator lifetime). The client keeps its same-relay
+    /// backoff and re-asks later.
+    Unavailable,
+    /// The relay the whole homed group should move to, with the cert the client
+    /// pins to reach it. The client keeps its token and re-dials this endpoint.
+    NewTarget(RelayEndpoint),
+}
+
+/// Coordinator-mediated failover: the client believes `dead_relay` has died and
+/// asks where its session should move. Returns [`RehomeOutcome::Stay`] when the
+/// relay is in fact still enrolled (a false alarm the coordinator authoritatively
+/// overrules from the registry), [`RehomeOutcome::Unavailable`] when the session
+/// is unknown or no live relay can take it over, and otherwise moves the whole
+/// homed group to a replacement relay and returns its [`RelayEndpoint`].
+///
+/// The replacement `R_new` is chosen as a live relay **already serving** the
+/// session if one exists (earliest in the authority order, which the serving set
+/// records home-first), else the lowest-id live registered relay. The dead relay
+/// is replaced **in place** in the serving set — which is also the descriptors'
+/// authority order — so `R_new` inherits its rank, and every serving relay's
+/// descriptor is rebuilt as a `resumed` (rehome) descriptor seeding
+/// `departed_slots`. The push to `R_new` is recorded first, so it is staged for
+/// its control connection before this returns.
+///
+/// Idempotent per `(tenant, session, dead_relay)`: a concurrent or repeated call
+/// naming the same dead relay returns the same `R_new` without re-mutating the
+/// session's relay set, as long as that target is still live.
+pub fn rehome(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+    dead_relay: RelayId,
+    departed_slots: Vec<DepartedSlot>,
+) -> RehomeOutcome {
+    // The named relay is still enrolled: the coordinator authoritatively knows it
+    // is alive, so overrule the client's belief and tell it to stay.
+    if registry::entry(&setup.registry, dead_relay).is_some() {
+        return RehomeOutcome::Stay;
+    }
+
+    let key = (tenant.clone(), session);
+    let serving = setup.serving_relays(tenant, session);
+    // Unknown session (never created here, or a coordinator restart wiped its
+    // membership): there is nothing to re-home.
+    if serving.is_empty() {
+        return RehomeOutcome::Unavailable;
+    }
+
+    let mut rehomes = setup.rehomes.lock();
+
+    // Idempotent: a prior rehome for this dead relay already chose a target.
+    // Return it verbatim as long as it is still live, without re-mutating.
+    if let Some(&existing) = rehomes.get(&(tenant.clone(), session, dead_relay))
+        && let Some(entry) = registry::entry(&setup.registry, existing)
+    {
+        return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
+    }
+
+    // Pick the replacement: prefer a live relay already serving the session
+    // (earliest in the authority order), else the lowest-id live registered relay.
+    let r_new = serving
+        .iter()
+        .copied()
+        .find(|&id| id != dead_relay && registry::entry(&setup.registry, id).is_some())
+        .or_else(|| {
+            let mut entries = registry::all_entries(&setup.registry);
+            entries.sort_by_key(|e| e.relay_id);
+            entries.first().map(|e| e.relay_id)
+        });
+    let Some(r_new) = r_new else {
+        return RehomeOutcome::Unavailable;
+    };
+    let Some(new_entry) = registry::entry(&setup.registry, r_new) else {
+        return RehomeOutcome::Unavailable;
+    };
+
+    // Move every slot homed on the dead relay onto R_new: replace the dead relay
+    // in place in the serving set (which is also the authority order), so the
+    // rebuilt descriptors rank R_new where the dead relay stood. If R_new was
+    // already serving, drop the dead entry rather than list it twice.
+    {
+        let mut relays = setup.session_relays.lock();
+        if let Some(members) = relays.get_mut(&key) {
+            if members.contains(&r_new) {
+                members.retain(|&id| id != dead_relay);
+            } else {
+                for id in members.iter_mut() {
+                    if *id == dead_relay {
+                        *id = r_new;
+                    }
+                }
+            }
+        }
+    }
+
+    // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
+    // seeding the departed slots, and push each. Record R_new's first so it is
+    // staged for its control connection before this returns, shrinking the
+    // descriptor/dial race the client's backoff otherwise absorbs.
+    let mut serving_now = setup.serving_relays(tenant, session);
+    serving_now.sort_by_key(|&id| if id == r_new { 0 } else { 1 });
+    for relay_id in serving_now {
+        if let Some(descriptor) = build_descriptor(
+            setup,
+            tenant,
+            session,
+            relay_id,
+            true,
+            departed_slots.clone(),
+        ) {
+            setup.descriptors.record(relay_id, descriptor);
+        }
+    }
+
+    rehomes.insert((tenant.clone(), session, dead_relay), r_new);
+    tracing::info!(
+        tenant = tenant.as_ref(),
+        session = session.0,
+        dead_relay = dead_relay.0,
+        new_relay = r_new.0,
+        "session re-homed onto a replacement relay",
+    );
+    RehomeOutcome::NewTarget(RelayEndpoint::from(&new_entry))
 }
 
 /// The first session id for a freshly constructed coordinator: the wall clock
@@ -359,6 +511,26 @@ pub fn descriptor_for(
     session: SessionId,
     relay_id: RelayId,
 ) -> Option<SessionDescriptor> {
+    build_descriptor(setup, tenant, session, relay_id, false, Vec::new())
+}
+
+/// Builds the [`SessionDescriptor`] for a relay serving `session`, with the
+/// rehome-specific fields controlled by the caller.
+///
+/// `resumed` marks a descriptor that re-homes an already-running session onto a
+/// relay (the coordinator-mediated failover path), and `departed_slots` seeds the
+/// slots the coordinator already knows departed so a fresh relay with no mesh peer
+/// to replay them still treats their leaves as decided. `create_session` and the
+/// public [`descriptor_for`] pass `false`/empty (the ordinary start-on-coverage
+/// path); [`rehome`] passes `true` plus the session's departed accounting.
+pub fn build_descriptor(
+    setup: &SessionSetup,
+    tenant: &rally_point_proto::control::TenantId,
+    session: SessionId,
+    relay_id: RelayId,
+    resumed: bool,
+    departed_slots: Vec<DepartedSlot>,
+) -> Option<SessionDescriptor> {
     let bounds = tenant::bounds(&setup.tenants, tenant)?;
 
     let relay_ids = setup
@@ -396,6 +568,8 @@ pub fn descriptor_for(
             .collect(),
         observer_slots: refs.observers,
         expected_slots: refs.expected,
+        resumed,
+        departed_slots,
     })
 }
 
@@ -461,7 +635,7 @@ mod tests {
 
     use super::*;
     use rally_point_proto::control::{
-        BufferBounds, PlayerHandoff, RelayHello, SessionRequest, TenantId,
+        BufferBounds, DepartureKind, PlayerHandoff, RelayHello, SessionRequest, TenantId,
     };
     use rally_point_proto::ids::{RelayId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId, SignedToken};
@@ -1167,6 +1341,170 @@ mod tests {
         assert!(
             new.session.0 >= old.session.0,
             "a fresh coordinator's ids never start below the old one's",
+        );
+    }
+
+    // --- Coordinator-mediated re-home ---
+
+    fn tid() -> TenantId {
+        TenantId("sb-test".to_owned())
+    }
+
+    /// Creates a plain two-player session on `setup`, returning the response.
+    fn create_default_session(setup: &SessionSetup) -> SessionResponse {
+        create_session(
+            setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rehome_stays_when_the_named_relay_is_still_live() {
+        // The coordinator authoritatively knows the relay's liveness from its
+        // registry: a client that believes a still-enrolled relay is dead is told to
+        // stay rather than move.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Stay,
+        );
+    }
+
+    #[test]
+    fn rehome_moves_the_group_to_a_live_relay_when_the_home_died() {
+        // The home relay (1) drops out of the registry; the session's whole group
+        // moves to the lowest-id live relay (2), and the rebuilt descriptor is a
+        // resumed one carrying the seeded departure and ranking the new relay in the
+        // dead one's place.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+
+        let departed = vec![DepartedSlot {
+            slot: SlotId(0),
+            kind: DepartureKind::Dropped,
+        }];
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), departed.clone())
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            endpoint.relay_id,
+            RelayId(2),
+            "the lowest-id live relay takes over"
+        );
+        assert_eq!(
+            setup.serving_relays(&tid(), resp.session),
+            vec![RelayId(2)],
+            "the dead relay is replaced in place in the serving set",
+        );
+
+        let staged = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].resumed, "a rehome descriptor resumes the session");
+        assert_eq!(
+            staged[0].departed_slots, departed,
+            "the seeded departure rides it"
+        );
+        assert_eq!(staged[0].authority_order, vec![RelayId(2)]);
+    }
+
+    #[test]
+    fn rehome_prefers_a_relay_already_serving_the_session() {
+        // Relays 1 (home), 2 (dev-split secondary), and 3 (live but idle). The home
+        // dies; the replacement must be relay 2 — already serving the session — not
+        // the idle relay 3, even though 3 is a lower id than any non-serving pick
+        // would otherwise use.
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 1, 14900);
+        enroll_relay(&reg, 2, 14901);
+        enroll_relay(&reg, 3, 14902);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        // serving == {1, 2}; kill the home relay 1.
+        registry::remove(setup.registry(), RelayId(1));
+
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            endpoint.relay_id,
+            RelayId(2),
+            "a live relay already serving the session is preferred over an idle one",
+        );
+    }
+
+    #[test]
+    fn rehome_is_idempotent_for_the_same_dead_relay() {
+        // A concurrent/repeated re-home naming the same dead relay returns the same
+        // target and does not re-mutate the serving set.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+
+        let first = rehome(&setup, &tid(), resp.session, RelayId(1), vec![]);
+        let second = rehome(&setup, &tid(), resp.session, RelayId(1), vec![]);
+        assert_eq!(first, second, "a repeat rehome returns the same target");
+        assert!(matches!(first, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2)));
+        assert_eq!(
+            setup.serving_relays(&tid(), resp.session),
+            vec![RelayId(2)],
+            "a repeat rehome did not further mutate the serving set",
+        );
+    }
+
+    #[test]
+    fn rehome_unavailable_for_an_unknown_session() {
+        // The dead relay is gone (else the stay-guard short-circuits); an unknown
+        // session has no serving set to move.
+        let setup = setup_with_two_relays_and_tenant();
+        registry::remove(setup.registry(), RelayId(1));
+        assert_eq!(
+            rehome(&setup, &tid(), SessionId(999_999), RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
+        );
+    }
+
+    #[test]
+    fn rehome_unavailable_when_no_relay_can_take_over() {
+        // Every relay has left the registry, so there is nobody to move the session
+        // to.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+        registry::remove(setup.registry(), RelayId(2));
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
         );
     }
 }

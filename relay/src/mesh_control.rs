@@ -285,6 +285,21 @@ impl MeshControl {
             descriptor.expected_slots.iter().copied().collect(),
         );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
+        // A rehome descriptor (coordinator-mediated failover) resumes an
+        // already-running session onto this relay. Seed the departures the
+        // coordinator already knows about as already-decided leaves — a fresh
+        // relay has no mesh peer to replay their `SlotDeparted` from — so the
+        // desync comparator, the coverage check, and any later promotion
+        // re-broadcast treat them exactly like mesh-learned ones. Then latch the
+        // session started, so this relay never waits on the full expected set
+        // (which still lists the departed slots that will never dial) and never
+        // re-fires the session-start machinery session-wide.
+        if descriptor.resumed {
+            for departed in &descriptor.departed_slots {
+                consensus::seed_departed(&self.decision_makers, &key, departed.slot, departed.kind);
+            }
+            consensus::mark_session_started(&self.decision_makers, &key);
+        }
         // A descriptor push that promotes this relay to authority (the
         // coordinator dropped the former authority from the order) may make this
         // relay the one to observe full slot presence — re-evaluate and fire the
@@ -466,7 +481,9 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
-    use rally_point_proto::control::{BufferBounds, RelayPeer, SlotExternalRef, TenantId};
+    use rally_point_proto::control::{
+        BufferBounds, DepartedSlot, DepartureKind, RelayPeer, SlotExternalRef, TenantId,
+    };
     use rally_point_proto::ids::{SessionId, SlotId};
 
     const TENANT: &str = "sb-test";
@@ -497,6 +514,8 @@ mod tests {
             slot_refs: vec![],
             observer_slots: vec![],
             expected_slots: vec![],
+            resumed: false,
+            departed_slots: vec![],
         }
     }
 
@@ -975,6 +994,66 @@ mod tests {
         assert!(
             makers.lock().get(&key(1)).unwrap().is_authority(),
             "a re-push recomputes against known presence, not from scratch",
+        );
+    }
+
+    #[test]
+    fn a_resumed_descriptor_latches_started_and_seeds_departures() {
+        // A rehome descriptor: it resumes an already-running session onto this fresh
+        // relay, expecting slots {0, 1} with slot 1 already departed. The relay must
+        // latch the session started (never wait on the full expected set, which lists
+        // the departed slot that will never dial) and record the departure as already
+        // decided.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        desc.resumed = true;
+        desc.departed_slots = vec![DepartedSlot {
+            slot: SlotId(1),
+            kind: DepartureKind::Dropped,
+        }];
+        control.apply_descriptor(&desc);
+
+        {
+            let registry = makers.lock();
+            let maker = registry.get(&key(1)).expect("a maker was created");
+            assert!(
+                maker.is_authority(),
+                "a single-relay rehome session is its own authority",
+            );
+            assert!(
+                maker.is_started(),
+                "a resumed descriptor latches the session started",
+            );
+            assert!(
+                !maker.has_undecided_departure(),
+                "the seeded departure is recorded as already decided",
+            );
+        }
+
+        // Because the session is already started, a slot registering does not fire a
+        // fresh session-wide start (the authority never re-covers the expected set).
+        assert!(
+            !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+            "an already-started session fires no fresh session-wide start directive",
+        );
+    }
+
+    #[test]
+    fn a_non_resumed_descriptor_leaves_the_session_not_started() {
+        // The ordinary (non-rehome) path: without `resumed`, the session is not
+        // latched started, so the normal start-on-coverage flow still governs it.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        control.apply_descriptor(&desc);
+        let registry = makers.lock();
+        assert!(
+            !registry.get(&key(1)).unwrap().is_started(),
+            "a fresh descriptor does not latch the session started",
         );
     }
 

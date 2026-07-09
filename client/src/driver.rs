@@ -61,7 +61,9 @@
 //! draining, so the inbound buffer fills) or hands over an undeliverable turn.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -509,9 +511,31 @@ impl LinkDriver {
     /// ([`DriverError::TokenExpired`]), or a non-link failure the loop can't fix (a
     /// stalled game, an exhausted unacked window).
     pub async fn run_reconnecting(self, reconnect: Reconnect) -> Result<(), DriverError> {
+        let Reconnect {
+            endpoint,
+            relay_addr,
+            server_name,
+            identity,
+            rehome,
+            escalate_after,
+            escalate_retry,
+        } = reconnect;
         // The driver knows its own slot from its token; it labels the
         // self-connectivity signal with it.
-        let own_slot = reconnect.identity.token().claims.slot;
+        let own_slot = identity.token().claims.slot;
+        // The reconnect machinery, its target mutable so a successful re-home moves
+        // where subsequent drops reconnect to.
+        let mut rc = ReconnectDriver {
+            target: ReconnectTarget {
+                endpoint,
+                relay_addr,
+                server_name,
+            },
+            identity,
+            rehome,
+            escalate_after: escalate_after.unwrap_or(ESCALATE_AFTER),
+            escalate_retry: escalate_retry.unwrap_or(ESCALATE_RETRY),
+        };
         let LinkDriver {
             mut link,
             outbound,
@@ -553,7 +577,7 @@ impl LinkDriver {
                 // A link/stream failure: keep the channels alive and re-dial.
                 Err(error) if is_link_failure(&error) => {
                     let _ = seam.connectivity.send((own_slot, false)).await;
-                    match reconnect_link(&reconnect, &mut link, &mut seam, &mut state, &mut backoff)
+                    match reconnect_link(&mut rc, &mut link, &mut seam, &mut state, &mut backoff)
                         .await
                     {
                         Reconnected::Resumed => {
@@ -621,6 +645,9 @@ impl LinkDriver {
             next_outbound_seq,
             announcer,
             outbound_buffer,
+            game_started,
+            retention,
+            retention_bytes,
         } = state;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -686,6 +713,9 @@ impl LinkDriver {
         for mut buffered in std::mem::take(outbound_buffer) {
             buffered.seq = *next_outbound_seq;
             *next_outbound_seq += 1;
+            // Retain a copy for a possible re-home re-injection before the turn is
+            // handed to the link (which moves it).
+            retain_sent(retention, retention_bytes, &buffered);
             if link.payload_fits(&buffered)? {
                 match send_packet(link, Some(buffered)) {
                     Ok(carried_redundancy) => {
@@ -902,6 +932,10 @@ impl LinkDriver {
                         // authority handoff) is idempotent for the game. Dropping it
                         // (game gone) is a clean shutdown.
                         Some(ControlInbound::SessionStart) => {
+                            // The game has started: from here a dead home relay may
+                            // escalate to coordinator-mediated failover. Latched, and
+                            // kept across reconnects via the persistent state.
+                            *game_started = true;
                             if session_start.send(()).await.is_err() {
                                 return Ok(());
                             }
@@ -986,6 +1020,9 @@ impl LinkDriver {
                             // sole authority for its own slot's production order.
                             payload.seq = *next_outbound_seq;
                             *next_outbound_seq += 1;
+                            // Retain a copy for a possible re-home re-injection before
+                            // the turn is handed to the link (which moves it).
+                            retain_sent(retention, retention_bytes, &payload);
                             if link.payload_fits(&payload)? {
                                 let carried_redundancy = match send_packet(link, Some(payload)) {
                                     Ok(carried_redundancy) => carried_redundancy,
@@ -1372,6 +1409,32 @@ const RECONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// turn is dropped (with a warning) rather than let the buffer grow without bound.
 const OUTAGE_OUTBOUND_BUFFER_CAP: usize = 256;
 
+/// How many of this client's own recently-sent turns the retention ring keeps for
+/// re-injection after a re-home. Independent of ack retirement — a turn the old
+/// relay acked is dropped from the unacked window but kept here — so the ring can
+/// re-carry it to a replacement relay whose turn ring is empty. A few times the
+/// deepest realistic latency buffer; the byte cap ([`RETENTION_BYTE_CAP`]) bounds it
+/// too, so an oversize turn can't blow the memory budget.
+const RETENTION_TURN_CAP: usize = 512;
+
+/// The byte ceiling on the retention ring, enforced alongside
+/// [`RETENTION_TURN_CAP`] so a run of large turns can't grow it past this even
+/// under the turn cap. 256 KiB comfortably holds 512 ordinary (tens-of-bytes)
+/// turns and still bounds a pathological run of near-MTU ones.
+const RETENTION_BYTE_CAP: usize = 256 * 1024;
+
+/// How long a run of failed same-relay re-dials must persist before the driver
+/// escalates to coordinator-mediated failover (asking the [`RehomeProvider`] where
+/// to move). A cert/pin rejection — a restarted relay serving a fresh cert —
+/// escalates immediately instead, since no same-relay retry can ever succeed.
+const ESCALATE_AFTER: Duration = Duration::from_secs(10);
+
+/// How often the driver re-escalates while the provider keeps answering
+/// `Unavailable` (no relay can take the session over yet) or a re-home dial keeps
+/// failing — the coordinator may gain a relay, so the driver re-asks on this
+/// cadence while continuing its same-relay backoff in between.
+const ESCALATE_RETRY: Duration = Duration::from_secs(15);
+
 /// The driver's half of the game seam: the channels a [`LinkDriver`] owns to
 /// exchange turns and control with the game thread. Bundled so a session runs over
 /// them by reference and they outlive a reconnect that swaps the underlying link.
@@ -1413,6 +1476,20 @@ struct LoopState {
     /// Turns the game produced while the link was down, flushed in order when the
     /// next session comes up.
     outbound_buffer: VecDeque<Payload>,
+    /// Whether the relay's `SessionStart` directive has passed through the driver —
+    /// the game has started. Gates escalation to coordinator-mediated failover: the
+    /// driver only ever re-homes an in-game session, never a still-forming lobby.
+    /// Latched once and kept across reconnects.
+    game_started: bool,
+    /// A ring of this client's own recently-sent turns, retained for re-injection
+    /// after a **re-home** so a replacement relay's empty turn ring still fans them
+    /// out to peers. Bounded by [`RETENTION_TURN_CAP`] and [`RETENTION_BYTE_CAP`],
+    /// drop-oldest — independent of ack retirement (a turn the old relay acked is
+    /// dropped from the unacked window but stays here). Persisted across reconnects.
+    retention: VecDeque<Payload>,
+    /// The running encoded-byte total of [`retention`](Self::retention), so the
+    /// byte cap is enforced without re-summing the ring on every push.
+    retention_bytes: usize,
 }
 
 impl LoopState {
@@ -1423,8 +1500,90 @@ impl LoopState {
             next_outbound_seq: 0,
             announcer: LeaveAnnouncer::new(result_expected),
             outbound_buffer: VecDeque::new(),
+            game_started: false,
+            retention: VecDeque::new(),
+            retention_bytes: 0,
         }
     }
+}
+
+/// Records one of this client's own sent turns into the retention ring, evicting
+/// the oldest turns until both the turn-count and byte caps hold. Called for every
+/// turn the driver sends for its own slot (datagram or diverted), so a re-home can
+/// re-inject them onto a replacement relay whose turn ring is empty.
+fn retain_sent(retention: &mut VecDeque<Payload>, retention_bytes: &mut usize, payload: &Payload) {
+    retention.push_back(payload.clone());
+    *retention_bytes += retained_size(payload);
+    while retention.len() > RETENTION_TURN_CAP
+        || (*retention_bytes > RETENTION_BYTE_CAP && retention.len() > 1)
+    {
+        if let Some(dropped) = retention.pop_front() {
+            *retention_bytes = retention_bytes.saturating_sub(retained_size(&dropped));
+        } else {
+            break;
+        }
+    }
+}
+
+/// The size a retained turn counts against [`RETENTION_BYTE_CAP`]: its command
+/// bytes (the variable bulk) plus a fixed allowance for the small fixed fields.
+/// An estimate, not the exact encoded length — the byte cap is a memory safety
+/// bound, so an approximation that avoids pulling a prost dependency into the lib
+/// is enough.
+fn retained_size(payload: &Payload) -> usize {
+    payload.commands.len() + 32
+}
+
+/// The embedder's answer to "where should this session re-home?" — the outcome a
+/// [`RehomeProvider`] returns when the driver escalates a dead home relay to
+/// coordinator-mediated failover.
+///
+/// The embedder does the coordinator round-trip and the cert pinning; the driver
+/// never touches certs. A [`NewTarget`](Self::NewTarget) hands back a fresh
+/// [`ClientEndpoint`] whose trust roots pin the *new* relay's cert — the driver
+/// just dials it with the same identity and resume cursors.
+pub enum RehomeOutcome {
+    /// Move the session to a new relay: dial `endpoint` at `relay_addr` (TLS
+    /// `server_name`) with the same identity and resume cursors. The embedder built
+    /// `endpoint` with the replacement relay's pinned cert.
+    NewTarget {
+        /// The endpoint to dial the replacement relay from — its trust roots pin the
+        /// new relay's cert.
+        endpoint: ClientEndpoint,
+        /// The replacement relay's address.
+        relay_addr: SocketAddr,
+        /// The replacement relay's TLS server name.
+        server_name: String,
+    },
+    /// The coordinator says the named relay is in fact still live: keep dialing it,
+    /// resuming the same-relay backoff (the escalation window resets).
+    Stay,
+    /// No live relay can take the session over yet (or the session is unknown to the
+    /// coordinator). Keep the same-relay backoff and let the driver re-ask on the
+    /// [`ESCALATE_RETRY`] cadence.
+    Unavailable,
+}
+
+/// A boxed future a [`RehomeProvider::rehome`] returns — the manual async-trait
+/// shape, so the crate needs no proc-macro dependency and the DLL implements the
+/// trait with a plain `Box::pin(async move { … })`.
+pub type RehomeFuture<'a> = Pin<Box<dyn Future<Output = RehomeOutcome> + Send + 'a>>;
+
+/// An embedder-supplied hook the driver calls when its home relay looks dead and
+/// reconnection should escalate to coordinator-mediated failover.
+///
+/// The driver calls [`rehome`](Self::rehome) only once the game has started (it
+/// tracks the relay's `SessionStart` directive itself) and only after same-relay
+/// re-dials have failed long enough — immediately on a cert/pin rejection (a
+/// restarted relay serving a fresh cert), otherwise after [`ESCALATE_AFTER`]. The
+/// implementation is where the embedder enforces "only once the game has started"
+/// as well, does the coordinator `POST /session/rehome` round-trip, and — for a
+/// [`RehomeOutcome::NewTarget`] — builds the fresh [`ClientEndpoint`] pinning the
+/// replacement relay's cert. The driver never constructs certs.
+pub trait RehomeProvider: Send + Sync {
+    /// Resolves where the session should re-home. Called at most on the escalation
+    /// cadence, never on the hot path.
+    fn rehome(&self) -> RehomeFuture<'_>;
 }
 
 /// What a [`LinkDriver`] needs to re-dial its home relay itself, so
@@ -1443,6 +1602,41 @@ pub struct Reconnect {
     /// subject of the self-connectivity signal) and bounds how long reconnection is
     /// attempted — an expired token ends the loop.
     pub identity: Identity,
+    /// The coordinator-mediated failover hook. `None` disables re-home escalation:
+    /// the driver only ever retries the *same* relay (the pre-failover behavior).
+    /// `Some` enables escalation to a replacement relay when the home relay stays
+    /// unreachable (see [`RehomeProvider`]).
+    pub rehome: Option<Arc<dyn RehomeProvider>>,
+    /// How long same-relay re-dials must keep failing before the driver escalates to
+    /// the re-home provider. `None` uses [`ESCALATE_AFTER`]; set it only to tune the
+    /// escalation aggressiveness (or shorten it in a test). A cert/pin rejection
+    /// escalates immediately regardless.
+    pub escalate_after: Option<Duration>,
+    /// How often the driver re-escalates while the provider answers `Unavailable` or
+    /// a re-home dial keeps failing. `None` uses [`ESCALATE_RETRY`].
+    pub escalate_retry: Option<Duration>,
+}
+
+/// The current re-dial target, mutable across sessions so a successful re-home
+/// updates where subsequent drops reconnect to (the old relay is dead). The
+/// identity and the [`RehomeProvider`] stay fixed for the driver's life; only the
+/// endpoint/address/name move.
+struct ReconnectTarget {
+    endpoint: ClientEndpoint,
+    relay_addr: SocketAddr,
+    server_name: String,
+}
+
+/// The reconnect machinery [`run_reconnecting`](LinkDriver::run_reconnecting) owns
+/// across a session's life: the current (mutable) re-dial target plus the fixed
+/// credentials, re-home hook, and escalation timing. Bundled so `reconnect_link`
+/// takes it as one argument.
+struct ReconnectDriver {
+    target: ReconnectTarget,
+    identity: Identity,
+    rehome: Option<Arc<dyn RehomeProvider>>,
+    escalate_after: Duration,
+    escalate_retry: Duration,
 }
 
 /// The per-slot resume cursors to present on a reconnect: for each peer slot the
@@ -1484,22 +1678,42 @@ enum Reconnected {
     GameGone,
 }
 
-/// Re-dials the home relay until the link is re-established, the game leaves, or a
-/// terminal refusal. Backs off between attempts (buffering any turns the game
-/// produces meanwhile and noticing a teardown), presents the resume cursors, and on
-/// success rebinds `link` in place so the receive dedup and unacked window carry
-/// over. A slot-departed refusal or an expired token ends it terminally; every other
-/// dial failure is retried under a growing backoff.
+/// Re-dials until the link is re-established, the game leaves, or a terminal
+/// refusal — retrying the same relay, and escalating to coordinator-mediated
+/// failover (the [`RehomeProvider`]) when it stays unreachable.
+///
+/// Backs off between attempts (buffering any turns the game produces meanwhile and
+/// noticing a teardown), presents the resume cursors, and on success rebinds `link`
+/// in place so the receive dedup and unacked window carry over. A slot-departed
+/// refusal or an expired token ends it terminally; every other dial failure is
+/// retried under a growing backoff.
+///
+/// **Escalation.** Once the game has started (`state.game_started`) and a
+/// [`RehomeProvider`] is configured, a run of failed same-relay dials escalates to
+/// the provider — immediately on a cert/pin rejection (a restarted relay serving a
+/// fresh cert, which no same-relay retry can pass), otherwise after
+/// [`ESCALATE_AFTER`]. [`RehomeOutcome::Stay`] resumes the same-relay backoff and
+/// resets the window; [`RehomeOutcome::Unavailable`] keeps it and re-escalates on
+/// the [`ESCALATE_RETRY`] cadence; [`RehomeOutcome::NewTarget`] dials the
+/// replacement relay with the same identity and cursors, and on success rebinds,
+/// re-injects the retained turns, and updates `target` so subsequent drops
+/// reconnect there.
 async fn reconnect_link(
-    reconnect: &Reconnect,
+    rc: &mut ReconnectDriver,
     link: &mut Link,
     seam: &mut GameSeam,
     state: &mut LoopState,
     backoff: &mut Backoff,
 ) -> Reconnected {
+    // When escalation to the re-home provider is next due. It starts one window out
+    // and is pulled to now on the first cert/pin rejection; each escalation advances
+    // it, so continuous failures escalate on a bounded cadence, not every attempt.
+    let mut next_escalate_at = Instant::now() + rc.escalate_after;
+    let mut escalated_once = false;
+
     loop {
         // An expired token can never re-authorize: stop before wasting a dial.
-        if token_expired(&reconnect.identity) {
+        if token_expired(&rc.identity) {
             return Reconnected::Terminal(DriverError::TokenExpired);
         }
         match wait_backoff(backoff, seam, state).await {
@@ -1507,20 +1721,22 @@ async fn reconnect_link(
             WaitOutcome::GameGone => return Reconnected::GameGone,
         }
         let cursors = resume_cursors(&state.next_seq);
-        match reconnect
+        match rc
+            .target
             .endpoint
             .reconnect_with_timeout(
-                reconnect.relay_addr,
-                &reconnect.server_name,
-                &reconnect.identity,
+                rc.target.relay_addr,
+                &rc.target.server_name,
+                &rc.identity,
                 &cursors,
                 RECONNECT_DIAL_TIMEOUT,
             )
             .await
         {
             Ok(fresh) => {
-                // Adopt only the new connection; the old link's receive dedup and
-                // unacked window carry over, turning the re-dial into a resume.
+                // A same-relay resume: the old link's receive dedup and unacked
+                // window carry over. No retention re-injection — the same relay
+                // still holds this session's turn ring.
                 link.rebind(fresh.connection().clone());
                 backoff.reset();
                 return Reconnected::Resumed;
@@ -1529,13 +1745,115 @@ async fn reconnect_link(
             Err(DialError::SlotDeparted) => {
                 return Reconnected::Terminal(DriverError::SlotDeparted);
             }
-            // Any transient failure (a timeout, a lost connection, a slot still held
-            // by a not-yet-reaped previous connection): back off further and retry.
+            // A transient same-relay failure. Retry, and — for an in-game session
+            // with a provider — escalate to coordinator-mediated failover when the
+            // relay stays unreachable.
             Err(error) => {
+                // Clone the provider handle out so the escalation block can mutate
+                // `rc.target` without holding a borrow of `rc.rehome` across it.
+                let provider = rc.rehome.clone();
+                if let Some(provider) = provider
+                    && state.game_started
+                {
+                    // A cert/pin rejection can never be cured by a same-relay retry,
+                    // so escalate at once rather than waiting out the timed window.
+                    if !escalated_once && is_cert_rejection(&error) {
+                        next_escalate_at = Instant::now();
+                    }
+                    if Instant::now() >= next_escalate_at {
+                        escalated_once = true;
+                        match provider.rehome().await {
+                            RehomeOutcome::Stay => {
+                                // The relay is live after all: resume same-relay
+                                // backoff, resetting the escalation window.
+                                next_escalate_at = Instant::now() + rc.escalate_after;
+                                tracing::info!("re-home escalation: coordinator says stay");
+                            }
+                            RehomeOutcome::Unavailable => {
+                                next_escalate_at = Instant::now() + rc.escalate_retry;
+                                tracing::info!(
+                                    "re-home escalation: no relay available yet; re-asking later",
+                                );
+                            }
+                            RehomeOutcome::NewTarget {
+                                endpoint,
+                                relay_addr,
+                                server_name,
+                            } => match endpoint
+                                .reconnect_with_timeout(
+                                    relay_addr,
+                                    &server_name,
+                                    &rc.identity,
+                                    &cursors,
+                                    RECONNECT_DIAL_TIMEOUT,
+                                )
+                                .await
+                            {
+                                Ok(fresh) => {
+                                    // A re-home resume onto a fresh relay: rebind, then
+                                    // re-inject the retained turns so the new relay's
+                                    // empty ring re-carries them to peers.
+                                    link.rebind(fresh.connection().clone());
+                                    reinject_retention(link, state);
+                                    rc.target = ReconnectTarget {
+                                        endpoint,
+                                        relay_addr,
+                                        server_name,
+                                    };
+                                    backoff.reset();
+                                    tracing::info!(
+                                        relay = %relay_addr,
+                                        "re-homed onto a replacement relay",
+                                    );
+                                    return Reconnected::Resumed;
+                                }
+                                Err(DialError::SlotDeparted) => {
+                                    return Reconnected::Terminal(DriverError::SlotDeparted);
+                                }
+                                Err(new_error) => {
+                                    next_escalate_at = Instant::now() + rc.escalate_retry;
+                                    tracing::info!(
+                                        %new_error,
+                                        "re-home dial failed; retrying the old relay meanwhile",
+                                    );
+                                }
+                            },
+                        }
+                    }
+                }
                 tracing::info!(%error, "re-dial attempt failed; backing off");
             }
         }
     }
+}
+
+/// Re-injects the retained turns onto a freshly re-homed link so the replacement
+/// relay's empty turn ring re-carries them to peers (each deduping by origin
+/// `(slot, seq)`). Only ever called on a re-home — a same-relay resume keeps the
+/// old relay's ring, so there is nothing to re-inject.
+fn reinject_retention(link: &mut Link, state: &LoopState) {
+    for turn in &state.retention {
+        link.reinject_unacked(turn.clone());
+    }
+}
+
+/// Best-effort classification of a dial failure as a TLS certificate / pin
+/// rejection — a relay that restarted with a fresh keypair, which no same-relay
+/// retry can ever get past, so escalation need not wait out the timed window. It
+/// inspects the crypto-handshake markers quinn/rustls surface; a miss only defers
+/// escalation to the [`ESCALATE_AFTER`] fallback rather than breaking it, so the
+/// classifier is deliberately conservative.
+fn is_cert_rejection(error: &DialError) -> bool {
+    if !matches!(error, DialError::Connection(_)) {
+        return false;
+    }
+    let text = error.to_string().to_lowercase();
+    text.contains("certificate")
+        || text.contains("crypto")
+        || text.contains("tls")
+        || text.contains("handshake")
+        || text.contains("unknownissuer")
+        || text.contains("bad_certificate")
 }
 
 /// The outcome of a backoff wait between reconnect attempts.

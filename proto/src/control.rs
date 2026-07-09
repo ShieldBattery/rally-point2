@@ -503,6 +503,41 @@ pub struct SessionDescriptor {
     /// exactly like `observer_slots`. Defaults empty for backward compatibility.
     #[serde(default)]
     pub expected_slots: Vec<SlotId>,
+    /// Whether this descriptor re-homes an **already-running** session onto the
+    /// relay (coordinator-mediated failover). A relay that receives a `resumed`
+    /// descriptor treats the session as already started: it seeds the started
+    /// latch rather than waiting for the full [`expected_slots`](Self::expected_slots)
+    /// set to connect, so it never stalls on a departed slot that will never dial
+    /// and never re-fires the session-start machinery session-wide. A fresh
+    /// (non-rehome) descriptor leaves this `false`, so the normal start-on-coverage
+    /// path runs unchanged. Defaults `false` for a descriptor from a coordinator
+    /// that predates the field.
+    #[serde(default)]
+    pub resumed: bool,
+    /// The slots the coordinator already knows have departed this session, each
+    /// with the relay's left-vs-dropped classification. Carried only on a
+    /// rehome-rebuilt descriptor (see [`resumed`](Self::resumed)): a fresh relay
+    /// taking over a running session has no mesh peer to replay `SlotDeparted`
+    /// records from, so the coordinator seeds the already-decided departures here.
+    /// The relay records each as a decided leave, so its comparator, coverage
+    /// check, and promotion re-broadcast all treat a coordinator-seeded departure
+    /// exactly like a mesh-learned one. Defaults empty for a non-rehome descriptor
+    /// (or a coordinator that predates the field).
+    #[serde(default)]
+    pub departed_slots: Vec<DepartedSlot>,
+}
+
+/// One slot the coordinator has recorded as departed, carried in a rehome-rebuilt
+/// [`SessionDescriptor::departed_slots`] so a fresh relay taking over a running
+/// session can seed the already-decided departure. Mirrors [`SlotExternalRef`]'s
+/// shape (a slot plus one datum) rather than a bare tuple, so the wire form stays
+/// a self-describing JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepartedSlot {
+    /// The slot that departed.
+    pub slot: SlotId,
+    /// The relay's left-vs-dropped classification for the departure.
+    pub kind: DepartureKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +949,8 @@ mod tests {
                 slot_refs: vec![],
                 observer_slots: vec![],
                 expected_slots: vec![],
+                resumed: false,
+                departed_slots: vec![],
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -1033,10 +1070,62 @@ mod tests {
             }],
             observer_slots: vec![SlotId(1)],
             expected_slots: vec![SlotId(0), SlotId(1)],
+            resumed: true,
+            departed_slots: vec![DepartedSlot {
+                slot: SlotId(2),
+                kind: DepartureKind::Dropped,
+            }],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(back, desc);
+    }
+
+    #[test]
+    fn session_descriptor_without_rehome_fields_decodes_to_defaults() {
+        // A descriptor from a coordinator that predates the rehome fields must
+        // still decode: `resumed` defaults false and `departed_slots` empty, so
+        // the normal start-on-coverage path runs unchanged.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6}
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert!(
+            !back.resumed,
+            "a descriptor that predates rehome is not resumed"
+        );
+        assert!(back.departed_slots.is_empty());
+    }
+
+    #[test]
+    fn session_descriptor_with_rehome_fields_decodes_them() {
+        // A rehome-rebuilt descriptor: `resumed` and the seeded departed slots
+        // round-trip verbatim so a fresh relay taking over the session can seed
+        // its consensus with the already-decided departures.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6},
+            "resumed":true,
+            "departed_slots":[{"slot":1,"kind":"left"},{"slot":3,"kind":"dropped"}]
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert!(back.resumed);
+        assert_eq!(
+            back.departed_slots,
+            vec![
+                DepartedSlot {
+                    slot: SlotId(1),
+                    kind: DepartureKind::Left,
+                },
+                DepartedSlot {
+                    slot: SlotId(3),
+                    kind: DepartureKind::Dropped,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -1055,6 +1144,8 @@ mod tests {
             slot_refs: vec![],
             observer_slots: vec![],
             expected_slots: vec![],
+            resumed: false,
+            departed_slots: vec![],
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("external_id"));

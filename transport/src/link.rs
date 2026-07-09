@@ -152,6 +152,18 @@ impl Link {
         }
     }
 
+    /// Re-registers a turn this client sent as still-unacked so the redundancy
+    /// pass re-carries it over the current connection, without sending a packet —
+    /// the re-inject half of a coordinator-mediated re-home. A replacement relay's
+    /// turn ring is empty, so turns the old relay already acked (retired from the
+    /// window) are re-injected here after a rehome [`rebind`](Self::rebind), letting
+    /// the next packet's redundancy carry them to the new relay, which fans them out
+    /// to peers (each deduping by origin `(slot, seq)`). A turn still in flight at
+    /// the drop is already unacked and left untouched.
+    pub fn reinject_unacked(&mut self, payload: Payload) {
+        self.acks.reinject_unacked(payload);
+    }
+
     /// Whether `payload` can ever ride a datagram on this link's current path:
     /// a packet carrying it alone, under worst-case header state, fits the live
     /// `max_datagram_size()`. The caller's pre-check for the divert-to-stream
