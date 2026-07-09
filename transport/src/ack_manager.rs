@@ -126,6 +126,23 @@ impl AckManager {
         self.packet_seq
     }
 
+    /// The lowest still-unacked payload seq for `slot`, or `None` if the slot has
+    /// nothing in flight.
+    ///
+    /// This is the oldest seq the redundancy pass will re-carry over a rebound
+    /// connection (it repacks the unacked window oldest-seq-first within each slot),
+    /// so it is exactly the lowest seq a peer will receive from this slot after a
+    /// same-relay resume. A fresh relay uses it to anchor that slot's receive window
+    /// there instead of at 0, so a session resumed past the window is accepted and
+    /// its delivered prefix advances from the resume point (see
+    /// [`Link::anchor_receive_window`](crate::Link::anchor_receive_window)).
+    pub fn oldest_unacked_seq(&self, slot: SlotId) -> Option<u64> {
+        self.unacked_payloads
+            .range((slot, u64::MIN)..=(slot, u64::MAX))
+            .next()
+            .map(|(&(_, seq), _)| seq)
+    }
+
     /// Builds the `ack_bits` field: bit `N` is set when the peer's packet
     /// `(most_recent - N - 1)` has been received.
     fn ack_bits(&self) -> u32 {
@@ -611,6 +628,27 @@ mod tests {
             .map(|p| (p.slot as u8, p.seq))
             .collect();
         assert_eq!(keys, vec![(0, 3), (0, 4)]);
+    }
+
+    #[test]
+    fn oldest_unacked_seq_is_the_lowest_in_flight_per_slot() {
+        let mut manager = AckManager::new();
+        // Nothing in flight yet.
+        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), None);
+
+        // No redundancy, so each payload rides one packet and stays in flight.
+        for seq in [7u64, 8, 9] {
+            manager.build_outgoing(Some(test_payload(0, seq)), 0);
+        }
+        manager.build_outgoing(Some(test_payload(1, 3)), 0);
+        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(7));
+        assert_eq!(manager.oldest_unacked_seq(SlotId(1)), Some(3));
+        // A slot with nothing in flight is still None.
+        assert_eq!(manager.oldest_unacked_seq(SlotId(2)), None);
+
+        // Retiring the oldest advances the answer to the next in flight.
+        manager.retire_payloads_through(SlotId(0), 7);
+        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(8));
     }
 
     #[test]

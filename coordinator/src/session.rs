@@ -228,12 +228,6 @@ pub fn rehome(
     dead_relay: RelayId,
     departed_slots: Vec<DepartedSlot>,
 ) -> RehomeOutcome {
-    // The named relay is still enrolled: the coordinator authoritatively knows it
-    // is alive, so overrule the client's belief and tell it to stay.
-    if registry::entry(&setup.registry, dead_relay).is_some() {
-        return RehomeOutcome::Stay;
-    }
-
     let key = (tenant.clone(), session);
     let serving = setup.serving_relays(tenant, session);
     // Unknown session (never created here, or a coordinator restart wiped its
@@ -244,19 +238,36 @@ pub fn rehome(
 
     let mut rehomes = setup.rehomes.lock();
 
-    // Idempotent: a prior rehome for this dead relay already chose a target.
-    // Return it verbatim as long as it is still live, without re-mutating.
+    // Idempotent / already-re-homed: a prior rehome for this dead relay already
+    // chose a target. Return it verbatim as long as that target is still live,
+    // without re-mutating. This lookup runs *before* the registry-liveness Stay
+    // check below on purpose: a dead relay can restart and re-enroll under a fresh
+    // cert, but a straggler client still pinned to its OLD cert (which this session
+    // already re-homed off) can never accept that new cert, so telling it to Stay
+    // would wedge it dialing a cert it can never pass. The recorded replacement is
+    // the honest answer for it.
     if let Some(&existing) = rehomes.get(&(tenant.clone(), session, dead_relay))
         && let Some(entry) = registry::entry(&setup.registry, existing)
     {
         return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
     }
 
-    // The named dead relay must actually be serving this session. It is not still
-    // enrolled (the stay-guard above ruled that out) and — checked here — it has no
-    // recorded rehome yet (the idempotency block above returned if it did), so if it
-    // is also not a member of the serving set, the client named a relay unrelated to
-    // its session. The in-place `retain`/reassign over the serving set below would
+    // The named relay is still enrolled *and* still serving this session: a genuine
+    // false alarm, so the coordinator authoritatively overrules the client's belief
+    // and tells it to stay. The serving-set guard is what distinguishes this from
+    // the already-re-homed straggler above: a relay that is enrolled but no longer
+    // in the serving set was moved off in a prior re-home (handled by the
+    // idempotency lookup), not a false alarm — falling into Stay there would pin the
+    // straggler to a relay this session no longer uses.
+    if serving.contains(&dead_relay) && registry::entry(&setup.registry, dead_relay).is_some() {
+        return RehomeOutcome::Stay;
+    }
+
+    // The named dead relay must actually be serving this session. It is not both
+    // enrolled and serving (the stay-guard above ruled that out) and — checked here
+    // — it has no recorded rehome yet (the idempotency block above returned if it
+    // did), so if it is also not a member of the serving set, the client named a
+    // relay unrelated to its session. The in-place `retain`/reassign over the serving set below would
     // then be a silent no-op, yet the function would still pick an `r_new`, re-push
     // `resumed` descriptors to the untouched (healthy) serving set, and record a
     // bogus idempotency entry. Refuse before any of that: the coordinator cannot
@@ -1495,6 +1506,39 @@ mod tests {
             setup.serving_relays(&tid(), resp.session),
             vec![RelayId(2)],
             "a repeat rehome did not further mutate the serving set",
+        );
+    }
+
+    #[test]
+    fn rehome_returns_the_recorded_target_after_the_dead_relay_re_enrolls() {
+        // A dead relay can restart and re-enroll under a fresh cert after a session
+        // has already re-homed off it. A straggler client still pinned to the OLD
+        // cert then asks to re-home the same dead relay id. It must get the recorded
+        // replacement (relay 2), not `Stay` — a `Stay` would pin it to relay 1's new
+        // cert, which its old pin can never accept, wedging it forever.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+
+        // The home relay 1 dies; the first client re-homes the group onto relay 2.
+        registry::remove(setup.registry(), RelayId(1));
+        let first = rehome(&setup, &tid(), resp.session, RelayId(1), vec![]);
+        assert!(
+            matches!(first, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2)),
+            "the first re-home moves the group to relay 2",
+        );
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(2)]);
+
+        // Relay 1 restarts and re-enrolls under a fresh cert.
+        enroll_relay(setup.registry(), 1, 14900);
+
+        // The straggler names the same dead relay 1. Even though relay 1 is enrolled
+        // again, the recorded re-home wins: it gets relay 2, not Stay.
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::NewTarget(RelayEndpoint::from(
+                &registry::entry(setup.registry(), RelayId(2)).unwrap()
+            )),
+            "the recorded replacement overrules the re-enrolled dead relay's liveness",
         );
     }
 

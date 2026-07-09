@@ -515,6 +515,7 @@ impl LinkDriver {
             endpoint,
             relay_addr,
             server_name,
+            relay_id,
             identity,
             rehome,
             escalate_after,
@@ -530,6 +531,7 @@ impl LinkDriver {
                 endpoint,
                 relay_addr,
                 server_name,
+                relay_id,
             },
             identity,
             rehome,
@@ -711,10 +713,10 @@ impl LinkDriver {
         // first sent — before the buffered live turns below, preserving seq order
         // (a retained turn's seq always precedes a turn produced during the outage).
         // Empty on a same-relay resume, which keeps the old relay's reliable state.
-        for turn in std::mem::take(pending_control_redivert) {
-            if let Err(error) = send_control_turn(&mut control_send, turn).await {
-                return announcer.absorb_link_close(Err(DriverError::from(error)));
-            }
+        if let Err(error) =
+            redivert_pending_control(&mut control_send, pending_control_redivert).await
+        {
+            return announcer.absorb_link_close(Err(DriverError::from(error)));
         }
         // Flush any turns the game produced while the link was down, in seq order,
         // before live turns resume. On a fresh dial the buffer is empty; on a
@@ -1442,12 +1444,24 @@ const RETENTION_BYTE_CAP: usize = 256 * 1024;
 /// escalates to coordinator-mediated failover (asking the [`RehomeProvider`] where
 /// to move). A cert/pin rejection — a restarted relay serving a fresh cert —
 /// escalates immediately instead, since no same-relay retry can ever succeed.
+///
+/// **Timing budget.** BW's native transport drops a silent peer after roughly 45s
+/// of stall, so a re-home must complete — coordinator round-trip plus a
+/// [`RECONNECT_DIAL_TIMEOUT`]-bounded dial — inside that window or the game gives up
+/// on the slot. The timed path spends ~10s here before the first escalation, then
+/// the provider's own HTTP timeout (embedder-owned — the DLL sizes it to cover the
+/// coordinator call), then a ≤3s dial: comfortably inside 45s. The cert/pin path
+/// skips the 10s wait entirely. The one way to blow the budget is a genuine
+/// "no live relay yet" stretch, where [`ESCALATE_RETRY`] re-asks every ~15s until
+/// one appears — there is nothing to re-home *to*, so the stall-drop is unavoidable.
 const ESCALATE_AFTER: Duration = Duration::from_secs(10);
 
 /// How often the driver re-escalates while the provider keeps answering
 /// `Unavailable` (no relay can take the session over yet) or a re-home dial keeps
 /// failing — the coordinator may gain a relay, so the driver re-asks on this
-/// cadence while continuing its same-relay backoff in between.
+/// cadence while continuing its same-relay backoff in between. Kept below the ~45s
+/// BW native stall-drop budget (see [`ESCALATE_AFTER`]) so a transiently-unavailable
+/// coordinator is re-asked at least twice before the game would give up on the slot.
 const ESCALATE_RETRY: Duration = Duration::from_secs(15);
 
 /// The driver's half of the game seam: the channels a [`LinkDriver`] owns to
@@ -1572,6 +1586,11 @@ pub enum RehomeOutcome {
     /// `server_name`) with the same identity and resume cursors. The embedder built
     /// `endpoint` with the replacement relay's pinned cert.
     NewTarget {
+        /// The replacement relay's id. The driver adopts this as its current relay
+        /// id only on a *successful* replacement dial, so the id it next passes to
+        /// [`RehomeProvider::rehome`] always names the relay the driver is actually
+        /// homed on — never a relay it merely tried and failed to reach.
+        relay_id: u64,
         /// The endpoint to dial the replacement relay from — its trust roots pin the
         /// new relay's cert.
         endpoint: ClientEndpoint,
@@ -1606,9 +1625,13 @@ pub type RehomeFuture<'a> = Pin<Box<dyn Future<Output = RehomeOutcome> + Send + 
 /// [`RehomeOutcome::NewTarget`] — builds the fresh [`ClientEndpoint`] pinning the
 /// replacement relay's cert. The driver never constructs certs.
 pub trait RehomeProvider: Send + Sync {
-    /// Resolves where the session should re-home. Called at most on the escalation
-    /// cadence, never on the hot path.
-    fn rehome(&self) -> RehomeFuture<'_>;
+    /// Resolves where the session should re-home, given the id of the relay the
+    /// driver believes is dead. The **driver owns** this id — it is the relay the
+    /// driver is currently homed on, seeded from [`Reconnect::relay_id`] and advanced
+    /// only on a successful re-home dial — so the embedder names it to the
+    /// coordinator verbatim rather than guessing its own current relay. Called at
+    /// most on the escalation cadence, never on the hot path.
+    fn rehome(&self, dead_relay_id: u64) -> RehomeFuture<'_>;
 }
 
 /// What a [`LinkDriver`] needs to re-dial its home relay itself, so
@@ -1623,6 +1646,11 @@ pub struct Reconnect {
     pub relay_addr: SocketAddr,
     /// The relay's TLS server name, checked against its certificate.
     pub server_name: String,
+    /// The home relay's id — seeds the reconnect target's current relay id. The
+    /// driver owns this id from here on, passing it to [`RehomeProvider::rehome`] as
+    /// the dead relay and advancing it only on a successful re-home dial, so the
+    /// provider never has to guess which relay the driver is homed on.
+    pub relay_id: u64,
     /// The credentials to re-authorize with. Its token names this client's slot (the
     /// subject of the self-connectivity signal) and bounds how long reconnection is
     /// attempted — an expired token ends the loop.
@@ -1650,6 +1678,11 @@ struct ReconnectTarget {
     endpoint: ClientEndpoint,
     relay_addr: SocketAddr,
     server_name: String,
+    /// The id of the relay this target dials — the driver's current relay id, passed
+    /// to [`RehomeProvider::rehome`] as the dead relay. Seeded from
+    /// [`Reconnect::relay_id`] and updated only on a successful re-home dial (never a
+    /// failed one), so it always names the relay the driver is actually homed on.
+    relay_id: u64,
 }
 
 /// The reconnect machinery [`run_reconnecting`](LinkDriver::run_reconnecting) owns
@@ -1730,6 +1763,11 @@ async fn reconnect_link(
     state: &mut LoopState,
     backoff: &mut Backoff,
 ) -> Reconnected {
+    // This client's own slot, from its token — the slot whose receive window every
+    // re-dial anchors on the (always fresh) relay-side link: the same-relay dial
+    // below anchors from the oldest-unacked seq, the re-home dial from the retention
+    // ring's front (see the NewTarget branch).
+    let own_slot = rc.identity.token().claims.slot;
     // When escalation to the re-home provider is next due. It starts one window out
     // and is pulled to now on the first cert/pin rejection; each escalation advances
     // it, so continuous failures escalate on a bounded cadence, not every attempt.
@@ -1746,6 +1784,24 @@ async fn reconnect_link(
             WaitOutcome::GameGone => return Reconnected::GameGone,
         }
         let cursors = resume_cursors(&state.next_seq);
+        // The relay builds a brand-new receive dedup on *every* re-dial (a fresh
+        // `Link` per connection), so a same-relay resume must anchor our own slot's
+        // window too — otherwise a game past ~4096 turns re-dials into an
+        // out-of-window rejection that closes the link. The anchor is the oldest seq
+        // we will actually re-send: the AckManager's oldest still-unacked seq, which
+        // the redundancy pass re-carries oldest-first over the rebound connection.
+        // With nothing unacked, it is the next seq we will produce (the buffered/live
+        // turns that flush on resume). NOT the retention ring's front — a same-relay
+        // resume does not re-inject that ring, so a lower anchor would strand a
+        // permanent prefix gap. (`cursors` stays peer-only; the re-home dial builds
+        // its own set below with the retention-front anchor, which it *does* re-inject.)
+        let same_relay_anchor = link
+            .oldest_unacked_seq(own_slot)
+            .unwrap_or(state.next_outbound_seq);
+        let mut same_relay_cursors = cursors.clone();
+        if same_relay_anchor > 0 {
+            same_relay_cursors.push((own_slot, same_relay_anchor));
+        }
         match rc
             .target
             .endpoint
@@ -1753,7 +1809,7 @@ async fn reconnect_link(
                 rc.target.relay_addr,
                 &rc.target.server_name,
                 &rc.identity,
-                &cursors,
+                &same_relay_cursors,
                 RECONNECT_DIAL_TIMEOUT,
             )
             .await
@@ -1787,7 +1843,9 @@ async fn reconnect_link(
                     }
                     if Instant::now() >= next_escalate_at {
                         escalated_once = true;
-                        match provider.rehome().await {
+                        // The driver owns the current relay id: name the relay it is
+                        // actually homed on as the dead one, never a guess.
+                        match provider.rehome(rc.target.relay_id).await {
                             RehomeOutcome::Stay => {
                                 // The relay is live after all: resume same-relay
                                 // backoff, resetting the escalation window.
@@ -1801,15 +1859,32 @@ async fn reconnect_link(
                                 );
                             }
                             RehomeOutcome::NewTarget {
+                                relay_id,
                                 endpoint,
                                 relay_addr,
                                 server_name,
-                            } => match endpoint
+                            } => {
+                            // The replacement relay has never seen this client, so
+                            // its receive-side dedup for our own slot would base at
+                            // seq 0 and reject our resumed (already high) seq stream
+                            // once it passed the window — dropping the link, and with
+                            // every re-homed slot crossing the window together, the
+                            // whole group. Declare our own-slot resume anchor: the
+                            // oldest seq the retention ring will re-inject, so the
+                            // relay bases the window there and the resumed stream is
+                            // accepted. Empty retention means nothing to re-send, so
+                            // no anchor is needed (the window bases at 0, correct for
+                            // a slot that never sent a turn).
+                            let mut rehome_cursors = cursors.clone();
+                            if let Some(front) = state.retention.front() {
+                                rehome_cursors.push((own_slot, front.seq));
+                            }
+                            match endpoint
                                 .reconnect_with_timeout(
                                     relay_addr,
                                     &server_name,
                                     &rc.identity,
-                                    &cursors,
+                                    &rehome_cursors,
                                     RECONNECT_DIAL_TIMEOUT,
                                 )
                                 .await
@@ -1817,13 +1892,17 @@ async fn reconnect_link(
                                 Ok(fresh) => {
                                     // A re-home resume onto a fresh relay: rebind, then
                                     // re-inject the retained turns so the new relay's
-                                    // empty ring re-carries them to peers.
+                                    // empty ring re-carries them to peers. Only now —
+                                    // on a *successful* dial — does the driver adopt
+                                    // the new relay id, so a failed dial never leaves
+                                    // it naming a relay it isn't homed on.
                                     link.rebind(fresh.connection().clone());
                                     reinject_retention(link, state);
                                     rc.target = ReconnectTarget {
                                         endpoint,
                                         relay_addr,
                                         server_name,
+                                        relay_id,
                                     };
                                     backoff.reset();
                                     tracing::info!(
@@ -1842,7 +1921,8 @@ async fn reconnect_link(
                                         "re-home dial failed; retrying the old relay meanwhile",
                                     );
                                 }
-                            },
+                            }
+                            }
                         }
                     }
                 }
@@ -1868,6 +1948,30 @@ async fn reconnect_link(
 /// stream — the same divert path an oversize turn takes when first sent. A path
 /// that can't currently size a datagram is treated as oversize, so the turn is
 /// re-carried reliably rather than risk being lost.
+/// Drains the retained oversize turns a re-home staged for the fresh connection's
+/// control stream onto `control_send`, oldest-first — the same divert path an
+/// oversize turn takes when first sent.
+///
+/// Each turn is removed from `pending` only *after* its send succeeds, so if the
+/// stream fails partway (the fresh connection dropped again) the unsent remainder
+/// stays staged and the next session over the re-dialed link retries it. Draining
+/// with a `mem::take` up front would instead move the whole batch out and drop the
+/// unsent tail on a mid-batch failure — and a later same-relay resume does not
+/// re-run [`reinject_retention`], so those oversize turns would be lost for good,
+/// permanently stalling a peer that never received them from the dead relay on that
+/// seq. The clone is cheap next to that risk (these turns are rare and the batch
+/// tiny), and paid only while turns remain to send.
+async fn redivert_pending_control(
+    control_send: &mut quinn::SendStream,
+    pending: &mut Vec<Payload>,
+) -> Result<(), ControlSendError> {
+    while let Some(turn) = pending.first().cloned() {
+        send_control_turn(control_send, turn).await?;
+        pending.remove(0);
+    }
+    Ok(())
+}
+
 fn reinject_retention(link: &mut Link, state: &mut LoopState) {
     let LoopState {
         retention,
@@ -2208,6 +2312,59 @@ mod tests {
                 );
             }
             other => panic!("expected an oversize turn on the control stream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_oversize_turns_survive_a_control_stream_send_failure_and_deliver_on_retry() {
+        // A re-home stages oversize retained turns for the fresh connection's control
+        // stream. If that connection drops again mid-drain, the unsent turns must not
+        // be lost: `redivert_pending_control` keeps each staged until its send
+        // succeeds, so a failed attempt leaves them all in place and the next session
+        // retries them. Without this, a peer that never got an oversize turn from the
+        // dead relay would stall forever on that seq.
+        let oversize = |seq: u64, byte: u8| turn(seq, &vec![byte; 4096]);
+        let mut pending = vec![oversize(0, 0x11), oversize(1, 0x22)];
+
+        // Attempt 1: a connection closed before the send, so `write_all` fails. Every
+        // staged turn must remain — none dropped on the failure.
+        {
+            let (link_a, _link_b, _ea, _eb) = connected_links().await;
+            let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
+            link_a
+                .connection()
+                .close(quinn::VarInt::from_u32(0), b"boom");
+            let result = redivert_pending_control(&mut control_send, &mut pending).await;
+            assert!(result.is_err(), "a send over a dead connection must fail");
+            assert_eq!(
+                pending.len(),
+                2,
+                "a failed control-stream send loses no staged turn",
+            );
+        }
+
+        // Attempt 2: a fresh connection whose peer reads its control stream. Both
+        // staged turns cross, in seq order, and the staging drains empty.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+        let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
+        redivert_pending_control(&mut control_send, &mut pending)
+            .await
+            .expect("the retry over a live connection delivers the staged turns");
+        assert!(pending.is_empty(), "every staged turn was sent on the retry");
+
+        for expected_seq in [0u64, 1] {
+            let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+                .await
+                .expect("a staged oversize turn never crossed on the retry")
+                .expect("control reader closed early");
+            match delivered {
+                ControlInbound::OversizeTurn(payload) => {
+                    assert_eq!(payload.seq, expected_seq);
+                    assert_eq!(payload.commands.len(), 4096, "the oversize turn arrives whole");
+                }
+                other => panic!("expected an oversize turn on the control stream, got {other:?}"),
+            }
         }
     }
 

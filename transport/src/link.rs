@@ -122,6 +122,16 @@ impl Link {
         self.acks.payloads_in_flight()
     }
 
+    /// The lowest still-unacked payload seq this link holds for `slot`, or `None`
+    /// if nothing is in flight for it. It is the oldest seq the redundancy pass will
+    /// re-carry over a rebound connection, so a driver presents it as its own-slot
+    /// resume anchor on a same-relay re-dial: the fresh relay bases the slot's
+    /// receive window there (see [`anchor_receive_window`](Self::anchor_receive_window))
+    /// rather than at 0, which a session past the window would otherwise trip.
+    pub fn oldest_unacked_seq(&self, slot: SlotId) -> Option<u64> {
+        self.acks.oldest_unacked_seq(slot)
+    }
+
     /// The top of the contiguous run of payloads this link has delivered to its
     /// consumer for `slot` (the highest seq such that every seq up to it has been
     /// delivered for that slot), or `None` before the first payload for that slot
@@ -176,6 +186,27 @@ impl Link {
             .max_datagram_size()
             .ok_or(LinkError::DatagramsUnsupported)?;
         Ok(crate::ack_manager::lone_packet_len(payload) <= budget)
+    }
+
+    /// Anchors this link's receive window for `slot` to `anchor`, treating every
+    /// seq below `anchor` as already delivered so the window's base is `anchor`
+    /// rather than 0.
+    ///
+    /// A fresh link's [`Dedup`] anchors the receive window at seq 0 — correct for a
+    /// client whose slot stream genuinely starts there. But a session **re-homed**
+    /// onto a fresh relay resumes its slot's seq stream mid-way (it kept counting
+    /// across the move and re-injects only a recent retention ring, never seq 0
+    /// onward), so a from-zero base would hold the delivered prefix at `None`
+    /// forever and reject the resumed stream as
+    /// [`PayloadOutOfWindow`](LinkError::PayloadOutOfWindow) the moment its seq
+    /// passed the window — dropping the link. Anchoring the window at the resume
+    /// point (the oldest seq the client will re-send) lets the resumed stream be
+    /// accepted and the prefix advance normally from there.
+    ///
+    /// Only meaningful on a pristine slot (nothing received yet); it never rewinds a
+    /// prefix already forming, and an `anchor` of 0 is a no-op (the default base).
+    pub fn anchor_receive_window(&mut self, slot: SlotId, anchor: u64) {
+        self.dedup.anchor(slot, anchor);
     }
 
     /// Folds a payload that arrived *outside* the datagram path — the reliable
@@ -409,6 +440,25 @@ impl Dedup {
         Delivery::New
     }
 
+    /// Anchors `slot`'s receive window at `anchor`: sets the delivered prefix top to
+    /// `anchor - 1` so the window's base becomes `anchor` and seqs below it are
+    /// treated as already delivered. See [`Link::anchor_receive_window`] for why a
+    /// re-homed session needs this. A no-op when `anchor` is 0 (the default base is
+    /// already 0) or when the slot has already received something — anchoring only a
+    /// pristine slot means it never rewinds a prefix that is already forming.
+    pub(crate) fn anchor(&mut self, slot: SlotId, anchor: u64) {
+        let Some(prefix_top) = anchor.checked_sub(1) else {
+            return;
+        };
+        let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
+            delivered_through: None,
+            ahead: BTreeSet::new(),
+        });
+        if state.delivered_through.is_none() && state.ahead.is_empty() {
+            state.delivered_through = Some(prefix_top);
+        }
+    }
+
     /// Advances the per-slot retired-through guard, returning whether the cursor
     /// was strictly greater than the last one applied for `slot` (so the caller
     /// should retire). A cursor not strictly advancing is a no-op.
@@ -476,6 +526,86 @@ mod tests {
         assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New); // prefix top = 0, base = 1
         assert_eq!(dedup.accept(SlotId(0), 9), Delivery::OutOfWindow); // 9 - 1 >= 8
         assert_eq!(dedup.accept(SlotId(0), 8), Delivery::New); // 8 - 1 < 8, still in window
+    }
+
+    #[test]
+    fn anchored_window_accepts_a_resumed_high_seq_stream() {
+        // A session re-homed onto a fresh dedup resumes its slot mid-stream. Without
+        // an anchor the base is 0, so a seq at/beyond the window is rejected and the
+        // prefix never forms. Anchored at the resume point, the resumed stream is
+        // accepted and the prefix advances from there.
+        let mut dedup = Dedup::with_window(8);
+
+        // Unanchored: the resumed seq 20 is far beyond the from-zero window.
+        assert_eq!(dedup.accept(SlotId(0), 20), Delivery::OutOfWindow);
+
+        // Anchor slot 1 at its resume point (20): base becomes 20.
+        dedup.anchor(SlotId(1), 20);
+        assert_eq!(dedup.accept(SlotId(1), 20), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(1), 21), Delivery::New);
+        // Seqs below the anchor are already-delivered (never re-delivered to the game).
+        assert_eq!(dedup.accept(SlotId(1), 19), Delivery::Duplicate);
+        // The prefix advanced from the anchor, so the window slides: a seq that would
+        // be out-of-window against a from-zero base is fine here.
+        assert_eq!(dedup.delivered_through(SlotId(1)), Some(21));
+        assert_eq!(dedup.accept(SlotId(1), 25), Delivery::New);
+    }
+
+    #[test]
+    fn anchor_is_a_no_op_on_zero_or_an_already_active_slot() {
+        let mut dedup = Dedup::with_window(8);
+        // Anchor 0 leaves the default from-zero base.
+        dedup.anchor(SlotId(0), 0);
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        // Once a slot has received, a later anchor never rewinds its prefix.
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::New);
+        dedup.anchor(SlotId(0), 100);
+        assert_eq!(dedup.accept(SlotId(0), 2), Delivery::New);
+        assert_eq!(dedup.delivered_through(SlotId(0)), Some(2));
+    }
+
+    #[tokio::test]
+    async fn same_relay_resume_anchor_from_oldest_unacked_accepts_a_past_window_stream() {
+        // The same-relay reconnect fix, end to end at the transport layer: a client
+        // deep into a game (unacked turns at a high absolute seq) sources its own-slot
+        // resume anchor from `oldest_unacked_seq` — exactly what the driver presents on
+        // a same-relay dial — and a fresh relay-side dedup anchored there accepts the
+        // resumed stream that a from-zero window would reject as out-of-window (the
+        // production blocker for any game past ~4096 turns).
+        let (mut sender, _peer, _ea, _eb) = connected_links().await;
+
+        let high = |seq: u64| Payload {
+            seq,
+            slot: 0,
+            commands: vec![0u8; 4].into(),
+            ..Default::default()
+        };
+        // The peer never acks, so these stay in flight — the window the redundancy
+        // pass re-carries over a rebound connection, oldest-first.
+        for seq in [8000u64, 8001, 8002] {
+            sender.send(Some(high(seq))).unwrap();
+        }
+        let anchor = sender
+            .oldest_unacked_seq(SlotId(0))
+            .expect("turns are in flight");
+        assert_eq!(anchor, 8000, "the same-relay anchor is the oldest unacked seq");
+
+        // The relay builds a fresh dedup on the re-dial. From zero the resumed seq is
+        // far beyond the window (the bug); anchored at the resume point it is accepted
+        // and the delivered prefix advances from there.
+        let mut unanchored = Dedup::with_window(RECEIVE_WINDOW);
+        assert_eq!(
+            unanchored.accept(SlotId(0), anchor),
+            Delivery::OutOfWindow,
+            "without the anchor a fresh relay rejects the resumed stream",
+        );
+
+        let mut anchored = Dedup::with_window(RECEIVE_WINDOW);
+        anchored.anchor(SlotId(0), anchor);
+        for seq in [8000u64, 8001, 8002] {
+            assert_eq!(anchored.accept(SlotId(0), seq), Delivery::New);
+        }
+        assert_eq!(anchored.delivered_through(SlotId(0)), Some(8002));
     }
 
     fn self_signed() -> (

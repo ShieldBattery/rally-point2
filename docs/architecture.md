@@ -325,14 +325,28 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
 - **Resume cursors** (the same infrastructure a same-relay reconnect uses): on re-dial the client presents,
   per peer slot, the seq it next needs, and the relay replays from its turn ring at or past it. A fresh
   replacement relay's ring is empty, so this alone recovers nothing from it — which is what the retention
-  ring below is for.
+  ring below is for. Every re-dial also presents an **own-slot resume anchor** among the cursors. The relay
+  builds a brand-new receive-side dedup on *every* connection (a same-relay resume or a re-home alike), which
+  would base that slot's window at seq 0 — and since a resuming client keeps counting its seq stream across
+  the drop, the resumed stream is rejected as out-of-window the instant its seq passes the window (~4096
+  turns, ~3 min in), dropping the link. Because every slot in a group crosses the window at the same absolute
+  seq, that tears the whole group down at once. The client heads it off by naming, as its own-slot cursor,
+  the lowest seq it will actually re-send: **the oldest still-unacked seq on a same-relay resume** (the
+  AckManager re-carries the unacked window over the rebound connection, oldest-first — anchoring below it,
+  e.g. at the retention front, would strand a permanent prefix gap since a same-relay resume does not
+  re-inject the ring), and **the retention ring's front on a re-home** (which *does* re-inject that ring).
+  The relay reads the own-slot cursor (a slot never replays its own turns) as the window's base, so the
+  resumed stream is accepted and the delivered prefix advances from there. The own-slot cursor rides the
+  existing resume-cursor frame — additive, no handshake or frame-count change.
 - **The outbound retention ring.** Each client retains a ring of *its own* recently-sent turns (capped at 512
   turns / 256 KiB), independent of ack retirement — a turn the dead relay had already acked is dropped from
   the unacked window but kept here. On a re-home dial (only), the client re-injects the retained turns as
   unacked into the fresh link, so the replacement relay's empty ring re-carries them to peers, which dedup by
   origin `(slot, seq)`. This closes the window where the dead relay acked a turn but died before fanning it
-  out. An undecided drop-hold at relay death is deliberately lost — survivors re-wait the fresh 30s floor on
-  the new relay.
+  out. An oversize (control-diverted) retained turn is staged for the fresh connection's reliable control
+  stream and kept staged until its send succeeds, so a mid-drain stream failure retries it on the next
+  session rather than losing it. An undecided drop-hold at relay death is deliberately lost — survivors
+  re-wait the fresh 30s floor on the new relay.
 
 **Coordinator `POST /session/rehome`.** Tenant-authenticated and app-server-mediated — clients never talk to
 the coordinator directly. The re-home is authenticated exactly like `POST /session/create`: the tenant's app
@@ -343,16 +357,21 @@ verifies under, and `session` + `dead_relay_id` are the app server's trusted ass
 sessions. A missing/invalid signature, a stale timestamp, or an unenrolled tenant all `401`; a lenient
 per-`(tenant, session)` rate limit `429`s a caller that re-asks too fast. Because the session lookup is
 tenant-keyed, a `session` owned by another tenant simply finds no serving set and returns `unavailable`,
-leaking nothing. The decision: a relay **still enrolled** → `stay` (the coordinator overrules a false alarm);
-**dead** → move the whole group to a replacement — a live relay already serving the session (earliest in the
-authority order) if one exists, else the lowest-id live relay, else `unavailable` — updating the serving set
-(which is also the descriptors' authority order) in place, rebuilding every serving relay's descriptor as
-**resumed**, and pushing R_new's first so it is staged before the response returns (the client's backoff
-absorbs the residual descriptor/dial race). The response is snake_case `{ "decision", "relay"? }`, where
-`relay` (present only when `decision` is `newTarget`) is `{ "relay_id", "relay_addr", "cert_der" }` with the
-cert hex-encoded.
+leaking nothing. The decision: a relay **still enrolled *and* still in this session's serving set** → `stay`
+(the coordinator overrules a genuine false alarm); **dead** → move the whole group to a replacement — a live
+relay already serving the session (earliest in the authority order) if one exists, else the lowest-id live
+relay, else `unavailable` — updating the serving set (which is also the descriptors' authority order) in place,
+rebuilding every serving relay's descriptor as **resumed**, and pushing R_new's first so it is staged before
+the response returns (the client's backoff absorbs the residual descriptor/dial race). The response is
+snake_case `{ "decision", "relay"? }`, where `relay` (present only when `decision` is `newTarget`) is
+`{ "relay_id", "relay_addr", "cert_der" }` with the cert hex-encoded.
 The decision is idempotent per `(session, dead_relay)`, so concurrent or repeated asks return the same target
-without re-mutating. An unknown session (a coordinator restart wiped its membership) is `unavailable`.
+without re-mutating — and this recorded-target lookup runs *before* the stay check, so a dead relay that has
+since restarted and re-enrolled under a fresh cert does not flip an already-re-homed straggler (still pinned to
+the old cert, which the re-enrolled relay's new cert can never satisfy) into a `stay` it would wedge on; it
+still gets the recorded replacement. Only a relay that is both re-enrolled *and* still serving this session
+(never re-homed away) reads as a false-alarm `stay`. An unknown session (a coordinator restart wiped its
+membership) is `unavailable`.
 
 **Resumed descriptors.** A `resumed` descriptor additionally carries the session's already-decided
 `departed_slots` (slot + left/dropped kind, seeded from the coordinator's lifecycle accounting). A fresh relay
@@ -365,13 +384,17 @@ machinery session-wide. Both fields are additive with serde defaults, so an old 
 **Client-side escalation.** The link driver's reconnect loop retries the same relay first, and escalates to an
 embedder-supplied `RehomeProvider` only once the game has started (it tracks the relay's `SessionStart`
 itself) and the relay stays unreachable — immediately on a TLS cert/pin rejection (a restarted relay serves a
-fresh cert, which no same-relay retry can pass), otherwise after ~10s of failed attempts. The provider is
-where the embedder does the coordinator round-trip and builds a fresh endpoint pinning the replacement relay's
-cert — the driver never touches certs. `Stay` resumes same-relay backoff; `Unavailable` keeps it and
-re-escalates periodically; `NewTarget` re-dials the replacement with the same identity and resume cursors,
-rebinds the link in place (preserving the receive dedup so the re-home is a resume, not a restart), re-injects
-the retention ring, and points subsequent drops at the new relay. This same reconnect infrastructure also
-covers a client's own transient disconnects (a same-relay resume, no re-home).
+fresh cert, which no same-relay retry can pass), otherwise after ~10s of failed attempts. The **driver owns
+the current relay id**: it is seeded from the reconnect config, passed to `RehomeProvider::rehome(dead_relay_id)`
+as the relay the driver believes is dead, and advanced to the replacement's id only on a *successful* re-home
+dial — never on a guess and never on a failed dial, so the provider can never name a live replacement as dead
+and get wedged on a `Stay`. The provider is where the embedder does the coordinator round-trip and builds a
+fresh endpoint pinning the replacement relay's cert — the driver never touches certs. `Stay` resumes same-relay
+backoff; `Unavailable` keeps it and re-escalates periodically; `NewTarget` re-dials the replacement with the
+same identity, resume cursors, and own-slot window anchor, rebinds the link in place (preserving the receive
+dedup so the re-home is a resume, not a restart), re-injects the retention ring, and points subsequent drops
+(and the owned relay id) at the new relay. This same reconnect infrastructure also covers a client's own
+transient disconnects (a same-relay resume, no re-home).
 
 ### Latency buffer
 

@@ -663,7 +663,7 @@ pub async fn run_slot_link(
     mut link: Link,
     key: SessionKey,
     slot: SlotId,
-    resume_cursors: std::collections::HashMap<SlotId, u64>,
+    mut resume_cursors: std::collections::HashMap<SlotId, u64>,
     inbox: SlotInbox,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
@@ -823,6 +823,21 @@ pub async fn run_slot_link(
     // to fire when a forward carries no redundancy or the link is idle, so a turn the
     // fresh packets can't re-carry is still retransmitted.
     let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
+
+    // Anchor this connection's own-slot receive window. A re-homing client presents
+    // a cursor for *its own* slot (peers present per-peer cursors; a slot never
+    // resumes from itself) whose value is the oldest seq it will re-send — its
+    // retention ring's front. This fresh relay's dedup would otherwise base that
+    // slot's window at 0 and, once the resumed high-seq stream passed the window,
+    // reject it as out-of-window and drop the link — which, because every re-homed
+    // slot crosses the window at the same absolute seq, tears down the whole group
+    // at once and leaves a later peer death unconfirmable to the survivor. Removing
+    // the own-slot entry here also keeps it out of the replay below (a slot is never
+    // replayed its own turns). Absent (a fresh dial or a peer-only reconnect), this
+    // is a no-op and the window bases at 0 as before.
+    if let Some(anchor) = resume_cursors.remove(&slot) {
+        link.anchor_receive_window(slot, anchor);
+    }
 
     // Replay to a reconnecting client the turns it missed while it was gone. A fresh
     // dial presents no resume cursors, so this replays nothing; a reconnect presents

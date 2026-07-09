@@ -697,6 +697,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
         endpoint: ClientEndpoint::from_endpoint(endpoint.endpoint().clone()),
         relay_addr: addr,
         server_name: "localhost".to_owned(),
+        relay_id: 1,
         identity: id0,
         rehome: None,
         escalate_after: None,
@@ -891,18 +892,30 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
 
 /// A re-home provider that always hands back a fixed replacement relay's target,
 /// building a fresh client endpoint that pins the replacement's cert on each call —
-/// standing in for the embedder's coordinator round-trip + cert pinning.
+/// standing in for the embedder's coordinator round-trip + cert pinning. It also
+/// asserts the driver passes the relay id it is homed on as the dead relay, and
+/// hands back the replacement relay's own id — the driver-owns-the-id contract.
 struct FixedTarget {
     ca: CertificateDer<'static>,
     addr: SocketAddr,
+    /// The relay id the driver must name as dead (the home relay it is on).
+    expected_dead: u64,
+    /// The replacement relay's id, returned in the `NewTarget` outcome.
+    relay_id: u64,
 }
 
 impl rally_point_client::RehomeProvider for FixedTarget {
-    fn rehome(&self) -> rally_point_client::RehomeFuture<'_> {
+    fn rehome(&self, dead_relay_id: u64) -> rally_point_client::RehomeFuture<'_> {
+        assert_eq!(
+            dead_relay_id, self.expected_dead,
+            "the driver must name the relay it is homed on as the dead one",
+        );
         let ca = self.ca.clone();
         let addr = self.addr;
+        let relay_id = self.relay_id;
         Box::pin(async move {
             rally_point_client::RehomeOutcome::NewTarget {
+                relay_id,
                 endpoint: client_endpoint(&ca),
                 relay_addr: addr,
                 server_name: "localhost".to_owned(),
@@ -977,14 +990,20 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     // Both drivers re-home to relay B when A stays unreachable. A short escalation
     // window keeps the test fast (a cert/pin rejection would escalate at once; here
     // the dead relay just stops responding, so the timed window drives it).
+    // Relay A is id 1 (the home the drivers start on); relay B is id 2 (the
+    // replacement). The drivers seed their current relay id as A's and must name it
+    // as the dead relay when they escalate.
     let reconnect0 = Reconnect {
         endpoint: ep0,
         relay_addr: addr_a,
         server_name: "localhost".to_owned(),
+        relay_id: 1,
         identity: id0,
         rehome: Some(Arc::new(FixedTarget {
             ca: ca_b.clone(),
             addr: addr_b,
+            expected_dead: 1,
+            relay_id: 2,
         })),
         escalate_after: Some(Duration::from_millis(50)),
         escalate_retry: Some(Duration::from_millis(50)),
@@ -993,10 +1012,13 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         endpoint: ep1,
         relay_addr: addr_a,
         server_name: "localhost".to_owned(),
+        relay_id: 1,
         identity: id1,
         rehome: Some(Arc::new(FixedTarget {
             ca: ca_b.clone(),
             addr: addr_b,
+            expected_dead: 1,
+            relay_id: 2,
         })),
         escalate_after: Some(Duration::from_millis(50)),
         escalate_retry: Some(Duration::from_millis(50)),
@@ -1046,6 +1068,106 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     drop(chan1.inbound);
     let _ = task0.await;
     let _ = task1.await;
+}
+
+#[tokio::test]
+async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
+    use std::collections::HashSet;
+
+    use rally_point_proto::control::BufferBounds;
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    // Regression for the re-home receive-window bug (the confirmed-disconnect-tier
+    // failure). A client re-homing onto a fresh relay resumes its own slot's seq
+    // stream mid-way — it kept counting across the move and re-injects only a recent
+    // retention ring, never seq 0 onward. The fresh relay's dedup would base that
+    // slot's receive window at 0, so once the resumed seq passed the window (4096) it
+    // was rejected as out-of-window and the link dropped. Because every re-homed slot
+    // crosses the window at the same absolute seq, that tore down the whole group at
+    // once — so a peer death after the re-home never reached the survivor as a
+    // relay-confirmed disconnect (the game stayed at "stall", never "confirmed").
+    //
+    // The driver now declares an own-slot resume anchor on the re-home dial and the
+    // relay bases the window there, so the resumed high-seq stream is accepted and
+    // the link survives — which is what lets the ordinary post-drop connectivity /
+    // leave machinery (covered by the drop/reconnect tests above) confirm to the
+    // survivor exactly as in a non-re-homed game.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(90);
+
+    // Seed the relay as a resumed, already-started session over {0, 1}, standing in
+    // for the replacement relay the coordinator pushed a `resumed` descriptor to.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &mesh.decision_makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+    );
+    consensus::mark_session_started(&mesh.decision_makers, &key);
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+
+    // The seq the re-homing client resumes at — far past the from-zero window (4096).
+    const ANCHOR: u64 = 5000;
+
+    // The peer receives on a raw link whose receive window for the sender's slot is
+    // anchored to the resume point — modeling a survivor already caught up on slot 0's
+    // stream over the game (its own dedup never resets: the driver rebinds and keeps
+    // it). The bug under test is the *relay's* fresh own-slot window, not this one.
+    let mut peer = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    peer.anchor_receive_window(SlotId(0), ANCHOR);
+
+    // Slot 0 dials as a re-home: it presents an own-slot resume anchor at the high
+    // seq, exactly as the driver now does from its retention ring's front.
+    let mut link0 = endpoint
+        .reconnect_with_timeout(
+            addr,
+            "localhost",
+            &id0,
+            &[(SlotId(0), ANCHOR)],
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    // Slot 0 sends a turn at the anchored high seq — beyond a from-zero window. With
+    // the anchor the relay accepts and forwards it; without it the relay would reject
+    // it as out-of-window and close slot 0's link, and the peer would never see it. A
+    // raw link runs no redundancy of its own, so re-send until it lands (or the outer
+    // timeout fails the test), skipping the relay's ack-only maintenance packets.
+    let turn = Payload {
+        seq: ANCHOR,
+        slot: 0,
+        commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+        ..Default::default()
+    };
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            link0.send(Some(turn.clone())).unwrap();
+            if let Ok(Ok(received)) =
+                tokio::time::timeout(Duration::from_millis(200), peer.recv()).await
+                && let Some(payload) = received.fresh.into_iter().find(|p| p.seq == ANCHOR)
+            {
+                return payload;
+            }
+        }
+    })
+    .await
+    .expect("the re-homed high-seq turn never crossed the relay (window not anchored)");
+    assert_eq!(got.seq, ANCHOR);
+    assert_eq!(got.slot, 0, "bound to the sender's authorized slot, like any turn");
 }
 
 #[tokio::test]
