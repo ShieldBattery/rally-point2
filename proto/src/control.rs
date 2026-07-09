@@ -540,6 +540,35 @@ pub struct DepartedSlot {
     pub kind: DepartureKind,
 }
 
+/// The domain-separation prefix on a re-home request signature. Binds the
+/// signature to the rehome scheme so it can never be confused with a token
+/// signature (tenant key), a request-auth signature (app-server key), or a
+/// connection-binding challenge (both a different byte shape and a different key).
+pub const REHOME_SIG_DOMAIN: &str = "rp2-rehome-v1:";
+
+/// The exact bytes a coordinator-mediated re-home request signature covers:
+/// `rp2-rehome-v1:<ts>:<session>:<slot>:<dead_relay_id>` — the domain prefix
+/// followed by the four decimal fields, colon-separated. `session` and `slot` are
+/// the ones the client's *verified token* authorizes (never taken from the request
+/// body), binding the request to the client's own session and slot.
+///
+/// Single-sourced here because three parties must agree on it byte-for-byte: the
+/// coordinator's signature builder, the coordinator's verifier, and the game
+/// client that signs the request. A divergence in any of them silently fails every
+/// failover with a `401`, so the format has exactly one definition and any change
+/// to it is a change to this function.
+pub fn rehome_signed_message(
+    ts: u64,
+    session: SessionId,
+    slot: SlotId,
+    dead_relay_id: u64,
+) -> String {
+    format!(
+        "{REHOME_SIG_DOMAIN}{ts}:{}:{}:{}",
+        session.0, slot.0, dead_relay_id
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Persistent control connection (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
@@ -917,6 +946,28 @@ mod tests {
         assert_eq!(b.clamp(0), 2);
         assert_eq!(b.clamp(5), 5);
         assert_eq!(b.clamp(99), 8);
+    }
+
+    #[test]
+    fn rehome_signed_message_pins_the_exact_byte_format() {
+        // The failover signature format is a cross-party contract: the coordinator
+        // builder, the coordinator verifier, and the game client all reproduce these
+        // exact bytes, and any divergence silently 401s every failover. Pin the
+        // output for known inputs so a format change can only land by updating this
+        // expectation deliberately.
+        assert_eq!(
+            rehome_signed_message(1_700_000_000, SessionId(42), SlotId(3), 7),
+            "rp2-rehome-v1:1700000000:42:3:7",
+        );
+        // Field boundaries: the domain prefix ends in a colon, the fields are decimal
+        // and colon-separated, and a zero slot / zero relay id serialize as "0".
+        assert_eq!(
+            rehome_signed_message(0, SessionId(0), SlotId(0), 0),
+            "rp2-rehome-v1:0:0:0:0",
+        );
+        assert!(
+            rehome_signed_message(0, SessionId(0), SlotId(0), 0).starts_with(REHOME_SIG_DOMAIN)
+        );
     }
 
     #[test]

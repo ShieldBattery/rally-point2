@@ -252,6 +252,22 @@ pub fn rehome(
         return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
     }
 
+    // The named dead relay must actually be serving this session. It is not still
+    // enrolled (the stay-guard above ruled that out) and — checked here — it has no
+    // recorded rehome yet (the idempotency block above returned if it did), so if it
+    // is also not a member of the serving set, the client named a relay unrelated to
+    // its session. The in-place `retain`/reassign over the serving set below would
+    // then be a silent no-op, yet the function would still pick an `r_new`, re-push
+    // `resumed` descriptors to the untouched (healthy) serving set, and record a
+    // bogus idempotency entry. Refuse before any of that: the coordinator cannot
+    // re-home a session off a relay that does not serve it. `Unavailable` (not
+    // `Stay`) is the honest answer — the relay is genuinely gone, so "keep dialing
+    // it" would be wrong; the client keeps its same-relay backoff and re-asks, and a
+    // correctly-named later request (its real home relay) re-homes normally.
+    if !serving.contains(&dead_relay) {
+        return RehomeOutcome::Unavailable;
+    }
+
     // Pick the replacement: prefer a live relay already serving the session
     // (earliest in the authority order), else the lowest-id live registered relay.
     let r_new = serving
@@ -1506,5 +1522,60 @@ mod tests {
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
             RehomeOutcome::Unavailable,
         );
+    }
+
+    #[test]
+    fn rehome_unavailable_when_the_named_relay_does_not_serve_the_session() {
+        // `dead_relay` comes from the request body. A client that names a relay that
+        // is neither still enrolled (so the stay-guard doesn't fire) nor a member of
+        // the session's serving set must get Unavailable — with no mutation, no
+        // resumed-descriptor push, and no idempotency entry recorded, so a bogus name
+        // can't disturb an otherwise-healthy session.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+
+        // The session serves only its home relay 1. Relay 99 was never enrolled and
+        // never served it, so it passes the stay-guard yet is not a serving member.
+        let before_serving = setup.serving_relays(&tid(), resp.session);
+        assert_eq!(before_serving, vec![RelayId(1)]);
+        let baseline_descriptor = setup.descriptors().current_for(RelayId(1));
+
+        assert_eq!(
+            rehome(
+                &setup,
+                &tid(),
+                resp.session,
+                RelayId(99),
+                vec![DepartedSlot {
+                    slot: SlotId(0),
+                    kind: DepartureKind::Dropped,
+                }],
+            ),
+            RehomeOutcome::Unavailable,
+        );
+
+        // The serving set is untouched, and no resumed descriptor was pushed to the
+        // healthy relay (its outbox still holds exactly the create_session baseline).
+        assert_eq!(setup.serving_relays(&tid(), resp.session), before_serving);
+        assert_eq!(
+            setup.descriptors().current_for(RelayId(1)),
+            baseline_descriptor,
+            "a non-serving dead-relay name must not re-push descriptors",
+        );
+
+        // Re-asking about the same unrelated relay is still Unavailable — no
+        // idempotency entry was recorded that would echo a spurious target.
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(99), vec![]),
+            RehomeOutcome::Unavailable,
+        );
+
+        // And the session is otherwise unharmed: when its real home relay dies, a
+        // correctly-named rehome still moves the group to the live relay 2.
+        registry::remove(setup.registry(), RelayId(1));
+        assert!(matches!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2),
+        ));
     }
 }

@@ -69,10 +69,10 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
+    self, CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
     SessionResponse, TenantId,
 };
-use rally_point_proto::ids::{RelayId, SessionId, SlotId};
+use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::token::SignedToken;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
@@ -265,12 +265,6 @@ async fn create_session(
     Ok(Json(resp))
 }
 
-/// The domain-separation prefix on a re-home request signature. Binds the
-/// signature to the rehome scheme so it can never be confused with a token
-/// signature (tenant key), a request-auth signature (app-server key), or a
-/// connection-binding challenge (both a different byte shape and a different key).
-const REHOME_SIG_DOMAIN: &str = "rp2-rehome-v1:";
-
 /// Request body for `POST /session/rehome` (client-authenticated, camelCase — this
 /// is game-client-facing surface, not the control plane's snake_case wire).
 ///
@@ -390,7 +384,8 @@ async fn rehome_session(
     // the body) plus the timestamp and the relay the client believes dead, made
     // with the client's session key — the token's embedded pubkey verifies it.
     let signature = hex::decode(&request.signature).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let message = build_rehome_message(request.timestamp, session, slot, request.dead_relay_id);
+    let message =
+        control::rehome_signed_message(request.timestamp, session, slot, request.dead_relay_id);
     UnparsedPublicKey::new(&ED25519, token.claims.client_pubkey.as_bytes())
         .verify(message.as_bytes(), &signature)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -415,16 +410,6 @@ async fn rehome_session(
     tokio::task::yield_now().await;
 
     Ok(Json(RehomeResponse::from(outcome)))
-}
-
-/// The bytes a re-home signature covers:
-/// `rp2-rehome-v1:<ts>:<session>:<slot>:<dead_relay_id>`. Session and slot come
-/// from the verified token, binding the request to the client's own authorization.
-fn build_rehome_message(ts: u64, session: SessionId, slot: SlotId, dead_relay_id: u64) -> String {
-    format!(
-        "{REHOME_SIG_DOMAIN}{ts}:{}:{}:{}",
-        session.0, slot.0, dead_relay_id
-    )
 }
 
 /// Verifies a re-home request's token the way a relay verifies it at dial time:

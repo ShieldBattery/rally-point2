@@ -648,6 +648,7 @@ impl LinkDriver {
             game_started,
             retention,
             retention_bytes,
+            pending_control_redivert,
         } = state;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -701,6 +702,20 @@ impl LinkDriver {
         // fire when a send carries no redundancy or the link is idle, so a turn the
         // fresh packets can't re-carry is still retransmitted.
         let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
+        // Re-carry any oversize turns a re-home deferred to this connection's control
+        // stream. Too large to ride a datagram, they were kept out of the unacked
+        // window by `reinject_retention` (where the redundancy pass would skip them
+        // forever) and staged here instead; the replacement relay needs them to fan
+        // out to peers that never received them from the dead relay. They ride the
+        // fresh control stream — the same divert path an oversize turn takes when
+        // first sent — before the buffered live turns below, preserving seq order
+        // (a retained turn's seq always precedes a turn produced during the outage).
+        // Empty on a same-relay resume, which keeps the old relay's reliable state.
+        for turn in std::mem::take(pending_control_redivert) {
+            if let Err(error) = send_control_turn(&mut control_send, turn).await {
+                return announcer.absorb_link_close(Err(DriverError::from(error)));
+            }
+        }
         // Flush any turns the game produced while the link was down, in seq order,
         // before live turns resume. On a fresh dial the buffer is empty; on a
         // reconnect these are the turns buffered during the outage. Each goes out
@@ -1490,6 +1505,15 @@ struct LoopState {
     /// The running encoded-byte total of [`retention`](Self::retention), so the
     /// byte cap is enforced without re-summing the ring on every push.
     retention_bytes: usize,
+    /// Retained turns a **re-home** deferred to the fresh connection's reliable
+    /// control stream: turns too large to ride any datagram, staged here by
+    /// [`reinject_retention`] because re-injecting them into the unacked window
+    /// would strand them there forever (the redundancy pass always skips a payload
+    /// that can't fit a lone packet). [`session`](Driver::session) drains this onto
+    /// the control stream it opens on the new connection — the same divert path an
+    /// oversize turn takes when first sent. Empty on a same-relay resume (which
+    /// keeps the old relay's reliable-stream state) and after each drain.
+    pending_control_redivert: Vec<Payload>,
 }
 
 impl LoopState {
@@ -1503,6 +1527,7 @@ impl LoopState {
             game_started: false,
             retention: VecDeque::new(),
             retention_bytes: 0,
+            pending_control_redivert: Vec::new(),
         }
     }
 }
@@ -1827,13 +1852,34 @@ async fn reconnect_link(
     }
 }
 
-/// Re-injects the retained turns onto a freshly re-homed link so the replacement
-/// relay's empty turn ring re-carries them to peers (each deduping by origin
+/// Re-carries the retained turns onto a freshly re-homed link so the replacement
+/// relay's empty turn ring re-delivers them to peers (each deduping by origin
 /// `(slot, seq)`). Only ever called on a re-home — a same-relay resume keeps the
-/// old relay's ring, so there is nothing to re-inject.
-fn reinject_retention(link: &mut Link, state: &LoopState) {
-    for turn in &state.retention {
-        link.reinject_unacked(turn.clone());
+/// old relay's ring, so there is nothing to re-carry.
+///
+/// A turn that still fits a datagram goes back into the unacked window, where the
+/// next packet's redundancy pass re-carries it. A turn too large for any datagram
+/// cannot go there: [`AckManager::build_outgoing`] skips a payload that can't fit a
+/// lone packet on every pass, so a re-injected oversize turn would sit in the
+/// window forever — never re-delivered (inflating `payloads_in_flight`) and, worse,
+/// leaving a peer that never received it from the dead relay stalled on its seq.
+/// Those are staged in [`LoopState::pending_control_redivert`] instead, which
+/// [`session`](Driver::session) drains onto the new connection's reliable control
+/// stream — the same divert path an oversize turn takes when first sent. A path
+/// that can't currently size a datagram is treated as oversize, so the turn is
+/// re-carried reliably rather than risk being lost.
+fn reinject_retention(link: &mut Link, state: &mut LoopState) {
+    let LoopState {
+        retention,
+        pending_control_redivert,
+        ..
+    } = state;
+    for turn in retention.iter() {
+        if matches!(link.payload_fits(turn), Ok(true)) {
+            link.reinject_unacked(turn.clone());
+        } else {
+            pending_control_redivert.push(turn.clone());
+        }
     }
 }
 
@@ -2111,6 +2157,58 @@ mod tests {
         drop(chan_b.outbound);
         let _ = task_a.await;
         let _ = task_b.await;
+    }
+
+    #[tokio::test]
+    async fn reinject_retention_defers_oversize_turns_to_the_control_stream() {
+        // On a re-home, a retained turn that still fits a datagram re-enters the
+        // unacked window for the redundancy pass to re-carry. One too big for any
+        // datagram must not: build_outgoing skips it on every pass, so it would sit
+        // in the window forever — never re-delivered and stalling a peer that never
+        // got it from the dead relay. Such a turn is staged for the fresh control
+        // stream instead, and it genuinely crosses that stream whole.
+        let (mut link_a, link_b, _ea, _eb) = connected_links().await;
+        let mut state = LoopState::new(Arc::new(AtomicBool::new(false)));
+
+        state.retention.push_back(turn(0, &[0x01]));
+        state.retention.push_back(turn(1, &vec![0x42; 4096]));
+
+        reinject_retention(&mut link_a, &mut state);
+
+        // The datagram-sized turn re-entered the window; the oversize one did not.
+        assert_eq!(
+            link_a.payloads_in_flight(),
+            1,
+            "only the datagram-sized turn re-enters the unacked window",
+        );
+        assert_eq!(state.pending_control_redivert.len(), 1);
+        assert_eq!(
+            state.pending_control_redivert[0].seq, 1,
+            "the oversize turn is staged for the control stream, not the window",
+        );
+
+        // The staged turn is carriable on the control stream: sent over a fresh
+        // bi-stream it crosses whole, and the peer's control reader folds it back as
+        // an oversize turn — exactly the divert path a first-time oversize turn takes.
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+        let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
+        let staged = state.pending_control_redivert.remove(0);
+        send_control_turn(&mut control_send, staged).await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the deferred oversize turn never crossed the control stream")
+            .expect("control reader closed early");
+        match delivered {
+            ControlInbound::OversizeTurn(payload) => {
+                assert_eq!(payload.seq, 1);
+                assert_eq!(
+                    payload.commands.len(),
+                    4096,
+                    "the oversize turn arrives whole"
+                );
+            }
+            other => panic!("expected an oversize turn on the control stream, got {other:?}"),
+        }
     }
 
     #[tokio::test]
