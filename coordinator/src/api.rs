@@ -69,8 +69,8 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
-    SessionResponse, TenantId,
+    CoordinatorToRelay, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
+    SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -287,25 +287,13 @@ struct RehomeRequest {
     dead_relay_id: u64,
 }
 
-/// The replacement relay a `newTarget` re-home decision names — where the moved
-/// clients re-dial, with the cert they pin (hex). Distinct from the proto
-/// [`RelayEndpoint`](rally_point_proto::control::RelayEndpoint) so the cert is a
-/// hex string rather than a byte array; field names are snake_case to match the
-/// rest of the tenant-facing API ([`SessionResponse`]).
-#[derive(Debug, Serialize)]
-struct RehomeRelay {
-    /// The replacement relay's coordinator-assigned id.
-    relay_id: u64,
-    /// Where clients reach it, `"ip:port"`.
-    relay_addr: String,
-    /// DER of the relay's TLS leaf cert, hex — clients pin exactly this.
-    cert_der: String,
-}
-
 /// Response body for `POST /session/rehome`. `decision` is `"stay"`,
 /// `"unavailable"`, or `"newTarget"`; `relay` is present only for `"newTarget"`.
-/// Field names are snake_case to match the rest of the tenant-facing API; the
-/// `decision` discriminant strings are unchanged.
+/// `relay` is the same proto [`RelayEndpoint`] shape `SessionResponse::home_relay`
+/// uses (field names are snake_case to match the rest of the tenant-facing API,
+/// and `cert_der` rides as a JSON byte array, not hex) — the app server already
+/// parses that shape for `/session/create`, so the re-home response reuses it
+/// verbatim rather than converting to a bespoke encoding.
 #[derive(Debug, Serialize)]
 struct RehomeResponse {
     /// The re-home decision: `stay` (the relay is still live), `unavailable` (no
@@ -313,7 +301,7 @@ struct RehomeResponse {
     decision: &'static str,
     /// The replacement relay, present only when `decision` is `newTarget`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    relay: Option<RehomeRelay>,
+    relay: Option<RelayEndpoint>,
 }
 
 impl From<RehomeOutcome> for RehomeResponse {
@@ -329,11 +317,7 @@ impl From<RehomeOutcome> for RehomeResponse {
             },
             RehomeOutcome::NewTarget(endpoint) => Self {
                 decision: "newTarget",
-                relay: Some(RehomeRelay {
-                    relay_id: endpoint.relay_id.0,
-                    relay_addr: endpoint.relay_addr.to_string(),
-                    cert_der: hex::encode(&endpoint.cert_der),
-                }),
+                relay: Some(endpoint),
             },
         }
     }
@@ -1833,8 +1817,11 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["decision"], "newTarget");
-        // Response fields are snake_case, matching the rest of the tenant-facing API.
+        // Response fields are snake_case, matching the rest of the tenant-facing API,
+        // and `relay` is the same proto `RelayEndpoint` shape as `home_relay` —
+        // `cert_der` rides as a JSON byte array, not hex.
         assert_eq!(json["relay"]["relay_id"], 2);
+        assert!(json["relay"]["cert_der"].is_array());
     }
 
     #[tokio::test]
