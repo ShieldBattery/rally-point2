@@ -318,7 +318,11 @@ async fn serve_connection(
         "client authorized",
     );
     routing::run_slot_link(
-        Link::new(connection),
+        // A single-ingress edge: every payload on this connection is authorized as
+        // `authorized.slot`, so the link rebinds the untrusted wire slot to it
+        // before dedup keys on it — keeping the receive-window anchor and dedup on
+        // the same slot across a same-relay resume.
+        Link::with_ingress_slot(connection, authorized.slot),
         key,
         authorized.slot,
         resume_cursors,

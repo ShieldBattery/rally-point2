@@ -1503,6 +1503,74 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
 }
 
 #[tokio::test]
+async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_closed() {
+    // The same-relay resume regression, end to end: a client authorized on a NONZERO
+    // slot re-homes mid-game and resumes its own-slot seq stream well past the 4096
+    // receive window. The real DLL leaves the wire slot at 0 on every turn, while the
+    // resume anchor is keyed on the authorized slot — so a relay edge that keyed dedup
+    // on the wire slot would anchor slot 1 yet dedup slot 0, reject the first resumed
+    // turn as out-of-window, and fatally close the link. The ingress-slot rebind keeps
+    // dedup and the anchor on the authorized slot, so the turn is accepted and fanned
+    // out. (Presenting a high own-slot resume cursor reproduces the anchored,
+    // past-window state without pushing 4096 real turns through the loopback first.)
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(320);
+
+    // The peer that should receive slot 1's resumed turn. It is deep in the same
+    // game, so its own fan-in dedup has already tracked slot 1's stream up to the
+    // resume point — anchor it there so the past-window forwarded turn is in this
+    // peer's window (exactly as a real re-home, where every peer resumes too).
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    slot0.anchor_receive_window(SlotId(1), 8000);
+
+    // Slot 1 (re)connects presenting a resume cursor for its OWN slot at a high
+    // absolute seq — the oldest seq it will re-send after a re-home. The relay anchors
+    // slot 1's receive window there.
+    let mut slot1 = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(1), 8000)],
+    )
+    .await;
+
+    // Slot 1 re-sends its resumed turn, stamping wire slot 0 exactly as the DLL does,
+    // at a seq far past the from-zero window. Keyed on the wire slot this trips
+    // PayloadOutOfWindow and closes the link — the regression.
+    slot1
+        .send(Some(Payload {
+            seq: 8000,
+            slot: 0,
+            game_frame_count: Some(9000),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+
+    // The turn is forwarded to slot 0, bound to the authorized slot 1.
+    let mut delivered = Vec::new();
+    while delivered.is_empty() {
+        delivered = slot0.recv().await.unwrap().fresh;
+    }
+    assert_eq!(
+        delivered[0].slot, 1,
+        "the resumed turn keeps its authorized slot"
+    );
+    assert_eq!(delivered[0].seq, 8000);
+    assert_eq!(&delivered[0].commands[..], &[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+
+    // And slot 1's link was not torn down over the past-window resumed turn.
+    assert!(
+        slot1.connection().close_reason().is_none(),
+        "the resumed nonzero-slot link must survive its first past-window turn",
+    );
+}
+
+#[tokio::test]
 async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;

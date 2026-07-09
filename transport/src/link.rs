@@ -48,6 +48,12 @@ pub struct Link {
     connection: quinn::Connection,
     acks: AckManager,
     dedup: Dedup,
+    /// The slot every incoming payload on this link is authorized as, or `None` on
+    /// a link that genuinely carries more than one slot. When set, each incoming
+    /// payload's wire slot is rewritten to this before dedup keys on it — the wire
+    /// slot is an untrusted client claim (see
+    /// [`with_ingress_slot`](Link::with_ingress_slot)).
+    ingress_slot: Option<SlotId>,
 }
 
 /// A send or receive on a link failed.
@@ -83,12 +89,52 @@ pub enum LinkError {
 }
 
 impl Link {
-    /// Wraps an established QUIC connection as a transport link.
+    /// Wraps an established QUIC connection as a transport link that trusts the
+    /// wire slot on each payload to demux slots.
+    ///
+    /// This is the constructor for links that genuinely carry many slots: the game
+    /// client's fan-in link (which receives every peer's turns over one connection)
+    /// and the relay↔relay mesh links (which trust their peer relay's per-slot
+    /// demux). A single-slot ingress edge — the relay's link to one authorized game
+    /// client — uses [`with_ingress_slot`](Self::with_ingress_slot) instead.
     pub fn new(connection: quinn::Connection) -> Self {
         Self {
             connection,
             acks: AckManager::new(),
             dedup: Dedup::new(),
+            ingress_slot: None,
+        }
+    }
+
+    /// Wraps an established QUIC connection as a single-slot ingress edge: every
+    /// incoming payload is authorized as `slot`, and its wire slot field is
+    /// rewritten to `slot` before anything keys on it.
+    ///
+    /// The slot a client stamps on the wire is an untrusted claim — the real game
+    /// client leaves it at 0 on every outbound turn regardless of which slot it
+    /// actually holds. Dedup and the receive-window anchor, though, key on the
+    /// *authorized* slot: a same-relay resume anchors this edge's window for the
+    /// authorized slot (see [`anchor_receive_window`](Self::anchor_receive_window)),
+    /// keyed on that slot. If dedup kept keying on the wire claim, the anchor would
+    /// land on the authorized slot while the resumed stream deduped under a phantom
+    /// slot-0 key with a from-zero window — making the anchor a silent no-op and
+    /// rejecting the first resumed turn past the window as
+    /// [`PayloadOutOfWindow`](LinkError::PayloadOutOfWindow), fatally closing a
+    /// resumed link for any authorized slot other than 0. Rewriting the wire slot to
+    /// `slot` here keeps the dedup key, the returned fresh payloads, and the window
+    /// anchor all on the one authorized slot. It also closes off a lying client
+    /// opening extra per-slot dedup key spaces by claiming slots it was not
+    /// authorized for.
+    ///
+    /// Only single-ingress edges rebind; the multi-slot links built by
+    /// [`new`](Self::new) must not, as they legitimately demux several slots off the
+    /// wire slot.
+    pub fn with_ingress_slot(connection: quinn::Connection, slot: SlotId) -> Self {
+        Self {
+            connection,
+            acks: AckManager::new(),
+            dedup: Dedup::new(),
+            ingress_slot: Some(slot),
         }
     }
 
@@ -114,6 +160,8 @@ impl Link {
         self.connection = connection;
         self.acks.reset_connection();
         // dedup preserved: it is what makes the reconnect a resume, not a restart.
+        // ingress_slot preserved: the connection swapped, but the slot this edge is
+        // authorized for did not, so the wire-slot rewrite must keep applying.
     }
 
     /// Payloads sent but not yet known-delivered — the in-flight depth, and the
@@ -302,6 +350,22 @@ impl Link {
         // can retire them, while an ack-only packet does not — acking it would only
         // provoke another ack-only packet in return, forever.
         let carried_payloads = !packet.payloads.is_empty();
+
+        // On a single-ingress edge the wire slot is an untrusted client claim (the
+        // real game client always sends 0), so rewrite every payload to the
+        // authorized slot before dedup keys on it. This keeps the dedup key, the
+        // returned fresh payloads, and the receive-window anchor all on the one
+        // authorized slot — without it a nonzero-slot client's resumed stream would
+        // dedup under a phantom slot-0 key while its anchor sat on the authorized
+        // slot, so the anchor would be a silent no-op and the first resumed turn
+        // past the window would fatally close the link. Multi-slot links (fan-in,
+        // mesh) leave this unset and demux by the wire slot as before.
+        if let Some(ingress) = self.ingress_slot {
+            let wire_slot = u32::from(ingress.0);
+            for payload in &mut packet.payloads {
+                payload.slot = wire_slot;
+            }
+        }
 
         // Process payloads low-seq first within each slot. A packet leads with its
         // fresh (highest) seq per slot, so without this a deep-loss packet's high
@@ -588,7 +652,10 @@ mod tests {
         let anchor = sender
             .oldest_unacked_seq(SlotId(0))
             .expect("turns are in flight");
-        assert_eq!(anchor, 8000, "the same-relay anchor is the oldest unacked seq");
+        assert_eq!(
+            anchor, 8000,
+            "the same-relay anchor is the oldest unacked seq"
+        );
 
         // The relay builds a fresh dedup on the re-dial. From zero the resumed seq is
         // far beyond the window (the bug); anchored at the resume point it is accepted
@@ -608,6 +675,140 @@ mod tests {
         assert_eq!(anchored.delivered_through(SlotId(0)), Some(8002));
     }
 
+    #[tokio::test]
+    async fn ingress_slot_rebinds_a_wire_slot_zero_payload_to_the_authorized_slot() {
+        // A relay's client edge authorizes one slot. The real game client leaves the
+        // wire slot at 0 on every turn, but dedup and the receive-window anchor key
+        // on the authorized slot. An ingress link rewrites the wire slot before
+        // dedup, so a resumed high-seq stream anchored on the authorized slot is
+        // accepted — not rejected as out-of-window under a phantom slot-0 key.
+        let (raw, _peer, _ea, _eb) = connected_connections().await;
+        let mut link = Link::with_ingress_slot(raw, SlotId(1));
+        link.anchor_receive_window(SlotId(1), 8000);
+
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![Payload {
+                seq: 8000,
+                slot: 0, // the untrusted wire claim the real client always sends
+                commands: vec![0x05].into(),
+                ..Default::default()
+            }],
+        };
+        let received = link.process_incoming(packet).unwrap();
+        assert_eq!(received.fresh.len(), 1);
+        // Rebound to the authorized slot, both in the dedup key and on the payload.
+        assert_eq!(received.fresh[0].slot, 1);
+        assert_eq!(link.delivered_through(SlotId(1)), Some(8000));
+        // Nothing was ever keyed under the wire slot 0.
+        assert_eq!(link.delivered_through(SlotId(0)), None);
+    }
+
+    #[tokio::test]
+    async fn a_non_ingress_link_keeps_per_wire_slot_demux() {
+        // A link with no ingress slot (the fan-in and mesh links) trusts the wire
+        // slot: two payloads with different wire slots dedup independently, each
+        // under its own key. This is the behavior the ingress rebind must not
+        // disturb on multi-slot links.
+        let (raw, _peer, _ea, _eb) = connected_connections().await;
+        let mut link = Link::new(raw);
+
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xA0].into(),
+                    ..Default::default()
+                },
+                Payload {
+                    seq: 0,
+                    slot: 1,
+                    commands: vec![0xB0].into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let received = link.process_incoming(packet).unwrap();
+        assert_eq!(received.fresh.len(), 2);
+        // Each wire slot advanced its own prefix; neither collapsed into the other.
+        assert_eq!(link.delivered_through(SlotId(0)), Some(0));
+        assert_eq!(link.delivered_through(SlotId(1)), Some(0));
+    }
+
+    #[tokio::test]
+    async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
+        // The exact production regression, one layer below the relay: the resuming
+        // client is authorized on a NONZERO slot but — like the real DLL — stamps
+        // wire slot 0 on every turn. The same-relay anchor is keyed on the authorized
+        // slot, so a relay edge that keyed dedup on the wire slot would anchor slot N
+        // yet dedup slot 0, making the anchor a silent no-op and rejecting the first
+        // resumed turn past the window. The ingress-slot rebind keeps both on slot N.
+        let (raw_sender, raw_relay, _ea, _eb) = connected_connections().await;
+        let mut sender = Link::new(raw_sender);
+
+        // The client counts its own seqs across the move but always sends wire slot 0.
+        let turn = |seq: u64| Payload {
+            seq,
+            slot: 0,
+            commands: vec![0u8; 4].into(),
+            ..Default::default()
+        };
+        for seq in [8000u64, 8001, 8002] {
+            sender.send(Some(turn(seq))).unwrap();
+        }
+        let anchor = sender
+            .oldest_unacked_seq(SlotId(0))
+            .expect("turns are in flight");
+        assert_eq!(
+            anchor, 8000,
+            "the same-relay anchor is the oldest unacked seq"
+        );
+
+        // The fresh relay edge authorizes this client as slot 1 and anchors slot 1 at
+        // the resume point. Even though every incoming payload claims wire slot 0, the
+        // rebind keys them under slot 1, where the anchor lives.
+        let mut relay = Link::with_ingress_slot(raw_relay, SlotId(1));
+        relay.anchor_receive_window(SlotId(1), anchor);
+        for seq in [8000u64, 8001, 8002] {
+            let packet = Packet {
+                seq: 0,
+                ack: None,
+                ack_bits: 0,
+                payloads: vec![turn(seq)],
+            };
+            let received = relay.process_incoming(packet).unwrap();
+            assert_eq!(received.fresh.len(), 1);
+            assert_eq!(received.fresh[0].slot, 1, "rebound to the authorized slot");
+        }
+        assert_eq!(relay.delivered_through(SlotId(1)), Some(8002));
+
+        // The bug shape for contrast: a wire-slot-keyed edge (no ingress rebind)
+        // anchors slot 1 but dedups the wire-slot-0 payload under slot 0's from-zero
+        // window, so it rejects the very first resumed turn and would close the link.
+        let (raw_bad, _peer, _ec, _ed) = connected_connections().await;
+        let mut buggy = Link::new(raw_bad);
+        buggy.anchor_receive_window(SlotId(1), anchor);
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![turn(8000)],
+        };
+        match buggy.process_incoming(packet) {
+            Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
+                assert_eq!(slot, SlotId(0));
+                assert_eq!(seq, 8000);
+            }
+            other => panic!("expected the wire-slot-keyed edge to reject, got {other:?}"),
+        }
+    }
+
     fn self_signed() -> (
         Vec<CertificateDer<'static>>,
         PrivateKeyDer<'static>,
@@ -619,9 +820,15 @@ mod tests {
         (vec![cert_der.clone()], key, cert_der)
     }
 
-    /// Brings up a loopback QUIC connection and wraps each end in a [`Link`]. The
-    /// endpoints are returned so the caller keeps them alive for the test.
-    async fn connected_links() -> (Link, Link, quinn::Endpoint, quinn::Endpoint) {
+    /// Brings up a loopback QUIC connection, returning both raw ends plus the
+    /// endpoints (kept alive by the caller). The caller wraps each connection as a
+    /// [`Link`] however the test needs — [`Link::new`] or [`Link::with_ingress_slot`].
+    async fn connected_connections() -> (
+        quinn::Connection,
+        quinn::Connection,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
 
@@ -646,6 +853,13 @@ mod tests {
             .unwrap();
         let server_conn = accept.await.unwrap();
 
+        (client_conn, server_conn, client, server)
+    }
+
+    /// Brings up a loopback QUIC connection and wraps each end in a plain [`Link`].
+    /// The endpoints are returned so the caller keeps them alive for the test.
+    async fn connected_links() -> (Link, Link, quinn::Endpoint, quinn::Endpoint) {
+        let (client_conn, server_conn, client, server) = connected_connections().await;
         (
             Link::new(client_conn),
             Link::new(server_conn),
