@@ -488,7 +488,11 @@ impl LinkDriver {
             connectivity,
         };
         let mut state = LoopState::new(result_expected);
-        Self::session(&mut link, &mut seam, &mut state).await
+        // The no-reconnect entry has no token to read a slot from, and it never
+        // re-dials (so no resume anchor is ever computed from the unacked window).
+        // It stamps slot 0 — the value the embedder already sends and the relay
+        // rewrites to the authorized slot on ingress — preserving prior behavior.
+        Self::session(&mut link, &mut seam, &mut state, SlotId(0)).await
     }
 
     /// Runs the link and, on a mid-session link failure, re-dials the home relay
@@ -572,7 +576,7 @@ impl LinkDriver {
         let mut backoff = Backoff::new();
 
         loop {
-            match Self::session(&mut link, &mut seam, &mut state).await {
+            match Self::session(&mut link, &mut seam, &mut state, own_slot).await {
                 // A clean game shutdown, or a link close absorbed after our own
                 // leave intent went out: the session is over, not to be resumed.
                 Ok(()) => return Ok(()),
@@ -623,6 +627,7 @@ impl LinkDriver {
         link: &mut Link,
         seam: &mut GameSeam,
         state: &mut LoopState,
+        own_slot: SlotId,
     ) -> Result<(), DriverError> {
         let GameSeam {
             outbound,
@@ -729,6 +734,7 @@ impl LinkDriver {
         // resumed session continues the seq stream rather than rewinding it.
         for mut buffered in std::mem::take(outbound_buffer) {
             buffered.seq = *next_outbound_seq;
+            buffered.slot = u32::from(own_slot.0);
             *next_outbound_seq += 1;
             // Retain a copy for a possible re-home re-injection before the turn is
             // handed to the link (which moves it).
@@ -1033,9 +1039,16 @@ impl LinkDriver {
                         // so push the flush out. If it carried none (a near-MTU turn that
                         // filled the datagram), leave the timer so the flush retransmits.
                         Some(mut payload) => {
-                            // Assign this turn its origin seq — the client is the
-                            // sole authority for its own slot's production order.
+                            // Assign this turn its origin seq and slot — the client
+                            // is the sole authority for both its own slot's identity
+                            // and its production order. The embedder leaves `slot` at
+                            // 0 on every outbound turn (as it does `seq`); stamping
+                            // our authorized slot here keys the AckManager's unacked
+                            // window under the same `own_slot` the resume anchor and
+                            // ack-beacon retirement use, so an in-flight turn is not
+                            // stranded under a phantom slot-0 key across a reconnect.
                             payload.seq = *next_outbound_seq;
+                            payload.slot = u32::from(own_slot.0);
                             *next_outbound_seq += 1;
                             // Retain a copy for a possible re-home re-injection before
                             // the turn is handed to the link (which moves it).
@@ -2380,6 +2393,173 @@ mod tests {
             }
             other => panic!("expected an oversize turn on the control stream, got {other:?}"),
         }
+    }
+
+    /// Splits a [`LinkDriver`] into the pieces [`session`](LinkDriver::session)
+    /// takes directly, so a test can drive exactly one session on an explicit
+    /// `own_slot` and then inspect the link and loop state afterward — state that
+    /// `run`/`run_reconnecting` consume and drop.
+    fn into_session_parts(driver: LinkDriver) -> (Link, GameSeam, LoopState) {
+        let LinkDriver {
+            link,
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            result_expected,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            request_drop,
+            session_start,
+            connectivity,
+        } = driver;
+        let seam = GameSeam {
+            outbound,
+            inbound,
+            leaves,
+            leave_intent,
+            result,
+            lobby_out,
+            lobby_in,
+            chat_out,
+            chat_in,
+            request_drop,
+            session_start,
+            connectivity,
+        };
+        let state = LoopState::new(result_expected);
+        (link, seam, state)
+    }
+
+    /// Drives one session on `own_slot`, feeding it one small datagram turn per
+    /// entry in `turns` and then closing the outbound seam so the session returns.
+    /// The peer link is never driven, so nothing acks: every sent turn stays in the
+    /// returned link's unacked window — the in-flight shape a reconnect anchors on.
+    /// The peer link and endpoints are returned so the caller keeps the connection
+    /// alive for any post-session wire inspection.
+    async fn drive_unacked_session(
+        own_slot: SlotId,
+        turns: &[&[u8]],
+    ) -> (Link, LoopState, Link, quinn::Endpoint, quinn::Endpoint) {
+        let (link_a, link_b, ea, eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        // Buffer every turn (channel depth is ample) and then drop the sender, so
+        // the session drains them all and returns Ok on the closed-seam `None`.
+        for bytes in turns {
+            chan_a.outbound.send(turn(0, bytes)).await.unwrap();
+        }
+        drop(chan_a.outbound);
+        let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+        LinkDriver::session(&mut link, &mut seam, &mut state, own_slot)
+            .await
+            .expect("session stops cleanly once the outbound seam closes");
+        (link, state, link_b, ea, eb)
+    }
+
+    #[tokio::test]
+    async fn driver_sends_key_the_unacked_window_under_the_authorized_slot() {
+        // The embedder leaves every outbound turn's slot at 0; the driver stamps its
+        // own authorized slot at send. Without that stamp a client on slot 1 keys its
+        // in-flight turns under a phantom slot 0, so `oldest_unacked_seq(SlotId(1))`
+        // (what a same-relay resume anchors on) sees nothing. Stamped, the unacked
+        // window keys under slot 1 and the anchor query finds the in-flight seqs.
+        let (link, state, _peer, _ea, _eb) =
+            drive_unacked_session(SlotId(1), &[&[0x01], &[0x02], &[0x03]]).await;
+
+        assert_eq!(state.next_outbound_seq, 3, "three turns were produced");
+        assert_eq!(
+            link.oldest_unacked_seq(SlotId(1)),
+            Some(0),
+            "the in-flight window keys under the authorized slot",
+        );
+        assert_eq!(
+            link.oldest_unacked_seq(SlotId(0)),
+            None,
+            "nothing is stranded under the wire-claim slot 0",
+        );
+        assert_eq!(link.payloads_in_flight(), 3);
+    }
+
+    #[tokio::test]
+    async fn outbound_turns_carry_the_authorized_slot_on_the_wire() {
+        // The end-to-end counterpart to the keying unit: the stamped slot rides the
+        // datagram, so an undriven peer reading the raw link sees the authorized slot
+        // on the turn, not the embedder's 0.
+        let (link, _state, mut peer, _ea, _eb) = drive_unacked_session(SlotId(1), &[&[0xAB]]).await;
+        // Hold the sending link so the connection stays up for the peer's read.
+        let _keep_alive = link;
+
+        let received = loop {
+            let received = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+                .await
+                .expect("the stamped turn never reached the peer")
+                .expect("peer link errored");
+            if !received.fresh.is_empty() {
+                break received;
+            }
+        };
+        assert_eq!(received.fresh[0].slot, 1, "the wire turn carries slot 1");
+        assert_eq!(received.fresh[0].commands[0], 0xAB);
+    }
+
+    #[tokio::test]
+    async fn same_relay_resume_anchors_at_the_oldest_in_flight_seq_for_a_nonzero_slot() {
+        // The live deadlock's shape: a client on slot 1 leaves a turn in flight, the
+        // link drops, and the same-relay re-dial must present an own-slot anchor at
+        // the oldest still-unacked seq so the relay's fresh receive window admits the
+        // re-carried turn. Before the slot stamp the anchor fell through to
+        // `next_outbound_seq` (one past the in-flight turn), and the relay classified
+        // the re-carried turn as already-delivered and dropped it — a permanent stall.
+        let (link, state, _peer, _ea, _eb) =
+            drive_unacked_session(SlotId(1), &[&[0x01], &[0x02]]).await;
+
+        // The exact computation `reconnect_link` performs for the same-relay anchor.
+        let own_slot = SlotId(1);
+        let anchor = link
+            .oldest_unacked_seq(own_slot)
+            .unwrap_or(state.next_outbound_seq);
+
+        assert_eq!(
+            anchor, 0,
+            "the anchor is the oldest in-flight seq, not next_outbound",
+        );
+        assert_ne!(
+            anchor, state.next_outbound_seq,
+            "the bug regressed: the anchor skipped past the in-flight turn",
+        );
+    }
+
+    #[tokio::test]
+    async fn beacon_retirement_prunes_driver_sends_for_a_nonzero_slot() {
+        // The relay's ack-beacon names the authorized slot. Retiring under it must
+        // actually prune this client's driver-sent turns — which only holds once the
+        // send path keys the unacked window under that same slot. Under the old
+        // slot-0 keying `retire_through(own_slot, ..)` matched nothing and the window
+        // grew unbounded on beacon retirement alone.
+        let (mut link, _state, _peer, _ea, _eb) =
+            drive_unacked_session(SlotId(1), &[&[0x01], &[0x02], &[0x03]]).await;
+        assert_eq!(link.payloads_in_flight(), 3);
+
+        // A beacon naming the wire-claim slot 0 prunes nothing — the turns aren't
+        // keyed there.
+        assert_eq!(
+            link.retire_through(SlotId(0), 2),
+            0,
+            "no driver-sent turn is keyed under slot 0",
+        );
+
+        // A beacon naming the authorized slot retires the confirmed prefix (seqs 0
+        // and 1), leaving only seq 2 in flight.
+        assert_eq!(
+            link.retire_through(SlotId(1), 1),
+            2,
+            "the authorized-slot cursor retires the driver's confirmed turns",
+        );
+        assert_eq!(link.oldest_unacked_seq(SlotId(1)), Some(2));
+        assert_eq!(link.payloads_in_flight(), 1);
     }
 
     #[tokio::test]
