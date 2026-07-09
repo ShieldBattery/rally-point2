@@ -44,12 +44,13 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 >   [Control plane](#control-plane-the-coordinator)).
 >
 > - **Relay-death failover (coordinator-mediated re-home).** In-game, whole-group failover onto a
->   replacement relay: the coordinator's client-authenticated `POST /session/rehome` moves every slot homed
->   on a dead relay to one live relay and rebuilds the serving relays' descriptors as **resumed** (seeding
->   the already-decided departures so a fresh relay resumes rather than waits), and the client driver
->   escalates a dead home relay to an embedder-supplied re-home provider, re-dials the replacement with its
->   existing token + resume cursors, and re-injects a retained ring of its own sent turns so the new relay's
->   empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
+>   replacement relay: the coordinator's tenant-authenticated, app-server-mediated `POST /session/rehome`
+>   moves every slot homed on a dead relay to one live relay and rebuilds the serving relays' descriptors as
+>   **resumed** (seeding the already-decided departures so a fresh relay resumes rather than waits), and the
+>   client driver escalates a dead home relay to an embedder-supplied re-home provider (which reaches the
+>   coordinator through the tenant's app server — clients never call the coordinator directly), re-dials the
+>   replacement with its existing token + resume cursors, and re-injects a retained ring of its own sent turns
+>   so the new relay's empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
 >
 > Still designed but not built: **dual-stack advertise addresses**, **per-relay identity binding** on the
 > control connection, production mesh **mTLS / an internal CA**, and coordinator **HA / persistence** (a
@@ -333,21 +334,25 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   out. An undecided drop-hold at relay death is deliberately lost — survivors re-wait the fresh 30s floor on
   the new relay.
 
-**Coordinator `POST /session/rehome`.** A client-authenticated endpoint, distinct from the tenant-signed
-`/session/create` scheme: the request carries the client's own token, a timestamp, the relay id it believes
-dead, and an Ed25519 signature by the client's session key over
-`rp2-rehome-v1:<ts>:<session>:<slot>:<relay_id>`. The coordinator verifies the token exactly as a relay would
-(tenant key + expiry), then the signature against the token's *embedded* client pubkey — so only the client a
-token was minted for can ask, and only about its own session + slot (both read from the verified token, never
-the body) — under a lenient per-`(session, slot)` rate limit. The decision: a relay **still enrolled** →
-`stay` (the coordinator overrules a false alarm); **dead** → move the whole group to a replacement — a live
-relay already serving the session (earliest in the authority order) if one exists, else the lowest-id live
-relay, else `unavailable` — updating the serving set (which is also the descriptors' authority order) in
-place, rebuilding every serving relay's descriptor as **resumed**, and pushing R_new's first so it is staged
-before the response returns (the client's backoff absorbs the residual descriptor/dial race). The decision is
-idempotent per `(session, dead_relay)`, so concurrent or repeated asks return the same target without
-re-mutating. An unknown session (a coordinator restart wiped its membership) is `unavailable`; the client
-keeps its token throughout.
+**Coordinator `POST /session/rehome`.** Tenant-authenticated and app-server-mediated — clients never talk to
+the coordinator directly. The re-home is authenticated exactly like `POST /session/create`: the tenant's app
+server signs the request with its client key, and the coordinator verifies that request signature (the
+domain-separated `rp2-request-v1:<ts>:<METHOD>:<path>:<body>` scheme) before doing anything. The request body
+is snake_case `{ "tenant", "session", "dead_relay_id" }`; the `tenant` must match the tenant the signature
+verifies under, and `session` + `dead_relay_id` are the app server's trusted assertion about one of its own
+sessions. A missing/invalid signature, a stale timestamp, or an unenrolled tenant all `401`; a lenient
+per-`(tenant, session)` rate limit `429`s a caller that re-asks too fast. Because the session lookup is
+tenant-keyed, a `session` owned by another tenant simply finds no serving set and returns `unavailable`,
+leaking nothing. The decision: a relay **still enrolled** → `stay` (the coordinator overrules a false alarm);
+**dead** → move the whole group to a replacement — a live relay already serving the session (earliest in the
+authority order) if one exists, else the lowest-id live relay, else `unavailable` — updating the serving set
+(which is also the descriptors' authority order) in place, rebuilding every serving relay's descriptor as
+**resumed**, and pushing R_new's first so it is staged before the response returns (the client's backoff
+absorbs the residual descriptor/dial race). The response is snake_case `{ "decision", "relay"? }`, where
+`relay` (present only when `decision` is `newTarget`) is `{ "relay_id", "relay_addr", "cert_der" }` with the
+cert hex-encoded.
+The decision is idempotent per `(session, dead_relay)`, so concurrent or repeated asks return the same target
+without re-mutating. An unknown session (a coordinator restart wiped its membership) is `unavailable`.
 
 **Resumed descriptors.** A `resumed` descriptor additionally carries the session's already-decided
 `departed_slots` (slot + left/dropped kind, seeded from the coordinator's lifecycle accounting). A fresh relay

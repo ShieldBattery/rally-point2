@@ -69,11 +69,10 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    self, CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
     SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
-use rally_point_proto::token::SignedToken;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -169,9 +168,9 @@ pub struct CoordinatorState {
     /// before its connection is dropped and it is deregistered (see
     /// [`LIVENESS_TIMEOUT`]). A field so tests can shorten it.
     pub liveness_timeout: Duration,
-    /// The per-slot rate limiter for the client-authenticated re-home endpoint
-    /// (`POST /session/rehome`). Lenient — a client may legitimately re-ask every
-    /// few seconds — sized only to bound a misbehaving client.
+    /// The per-session rate limiter for the tenant-authenticated re-home endpoint
+    /// (`POST /session/rehome`). Lenient — an app server may legitimately re-ask
+    /// every few seconds — sized only to bound a misbehaving caller.
     pub rehome_limiter: RehomeLimiter,
 }
 
@@ -265,47 +264,49 @@ async fn create_session(
     Ok(Json(resp))
 }
 
-/// Request body for `POST /session/rehome` (client-authenticated, camelCase — this
-/// is game-client-facing surface, not the control plane's snake_case wire).
+/// Request body for `POST /session/rehome` (tenant-authenticated, snake_case —
+/// this is control-plane surface, the same wire style as [`SessionRequest`]).
 ///
-/// The `token` is the client's own encoded [`SignedToken`], hex; the `signature`
-/// is a hex Ed25519 signature by the client's session key over
-/// `rp2-rehome-v1:<timestamp>:<session>:<slot>:<deadRelayId>`, where `session` and
-/// `slot` are taken from the *verified token* (never the body), so a client can
-/// only ask about the session and slot its token authorizes.
+/// The tenant's app server asserts, on behalf of one of its game clients, that a
+/// session's home relay has died and asks where the session should move. The
+/// request is authenticated exactly like `POST /session/create` — a tenant
+/// request signature over the raw body (see the module docs) — and `tenant` must
+/// match the tenant that signature verifies under. `session` and `dead_relay_id`
+/// are the app server's trusted assertion about one of its own sessions: the
+/// tenant is fully trusted for its own sessions, and the coordinator's
+/// session lookup is tenant-keyed, so a caller can only ever affect a session it
+/// actually owns (a cross-tenant `session` finds no serving set and yields
+/// `unavailable`).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RehomeRequest {
-    /// The client's encoded authorization token, hex.
-    token: String,
-    /// Unix timestamp (seconds) the signature was made at — replay-window bounded.
-    timestamp: u64,
-    /// The relay id the client believes has died.
+    /// The tenant the app server is acting for — must match the request signature.
+    tenant: TenantId,
+    /// The session to re-home, in the coordinator's `(tenant, session)` id space.
+    session: u64,
+    /// The relay id the app server reports has died.
     dead_relay_id: u64,
-    /// Hex Ed25519 signature by the client's session key over the domain-separated
-    /// rehome message.
-    signature: String,
 }
 
-/// The replacement relay a `newTarget` re-home decision names — where the client
-/// re-dials, with the cert it pins (hex). Distinct from the proto
-/// [`RelayEndpoint`](rally_point_proto::control::RelayEndpoint) so the client-facing
-/// JSON is camelCase with a hex cert rather than a byte array.
+/// The replacement relay a `newTarget` re-home decision names — where the moved
+/// clients re-dial, with the cert they pin (hex). Distinct from the proto
+/// [`RelayEndpoint`](rally_point_proto::control::RelayEndpoint) so the cert is a
+/// hex string rather than a byte array; field names are snake_case to match the
+/// rest of the tenant-facing API ([`SessionResponse`]).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct RehomeRelay {
     /// The replacement relay's coordinator-assigned id.
     relay_id: u64,
-    /// Where the client reaches it, `"ip:port"`.
+    /// Where clients reach it, `"ip:port"`.
     relay_addr: String,
-    /// DER of the relay's TLS leaf cert, hex — the client pins exactly this.
+    /// DER of the relay's TLS leaf cert, hex — clients pin exactly this.
     cert_der: String,
 }
 
 /// Response body for `POST /session/rehome`. `decision` is `"stay"`,
 /// `"unavailable"`, or `"newTarget"`; `relay` is present only for `"newTarget"`.
+/// Field names are snake_case to match the rest of the tenant-facing API; the
+/// `decision` discriminant strings are unchanged.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct RehomeResponse {
     /// The re-home decision: `stay` (the relay is still live), `unavailable` (no
     /// live relay can take over), or `newTarget` (move to `relay`).
@@ -338,61 +339,52 @@ impl From<RehomeOutcome> for RehomeResponse {
     }
 }
 
-/// Coordinator-mediated failover: an in-game client whose home relay is
-/// unreachable asks where its session should move.
+/// Coordinator-mediated failover: a tenant's app server, on behalf of an in-game
+/// client whose home relay is unreachable, asks where the session should move.
 ///
-/// **Authentication is client-side**, distinct from the tenant-signed scheme
-/// `/session/create` uses: the request carries the client's own token and an
-/// Ed25519 signature by the client's session key over
-/// `rp2-rehome-v1:<ts>:<session>:<slot>:<deadRelayId>`. The coordinator verifies
-/// the token exactly as a relay would (tenant key + expiry), then the signature
-/// against the token's **embedded** client pubkey — so only the client the token
-/// was minted for can ask, and only about its own session + slot (both read from
-/// the verified token, never the body). A bad token, a stale timestamp, or a bad
-/// signature all map to `401` without revealing which failed. A per-slot rate
-/// limit (lenient) returns `429` when a client re-asks too fast.
+/// **Authenticated exactly like `POST /session/create`** — a tenant request
+/// signature over the raw body ([`verify_tenant_request`]) — because the caller
+/// is the tenant's app server (the control plane), not the game client. Clients
+/// never talk to the coordinator directly; the app server mediates the re-home.
+/// The `tenant` in the body must match the tenant the signature verifies under,
+/// and the `session` + `dead_relay_id` are the app server's trusted assertion
+/// about one of its own sessions. A missing/invalid signature, a stale timestamp,
+/// or an unenrolled tenant all map to `401` without revealing which failed. A
+/// lenient per-`(tenant, session)` rate limit returns `429` when the caller
+/// re-asks too fast.
 ///
-/// The decision itself is [`session::rehome`]: `stay` when the named relay is in
-/// fact still enrolled, `newTarget` when the coordinator moves the whole homed
-/// group to a replacement relay (seeding the rebuilt descriptors with the
-/// session's already-decided departures so a fresh relay resumes rather than
-/// waits), and `unavailable` when the session is unknown or no live relay can
-/// take it over.
+/// The session lookup [`session::rehome`] performs is tenant-keyed, so a caller
+/// can only ever affect a session it actually owns: a `session` that belongs to
+/// another tenant (or to no one) finds no serving set and yields `unavailable`,
+/// leaking nothing. The decision itself: `stay` when the named relay is in fact
+/// still enrolled, `newTarget` when the coordinator moves the whole homed group
+/// to a replacement relay (seeding the rebuilt descriptors with the session's
+/// already-decided departures so a fresh relay resumes rather than waits), and
+/// `unavailable` when the session is unknown or no live relay can take it over.
 async fn rehome_session(
     State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<RehomeResponse>, StatusCode> {
     let request: RehomeRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    )?;
 
-    // Verify the token (tenant key + expiry) exactly as a relay would, then bind
-    // the request to the client that holds the matching session key.
-    let token = verify_rehome_token(&state.setup, &request.token)?;
-    let tenant = token.claims.tenant.clone();
-    let session = token.claims.session;
-    let slot = token.claims.slot;
+    let tenant = request.tenant;
+    let session = SessionId(request.session);
 
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now_secs.abs_diff(request.timestamp) > REQUEST_TIMESTAMP_WINDOW_SECS {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    // The rehome signature covers session + slot from the *verified token* (never
-    // the body) plus the timestamp and the relay the client believes dead, made
-    // with the client's session key — the token's embedded pubkey verifies it.
-    let signature = hex::decode(&request.signature).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let message =
-        control::rehome_signed_message(request.timestamp, session, slot, request.dead_relay_id);
-    UnparsedPublicKey::new(&ED25519, token.claims.client_pubkey.as_bytes())
-        .verify(message.as_bytes(), &signature)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    // Rate limit per authenticated (tenant, session, slot). A refused request is a
-    // 429 the client backs off and re-asks after.
-    if !state.rehome_limiter.check(&tenant, session, slot) {
+    // Rate limit per authenticated (tenant, session). A refused request is a 429
+    // the caller backs off and re-asks after.
+    if !state.rehome_limiter.check(&tenant, session) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -405,40 +397,11 @@ async fn rehome_session(
         departed,
     );
     // Let the descriptor push reach R_new's control task before responding, so the
-    // relay is likelier to hold the resumed descriptor before the client dials it
+    // relay is likelier to hold the resumed descriptor before a client dials it
     // (the client's reconnect backoff absorbs whatever race remains).
     tokio::task::yield_now().await;
 
     Ok(Json(RehomeResponse::from(outcome)))
-}
-
-/// Verifies a re-home request's token the way a relay verifies it at dial time:
-/// decode it, verify the tenant's Ed25519 signature over its canonical bytes, and
-/// confirm it is unexpired. Every failure maps to `401` so a probe learns nothing.
-/// Returns the decoded token, whose claims (session, slot, client pubkey) drive
-/// the rest of the handler.
-fn verify_rehome_token(setup: &SessionSetup, token_hex: &str) -> Result<SignedToken, StatusCode> {
-    let bytes = hex::decode(token_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let token = SignedToken::decode(&bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let (_kid, pubkey) = tenant::verifying_key(setup.tenants(), &token.claims.tenant)
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let mut signed = Vec::new();
-    token
-        .signed_message(&mut signed)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    UnparsedPublicKey::new(&ED25519, pubkey.as_ref())
-        .verify(&signed, token.signature.as_bytes())
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if token.claims.expires_at.0 <= now_secs {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    Ok(token)
 }
 
 /// The most session ids one liveness probe may ask about, so a caller cannot make
@@ -1105,7 +1068,7 @@ mod tests {
     use rally_point_proto::ids::{RelayId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
     use rally_point_proto::version::ProtocolVersion;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use ring::signature::Ed25519KeyPair;
     use tower::ServiceExt;
 
     /// A fixed dev-style client seed for the `sb-test` tenant: its public half
@@ -1784,9 +1747,10 @@ mod tests {
 
     // --- Re-home endpoint ---
 
-    /// A dev client seed for the re-home tests: its public half is embedded in the
-    /// session's token, and it signs the rehome message.
-    const REHOME_CLIENT_SEED: [u8; 32] = [0x33; 32];
+    /// A dev client seed for a *second* tenant (`sb-other`) in the cross-tenant
+    /// probe test: its public half is enrolled as that tenant's request key, so
+    /// `sb-other` can sign a request that authenticates as itself.
+    const OTHER_CLIENT_SEED: [u8; 32] = [0x44; 32];
 
     /// Enrolls a second relay (id 2) into `state`'s registry, so a re-home whose home
     /// relay died has a live relay to move to.
@@ -1802,99 +1766,84 @@ mod tests {
         );
     }
 
-    /// Creates a one-slot session whose token embeds `seed`'s client key, returning
-    /// the session id and the encoded token bytes.
-    fn session_with_client_key(state: &CoordinatorState, seed: &[u8; 32]) -> (SessionId, Vec<u8>) {
-        let pair = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
-        let pubkey: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
+    /// Creates a one-slot session owned by the `sb-test` tenant, returning its id.
+    /// The re-home endpoint is now tenant-authenticated (the app server mediates),
+    /// so the session's tokens no longer ride the request — only the session's
+    /// existence and its `(tenant, session)` ownership matter.
+    fn create_rehome_session(state: &CoordinatorState) -> SessionId {
         let req = SessionRequest {
             tenant: TenantId("sb-test".to_owned()),
             players: vec![PlayerHandoff {
                 slot: SlotId(0),
-                client_pubkey: ClientPublicKey(pubkey),
+                client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,
                 observer: false,
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let resp = crate::session::create_session(&state.setup, req, ExpiresAt(u64::MAX)).unwrap();
-        (resp.session, resp.tokens[0].token.clone())
+        crate::session::create_session(&state.setup, req, ExpiresAt(u64::MAX))
+            .unwrap()
+            .session
     }
 
-    /// Signs the rehome message with `seed`'s key for the given fields.
-    fn sign_rehome(
-        seed: &[u8; 32],
-        ts: u64,
-        session: SessionId,
-        slot: u8,
-        dead_relay: u64,
-    ) -> String {
-        let pair = Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
-        let message = format!("rp2-rehome-v1:{ts}:{}:{}:{}", session.0, slot, dead_relay);
-        hex::encode(pair.sign(message.as_bytes()).as_ref())
+    /// Enrolls a second tenant (`sb-other`), with [`OTHER_CLIENT_SEED`]'s public
+    /// half as its request-signing key, so a cross-tenant probe can authenticate as
+    /// a *different* tenant than the one that owns the target session.
+    fn enroll_other_tenant(state: &CoordinatorState) {
+        crate::tenant::enroll(
+            state.setup.tenants(),
+            KeyId("other-key-1".to_owned()),
+            TenantId("sb-other".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let client_pubkey = crate::tenant::client_pubkey_from_seed(&OTHER_CLIENT_SEED).unwrap();
+        crate::tenant::set_client_pubkey(
+            state.setup.tenants(),
+            &TenantId("sb-other".to_owned()),
+            client_pubkey,
+        );
     }
 
-    /// Builds the rehome request body JSON.
-    fn rehome_body(token: &[u8], ts: u64, dead_relay: u64, signature: &str) -> Vec<u8> {
+    /// Builds the tenant-signed rehome request body `{tenant, session, dead_relay_id}`
+    /// (snake_case, the control-plane wire style).
+    fn rehome_body(tenant: &str, session: SessionId, dead_relay: u64) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "token": hex::encode(token),
-            "timestamp": ts,
-            "deadRelayId": dead_relay,
-            "signature": signature,
+            "tenant": tenant,
+            "session": session.0,
+            "dead_relay_id": dead_relay,
         }))
         .unwrap()
-    }
-
-    /// POSTs a rehome request body to `app`.
-    async fn post_rehome(app: Router, body: Vec<u8>) -> axum::http::Response<axum::body::Body> {
-        app.oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/session/rehome")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-    }
-
-    fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
     }
 
     #[tokio::test]
     async fn rehome_endpoint_returns_a_new_target_when_the_home_died() {
         let state = state_with_relay_and_tenant();
         enroll_second_relay(&state);
-        let (session, token) = session_with_client_key(&state, &REHOME_CLIENT_SEED);
+        let session = create_rehome_session(&state);
         // The home relay (1) dies; the session should move to the live relay 2.
         registry::remove(state.setup.registry(), RelayId(1));
 
-        let ts = now_secs();
-        let sig = sign_rehome(&REHOME_CLIENT_SEED, ts, session, 0, 1);
-        let resp = post_rehome(router(state), rehome_body(&token, ts, 1, &sig)).await;
+        let body = rehome_body("sb-test", session, 1);
+        let resp = signed_post(router(state), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["decision"], "newTarget");
-        assert_eq!(json["relay"]["relayId"], 2);
+        // Response fields are snake_case, matching the rest of the tenant-facing API.
+        assert_eq!(json["relay"]["relay_id"], 2);
     }
 
     #[tokio::test]
     async fn rehome_endpoint_stays_when_the_relay_is_still_live() {
         let state = state_with_relay_and_tenant();
-        let (session, token) = session_with_client_key(&state, &REHOME_CLIENT_SEED);
-        // Relay 1 is still enrolled: the coordinator overrules the client's belief.
-        let ts = now_secs();
-        let sig = sign_rehome(&REHOME_CLIENT_SEED, ts, session, 0, 1);
-        let resp = post_rehome(router(state), rehome_body(&token, ts, 1, &sig)).await;
+        let session = create_rehome_session(&state);
+        // Relay 1 is still enrolled: the coordinator overrules the caller's belief.
+        let body = rehome_body("sb-test", session, 1);
+        let resp = signed_post(router(state), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1907,13 +1856,12 @@ mod tests {
     async fn rehome_endpoint_rejects_a_wrong_key_signature() {
         let state = state_with_relay_and_tenant();
         enroll_second_relay(&state);
-        let (session, token) = session_with_client_key(&state, &REHOME_CLIENT_SEED);
+        let session = create_rehome_session(&state);
         registry::remove(state.setup.registry(), RelayId(1));
 
-        let ts = now_secs();
-        // Signed by a key whose public half is not the one the token embeds.
-        let sig = sign_rehome(&[0x99; 32], ts, session, 0, 1);
-        let resp = post_rehome(router(state), rehome_body(&token, ts, 1, &sig)).await;
+        // Signed by a key whose public half is not the tenant's enrolled request key.
+        let body = rehome_body("sb-test", session, 1);
+        let resp = signed_post(router(state), "/session/rehome", &body, &[0x99; 32]).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1921,33 +1869,78 @@ mod tests {
     async fn rehome_endpoint_rejects_a_stale_timestamp() {
         let state = state_with_relay_and_tenant();
         enroll_second_relay(&state);
-        let (session, token) = session_with_client_key(&state, &REHOME_CLIENT_SEED);
+        let session = create_rehome_session(&state);
         registry::remove(state.setup.registry(), RelayId(1));
+        let app = router(state);
 
         // A correctly-keyed signature, but over a timestamp far outside the window.
-        let stale = now_secs() - (REQUEST_TIMESTAMP_WINDOW_SECS + 60);
-        let sig = sign_rehome(&REHOME_CLIENT_SEED, stale, session, 0, 1);
-        let resp = post_rehome(router(state), rehome_body(&token, stale, 1, &sig)).await;
+        let body = rehome_body("sb-test", session, 1);
+        let pair = Ed25519KeyPair::from_seed_unchecked(&TEST_CLIENT_SEED).unwrap();
+        let stale_ts = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - (REQUEST_TIMESTAMP_WINDOW_SECS + 60))
+            .to_string();
+        let message = build_request_message(&stale_ts, &Method::POST, "/session/rehome", &body);
+        let sig = hex::encode(pair.sign(&message).as_ref());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/session/rehome")
+                    .header("content-type", "application/json")
+                    .header(REQUEST_TIMESTAMP_HEADER, stale_ts)
+                    .header(REQUEST_SIGNATURE_HEADER, sig)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rehome_endpoint_unavailable_for_a_cross_tenant_session() {
+        // A different tenant (sb-other) names sb-test's session id in a validly
+        // *self*-signed request. The session lookup is tenant-keyed, so sb-other
+        // finds no serving set for that id and gets `unavailable` — no cross-tenant
+        // state is touched or leaked, and (relay 1 removed so the stay-guard cannot
+        // fire) the answer is unambiguously unavailable rather than stay.
+        let state = state_with_relay_and_tenant();
+        enroll_second_relay(&state);
+        enroll_other_tenant(&state);
+        let session = create_rehome_session(&state); // owned by sb-test
+        registry::remove(state.setup.registry(), RelayId(1));
+
+        let body = rehome_body("sb-other", session, 1);
+        let resp = signed_post(router(state), "/session/rehome", &body, &OTHER_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"], "unavailable");
+        assert!(json.get("relay").is_none(), "no relay leaks to another tenant");
     }
 
     #[tokio::test]
     async fn rehome_endpoint_rate_limits_repeated_requests() {
         let state = state_with_relay_and_tenant();
         enroll_second_relay(&state);
-        let (session, token) = session_with_client_key(&state, &REHOME_CLIENT_SEED);
+        let session = create_rehome_session(&state);
         registry::remove(state.setup.registry(), RelayId(1));
         let app = router(state);
 
-        let ts = now_secs();
-        let sig = sign_rehome(&REHOME_CLIENT_SEED, ts, session, 0, 1);
+        let body = rehome_body("sb-test", session, 1);
         // The default burst is 3: the first three are admitted (idempotent, same
         // target), the fourth is rate-limited.
         for _ in 0..3 {
-            let resp = post_rehome(app.clone(), rehome_body(&token, ts, 1, &sig)).await;
+            let resp =
+                signed_post(app.clone(), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        let resp = post_rehome(app, rehome_body(&token, ts, 1, &sig)).await;
+        let resp = signed_post(app, "/session/rehome", &body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
