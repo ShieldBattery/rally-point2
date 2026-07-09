@@ -1869,15 +1869,22 @@ async fn reconnect_link(
                             // seq 0 and reject our resumed (already high) seq stream
                             // once it passed the window — dropping the link, and with
                             // every re-homed slot crossing the window together, the
-                            // whole group. Declare our own-slot resume anchor: the
-                            // oldest seq the retention ring will re-inject, so the
-                            // relay bases the window there and the resumed stream is
-                            // accepted. Empty retention means nothing to re-send, so
-                            // no anchor is needed (the window bases at 0, correct for
-                            // a slot that never sent a turn).
+                            // whole group. Declare our own-slot resume anchor at the
+                            // oldest seq we will actually re-send, so the relay bases
+                            // the window there and the resumed stream is accepted. Two
+                            // sources feed that re-send: the rebound link keeps its
+                            // unacked window (the redundancy pass re-carries it) and
+                            // `reinject_retention` re-adds the retained ring, so the
+                            // anchor is the lower of the oldest-unacked seq and the
+                            // retention front (see `rehome_own_slot_anchor`). No source
+                            // means nothing to re-send, so no anchor is needed (the
+                            // window bases at 0, correct for a slot that never sent).
                             let mut rehome_cursors = cursors.clone();
-                            if let Some(front) = state.retention.front() {
-                                rehome_cursors.push((own_slot, front.seq));
+                            if let Some(anchor) = rehome_own_slot_anchor(
+                                link.oldest_unacked_seq(own_slot),
+                                state.retention.front().map(|turn| turn.seq),
+                            ) {
+                                rehome_cursors.push((own_slot, anchor));
                             }
                             match endpoint
                                 .reconnect_with_timeout(
@@ -1970,6 +1977,36 @@ async fn redivert_pending_control(
         pending.remove(0);
     }
     Ok(())
+}
+
+/// The own-slot receive-window anchor a re-home dial presents to the fresh relay:
+/// the oldest seq the client will actually re-send once it resumes there. Two
+/// sources feed that re-send and the anchor must cover the lower of them —
+///
+/// - the rebound link keeps its unacked window (`reset_connection` preserves it and
+///   the redundancy pass re-carries it oldest-first), whose oldest seq is
+///   `oldest_unacked`; and
+/// - [`reinject_retention`] re-adds the retained ring, whose oldest seq is
+///   `retention_front` (this can sit *below* `oldest_unacked` when the oldest turns
+///   were already acked — retention keeps them, the unacked window does not).
+///
+/// Anchoring at only the retention front (as this once did) strands the unacked tail
+/// below it whenever own-slot in-flight has outgrown the retention cap —
+/// [`UNACKED_WINDOW_CAP`] is twice [`RETENTION_TURN_CAP`], so 513..=1024 turns in
+/// flight is reachable under sustained forward-path loss (a relay degrading, then
+/// dying). Those turns are re-carried but the relay buries them below the window and
+/// never fans them to peers, permanently gapping the game — a comparator-visible
+/// desync at turn 1. `None` means neither source will re-send anything (a slot that
+/// never sent a turn), so the window correctly bases at 0 and no anchor is declared.
+fn rehome_own_slot_anchor(
+    oldest_unacked: Option<u64>,
+    retention_front: Option<u64>,
+) -> Option<u64> {
+    match (oldest_unacked, retention_front) {
+        (Some(unacked), Some(front)) => Some(unacked.min(front)),
+        (Some(unacked), None) => Some(unacked),
+        (None, front) => front,
+    }
 }
 
 fn reinject_retention(link: &mut Link, state: &mut LoopState) {
@@ -2261,6 +2298,36 @@ mod tests {
         drop(chan_b.outbound);
         let _ = task_a.await;
         let _ = task_b.await;
+    }
+
+    #[test]
+    fn rehome_anchor_covers_the_unacked_tail_below_the_retention_front() {
+        // The bug this guards: on a re-home the rebound link keeps its unacked window
+        // AND re-injects the retention ring, so the oldest re-sent seq is the lower of
+        // the two. When own-slot in-flight has outgrown the retention cap the oldest
+        // unacked seq sits BELOW the retention front; anchoring at the front would
+        // strand every turn between them (re-carried, but buried below the fresh
+        // relay's window — a comparator-visible desync).
+        assert_eq!(
+            rehome_own_slot_anchor(Some(4300), Some(4788)),
+            Some(4300),
+            "in-flight past the retention cap: anchor at the oldest unacked, not the front",
+        );
+        // The mirror case: the oldest turns were already acked (dropped from the
+        // window) but retention still holds them to re-supply, so the retention front
+        // is the lower — and load-bearing — bound.
+        assert_eq!(
+            rehome_own_slot_anchor(Some(5000), Some(4788)),
+            Some(4788),
+            "acked-then-retained old turns: anchor at the retention front",
+        );
+        // Equal bounds are a no-op either way.
+        assert_eq!(rehome_own_slot_anchor(Some(4788), Some(4788)), Some(4788));
+        // A single source: fall back to whichever will re-send.
+        assert_eq!(rehome_own_slot_anchor(None, Some(4788)), Some(4788));
+        assert_eq!(rehome_own_slot_anchor(Some(4300), None), Some(4300));
+        // Nothing to re-send: no anchor, the fresh relay's window bases at 0.
+        assert_eq!(rehome_own_slot_anchor(None, None), None);
     }
 
     #[tokio::test]
