@@ -205,21 +205,46 @@ impl SessionSetup {
             .retain(|(t, s, _), _| !(t == tenant && *s == session));
     }
 
-    /// Retires a closed session's membership maps — its `session_relays` and
-    /// `session_refs` entries for `(tenant, session)`. Called when the lifecycle
-    /// removes the session, alongside [`forget_rehomes`], so both grow only with
-    /// live sessions rather than for the coordinator's whole lifetime.
+    /// Takes — removes and returns — a closing session's relay membership: its
+    /// `session_relays` entry for `(tenant, session)`, or an empty vec if none is
+    /// recorded. The `session_refs` entry is dropped in the same call.
     ///
-    /// Retiring `session_relays` is also what refuses a re-home for a closed
-    /// session: with no serving relays recorded, [`rehome`]'s
-    /// `serving.is_empty() → Unavailable` guard fires, so a straggler whose token
-    /// has not yet expired can no longer pick a replacement relay and resurrect a
-    /// dead game. No separate liveness flag is needed — the empty membership *is*
-    /// the terminal state.
-    pub fn forget_session_membership(&self, tenant: &TenantId, session: SessionId) {
+    /// The removal-and-return of `session_relays` happens under a **single** lock
+    /// acquisition, which is what makes the close path's clean-up race-free. A
+    /// concurrent [`rehome`] re-validates membership under this same lock before it
+    /// mutates, so relative to this take it lands wholly before or wholly after:
+    ///
+    /// - A rehome that observes the membership **gone** (it ran after this take)
+    ///   fails its under-lock re-validation and returns `Unavailable` — it neither
+    ///   pushes a descriptor nor records a rehome, so there is nothing left to clean.
+    /// - A rehome that completed **before** this take had already added its target
+    ///   relay to the membership, so that relay is in the vec this take returns — the
+    ///   close's descriptor removal over the returned set therefore covers the
+    ///   resumed descriptor that rehome pushed, and the close's [`forget_rehomes`]
+    ///   (run after the take) clears the idempotency entry it recorded.
+    ///
+    /// Retiring `session_relays` is also what refuses a *later* re-home for the
+    /// closed session: with no serving relays recorded, [`rehome`]'s
+    /// `serving.is_empty() → Unavailable` guard fires, so a straggler whose token has
+    /// not yet expired can no longer pick a replacement relay and resurrect a dead
+    /// game. No separate liveness flag is needed — the empty membership *is* the
+    /// terminal state. The `session_refs` clear takes its own lock afterward; only
+    /// the take-and-clear of `session_relays` needs to be atomic (it is the map the
+    /// racing rehome re-validates against), so nothing hinges on the two being
+    /// retired under one lock.
+    pub fn take_session_membership(&self, tenant: &TenantId, session: SessionId) -> Vec<RelayId> {
         let key = (tenant.clone(), session);
-        self.session_relays.lock().remove(&key);
+        let taken = self.session_relays.lock().remove(&key).unwrap_or_default();
         self.session_refs.lock().remove(&key);
+        taken
+    }
+
+    /// Retires a closed session's membership maps, discarding the taken serving set
+    /// — the value-free form of [`take_session_membership`](Self::take_session_membership)
+    /// for callers that only need the retirement, not the snapshot (the close paths
+    /// use the take so they can remove each serving relay's descriptor).
+    pub fn forget_session_membership(&self, tenant: &TenantId, session: SessionId) {
+        self.take_session_membership(tenant, session);
     }
 
     /// The per-session re-home rate limiter, so the api handler can charge a token
@@ -1878,6 +1903,75 @@ mod tests {
             setup.descriptors().current_for(RelayId(2)),
             baseline_relay2,
             "the raced rehome pushed no resumed descriptor to a live relay",
+        );
+    }
+
+    #[test]
+    fn a_full_close_after_a_completed_rehome_clears_the_new_relays_descriptor_and_record() {
+        // The complement of the racing-rehome test: when a rehome completes FULLY —
+        // recording its idempotency entry and pushing a resumed descriptor to the new
+        // relay — BEFORE a full close, the close must still clean up after it. The
+        // close takes the session's membership atomically, and that snapshot now
+        // includes the new relay the completed rehome added, so the close removes the
+        // new relay's descriptor too and its forget_rehomes clears the recorded entry.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup); // serving == {1}
+        registry::remove(setup.registry(), RelayId(1)); // the home died, so not Stay
+
+        // A full rehome moves the group onto relay 2: it records the idempotency entry
+        // and pushes a resumed descriptor to relay 2.
+        assert!(matches!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2),
+        ));
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(2)]);
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(2))
+                .iter()
+                .any(|d| d.session == resp.session),
+            "the completed rehome staged a resumed descriptor on the new relay",
+        );
+        assert!(
+            recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_some(),
+            "the completed rehome recorded an idempotency entry",
+        );
+
+        // A full close, in the coordinator's take-first order: take the membership
+        // snapshot (it now includes relay 2), remove each taken relay's descriptor,
+        // then forget the recorded rehomes.
+        let taken = setup.take_session_membership(&tid(), resp.session);
+        assert_eq!(
+            taken,
+            vec![RelayId(2)],
+            "the taken snapshot includes the relay the completed rehome added",
+        );
+        for relay_id in taken {
+            setup.descriptors().remove(relay_id, &tid(), resp.session);
+        }
+        setup.forget_rehomes(&tid(), resp.session);
+
+        // The new relay's descriptor for the closed session is gone from its outbox,
+        // and a relay resubscribing after the close is not re-synced it.
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(2))
+                .iter()
+                .all(|d| d.session != resp.session),
+            "the close removed the new relay's descriptor for the closed session",
+        );
+        let rx = setup.descriptors().subscribe(RelayId(2));
+        assert!(
+            !rx.borrow().iter().any(|d| d.session == resp.session),
+            "a fresh subscribe for the new relay lacks the closed session",
+        );
+
+        // No recorded rehome survives to be served token-free after the close.
+        assert!(
+            recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
+            "the close cleared the recorded rehome",
         );
     }
 }

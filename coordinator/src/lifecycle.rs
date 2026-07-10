@@ -321,26 +321,37 @@ impl Lifecycle {
         // not replayed to a relay that reconnects after this.
         self.prune_dedup(&tenant, session);
         self.inner.setup.reaps().retire(&tenant, session);
-        self.inner.setup.forget_rehomes(&tenant, session);
-        // Drop the session's descriptor from every relay that was serving it,
-        // BEFORE forget_session_membership below clears the membership we read the
-        // serving set from. Otherwise the descriptor stays in each serving relay's
-        // latest-wins outbox forever, and a relay reconnecting after the close is
-        // re-synced the dead session's stale descriptor and re-applies it — the
-        // relay-side reconciler only ends sessions ABSENT from the pushed set, so a
-        // present-but-dead descriptor resurrects the session on that relay.
-        for relay_id in self.inner.setup.serving_relays(&tenant, session) {
+        // Take (remove-and-return) the session's relay membership FIRST, atomically
+        // with the serving-set snapshot, then drop each serving relay's descriptor
+        // and only afterward clear the recorded rehomes. Ordering matters against a
+        // concurrent `session::rehome`, which re-validates membership under the same
+        // `session_relays` lock this take acquires:
+        //
+        // - Once the membership is gone (after this take), any racing rehome fails
+        //   its under-lock re-validation: it can neither push a descriptor nor record
+        //   a rehome, so there is nothing of its left to clean up.
+        // - A rehome that completed BEFORE this take had already added its target
+        //   relay to the membership, so that relay is in `serving` here — the
+        //   descriptor removal below therefore covers the resumed descriptor it
+        //   pushed, and `forget_rehomes` (run after the take) clears the idempotency
+        //   entry it recorded.
+        //
+        // Every interleaving is thus covered. Removing the descriptor also stops a
+        // relay reconnecting after the close from being re-synced the dead session's
+        // stale descriptor and re-applying it — the relay-side reconciler only ends
+        // sessions ABSENT from the pushed set, so a present-but-dead descriptor would
+        // otherwise resurrect the session on that relay. Retiring the membership is
+        // also what makes every subsequent re-home ask honestly answer `Unavailable`
+        // (the empty serving set trips `session::rehome`'s guard), and dropping the
+        // rate-limit bucket keeps that map bounded by live sessions.
+        let serving = self.inner.setup.take_session_membership(&tenant, session);
+        for relay_id in serving {
             self.inner
                 .setup
                 .descriptors()
                 .remove(relay_id, &tenant, session);
         }
-        // Retire the session's relay membership and rate-limit bucket at the same
-        // moment its recorded rehomes are cleared: the session is gone, so every
-        // subsequent re-home ask honestly answers `Unavailable` (the empty serving
-        // set trips `session::rehome`'s guard, so no straggler can resurrect the
-        // dead game onto a live relay), and neither map leaks past the session.
-        self.inner.setup.forget_session_membership(&tenant, session);
+        self.inner.setup.forget_rehomes(&tenant, session);
         self.inner.setup.rehome_limiter().forget(&tenant, session);
         tracing::info!(
             tenant = tenant.as_ref(),
@@ -461,18 +472,19 @@ impl Lifecycle {
         // Retire any pending reap directives for the removed session (a webhook-only
         // state normally has none, but this keeps the pending set bounded either way).
         self.inner.setup.reaps().retire(&tenant, session);
-        self.inner.setup.forget_rehomes(&tenant, session);
         // A webhook-only state has no relay membership (this coordinator lifetime
-        // never created the session), so it has no descriptor outbox entries and no
-        // membership to retire — the removal loop below is empty and the retirement
-        // a harmless no-op; both are done anyway to keep the two close paths uniform.
-        for relay_id in self.inner.setup.serving_relays(&tenant, session) {
+        // never created the session), so the take returns an empty serving set, the
+        // removal loop is empty, and forget_rehomes a harmless no-op. The steps run
+        // anyway in the same take-first order as `on_session_closed` above, so the two
+        // close paths stay uniform (see that path for why the take must come first).
+        let serving = self.inner.setup.take_session_membership(&tenant, session);
+        for relay_id in serving {
             self.inner
                 .setup
                 .descriptors()
                 .remove(relay_id, &tenant, session);
         }
-        self.inner.setup.forget_session_membership(&tenant, session);
+        self.inner.setup.forget_rehomes(&tenant, session);
         self.inner.setup.rehome_limiter().forget(&tenant, session);
         tracing::debug!(
             tenant = tenant.as_ref(),
