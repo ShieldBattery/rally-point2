@@ -1005,3 +1005,61 @@ async fn removing_a_serving_peer_cleans_up_its_mesh_forwarding_state() -> Result
     drop(relay_a);
     Ok(())
 }
+
+/// The accept side enforces protocol-version negotiation on the identity hello:
+/// a dialer advertising a version this build cannot negotiate is refused — the
+/// connection is application-closed with `MESH_CLOSE_PROTOCOL_MISMATCH` before
+/// the link driver spawns, and nothing ever surfaces on the `links` channel.
+#[tokio::test]
+async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
+    use rally_point_proto::mesh::MeshHello;
+    use rally_point_proto::version::{MESH_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
+
+    let tenant = make_tenant();
+    let relay_b = Relay::start(&tenant, 2);
+
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
+    tokio::spawn(mesh_edge::run_mesh_accept(
+        relay_b.mesh_accept_rx,
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+        links_b_tx,
+    ));
+
+    // A stand-in dialer speaking only v1 (below MIN_SUPPORTED): connect on the
+    // mesh ALPN and announce the incompatible version in the hello.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let cfg = rally_point_transport::quic::mesh_client_config(roots)
+        .map_err(|e| format!("building mesh client config: {e}"))?;
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut ep = quinn::Endpoint::client(bind)?;
+    ep.set_default_client_config(cfg);
+    let connection = ep.connect(relay_b.addr, "localhost")?.await?;
+
+    let mut hello_stream = connection.open_uni().await?;
+    let hello = MeshHello::new(RelayId(1), ProtocolVersion(1));
+    hello_stream.write_all(&hello.encode()).await?;
+
+    // The acceptor refuses with the protocol-mismatch application close...
+    let reason = connection.closed().await;
+    match reason {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(
+                close.error_code,
+                quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
+                "the close carries the protocol-mismatch code",
+            );
+        }
+        other => panic!("expected an application close refusing the version, got {other:?}"),
+    }
+
+    // ...and no link ever surfaces for the refused peer.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
+            .await
+            .is_err(),
+        "a refused peer must not surface on the links channel",
+    );
+    Ok(())
+}

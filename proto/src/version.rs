@@ -2,7 +2,24 @@
 //!
 //! netcode v2 components are deployed independently — the game DLL, the relay
 //! fleet, and the coordinator each ship on their own cadence — so every
-//! connection negotiates a protocol version before exchanging turns.
+//! connection settles a protocol version before exchanging anything else. The
+//! data-plane edges (client↔relay, relay↔relay QUIC) carry the version in their
+//! ALPN strings, where a mismatch fails the TLS handshake outright. On top of
+//! that, [`negotiate`] is enforced at two hello seams, where a *window* (or a
+//! future graceful downgrade) is possible in a way an all-or-nothing ALPN string
+//! is not:
+//!
+//! - **The relay control connection.** A relay's enroll `Hello` advertises its
+//!   `[min_protocol, protocol]` window, and the coordinator negotiates before
+//!   enrolling it — refusing an incompatible relay with a WebSocket close carrying
+//!   [`CONTROL_CLOSE_PROTOCOL_MISMATCH`] rather than registering a relay it cannot
+//!   drive.
+//! - **The mesh identity hello.** The dialing relay's `MeshHello` names the single
+//!   version it speaks (a degenerate window — the fixed frame has no room for two),
+//!   and the *acceptor* negotiates before spawning the link driver — closing an
+//!   incompatible connection with [`MESH_CLOSE_PROTOCOL_MISMATCH`]. The hello is
+//!   one-way (dialer→acceptor) and every relay-pair has exactly one acceptor, so
+//!   one side enforcing covers the pair.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +75,29 @@ pub fn negotiate(
         })
     }
 }
+
+/// WebSocket close code the coordinator sends when it refuses a relay's control
+/// connection because [`negotiate`] found no common version between the relay's
+/// advertised window and its own. In the private-use close-code range
+/// (4000–4999), so no WebSocket library or intermediary assigns it a meaning.
+///
+/// A cross-component contract: the coordinator sends it (with a reason naming
+/// both windows — [`NegotiationError`]'s Display) *instead of enrolling*, and the
+/// relay's coordinator client recognizes it to back off far longer than a normal
+/// reconnect — a version mismatch is fixed by a deploy, not a redial.
+pub const CONTROL_CLOSE_PROTOCOL_MISMATCH: u16 = 4001;
+
+/// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
+/// whose advertised protocol version does not [`negotiate`] against its own.
+/// Sent before the link driver is ever spawned, so an incompatible pair never
+/// half-establishes. Outside the client-edge close-code space (`0x01`–`0x06`) so
+/// a trace never reads one connection type's code through the other's table.
+///
+/// The dial side's reconnect supervision treats the closure like any failed
+/// connection (redial on its ordinary delay); this code only lets it *name* the
+/// refusal in its logs — mesh topology is coordinator-pushed, so a mismatched
+/// pair stops being asked to connect once the fleet converges.
+pub const MESH_CLOSE_PROTOCOL_MISMATCH: u32 = 0x10;
 
 /// The local and peer protocol-version support windows have no version in common.
 #[derive(Debug, Clone, thiserror::Error)]

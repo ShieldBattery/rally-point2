@@ -331,13 +331,16 @@ async fn main() -> Result<()> {
             let advertise_addr = config::resolve_advertise_addr(cli.advertise_addr, cli.listen);
             // The hello carries our client-edge leaf cert so the coordinator
             // can hand it to clients in session responses — they pin exactly
-            // this cert to connect.
+            // this cert to connect — and the full `[MIN_SUPPORTED, CURRENT]`
+            // protocol window, so a newer relay downgrades to an older
+            // coordinator's version instead of being refused.
             let relay_hello = RelayHello::new(
                 RelayId(our_id),
                 advertise_addr,
                 ProtocolVersion::CURRENT,
                 ca.as_ref().to_vec(),
-            );
+            )
+            .with_min_protocol(ProtocolVersion::MIN_SUPPORTED);
             tracing::info!(
                 relay_id = our_id,
                 advertise = %advertise_addr,

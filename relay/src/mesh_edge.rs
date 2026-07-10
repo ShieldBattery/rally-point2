@@ -64,7 +64,7 @@ use std::time::Duration;
 
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::mesh::{MESH_HELLO_LEN, MeshHello};
-use rally_point_proto::version::ProtocolVersion;
+use rally_point_proto::version::{self, MESH_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
 use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
 use tokio::sync::mpsc;
@@ -193,13 +193,27 @@ pub async fn run_mesh_accept(
         tokio::spawn(async move {
             let (peer_id, hello_stream) = match recv_mesh_hello(&connection).await {
                 Ok((hello, stream)) => {
-                    if hello.protocol != ProtocolVersion::CURRENT {
+                    // The acceptor is the version-enforcement point for the pair:
+                    // the hello is one-way (dialer→acceptor), and exactly one side
+                    // of every relay-pair accepts. The fixed hello frame carries a
+                    // single version, so it negotiates as a degenerate window. No
+                    // overlap means the two relays cannot mesh at any version —
+                    // close before the link driver ever spawns or the link
+                    // surfaces, so an incompatible pair never half-establishes.
+                    // The dial side's supervision redials on its ordinary delay;
+                    // the coordinator's descriptors stop pairing the two once the
+                    // fleet converges on one version.
+                    if let Err(error) = version::negotiate(hello.protocol, hello.protocol) {
                         tracing::warn!(
                             peer_id = hello.relay_id.0,
-                            peer_protocol = %hello.protocol,
-                            our_protocol = %ProtocolVersion::CURRENT,
-                            "mesh peer protocol version differs from ours",
+                            %error,
+                            "refusing mesh peer: no common protocol version",
                         );
+                        connection.close(
+                            quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
+                            b"protocol version mismatch",
+                        );
+                        return;
                     }
                     (hello.relay_id, stream)
                 }
@@ -393,6 +407,38 @@ pub async fn run_mesh_dial_with(
     }
 }
 
+/// Whether the peer application-closed the connection refusing our protocol
+/// version ([`MESH_CLOSE_PROTOCOL_MISMATCH`]). Read from the connection's close
+/// reason rather than any one operation's error: the acceptor closes right after
+/// reading our hello, so the refusal surfaces as whichever stream operation
+/// happened to fail next, and this names it regardless of which that was.
+fn refused_for_protocol_mismatch(connection: &quinn::Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH)
+    )
+}
+
+/// Logs one post-connect dial failure before the supervisor retries, naming a
+/// peer's protocol-version refusal distinctly (at warn — a deploy fixes it, not a
+/// redial) and falling back to the ordinary retry line otherwise.
+fn log_dial_retry(
+    connection: &quinn::Connection,
+    peer_id: RelayId,
+    context: &str,
+    error: &dyn std::fmt::Display,
+) {
+    if refused_for_protocol_mismatch(connection) {
+        tracing::warn!(
+            peer_id = peer_id.0,
+            "mesh peer refused our protocol version; will retry",
+        );
+    } else {
+        tracing::info!(error = %error, peer_id = peer_id.0, "{}; will retry", context);
+    }
+}
+
 /// The fixed target of a supervised dial, reused across redial attempts.
 struct DialTarget {
     our_id: RelayId,
@@ -471,7 +517,7 @@ async fn dial_and_serve(
     let presence_tx = match send_mesh_hello(&connection, *our_id).await {
         Ok(stream) => stream,
         Err(error) => {
-            tracing::info!(%error, peer_id = peer_id.0, "mesh hello send failed; will retry");
+            log_dial_retry(&connection, *peer_id, "mesh hello send failed", &error);
             return DialOutcome::Retry;
         }
     };
@@ -487,19 +533,27 @@ async fn dial_and_serve(
     let (mut control_send, control_recv) = match connection.open_bi().await {
         Ok(halves) => halves,
         Err(error) => {
-            tracing::info!(%error, peer_id = peer_id.0, "mesh control stream open failed; will retry");
+            log_dial_retry(&connection, *peer_id, "mesh control stream open failed", &error);
             return DialOutcome::Retry;
         }
     };
     if let Err(error) =
         rally_point_transport::mesh_control_stream::establish_mesh_control(&mut control_send).await
     {
-        tracing::info!(%error, peer_id = peer_id.0, "mesh control stream establish failed; will retry");
+        log_dial_retry(
+            &connection,
+            *peer_id,
+            "mesh control stream establish failed",
+            &error,
+        );
         return DialOutcome::Retry;
     }
     let peer_control_rx =
         rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
 
+    // A cheap handle kept past the link's move below, so a driver exit can still
+    // read the connection's close reason (naming a protocol-version refusal).
+    let connection_for_exit = connection.clone();
     let link = rally_point_transport::MeshLink::new(connection);
     let (tx, rx) = mesh::command_channel();
     // Hand the fresh command sender to the Join source. On a redial this
@@ -529,10 +583,17 @@ async fn dial_and_serve(
 
     match exit {
         mesh::MeshLinkExit::ConnectionFailed => {
-            tracing::info!(
-                peer_id = peer_id.0,
-                "mesh link connection failed; redialing"
-            );
+            if refused_for_protocol_mismatch(&connection_for_exit) {
+                tracing::warn!(
+                    peer_id = peer_id.0,
+                    "mesh link closed: peer refused our protocol version; redialing",
+                );
+            } else {
+                tracing::info!(
+                    peer_id = peer_id.0,
+                    "mesh link connection failed; redialing"
+                );
+            }
             DialOutcome::Retry
         }
         mesh::MeshLinkExit::Idle => {

@@ -22,7 +22,7 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
-use rally_point_proto::version::ProtocolVersion;
+use rally_point_proto::version::{CONTROL_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
 use rally_point_relay::consensus::RelayNotice;
 use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
@@ -232,6 +232,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_secs(3600),
     ));
 
@@ -259,6 +260,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_secs(3600),
     ));
 
@@ -298,6 +300,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_secs(3600),
     ));
 
@@ -332,6 +335,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_secs(3600),
     ));
 
@@ -456,6 +460,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_secs(3600), // effectively no heartbeat during the test
     ));
     assert!(
@@ -699,6 +704,152 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
     );
 }
 
+// --- Protocol-version negotiation at the enroll Hello ---
+
+/// Connects to `base_url`'s control endpoint and sends `hello` as the enroll
+/// frame, returning the open socket for the test to read the coordinator's answer.
+async fn connect_and_send_hello(
+    base_url: &str,
+    hello: RelayHello,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let frame = serde_json::to_string(&RelayToCoordinator::Hello(hello)).unwrap();
+    socket.send(Message::Text(frame.into())).await.unwrap();
+    socket
+}
+
+/// Reads the coordinator's answer to an incompatible Hello and asserts it is the
+/// version-refusal close — code [`CONTROL_CLOSE_PROTOCOL_MISMATCH`] with a reason
+/// naming both windows — arriving as the FIRST frame (never a descriptor push).
+async fn expect_version_refusal_close(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let answer = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator answers the incompatible Hello promptly")
+        .expect("a frame arrives before the stream ends")
+        .unwrap();
+    let Message::Close(Some(frame)) = answer else {
+        panic!("expected a version-refusal close frame, got {answer:?}");
+    };
+    assert_eq!(u16::from(frame.code), CONTROL_CLOSE_PROTOCOL_MISMATCH);
+    assert!(
+        frame.reason.contains("no common protocol version"),
+        "the reason names the mismatch: {}",
+        frame.reason,
+    );
+    assert!(
+        frame
+            .reason
+            .contains(&format!("local supports {}", ProtocolVersion::MIN_SUPPORTED)),
+        "the reason names the coordinator's window: {}",
+        frame.reason,
+    );
+    assert!(
+        frame.reason.contains("peer supports"),
+        "the reason names the relay's window: {}",
+        frame.reason,
+    );
+}
+
+#[tokio::test]
+async fn an_old_relay_below_min_supported_is_refused_and_never_enrolled() {
+    // Old-relay/new-coordinator skew: a Hello speaking only a version below
+    // MIN_SUPPORTED (no window field — an old build predates it) is refused with
+    // the version close, and the relay never enters the registry, so no session
+    // can ever be assigned to it and no descriptor is ever pushed.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+
+    let hello = RelayHello::new(
+        RelayId(9),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 14909)),
+        ProtocolVersion(1),
+        vec![0xC9; 4],
+    );
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    expect_version_refusal_close(&mut socket).await;
+
+    assert!(
+        registry::peer(setup.registry(), RelayId(9)).is_none(),
+        "a refused relay is never enrolled",
+    );
+}
+
+#[tokio::test]
+async fn a_future_only_relay_is_refused_the_same_way() {
+    // New-relay/old-coordinator skew, seen from this coordinator: a relay whose
+    // whole window sits above CURRENT (it dropped support for our newest version)
+    // cannot be driven at any version — refused exactly like the old relay.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+
+    let future = ProtocolVersion(ProtocolVersion::CURRENT.0 + 1);
+    let hello = RelayHello::new(
+        RelayId(9),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 14909)),
+        future,
+        vec![0xC9; 4],
+    )
+    .with_min_protocol(future);
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    expect_version_refusal_close(&mut socket).await;
+
+    assert!(
+        registry::peer(setup.registry(), RelayId(9)).is_none(),
+        "a refused relay is never enrolled",
+    );
+}
+
+#[tokio::test]
+async fn a_newer_relay_with_an_overlapping_window_downgrades_and_enrolls() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The downgrade rule: a relay one version ahead that still speaks CURRENT
+    // (min_protocol = CURRENT) overlaps this coordinator's window, so it enrolls —
+    // negotiated at CURRENT — receives its descriptor re-sync, and can be assigned
+    // sessions.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+
+    let hello = RelayHello::new(
+        RelayId(9),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 14909)),
+        ProtocolVersion(ProtocolVersion::CURRENT.0 + 1),
+        vec![0xC9; 4],
+    )
+    .with_min_protocol(ProtocolVersion::CURRENT);
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+
+    // The first frame down is the enrolled path's initial descriptor re-sync —
+    // not a refusal close.
+    let first = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator answers")
+        .expect("a frame arrives")
+        .unwrap();
+    let Message::Text(text) = first else {
+        panic!("expected the initial descriptor re-sync, got {first:?}");
+    };
+    assert!(text.contains("\"type\":\"descriptors\""));
+
+    assert!(
+        wait_for_enrollment(setup.registry(), RelayId(9)).await,
+        "the overlapping-window relay enrolls",
+    );
+
+    // The enrolled relay is assignable: a session create succeeds and homes on it.
+    let session = create_one_slot_session(&setup);
+    assert_eq!(setup.serving_relays(&TenantId(TENANT.to_owned()), session), vec![RelayId(9)]);
+}
+
 #[tokio::test]
 async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     // The liveness deadline is short, but the relay heartbeats well inside it, so
@@ -721,6 +872,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         no_drain_rx(),
         no_drain_ack(),
         Duration::from_millis(50),
+        Duration::from_secs(60),
         Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
     ));
     assert!(

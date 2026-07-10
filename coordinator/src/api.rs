@@ -62,7 +62,7 @@ use axum::{
     body::Bytes,
     extract::{
         Path, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
     response::{IntoResponse, Response},
@@ -73,6 +73,7 @@ use rally_point_proto::control::{
     SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::version::{self, CONTROL_CLOSE_PROTOCOL_MISMATCH};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -564,11 +565,37 @@ async fn serve_relay_control(
             return;
         }
     };
+    // Negotiate before enrolling: the Hello advertises the relay's
+    // `[min_protocol, protocol]` window (a relay predating the field advertises
+    // the single version in `protocol`). No overlap with this build's window means
+    // this coordinator cannot drive the relay at any version — refuse with a close
+    // frame naming both windows rather than register a relay every session
+    // assignment would then mis-speak to. The relay recognizes the close code and
+    // backs off until a deploy fixes the skew.
+    let window_min = hello.min_protocol.unwrap_or(hello.protocol);
+    let negotiated = match version::negotiate(window_min, hello.protocol) {
+        Ok(negotiated) => negotiated,
+        Err(error) => {
+            tracing::warn!(
+                relay_id = hello.relay_id.0,
+                %error,
+                "refusing relay control connection: no common protocol version",
+            );
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CONTROL_CLOSE_PROTOCOL_MISMATCH,
+                    reason: error.to_string().into(),
+                })))
+                .await;
+            return;
+        }
+    };
     let relay_id = hello.relay_id;
     let registry = setup.registry();
     let generation = registry::enroll(registry, hello);
     tracing::info!(
         relay_id = relay_id.0,
+        negotiated = %negotiated,
         "relay enrolled over control connection"
     );
 

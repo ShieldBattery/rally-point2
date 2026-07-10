@@ -94,7 +94,12 @@ pub struct RelayHello {
     /// Where clients and peer relays reach this relay (a direct public IP,
     /// not behind an anycast layer).
     pub relay_addr: SocketAddr,
-    /// Protocol version the relay implements, for negotiation checking.
+    /// The newest protocol version the relay implements — the top of its
+    /// negotiation window. The coordinator negotiates against
+    /// `[min_protocol.unwrap_or(protocol), protocol]` before enrolling, and
+    /// refuses the connection (close code
+    /// [`CONTROL_CLOSE_PROTOCOL_MISMATCH`](crate::version::CONTROL_CLOSE_PROTOCOL_MISMATCH))
+    /// when the windows do not overlap.
     pub protocol: ProtocolVersion,
     /// DER encoding of the TLS leaf certificate the relay serves on its client
     /// edge. The coordinator forwards it in session responses so clients pin
@@ -102,10 +107,19 @@ pub struct RelayHello {
     /// out-of-band cert distribution.
     #[serde(with = "serde_bytes")]
     pub cert_der: Vec<u8>,
+    /// The oldest protocol version the relay still speaks — the bottom of its
+    /// negotiation window, letting a newer relay downgrade to an older
+    /// coordinator's version instead of being refused. Absent (a relay that
+    /// predates the field) the window collapses to the single version in
+    /// [`protocol`](Self::protocol), which is exactly how such a relay behaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_protocol: Option<ProtocolVersion>,
 }
 
 impl RelayHello {
-    /// Constructs a relay phone-home message.
+    /// Constructs a relay phone-home message advertising the single version
+    /// `protocol` (no `min_protocol` — a one-version negotiation window; widen it
+    /// with [`with_min_protocol`](Self::with_min_protocol)).
     ///
     /// Provided because `RelayHello` is `#[non_exhaustive]`: future fields
     /// (e.g. capabilities, region) can be added without breaking external
@@ -121,7 +135,17 @@ impl RelayHello {
             relay_addr,
             protocol,
             cert_der,
+            min_protocol: None,
         }
+    }
+
+    /// Sets the oldest protocol version the relay still speaks, widening the
+    /// negotiation window from the single version [`new`](Self::new) advertises to
+    /// `[min, protocol]`. The relay's real enroll passes
+    /// [`ProtocolVersion::MIN_SUPPORTED`].
+    pub fn with_min_protocol(mut self, min: ProtocolVersion) -> Self {
+        self.min_protocol = Some(min);
+        self
     }
 }
 
@@ -953,10 +977,45 @@ mod tests {
             relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
             protocol: ProtocolVersion::CURRENT,
             cert_der: vec![0x30, 0x82, 0xAA, 0xBB],
+            min_protocol: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
+        // An unset window bottom stays off the wire (a one-version window).
+        assert!(!json.contains("min_protocol"));
         let back: RelayHello = serde_json::from_str(&json).unwrap();
         assert_eq!(back, hello);
+    }
+
+    #[test]
+    fn relay_hello_with_min_protocol_roundtrips_json() {
+        let hello = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion(3),
+            vec![0x30, 0x82, 0xAA, 0xBB],
+        )
+        .with_min_protocol(ProtocolVersion(2));
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"min_protocol\":2"));
+        let back: RelayHello = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hello);
+        assert_eq!(back.min_protocol, Some(ProtocolVersion(2)));
+    }
+
+    #[test]
+    fn relay_hello_without_min_protocol_decodes_to_none() {
+        // A hello from a relay that predates the window field must still decode —
+        // `min_protocol` defaults to None, which the coordinator reads as a
+        // one-version window at `protocol`.
+        let json = r#"{
+            "relay_id":7,
+            "relay_addr":"127.0.0.1:14900",
+            "protocol":2,
+            "cert_der":[1,2,3]
+        }"#;
+        let back: RelayHello = serde_json::from_str(json).unwrap();
+        assert_eq!(back.min_protocol, None);
+        assert_eq!(back.protocol, ProtocolVersion(2));
     }
 
     #[test]

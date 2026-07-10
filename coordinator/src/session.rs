@@ -863,6 +863,13 @@ fn assign_relays(
         return Err(SessionSetupError::NoRelaysAvailable);
     }
 
+    // NOTE(version-aware placement): each entry carries the relay's advertised
+    // `protocol` (negotiated against at enroll — an incompatible relay never gets
+    // this far), so a placement policy that keeps one session's relays on a single
+    // protocol version — needed once a wire bump rolls through a mixed fleet —
+    // would filter the candidates here. Nothing consumes it yet; assignment stays
+    // version-blind.
+
     // Sort by relay_id for deterministic assignment.
     entries.sort_by_key(|e| e.relay_id);
 

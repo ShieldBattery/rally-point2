@@ -254,7 +254,13 @@ and the dial side needs the peer's id *before* connecting (the tie-break is a pr
 decision). The dialer knows whom it dialed, but the acceptor only sees an inbound connection from an
 ephemeral port, so right after connecting the dialer sends a one-way identity hello (`MeshHello`) and
 the acceptor reads it; each established link is then **labeled with its peer's id**. This is labeling,
-not the tie-break — it carries no authority and doesn't decide the dial.
+not the tie-break — it carries no authority and doesn't decide the dial. The hello also carries the
+dialer's protocol version, and the **acceptor enforces negotiation** on it: an incompatible version is
+refused with a QUIC application close (a named protocol-mismatch code) before the link driver ever
+spawns, so an incompatible relay-pair never half-establishes. The hello being one-way is enough — every
+pair has exactly one acceptor, so one side enforcing covers the pair; the dialer's reconnect supervision
+just redials on its ordinary delay (naming the refusal in its logs), and the coordinator's descriptors
+stop pairing the two relays once the fleet converges on one version.
 
 The labeled links feed a **`MeshControl` Join source**: it holds each peer's `MeshCommand` sender keyed
 by id, and turns a coordinator `SessionDescriptor` into targeted `MeshCommand::Join`/`Leave` on the link
@@ -510,6 +516,19 @@ and IPv6 but reaches the coordinator over only one of them): a `--advertise-addr
 listen address, with cloud-substrate auto-discovery later. One near-term simplification remains: enroll
 carries a **single** address — the dual-stack model (a v4 *and* a v6 endpoint, with per-family selection
 at the consumers) is a follow-up reshape of the relay-address contract.
+
+**Version negotiation at the Hello.** The relay and coordinator deploy independently, so the `Hello`
+also carries the relay's protocol **window** — `protocol` (the newest version it implements) plus an
+additive `min_protocol` (the oldest it still speaks; absent on an older relay, collapsing the window to
+the single `protocol`). The coordinator negotiates *before enrolling*: the highest version inside both
+windows wins, which is the **downgrade rule** — a relay one version ahead that still speaks the
+coordinator's newest enrolls at that version rather than being turned away, exactly what a rolling
+deploy needs. No overlap means this coordinator could not drive the relay at any version, so enrolling
+it would only mint sessions it mis-speaks to; instead the coordinator **refuses** with a WebSocket close
+(app close code **4001**, reason naming both windows) and never registers the relay — no enrollment, no
+descriptor push, nothing to clean up. The relay recognizes that close and backs off far longer than a
+normal reconnect: a version mismatch is fixed by a deploy, not a redial, so hot-retrying the refused
+handshake would only re-run it as log noise.
 
 **Deregister on drop.** Registration is connection-lifetime-bound: when a relay's control connection
 drops — or goes silent past the liveness deadline (below) — the coordinator deregisters it, so the

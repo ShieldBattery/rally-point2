@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor,
 };
+use rally_point_proto::version::CONTROL_CLOSE_PROTOCOL_MISMATCH;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -70,6 +71,27 @@ pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// detector: a heartbeat on a half-open socket eventually errors, ending the
 /// connection so the relay redials.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long to wait before redialing after the coordinator refused the connection
+/// over a protocol-version mismatch
+/// ([`CONTROL_CLOSE_PROTOCOL_MISMATCH`]). Much longer than [`RECONNECT_DELAY`]:
+/// a mismatch is fixed by deploying a compatible build on one side, not by
+/// retrying, so hot-redialing every couple of seconds would only re-run the same
+/// refused handshake as log noise. Still finite — the deploy that fixes the skew
+/// needs no relay restart to take effect.
+pub const VERSION_REFUSED_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// How one control connection ended, when it ended without an error — what the
+/// reconnect loop keys its next-dial delay on.
+enum ControlDisconnect {
+    /// The connection closed ordinarily (a coordinator restart, a plain close, the
+    /// stream ending). Redial after [`RECONNECT_DELAY`].
+    Ordinary,
+    /// The coordinator refused the connection over a protocol-version mismatch
+    /// (close code [`CONTROL_CLOSE_PROTOCOL_MISMATCH`]). Redial only after the far
+    /// longer [`VERSION_REFUSED_RECONNECT_DELAY`] — nothing changes until a deploy.
+    VersionRefused,
+}
 
 /// The sessions the last-applied descriptor set named — the subscriber's removal
 /// detector, shared as a handle so the drain path can read it.
@@ -202,13 +224,15 @@ pub async fn run_descriptor_subscriber(
         drain,
         drain_acked,
         RECONNECT_DELAY,
+        VERSION_REFUSED_RECONNECT_DELAY,
         HEARTBEAT_INTERVAL,
     )
     .await
 }
 
-/// [`run_descriptor_subscriber`] with the reconnect delay and heartbeat interval
-/// injected, so a test need not wait the production intervals.
+/// [`run_descriptor_subscriber`] with the reconnect delays (ordinary and
+/// version-refused) and heartbeat interval injected, so a test need not wait the
+/// production intervals.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_descriptor_subscriber_with(
     coordinator_url: String,
@@ -224,6 +248,7 @@ pub async fn run_descriptor_subscriber_with(
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
     reconnect_delay: Duration,
+    version_refused_delay: Duration,
     heartbeat_interval: Duration,
 ) {
     // The one notice pulled from the channel but not yet confirmed sent. Held
@@ -234,7 +259,7 @@ pub async fn run_descriptor_subscriber_with(
     let relay_id = relay_hello.relay_id;
 
     loop {
-        match connect_and_stream(
+        let delay = match connect_and_stream(
             &coordinator_url,
             &relay_hello,
             bootstrap_secret.as_deref(),
@@ -248,17 +273,26 @@ pub async fn run_descriptor_subscriber_with(
         )
         .await
         {
-            Ok(()) => tracing::info!(
-                relay_id = relay_id.0,
-                "coordinator control connection closed; reconnecting",
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                relay_id = relay_id.0,
-                "coordinator control connection failed; reconnecting",
-            ),
-        }
-        tokio::time::sleep(reconnect_delay).await;
+            Ok(ControlDisconnect::Ordinary) => {
+                tracing::info!(
+                    relay_id = relay_id.0,
+                    "coordinator control connection closed; reconnecting",
+                );
+                reconnect_delay
+            }
+            // Already logged (with the coordinator's reason) where the close frame
+            // was read; only the far longer backoff is decided here.
+            Ok(ControlDisconnect::VersionRefused) => version_refused_delay,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    relay_id = relay_id.0,
+                    "coordinator control connection failed; reconnecting",
+                );
+                reconnect_delay
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -266,7 +300,9 @@ pub async fn run_descriptor_subscriber_with(
 /// `Hello` as the first frame, then applies every descriptor set the coordinator
 /// pushes while sending a periodic heartbeat up the connection — until it closes
 /// or errors. `applied` is updated in place across the connection's lifetime (and
-/// persists into the next one).
+/// persists into the next one). A clean ending reports *how* the connection ended
+/// ([`ControlDisconnect`]), so the caller can back off a version refusal far
+/// longer than an ordinary close.
 ///
 /// A heartbeat send that fails ends the connection so the caller redials: on a
 /// half-open socket (a silently dead coordinator) the periodic send is what
@@ -283,7 +319,7 @@ async fn connect_and_stream(
     drain: &mut watch::Receiver<bool>,
     drain_acked: &watch::Sender<bool>,
     heartbeat_interval: Duration,
-) -> Result<(), ControlError> {
+) -> Result<ControlDisconnect, ControlError> {
     let relay_id = relay_hello.relay_id;
     let request = build_request(coordinator_url, secret)?;
     let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
@@ -350,7 +386,25 @@ async fn connect_and_stream(
                             apply_message(control, message, applied);
                         }
                     }
-                    Message::Close(_) => break,
+                    Message::Close(frame) => {
+                        // A protocol-version refusal is a distinct disconnect: the
+                        // coordinator found no common version and will keep refusing
+                        // until a deploy fixes the skew, so the caller backs off far
+                        // longer than a normal reconnect. The reason names both
+                        // windows — surface it at error, since no amount of retrying
+                        // resolves this.
+                        if let Some(frame) = &frame
+                            && u16::from(frame.code) == CONTROL_CLOSE_PROTOCOL_MISMATCH
+                        {
+                            tracing::error!(
+                                relay_id = relay_id.0,
+                                reason = %frame.reason,
+                                "coordinator refused our protocol version; backing off until a deploy resolves the skew",
+                            );
+                            return Ok(ControlDisconnect::VersionRefused);
+                        }
+                        break;
+                    }
                     // The coordinator sends no pings today and the relay reads only
                     // descriptor text frames; any other frame is ignored.
                     Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
@@ -388,7 +442,7 @@ async fn connect_and_stream(
             }
         }
     }
-    Ok(())
+    Ok(ControlDisconnect::Ordinary)
 }
 
 /// Sends a [`RelayToCoordinator::Draining`] up the control connection, asking the
@@ -903,6 +957,7 @@ mod tests {
             drain_rx,
             drain_acked,
             Duration::from_millis(20), // redial fast after the failed first dial
+            Duration::from_secs(60),
             Duration::from_secs(3600), // no heartbeat during the test
         ));
 
@@ -1048,6 +1103,7 @@ mod tests {
             drain_rx,
             drain_acked_tx,
             Duration::from_millis(20),
+            Duration::from_secs(60),
             Duration::from_secs(3600),
         ));
 
@@ -1103,6 +1159,7 @@ mod tests {
             drain_rx,
             drain_acked_tx,
             Duration::from_millis(20),
+            Duration::from_secs(60),
             Duration::from_secs(3600),
         ));
 
@@ -1164,12 +1221,127 @@ mod tests {
             drain_rx,
             drain_acked_tx,
             Duration::from_millis(20),
+            Duration::from_secs(60),
             Duration::from_secs(3600),
         ));
 
         tokio::time::timeout(Duration::from_secs(5), done_rx)
             .await
             .expect("the reconnect re-sends Draining after the Hello")
+            .unwrap();
+    }
+
+    // --- Protocol-version refusal backoff ---
+
+    /// Spawns a stand-in coordinator that, for every control connection, reads the
+    /// enroll Hello and then closes with `close_frame` — reporting the instant each
+    /// connection was accepted, so a test can measure the redial gap.
+    async fn spawn_closing_coordinator(
+        close_frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::UnboundedReceiver<std::time::Instant>,
+    ) {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (times_tx, times_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = times_tx.send(std::time::Instant::now());
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                let _hello = ws.next().await;
+                let _ = ws.close(close_frame.clone()).await;
+                // Drain until the client answers the close, so it completes cleanly.
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        });
+        (addr, times_rx)
+    }
+
+    /// Spawns the subscriber against `addr` with a fast ordinary reconnect delay
+    /// and the given version-refusal delay, returning nothing — the stand-in
+    /// coordinator's accept times are the observable.
+    fn spawn_subscriber_with_delays(
+        addr: std::net::SocketAddr,
+        reconnect_delay: Duration,
+        version_refused_delay: Duration,
+    ) {
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            AppliedSessions::default(),
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked,
+            reconnect_delay,
+            version_refused_delay,
+            Duration::from_secs(3600),
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_version_refusal_close_waits_the_refusal_backoff_before_redialing() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        // The coordinator refuses every connection with the version-mismatch close.
+        let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
+            code: CloseCode::from(CONTROL_CLOSE_PROTOCOL_MISMATCH),
+            reason: "no common protocol version: local supports v2..=v2, \
+                     peer supports v1..=v1"
+                .into(),
+        }))
+        .await;
+
+        // Ordinary reconnect would redial in ~20ms; the refusal backoff is 500ms.
+        spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
+
+        let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the first dial arrives")
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the relay eventually redials")
+            .unwrap();
+        let gap = second.duration_since(first);
+        assert!(
+            gap >= Duration::from_millis(400),
+            "a version refusal must wait the refusal backoff, not the ordinary \
+             reconnect delay (observed gap: {gap:?})",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_close_redials_at_the_normal_delay() {
+        // The coordinator closes normally (no version refusal). With the refusal
+        // backoff set absurdly long, a redial arriving promptly proves the ordinary
+        // path took the ordinary delay — the wrong branch would blow the timeout.
+        let (addr, mut times_rx) = spawn_closing_coordinator(None).await;
+        spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_secs(3600));
+
+        tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the first dial arrives")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), times_rx.recv())
+            .await
+            .expect("an ordinary close redials at the normal delay, not the refusal backoff")
             .unwrap();
     }
 }
