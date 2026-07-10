@@ -578,6 +578,7 @@ async fn serve_relay_control(
         &notices,
         &lifecycle,
         relay_id,
+        generation,
         liveness_timeout,
     )
     .await;
@@ -610,6 +611,7 @@ async fn push_and_watch(
     notices: &NoticeDedup,
     lifecycle: &Lifecycle,
     relay_id: RelayId,
+    generation: u64,
     liveness_timeout: Duration,
 ) {
     let mut rx = setup.descriptors().subscribe(relay_id);
@@ -655,9 +657,22 @@ async fn push_and_watch(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        note_inbound(setup, notices, lifecycle, relay_id, &message);
+                        let action = note_inbound(setup, notices, lifecycle, relay_id, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
+                        // A Draining frame additionally runs the drain exchange: mark
+                        // the relay ineligible for new assignments, then push its
+                        // current descriptor set followed by a DrainAck (set before
+                        // ack, racing the refreshed deadline). A send that stalls or
+                        // errors ends the connection like any other.
+                        if action == InboundAction::DrainRequested
+                            && !handle_drain_request(
+                                socket, setup, relay_id, generation, &mut rx, deadline,
+                            )
+                            .await
+                        {
+                            break;
+                        }
                     }
                     Some(Err(error)) => {
                         tracing::debug!(%error, relay_id = relay_id.0, "relay control connection error");
@@ -742,11 +757,105 @@ async fn send_before_deadline(
     }
 }
 
-/// Handles an inbound relay frame: any frame already counts as the liveness
-/// signal, and a [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
+/// Runs a relay's coordinated-drain exchange after it sent a
+/// [`RelayToCoordinator::Draining`]: mark it ineligible for new assignments, then —
+/// if the mark applied — push its current descriptor set followed by a
+/// [`CoordinatorToRelay::DrainAck`]. Returns whether the connection should keep
+/// running (`false` on a send stall/error, which ends it like any other).
+///
+/// The mark is taken under the assignment lock ([`SessionSetup::lock_assignment`]),
+/// so it linearizes against any in-flight `create_session`/`rehome`: after it lands,
+/// every session that will ever name this relay has already staged its descriptor in
+/// the relay's outbox. The set is then pushed **before** the ack, so a relay that
+/// sees an empty descriptor set at ack time knows it is provably unassigned.
+///
+/// A mark that does **not** apply — a stale generation, meaning a newer connection
+/// re-enrolled this relay (its fresh enroll cleared the flag) — draws no ack: that
+/// live connection runs its own drain exchange when its `Draining` arrives.
+async fn handle_drain_request(
+    socket: &mut WebSocket,
+    setup: &SessionSetup,
+    relay_id: RelayId,
+    generation: u64,
+    rx: &mut tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let applied = {
+        let _assign = setup.lock_assignment();
+        registry::mark_draining(setup.registry(), relay_id, generation)
+    };
+    if !applied {
+        // A stale connection's Draining: the live successor acks its own drain.
+        tracing::debug!(
+            relay_id = relay_id.0,
+            "ignoring a Draining frame from a stale control connection",
+        );
+        return true;
+    }
+    tracing::info!(relay_id = relay_id.0, "relay draining; sending set + ack");
+    // Set before ack. Clone the set out of the watch borrow before awaiting — a
+    // watch borrow must never be held across an await — and mark it seen so the
+    // loop's `changed()` doesn't redundantly re-push the same set right after.
+    let set = rx.borrow_and_update().clone();
+    if !send_before_deadline(socket, &set, relay_id, deadline).await {
+        return false;
+    }
+    send_drain_ack_before_deadline(socket, relay_id, deadline).await
+}
+
+/// Sends a [`CoordinatorToRelay::DrainAck`] down the connection, racing the same
+/// liveness deadline as a descriptor push. Returns whether the connection should
+/// keep running.
+async fn send_drain_ack_before_deadline(
+    socket: &mut WebSocket,
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let json = serde_json::to_string(&CoordinatorToRelay::DrainAck)
+        .expect("a drain-ack frame always serializes");
+    tokio::select! {
+        result = socket.send(Message::Text(json.into())) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "drain-ack push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "drain-ack push stalled past the liveness deadline; dropping",
+            );
+            false
+        }
+    }
+}
+
+/// What an inbound relay frame asks the connection loop to do beyond the liveness
+/// refresh every frame already triggers. Most frames drive their webhook/lifecycle
+/// side effects inside [`note_inbound`] and ask nothing further ([`None`](Self::None));
+/// a [`RelayToCoordinator::Draining`] asks the loop to run the drain exchange
+/// ([`DrainRequested`](Self::DrainRequested)), which needs the connection's
+/// generation and socket that only the loop holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundAction {
+    /// Nothing beyond the liveness refresh.
+    None,
+    /// The relay asked to drain: mark it ineligible and run the set-before-ack
+    /// exchange.
+    DrainRequested,
+}
+
+/// Handles an inbound relay frame, returning what the connection loop should do
+/// next. Any frame already counts as the liveness signal; a
+/// [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
 /// [`RelayToCoordinator::Result`], or [`RelayToCoordinator::SessionClosed`]
-/// additionally drives its webhook and lifecycle paths. A heartbeat is just
-/// liveness; anything undecodable is flagged.
+/// additionally drives its webhook and lifecycle paths here; a
+/// [`RelayToCoordinator::Draining`] returns [`InboundAction::DrainRequested`] so the
+/// loop can run the drain exchange (which needs the socket + generation it owns). A
+/// heartbeat is just liveness; anything undecodable is flagged.
 ///
 /// The lifecycle accounting (result/departure account a slot; `SessionClosed`
 /// closes a serving relay) is fed *before* the webhook path and independent of the
@@ -760,13 +869,19 @@ fn note_inbound(
     lifecycle: &Lifecycle,
     relay_id: RelayId,
     message: &Message,
-) {
+) -> InboundAction {
     let Message::Text(text) = message else {
-        return; // a ping/pong/binary frame: a liveness signal with nothing to read
+        return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
         Ok(RelayToCoordinator::Heartbeat) => {
-            tracing::trace!(relay_id = relay_id.0, "relay heartbeat")
+            tracing::trace!(relay_id = relay_id.0, "relay heartbeat");
+            InboundAction::None
+        }
+        Ok(RelayToCoordinator::Draining) => {
+            // Presence is enough for liveness; the loop runs the set-before-ack drain
+            // exchange, which needs the connection's socket and generation.
+            InboundAction::DrainRequested
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
             if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
@@ -777,7 +892,7 @@ fn note_inbound(
                     slot = notice.slot.0,
                     "departure notice from a relay not serving the session; rejecting",
                 );
-                return;
+                return InboundAction::None;
             }
             lifecycle.on_departure(
                 notice.tenant.clone(),
@@ -786,6 +901,7 @@ fn note_inbound(
                 notice.kind,
             );
             notify::handle_departure(setup, &notices.departures, lifecycle, notice);
+            InboundAction::None
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
             if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
@@ -796,9 +912,10 @@ fn note_inbound(
                     sync_ordinal = notice.sync_ordinal,
                     "desync notice from a relay not serving the session; rejecting",
                 );
-                return;
+                return InboundAction::None;
             }
             notify::handle_desync(setup, &notices.desyncs, lifecycle, notice);
+            InboundAction::None
         }
         Ok(RelayToCoordinator::Result(notice)) => {
             if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
@@ -809,18 +926,21 @@ fn note_inbound(
                     slot = notice.slot.0,
                     "result notice from a relay not serving the session; rejecting",
                 );
-                return;
+                return InboundAction::None;
             }
             lifecycle.on_result(notice.tenant.clone(), notice.session, notice.slot);
             notify::handle_result(setup, &notices.results, lifecycle, notice);
+            InboundAction::None
         }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
             lifecycle.on_session_closed(tenant, session, relay_id);
+            InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
-        Ok(_) => {}
+        Ok(_) => InboundAction::None,
         Err(error) => {
-            tracing::debug!(%error, relay_id = relay_id.0, "undecodable relay control frame")
+            tracing::debug!(%error, relay_id = relay_id.0, "undecodable relay control frame");
+            InboundAction::None
         }
     }
 }
@@ -875,6 +995,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                     // enrollment comes first.
                     Ok(
                         RelayToCoordinator::Heartbeat
+                        | RelayToCoordinator::Draining
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)

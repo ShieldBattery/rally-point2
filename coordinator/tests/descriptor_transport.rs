@@ -17,8 +17,8 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, PlayerHandoff, RelayHello, RelayToCoordinator, ResultNotice, SessionRequest,
-    TenantId,
+    BufferBounds, CoordinatorToRelay, PlayerHandoff, RelayHello, RelayToCoordinator, ResultNotice,
+    SessionDescriptor, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -28,7 +28,7 @@ use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::mesh_control::MeshControl;
 use rally_point_relay::routing::SessionKey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 const TENANT: &str = "sb-test";
@@ -42,6 +42,17 @@ const LIVENESS: Duration = Duration::from_secs(30);
 /// simply idles (the sender is dropped, so the arm disables itself).
 fn no_notices() -> mpsc::UnboundedReceiver<RelayNotice> {
     mpsc::unbounded_channel().1
+}
+
+/// A never-signaling drain receiver for subscriber spawns that don't exercise the
+/// coordinated-drain seam (the sender end drops immediately, disabling the arm).
+fn no_drain_rx() -> watch::Receiver<bool> {
+    watch::channel(false).1
+}
+
+/// A throwaway drain-ack sender for the same subscribers — nothing awaits it.
+fn no_drain_ack() -> watch::Sender<bool> {
+    watch::channel(false).0
 }
 
 fn session_key(session: SessionId) -> SessionKey {
@@ -216,7 +227,10 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         relay_hello(1, 14900),
         Some(secret.to_owned()),
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -240,7 +254,10 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         relay_hello(1, 14900),
         None,
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -276,7 +293,10 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         relay_hello(1, 14900),
         Some("wrong-secret".to_owned()),
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -307,7 +327,10 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         relay_hello(5, 15000),
         None,
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_secs(3600),
     ));
@@ -428,7 +451,10 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         relay_hello(7, 15007),
         None,
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_secs(3600), // effectively no heartbeat during the test
     ));
@@ -482,6 +508,197 @@ async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
     );
 }
 
+/// Serves a coordinator with a tenant enrolled and the given relays pre-enrolled,
+/// on an ephemeral port (open auth, production handshake/liveness deadlines).
+/// Returns the base URL and a handle to the same `SessionSetup` so a drain test can
+/// create sessions and observe registry availability. Unlike
+/// [`serve_bare_coordinator`], this exposes the setup and enrolls a tenant, which a
+/// drain test needs to prove the assignment path excludes the drained relay.
+async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (String, SessionSetup) {
+    let reg = registry::new_registry();
+    for &(id, port) in pre_enrolled {
+        registry::enroll(&reg, relay_hello(id, port));
+    }
+    let tenants = tenant::new_store();
+    tenant::enroll(
+        &tenants,
+        KeyId("test-key-1".to_owned()),
+        TenantId(TENANT.to_owned()),
+        BufferBounds::new(1, 6).unwrap(),
+    )
+    .unwrap();
+    let setup = session::SessionSetup::new(reg, tenants);
+    let handle = setup.clone();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let app = api::router(CoordinatorState {
+        setup,
+        notices: notify::new_dedup(),
+        lifecycle,
+        control_auth: ControlAuth::Open,
+        hello_timeout: api::HELLO_TIMEOUT,
+        liveness_timeout: LIVENESS,
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Creates a single-slot session for the test tenant on `setup`, returning its id.
+fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
+    session::create_session(
+        setup,
+        SessionRequest {
+            tenant: TenantId(TENANT.to_owned()),
+            players: vec![PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0xAA; 32]),
+                external_ref: None,
+                observer: false,
+            }],
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        },
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .session
+}
+
+/// Reads down-frames from `socket` until a [`CoordinatorToRelay::DrainAck`] arrives,
+/// returning the descriptor set carried by the last [`CoordinatorToRelay::Descriptors`]
+/// seen before it — the set-before-ack the coordinator pushes. Panics if the ack
+/// never arrives within a few seconds.
+async fn read_until_drain_ack(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Vec<SessionDescriptor> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut last: Vec<SessionDescriptor> = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message {
+                match serde_json::from_str::<CoordinatorToRelay>(&text).unwrap() {
+                    CoordinatorToRelay::Descriptors { descriptors } => last = descriptors,
+                    CoordinatorToRelay::DrainAck => return,
+                    _ => {}
+                }
+            }
+        }
+        panic!("the connection closed before a DrainAck arrived");
+    })
+    .await
+    .expect("a DrainAck should arrive after the descriptor set");
+    last
+}
+
+#[tokio::test]
+async fn a_draining_relay_gets_its_set_then_an_ack_and_is_excluded_from_new_sessions() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // One relay, enrolled over the socket; it serves one session, then drains.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    // Enroll relay 1 via its Hello, then give it a session so its descriptor set is
+    // non-empty at drain time.
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    assert!(
+        wait_for_enrollment(setup.registry(), RelayId(1)).await,
+        "the relay enrolls from its Hello",
+    );
+    let session = create_one_slot_session(&setup);
+
+    // The relay asks to drain.
+    let draining = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
+    socket.send(Message::Text(draining.into())).await.unwrap();
+
+    // It receives its current descriptor set (naming the session) and then a
+    // DrainAck — set before ack.
+    let set = read_until_drain_ack(&mut socket).await;
+    assert!(
+        set.iter().any(|d| d.session == session),
+        "the descriptor set pushed before the ack names the relay's session",
+    );
+
+    // The coordinator has marked it draining: a new session can no longer be
+    // assigned (it was the only relay), and the registry reports it unavailable.
+    assert!(!registry::is_available(setup.registry(), RelayId(1)));
+    let err = session::create_session(
+        &setup,
+        SessionRequest {
+            tenant: TenantId(TENANT.to_owned()),
+            players: vec![PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0xCC; 32]),
+                external_ref: None,
+                observer: false,
+            }],
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        },
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap_err();
+    assert_eq!(err, registry::SessionSetupError::NoRelaysAvailable);
+}
+
+#[tokio::test]
+async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Relay 2 is pre-enrolled; relay 1 enrolls over the socket, then drains. A
+    // create after the drain homes on the still-available relay 2.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[(2, 14901)]).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
+
+    let draining = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
+    socket.send(Message::Text(draining.into())).await.unwrap();
+    // Its set is empty (it serves no session), and the ack still arrives after it.
+    let set = read_until_drain_ack(&mut socket).await;
+    assert!(set.is_empty(), "a relay serving nothing drains with an empty set");
+
+    // A fresh session homes on relay 2 — relay 1 (lower id, normally the primary) is
+    // draining and excluded from the pick.
+    let resp = session::create_session(
+        &setup,
+        SessionRequest {
+            tenant: TenantId(TENANT.to_owned()),
+            players: vec![PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0xDD; 32]),
+                external_ref: None,
+                observer: false,
+            }],
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        },
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(
+        resp.home_relay.relay_id,
+        RelayId(2),
+        "a create skips the draining relay and homes on the available one",
+    );
+}
+
 #[tokio::test]
 async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     // The liveness deadline is short, but the relay heartbeats well inside it, so
@@ -499,7 +716,10 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         relay_hello(7, 15007),
         None,
         control,
+        coordinator_client::AppliedSessions::default(),
         no_notices(),
+        no_drain_rx(),
+        no_drain_ack(),
         Duration::from_millis(50),
         Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
     ));

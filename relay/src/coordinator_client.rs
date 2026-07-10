@@ -30,25 +30,32 @@
 //! thing) converges rather than double-applies, and a dropped message is corrected
 //! by the next one. The one thing a full set must do that a delta would carry
 //! explicitly is detect *removals*: a session gone from the set is one to leave.
-//! That is what `applied` tracks — the sessions delivered on the last set — and it
-//! is kept **across reconnects** so a session removed while the relay was
-//! disconnected is left when the next connection's full set arrives without it.
+//! That is what [`AppliedSessions`] tracks — the sessions delivered on the last
+//! set — and it is kept **across reconnects** so a session removed while the relay
+//! was disconnected is left when the next connection's full set arrives without it.
+//! It is a shared handle (not loop-local state) because the coordinated-drain
+//! shutdown path reads it too: a session the coordinator assigned whose clients
+//! have not dialed yet holds no local slot, so the applied set is the only signal
+//! that the relay is still spoken for (see [`drained_idle`]).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 use crate::consensus::RelayNotice;
 use crate::mesh_control::MeshControl;
-use crate::routing::SessionKey;
+use crate::routing::{SessionKey, Sessions};
 
 /// How long to wait before redialing after the control connection drops. The
 /// control plane is not latency-critical and a running game does not depend on
@@ -63,6 +70,65 @@ pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// detector: a heartbeat on a half-open socket eventually errors, ending the
 /// connection so the relay redials.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The sessions the last-applied descriptor set named — the subscriber's removal
+/// detector, shared as a handle so the drain path can read it.
+///
+/// [`reconcile`] replaces its contents on every pushed set (and it persists across
+/// reconnects, so a session removed while disconnected is left on the next full-set
+/// re-sync). The coordinated-drain sequence reads it through [`drained_idle`]: a
+/// session the coordinator assigned to this relay appears here the moment its
+/// descriptor push is applied — *before* any client dials — so an empty applied set
+/// at DrainAck time means the coordinator's post-mark truth names this relay in no
+/// session at all. The DrainAck contract guarantees the pre-ack descriptor push is
+/// processed (through [`apply_message`]/[`reconcile`], updating this set) before
+/// the ack flips the drain-acked signal — same socket, sequential loop — so the set
+/// is authoritative at exactly the moment the drain sequence consults it.
+///
+/// A plain (non-async) mutex: every critical section is a short, await-free set
+/// read or replace, following the same rule as the roster and mesh registries.
+#[derive(Clone, Default)]
+pub struct AppliedSessions {
+    inner: Arc<Mutex<HashSet<SessionKey>>>,
+}
+
+impl AppliedSessions {
+    /// Creates an empty applied set (a relay that has received no descriptor push).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the last-applied descriptor set named no session — the coordinator
+    /// currently assigns this relay nothing.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// The applied set's current contents, for test assertions.
+    #[cfg(test)]
+    fn snapshot(&self) -> HashSet<SessionKey> {
+        self.inner.lock().clone()
+    }
+}
+
+/// Whether the relay is drained-idle — safe to exit without abandoning anyone: it
+/// holds **no local slot** ([`crate::routing::holds_any_slots`]) *and* its
+/// last-applied descriptor set is **empty**.
+///
+/// Both halves are load-bearing. Slot liveness alone misses a session the
+/// coordinator committed to this relay just before the drain mark whose clients
+/// have not dialed yet — exiting then strands them dialing a dead relay pre-start,
+/// which the client driver cannot recover (it escalates to re-home only after
+/// `SessionStart`). The applied set alone would over-wait: it can linger for a
+/// multi-relay session a *peer* still serves after our players left, or a session
+/// whose clients never dial. So the drain sequence waits on both, bounded by the
+/// drain timeout — an empty set at ack time exits immediately (the truly-idle
+/// scale-in case), a non-empty one waits so not-yet-dialed clients can connect and
+/// be served, and whatever outlives the timeout is abandoned to the
+/// coordinator-mediated failover.
+pub fn drained_idle(sessions: &Sessions, applied: &AppliedSessions) -> bool {
+    !crate::routing::holds_any_slots(sessions) && applied.is_empty()
+}
 
 /// Why a control-connection attempt ended.
 #[derive(Debug, thiserror::Error)]
@@ -99,19 +165,42 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// connection. The channel is unbounded and held across reconnects, so a notice
 /// decided while the coordinator is down goes out on the next successful
 /// connection rather than being lost.
+///
+/// `applied` is the shared last-applied session set ([`AppliedSessions`]): this
+/// loop reconciles it on every descriptor push, and the drain sequence reads it
+/// through [`drained_idle`] to tell an assigned-but-not-yet-dialed session from a
+/// provably unassigned relay.
+///
+/// `drain` and `drain_acked` are the coordinated-drain seam: when the relay
+/// receives its shutdown signal, the drain sequence flips `drain` to `true`, and
+/// this loop sends a [`RelayToCoordinator::Draining`] up the connection asking the
+/// coordinator to stop assigning new sessions. Because a re-enroll clears the
+/// coordinator-side flag, the loop *remembers* it is draining and re-sends
+/// `Draining` right after the `Hello` on every subsequent reconnect. When the
+/// coordinator answers with [`CoordinatorToRelay::DrainAck`], the loop flips
+/// `drain_acked` to `true`, unblocking the drain sequence — and because the
+/// coordinator pushes the descriptor set *before* the ack on the same socket, this
+/// sequential loop has already reconciled `applied` to the post-mark truth by then.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_descriptor_subscriber(
     coordinator_url: String,
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
+    applied: AppliedSessions,
     notices: UnboundedReceiver<RelayNotice>,
+    drain: watch::Receiver<bool>,
+    drain_acked: watch::Sender<bool>,
 ) {
     run_descriptor_subscriber_with(
         coordinator_url,
         relay_hello,
         bootstrap_secret,
         control,
+        applied,
         notices,
+        drain,
+        drain_acked,
         RECONNECT_DELAY,
         HEARTBEAT_INTERVAL,
     )
@@ -120,18 +209,23 @@ pub async fn run_descriptor_subscriber(
 
 /// [`run_descriptor_subscriber`] with the reconnect delay and heartbeat interval
 /// injected, so a test need not wait the production intervals.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_descriptor_subscriber_with(
     coordinator_url: String,
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
+    // Mutated in place across connections, so it keeps the persist-across-
+    // reconnects semantics the loop-local set had: a session removed while
+    // disconnected is left when the next connection's full-set re-sync arrives
+    // without it.
+    applied: AppliedSessions,
     mut notices: UnboundedReceiver<RelayNotice>,
+    mut drain: watch::Receiver<bool>,
+    drain_acked: watch::Sender<bool>,
     reconnect_delay: Duration,
     heartbeat_interval: Duration,
 ) {
-    // Kept across reconnects: a session removed while disconnected is left when
-    // the next connection's full-set re-sync arrives without it.
-    let mut applied: HashSet<SessionKey> = HashSet::new();
     // The one notice pulled from the channel but not yet confirmed sent. Held
     // across reconnects so a notice decided (or half-sent) while the coordinator
     // link was down is flushed first on the next connection rather than lost. The
@@ -145,9 +239,11 @@ pub async fn run_descriptor_subscriber_with(
             &relay_hello,
             bootstrap_secret.as_deref(),
             &control,
-            &mut applied,
+            &applied,
             &mut notices,
             &mut pending,
+            &mut drain,
+            &drain_acked,
             heartbeat_interval,
         )
         .await
@@ -181,9 +277,11 @@ async fn connect_and_stream(
     relay_hello: &RelayHello,
     secret: Option<&str>,
     control: &MeshControl,
-    applied: &mut HashSet<SessionKey>,
+    applied: &AppliedSessions,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
+    drain: &mut watch::Receiver<bool>,
+    drain_acked: &watch::Sender<bool>,
     heartbeat_interval: Duration,
 ) -> Result<(), ControlError> {
     let relay_id = relay_hello.relay_id;
@@ -209,6 +307,15 @@ async fn connect_and_stream(
         *pending = None;
     }
 
+    // Re-assert a drain that is already in progress. A re-enroll clears the
+    // coordinator-side draining flag, so if we are mid-drain this fresh connection
+    // must re-send `Draining` right after the Hello or the coordinator would treat
+    // us as available again. `borrow_and_update` also marks the current value seen,
+    // so the loop's `drain.changed()` below fires only on a *new* transition.
+    if *drain.borrow_and_update() {
+        send_draining(&mut socket).await?;
+    }
+
     // The Hello already proved liveness at t=0, so skip the immediate first tick
     // and send the first heartbeat one interval later.
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
@@ -217,6 +324,10 @@ async fn connect_and_stream(
     // Once the notifier's senders are all dropped (relay shutdown) `recv` yields
     // `None` forever; stop selecting on it so the loop doesn't spin.
     let mut notifier_open = true;
+    // Likewise for the drain watch: if its sender is dropped (a relay with no drain
+    // sequence wired), `changed()` errors forever, so disable the arm on the first
+    // error rather than spin.
+    let mut drain_open = true;
 
     loop {
         tokio::select! {
@@ -229,7 +340,15 @@ async fn connect_and_stream(
                 let Some(message) = message else { break };
                 match message? {
                     Message::Text(text) => {
-                        apply_message(control, serde_json::from_str(text.as_str())?, applied);
+                        let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
+                        if matches!(message, CoordinatorToRelay::DrainAck) {
+                            // The coordinator has marked us ineligible and pushed our
+                            // current descriptor set just before this ack; signal the
+                            // drain sequence it may proceed (empty set ⇒ unassigned).
+                            let _ = drain_acked.send(true);
+                        } else {
+                            apply_message(control, message, applied);
+                        }
                     }
                     Message::Close(_) => break,
                     // The coordinator sends no pings today and the relay reads only
@@ -253,8 +372,33 @@ async fn connect_and_stream(
                     None => notifier_open = false,
                 }
             }
+            // The drain sequence flipped the flag: ask the coordinator to stop
+            // assigning us new sessions. A send error ends the connection; the next
+            // reconnect re-asserts the drain right after its Hello.
+            changed = drain.changed(), if drain_open => {
+                match changed {
+                    Ok(()) => {
+                        if *drain.borrow_and_update() {
+                            send_draining(&mut socket).await?;
+                        }
+                    }
+                    // The drain sender was dropped: no drain will ever come.
+                    Err(_) => drain_open = false,
+                }
+            }
         }
     }
+    Ok(())
+}
+
+/// Sends a [`RelayToCoordinator::Draining`] up the control connection, asking the
+/// coordinator to stop assigning this relay new sessions.
+async fn send_draining(
+    socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+) -> Result<(), ControlError> {
+    let frame =
+        serde_json::to_string(&RelayToCoordinator::Draining).expect("a draining frame serializes");
+    socket.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
@@ -287,11 +431,7 @@ async fn send_notice(
 /// *malformed* known message still surfaces as a decode error at the call site,
 /// closing the connection so the next one re-syncs — that is a coordinator bug,
 /// not a forward-compatible addition, and should not be silently swallowed.
-fn apply_message(
-    control: &MeshControl,
-    message: CoordinatorToRelay,
-    applied: &mut HashSet<SessionKey>,
-) {
+fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &AppliedSessions) {
     match message {
         CoordinatorToRelay::Descriptors { descriptors } => {
             reconcile(control, &descriptors, applied);
@@ -303,6 +443,11 @@ fn apply_message(
         } => {
             let key = SessionKey { tenant, session };
             control.close_slots(&key, &slots);
+        }
+        // The connection loop intercepts DrainAck (it drives the drain seam) before
+        // delegating here, so this arm is only a defensive no-op for a stray one.
+        CoordinatorToRelay::DrainAck => {
+            tracing::debug!("ignoring a DrainAck received outside a drain exchange");
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -351,17 +496,18 @@ fn to_ws_scheme(base: &str) -> String {
 
 /// Drives the Join source to exactly the pushed descriptor set: applies each
 /// descriptor, then leaves any session that was applied before but is no longer
-/// present. Updates `applied` to the new set.
+/// present. Replaces `applied`'s contents with the new set, so the shared handle
+/// the drain predicate reads always reflects the last push.
 ///
 /// Apply-then-leave, both idempotent on the Join source: a descriptor already in
 /// effect re-applies as a no-op, and a `Leave` for a session already gone is a
 /// no-op. So a re-sync of an unchanged set issues no commands, and a shrunk set
 /// issues only the leaves for what dropped.
-fn reconcile(
-    control: &MeshControl,
-    descriptors: &[SessionDescriptor],
-    applied: &mut HashSet<SessionKey>,
-) {
+///
+/// The `applied` lock is held across the (sync, await-free) Join-source calls so
+/// the set and the issued commands can never be observed out of step; `MeshControl`
+/// takes its own lock nested under it, and nothing acquires them in the other order.
+fn reconcile(control: &MeshControl, descriptors: &[SessionDescriptor], applied: &AppliedSessions) {
     let present: HashSet<SessionKey> = descriptors
         .iter()
         .map(|d| SessionKey {
@@ -370,6 +516,7 @@ fn reconcile(
         })
         .collect();
 
+    let mut applied = applied.inner.lock();
     for descriptor in descriptors {
         control.apply_descriptor(descriptor);
     }
@@ -433,15 +580,15 @@ mod tests {
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
-        let mut applied = HashSet::new();
+        let applied = AppliedSessions::new();
 
         // First push: session 1 names peer 2 → Join.
-        reconcile(&control, &[descriptor(1, &[2])], &mut applied);
+        reconcile(&control, &[descriptor(1, &[2])], &applied);
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
-        assert!(applied.contains(&key(1)));
+        assert!(applied.snapshot().contains(&key(1)));
 
         // Second push: the session has dropped out of the set → Leave.
-        reconcile(&control, &[], &mut applied);
+        reconcile(&control, &[], &applied);
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
         assert!(applied.is_empty());
     }
@@ -455,13 +602,13 @@ mod tests {
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
-        let mut applied = HashSet::new();
+        let applied = AppliedSessions::new();
 
-        reconcile(&control, &[descriptor(1, &[2])], &mut applied);
+        reconcile(&control, &[descriptor(1, &[2])], &applied);
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
         // A re-sync of the same set (e.g. on reconnect) issues no further commands.
-        reconcile(&control, &[descriptor(1, &[2])], &mut applied);
+        reconcile(&control, &[descriptor(1, &[2])], &applied);
         assert!(rx2.try_recv().is_err(), "an unchanged set is a no-op");
     }
 
@@ -474,22 +621,22 @@ mod tests {
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
-        let mut applied = HashSet::new();
+        let applied = AppliedSessions::new();
 
         // Two sessions on the link to peer 2.
         reconcile(
             &control,
             &[descriptor(1, &[2]), descriptor(2, &[2])],
-            &mut applied,
+            &applied,
         );
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(2)));
 
         // Session 1 ends; session 2 remains. Only session 1 is left.
-        reconcile(&control, &[descriptor(2, &[2])], &mut applied);
+        reconcile(&control, &[descriptor(2, &[2])], &applied);
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
         assert!(rx2.try_recv().is_err(), "session 2 stays joined");
-        assert_eq!(applied, HashSet::from([key(2)]));
+        assert_eq!(applied.snapshot(), HashSet::from([key(2)]));
     }
 
     #[tokio::test]
@@ -512,7 +659,7 @@ mod tests {
         guard.disarm();
         let shutdown = inbox.shutdown_handle();
 
-        let mut applied = HashSet::new();
+        let applied = AppliedSessions::new();
         apply_message(
             &control,
             CoordinatorToRelay::CloseSlot {
@@ -524,7 +671,7 @@ mod tests {
                     rally_point_proto::ids::SlotId(7),
                 ],
             },
-            &mut applied,
+            &applied,
         );
 
         tokio::time::timeout(Duration::from_millis(100), shutdown.notified())
@@ -541,7 +688,7 @@ mod tests {
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
-        let mut applied = HashSet::new();
+        let applied = AppliedSessions::new();
 
         // A known message joins session 1.
         apply_message(
@@ -549,14 +696,14 @@ mod tests {
             CoordinatorToRelay::Descriptors {
                 descriptors: vec![descriptor(1, &[2])],
             },
-            &mut applied,
+            &applied,
         );
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
         // An unknown message is a no-op: no commands, applied state untouched.
-        apply_message(&control, CoordinatorToRelay::Unknown, &mut applied);
+        apply_message(&control, CoordinatorToRelay::Unknown, &applied);
         assert!(rx2.try_recv().is_err(), "an unknown message issues nothing");
-        assert_eq!(applied, HashSet::from([key(1)]));
+        assert_eq!(applied.snapshot(), HashSet::from([key(1)]));
 
         // A later known message still applies — the unknown one did not break the
         // stream's state.
@@ -565,7 +712,7 @@ mod tests {
             CoordinatorToRelay::Descriptors {
                 descriptors: vec![],
             },
-            &mut applied,
+            &applied,
         );
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
     }
@@ -587,8 +734,8 @@ mod tests {
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
-        let mut applied = HashSet::new();
-        apply_message(&control, message, &mut applied);
+        let applied = AppliedSessions::new();
+        apply_message(&control, message, &applied);
         assert!(rx2.try_recv().is_err());
         assert!(applied.is_empty());
     }
@@ -740,6 +887,7 @@ mod tests {
             std::sync::Arc::default(),
             std::sync::Arc::default(),
         );
+        let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             RelayHello::new(
@@ -750,7 +898,10 @@ mod tests {
             ),
             None,
             control,
+            AppliedSessions::default(),
             notices_rx,
+            drain_rx,
+            drain_acked,
             Duration::from_millis(20), // redial fast after the failed first dial
             Duration::from_secs(3600), // no heartbeat during the test
         ));
@@ -783,5 +934,242 @@ mod tests {
     #[tokio::test]
     async fn a_queued_desync_is_delivered_after_a_reconnect() {
         a_queued_notice_is_delivered_after_a_reconnect(RelayNotice::Desync(desync_notice())).await;
+    }
+
+    // --- Coordinated drain ---
+
+    /// A never-draining `drain` receiver and a throwaway `drain_acked` sender, for
+    /// tests that don't exercise the drain seam. The internal channel ends drop
+    /// immediately, so the loop's drain arm disables itself and an ack `send` is a
+    /// harmless no-op.
+    fn no_drain() -> (watch::Receiver<bool>, watch::Sender<bool>) {
+        (watch::channel(false).1, watch::channel(false).0)
+    }
+
+    #[test]
+    fn drained_idle_requires_both_no_slots_and_an_empty_applied_set() {
+        let sessions: Sessions = std::sync::Arc::default();
+        let applied = AppliedSessions::new();
+
+        // Empty roster + empty applied set: provably unassigned, drained.
+        assert!(drained_idle(&sessions, &applied));
+
+        // An applied session with no dialed client (the pre-mark sliver: assigned
+        // just before the drain, clients not yet connected) blocks the drain even
+        // though no slot is held.
+        applied.inner.lock().insert(key(1));
+        assert!(
+            !drained_idle(&sessions, &applied),
+            "an assigned session whose clients have not dialed blocks the drain",
+        );
+        applied.inner.lock().clear();
+        assert!(drained_idle(&sessions, &applied));
+
+        // A held slot blocks the drain even with an empty applied set (e.g. a
+        // post-restart session the coordinator no longer tracks).
+        let (_guard, _inbox) = crate::routing::register(
+            &sessions,
+            &key(1),
+            rally_point_proto::ids::SlotId(0),
+        )
+        .expect("slot 0 registers");
+        assert!(
+            !drained_idle(&sessions, &applied),
+            "a held slot blocks the drain regardless of the applied set",
+        );
+    }
+
+    #[test]
+    fn reconcile_updates_the_shared_applied_set_the_drain_predicate_reads() {
+        // The subscriber-to-drain seam: a descriptor push reconciled into the shared
+        // handle flips the drain predicate, and the next push removing the session
+        // flips it back — what lets a drain wait out an assigned-but-undialed
+        // session and exit the moment the coordinator's set empties.
+        let sessions: Sessions = std::sync::Arc::default();
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let applied = AppliedSessions::new();
+        assert!(drained_idle(&sessions, &applied));
+
+        reconcile(&control, &[descriptor(1, &[])], &applied);
+        assert!(
+            !drained_idle(&sessions, &applied),
+            "a pushed session is visible through the drain predicate",
+        );
+
+        reconcile(&control, &[], &applied);
+        assert!(
+            drained_idle(&sessions, &applied),
+            "the session's removal on the next push re-drains the relay",
+        );
+    }
+
+    /// The relay's enroll Hello for these drain tests.
+    fn drain_hello() -> RelayHello {
+        RelayHello::new(
+            RelayId(1),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            rally_point_proto::version::ProtocolVersion::CURRENT,
+            vec![0xAB; 4],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_drain_trigger_sends_a_draining_frame_after_the_hello() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: accept, read the enroll Hello, then the frame that
+        // follows once the relay is told to drain.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = ws.next().await.unwrap().unwrap();
+            let next = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((hello, next));
+        });
+
+        let (drain_tx, drain_rx) = watch::channel(false);
+        let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            AppliedSessions::default(),
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked_tx,
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+        ));
+
+        // Trigger the drain; the relay must send a Draining frame after its Hello.
+        drain_tx.send(true).unwrap();
+
+        let (hello, draining) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("the relay sends a Draining frame after the trigger")
+            .unwrap();
+        let Message::Text(hello) = hello else {
+            panic!("the first frame is the Hello");
+        };
+        assert!(hello.contains("\"type\":\"hello\""));
+        let Message::Text(draining) = draining else {
+            panic!("the second frame is text");
+        };
+        assert_eq!(
+            serde_json::from_str::<RelayToCoordinator>(&draining).unwrap(),
+            RelayToCoordinator::Draining,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_ack_fires_the_acked_signal() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Stand-in coordinator: accept, read the Hello, then send a DrainAck and
+        // hold the connection open.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = ws.next().await.unwrap().unwrap();
+            let ack = serde_json::to_string(&CoordinatorToRelay::DrainAck).unwrap();
+            ws.send(Message::Text(ack.into())).await.unwrap();
+            // Keep the connection open so the relay doesn't reconnect mid-assert.
+            std::future::pending::<()>().await;
+        });
+
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        let (drain_acked_tx, mut drain_acked_rx) = watch::channel(false);
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            AppliedSessions::default(),
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked_tx,
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+        ));
+
+        // The DrainAck flips the acked watch to true.
+        tokio::time::timeout(Duration::from_secs(5), drain_acked_rx.changed())
+            .await
+            .expect("the DrainAck fires the acked signal")
+            .unwrap();
+        assert!(*drain_acked_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_while_draining_re_sends_draining_after_the_hello() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: the FIRST connection reads Hello then Draining and
+        // drops; the SECOND (reconnect) must again read Hello then Draining — proving
+        // a relay that reconnects mid-drain re-asserts it right after the Hello.
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let hello = ws.next().await.unwrap().unwrap();
+                let Message::Text(hello) = hello else {
+                    panic!("first frame is the Hello");
+                };
+                assert!(hello.contains("\"type\":\"hello\""));
+                let draining = ws.next().await.unwrap().unwrap();
+                let Message::Text(draining) = draining else {
+                    panic!("second frame is text");
+                };
+                assert_eq!(
+                    serde_json::from_str::<RelayToCoordinator>(&draining).unwrap(),
+                    RelayToCoordinator::Draining,
+                );
+                // Drop the first connection to force a reconnect; signal after the
+                // second one re-sent its Draining.
+                drop(ws);
+            }
+            let _ = done_tx.send(());
+        });
+
+        // Draining is already requested before the subscriber starts, so it must be
+        // re-asserted on every connection right after the Hello.
+        let (_drain_tx, drain_rx) = watch::channel(true);
+        let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
+        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            AppliedSessions::default(),
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked_tx,
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("the reconnect re-sends Draining after the Hello")
+            .unwrap();
     }
 }

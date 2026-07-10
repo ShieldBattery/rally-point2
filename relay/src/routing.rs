@@ -371,6 +371,18 @@ fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) -> bool {
     false
 }
 
+/// Whether this relay currently holds any connected slot in any routing group —
+/// its "am I serving a player" signal, used by the coordinated-drain shutdown path
+/// to know when the relay is idle enough to exit.
+///
+/// A group entry is created only when a slot registers and dropped the moment its
+/// last slot deregisters (see [`deregister`]), so the map is empty *exactly* when no
+/// slot is held. A session ending therefore shrinks this — the last slot's link task
+/// deregisters on exit — which is what lets the drain wait converge.
+pub fn holds_any_slots(sessions: &Sessions) -> bool {
+    !sessions.lock().is_empty()
+}
+
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
 /// without ever blocking on a slow peer.
 ///
@@ -2110,6 +2122,21 @@ mod tests {
         drop(guard);
         // The slot — and the now-empty group — are gone, so it registers anew.
         assert!(register(&sessions, &key(), SlotId(0)).is_some());
+    }
+
+    #[test]
+    fn holds_any_slots_tracks_registration_and_release() {
+        // The drain-idle predicate: empty until a slot registers, empty again once it
+        // is freed — so the coordinated-drain wait converges when the last slot leaves.
+        let sessions: Sessions = Arc::default();
+        assert!(!holds_any_slots(&sessions), "a fresh roster holds no slots");
+        let (guard, _inbox) = register(&sessions, &key(), SlotId(0)).expect("slot 0 registers");
+        assert!(holds_any_slots(&sessions), "a registered slot is held");
+        drop(guard);
+        assert!(
+            !holds_any_slots(&sessions),
+            "freeing the last slot drops the group, so nothing is held",
+        );
     }
 
     #[test]

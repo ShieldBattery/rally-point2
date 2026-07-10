@@ -123,6 +123,23 @@ pub struct SessionSetup {
     /// the same point it retires the session's other per-session state, keeping the
     /// bucket map bounded by live re-homing sessions.
     rehome_limiter: RehomeLimiter,
+    /// Linearizes an assignment's registry-read→commit span against a relay's drain
+    /// mark, closing the coordinated-drain race. The window is: [`create_session`]
+    /// (and [`rehome`]) reads the registry to pick a relay, then commits — records
+    /// `session_relays` membership and stages the descriptors that name it. If a
+    /// relay's drain mark landed *between* the pick and the commit, the session
+    /// would name a relay about to exit, and a never-started session on a gone relay
+    /// is unrecoverable client-side. So the pick→commit span and the drain mark
+    /// each hold this one lock and are therefore mutually exclusive: after the mark,
+    /// every session that will ever name the relay has already staged its descriptor
+    /// in the relay's outbox, and any create still mid-flight re-reads the registry
+    /// under the lock and sees the relay draining.
+    ///
+    /// **Outermost lock.** The fine-grained locks (`session_relays`, the registry
+    /// mutex, the descriptor outbox, `rehomes`) nest *under* this one; nothing
+    /// acquires this while already holding one of them. It guards only await-free
+    /// sync bodies, so the guard never crosses an await point.
+    assignment_lock: Arc<Mutex<()>>,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -152,6 +169,7 @@ impl SessionSetup {
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter,
+            assignment_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -252,6 +270,16 @@ impl SessionSetup {
     pub fn rehome_limiter(&self) -> &RehomeLimiter {
         &self.rehome_limiter
     }
+
+    /// Locks the assignment lock — the outermost lock that linearizes an
+    /// assignment's pick→commit span against a relay's drain mark (see the field
+    /// docs). The coordinator's control connection acquires it around
+    /// [`registry::mark_draining`](crate::registry::mark_draining) so a drain mark
+    /// lands wholly before or wholly after any in-flight `create_session`/`rehome`.
+    /// Returns a guard held only across await-free sync work.
+    pub fn lock_assignment(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.assignment_lock.lock()
+    }
 }
 
 /// The outcome of a coordinator-mediated re-home request (`POST /session/rehome`).
@@ -334,11 +362,15 @@ pub fn rehome(
 ///
 /// # Locking
 ///
-/// Holds the `rehomes` lock across the middle section and takes the `session_relays`
-/// lock *nested* inside it for the mutation. A full close ([`Lifecycle::on_session_closed`])
+/// Holds the outermost `assignment_lock` across its whole (await-free) body — so
+/// the replacement pick (a registry read) and the descriptor re-staging are atomic
+/// against a relay's drain mark, exactly as [`create_session`]'s pick→commit is —
+/// then the `rehomes` lock across the middle section, and the `session_relays` lock
+/// *nested* inside that for the mutation. A full close ([`Lifecycle::on_session_closed`])
 /// touches `forget_rehomes` (the `rehomes` lock) and `forget_session_membership`
-/// (the `session_relays` lock) as two separate, non-nested acquisitions, so it never
-/// holds both at once and cannot deadlock against this nesting order.
+/// (the `session_relays` lock) as two separate, non-nested acquisitions that take
+/// neither the assignment lock nor both fine locks at once, so it cannot deadlock
+/// against this nesting order.
 fn rehome_inner(
     setup: &SessionSetup,
     tenant: &TenantId,
@@ -347,6 +379,10 @@ fn rehome_inner(
     departed_slots: Vec<DepartedSlot>,
     before_mutation: impl FnOnce(),
 ) -> RehomeOutcome {
+    // The outermost assignment lock: this re-home's pick→re-stage span linearizes
+    // against a relay's drain mark the same way `create_session` does.
+    let _assign = setup.lock_assignment();
+
     let key = (tenant.clone(), session);
     let serving = setup.serving_relays(tenant, session);
     // Unknown session (never created here, or a coordinator restart wiped its
@@ -400,14 +436,16 @@ fn rehome_inner(
         return RehomeOutcome::Unavailable;
     }
 
-    // Pick the replacement: prefer a live relay already serving the session
-    // (earliest in the authority order), else the lowest-id live registered relay.
+    // Pick the replacement: prefer a live *available* relay already serving the
+    // session (earliest in the authority order), else the lowest-id live available
+    // registered relay. A draining relay is never chosen — it asked to stop taking
+    // new work, and re-homing a whole group onto it would be exactly that.
     let r_new = serving
         .iter()
         .copied()
-        .find(|&id| id != dead_relay && registry::entry(&setup.registry, id).is_some())
+        .find(|&id| id != dead_relay && registry::is_available(&setup.registry, id))
         .or_else(|| {
-            let mut entries = registry::all_entries(&setup.registry);
+            let mut entries = registry::available_entries(&setup.registry);
             entries.sort_by_key(|e| e.relay_id);
             entries.first().map(|e| e.relay_id)
         });
@@ -531,11 +569,37 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 ///
 /// Token expiry is set to `expires_at` — the caller decides the lifetime
 /// (typically game session duration plus margin).
+///
+/// The whole body runs under the assignment lock (see
+/// [`SessionSetup::lock_assignment`]), so the registry read that picks relays and
+/// the commit that records membership and stages descriptors are atomic against a
+/// concurrent relay drain mark — the mark lands wholly before this create (and this
+/// create then sees the relay draining) or wholly after it (and the descriptor is
+/// already staged in the relay's outbox).
 pub fn create_session(
     setup: &SessionSetup,
     request: SessionRequest,
     expires_at: ExpiresAt,
 ) -> Result<SessionResponse, SessionSetupError> {
+    create_session_inner(setup, request, expires_at, || {})
+}
+
+/// [`create_session`]'s body, with a test seam `before_commit` invoked after the
+/// relays are picked but before any membership is recorded or descriptor staged —
+/// the exact window in which a racing drain mark must be linearized out. Production
+/// passes a no-op; a test passes a closure that pauses A mid-span so it can prove a
+/// concurrent drain mark blocks on the assignment lock until A commits.
+fn create_session_inner(
+    setup: &SessionSetup,
+    request: SessionRequest,
+    expires_at: ExpiresAt,
+    before_commit: impl FnOnce(),
+) -> Result<SessionResponse, SessionSetupError> {
+    // Hold the outermost assignment lock across this entire (await-free) body, so
+    // the registry read below and the commit that follows cannot interleave with a
+    // relay's drain mark. See `SessionSetup::assignment_lock`.
+    let _assign = setup.lock_assignment();
+
     validate_request(&request)?;
 
     let (home, secondary) = assign_relays(&setup.registry)?;
@@ -587,6 +651,11 @@ pub fn create_session(
         }
         ids
     };
+
+    // Test seam: a drain mark racing this create lands wholly before or after,
+    // because it contends on the assignment lock this body holds (production no-op).
+    before_commit();
+
     setup
         .session_relays
         .lock()
@@ -781,10 +850,15 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
 /// The primary is the lowest-id registered relay (deterministic for a given
 /// fleet state); the secondary is the next one, or `None` when only one relay is
 /// enrolled (a single-relay session, where the split silently collapses).
+///
+/// Only *available* relays are candidates — a relay that has asked to drain is
+/// excluded from new assignments (it keeps serving its existing sessions). If every
+/// relay is draining (or none is enrolled), there is nothing to assign and this is
+/// [`NoRelaysAvailable`](SessionSetupError::NoRelaysAvailable).
 fn assign_relays(
     registry: &RelayRegistry,
 ) -> Result<(RelayEndpoint, Option<RelayEndpoint>), SessionSetupError> {
-    let mut entries = registry::all_entries(registry);
+    let mut entries = registry::available_entries(registry);
     if entries.is_empty() {
         return Err(SessionSetupError::NoRelaysAvailable);
     }
@@ -1973,5 +2047,240 @@ mod tests {
             recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
             "the close cleared the recorded rehome",
         );
+    }
+
+    // --- Coordinated drain: assignment eligibility + the linearization ---
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// A one-relay setup returning the relay's enroll generation (needed to mark it
+    /// draining under the generation fence).
+    fn one_relay_setup() -> (SessionSetup, u64) {
+        let reg = registry::new_registry();
+        let generation = registry::enroll(
+            &reg,
+            RelayHello::new(RelayId(1), addr(14900), ProtocolVersion::CURRENT, fake_cert(1)),
+        );
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        (SessionSetup::new(reg, tenants), generation)
+    }
+
+    /// A two-relay setup returning each relay's enroll generation.
+    fn two_relay_setup() -> (SessionSetup, u64, u64) {
+        let reg = registry::new_registry();
+        let g1 = registry::enroll(
+            &reg,
+            RelayHello::new(RelayId(1), addr(14900), ProtocolVersion::CURRENT, fake_cert(1)),
+        );
+        let g2 = registry::enroll(
+            &reg,
+            RelayHello::new(RelayId(2), addr(14901), ProtocolVersion::CURRENT, fake_cert(2)),
+        );
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        (SessionSetup::new(reg, tenants), g1, g2)
+    }
+
+    #[test]
+    fn create_session_skips_a_draining_relay() {
+        // Relay 1 (the default primary) drains; a create homes on the still-available
+        // relay 2 and never names relay 1 in its outbox.
+        let (setup, g1, _g2) = two_relay_setup();
+        assert!(registry::mark_draining(setup.registry(), RelayId(1), g1));
+
+        let resp = create_default_session(&setup);
+        assert_eq!(
+            resp.home_relay.relay_id,
+            RelayId(2),
+            "a create skips the draining relay and homes on the available one",
+        );
+        assert!(
+            setup.descriptors().current_for(RelayId(1)).is_empty(),
+            "the drained relay's outbox gains no session from a post-mark create",
+        );
+    }
+
+    #[test]
+    fn all_relays_draining_yields_no_relays_available() {
+        let (setup, g1) = one_relay_setup();
+        registry::mark_draining(setup.registry(), RelayId(1), g1);
+
+        let err = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap_err();
+        assert_eq!(err, SessionSetupError::NoRelaysAvailable);
+    }
+
+    #[test]
+    fn rehome_replacement_pick_never_selects_a_draining_relay() {
+        // Home relay 1 dies; the only other live relay (2) is draining, so the
+        // replacement pick refuses it (there is no other live relay) — Unavailable
+        // rather than re-homing the whole group onto a relay that asked to stop.
+        let (setup, _g1, g2) = two_relay_setup();
+        let resp = create_default_session(&setup); // serving == {1}
+        registry::remove(setup.registry(), RelayId(1));
+        registry::mark_draining(setup.registry(), RelayId(2), g2);
+
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
+            "a draining relay is never chosen as a re-home target",
+        );
+    }
+
+    #[test]
+    fn rehome_for_a_serving_but_draining_relay_returns_stay() {
+        // The dead-named relay is enrolled AND still serving, only draining. Drain
+        // blocks NEW assignments; a draining relay still serving is alive, so the
+        // stay-check (unchanged — it reads registry liveness, not availability)
+        // correctly overrules the client's belief that it died.
+        let (setup, g1, _g2) = two_relay_setup();
+        let resp = create_default_session(&setup); // serving == {1}
+        registry::mark_draining(setup.registry(), RelayId(1), g1);
+
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Stay,
+            "a draining relay still serving its session is alive: Stay, not a move",
+        );
+    }
+
+    #[test]
+    fn a_drain_mark_racing_create_session_is_linearized_after_the_commit() {
+        // The deterministic interleaving: thread A enters create_session's critical
+        // section and pauses at the seam (holding the assignment lock); thread B's
+        // drain mark must block on that lock until A commits, so B's post-mark view of
+        // the relay's descriptor outbox already includes A's just-created session.
+        let (setup, g1) = one_relay_setup();
+
+        let (seam_tx, seam_rx) = std::sync::mpsc::channel();
+        let setup_a = setup.clone();
+        let a = std::thread::spawn(move || {
+            create_session_inner(
+                &setup_a,
+                SessionRequest {
+                    tenant: tid(),
+                    players: two_players(),
+                    external_id: None,
+                    dev_relay_split: Vec::new(),
+                },
+                ExpiresAt(u64::MAX),
+                || {
+                    // Reached the seam (past the pick, before the commit). Signal, then
+                    // linger so B has time to contend on the assignment lock A holds.
+                    seam_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                },
+            )
+            .unwrap()
+        });
+
+        seam_rx.recv().unwrap(); // A is in its critical section, holding the lock
+        {
+            // B's drain mark blocks on the assignment lock until A commits and releases.
+            let _assign = setup.lock_assignment();
+            assert!(registry::mark_draining(setup.registry(), RelayId(1), g1));
+        }
+        let resp = a.join().unwrap();
+
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .any(|d| d.session == resp.session),
+            "A committed before B could mark, so A's session is staged in the outbox",
+        );
+        assert!(
+            !registry::is_available(setup.registry(), RelayId(1)),
+            "the relay is now draining",
+        );
+    }
+
+    #[test]
+    fn concurrent_creates_and_a_drain_never_name_the_relay_without_staging_it() {
+        // The stochastic form of the invariant: N threads hammer create_session on a
+        // single relay while one thread marks it draining. Every session a create
+        // returned Ok for necessarily committed before the mark (a post-mark create
+        // sees the relay draining and fails NoRelaysAvailable), so it must be staged in
+        // the relay's descriptor outbox as observed at the mark point — "set before
+        // ack: an empty set at ack means provably unassigned", proven at coordinator
+        // state level with no sockets.
+        let (setup, g1) = one_relay_setup();
+
+        let created: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let setup = setup.clone();
+            let created = Arc::clone(&created);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    if let Ok(resp) = create_session(
+                        &setup,
+                        SessionRequest {
+                            tenant: tid(),
+                            players: two_players(),
+                            external_id: None,
+                            dev_relay_split: Vec::new(),
+                        },
+                        ExpiresAt(u64::MAX),
+                    ) {
+                        created.lock().push(resp.session);
+                    }
+                }
+            }));
+        }
+
+        // Mark the relay draining partway through, then snapshot its outbox — the
+        // coordinator-side ack point. After the mark, no further create can stage a
+        // descriptor for the relay, so this snapshot is the complete set of sessions
+        // that will ever name it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        {
+            let _assign = setup.lock_assignment();
+            registry::mark_draining(setup.registry(), RelayId(1), g1);
+        }
+        let staged: std::collections::HashSet<SessionId> = setup
+            .descriptors()
+            .current_for(RelayId(1))
+            .into_iter()
+            .map(|d| d.session)
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let created = created.lock();
+        assert!(!created.is_empty(), "some creates committed before the drain");
+        for session in created.iter() {
+            assert!(
+                staged.contains(session),
+                "every Ok session is staged in the relay's outbox at the drain point",
+            );
+        }
     }
 }

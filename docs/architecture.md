@@ -520,6 +520,44 @@ down: a naïve drop would evict the live entry the reconnect just installed. It 
 dropping connection removes the relay only if its generation still matches the one held, so a stale drop
 racing a reconnect is a no-op.
 
+**Coordinated drain.** A relay must be able to exit on its shutdown signal without racing the coordinator
+into handing it a fresh session it will never serve. When a relay receives `SIGTERM`/Ctrl-C it keeps
+serving — existing games play on — but sends a **`Draining`** frame up the control connection. The
+coordinator marks the relay ineligible for *new* assignments (it stays enrolled and keeps serving what it
+already has), then answers **`DrainAck`** — but only *after* pushing the relay's current descriptor set
+down the same socket. The **set-before-ack** ordering is the contract: a relay that sees an empty
+descriptor set at ack time knows it is *provably unassigned* and can exit at once, while one still holding
+sessions waits them out. The mark is race-closed by an **assignment lock**, the coordinator's outermost
+control-plane lock: `create_session` (and `rehome`) hold it across the whole span from reading the registry
+to pick a relay through staging that relay's descriptors, and the drain mark holds it around setting the
+flag. So the two are mutually exclusive — after the mark lands, every session that will ever name the relay
+has already staged its descriptor in the relay's outbox, and any create still mid-flight re-reads the
+registry under the lock and sees the relay draining. A relay that reconnects mid-drain re-sends `Draining`
+right after its `Hello` (a re-enroll clears the coordinator-side flag deliberately, fenced by the same
+generation token as deregistration, so a stale connection's `Draining` can't mark an entry a live successor
+re-enrolled).
+
+Once acked (or after a short timeout — a coordinator that is down or predates the frame must never wedge
+shutdown), the relay waits until it is **drained-idle** — it holds **no local slot** *and* its
+**last-applied descriptor set is empty** — bounded by a **drain timeout** (default 90s, deliberately under
+Fargate's 120s `stopTimeout` so the drain always finishes before the platform `SIGKILL`s the process). Both
+halves of the predicate are load-bearing. The descriptor half is what makes the set-before-ack contract
+usable: an empty set at ack time means the coordinator's post-mark truth names this relay in no session, so
+the truly-idle scale-in relay exits at once (well under a second). Slot liveness alone would miss the very
+sliver the ordering exists to cover — a session committed to this relay just before the drain mark, whose
+clients haven't dialed yet, holds no slot; exiting then strands those clients dialing a dead relay
+pre-start, which the client driver cannot recover (it escalates to re-home only after `SessionStart`). A
+non-empty set therefore makes the relay wait: the assigned clients dial, register slots, and are served to
+completion. The descriptor half can over-hold — a session whose clients never dial, or a multi-relay
+session whose descriptor lingers while a *peer* relay still serves it after this relay's players left —
+but that costs only a bounded wait: it, like any session still running at the drain timeout, is
+**deliberately abandoned** — the coordinator-mediated re-home (see
+[Failover and reconnect](#failover-and-reconnect)) re-homes its clients onto a live relay, which is exactly
+the mechanism a hard relay death already relies on.
+The drain mark also steers re-home: a draining relay is never chosen as a re-home target (it asked to stop
+taking work), though a draining relay *still serving* a session it is named dead for correctly reads as a
+false-alarm `stay` — drain blocks only new assignments, and a serving relay is alive.
+
 **Logical push, physical pull.** The coordinator decides a relay's mesh membership and the relay
 applies it — the data flows coordinator→relay. But the relay is what *opens* the connection, rather than
 the coordinator reaching into a relay that churns under scale-to-zero and may sit behind a firewall.

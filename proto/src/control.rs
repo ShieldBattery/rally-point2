@@ -548,8 +548,10 @@ pub struct DepartedSlot {
 /// relay holds open to it.
 ///
 /// The connection is the relay's single, authenticated control channel: the
-/// coordinator pushes mesh topology down it, and (as the control plane grows)
-/// the relay reports liveness up it. This enum is the **down** direction. It is
+/// coordinator pushes mesh topology down it, and the relay reports liveness (and
+/// a drain request) up it. This enum is the **down** direction — descriptor
+/// pushes, reap directives, and the [`DrainAck`](Self::DrainAck) that answers a
+/// relay's coordinated-drain request. It is
 /// tagged so the channel can carry new message kinds without a wire break — a
 /// relay and coordinator deploy independently, so during a rolling deploy a newer
 /// coordinator may send a message kind an older relay does not know. The
@@ -590,6 +592,18 @@ pub enum CoordinatorToRelay {
         /// The slots to close. A slot this relay does not hold is ignored.
         slots: Vec<SlotId>,
     },
+    /// Acknowledges a relay's [`Draining`](RelayToCoordinator::Draining) request:
+    /// the coordinator has marked the relay ineligible for new session assignments
+    /// **and**, immediately before this frame, pushed the relay's current
+    /// descriptor set down the same socket. That ordering is load-bearing — the set
+    /// arrives before the ack — so a relay that sees an *empty* descriptor set at
+    /// ack time knows it is provably unassigned and can exit at once, while a relay
+    /// still holding sessions waits them out (up to its drain timeout) rather than
+    /// abandoning a client mid-connect. Payload-free: the acknowledgement is the
+    /// whole signal. Sent only when the mark applied under a current connection
+    /// generation; a stale connection's Draining draws no ack (its live successor
+    /// runs its own drain exchange).
+    DrainAck,
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -607,7 +621,9 @@ pub enum CoordinatorToRelay {
 /// that then carries descriptor pushes back down, so a relay has one channel to
 /// the coordinator rather than a separate phone-home. After enrolling, the relay
 /// sends a periodic [`Heartbeat`](Self::Heartbeat) so the coordinator can tell a
-/// live relay from one whose connection has silently died. Tagged and
+/// live relay from one whose connection has silently died, and — once it has
+/// received its shutdown signal — a [`Draining`](Self::Draining) frame asking the
+/// coordinator to stop assigning it new sessions. Tagged and
 /// forward-compatible the same way as the down direction — a message kind a newer
 /// relay sends that an older coordinator predates decodes to
 /// [`Unknown`](Self::Unknown) and is skipped rather than tearing the connection
@@ -628,6 +644,17 @@ pub enum RelayToCoordinator {
     /// can ride a later frame, which the forward-compatible envelope already
     /// accommodates without a wire break.
     Heartbeat,
+    /// The relay has received its shutdown signal and asks the coordinator to
+    /// **stop assigning it new sessions**. The control connection itself identifies
+    /// the relay, so — like [`Heartbeat`](Self::Heartbeat) — it carries no payload.
+    ///
+    /// The coordinator marks the relay ineligible for assignment, then answers with
+    /// [`DrainAck`](CoordinatorToRelay::DrainAck) after pushing the relay's current
+    /// descriptor set (set-before-ack: an empty set at ack time means provably
+    /// unassigned). A re-enroll clears the coordinator-side flag, so a relay that
+    /// reconnects mid-drain re-sends this frame right after its `Hello`. Idempotent:
+    /// re-sending it just draws a fresh set-plus-ack.
+    Draining,
     /// A player permanently departed a running game: a synced leave for the slot
     /// just first entered this relay's consensus cache. The relay reports it so
     /// the coordinator can forward the "player X left vs. was dropped" fact to
@@ -1018,6 +1045,46 @@ mod tests {
         assert_eq!(json, r#"{"type":"heartbeat"}"#);
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn relay_to_coordinator_draining_roundtrips_json() {
+        let message = RelayToCoordinator::Draining;
+        let json = serde_json::to_string(&message).unwrap();
+        // A payload-free drain request: just the tag, like a heartbeat.
+        assert_eq!(json, r#"{"type":"draining"}"#);
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn coordinator_to_relay_drain_ack_roundtrips_json() {
+        let message = CoordinatorToRelay::DrainAck;
+        let json = serde_json::to_string(&message).unwrap();
+        // A payload-free acknowledgement: just the tag.
+        assert_eq!(json, r#"{"type":"drain_ack"}"#);
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn draining_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `Draining` up-frame decoded by the down-direction
+        // `CoordinatorToRelay` (which has no such variant) folds into `Unknown`
+        // rather than erroring — an older coordinator's path against a newer relay.
+        let json = r#"{"type":"draining"}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn drain_ack_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `DrainAck` down-frame decoded by the up-direction
+        // `RelayToCoordinator` (which has no such variant) folds into `Unknown`
+        // rather than erroring — an older relay's path against a newer coordinator.
+        let json = r#"{"type":"drain_ack"}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
     }
 
     #[test]

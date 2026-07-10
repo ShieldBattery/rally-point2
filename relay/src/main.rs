@@ -20,6 +20,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::Result;
@@ -133,7 +134,23 @@ struct Cli {
     /// Production sets this explicitly (later, derived from the cloud substrate).
     #[arg(long, env = "RELAY_ADVERTISE_ADDR")]
     advertise_addr: Option<SocketAddr>,
+
+    /// How long the coordinated-drain shutdown path waits for in-flight sessions to
+    /// finish before exiting and abandoning any that remain to coordinator-mediated
+    /// failover. Deliberately under Fargate's 120s `stopTimeout`, so the drain always
+    /// completes before the platform SIGKILLs the process.
+    #[arg(long, env = "RELAY_DRAIN_TIMEOUT_SECS", default_value_t = 90)]
+    drain_timeout_secs: u64,
 }
+
+/// How long the drain sequence waits for the coordinator's `DrainAck` before
+/// proceeding regardless. A coordinator that is down, or one predating the drain
+/// frame, must never wedge shutdown — so this is short and the wait is best-effort.
+const DRAIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the drain sequence re-checks whether the relay has gone idle. A
+/// shutdown path is not latency-critical, so a coarse poll keeps it simple.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,6 +202,23 @@ async fn main() -> Result<()> {
     let registry = Arc::new(config::registry_from_tenant_key(&tenant_key));
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::new_mesh_state();
+
+    // The coordinated-drain seam. On a shutdown signal the drain sequence flips
+    // `drain_tx`, the coordinator client sends `Draining` up the control connection,
+    // and the coordinator answers `DrainAck` by flipping `drain_acked` — which the
+    // drain sequence waits on (bounded). Both are wired into the coordinator client
+    // only when a coordinator URL is configured; without one the drain sequence skips
+    // the handshake and waits on local idleness alone.
+    let has_coordinator = cli.relay_id.is_some() && cli.coordinator_url.is_some();
+    let drain_timeout = Duration::from_secs(cli.drain_timeout_secs);
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let (drain_acked_tx, mut drain_acked_rx) = tokio::sync::watch::channel(false);
+    // The last-applied session set, shared between the coordinator client (which
+    // reconciles it on every descriptor push) and the drain sequence (which reads
+    // it to tell an assigned-but-not-yet-dialed session from a provably unassigned
+    // relay). Trivially empty without a coordinator, so the drain then keys on
+    // local slot liveness alone.
+    let applied = coordinator_client::AppliedSessions::new();
 
     // The mesh-edge connection half. When a relay-id is configured, spawn the
     // accept drain (peer relays dialing us arrive on `mesh_accept`) and one
@@ -323,7 +357,10 @@ async fn main() -> Result<()> {
                 relay_hello,
                 cli.coordinator_secret.clone(),
                 mesh_control.clone(),
+                applied.clone(),
                 notices_rx,
+                drain_rx.clone(),
+                drain_acked_tx.clone(),
             ));
         }
 
@@ -338,17 +375,127 @@ async fn main() -> Result<()> {
         None
     };
 
-    server::run(
+    // Keep serving during the drain: existing sessions' clients still connect and
+    // play while we wind down, so the server runs on its own task rather than being
+    // awaited inline. Clone the roster first so the drain path can watch local slot
+    // liveness after `sessions` moves into the server.
+    let sessions_for_drain = Arc::clone(&sessions);
+    let mut server = tokio::spawn(server::run(
         cli.listen,
         server_config,
         registry,
         sessions,
         mesh_state,
         mesh_accept,
-    )
-    .await
-    .context("relay server ended with an error")?;
+    ));
+
+    tokio::select! {
+        result = &mut server => {
+            // The server ended on its own — a bind failure or a fatal serve error.
+            result
+                .context("relay server task panicked")?
+                .context("relay server ended with an error")?;
+        }
+        _ = shutdown_signal() => {
+            drain_and_exit(
+                has_coordinator,
+                &drain_tx,
+                &mut drain_acked_rx,
+                &sessions_for_drain,
+                &applied,
+                drain_timeout,
+            )
+            .await;
+            // Started sessions still alive here are deliberately abandoned: the
+            // coordinator-mediated failover re-homes their clients onto a live relay.
+            tracing::info!("drain complete; exiting");
+        }
+    }
     Ok(())
+}
+
+/// Resolves when the process receives a shutdown signal: `Ctrl-C` everywhere, plus
+/// `SIGTERM` on Unix — production runs on Linux/Fargate, which stops a task by
+/// sending `SIGTERM` (then `SIGKILL` after `stopTimeout`), so the drain must key on
+/// `SIGTERM`, not just an interactive interrupt.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing a SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
+}
+
+/// The coordinated-drain sequence, run once a shutdown signal arrives while the
+/// server keeps serving: ask the coordinator to stop assigning us new sessions,
+/// wait (bounded) for its `DrainAck`, then wait for the relay to go idle before
+/// returning so the caller can exit.
+///
+/// **Idle predicate: no local slot held AND an empty applied descriptor set**
+/// ([`coordinator_client::drained_idle`]). The DrainAck contract makes the second
+/// half sound: the coordinator pushes our current descriptor set before the ack, so
+/// an empty applied set at ack time means we are *provably unassigned* — the
+/// truly-idle scale-in case exits immediately (well under a second). A non-empty
+/// set names sessions whose clients may not have dialed yet (a session committed
+/// just before our drain mark), so we wait: they dial, register slots, and the wait
+/// ends when they finish. Slot liveness alone would miss exactly that window and
+/// strand those clients dialing a dead relay pre-start, which the client driver
+/// cannot recover (it escalates to re-home only after `SessionStart`). The cost of
+/// the descriptor half is a *bounded* wait: a session whose clients never dial, or
+/// one a peer relay still serves after our players left, holds its descriptor here
+/// until the drain timeout — under Fargate's stopTimeout — and is then, like any
+/// session still running at the deadline, deliberately abandoned to the
+/// coordinator-mediated failover.
+async fn drain_and_exit(
+    has_coordinator: bool,
+    drain_tx: &tokio::sync::watch::Sender<bool>,
+    drain_acked_rx: &mut tokio::sync::watch::Receiver<bool>,
+    sessions: &Sessions,
+    applied: &coordinator_client::AppliedSessions,
+    drain_timeout: Duration,
+) {
+    tracing::info!("shutdown signal received; beginning coordinated drain");
+
+    if has_coordinator {
+        // Ask the coordinator to stop assigning us new sessions.
+        let _ = drain_tx.send(true);
+        // Wait for the DrainAck, but never let a down/older coordinator wedge us.
+        match tokio::time::timeout(DRAIN_ACK_TIMEOUT, drain_acked_rx.changed()).await {
+            Ok(Ok(())) => tracing::info!("coordinator acknowledged drain"),
+            Ok(Err(_)) => tracing::warn!("drain-ack channel closed before an ack; proceeding"),
+            Err(_) => tracing::warn!("timed out waiting for a drain ack; proceeding"),
+        }
+    } else {
+        tracing::info!("no coordinator configured; skipping the drain handshake");
+    }
+
+    // Wait until drained-idle, bounded by the drain timeout.
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    loop {
+        if coordinator_client::drained_idle(sessions, applied) {
+            tracing::info!("relay idle; no local slots held and no session assigned");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "drain timeout reached with sessions still live or assigned; abandoning them to failover",
+            );
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
 }
 
 fn init_tracing() {

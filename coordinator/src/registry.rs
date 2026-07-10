@@ -47,6 +47,14 @@ use rally_point_proto::ids::RelayId;
 struct Registered {
     entry: RelayEntry,
     generation: u64,
+    /// Whether this relay has asked to drain — it received its shutdown signal and
+    /// requested that the coordinator stop assigning it new sessions (see
+    /// [`mark_draining`]). A draining relay stays enrolled and keeps serving its
+    /// existing sessions; it is only excluded from *new* assignments
+    /// ([`is_available`], [`available_entries`]). Reset to `false` on every enroll,
+    /// so a relay that restarted or reconnected is fresh — which is why a relay that
+    /// reconnects mid-drain must re-send its `Draining` frame.
+    draining: bool,
 }
 
 /// The coordinator's relay registry: `RelayId` → the relay's entry.
@@ -82,11 +90,49 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
         cert_der: hello.cert_der,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
+    registry.relays.lock().insert(
+        entry.relay_id,
+        Registered {
+            entry,
+            generation,
+            // A fresh enroll is never draining: a relay that reconnects mid-drain
+            // re-sends its `Draining` frame to re-mark itself.
+            draining: false,
+        },
+    );
+    generation
+}
+
+/// Marks `id` as draining — it has asked the coordinator to stop assigning it new
+/// sessions — **only if the entry's generation matches** `generation`. Returns
+/// whether the mark applied.
+///
+/// The generation fence is what makes a racing reconnect safe: a stale connection's
+/// `Draining` must not mark an entry a *newer* connection just re-enrolled (a
+/// re-enroll clears the flag deliberately, so the live connection re-sends its own
+/// `Draining`). A mismatched generation, or an unknown relay, is a no-op returning
+/// `false`. Already-draining under the same generation counts as applied (`true`) —
+/// the mark is idempotent, so a re-sent `Draining` still draws its ack.
+pub fn mark_draining(registry: &RelayRegistry, id: RelayId, generation: u64) -> bool {
+    let mut relays = registry.relays.lock();
+    match relays.get_mut(&id) {
+        Some(registered) if registered.generation == generation => {
+            registered.draining = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether `id` is enrolled and available for a *new* session assignment — present
+/// in the registry and not draining. A draining relay reads as unavailable here
+/// even though it stays enrolled and keeps serving its existing sessions.
+pub fn is_available(registry: &RelayRegistry, id: RelayId) -> bool {
     registry
         .relays
         .lock()
-        .insert(entry.relay_id, Registered { entry, generation });
-    generation
+        .get(&id)
+        .is_some_and(|r| !r.draining)
 }
 
 /// Looks up a relay by id, returning a [`RelayPeer`] (the id, address, and
@@ -105,14 +151,29 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
     registry.relays.lock().get(&id).map(|r| r.entry.clone())
 }
 
-/// All registered relays' full entries, in an unspecified order. Used to pick
-/// the home relays for a session — the session response needs the full
-/// enrollment record (protocol version and all), not just the peer view.
+/// All registered relays' full entries, in an unspecified order — draining ones
+/// included. Callers that must reach *every* enrolled relay (e.g. a re-home
+/// last-resort fallback picking any live relay) use this; assignment of a *new*
+/// session uses [`available_entries`] instead.
 pub fn all_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
     registry
         .relays
         .lock()
         .values()
+        .map(|r| r.entry.clone())
+        .collect()
+}
+
+/// The registered relays available for a *new* session assignment — every enrolled
+/// relay that is not draining — in an unspecified order. This is what session setup
+/// and the re-home replacement pick read, so a relay that has asked to drain is
+/// never handed a fresh session even while it keeps serving its existing ones.
+pub fn available_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
+    registry
+        .relays
+        .lock()
+        .values()
+        .filter(|r| !r.draining)
         .map(|r| r.entry.clone())
         .collect()
 }
@@ -293,5 +354,80 @@ mod tests {
         remove(&reg, RelayId(1));
         assert!(is_empty(&reg));
         assert!(peer(&reg, RelayId(1)).is_none());
+    }
+
+    #[test]
+    fn mark_draining_applies_under_the_current_generation() {
+        let reg = new_registry();
+        let generation = enroll(&reg, hello(1, 14900));
+        assert!(is_available(&reg, RelayId(1)));
+
+        assert!(mark_draining(&reg, RelayId(1), generation));
+        assert!(!is_available(&reg, RelayId(1)), "a marked relay is unavailable");
+        // Idempotent: re-marking under the same generation still reports applied.
+        assert!(mark_draining(&reg, RelayId(1), generation));
+        // Still enrolled — draining excludes only new assignments, not the entry.
+        assert!(entry(&reg, RelayId(1)).is_some());
+    }
+
+    #[test]
+    fn mark_draining_ignores_a_stale_generation() {
+        // A stale connection's Draining must not mark an entry a newer connection
+        // re-enrolled (whose fresh enroll cleared the flag deliberately).
+        let reg = new_registry();
+        let stale = enroll(&reg, hello(1, 14900));
+        let current = enroll(&reg, hello(1, 14999));
+        assert_ne!(stale, current);
+
+        assert!(
+            !mark_draining(&reg, RelayId(1), stale),
+            "a stale generation must not mark the reconnected relay draining",
+        );
+        assert!(
+            is_available(&reg, RelayId(1)),
+            "the reconnected relay stays available",
+        );
+        // The live connection's own Draining applies.
+        assert!(mark_draining(&reg, RelayId(1), current));
+        assert!(!is_available(&reg, RelayId(1)));
+    }
+
+    #[test]
+    fn mark_draining_on_an_unknown_relay_is_a_no_op() {
+        let reg = new_registry();
+        assert!(!mark_draining(&reg, RelayId(7), 0));
+    }
+
+    #[test]
+    fn re_enroll_clears_the_draining_flag() {
+        // A relay that reconnects mid-drain is fresh: its enroll clears the flag, so
+        // it must re-send Draining to re-mark itself.
+        let reg = new_registry();
+        let g0 = enroll(&reg, hello(1, 14900));
+        assert!(mark_draining(&reg, RelayId(1), g0));
+        assert!(!is_available(&reg, RelayId(1)));
+
+        enroll(&reg, hello(1, 14999)); // reconnect
+        assert!(
+            is_available(&reg, RelayId(1)),
+            "a re-enroll clears draining — the relay is fresh again",
+        );
+    }
+
+    #[test]
+    fn available_entries_excludes_a_draining_relay() {
+        let reg = new_registry();
+        let g1 = enroll(&reg, hello(1, 14900));
+        enroll(&reg, hello(2, 14901));
+
+        // Both enrolled: both available.
+        assert_eq!(available_entries(&reg).len(), 2);
+        assert_eq!(all_entries(&reg).len(), 2);
+
+        mark_draining(&reg, RelayId(1), g1);
+        // available_entries drops the draining relay; all_entries keeps it.
+        let available: Vec<_> = available_entries(&reg).into_iter().map(|e| e.relay_id).collect();
+        assert_eq!(available, vec![RelayId(2)]);
+        assert_eq!(all_entries(&reg).len(), 2, "the draining relay stays enrolled");
     }
 }

@@ -20,7 +20,9 @@ clap = { workspace = true }
 color-eyre = { workspace = true }
 ring = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `signal` (on top of the workspace features) for the coordinated-drain shutdown
+# path: ctrl_c everywhere, plus SIGTERM on Linux/Fargate.
+tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # PEM cert/key file parsing for --cert/--key.
