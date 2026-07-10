@@ -847,6 +847,12 @@ pub async fn run_slot_link(
     // The highest cursor the relay has pushed to the client, per slot. Push only
     // on advance.
     let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
+    // This destination's end-to-end cursor share to the session's mesh peers:
+    // push-on-advance, at most one complete-map frame per
+    // `DELIVERY_SYNC_MIN_INTERVAL`, so the authority (wherever it is) can fold
+    // final delivery without the share ever getting chatty.
+    let mut delivery_share =
+        crate::delivery::CursorShare::new(crate::delivery::DELIVERY_SYNC_MIN_INTERVAL);
     // Whether the inbound beacon reader task is still feeding cursors. Once it
     // ends (the client's beacon uni-stream closed or errored), `recv()` returns
     // `None` — an always-ready future that would spin the loop at 100% CPU.
@@ -968,6 +974,7 @@ pub async fn run_slot_link(
                                     slot,
                                     payload.seq,
                                     rally_point_proto::ids::GameFrameCount(frame),
+                                    crate::delivery::DeliveryHome::Local,
                                 );
                             }
                             // NOTE: the desync comparator is NOT fed here. The
@@ -1391,6 +1398,7 @@ pub async fn run_slot_link(
                                         slot,
                                         payload.seq,
                                         rally_point_proto::ids::GameFrameCount(frame),
+                                        crate::delivery::DeliveryHome::Local,
                                     );
                                 }
                                 // NOTE: no desync-comparator call here either —
@@ -1509,6 +1517,31 @@ pub async fn run_slot_link(
                 match received {
                     Some((beacon_slot, cursor)) => {
                         link.retire_through(beacon_slot, cursor);
+                        // The same cursor is the end-to-end delivery truth:
+                        // origin `beacon_slot`'s turns reached THIS client
+                        // through `cursor`. Fold it locally and — throttled —
+                        // re-share it to the session's mesh peers so a
+                        // peer-homed authority can fold it too.
+                        consensus::observe_delivery(
+                            &decision_makers,
+                            &key,
+                            slot,
+                            beacon_slot,
+                            cursor,
+                            crate::delivery::DeliveryHome::Local,
+                        );
+                        if let Some(snapshot) = delivery_share.advance(
+                            beacon_slot,
+                            cursor,
+                            std::time::Instant::now(),
+                        ) {
+                            crate::mesh::fan_out_delivery_cursors(
+                                &mesh_links,
+                                &key,
+                                slot,
+                                &snapshot,
+                            );
+                        }
                         if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
                             tracing::warn!(
                                 tenant = key.tenant.as_ref(),

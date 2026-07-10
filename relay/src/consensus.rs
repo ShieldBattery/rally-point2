@@ -518,6 +518,13 @@ pub struct DecisionMaker {
     /// authority re-affirms the buffer to every survivor, the same way a promotion
     /// re-broadcasts leaves.
     initial_directive_sent: bool,
+    /// End-to-end delivery tracking: which origins' turns have reached which
+    /// destination clients, folded from the beacon cursors this relay taps
+    /// locally and receives over the mesh. Feeds the control law's target a
+    /// clamped additive cushion (see [`decide`](Self::decide)) and the flight
+    /// recorder's per-session lag/hop fields; the law itself never reads it
+    /// beyond that one additive term.
+    delivery: crate::delivery::DeliveryTracking,
     /// The session frame at which the control law's inputs were last traced, for
     /// the rate-limited diagnostic in [`decide`](Self::decide). `None` until the
     /// first trace. Only observability state; carries no decision meaning.
@@ -1606,6 +1613,7 @@ impl DecisionMaker {
             decision_seq: 0,
             pending_directive: None,
             initial_directive_sent: false,
+            delivery: crate::delivery::DeliveryTracking::default(),
             last_trace_frame: None,
             decided_leaves: HashMap::new(),
             departures: HashMap::new(),
@@ -1622,6 +1630,24 @@ impl DecisionMaker {
     /// The session this decision-maker serves.
     pub fn key(&self) -> &SessionKey {
         &self.key
+    }
+
+    /// The session's end-to-end delivery fold, for the observation feeds (the
+    /// beacon tap, the mesh `DeliveryCursors` handler) and the observability
+    /// reads. Mutable access is deliberate: the fold is observation-only state
+    /// the decision path reads but never writes.
+    pub fn delivery_mut(&mut self) -> &mut crate::delivery::DeliveryTracking {
+        &mut self.delivery
+    }
+
+    /// The session's end-to-end delivery view (worst pair lag in turns, max
+    /// relay hops), for observability. `None` on either half until a pair has
+    /// evidence on both ends.
+    pub fn delivery_view(&self) -> (Option<u64>, Option<u32>) {
+        (
+            self.delivery.worst_lag_turns(),
+            self.delivery.max_relay_hops(),
+        )
     }
 
     /// The current buffer size.
@@ -2176,9 +2202,17 @@ impl DecisionMaker {
             self.trace_control_inputs(frame, inputs);
         }
 
-        // The control law, when it has an RTT-derived target.
+        // The control law, when it has an RTT-derived target. The end-to-end
+        // delivery cushion is a clamped ADDITIVE term on the law's target — the
+        // law itself is untouched: per-hop and lag-responsive slack for the
+        // path segments per-link RTT/loss cannot see (a turn clearing one hop
+        // and stalling on the next), riding into the same `BufferBounds` clamp
+        // below. Its inputs are client-claimed beacon cursors, so a malicious
+        // client can only understate its own delivery — the cushion's cap and
+        // the bounds clamp bound that lever to a few turns of extra buffer in
+        // its own game (see `crate::delivery`).
         if let Some(inputs) = &inputs {
-            let target = inputs.target;
+            let target = inputs.target.saturating_add(self.delivery.cushion_turns());
             let new_buffer = if target > self.buffer.0 {
                 // Raise fast: jump to the target immediately. No dwell -- a
                 // too-small buffer stalls, and you can't wait through a stall.
@@ -2418,6 +2452,9 @@ impl DecisionMaker {
         reason: u32,
     ) {
         self.note_departure(slot, last_frame, reachable, result, reason);
+        // A departed slot's frozen cursors and newest-seq must not hold the
+        // worst-lag view (and its buffer cushion) up forever.
+        self.delivery.forget_slot(slot);
     }
 
     /// Seeds a coordinator-known departure as **already decided** on a rehome (see
@@ -2775,6 +2812,7 @@ impl DecisionMaker {
     /// re-derive the leave.
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
+        self.delivery.forget_slot(slot);
     }
 
     /// Replaces the session's observer slots (from the coordinator descriptor)
@@ -3744,10 +3782,49 @@ pub fn observe_turn_frame(
     slot: SlotId,
     seq: u64,
     frame: GameFrameCount,
+    home: crate::delivery::DeliveryHome,
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.observe_turn_frame(slot, seq, frame);
+        // The same validated turn is the origin-side half of end-to-end
+        // delivery tracking: the newest seq this relay has seen from `slot`,
+        // and — because turns are never re-forwarded relay-to-relay — the
+        // source it arrived by is the slot's home relay, which is what hop
+        // inference keys on.
+        maker.delivery_mut().observe_origin(slot, seq, home);
     }
+}
+
+/// Folds one destination delivered-through cursor into `key`'s end-to-end
+/// delivery tracking: `dest` claims `origin`'s turns reached it through
+/// `delivered_seq`. `home` is where the claim arrived by — the local beacon tap
+/// for a slot homed here, or the mesh link to the destination's home relay for
+/// a `DeliveryCursors` frame. Monotonic per pair (a regressing cursor is
+/// ignored). A no-op when no maker exists.
+pub fn observe_delivery(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    dest: SlotId,
+    origin: SlotId,
+    delivered_seq: u64,
+    home: crate::delivery::DeliveryHome,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker
+            .delivery_mut()
+            .observe_delivery(dest, origin, delivered_seq, home);
+    }
+}
+
+/// The session's end-to-end delivery view — `(worst pair lag in turns, max
+/// relay hops)` — for the flight recorder's sample rows. `None` when no maker
+/// exists; either half `None` until a pair has evidence on both ends.
+pub fn session_e2e(registry: &DecisionMakers, key: &SessionKey) -> (Option<u64>, Option<u32>) {
+    registry
+        .lock()
+        .get(key)
+        .map(|maker| maker.delivery_view())
+        .unwrap_or((None, None))
 }
 
 /// Feeds one forwarded turn's commands into the session's desync comparator, if

@@ -1151,6 +1151,88 @@ mod tests {
     }
 
     #[test]
+    fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
+        use crate::delivery::{
+            DeliveryHome, E2E_LAG_CUSHION_CAP_TURNS, EXTRA_HOP_CUSHION_TURNS,
+        };
+        use rally_point_proto::ids::GameFrameCount;
+        use rally_point_proto::messages::{LinkConditions, SlotConditions};
+
+        let conditions = LinkConditions {
+            slots: vec![SlotConditions {
+                slot: 0,
+                rtt_us: 150_000,
+                lost_packets: 0,
+                sent_packets: 100,
+            }],
+        };
+
+        // Wide bounds so the cushion's own caps are what bounds the outcome.
+        // The malicious case: a cross-relay destination understating its cursor
+        // by miles. The law's 150ms baseline is 4 turns (see the sibling test);
+        // the delivery inputs may add AT MOST one hop turn plus the capped lag
+        // term — never more, however absurd the claimed lag.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        let mut desc = descriptor(1, &[]);
+        desc.bounds = BufferBounds::new(1, 20).unwrap();
+        control.apply_descriptor(&desc);
+
+        consensus::observe_turn_frame(
+            &makers,
+            &key(1),
+            SlotId(0),
+            100_000, // the origin's newest seq, miles past the claimed cursor
+            GameFrameCount(1),
+            DeliveryHome::Local,
+        );
+        consensus::observe_delivery(
+            &makers,
+            &key(1),
+            SlotId(1),
+            SlotId(0),
+            0, // the wildly understated claim
+            DeliveryHome::Peer(RelayId(9)),
+        );
+
+        let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+            .expect("a raise fires on the first high-RTT sample");
+        assert_eq!(
+            decision.buffer.0,
+            4 + EXTRA_HOP_CUSHION_TURNS + E2E_LAG_CUSHION_CAP_TURNS,
+            "the cushion saturates at its caps, however large the claimed lag",
+        );
+
+        // The same inputs under tight bounds: the existing BufferBounds clamp
+        // still has the last word.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6)
+        consensus::observe_turn_frame(
+            &makers,
+            &key(1),
+            SlotId(0),
+            100_000,
+            GameFrameCount(1),
+            DeliveryHome::Local,
+        );
+        consensus::observe_delivery(
+            &makers,
+            &key(1),
+            SlotId(1),
+            SlotId(0),
+            0,
+            DeliveryHome::Peer(RelayId(9)),
+        );
+        let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+            .expect("a raise fires");
+        assert_eq!(
+            decision.buffer.0, 6,
+            "the cushion never escapes the session's BufferBounds",
+        );
+    }
+
+    #[test]
     fn a_created_maker_ingests_conditions_and_queues_a_directive() {
         use rally_point_proto::ids::{GameFrameCount, SlotId};
         use rally_point_proto::messages::{LinkConditions, SlotConditions};

@@ -254,6 +254,7 @@ async fn main() -> Result<()> {
     tokio::spawn(rally_point_relay::flight_recorder::run_sampler(
         flight.clone(),
         mesh_state.conditions.clone(),
+        Arc::clone(&mesh_state.decision_makers),
         rally_point_relay::flight_recorder::SAMPLE_INTERVAL,
     ));
 

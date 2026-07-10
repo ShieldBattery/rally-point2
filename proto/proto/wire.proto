@@ -691,7 +691,45 @@ message MeshControlFrame {
     // already sent a copy to every peer, so re-flooding would only echo, the same
     // no-echo rule `SlotDeparted` and `GameChat` follow. See `RequestDrop`.
     RequestDrop request_drop = 10;
+
+    // One destination client's end-to-end delivered-through cursors, shipped by
+    // its home relay to the session's other relays so the authority can track
+    // FINAL delivery (origin turns reaching the destination client) rather than
+    // only per-link acks. The cursors are the ones the destination itself pushes
+    // up its ack-beacon stream -- client-claimed truth, re-shared, never
+    // measured anew. Declarative: each frame carries the destination's complete
+    // per-origin cursor map, so a single frame fully (re)syncs a fresh or
+    // reconnected link and a lost frame is corrected by the next one.
+    // Push-on-advance with a per-destination minimum interval, so it stays off
+    // the hot path's budget. A relay that receives this does NOT re-broadcast
+    // it -- the home relay sent a copy to every session peer, the same no-echo
+    // rule the other kinds follow.
+    DeliveryCursors delivery_cursors = 11;
   }
+}
+
+// One destination client's end-to-end delivered-through cursors: for each
+// origin slot, the highest turn seq the destination has confirmed received
+// (via its ack-beacon stream to its home relay). See
+// `MeshControlFrame.delivery_cursors` for the sharing discipline.
+message DeliveryCursors {
+  // The destination slot these cursors describe -- a home client of the
+  // sending relay.
+  uint32 dest_slot = 1;
+
+  // The destination's per-origin delivered-through cursors, complete as of
+  // this frame.
+  repeated DeliveryCursor cursors = 2;
+}
+
+// One origin's delivered-through cursor within a `DeliveryCursors` frame.
+message DeliveryCursor {
+  // The origin slot whose turns the cursor covers.
+  uint32 origin_slot = 1;
+
+  // The highest origin seq the destination has confirmed received. Monotonic
+  // per (destination, origin): a receiver ignores a regressing value.
+  uint64 delivered_seq = 2;
 }
 
 // A relay's announcement to its mesh peers that one of its home clients has

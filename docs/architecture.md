@@ -439,6 +439,22 @@ instead of each skipping the silent others. The coordinator's only role here is 
 (home relay first) and set the **bounds** the decision-maker stays within; it makes no per-adjustment
 decision, so a running game is unaffected by a coordinator outage.
 
+The decision also carries an **end-to-end delivery input** — per-link RTT/loss cannot see a turn that
+clears one hop and stalls on the next, and chained per-link stalls blow the latency budget with no single
+link looking bad. The final-delivery truth already exists: each client pushes per-origin-slot
+`delivered_through` cursors up its ack-beacon stream, and its home relay reads them for ack retirement.
+The relay taps that same cursor, ships each destination's complete cursor map to its session peers over
+the mesh control stream (`DeliveryCursors`, push-on-advance with a ~250ms per-destination floor), and the
+authority folds per-`(origin, dest)` **lag** (newest origin seq it has seen minus the destination's
+cursor — one seq is one turn) and infers **hop count** with no extra wire (turns are never re-forwarded
+relay-to-relay, so the source a slot's fresh turns arrive by *is* its home; same home ⇒ 1 relay hop,
+cross ⇒ 2). These feed the buffer as a **clamped additive cushion** on the control law's target — one
+turn per hop beyond the first, plus a shallow lag-responsive term capped at a few turns — inside the
+existing bounds clamp; the law itself is unchanged. The inputs are client-claimed, so a malicious client
+can only *understate its own* delivery — the same bounded push-the-buffer-up lever as inflating its own
+link loss — and the cap plus bounds contain it; it can never stall anyone or frame another player. The
+same per-session worst-lag and hop-count view rides the flight recorder's sample rows.
+
 To decide well the decision-maker needs the **whole game's** network conditions, but each relay directly
 observes only its *own* home clients' links — loss, RTT, and the like, which QUIC already measures per
 connection. So those per-client conditions travel **with the turns**: a relay attaches its home clients'

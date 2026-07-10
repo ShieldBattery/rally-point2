@@ -39,6 +39,10 @@
 //!   change, scheduled at an agreed future turn. Authority is an injected input
 //!   (single-relay = `SelfRelay`) until multi-relay liveness lands with the mesh
 //!   wiring + coordinator; the coordinator only sets *bounds*.
+//! - **delivery** ([`delivery`]) — end-to-end turn-delivery tracking: the
+//!   per-pair fold of client-claimed beacon cursors (origin turns reaching each
+//!   destination client), hop inference, and the clamped cushion it feeds the
+//!   latency-buffer decision.
 //! - **turn log** — persist + replicate the per-game turn log; the same
 //!   "replay from cursor X" primitive serves failover and (future) observers.
 //! - **flight recorder** ([`flight_recorder`]) — per-game observability:
@@ -55,6 +59,7 @@ pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod coordinator_client;
+pub mod delivery;
 pub mod drop_hold;
 pub mod flight_recorder;
 pub mod lobby;

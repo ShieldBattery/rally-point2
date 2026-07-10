@@ -422,6 +422,42 @@ mod tests {
     }
 
     #[test]
+    fn delivery_cursor_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::{DeliveryCursor, DeliveryCursors};
+
+        // A destination's delivered-through cursors ride only the mesh control
+        // frame — relay ↔ relay, never sent to a client — carrying the complete
+        // per-origin map verbatim.
+        let mesh = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::DeliveryCursors(DeliveryCursors {
+                dest_slot: 1,
+                cursors: vec![
+                    DeliveryCursor {
+                        origin_slot: 0,
+                        delivered_seq: 4200,
+                    },
+                    DeliveryCursor {
+                        origin_slot: 2,
+                        delivered_seq: 17,
+                    },
+                ],
+            })),
+        };
+        let encoded = encode_frame(&mesh).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, mesh);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::DeliveryCursors(dc)) => {
+                assert_eq!(dc.dest_slot, 1);
+                assert_eq!(dc.cursors.len(), 2);
+                assert_eq!(dc.cursors[0].delivered_seq, 4200);
+            }
+            other => panic!("expected DeliveryCursors, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_control_frame_kind_a_peer_predates_decodes_with_the_oneof_unset() {
         // Forward/backward compatibility, mirroring the mesh-side test below: a
         // build that predates a newer `ControlFrame.kind` (the slot-connectivity

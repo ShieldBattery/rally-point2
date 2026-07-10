@@ -198,6 +198,18 @@ pub struct SampleRecord {
     pub at_ms: u64,
     /// Per-slot rows, sorted by slot.
     pub slots: Vec<SlotSample>,
+    /// The worst end-to-end delivery lag across the session's `(origin, dest)`
+    /// pairs at sampling time, in turns — newest origin seq the relay has seen
+    /// minus the destination's claimed delivered cursor (see
+    /// [`crate::delivery`]). Absent until a pair has evidence on both ends (or
+    /// on the final flush snapshot, which samples counters only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worst_e2e_lag_turns: Option<u64>,
+    /// The session's maximum relay hop count across observed pairs: 1 when
+    /// every pair shares a home relay, 2 when any pair crosses the mesh.
+    /// Absent like [`worst_e2e_lag_turns`](Self::worst_e2e_lag_turns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_relay_hops: Option<u32>,
 }
 
 /// One session's flushed recording: the versioned, self-describing envelope a
@@ -377,8 +389,13 @@ impl SessionRecording {
     }
 
     /// Builds one sample row from the current counters plus the given
-    /// conditions snapshot (the slot link's latest published QUIC stats).
-    fn sample_row(&self, conditions: Option<&HashMap<SlotId, SlotConditionsRow>>) -> SampleRecord {
+    /// conditions snapshot (the slot link's latest published QUIC stats) and
+    /// the session's end-to-end delivery view.
+    fn sample_row(
+        &self,
+        conditions: Option<&HashMap<SlotId, SlotConditionsRow>>,
+        e2e: (Option<u64>, Option<u32>),
+    ) -> SampleRecord {
         let counters = self.counters.lock();
         let mut slots: Vec<SlotSample> = counters
             .iter()
@@ -401,6 +418,8 @@ impl SessionRecording {
         SampleRecord {
             at_ms: now_ms(),
             slots,
+            worst_e2e_lag_turns: e2e.0,
+            max_relay_hops: e2e.1,
         }
     }
 }
@@ -494,10 +513,16 @@ impl FlightRecorder {
         self.slot_counters(key, slot).note_dedup_drop();
     }
 
-    /// Folds the current counters and published link conditions into one
-    /// sample row per live recording — the sampling tick's body, exposed so
-    /// tests drive it directly.
-    pub fn sample_now(&self, conditions: &ConditionsRegistry) {
+    /// Folds the current counters, published link conditions, and per-session
+    /// end-to-end delivery view (`e2e_for`, typically
+    /// [`crate::consensus::session_e2e`]) into one sample row per live
+    /// recording — the sampling tick's body, exposed so tests drive it
+    /// directly.
+    pub fn sample_now(
+        &self,
+        conditions: &ConditionsRegistry,
+        e2e_for: impl Fn(&SessionKey) -> (Option<u64>, Option<u32>),
+    ) {
         let recordings: Vec<(SessionKey, Arc<SessionRecording>)> = {
             let sessions = self.inner.sessions.lock();
             sessions
@@ -522,7 +547,7 @@ impl FlightRecorder {
                         })
                         .collect()
                 });
-            let row = recording.sample_row(rows.as_ref());
+            let row = recording.sample_row(rows.as_ref(), e2e_for(&key));
             recording.push_sample(row);
         }
     }
@@ -548,8 +573,10 @@ impl FlightRecorder {
     fn take_blob(&self, key: &SessionKey) -> Option<FlightBlob> {
         let recording = self.inner.sessions.lock().remove(key)?;
         // Fold a final counter snapshot in, so a short session that never saw a
-        // sampling tick still carries its turn-stream totals.
-        let final_row = recording.sample_row(None);
+        // sampling tick still carries its turn-stream totals. Counters only —
+        // the consensus state this flush races may already be gone, so the
+        // e2e view is deliberately absent here (the periodic rows carry it).
+        let final_row = recording.sample_row(None, (None, None));
         recording.push_sample(final_row);
         Some(FlightBlob {
             version: BLOB_VERSION,
@@ -653,12 +680,13 @@ impl FlightRecorder {
     }
 }
 
-/// The relay-wide sampling tick: folds counters + link conditions into a
-/// sample row per live session every `interval`. One task per relay, spawned
-/// by the binary; never returns.
+/// The relay-wide sampling tick: folds counters, link conditions, and each
+/// session's end-to-end delivery view into a sample row per live session every
+/// `interval`. One task per relay, spawned by the binary; never returns.
 pub async fn run_sampler(
     recorder: FlightRecorder,
     conditions: ConditionsRegistry,
+    makers: Arc<crate::consensus::DecisionMakers>,
     interval: Duration,
 ) {
     let mut tick = tokio::time::interval(interval);
@@ -667,7 +695,9 @@ pub async fn run_sampler(
     tick.tick().await;
     loop {
         tick.tick().await;
-        recorder.sample_now(&conditions);
+        recorder.sample_now(&conditions, |key| {
+            crate::consensus::session_e2e(&makers, key)
+        });
     }
 }
 
@@ -767,9 +797,10 @@ mod tests {
         counters.note_oversize_divert();
         recorder.note_dedup_drop(&k, SlotId(2));
 
-        // Drive the tick body directly with an empty conditions registry.
+        // Drive the tick body directly with an empty conditions registry and no
+        // e2e view.
         let conditions = crate::mesh::new_conditions_registry();
-        recorder.sample_now(&conditions);
+        recorder.sample_now(&conditions, |_| (None, None));
 
         let blob = recorder.take_blob(&k).expect("a recording exists");
         // One tick sample plus the final flush snapshot.
@@ -802,10 +833,14 @@ mod tests {
                 sent_packets: 500,
             },
         );
-        recorder.sample_now(&conditions);
+        recorder.sample_now(&conditions, |_| (Some(17), Some(2)));
 
         let blob = recorder.take_blob(&k).expect("a recording exists");
-        let row = &blob.samples[0].slots[0];
+        let sample = &blob.samples[0];
+        // The session-level end-to-end view rides the sample row.
+        assert_eq!(sample.worst_e2e_lag_turns, Some(17));
+        assert_eq!(sample.max_relay_hops, Some(2));
+        let row = &sample.slots[0];
         assert_eq!(row.rtt_us, Some(42_000));
         assert_eq!(row.lost_packets, Some(3));
         assert_eq!(row.sent_packets, Some(500));

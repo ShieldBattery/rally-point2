@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rally_point_proto::control::ResultEcho;
-use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
     GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, RequestDrop,
     SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
@@ -543,6 +543,39 @@ pub(crate) fn fan_out_control(links: &MeshLinks, key: &SessionKey, mut frame: Me
     for tx in targets {
         let _ = tx.send(frame.clone());
     }
+}
+
+/// Ships one destination client's complete delivered-through cursor map to every
+/// peer relay serving `key` — the home relay re-sharing the beacon cursors it
+/// already reads, so the session's authority (wherever it is) can fold final
+/// delivery. Declarative per frame (the complete map), throttled at the caller
+/// by [`crate::delivery::CursorShare`]; the receiver folds it and never
+/// re-broadcasts (the no-echo rule every mesh control kind follows).
+pub(crate) fn fan_out_delivery_cursors(
+    links: &MeshLinks,
+    key: &SessionKey,
+    dest: SlotId,
+    cursors: &[(SlotId, u64)],
+) {
+    fan_out_control(
+        links,
+        key,
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::DeliveryCursors(
+                rally_point_proto::messages::DeliveryCursors {
+                    dest_slot: u32::from(dest.0),
+                    cursors: cursors
+                        .iter()
+                        .map(|&(origin, seq)| rally_point_proto::messages::DeliveryCursor {
+                            origin_slot: u32::from(origin.0),
+                            delivered_seq: seq,
+                        })
+                        .collect(),
+                },
+            )),
+        },
+    );
 }
 
 /// Announces a departed slot to every peer relay serving `key`: the home relay
@@ -1143,6 +1176,7 @@ pub async fn run_mesh_link(
                                     slot,
                                     payload.seq,
                                     rally_point_proto::ids::GameFrameCount(frame),
+                                    crate::delivery::DeliveryHome::Peer(peer_id),
                                 );
                             }
                             // NOTE: no desync-comparator call here. This relay
@@ -1210,6 +1244,7 @@ pub async fn run_mesh_link(
                 match received {
                     Some(frame) => dispatch_mesh_control(
                         frame,
+                        peer_id,
                         &joined,
                         &sessions,
                         &mesh_for_dispatch,
@@ -1554,6 +1589,7 @@ pub async fn run_mesh_link(
 /// already); `sessions` stays separate because it is not part of `MeshState`.
 fn dispatch_mesh_control(
     frame: MeshControlFrame,
+    peer_id: RelayId,
     joined: &HashMap<SessionId, SessionState>,
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -1662,6 +1698,7 @@ fn dispatch_mesh_control(
                     slot,
                     payload.seq,
                     rally_point_proto::ids::GameFrameCount(frame),
+                    crate::delivery::DeliveryHome::Peer(peer_id),
                 );
             }
             // NOTE: no desync-comparator call here — `deliver_turn_to_locals`
@@ -1780,6 +1817,35 @@ fn dispatch_mesh_control(
                 target,
                 request.requester,
             );
+        }
+        Some(mesh_control_frame::Kind::DeliveryCursors(delivery)) => {
+            // A peer-homed destination's delivered-through cursors: fold each
+            // pair into the session's end-to-end delivery tracking. The mesh
+            // link the frame arrived on IS the destination's home relay (the
+            // same inference the origin side uses), and the fold ignores
+            // regressing cursors, so a reordered share is harmless. Never
+            // re-broadcast — the home relay sent a copy to every session peer.
+            let Ok(dest) = u8::try_from(delivery.dest_slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = delivery.dest_slot,
+                    "mesh DeliveryCursors names a dest slot id out of range; dropping",
+                );
+                return;
+            };
+            for cursor in &delivery.cursors {
+                let Ok(origin) = u8::try_from(cursor.origin_slot).map(SlotId) else {
+                    continue;
+                };
+                crate::consensus::observe_delivery(
+                    &mesh.decision_makers,
+                    &key,
+                    dest,
+                    origin,
+                    cursor.delivered_seq,
+                    crate::delivery::DeliveryHome::Peer(peer_id),
+                );
+            }
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -2366,7 +2432,7 @@ mod tests {
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The remote slot's frame fed the consensus coordinate, exactly as a
         // datagram-delivered turn's would.
@@ -2430,7 +2496,7 @@ mod tests {
             })),
         };
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local member received the command with the origin's authoritative slot.
         let delivered = member.try_recv().expect("the local member received it");
@@ -2486,7 +2552,7 @@ mod tests {
             })),
         };
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local member received the message with the origin's authoritative
         // slot, and its scope fields intact — the relay never interprets them.
@@ -2546,7 +2612,7 @@ mod tests {
             )),
         };
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local slot heard the change, naming the disconnected subject slot.
         assert_eq!(
@@ -2610,7 +2676,7 @@ mod tests {
                 },
             )),
         };
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         assert!(
             !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
@@ -2690,7 +2756,7 @@ mod tests {
                 requester: 3,
             })),
         };
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         assert!(
             !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
@@ -2763,7 +2829,7 @@ mod tests {
                 requester: 3,
             })),
         };
-        dispatch_mesh_control(frame, &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         assert!(
             mesh_state.drop_holds.is_pending(&key, SlotId(0)),
