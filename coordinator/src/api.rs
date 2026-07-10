@@ -1908,7 +1908,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["decision"], "unavailable");
-        assert!(json.get("relay").is_none(), "no relay leaks to another tenant");
+        assert!(
+            json.get("relay").is_none(),
+            "no relay leaks to another tenant"
+        );
     }
 
     #[tokio::test]

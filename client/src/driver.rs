@@ -1877,71 +1877,71 @@ async fn reconnect_link(
                                 relay_addr,
                                 server_name,
                             } => {
-                            // The replacement relay has never seen this client, so
-                            // its receive-side dedup for our own slot would base at
-                            // seq 0 and reject our resumed (already high) seq stream
-                            // once it passed the window — dropping the link, and with
-                            // every re-homed slot crossing the window together, the
-                            // whole group. Declare our own-slot resume anchor at the
-                            // oldest seq we will actually re-send, so the relay bases
-                            // the window there and the resumed stream is accepted. Two
-                            // sources feed that re-send: the rebound link keeps its
-                            // unacked window (the redundancy pass re-carries it) and
-                            // `reinject_retention` re-adds the retained ring, so the
-                            // anchor is the lower of the oldest-unacked seq and the
-                            // retention front (see `rehome_own_slot_anchor`). No source
-                            // means nothing to re-send, so no anchor is needed (the
-                            // window bases at 0, correct for a slot that never sent).
-                            let mut rehome_cursors = cursors.clone();
-                            if let Some(anchor) = rehome_own_slot_anchor(
-                                link.oldest_unacked_seq(own_slot),
-                                state.retention.front().map(|turn| turn.seq),
-                            ) {
-                                rehome_cursors.push((own_slot, anchor));
-                            }
-                            match endpoint
-                                .reconnect_with_timeout(
-                                    relay_addr,
-                                    &server_name,
-                                    &rc.identity,
-                                    &rehome_cursors,
-                                    RECONNECT_DIAL_TIMEOUT,
-                                )
-                                .await
-                            {
-                                Ok(fresh) => {
-                                    // A re-home resume onto a fresh relay: rebind, then
-                                    // re-inject the retained turns so the new relay's
-                                    // empty ring re-carries them to peers. Only now —
-                                    // on a *successful* dial — does the driver adopt
-                                    // the new relay id, so a failed dial never leaves
-                                    // it naming a relay it isn't homed on.
-                                    link.rebind(fresh.connection().clone());
-                                    reinject_retention(link, state);
-                                    rc.target = ReconnectTarget {
-                                        endpoint,
+                                // The replacement relay has never seen this client, so
+                                // its receive-side dedup for our own slot would base at
+                                // seq 0 and reject our resumed (already high) seq stream
+                                // once it passed the window — dropping the link, and with
+                                // every re-homed slot crossing the window together, the
+                                // whole group. Declare our own-slot resume anchor at the
+                                // oldest seq we will actually re-send, so the relay bases
+                                // the window there and the resumed stream is accepted. Two
+                                // sources feed that re-send: the rebound link keeps its
+                                // unacked window (the redundancy pass re-carries it) and
+                                // `reinject_retention` re-adds the retained ring, so the
+                                // anchor is the lower of the oldest-unacked seq and the
+                                // retention front (see `rehome_own_slot_anchor`). No source
+                                // means nothing to re-send, so no anchor is needed (the
+                                // window bases at 0, correct for a slot that never sent).
+                                let mut rehome_cursors = cursors.clone();
+                                if let Some(anchor) = rehome_own_slot_anchor(
+                                    link.oldest_unacked_seq(own_slot),
+                                    state.retention.front().map(|turn| turn.seq),
+                                ) {
+                                    rehome_cursors.push((own_slot, anchor));
+                                }
+                                match endpoint
+                                    .reconnect_with_timeout(
                                         relay_addr,
-                                        server_name,
-                                        relay_id,
-                                    };
-                                    backoff.reset();
-                                    tracing::info!(
-                                        relay = %relay_addr,
-                                        "re-homed onto a replacement relay",
-                                    );
-                                    return Reconnected::Resumed;
+                                        &server_name,
+                                        &rc.identity,
+                                        &rehome_cursors,
+                                        RECONNECT_DIAL_TIMEOUT,
+                                    )
+                                    .await
+                                {
+                                    Ok(fresh) => {
+                                        // A re-home resume onto a fresh relay: rebind, then
+                                        // re-inject the retained turns so the new relay's
+                                        // empty ring re-carries them to peers. Only now —
+                                        // on a *successful* dial — does the driver adopt
+                                        // the new relay id, so a failed dial never leaves
+                                        // it naming a relay it isn't homed on.
+                                        link.rebind(fresh.connection().clone());
+                                        reinject_retention(link, state);
+                                        rc.target = ReconnectTarget {
+                                            endpoint,
+                                            relay_addr,
+                                            server_name,
+                                            relay_id,
+                                        };
+                                        backoff.reset();
+                                        tracing::info!(
+                                            relay = %relay_addr,
+                                            "re-homed onto a replacement relay",
+                                        );
+                                        return Reconnected::Resumed;
+                                    }
+                                    Err(DialError::SlotDeparted) => {
+                                        return Reconnected::Terminal(DriverError::SlotDeparted);
+                                    }
+                                    Err(new_error) => {
+                                        next_escalate_at = Instant::now() + rc.escalate_retry;
+                                        tracing::info!(
+                                            %new_error,
+                                            "re-home dial failed; retrying the old relay meanwhile",
+                                        );
+                                    }
                                 }
-                                Err(DialError::SlotDeparted) => {
-                                    return Reconnected::Terminal(DriverError::SlotDeparted);
-                                }
-                                Err(new_error) => {
-                                    next_escalate_at = Instant::now() + rc.escalate_retry;
-                                    tracing::info!(
-                                        %new_error,
-                                        "re-home dial failed; retrying the old relay meanwhile",
-                                    );
-                                }
-                            }
                             }
                         }
                     }
@@ -2598,7 +2598,10 @@ mod tests {
         redivert_pending_control(&mut control_send, &mut pending)
             .await
             .expect("the retry over a live connection delivers the staged turns");
-        assert!(pending.is_empty(), "every staged turn was sent on the retry");
+        assert!(
+            pending.is_empty(),
+            "every staged turn was sent on the retry"
+        );
 
         for expected_seq in [0u64, 1] {
             let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
@@ -2608,7 +2611,11 @@ mod tests {
             match delivered {
                 ControlInbound::OversizeTurn(payload) => {
                     assert_eq!(payload.seq, expected_seq);
-                    assert_eq!(payload.commands.len(), 4096, "the oversize turn arrives whole");
+                    assert_eq!(
+                        payload.commands.len(),
+                        4096,
+                        "the oversize turn arrives whole"
+                    );
                 }
                 other => panic!("expected an oversize turn on the control stream, got {other:?}"),
             }

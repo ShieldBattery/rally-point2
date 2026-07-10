@@ -1167,7 +1167,10 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
     .await
     .expect("the re-homed high-seq turn never crossed the relay (window not anchored)");
     assert_eq!(got.seq, ANCHOR);
-    assert_eq!(got.slot, 0, "bound to the sender's authorized slot, like any turn");
+    assert_eq!(
+        got.slot, 0,
+        "bound to the sender's authorized slot, like any turn"
+    );
 }
 
 #[tokio::test]
