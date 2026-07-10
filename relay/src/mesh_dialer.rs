@@ -101,24 +101,26 @@ pub struct DialerConfig {
 /// is plenty; it exists only so a supervisor task never blocks reporting its exit.
 const STOPPED_CHANNEL_DEPTH: usize = 16;
 
-/// One desired peer's dial target: the address to dial and the certificate the
+/// One desired peer's dial target: the candidate addresses to walk (the peer's
+/// complete advertised set, in its preference order) and the certificate the
 /// descriptor pinned for it (empty when the descriptor carried none — the dial
 /// then falls back to the configured mesh roots). The cert is part of the dial
-/// identity alongside the address: a relay that restarts re-enrolls with a fresh
-/// self-signed cert, often at the same address, and a supervisor pinning the
-/// stale cert would redial a doomed TLS config forever while the one-per-peer
-/// dedup blocked the corrected dial — the same trap the address-change
-/// cancellation exists to prevent.
+/// identity alongside the addresses: a relay that restarts re-enrolls with a
+/// fresh self-signed cert, often at the same address, and a supervisor pinning
+/// the stale cert would redial a doomed TLS config forever while the
+/// one-per-peer dedup blocked the corrected dial — the same trap the
+/// address-change cancellation exists to prevent. A changed candidate set is a
+/// retarget for the same reason a changed single address was.
 #[derive(Clone, PartialEq, Eq)]
 struct PeerTarget {
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
     cert_der: Vec<u8>,
 }
 
 impl PeerTarget {
     fn from_peer(peer: &RelayPeer) -> Self {
         Self {
-            addr: peer.relay_addr,
+            addrs: peer.addrs(),
             cert_der: peer.cert_der.clone(),
         }
     }
@@ -246,7 +248,7 @@ fn spawn_dial(
     let dial = MeshDial {
         our_id: config.our_id,
         peer_id,
-        peer_addr: target.addr,
+        peer_addrs: target.addrs.clone(),
         server_name: config.server_name.clone(),
         roots: dial_roots(peer_id, &target.cert_der, &config.roots),
     };

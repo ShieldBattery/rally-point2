@@ -274,7 +274,7 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     let dial = mesh_edge::MeshDial {
         our_id: RelayId(1),
         peer_id: RelayId(2),
-        peer_addr: relay_b.addr,
+        peer_addrs: vec![relay_b.addr],
         server_name: "localhost".to_owned(),
         roots,
     };
@@ -376,7 +376,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     let dial = mesh_edge::MeshDial {
         our_id: RelayId(1),
         peer_id: RelayId(2),
-        peer_addr: relay_b.addr,
+        peer_addrs: vec![relay_b.addr],
         server_name: "localhost".to_owned(),
         roots,
     };
@@ -411,6 +411,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
             relay_id: RelayId(2),
             relay_addr: relay_b.addr,
             cert_der: relay_b.ca.to_vec(),
+            relay_addrs: vec![],
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
@@ -428,6 +429,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
             relay_id: RelayId(1),
             relay_addr: relay_a.addr,
             cert_der: relay_a.ca.to_vec(),
+            relay_addrs: vec![],
         }],
         bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![],
@@ -513,7 +515,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         mesh_edge::MeshDial {
             our_id: RelayId(1),
             peer_id: RelayId(2),
-            peer_addr: relay_b.addr,
+            peer_addrs: vec![relay_b.addr],
             server_name: "localhost".to_owned(),
             roots,
         },
@@ -551,11 +553,13 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         relay_id: RelayId(2),
         relay_addr: relay_b.addr,
         cert_der: relay_b.ca.to_vec(),
+        relay_addrs: vec![],
     }]));
     control_b.apply_descriptor(&descriptor_for(vec![RelayPeer {
         relay_id: RelayId(1),
         relay_addr: relay_a.addr,
         cert_der: relay_a.ca.to_vec(),
+        relay_addrs: vec![],
     }]));
 
     // A player on each relay. A's client is the one whose departure hands off.
@@ -641,7 +645,7 @@ async fn equal_relay_ids_do_not_dial() -> Result<(), AnyError> {
     let dial = mesh_edge::MeshDial {
         our_id: RelayId(1),
         peer_id: RelayId(1),
-        peer_addr: relay_b.addr,
+        peer_addrs: vec![relay_b.addr],
         server_name: "localhost".to_owned(),
         roots,
     };
@@ -676,7 +680,7 @@ async fn higher_id_relay_does_not_dial_lower_id_peer() -> Result<(), AnyError> {
     let dial = mesh_edge::MeshDial {
         our_id: RelayId(2),
         peer_id: RelayId(1),
-        peer_addr: relay_b.addr,
+        peer_addrs: vec![relay_b.addr],
         server_name: "localhost".to_owned(),
         roots,
     };
@@ -719,7 +723,7 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
     let dial = mesh_edge::MeshDial {
         our_id: RelayId(1),
         peer_id: RelayId(2),
-        peer_addr: relay_b.addr,
+        peer_addrs: vec![relay_b.addr],
         server_name: "localhost".to_owned(),
         roots,
     };
@@ -814,6 +818,7 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
         relay_id: RelayId(2),
         relay_addr: relay_b.addr,
         cert_der: relay_b.ca.to_vec(),
+        relay_addrs: vec![],
     }])?;
     let (peer1, cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
         .await
@@ -870,6 +875,7 @@ fn peer_at(id: u64, addr: SocketAddr) -> RelayPeer {
         relay_id: RelayId(id),
         relay_addr: addr,
         cert_der: Vec::new(),
+        relay_addrs: Vec::new(),
     }
 }
 
@@ -1159,5 +1165,61 @@ async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close(
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// A dual-stack peer's dial walks the candidate list: the first advertised
+/// address is unusable (rejected at connect — port 0), and the link still
+/// establishes on the second candidate within the same attempt, no redial
+/// delay spent.
+#[tokio::test]
+async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let relay_a = Relay::start(&tenant, 1);
+    let relay_b = Relay::start(&tenant, 2);
+
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
+    tokio::spawn(mesh_edge::run_mesh_accept(
+        relay_b.mesh_accept_rx,
+        Arc::clone(&relay_b.sessions),
+        relay_b.mesh.clone(),
+        links_b_tx,
+    ));
+
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let unreachable: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let dial = mesh_edge::MeshDial {
+        our_id: RelayId(1),
+        peer_id: RelayId(2),
+        // The peer advertises an unusable candidate first; the walk must fall
+        // through to the reachable one.
+        peer_addrs: vec![unreachable, relay_b.addr],
+        server_name: "localhost".to_owned(),
+        roots,
+    };
+    tokio::spawn(mesh_edge::run_mesh_dial(
+        dial,
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+    ));
+
+    // The link establishes on the second candidate — well within one attempt
+    // (the 2s bound is far under the supervisor's redial delay would allow for
+    // a second attempt to even begin mattering here).
+    let (peer_a, _cmds_a) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "the dial did not fall back to the reachable candidate")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer_a, RelayId(2));
+    let (peer_b, _cmds_b) = tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
+        .await
+        .map_err(|_| "the acceptor did not surface the link")?
+        .ok_or("B's links channel closed")?;
+    assert_eq!(peer_b, RelayId(1));
+
+    drop(relay_a);
     Ok(())
 }

@@ -128,12 +128,17 @@ struct Cli {
     #[arg(long, env = "RELAY_COORDINATOR_SECRET")]
     coordinator_secret: Option<String>,
 
-    /// Public address clients and peer relays reach this relay at — sent to the
-    /// coordinator in the enroll `Hello`. Defaults to `--listen` when that is a
-    /// concrete address, else loopback on the listen port (dev/loopback).
-    /// Production sets this explicitly (later, derived from the cloud substrate).
-    #[arg(long, env = "RELAY_ADVERTISE_ADDR")]
-    advertise_addr: Option<SocketAddr>,
+    /// Public address(es) clients and peer relays reach this relay at — sent to
+    /// the coordinator in the enroll `Hello`. Repeatable (or comma-separated in
+    /// the env var) for a dual-stack relay: one flag per family, the first is the
+    /// primary and the order is the advertised preference. Defaults to `--listen`
+    /// when that is a concrete address, else loopback on the listen port
+    /// (dev/loopback) — a single-address advertise. Always explicit: the
+    /// coordinator never infers these from the control connection's source IP
+    /// (the relay reaches it over one family but must advertise both); deriving
+    /// them from the cloud substrate (ECS metadata) is a follow-up.
+    #[arg(long, env = "RELAY_ADVERTISE_ADDR", value_delimiter = ',')]
+    advertise_addr: Vec<SocketAddr>,
 
     /// How long the coordinated-drain shutdown path waits for in-flight sessions to
     /// finish before exiting and abandoning any that remain to coordinator-mediated
@@ -307,7 +312,8 @@ async fn main() -> Result<()> {
                 let dial = mesh_edge::MeshDial {
                     our_id: RelayId(our_id),
                     peer_id: peer.id,
-                    peer_addr: peer.addr,
+                    // The static dev/loopback path is single-address by nature.
+                    peer_addrs: vec![peer.addr],
                     server_name: cli.mesh_server_name.clone(),
                     roots: mesh_roots.clone(),
                 };
@@ -360,19 +366,23 @@ async fn main() -> Result<()> {
                 mesh_control.desired_peers(),
             ));
 
-            let advertise_addr = config::resolve_advertise_addr(cli.advertise_addr, cli.listen);
+            let (advertise_addr, advertise_addrs) =
+                config::resolve_advertise_addrs(&cli.advertise_addr, cli.listen);
             // The hello carries our client-edge leaf cert so the coordinator
             // can hand it to clients in session responses — they pin exactly
-            // this cert to connect — and the full `[MIN_SUPPORTED, CURRENT]`
+            // this cert to connect — the full `[MIN_SUPPORTED, CURRENT]`
             // protocol window, so a newer relay downgrades to an older
-            // coordinator's version instead of being refused.
+            // coordinator's version instead of being refused, and the complete
+            // advertised address set (empty for a single-address relay), so a
+            // dual-stack relay's consumers can pick a family.
             let relay_hello = RelayHello::new(
                 RelayId(our_id),
                 advertise_addr,
                 ProtocolVersion::CURRENT,
                 ca.as_ref().to_vec(),
             )
-            .with_min_protocol(ProtocolVersion::MIN_SUPPORTED);
+            .with_min_protocol(ProtocolVersion::MIN_SUPPORTED)
+            .with_relay_addrs(advertise_addrs);
             tracing::info!(
                 relay_id = our_id,
                 advertise = %advertise_addr,

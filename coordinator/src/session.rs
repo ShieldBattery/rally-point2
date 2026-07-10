@@ -1017,6 +1017,7 @@ mod tests {
                     relay_id: RelayId(2),
                     relay_addr: resp.slot_homes[0].relay.relay_addr,
                     cert_der: fake_cert(2),
+                    relay_addrs: vec![],
                 },
             }],
             "only the split slot homes on the secondary relay, with its pinned cert",
@@ -2067,6 +2068,78 @@ mod tests {
             recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
             "the close cleared the recorded rehome",
         );
+    }
+
+    // --- Dual-stack advertise ---
+
+    #[test]
+    fn a_dual_stack_enrollment_flows_through_response_descriptor_and_rehome() {
+        // Two dual-stack relays enroll with complete v4+v6 sets. The set must
+        // survive every consumer-facing path unchanged — session response,
+        // descriptor peers, and a rehome's NewTarget — with the primary intact.
+        let v4_1: SocketAddr = "203.0.113.1:14900".parse().unwrap();
+        let v6_1: SocketAddr = "[2001:db8::1]:14900".parse().unwrap();
+        let v4_2: SocketAddr = "203.0.113.2:14900".parse().unwrap();
+        let v6_2: SocketAddr = "[2001:db8::2]:14900".parse().unwrap();
+
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(RelayId(1), v4_1, ProtocolVersion::CURRENT, fake_cert(1))
+                .with_relay_addrs(vec![v4_1, v6_1]),
+        );
+        registry::enroll(
+            &reg,
+            RelayHello::new(RelayId(2), v4_2, ProtocolVersion::CURRENT, fake_cert(2))
+                .with_relay_addrs(vec![v4_2, v6_2]),
+        );
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+
+        // A cross-relay session so both relays serve (and each descriptor names
+        // the other as a peer).
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        // The session response's endpoints carry the set, primary unchanged.
+        assert_eq!(resp.home_relay.relay_addr, v4_1);
+        assert_eq!(resp.home_relay.relay_addrs, vec![v4_1, v6_1]);
+        assert_eq!(resp.home_relay.addr_for_family(true), Some(v6_1));
+        assert_eq!(resp.slot_homes[0].relay.relay_addrs, vec![v4_2, v6_2]);
+
+        // The descriptor's peer carries the other relay's full set.
+        let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
+        assert_eq!(desc.peers[0].relay_id, RelayId(2));
+        assert_eq!(desc.peers[0].relay_addr, v4_2);
+        assert_eq!(desc.peers[0].relay_addrs, vec![v4_2, v6_2]);
+        assert_eq!(desc.peers[0].addrs(), vec![v4_2, v6_2]);
+
+        // The home relay dies; the rehome's NewTarget carries the survivor's set.
+        registry::remove(setup.registry(), RelayId(1));
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(2));
+        assert_eq!(endpoint.relay_addr, v4_2);
+        assert_eq!(endpoint.relay_addrs, vec![v4_2, v6_2]);
     }
 
     // --- Coordinated drain: assignment eligibility + the linearization ---

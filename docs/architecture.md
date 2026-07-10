@@ -52,9 +52,10 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 >   replacement with its existing token + resume cursors, and re-injects a retained ring of its own sent turns
 >   so the new relay's empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
 >
-> Still designed but not built: **dual-stack advertise addresses**, **per-relay identity binding** on the
-> control connection, production mesh **mTLS / an internal CA**, and coordinator **HA / persistence** (a
-> restart still forgets the registry, tenant keys, and session accounting).
+> Still designed but not built: **per-relay identity binding** on the control connection, production mesh
+> **mTLS / an internal CA**, coordinator **HA / persistence** (a restart still forgets the registry,
+> tenant keys, and session accounting), and **ECS-metadata address discovery** (dual-stack advertise is
+> built — explicit flags carry the address set; deriving it from the cloud substrate is what remains).
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -542,15 +543,23 @@ descriptors** down it (driving mesh `Join`/`Leave`), and the relay reports **liv
 same connection (a periodic heartbeat). One channel, authenticated once at the handshake, in both
 directions.
 
-**Enroll over the connection.** A relay's *first* frame is its `Hello` — its id and the address clients
+**Enroll over the connection.** A relay's *first* frame is its `Hello` — its id and the addresses clients
 and peer relays reach it at — which enrolls it into the coordinator's registry. So a relay registers
 *and* receives its topology over one authenticated connection, not a phone-home POST plus a separate
-socket; the registry membership and the descriptor stream share a lifecycle and a credential. The relay
-**asserts** its address (it isn't observed from the connection's source, since a relay serves both IPv4
-and IPv6 but reaches the coordinator over only one of them): a `--advertise-addr` flag, defaulting to the
-listen address, with cloud-substrate auto-discovery later. One near-term simplification remains: enroll
-carries a **single** address — the dual-stack model (a v4 *and* a v6 endpoint, with per-family selection
-at the consumers) is a follow-up reshape of the relay-address contract.
+socket; the registry membership and the descriptor stream share a lifecycle and a credential. The
+address contract is **dual-stack**: `relay_addr` stays the primary/back-compat address (the cross-repo
+contract existing consumers keep working against), and an additive `relay_addrs` carries the relay's
+**complete** advertised set in its own preference order — non-empty means the whole set including the
+primary, empty means a single-address relay, and a single-address hello stays byte-identical to the
+pre-dual-stack form. Advertised **order is the relay's preference**: a consumer that knows its
+connectivity picks a family (`addr_for_family`), one that doesn't walks the candidates in order — the
+mesh dialer does exactly that, walking a peer's candidates each attempt until one connects, while a
+*game client's* family choice belongs to the embedder (ShieldBattery picks per client when its infra
+work lands). The relay **asserts** its addresses via repeatable explicit `--advertise-addr` flags (one
+per family, first is primary; defaulting to the listen address as a single-address advertise) — they
+are deliberately *never* observed from the control connection's source IP, since a relay reaches the
+coordinator over one family but must advertise both; deriving them from the cloud substrate (ECS
+metadata) is still future work.
 
 **Version negotiation at the Hello.** The relay and coordinator deploy independently, so the `Hello`
 also carries the relay's protocol **window** — `protocol` (the newest version it implements) plus an

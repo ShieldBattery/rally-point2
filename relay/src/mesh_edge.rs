@@ -143,8 +143,11 @@ pub struct MeshDial {
     pub our_id: RelayId,
     /// The peer relay's id.
     pub peer_id: RelayId,
-    /// The peer relay's listen endpoint.
-    pub peer_addr: SocketAddr,
+    /// The peer relay's candidate endpoints, in the peer's advertised
+    /// preference order — each dial attempt walks them until one connects. A
+    /// single-address peer (the static `--mesh-peer` path, or a descriptor
+    /// carrying no set) is just a one-element list.
+    pub peer_addrs: Vec<SocketAddr>,
     /// The TLS SNI / verified hostname for the peer's certificate (for
     /// self-signed dev certs this is `localhost`; for production it is the
     /// hostname on the relay's cert).
@@ -350,7 +353,7 @@ pub async fn run_mesh_dial_with(
     let MeshDial {
         our_id,
         peer_id,
-        peer_addr,
+        peer_addrs,
         server_name,
         roots,
     } = dial;
@@ -393,7 +396,7 @@ pub async fn run_mesh_dial_with(
     let target = DialTarget {
         our_id,
         peer_id,
-        peer_addr,
+        peer_addrs,
         server_name,
     };
 
@@ -443,7 +446,7 @@ fn log_dial_retry(
 struct DialTarget {
     our_id: RelayId,
     peer_id: RelayId,
-    peer_addr: SocketAddr,
+    peer_addrs: Vec<SocketAddr>,
     server_name: String,
 }
 
@@ -477,30 +480,56 @@ async fn dial_and_serve(
     let DialTarget {
         our_id,
         peer_id,
-        peer_addr,
+        peer_addrs,
         server_name,
     } = target;
 
-    tracing::info!(
-        our_id = our_id.0,
-        peer_id = peer_id.0,
-        %peer_addr,
-        server_name,
-        "dialing mesh peer",
-    );
-    let connecting = match endpoint.connect(*peer_addr, server_name) {
-        Ok(c) => c,
-        Err(error) => {
-            tracing::info!(%error, peer_id = peer_id.0, "starting mesh dial connect failed; will retry");
-            return DialOutcome::Retry;
+    // Walk the peer's candidate addresses in its advertised order until one
+    // connects — the dual-stack fallback. Sequential on purpose: mesh
+    // establishment is not latency-critical (a running game rides
+    // already-established links), so a plain fallback loop beats
+    // happy-eyeballs machinery here. All candidates failing is one failed
+    // attempt: the supervisor redials after its delay and walks again.
+    let mut connection = None;
+    for peer_addr in peer_addrs {
+        tracing::info!(
+            our_id = our_id.0,
+            peer_id = peer_id.0,
+            %peer_addr,
+            server_name,
+            "dialing mesh peer",
+        );
+        let connecting = match endpoint.connect(*peer_addr, server_name) {
+            Ok(c) => c,
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    peer_id = peer_id.0,
+                    %peer_addr,
+                    "mesh dial candidate rejected; trying the next",
+                );
+                continue;
+            }
+        };
+        match connecting.await {
+            Ok(conn) => {
+                connection = Some(conn);
+                break;
+            }
+            Err(error) => tracing::info!(
+                %error,
+                peer_id = peer_id.0,
+                %peer_addr,
+                "mesh dial candidate failed; trying the next",
+            ),
         }
-    };
-    let connection = match connecting.await {
-        Ok(conn) => conn,
-        Err(error) => {
-            tracing::info!(%error, peer_id = peer_id.0, "mesh dial to peer failed; will retry");
-            return DialOutcome::Retry;
-        }
+    }
+    let Some(connection) = connection else {
+        tracing::info!(
+            peer_id = peer_id.0,
+            "every mesh dial candidate failed; will retry",
+        );
+        return DialOutcome::Retry;
     };
 
     tracing::info!(

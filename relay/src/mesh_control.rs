@@ -119,8 +119,11 @@ struct Inner {
 /// One peer's dial ingredients as the latest descriptor reported them: where to
 /// reach it and the certificate to pin (empty when the coordinator predates
 /// carrying certs — the dialer then falls back to its configured mesh roots).
+/// `addrs` is the peer's complete advertised set (empty for a single-address
+/// peer), carried through so the dialer can walk every candidate.
 struct PeerContact {
     addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
     cert_der: Vec<u8>,
 }
 
@@ -329,6 +332,7 @@ impl MeshControl {
                     peer.relay_id,
                     PeerContact {
                         addr: peer.relay_addr,
+                        addrs: peer.relay_addrs.clone(),
                         cert_der: peer.cert_der.clone(),
                     },
                 );
@@ -402,6 +406,7 @@ fn publish_desired_peers(inner: &mut Inner) {
                 relay_id: *id,
                 relay_addr: contact.addr,
                 cert_der: contact.cert_der.clone(),
+                relay_addrs: contact.addrs.clone(),
             })
         })
         .collect();
@@ -506,6 +511,7 @@ mod tests {
             relay_id: RelayId(id),
             relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900 + id as u16)),
             cert_der: vec![id as u8; 4],
+            relay_addrs: vec![],
         }
     }
 

@@ -114,12 +114,24 @@ pub struct RelayHello {
     /// [`protocol`](Self::protocol), which is exactly how such a relay behaves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_protocol: Option<ProtocolVersion>,
+    /// The relay's **complete** advertised address set, in the relay's own
+    /// preference order — a dual-stack relay advertises both its v4 and v6
+    /// endpoints here. When non-empty it *includes*
+    /// [`relay_addr`](Self::relay_addr), which stays the primary/back-compat
+    /// address every existing consumer keeps working against; empty means a
+    /// single-address relay reachable only at `relay_addr` (and the field stays
+    /// off the wire, keeping the single-address hello byte-identical to the
+    /// pre-dual-stack form).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_addrs: Vec<SocketAddr>,
 }
 
 impl RelayHello {
     /// Constructs a relay phone-home message advertising the single version
     /// `protocol` (no `min_protocol` — a one-version negotiation window; widen it
-    /// with [`with_min_protocol`](Self::with_min_protocol)).
+    /// with [`with_min_protocol`](Self::with_min_protocol)) and the single
+    /// address `relay_addr` (widen to a dual-stack set with
+    /// [`with_relay_addrs`](Self::with_relay_addrs)).
     ///
     /// Provided because `RelayHello` is `#[non_exhaustive]`: future fields
     /// (e.g. capabilities, region) can be added without breaking external
@@ -136,6 +148,7 @@ impl RelayHello {
             protocol,
             cert_der,
             min_protocol: None,
+            relay_addrs: Vec::new(),
         }
     }
 
@@ -145,6 +158,13 @@ impl RelayHello {
     /// [`ProtocolVersion::MIN_SUPPORTED`].
     pub fn with_min_protocol(mut self, min: ProtocolVersion) -> Self {
         self.min_protocol = Some(min);
+        self
+    }
+
+    /// Sets the complete advertised address set (which must include the primary
+    /// `relay_addr`), in the relay's preference order — the dual-stack advertise.
+    pub fn with_relay_addrs(mut self, relay_addrs: Vec<SocketAddr>) -> Self {
+        self.relay_addrs = relay_addrs;
         self
     }
 }
@@ -161,7 +181,7 @@ impl RelayHello {
 pub struct RelayEntry {
     /// The relay's coordinator-assigned id.
     pub relay_id: RelayId,
-    /// Where clients and peer relays reach it.
+    /// Where clients and peer relays reach it — the primary/back-compat address.
     pub relay_addr: SocketAddr,
     /// Protocol version the relay reported at phone-home.
     pub protocol: ProtocolVersion,
@@ -169,6 +189,13 @@ pub struct RelayEntry {
     /// what clients pin to connect to it (carried in session responses).
     #[serde(with = "serde_bytes")]
     pub cert_der: Vec<u8>,
+    /// The relay's complete advertised address set, in its preference order,
+    /// as enrolled. Non-empty means the complete set (including `relay_addr`);
+    /// empty means a single-address relay reachable only at `relay_addr` —
+    /// the same semantics as [`RelayHello::relay_addrs`], carried through so
+    /// every endpoint/peer built from this entry advertises the full set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_addrs: Vec<SocketAddr>,
 }
 
 impl From<&RelayEntry> for RelayPeer {
@@ -177,6 +204,7 @@ impl From<&RelayEntry> for RelayPeer {
             relay_id: e.relay_id,
             relay_addr: e.relay_addr,
             cert_der: e.cert_der.clone(),
+            relay_addrs: e.relay_addrs.clone(),
         }
     }
 }
@@ -191,13 +219,39 @@ impl From<&RelayEntry> for RelayPeer {
 pub struct RelayEndpoint {
     /// The relay's coordinator-assigned id.
     pub relay_id: RelayId,
-    /// Where clients reach the relay.
+    /// Where clients reach the relay — the primary/back-compat address.
     pub relay_addr: SocketAddr,
     /// DER of the TLS leaf certificate the relay serves; clients pin exactly
     /// this cert, so self-signed relay certs work without out-of-band
     /// distribution.
     #[serde(with = "serde_bytes")]
     pub cert_der: Vec<u8>,
+    /// The relay's complete advertised address set, in the relay's preference
+    /// order (see [`RelayHello::relay_addrs`] for the non-empty-includes-primary
+    /// / empty-means-single-address contract). Which family a *game client*
+    /// dials is the embedder's choice — it knows the client's connectivity; the
+    /// app server picks per client when its infra work lands — via
+    /// [`addrs`](Self::addrs) / [`addr_for_family`](Self::addr_for_family).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_addrs: Vec<SocketAddr>,
+}
+
+impl RelayEndpoint {
+    /// The candidate connect addresses in advertised order — the relay's own
+    /// preference. The complete set when one was advertised, else just the
+    /// primary. A consumer that knows its connectivity picks a family
+    /// ([`addr_for_family`](Self::addr_for_family)); one that doesn't walks
+    /// this list in order.
+    pub fn addrs(&self) -> Vec<SocketAddr> {
+        candidate_addrs(self.relay_addr, &self.relay_addrs)
+    }
+
+    /// The first advertised address of the given family, or `None` when the
+    /// relay advertises none — the caller then falls back to walking
+    /// [`addrs`](Self::addrs).
+    pub fn addr_for_family(&self, is_ipv6: bool) -> Option<SocketAddr> {
+        addr_for_family(self.relay_addr, &self.relay_addrs, is_ipv6)
+    }
 }
 
 impl From<&RelayEntry> for RelayEndpoint {
@@ -206,6 +260,7 @@ impl From<&RelayEntry> for RelayEndpoint {
             relay_id: e.relay_id,
             relay_addr: e.relay_addr,
             cert_der: e.cert_der.clone(),
+            relay_addrs: e.relay_addrs.clone(),
         }
     }
 }
@@ -223,7 +278,7 @@ impl From<&RelayEntry> for RelayEndpoint {
 pub struct RelayPeer {
     /// The peer relay's coordinator-assigned id.
     pub relay_id: RelayId,
-    /// Where the peer relay is reached.
+    /// Where the peer relay is reached — the primary/back-compat address.
     pub relay_addr: SocketAddr,
     /// DER of the TLS leaf certificate the peer relay reported at enrollment —
     /// the same cert clients pin from a session response. The dialing relay
@@ -234,6 +289,52 @@ pub struct RelayPeer {
     /// field; the dialer then falls back to its configured mesh roots.
     #[serde(default, with = "serde_bytes")]
     pub cert_der: Vec<u8>,
+    /// The peer relay's complete advertised address set, in its preference
+    /// order (see [`RelayHello::relay_addrs`] for the non-empty-includes-primary
+    /// / empty-means-single-address contract). The mesh dialer walks
+    /// [`addrs`](Self::addrs) in order until a candidate connects, so a
+    /// dual-stack pair meshes over whichever family reaches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_addrs: Vec<SocketAddr>,
+}
+
+impl RelayPeer {
+    /// The candidate dial addresses in advertised order — the peer relay's own
+    /// preference. See [`RelayEndpoint::addrs`]; the same selection contract.
+    pub fn addrs(&self) -> Vec<SocketAddr> {
+        candidate_addrs(self.relay_addr, &self.relay_addrs)
+    }
+
+    /// The first advertised address of the given family, or `None`. See
+    /// [`RelayEndpoint::addr_for_family`].
+    pub fn addr_for_family(&self, is_ipv6: bool) -> Option<SocketAddr> {
+        addr_for_family(self.relay_addr, &self.relay_addrs, is_ipv6)
+    }
+}
+
+/// The shared selection contract behind [`RelayEndpoint::addrs`] and
+/// [`RelayPeer::addrs`]: the advertised set when one exists (its order is the
+/// relay's preference), else the single primary address.
+fn candidate_addrs(relay_addr: SocketAddr, relay_addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    if relay_addrs.is_empty() {
+        vec![relay_addr]
+    } else {
+        relay_addrs.to_vec()
+    }
+}
+
+/// The first candidate of the requested family, in advertised order — the
+/// pick for a consumer that knows its own connectivity. `None` when the relay
+/// advertises no address of that family (the caller falls back to walking the
+/// candidates).
+fn addr_for_family(
+    relay_addr: SocketAddr,
+    relay_addrs: &[SocketAddr],
+    is_ipv6: bool,
+) -> Option<SocketAddr> {
+    candidate_addrs(relay_addr, relay_addrs)
+        .into_iter()
+        .find(|addr| addr.is_ipv6() == is_ipv6)
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1114,7 @@ mod tests {
             protocol: ProtocolVersion::CURRENT,
             cert_der: vec![0x30, 0x82, 0xAA, 0xBB],
             min_protocol: None,
+            relay_addrs: vec![],
         };
         let json = serde_json::to_string(&hello).unwrap();
         // An unset window bottom stays off the wire (a one-version window).
@@ -1054,6 +1156,79 @@ mod tests {
     }
 
     #[test]
+    fn relay_hello_with_a_dual_stack_set_roundtrips_json() {
+        let v4: SocketAddr = "203.0.113.7:14900".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::7]:14900".parse().unwrap();
+        let hello = RelayHello::new(RelayId(7), v4, ProtocolVersion::CURRENT, vec![0xAA; 4])
+            .with_relay_addrs(vec![v4, v6]);
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"relay_addrs\""));
+        let back: RelayHello = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hello);
+        assert_eq!(back.relay_addr, v4, "the primary is unchanged");
+        assert_eq!(
+            back.relay_addrs,
+            vec![v4, v6],
+            "the complete set rides along"
+        );
+    }
+
+    #[test]
+    fn a_single_address_hello_keeps_the_field_off_the_wire_and_absent_decodes_empty() {
+        // Back-compat both directions: this build's single-address hello stays
+        // byte-stable (no `relay_addrs` key for an old consumer to trip on)...
+        let hello = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        );
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(!json.contains("relay_addrs"));
+
+        // ...and an old relay's hello (no field at all) decodes with an empty
+        // set, which every consumer reads as "single address at relay_addr".
+        let old = r#"{
+            "relay_id":7,
+            "relay_addr":"127.0.0.1:14900",
+            "protocol":2,
+            "cert_der":[1,2,3]
+        }"#;
+        let back: RelayHello = serde_json::from_str(old).unwrap();
+        assert!(back.relay_addrs.is_empty());
+    }
+
+    #[test]
+    fn addr_selection_walks_the_advertised_order_and_falls_back_to_the_primary() {
+        let v4: SocketAddr = "203.0.113.7:14900".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::7]:14900".parse().unwrap();
+
+        // A dual-stack endpoint: the candidates are the set, in advertised order
+        // (the relay's preference), and family selection picks within it.
+        let dual = RelayEndpoint {
+            relay_id: RelayId(1),
+            relay_addr: v4,
+            cert_der: vec![],
+            relay_addrs: vec![v6, v4], // the relay prefers v6
+        };
+        assert_eq!(dual.addrs(), vec![v6, v4], "advertised order is preserved");
+        assert_eq!(dual.addr_for_family(true), Some(v6));
+        assert_eq!(dual.addr_for_family(false), Some(v4));
+
+        // A single-address peer: the candidates collapse to the primary, and a
+        // family it doesn't serve yields None (the caller walks the candidates).
+        let single = RelayPeer {
+            relay_id: RelayId(2),
+            relay_addr: v4,
+            cert_der: vec![],
+            relay_addrs: vec![],
+        };
+        assert_eq!(single.addrs(), vec![v4]);
+        assert_eq!(single.addr_for_family(false), Some(v4));
+        assert_eq!(single.addr_for_family(true), None);
+    }
+
+    #[test]
     fn coordinator_to_relay_descriptors_roundtrips_json() {
         let message = CoordinatorToRelay::Descriptors {
             descriptors: vec![SessionDescriptor {
@@ -1063,6 +1238,7 @@ mod tests {
                     relay_id: RelayId(2),
                     relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
                     cert_der: vec![0x30, 0x82, 0xCC, 0xDD],
+                    relay_addrs: vec![],
                 }],
                 bounds: BufferBounds::new(1, 6).unwrap(),
                 authority_order: vec![RelayId(1), RelayId(2)],
@@ -1268,6 +1444,7 @@ mod tests {
                 relay_id: RelayId(2),
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
                 cert_der: vec![0x30, 0x82, 0xCC, 0xDD],
+                relay_addrs: vec![],
             }],
             bounds: BufferBounds::new(1, 6).unwrap(),
             authority_order: vec![RelayId(1), RelayId(2)],
@@ -1422,6 +1599,7 @@ mod tests {
                 relay_id: RelayId(1),
                 relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
                 cert_der: vec![0x30, 0x82, 0x01, 0x02],
+                relay_addrs: vec![],
             },
             slot_homes: vec![SlotHome {
                 slot: SlotId(1),
@@ -1429,6 +1607,7 @@ mod tests {
                     relay_id: RelayId(2),
                     relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
                     cert_der: vec![0x30, 0x82, 0x03, 0x04],
+                    relay_addrs: vec![],
                 },
             }],
             tokens: vec![PlayerToken {

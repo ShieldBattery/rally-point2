@@ -172,23 +172,35 @@ pub fn server_config_from_self_signed(
         .map_err(|e| color_eyre::eyre::eyre!("building QUIC server config: {e}"))
 }
 
-/// Resolves the address a relay advertises to the coordinator — where clients
+/// Resolves the addresses a relay advertises to the coordinator — where clients
 /// and peer relays reach it, carried in the relay's enroll `Hello` — from the
-/// optional `--advertise-addr` override and the `--listen` address.
+/// repeatable `--advertise-addr` flags and the `--listen` address. Returns
+/// `(primary, complete_set)` matching the hello's `relay_addr`/`relay_addrs`
+/// contract: the first flag is the primary and its order is the advertised
+/// preference; the set is empty (kept off the wire) for a single-address
+/// advertise, and includes the primary whenever it is non-empty.
 ///
-/// An explicit override always wins. Otherwise the listen address is used when it
+/// Explicit flags always win. With none, the listen address is used when it
 /// names a concrete IP; when listen is the unspecified address (`[::]` /
 /// `0.0.0.0` — the default, and not a routable destination) it falls back to
-/// loopback on the listen port, a working dev/loopback default. Production sets
-/// `--advertise-addr` explicitly (later, derived from the cloud substrate — see
-/// the dual-stack advertise follow-up).
-pub fn resolve_advertise_addr(advertise: Option<SocketAddr>, listen: SocketAddr) -> SocketAddr {
+/// loopback on the listen port, a working dev/loopback default — always a
+/// single-address advertise. Production sets the flags explicitly for each
+/// family it serves; deriving them from the cloud substrate (ECS metadata) is
+/// a follow-up. Deliberately *not* observed from the control connection's
+/// source IP: the relay reaches the coordinator over one family but must
+/// advertise both.
+pub fn resolve_advertise_addrs(
+    advertise: &[SocketAddr],
+    listen: SocketAddr,
+) -> (SocketAddr, Vec<SocketAddr>) {
     match advertise {
-        Some(addr) => addr,
-        None if listen.ip().is_unspecified() => {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port())
-        }
-        None => listen,
+        [] if listen.ip().is_unspecified() => (
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port()),
+            Vec::new(),
+        ),
+        [] => (listen, Vec::new()),
+        [single] => (*single, Vec::new()),
+        [primary, ..] => (*primary, advertise.to_vec()),
     }
 }
 
@@ -321,29 +333,48 @@ mod tests {
         let _ = std::fs::remove_file(&key_path);
     }
 
-    // --- resolve_advertise_addr ---
+    // --- resolve_advertise_addrs ---
 
     #[test]
-    fn resolve_advertise_addr_prefers_the_explicit_override() {
+    fn resolve_advertise_addrs_prefers_a_single_explicit_override() {
+        // One flag: it is the primary and the set stays empty (a single-address
+        // advertise keeps the wire form byte-stable).
         let advertise: SocketAddr = "203.0.113.7:14900".parse().unwrap();
         let listen: SocketAddr = "0.0.0.0:14900".parse().unwrap();
-        assert_eq!(resolve_advertise_addr(Some(advertise), listen), advertise);
+        assert_eq!(
+            resolve_advertise_addrs(&[advertise], listen),
+            (advertise, vec![]),
+        );
     }
 
     #[test]
-    fn resolve_advertise_addr_uses_a_concrete_listen_address() {
+    fn resolve_advertise_addrs_dual_stack_keeps_the_first_flag_primary() {
+        // Two flags (a v4 + a v6): the first is the primary, and the complete
+        // set — including the primary, in flag order (the relay's preference) —
+        // rides alongside.
+        let v4: SocketAddr = "203.0.113.7:14900".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::7]:14900".parse().unwrap();
+        let listen: SocketAddr = "[::]:14900".parse().unwrap();
+        assert_eq!(
+            resolve_advertise_addrs(&[v4, v6], listen),
+            (v4, vec![v4, v6]),
+        );
+    }
+
+    #[test]
+    fn resolve_advertise_addrs_uses_a_concrete_listen_address() {
         let listen: SocketAddr = "192.0.2.10:14900".parse().unwrap();
-        assert_eq!(resolve_advertise_addr(None, listen), listen);
+        assert_eq!(resolve_advertise_addrs(&[], listen), (listen, vec![]));
     }
 
     #[test]
-    fn resolve_advertise_addr_falls_back_to_loopback_for_an_unspecified_listen() {
+    fn resolve_advertise_addrs_falls_back_to_loopback_for_an_unspecified_listen() {
         // The default `[::]` listen is not a routable address to hand a client, so
         // with no override the relay advertises loopback on the same port (dev).
         let listen: SocketAddr = "[::]:14900".parse().unwrap();
         assert_eq!(
-            resolve_advertise_addr(None, listen),
-            "127.0.0.1:14900".parse().unwrap()
+            resolve_advertise_addrs(&[], listen),
+            ("127.0.0.1:14900".parse().unwrap(), vec![]),
         );
     }
 
