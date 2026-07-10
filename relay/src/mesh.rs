@@ -847,6 +847,9 @@ fn deliver_turn_to_locals(
     mut payload: Payload,
 ) -> Option<Payload> {
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
+        // Only the duplicate (mesh-echo) branch touches the recorder's maps —
+        // the fresh-turn common path stays lock-free for the recorder.
+        decision_makers.flight_recorder().note_dedup_drop(key, slot);
         return None;
     }
     // The desync comparator's one and only feed point. Every turn-delivery

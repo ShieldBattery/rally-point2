@@ -711,6 +711,21 @@ pub async fn run_slot_link(
     // pulls `mesh` apart, so every exit path can hand the whole bundle to
     // `end_slot_link` without ballooning that function's argument count.
     let mesh_for_teardown = mesh.clone();
+    // The flight recorder's per-slot counter handle, fetched ONCE here so the
+    // per-turn arms below bump plain atomics — no lock, no map lookup on the
+    // hot path. The connect event marks a resumed dial (any presented resume
+    // cursors: a reconnect or a re-home re-dial) apart from a fresh one.
+    let flight_counters = mesh
+        .decision_makers
+        .flight_recorder()
+        .slot_counters(&key, slot);
+    mesh.decision_makers.flight_recorder().record(
+        &key,
+        crate::flight_recorder::FlightEvent::SlotConnected {
+            slot: slot.0,
+            resumed: !resume_cursors.is_empty(),
+        },
+    );
     let crate::mesh::MeshState {
         links: mesh_links,
         seen: seen_registries,
@@ -940,6 +955,7 @@ pub async fn run_slot_link(
                     ) {
                         Ok(turn) => {
                             let payload = turn.payload;
+                            flight_counters.note_validated(payload.seq);
                             // Only a *validated* turn's frame feeds the consensus
                             // coordinate — a rejected packet must not leave a
                             // trace in decision state. (And the coordinate is the
@@ -1163,6 +1179,9 @@ pub async fn run_slot_link(
             forwarded = forward_rx.recv() => {
                 match forwarded {
                     Some(payload) => {
+                        // Counts every turn delivered to this client, datagram
+                        // and control-stream divert alike.
+                        flight_counters.note_forwarded();
                         let fits = match link.payload_fits(&payload) {
                             Ok(fits) => fits,
                             Err(error) => {
@@ -1171,6 +1190,7 @@ pub async fn run_slot_link(
                             }
                         };
                         if !fits {
+                            flight_counters.note_oversize_divert();
                             // Too large for any datagram on this client's path:
                             // divert to the reliable control stream, whose QUIC
                             // reliability replaces redundancy for this turn. A
@@ -1562,6 +1582,10 @@ fn end_slot_link(
     slot: SlotId,
     leave_announced: bool,
 ) {
+    mesh.decision_makers.flight_recorder().record(
+        key,
+        crate::flight_recorder::FlightEvent::SlotDisconnected { slot: slot.0 },
+    );
     // Drop this member's lobby-push channel before the roster deregister below.
     // The roster refuses a duplicate slot, so a reconnecting slot cannot register
     // (and re-register its lobby member) until this deregister frees the roster
@@ -1746,6 +1770,10 @@ pub(crate) fn hold_or_decide_leave(
         // Mark the drop as undecided and stop. Nothing here removes the slot — only
         // an honored manual request ever does.
         drop_holds.hold(key.clone(), slot);
+        decision_makers.flight_recorder().record(
+            key,
+            crate::flight_recorder::FlightEvent::DropHeld { slot: slot.0 },
+        );
     } else {
         // A clean leave supersedes any pending drop hold for this slot, then
         // decides immediately.
@@ -1822,6 +1850,13 @@ fn handle_drop_request(
         );
         return;
     }
+    decision_makers.flight_recorder().record(
+        key,
+        crate::flight_recorder::FlightEvent::DropRequested {
+            requester: requester.0,
+            target: target.0,
+        },
+    );
     // Honor it here (this relay may be the authority) and broadcast to every peer
     // so a peer-homed authority honors it too. The broadcast carries the
     // relay-stamped requester for logging/attribution.
@@ -2161,6 +2196,48 @@ mod tests {
             roster[0].1,
             vec![SlotId(0), SlotId(2)],
             "the group's connected slots, in sorted order",
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_teardown_records_flight_events_and_the_close_flushes() {
+        // The real teardown flow, through `end_slot_link`: a dropped link records
+        // its disconnect and the drop hold; the session-emptying teardown records
+        // the close and flushes the recording (a logged discard — no sink here).
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        let k = key();
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        g0.disarm();
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        g1.disarm();
+        let flight = mesh.decision_makers.flight_recorder().clone();
+
+        // Slot 1's link dies without a clean leave; slot 0 remains, so the
+        // session stays open and the recording keeps accumulating.
+        end_slot_link(&sessions, &mesh, &k, SlotId(1), false);
+        let events: Vec<_> = flight.events(&k).into_iter().map(|r| r.event).collect();
+        assert!(
+            events.contains(&crate::flight_recorder::FlightEvent::SlotDisconnected { slot: 1 }),
+            "the dropped link's disconnect is recorded: {events:?}",
+        );
+        assert!(
+            events.contains(&crate::flight_recorder::FlightEvent::DropHeld { slot: 1 }),
+            "the held drop decision is recorded: {events:?}",
+        );
+
+        // The last slot leaves: the close event seals the recording and the
+        // detached flush retires it (discarded — no sink configured).
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), false);
+        for _ in 0..100 {
+            if flight.recorded_sessions().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            flight.recorded_sessions().is_empty(),
+            "the session-emptying teardown flushed the recording",
         );
     }
 

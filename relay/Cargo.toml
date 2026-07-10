@@ -38,3 +38,5 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 # JSON codec for the control-connection messages.
 serde_json = { workspace = true }
+# Serialize/Deserialize derives for the flight recorder's blob envelope.
+serde = { workspace = true }

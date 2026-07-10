@@ -1330,6 +1330,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

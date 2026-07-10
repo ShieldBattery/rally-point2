@@ -3083,6 +3083,12 @@ pub struct DecisionMakers {
     /// a session simply carries no `external_id`/`external_ref`, and the
     /// coordinator falls back to its own store.
     refs: parking_lot::Mutex<HashMap<SessionKey, SessionExternalRefs>>,
+    /// The relay-wide flight recorder. Carried here — not as its own parameter
+    /// through every task — because this `Arc` already reaches every wiring
+    /// site: the slot-link tasks (via `MeshState`), the consensus decision
+    /// paths in this module, `MeshControl`, and the binary. Always present
+    /// (recording is cheap and bounded); the *sink* is what's optional.
+    flight: crate::flight_recorder::FlightRecorder,
 }
 
 impl DecisionMakers {
@@ -3091,6 +3097,12 @@ impl DecisionMakers {
     /// unchanged by the registry gaining the departure notifier.
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, MakerMap> {
         self.makers.lock()
+    }
+
+    /// The relay-wide flight recorder (see the field's doc for why it rides
+    /// this registry).
+    pub fn flight_recorder(&self) -> &crate::flight_recorder::FlightRecorder {
+        &self.flight
     }
 
     /// Installs the notice notifier — the sender half of the channel the
@@ -3178,6 +3190,7 @@ pub fn new_decision_makers() -> DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
         notices: OnceLock::new(),
         refs: parking_lot::Mutex::new(HashMap::new()),
+        flight: crate::flight_recorder::FlightRecorder::default(),
     }
 }
 
@@ -3351,6 +3364,7 @@ pub fn sync_maker(
         }
     };
     for leave in &fresh {
+        record_leave_event(registry, key, leave);
         registry.notify_departure(departure_notice(registry, key, leave));
     }
     leaves
@@ -3365,10 +3379,16 @@ pub fn sync_maker(
 /// exists (a session this relay does not serve, or one run without descriptors).
 #[must_use]
 pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
-    registry
+    let fired = registry
         .lock()
         .get_mut(key)
-        .is_some_and(|maker| maker.note_slot_present(slot))
+        .is_some_and(|maker| maker.note_slot_present(slot));
+    if fired {
+        registry
+            .flight
+            .record(key, crate::flight_recorder::FlightEvent::SessionStart);
+    }
+    fired
 }
 
 /// Re-evaluates `key`'s session-start condition after an authority change,
@@ -3378,10 +3398,16 @@ pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: Slot
 /// exists.
 #[must_use]
 pub fn reevaluate_session_start(registry: &DecisionMakers, key: &SessionKey) -> bool {
-    registry
+    let fired = registry
         .lock()
         .get_mut(key)
-        .is_some_and(|maker| maker.reevaluate_start())
+        .is_some_and(|maker| maker.reevaluate_start());
+    if fired {
+        registry
+            .flight
+            .record(key, crate::flight_recorder::FlightEvent::SessionStart);
+    }
+    fired
 }
 
 /// Whether `key`'s session-start directive has already been emitted — the guard
@@ -3448,6 +3474,7 @@ pub fn set_authority(
         "presence moved the session's buffer authority",
     );
     for leave in &fresh {
+        record_leave_event(registry, key, leave);
         registry.notify_departure(departure_notice(registry, key, leave));
     }
     leaves
@@ -3646,6 +3673,14 @@ pub fn decided_slots(registry: &DecisionMakers, key: &SessionKey) -> HashSet<Slo
 /// close as proof no earlier notice for the session is still in flight.
 pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
     registry.notify_session_closed(key.tenant.clone(), key.session);
+    // The session's local state is gone: seal the flight recording with the
+    // close event and flush it (fire-and-forget — a flush must never delay a
+    // teardown). This is the recording's ordinary end; the drain path's
+    // wholesale flush covers sessions that never reach it.
+    registry
+        .flight
+        .record(key, crate::flight_recorder::FlightEvent::SessionClosed);
+    registry.flight.flush_session_detached(key);
 }
 
 /// This relay's known leave state for `key` — every recorded departure and every
@@ -3739,6 +3774,14 @@ pub fn observe_sync(
     };
     if let Some(divergence) = divergence {
         log_desync(key, &divergence);
+        registry.flight.record(
+            key,
+            crate::flight_recorder::FlightEvent::DesyncDetected {
+                sync_ordinal: divergence.sync_ordinal,
+                diverged: divergence.diverged.iter().map(|slot| slot.0).collect(),
+                no_majority: divergence.no_majority,
+            },
+        );
         registry.notify_desync(desync_notice(registry, key, &divergence));
     }
 }
@@ -3754,9 +3797,37 @@ pub fn ingest_local_conditions(
     key: &SessionKey,
     conditions: &LinkConditions,
 ) -> Option<Decision> {
-    let decision = registry.lock().get_mut(key)?.ingest_local(conditions)?;
+    let (decision, directive) = {
+        let mut makers = registry.lock();
+        let maker = makers.get_mut(key)?;
+        let decision = maker.ingest_local(conditions)?;
+        // The queued broadcast carries the decision seq the Decision lacks;
+        // read it under the same lock so the recorded event matches exactly
+        // what clients will be stamped with.
+        (decision, maker.pending_directive)
+    };
     log_decision(key, decision);
+    record_buffer_event(registry, key, directive);
     Some(decision)
+}
+
+/// Records a freshly queued buffer directive into the session's flight
+/// recording — the buffer decision's observability shadow.
+fn record_buffer_event(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    directive: Option<BufferDirective>,
+) {
+    if let Some(directive) = directive {
+        registry.flight.record(
+            key,
+            crate::flight_recorder::FlightEvent::BufferDirective {
+                buffer_turns: directive.buffer_turns,
+                apply_frame: directive.apply_at_frame,
+                decision_seq: directive.decision_seq,
+            },
+        );
+    }
 }
 
 /// Feeds a peer relay's `conditions` sidecar (reached over a mesh hop of
@@ -3769,11 +3840,14 @@ pub fn ingest_remote_conditions(
     conditions: &LinkConditions,
     mesh_rtt_us: u32,
 ) -> Option<Decision> {
-    let decision = registry
-        .lock()
-        .get_mut(key)?
-        .ingest_remote(conditions, mesh_rtt_us)?;
+    let (decision, directive) = {
+        let mut makers = registry.lock();
+        let maker = makers.get_mut(key)?;
+        let decision = maker.ingest_remote(conditions, mesh_rtt_us)?;
+        (decision, maker.pending_directive)
+    };
     log_decision(key, decision);
+    record_buffer_event(registry, key, directive);
     Some(decision)
 }
 
@@ -3799,11 +3873,31 @@ pub fn decide_leave(
 ) -> Option<LeaveDirective> {
     let directive = registry.lock().get_mut(key)?.decide_leave(slot, reason)?;
     log_leave(key, &directive);
+    record_leave_event(registry, key, &directive);
     // `decide_leave` returns `Some` only on the authority's first decision for
     // the slot (it dedups internally), so this is the one departure notice the
     // authoring relay sends for it.
     registry.notify_departure(departure_notice(registry, key, &directive));
     Some(directive)
+}
+
+/// Records a decided leave into the session's flight recording — the decision's
+/// observability shadow, fired at the same once-per-slot points the departure
+/// notice is (the maker's internal dedup guarantees the once).
+fn record_leave_event(registry: &DecisionMakers, key: &SessionKey, directive: &LeaveDirective) {
+    registry.flight.record(
+        key,
+        crate::flight_recorder::FlightEvent::LeaveDecided {
+            slot: directive.slot as u8,
+            kind: if directive.reason == LEAVE_REASON_DROPPED {
+                DepartureKind::Dropped
+            } else {
+                DepartureKind::Left
+            },
+            apply_frame: directive.apply_at_frame,
+            leave_seq: directive.leave_seq,
+        },
+    );
 }
 
 /// Whether `key`'s decision-maker holds at least one recorded departure whose leave
@@ -3859,6 +3953,7 @@ pub fn decide_abandoned_departures(
     };
     for directive in &decided {
         log_leave(key, directive);
+        record_leave_event(registry, key, directive);
         registry.notify_departure(departure_notice(registry, key, directive));
     }
     decided

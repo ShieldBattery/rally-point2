@@ -491,6 +491,41 @@ provably executed, computed on the departing slot's home relay from turns it val
 client, a `LeaveTracker` collapses the redundant directive stamps into **at-most-one leave per slot**,
 surfaced at its apply frame — the leave-side mirror of the buffer `DirectiveTracker`.
 
+### Flight recorder
+
+When a desync, dispute, or stall is reported after the fact, someone has to reconstruct what the game's
+network actually did — and by then the session is gone from every live structure. The **flight recorder**
+is each relay's bounded, per-session black box: discrete **events** (slot connects/disconnects and
+resumes, decided leaves with their apply coordinates, buffer directives, detected desyncs, drop holds and
+requests, the session-start directive, a re-home landing, the close), periodic **link-health samples**
+(the same per-slot QUIC rtt/loss the slot links already publish for the latency-buffer decision-maker,
+folded together with per-slot turn-stream counters — validated/delivered turns, newest seq, dedup drops,
+oversize diverts — by a relay-wide 10s sampling tick). It **observes only**: no decision logic reads it,
+the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
+oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
+
+**What it never records:** raw turn/command bytes and chat. Summaries only — which, with the relay's
+standing PII rule (no user identity ever reaches a relay), keeps every blob **pseudonymous**: slot-keyed,
+content-free.
+
+**Flush protocol.** A recording becomes one versioned, self-describing JSON blob (header:
+tenant/session/relay identity, start/flush timestamps, overflow counts; body: events + samples) handed to
+a pluggable sink. Two triggers: **session close** — the same moment the relay reports `SessionClosed` to
+the coordinator — and **drain**, which flushes every live recording concurrently under its own 10s
+deadline inside the drain budget (bounded rings × bounded live sessions ⇒ the flush always fits the 90s
+drain ≤ 120s Fargate stopTimeout; the size caps exist precisely so observability can never wedge a
+shutdown). The dev sink writes `<dir>/<tenant>/<session>/<relay_id>.json` (`--flight-dir`); the
+tenant-first prefix is the structural hook for tenant-scoped read authorization when the durable store
+(S3) lands. With no sink configured the relay still records — cheap, bounded — and a flush is a logged
+discard. The **read path is not built**: investigating a blob today means opening the JSON; tenant-facing
+reads land with the durable store, scoped by that same path prefix.
+
+**Retention + PII — PROPOSAL (not yet ratified; Travis to confirm):** blobs are inherently pseudonymous
+(slot-keyed, no user identity, no payload bytes), so user erasure never touches flight data — the
+session↔user join lives only in the tenant's own records and happens tenant-side at read time. Retention:
+**14 days** via store lifecycle (an S3 rule when the durable store lands; the dev file sink has none —
+files sit until deleted by hand), with an optional longer pin (30–90 days) for desync-flagged sessions.
+
 ### Control plane: the coordinator
 
 The coordinator sits off the hot path. It mints per-tenant, connection-bound **tokens**, runs the
@@ -713,5 +748,5 @@ exists solely in the coordinator's tenant-supplied refs, resolved at query time.
 | `proto` | Frozen wire contracts: `Packet`/`Payload` framing, control-plane messages, tokens, protocol version, the SC:R command table. Anything crossing a component boundary is defined here first. |
 | `transport` | The per-link redundancy + ack + dedup machinery above, shared by `client` and `relay`. |
 | `client` | Portable client endpoint + link driver: per-slot ordering restoration and the buffer/leave directive trackers; linked into the game DLL. |
-| `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, topological dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves. (A replicated turn log and flight recorder are planned, not yet built.) |
+| `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, topological dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves — plus the per-session flight recorder (bounded events/samples/counters, flushed on close and drain). (A replicated turn log is planned, not yet built.) |
 | `coordinator` | Multi-tenant control plane: per-tenant token issuance + inbound request-signature auth, the relay registry and descriptor push, session setup, region assignment/provisioning, and the tenant-notification (webhook) + session-lifecycle layer. |

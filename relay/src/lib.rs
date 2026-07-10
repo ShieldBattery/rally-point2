@@ -41,8 +41,10 @@
 //!   wiring + coordinator; the coordinator only sets *bounds*.
 //! - **turn log** — persist + replicate the per-game turn log; the same
 //!   "replay from cursor X" primitive serves failover and (future) observers.
-//! - **flight recorder** — per-game turn stream + per-link health + events,
-//!   flushed to a durable store *before* scale-to-zero teardown.
+//! - **flight recorder** ([`flight_recorder`]) — per-game observability:
+//!   bounded per-session events + link-health samples + turn-stream counters
+//!   (summaries only, never payload bytes), flushed as a self-describing JSON
+//!   blob on session close and wholesale before a drain exits.
 //!
 //! The client edge — authorization, validation, single-relay routing, the
 //! consensus decision core, and the mesh-edge connection half — is built; the
@@ -54,6 +56,7 @@ pub mod chat;
 pub mod config;
 pub mod coordinator_client;
 pub mod drop_hold;
+pub mod flight_recorder;
 pub mod lobby;
 pub mod mesh;
 pub mod mesh_control;
@@ -67,7 +70,6 @@ pub mod validation;
 
 pub mod consensus;
 // TODO: pub mod turn_log;         // replicated, bounded + flushed
-// TODO: pub mod flight_recorder;  // tenant/session/slot/turn
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
 // TODO: reconcile with the Fargate task def + per-game IP rotation.

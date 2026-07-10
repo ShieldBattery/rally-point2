@@ -299,6 +299,12 @@ impl MeshControl {
                 consensus::seed_departed(&self.decision_makers, &key, departed.slot, departed.kind);
             }
             consensus::mark_session_started(&self.decision_makers, &key);
+            self.decision_makers.flight_recorder().record(
+                &key,
+                crate::flight_recorder::FlightEvent::ResumedDescriptorApplied {
+                    departed_slots: descriptor.departed_slots.len() as u32,
+                },
+            );
         }
         // A descriptor push that promotes this relay to authority (the
         // coordinator dropped the former authority from the order) may make this
@@ -1054,6 +1060,72 @@ mod tests {
         assert!(
             !registry.get(&key(1)).unwrap().is_started(),
             "a fresh descriptor does not latch the session started",
+        );
+    }
+
+    #[test]
+    fn a_leave_decision_lands_in_the_flight_recorder() {
+        // The consensus-side flight tap, through the production decide path: a
+        // decided synced leave records its event (slot, kind, apply coordinates)
+        // into the session's recording.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        control.apply_descriptor(&descriptor(1, &[])); // single relay: self-authority
+
+        consensus::observe_frame(
+            &makers,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::ids::GameFrameCount(10),
+        );
+        assert!(consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some());
+
+        let events: Vec<_> = makers
+            .flight_recorder()
+            .events(&key(1))
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                crate::flight_recorder::FlightEvent::LeaveDecided {
+                    slot: 0,
+                    kind: DepartureKind::Dropped,
+                    ..
+                }
+            )),
+            "the decided leave is recorded: {events:?}",
+        );
+    }
+
+    #[test]
+    fn a_resumed_descriptor_apply_lands_in_the_flight_recorder() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        desc.resumed = true;
+        desc.departed_slots = vec![DepartedSlot {
+            slot: SlotId(1),
+            kind: DepartureKind::Dropped,
+        }];
+        control.apply_descriptor(&desc);
+
+        let events: Vec<_> = makers
+            .flight_recorder()
+            .events(&key(1))
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            events.contains(
+                &crate::flight_recorder::FlightEvent::ResumedDescriptorApplied {
+                    departed_slots: 1
+                }
+            ),
+            "the re-home landing is recorded: {events:?}",
         );
     }
 

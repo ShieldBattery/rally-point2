@@ -141,6 +141,14 @@ struct Cli {
     /// completes before the platform SIGKILLs the process.
     #[arg(long, env = "RELAY_DRAIN_TIMEOUT_SECS", default_value_t = 90)]
     drain_timeout_secs: u64,
+
+    /// Directory the flight recorder flushes per-session blobs into
+    /// (`<dir>/<tenant>/<session>/<relay_id>.json`) — the dev/loopback sink.
+    /// Absent, the recorder still records (cheap, bounded) but a flush discards
+    /// the recording with a log line. The durable store (S3) replaces this in
+    /// production.
+    #[arg(long, env = "RELAY_FLIGHT_DIR")]
+    flight_dir: Option<std::path::PathBuf>,
 }
 
 /// How long the drain sequence waits for the coordinator's `DrainAck` before
@@ -219,6 +227,30 @@ async fn main() -> Result<()> {
     // relay). Trivially empty without a coordinator, so the drain then keys on
     // local slot liveness alone.
     let applied = coordinator_client::AppliedSessions::new();
+
+    // The flight recorder: per-session observability, always recording (cheap,
+    // bounded). The sink and identity are optional startup wiring; the sampling
+    // tick folds turn counters + link conditions into a row per live session.
+    let flight = mesh_state.decision_makers.flight_recorder().clone();
+    if let Some(relay_id) = cli.relay_id {
+        flight.set_identity(RelayId(relay_id));
+    }
+    match &cli.flight_dir {
+        Some(dir) => {
+            tracing::info!(dir = %dir.display(), "flight recordings flush to files");
+            flight.set_sink(Arc::new(rally_point_relay::flight_recorder::FileSink::new(
+                dir.clone(),
+            )));
+        }
+        None => tracing::info!(
+            "no --flight-dir configured; flight recordings are discarded at flush"
+        ),
+    }
+    tokio::spawn(rally_point_relay::flight_recorder::run_sampler(
+        flight.clone(),
+        mesh_state.conditions.clone(),
+        rally_point_relay::flight_recorder::SAMPLE_INTERVAL,
+    ));
 
     // The mesh-edge connection half. When a relay-id is configured, spawn the
     // accept drain (peer relays dialing us arrive on `mesh_accept`) and one
@@ -407,6 +439,7 @@ async fn main() -> Result<()> {
                 &mut drain_acked_rx,
                 &sessions_for_drain,
                 &applied,
+                &flight,
                 drain_timeout,
             )
             .await;
@@ -468,6 +501,7 @@ async fn drain_and_exit(
     drain_acked_rx: &mut tokio::sync::watch::Receiver<bool>,
     sessions: &Sessions,
     applied: &coordinator_client::AppliedSessions,
+    flight: &rally_point_relay::flight_recorder::FlightRecorder,
     drain_timeout: Duration,
 ) {
     tracing::info!("shutdown signal received; beginning coordinated drain");
@@ -490,16 +524,27 @@ async fn drain_and_exit(
     loop {
         if coordinator_client::drained_idle(sessions, applied) {
             tracing::info!("relay idle; no local slots held and no session assigned");
-            return;
+            break;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 "drain timeout reached with sessions still live or assigned; abandoning them to failover",
             );
-            return;
+            break;
         }
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
+
+    // Flush whatever flight recordings remain — sessions that never reached
+    // their ordinary close-time flush (still running at the deadline, or ended
+    // by a descriptor removal with no local slot to close). Bounded by its own
+    // deadline inside the drain budget: the rings are size-capped and live
+    // sessions bounded, so the volume always fits DRAIN_FLUSH_TIMEOUT, which
+    // nests under the 90s drain timeout and Fargate's 120s stopTimeout — the
+    // size caps exist precisely so this flush can never wedge the shutdown.
+    flight
+        .flush_all(rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT)
+        .await;
 }
 
 fn init_tracing() {
