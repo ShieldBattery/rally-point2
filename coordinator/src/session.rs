@@ -299,6 +299,29 @@ pub fn rehome(
     dead_relay: RelayId,
     departed_slots: Vec<DepartedSlot>,
 ) -> RehomeOutcome {
+    rehome_inner(setup, tenant, session, dead_relay, departed_slots, || {})
+}
+
+/// [`rehome`]'s body, with a test seam `before_mutation` invoked after the
+/// replacement relay is chosen but before the `session_relays` mutation — the exact
+/// window in which a concurrent full close can land. Production passes a no-op; a
+/// test passes a close to prove the mutation section re-validates and bails.
+///
+/// # Locking
+///
+/// Holds the `rehomes` lock across the middle section and takes the `session_relays`
+/// lock *nested* inside it for the mutation. A full close ([`Lifecycle::on_session_closed`])
+/// touches `forget_rehomes` (the `rehomes` lock) and `forget_session_membership`
+/// (the `session_relays` lock) as two separate, non-nested acquisitions, so it never
+/// holds both at once and cannot deadlock against this nesting order.
+fn rehome_inner(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+    dead_relay: RelayId,
+    departed_slots: Vec<DepartedSlot>,
+    before_mutation: impl FnOnce(),
+) -> RehomeOutcome {
     let key = (tenant.clone(), session);
     let serving = setup.serving_relays(tenant, session);
     // Unknown session (never created here, or a coordinator restart wiped its
@@ -370,24 +393,48 @@ pub fn rehome(
         return RehomeOutcome::Unavailable;
     };
 
+    // Test seam: a full close landing between the serving-set snapshot above and
+    // the mutation below (in production this is a no-op).
+    before_mutation();
+
     // Move every slot homed on the dead relay onto R_new: replace the dead relay
     // in place in the serving set (which is also the authority order), so the
     // rebuilt descriptors rank R_new where the dead relay stood. If R_new was
     // already serving, drop the dead entry rather than list it twice.
+    //
+    // Re-validate under the `session_relays` lock we are about to mutate: our
+    // `serving` snapshot was taken before this lock, so a full close could have
+    // cleared the membership (or a racing rehome moved the dead relay off) in the
+    // meantime. If the entry is gone, or no longer names the dead relay, bail with
+    // `Unavailable` here — before recording any rehome or pushing any descriptor —
+    // so a close that lands mid-rehome can never leave a post-close recorded rehome
+    // (which `recorded_rehome` would then serve token-free) or a re-staged
+    // descriptor that resurrects the dead session on a live relay.
     {
         let mut relays = setup.session_relays.lock();
-        if let Some(members) = relays.get_mut(&key) {
-            if members.contains(&r_new) {
-                members.retain(|&id| id != dead_relay);
-            } else {
-                for id in members.iter_mut() {
-                    if *id == dead_relay {
-                        *id = r_new;
-                    }
+        let Some(members) = relays.get_mut(&key) else {
+            return RehomeOutcome::Unavailable;
+        };
+        if !members.contains(&dead_relay) {
+            return RehomeOutcome::Unavailable;
+        }
+        if members.contains(&r_new) {
+            members.retain(|&id| id != dead_relay);
+        } else {
+            for id in members.iter_mut() {
+                if *id == dead_relay {
+                    *id = r_new;
                 }
             }
         }
     }
+
+    // The dead relay is no longer a member. Drop its descriptor outbox entry for
+    // this session so that if it re-enrolls later it is not re-synced a descriptor
+    // for a session it no longer serves (the surviving relays get the resumed push
+    // below). Safe even if the dead relay is disconnected — the outbox is
+    // latest-wins current state, and a session it left must not remain in its set.
+    setup.descriptors.remove(dead_relay, tenant, session);
 
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
     // seeding the departed slots, and push each. Record R_new's first so it is
@@ -1744,6 +1791,93 @@ mod tests {
         assert!(
             recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
             "no recorded target survives to resurrect the closed session",
+        );
+    }
+
+    #[test]
+    fn rehome_removes_the_dead_relays_descriptor_so_a_re_enroll_is_not_re_synced() {
+        // When the group moves off a dead relay, that relay's descriptor outbox entry
+        // for the session must be removed — else a re-enrolling dead relay would be
+        // re-synced a descriptor for a session it no longer serves and rejoin it.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                // Split slot 1 onto the secondary so both relays serve (and each has
+                // a descriptor staged).
+                dev_relay_split: vec![SlotId(1)],
+                external_id: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .any(|d| d.session == resp.session),
+            "the home relay has a descriptor before it dies",
+        );
+
+        // The home relay 1 dies; the group re-homes onto the already-serving relay 2.
+        registry::remove(setup.registry(), RelayId(1));
+        assert!(matches!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2),
+        ));
+
+        // The dead relay's outbox no longer carries the moved-off session, so a
+        // re-enrolling relay 1 subscribing afresh is not told to serve it.
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .all(|d| d.session != resp.session),
+            "the dead relay's descriptor for the moved-off session was removed",
+        );
+        let rx = setup.descriptors().subscribe(RelayId(1));
+        assert!(!rx.borrow().iter().any(|d| d.session == resp.session));
+    }
+
+    #[test]
+    fn a_rehome_racing_a_full_close_bails_without_recording_or_pushing() {
+        // A rehome that has already passed the early serving-set snapshot, then has a
+        // full close land before its mutation, must re-validate under the mutation
+        // lock and return Unavailable — recording no rehome (which recorded_rehome
+        // would otherwise serve token-free) and pushing no descriptor (which could
+        // resurrect the dead session on a live relay). The `before_mutation` seam
+        // simulates the close landing in exactly that window.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup); // serving == {1}
+        registry::remove(setup.registry(), RelayId(1)); // the home died, so not Stay
+
+        let baseline_relay2 = setup.descriptors().current_for(RelayId(2));
+
+        let outcome = rehome_inner(&setup, &tid(), resp.session, RelayId(1), vec![], || {
+            // The concurrent full close clears the session's membership between the
+            // snapshot and the mutation (its forget_rehomes would block on the
+            // rehomes lock this rehome holds, so only membership is cleared here —
+            // faithfully modeling the race window).
+            setup.forget_session_membership(&tid(), resp.session);
+        });
+
+        assert_eq!(
+            outcome,
+            RehomeOutcome::Unavailable,
+            "a rehome that raced a close bails instead of resurrecting the session",
+        );
+        assert!(
+            recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
+            "the raced rehome recorded no idempotency entry to serve token-free",
+        );
+        assert_eq!(
+            setup.descriptors().current_for(RelayId(2)),
+            baseline_relay2,
+            "the raced rehome pushed no resumed descriptor to a live relay",
         );
     }
 }

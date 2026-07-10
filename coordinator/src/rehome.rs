@@ -32,6 +32,15 @@ pub const REHOME_BURST: u32 = 3;
 /// five seconds while a relay is unreachable, so the steady-state rate matches that.
 pub const REHOME_REFILL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Hard cap on the number of live buckets. The time-window idle eviction alone only
+/// bounds the map by `O(rate x window)`, so an authenticated caller spraying unique
+/// garbage session ids at high rate could hold many thousands of buckets between
+/// eviction sweeps. This cap bounds the map by cardinality regardless of rate: when
+/// an insert would exceed it, the stalest bucket(s) are evicted to make room. A few
+/// thousand comfortably covers every session a real coordinator re-homes at once
+/// while keeping the worst-case memory footprint small.
+pub const REHOME_BUCKET_CAP: usize = 4096;
+
 /// The key of one session's rate-limit bucket: which session, for which tenant.
 type BucketKey = (TenantId, SessionId);
 
@@ -52,6 +61,9 @@ pub struct RehomeLimiter {
     buckets: Arc<Mutex<HashMap<BucketKey, Bucket>>>,
     burst: u32,
     refill_interval: Duration,
+    /// Hard cap on live bucket count — [`REHOME_BUCKET_CAP`] in production; a test
+    /// injects a small one to exercise the cardinality eviction cheaply.
+    bucket_cap: usize,
 }
 
 impl Default for RehomeLimiter {
@@ -61,14 +73,22 @@ impl Default for RehomeLimiter {
 }
 
 impl RehomeLimiter {
-    /// Builds a limiter with the given burst and refill interval. Production uses
+    /// Builds a limiter with the given burst and refill interval, using the
+    /// production bucket cap ([`REHOME_BUCKET_CAP`]). Production uses
     /// [`REHOME_BURST`]/[`REHOME_REFILL_INTERVAL`] (via [`Default`]); tests inject
     /// their own so they need not wait real seconds.
     pub fn new(burst: u32, refill_interval: Duration) -> Self {
+        Self::with_bucket_cap(burst, refill_interval, REHOME_BUCKET_CAP)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit bucket cap, so a test can drive
+    /// the cardinality eviction with a handful of keys rather than several thousand.
+    pub fn with_bucket_cap(burst: u32, refill_interval: Duration, bucket_cap: usize) -> Self {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             burst,
             refill_interval,
+            bucket_cap: bucket_cap.max(1),
         }
     }
 
@@ -95,12 +115,32 @@ impl RehomeLimiter {
         // fine for a map bounded by live re-homing sessions.
         let evict_after = self.refill_interval * self.burst.saturating_add(1);
         buckets.retain(|_, b| now.saturating_duration_since(b.last_refill) < evict_after);
-        let bucket = buckets
-            .entry((tenant.clone(), session))
-            .or_insert(Bucket {
-                tokens: burst,
-                last_refill: now,
-            });
+        // Hard cardinality cap: if admitting a *new* session would exceed the cap
+        // (idle eviction above didn't free enough — a high-rate spray of unique keys
+        // keeps every bucket fresh), evict the stalest bucket(s) — oldest
+        // `last_refill` — to make room. A stale bucket has refilled toward full, so
+        // dropping it only grants a fresh burst, never refuses a live survivor; the
+        // spray can never push a legitimate active session out because an active
+        // session's bucket is by definition newer than the sprayer's oldest. Never
+        // refuse the check outright — a full map must not become a DoS on the
+        // sessions actually re-homing.
+        let bucket_key = (tenant.clone(), session);
+        if !buckets.contains_key(&bucket_key) {
+            while buckets.len() >= self.bucket_cap {
+                let Some(stalest) = buckets
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.last_refill)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                buckets.remove(&stalest);
+            }
+        }
+        let bucket = buckets.entry(bucket_key).or_insert(Bucket {
+            tokens: burst,
+            last_refill: now,
+        });
         // Accrue refill for the elapsed time, capped at the burst.
         let elapsed = now
             .saturating_duration_since(bucket.last_refill)
@@ -223,6 +263,54 @@ mod tests {
         let t1 = t0 + Duration::from_secs(5);
         assert!(limiter.check_at(&tid(), SessionId(1), t1));
         assert_eq!(limiter.bucket_count(), 1, "the active bucket survives");
+    }
+
+    #[test]
+    fn a_unique_key_spray_is_bounded_by_the_cap_and_spares_an_active_bucket() {
+        // A cardinality cap must bound the map no matter the rate: an authenticated
+        // caller spraying unique session ids can never grow it past the cap, and the
+        // eviction (stalest first) never drops a legitimately active session.
+        let cap = 4;
+        let limiter = RehomeLimiter::with_bucket_cap(1, Duration::from_secs(5), cap);
+        let t0 = Instant::now();
+
+        // Spray far more unique sessions than the cap, all at t0.
+        for i in 0..(cap as u64 * 3) {
+            limiter.check_at(&tid(), SessionId(i), t0);
+        }
+        assert!(
+            limiter.bucket_count() <= cap,
+            "the cap bounds the map under a unique-key spray",
+        );
+
+        // A legitimate session re-homes slightly later (within the idle window, so
+        // the t0 buckets are cap-evicted rather than idle-evicted), spending its one
+        // token so a later reset would be observable.
+        let t1 = t0 + Duration::from_secs(1);
+        let legit = SessionId(999);
+        assert!(limiter.check_at(&tid(), legit, t1));
+        assert!(
+            !limiter.check_at(&tid(), legit, t1),
+            "its single-token burst is spent"
+        );
+
+        // More unique garbage at t1. Eviction targets the stalest (older t0) buckets,
+        // never the just-touched legit one; fewer sprays than the surviving t0 count
+        // keeps at least one stale bucket present at every step.
+        for i in 1000..(1000 + cap as u64 - 1) {
+            limiter.check_at(&tid(), SessionId(i), t1);
+        }
+        assert!(
+            limiter.bucket_count() <= cap,
+            "still bounded after the second spray"
+        );
+
+        // The legit bucket survived: its token is still spent, so it is refused —
+        // a fresh (evicted-and-recreated) bucket would instead admit a full burst.
+        assert!(
+            !limiter.check_at(&tid(), legit, t1),
+            "the active bucket was spared; it did not reset to a fresh burst",
+        );
     }
 
     #[test]

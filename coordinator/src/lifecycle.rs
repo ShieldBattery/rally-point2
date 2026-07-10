@@ -322,6 +322,19 @@ impl Lifecycle {
         self.prune_dedup(&tenant, session);
         self.inner.setup.reaps().retire(&tenant, session);
         self.inner.setup.forget_rehomes(&tenant, session);
+        // Drop the session's descriptor from every relay that was serving it,
+        // BEFORE forget_session_membership below clears the membership we read the
+        // serving set from. Otherwise the descriptor stays in each serving relay's
+        // latest-wins outbox forever, and a relay reconnecting after the close is
+        // re-synced the dead session's stale descriptor and re-applies it — the
+        // relay-side reconciler only ends sessions ABSENT from the pushed set, so a
+        // present-but-dead descriptor resurrects the session on that relay.
+        for relay_id in self.inner.setup.serving_relays(&tenant, session) {
+            self.inner
+                .setup
+                .descriptors()
+                .remove(relay_id, &tenant, session);
+        }
         // Retire the session's relay membership and rate-limit bucket at the same
         // moment its recorded rehomes are cleared: the session is gone, so every
         // subsequent re-home ask honestly answers `Unavailable` (the empty serving
@@ -450,8 +463,15 @@ impl Lifecycle {
         self.inner.setup.reaps().retire(&tenant, session);
         self.inner.setup.forget_rehomes(&tenant, session);
         // A webhook-only state has no relay membership (this coordinator lifetime
-        // never created the session), so retiring it is a harmless no-op; done here
-        // anyway to keep both close paths uniform and the limiter bucket bounded.
+        // never created the session), so it has no descriptor outbox entries and no
+        // membership to retire — the removal loop below is empty and the retirement
+        // a harmless no-op; both are done anyway to keep the two close paths uniform.
+        for relay_id in self.inner.setup.serving_relays(&tenant, session) {
+            self.inner
+                .setup
+                .descriptors()
+                .remove(relay_id, &tenant, session);
+        }
         self.inner.setup.forget_session_membership(&tenant, session);
         self.inner.setup.rehome_limiter().forget(&tenant, session);
         tracing::debug!(
@@ -1218,6 +1238,50 @@ mod tests {
         assert!(
             setup.rehome_limiter().check(&tid(), s),
             "close dropped the limiter bucket, so a fresh burst is available",
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_removes_its_descriptor_from_each_serving_relay() {
+        // A full close must drop the session's descriptor from every serving relay's
+        // latest-wins outbox. Otherwise a relay reconnecting after the close is
+        // re-synced the stale descriptor and re-applies the dead session (its
+        // reconciler only leaves sessions absent from the pushed set).
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        // create_session staged a descriptor for the sole serving relay.
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .any(|d| d.session == s),
+            "the session's descriptor is staged before the close",
+        );
+
+        lc.on_session_closed(tid(), s, RelayId(1));
+
+        // A relay reconnecting after the close subscribes to a set that no longer
+        // carries the closed session's descriptor.
+        let rx = setup.descriptors().subscribe(RelayId(1));
+        assert!(
+            !rx.borrow().iter().any(|d| d.session == s),
+            "the closed session's descriptor is gone from the serving relay's outbox",
+        );
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .all(|d| d.session != s),
         );
     }
 
