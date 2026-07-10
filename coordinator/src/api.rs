@@ -80,7 +80,6 @@ use crate::descriptors::SlotClose;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
 use crate::registry;
-use crate::rehome::RehomeLimiter;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 use crate::tenant;
 
@@ -168,10 +167,6 @@ pub struct CoordinatorState {
     /// before its connection is dropped and it is deregistered (see
     /// [`LIVENESS_TIMEOUT`]). A field so tests can shorten it.
     pub liveness_timeout: Duration,
-    /// The per-session rate limiter for the tenant-authenticated re-home endpoint
-    /// (`POST /session/rehome`). Lenient — an app server may legitimately re-ask
-    /// every few seconds — sized only to bound a misbehaving caller.
-    pub rehome_limiter: RehomeLimiter,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -365,21 +360,29 @@ async fn rehome_session(
 
     let tenant = request.tenant;
     let session = SessionId(request.session);
+    let dead_relay = RelayId(request.dead_relay_id);
 
-    // Rate limit per authenticated (tenant, session). A refused request is a 429
-    // the caller backs off and re-asks after.
-    if !state.rehome_limiter.check(&tenant, session) {
+    // Idempotent fast path, served WITHOUT spending a rate-limit token: a straggler
+    // re-asking about a relay this session already re-homed off gets the recorded
+    // replacement directly. Charging it a token would let already-answered re-asks
+    // starve a real survivor's ask for the same session's bucket. A fully-closed
+    // session records nothing here (its rehomes are cleared at close), so this can
+    // never revive a dead session.
+    if let Some(endpoint) = session::recorded_rehome(&state.setup, &tenant, session, dead_relay) {
+        return Ok(Json(RehomeResponse::from(RehomeOutcome::NewTarget(
+            endpoint,
+        ))));
+    }
+
+    // Every non-recorded ask — a first-time survivor, a false-alarm `stay`, or an
+    // unknown/garbage session — is rate-limited per authenticated (tenant, session).
+    // A refused request is a 429 the caller backs off and re-asks after.
+    if !state.setup.rehome_limiter().check(&tenant, session) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     let departed = state.lifecycle.departed_slots(&tenant, session);
-    let outcome = session::rehome(
-        &state.setup,
-        &tenant,
-        session,
-        RelayId(request.dead_relay_id),
-        departed,
-    );
+    let outcome = session::rehome(&state.setup, &tenant, session, dead_relay, departed);
     // Let the descriptor push reach R_new's control task before responding, so the
     // relay is likelier to hold the resumed descriptor before a client dials it
     // (the client's reconnect backoff absorbs whatever race remains).
@@ -1134,7 +1137,6 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
-            rehome_limiter: RehomeLimiter::default(),
         }
     }
 
@@ -1429,7 +1431,6 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
-            rehome_limiter: RehomeLimiter::default(),
         };
         let app = router(state);
 
@@ -1487,7 +1488,6 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
-            rehome_limiter: RehomeLimiter::default(),
         };
         let app = router(state);
 
@@ -1913,21 +1913,87 @@ mod tests {
 
     #[tokio::test]
     async fn rehome_endpoint_rate_limits_repeated_requests() {
+        // Relay 1 stays live, so every ask resolves to `stay` — a non-recorded
+        // outcome that spends a rate-limit token each time (the free recorded-rehome
+        // fast path never applies, since a `stay` records no replacement). This is
+        // the token-spending path the reorder must still rate-limit: the default
+        // burst is 3, so the first three are admitted and the fourth is a 429.
         let state = state_with_relay_and_tenant();
-        enroll_second_relay(&state);
         let session = create_rehome_session(&state);
-        registry::remove(state.setup.registry(), RelayId(1));
         let app = router(state);
 
         let body = rehome_body("sb-test", session, 1);
-        // The default burst is 3: the first three are admitted (idempotent, same
-        // target), the fourth is rate-limited.
         for _ in 0..3 {
-            let resp =
-                signed_post(app.clone(), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
+            let resp = signed_post(app.clone(), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         let resp = signed_post(app, "/session/rehome", &body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_rehome_re_ask_does_not_consume_a_token() {
+        // The idempotent recorded-rehome answer must be served without spending a
+        // rate-limit token, so an already-answered straggler can never starve a real
+        // survivor's ask. Prove it by exhausting the session's bucket, then showing a
+        // recorded re-ask still succeeds while a fresh (non-recorded) ask is a 429.
+        let state = state_with_relay_and_tenant();
+        enroll_second_relay(&state);
+        let session = create_rehome_session(&state);
+        // The home relay (1) dies; the first ask records the move to the live relay
+        // 2 (spending one token of the default burst of 3).
+        registry::remove(state.setup.registry(), RelayId(1));
+        let app = router(state);
+
+        let recorded_body = rehome_body("sb-test", session, 1);
+        let resp = signed_post(
+            app.clone(),
+            "/session/rehome",
+            &recorded_body,
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Exhaust the remaining tokens with garbage dead-relay asks on the SAME
+        // session (each unrecorded and unserving → `unavailable`, but token-spending).
+        // Relay ids 77/88 drain the last two tokens; 99 then hits the empty bucket.
+        for dead in [77u64, 88] {
+            let resp = signed_post(
+                app.clone(),
+                "/session/rehome",
+                &rehome_body("sb-test", session, dead),
+                &TEST_CLIENT_SEED,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let resp = signed_post(
+            app.clone(),
+            "/session/rehome",
+            &rehome_body("sb-test", session, 99),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a fresh, non-recorded ask is rate-limited once the bucket is empty",
+        );
+
+        // The straggler re-asks about the recorded dead relay 1. Even though the
+        // bucket is exhausted, the recorded fast path answers `newTarget` (relay 2)
+        // without charging a token.
+        let resp = signed_post(app, "/session/rehome", &recorded_body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"], "newTarget");
+        assert_eq!(
+            json["relay"]["relay_id"], 2,
+            "the recorded replacement is served despite the exhausted bucket",
+        );
     }
 }

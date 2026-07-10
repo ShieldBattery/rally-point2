@@ -85,6 +85,16 @@ impl RehomeLimiter {
         let refill_per_sec = 1.0 / self.refill_interval.as_secs_f64();
         let burst = f64::from(self.burst);
         let mut buckets = self.buckets.lock();
+        // Evict idle buckets lazily: a bucket untouched long enough to have
+        // refilled from empty all the way back to its full burst is
+        // indistinguishable from a never-seen session, so dropping it loses no
+        // state and keeps the map bounded by the sessions actively re-homing. The
+        // idle threshold is (burst + 1) refill intervals — the time to refill from
+        // empty to full, plus a one-interval margin. This is the "pruned lazily on
+        // access" the module docstring promises; it runs on every check, which is
+        // fine for a map bounded by live re-homing sessions.
+        let evict_after = self.refill_interval * self.burst.saturating_add(1);
+        buckets.retain(|_, b| now.saturating_duration_since(b.last_refill) < evict_after);
         let bucket = buckets
             .entry((tenant.clone(), session))
             .or_insert(Bucket {
@@ -111,6 +121,13 @@ impl RehomeLimiter {
         self.buckets
             .lock()
             .retain(|(t, s), _| !(t == tenant && *s == session));
+    }
+
+    /// The number of live buckets — a test hook for asserting idle eviction and
+    /// close-time forgetting actually bound the map.
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.buckets.lock().len()
     }
 }
 
@@ -163,6 +180,49 @@ mod tests {
             assert!(limiter.check_at(&tid(), SessionId(1), far));
         }
         assert!(!limiter.check_at(&tid(), SessionId(1), far));
+    }
+
+    #[test]
+    fn idle_buckets_evict_on_access() {
+        // The map must stay bounded by the sessions actively re-homing: a bucket
+        // idle long enough to have fully refilled is pruned on the next access.
+        let limiter = RehomeLimiter::new(3, Duration::from_secs(5));
+        let t0 = Instant::now();
+        for i in 0..100 {
+            limiter.check_at(&tid(), SessionId(i), t0);
+        }
+        assert_eq!(
+            limiter.bucket_count(),
+            100,
+            "one bucket per touched session"
+        );
+
+        // (burst + 1) refill intervals later, every one of those buckets has
+        // refilled to full and is evicted when the next, unrelated access sweeps
+        // the map — leaving only the freshly created bucket.
+        let later = t0 + Duration::from_secs(5) * 4 + Duration::from_secs(1);
+        assert!(limiter.check_at(&tid(), SessionId(1000), later));
+        assert_eq!(
+            limiter.bucket_count(),
+            1,
+            "idle buckets are pruned on access, bounding the map",
+        );
+    }
+
+    #[test]
+    fn a_bucket_touched_within_the_idle_window_is_not_evicted() {
+        // Eviction must not drop a session still within its idle window — a session
+        // re-asking at the steady-state cadence keeps its (partially spent) bucket.
+        let limiter = RehomeLimiter::new(3, Duration::from_secs(5));
+        let t0 = Instant::now();
+        assert!(limiter.check_at(&tid(), SessionId(1), t0));
+        assert!(limiter.check_at(&tid(), SessionId(1), t0));
+        // One refill interval later (well inside the idle window), the bucket is
+        // still present and has only partially refilled — the third and fourth
+        // asks are not a fresh full burst.
+        let t1 = t0 + Duration::from_secs(5);
+        assert!(limiter.check_at(&tid(), SessionId(1), t1));
+        assert_eq!(limiter.bucket_count(), 1, "the active bucket survives");
     }
 
     #[test]

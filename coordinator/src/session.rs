@@ -37,6 +37,7 @@ use rally_point_proto::token::ExpiresAt;
 
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::registry::{self, RelayRegistry, SessionSetupError};
+use crate::rehome::RehomeLimiter;
 use crate::tenant::{self, TenantStore};
 
 /// The relay ids serving one session, keyed by `(tenant, session)`.
@@ -116,14 +117,31 @@ pub struct SessionSetup {
     /// same target without re-mutating the session's relay set. Retired with the
     /// session's other state (see [`forget_rehomes`]).
     rehomes: Arc<Mutex<HashMap<RehomeKey, RelayId>>>,
+    /// The per-session rate limiter for the tenant-authenticated re-home endpoint
+    /// (`POST /session/rehome`). Held here — rather than only in the api-level
+    /// `CoordinatorState` — so the lifecycle can drop a closed session's bucket at
+    /// the same point it retires the session's other per-session state, keeping the
+    /// bucket map bounded by live re-homing sessions.
+    rehome_limiter: RehomeLimiter,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
 type RehomeKey = (rally_point_proto::control::TenantId, SessionId, RelayId);
 
 impl SessionSetup {
-    /// Creates a session-setup context from the coordinator's registries.
+    /// Creates a session-setup context from the coordinator's registries, with the
+    /// production re-home rate limiter ([`RehomeLimiter::default`]).
     pub fn new(registry: RelayRegistry, tenants: TenantStore) -> Self {
+        Self::with_rehome_limiter(registry, tenants, RehomeLimiter::default())
+    }
+
+    /// Like [`new`](Self::new) but with an explicit re-home rate limiter, so a test
+    /// can inject one with a shorter refill or smaller burst than production's.
+    pub fn with_rehome_limiter(
+        registry: RelayRegistry,
+        tenants: TenantStore,
+        rehome_limiter: RehomeLimiter,
+    ) -> Self {
         Self {
             registry,
             tenants,
@@ -133,6 +151,7 @@ impl SessionSetup {
             reaps: RelayReaps::new(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
+            rehome_limiter,
         }
     }
 
@@ -185,6 +204,29 @@ impl SessionSetup {
             .lock()
             .retain(|(t, s, _), _| !(t == tenant && *s == session));
     }
+
+    /// Retires a closed session's membership maps — its `session_relays` and
+    /// `session_refs` entries for `(tenant, session)`. Called when the lifecycle
+    /// removes the session, alongside [`forget_rehomes`], so both grow only with
+    /// live sessions rather than for the coordinator's whole lifetime.
+    ///
+    /// Retiring `session_relays` is also what refuses a re-home for a closed
+    /// session: with no serving relays recorded, [`rehome`]'s
+    /// `serving.is_empty() → Unavailable` guard fires, so a straggler whose token
+    /// has not yet expired can no longer pick a replacement relay and resurrect a
+    /// dead game. No separate liveness flag is needed — the empty membership *is*
+    /// the terminal state.
+    pub fn forget_session_membership(&self, tenant: &TenantId, session: SessionId) {
+        let key = (tenant.clone(), session);
+        self.session_relays.lock().remove(&key);
+        self.session_refs.lock().remove(&key);
+    }
+
+    /// The per-session re-home rate limiter, so the api handler can charge a token
+    /// and the lifecycle can drop a closed session's bucket.
+    pub fn rehome_limiter(&self) -> &RehomeLimiter {
+        &self.rehome_limiter
+    }
 }
 
 /// The outcome of a coordinator-mediated re-home request (`POST /session/rehome`).
@@ -200,6 +242,35 @@ pub enum RehomeOutcome {
     /// The relay the whole homed group should move to, with the cert the client
     /// pins to reach it. The client keeps its token and re-dials this endpoint.
     NewTarget(RelayEndpoint),
+}
+
+/// The replacement relay a prior [`rehome`] already recorded for
+/// `(tenant, session, dead_relay)`, if one exists and its target is still live.
+///
+/// This is the idempotent fast path the re-home handler consults *before*
+/// charging a rate-limit token: a straggler re-asking about a relay this session
+/// already re-homed off must get the recorded answer without spending a token a
+/// real survivor may need for the same session's bucket. Returns `None` when no
+/// rehome was recorded (the caller then falls through to the rate-limited
+/// [`rehome`] path) or when the recorded target has since left the registry.
+///
+/// A fully-closed session never matches: its recorded rehomes are cleared by
+/// [`forget_rehomes`] at close, at the same moment its membership is retired. This
+/// is the lock-free sibling of the identical lookup inside [`rehome`], which runs
+/// there under the rehomes lock so the read-and-mutate stays atomic; a shared
+/// helper cannot be reused there without re-entering that lock.
+pub fn recorded_rehome(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+    dead_relay: RelayId,
+) -> Option<RelayEndpoint> {
+    let existing = *setup
+        .rehomes
+        .lock()
+        .get(&(tenant.clone(), session, dead_relay))?;
+    let entry = registry::entry(&setup.registry, existing)?;
+    Some(RelayEndpoint::from(&entry))
 }
 
 /// Coordinator-mediated failover: the client believes `dead_relay` has died and
@@ -245,7 +316,9 @@ pub fn rehome(
     // cert, but a straggler client still pinned to its OLD cert (which this session
     // already re-homed off) can never accept that new cert, so telling it to Stay
     // would wedge it dialing a cert it can never pass. The recorded replacement is
-    // the honest answer for it.
+    // the honest answer for it. (The handler runs the same lookup lock-free first —
+    // see [`recorded_rehome`] — to answer a recorded re-ask without a rate-limit
+    // token; this copy stays here so the read-and-mutate below is atomic.)
     if let Some(&existing) = rehomes.get(&(tenant.clone(), session, dead_relay))
         && let Some(entry) = registry::entry(&setup.registry, existing)
     {
@@ -1621,5 +1694,56 @@ mod tests {
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
             RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2),
         ));
+    }
+
+    #[test]
+    fn forget_session_membership_retires_maps_and_refuses_rehome() {
+        // Retiring a closed session's membership must empty both `session_relays`
+        // and `session_refs`, and — with no serving set left — turn any further
+        // re-home ask into `Unavailable`, so a straggler cannot resurrect the game.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: Some("game-42".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert!(!setup.serving_relays(&tid(), resp.session).is_empty());
+        assert!(session_refs(&setup, &tid(), resp.session).is_some());
+
+        // Record a rehome first, so we can also prove the recorded fast path stops
+        // matching once membership is retired (its rehomes are cleared elsewhere,
+        // but even the standalone lookup must not resurrect a closed session).
+        registry::remove(setup.registry(), RelayId(1));
+        assert!(matches!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::NewTarget(_),
+        ));
+
+        setup.forget_session_membership(&tid(), resp.session);
+        setup.forget_rehomes(&tid(), resp.session);
+
+        assert!(
+            setup.serving_relays(&tid(), resp.session).is_empty(),
+            "membership retirement empties the serving set",
+        );
+        assert!(
+            session_refs(&setup, &tid(), resp.session).is_none(),
+            "membership retirement drops the correlation ids",
+        );
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
+            "a session with no membership refuses re-home",
+        );
+        assert!(
+            recorded_rehome(&setup, &tid(), resp.session, RelayId(1)).is_none(),
+            "no recorded target survives to resurrect the closed session",
+        );
     }
 }

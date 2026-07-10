@@ -322,6 +322,13 @@ impl Lifecycle {
         self.prune_dedup(&tenant, session);
         self.inner.setup.reaps().retire(&tenant, session);
         self.inner.setup.forget_rehomes(&tenant, session);
+        // Retire the session's relay membership and rate-limit bucket at the same
+        // moment its recorded rehomes are cleared: the session is gone, so every
+        // subsequent re-home ask honestly answers `Unavailable` (the empty serving
+        // set trips `session::rehome`'s guard, so no straggler can resurrect the
+        // dead game onto a live relay), and neither map leaks past the session.
+        self.inner.setup.forget_session_membership(&tenant, session);
+        self.inner.setup.rehome_limiter().forget(&tenant, session);
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -442,6 +449,11 @@ impl Lifecycle {
         // state normally has none, but this keeps the pending set bounded either way).
         self.inner.setup.reaps().retire(&tenant, session);
         self.inner.setup.forget_rehomes(&tenant, session);
+        // A webhook-only state has no relay membership (this coordinator lifetime
+        // never created the session), so retiring it is a harmless no-op; done here
+        // anyway to keep both close paths uniform and the limiter bucket bounded.
+        self.inner.setup.forget_session_membership(&tenant, session);
+        self.inner.setup.rehome_limiter().forget(&tenant, session);
         tracing::debug!(
             tenant = tenant.as_ref(),
             session = session.0,
@@ -1099,6 +1111,158 @@ mod tests {
         assert!(
             dedup.departures.lock().contains(&(tid(), other, SlotId(0))),
             "another session's dedup entry is untouched",
+        );
+    }
+
+    /// A setup with relay 1 enrolled and the test tenant, plus a real two-player
+    /// session created on it — so its `session_relays`/`session_refs` membership is
+    /// recorded, the way a lifecycle full-close later retires. Returns the setup and
+    /// the created session id.
+    fn setup_with_relay_and_session() -> (SessionSetup, SessionId) {
+        use rally_point_proto::control::{PlayerHandoff, RelayHello, SessionRequest};
+        use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
+        use rally_point_proto::version::ProtocolVersion;
+
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![1u8; 4],
+            ),
+        );
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("k1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = crate::session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                ],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        (setup, resp.session)
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_retires_membership_and_limiter_bucket() {
+        // A full close must retire the session's relay membership and drop its
+        // rate-limit bucket, so a straggler cannot re-home (and thus resurrect) a
+        // dead session and the bucket map stays bounded.
+        use crate::rehome::REHOME_BURST;
+        use crate::session::{self, RehomeOutcome};
+
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        // Membership is recorded; exhaust the session's limiter bucket so its later
+        // reset is observable.
+        assert!(
+            !setup.serving_relays(&tid(), s).is_empty(),
+            "membership is recorded before close",
+        );
+        for _ in 0..REHOME_BURST {
+            assert!(setup.rehome_limiter().check(&tid(), s));
+        }
+        assert!(
+            !setup.rehome_limiter().check(&tid(), s),
+            "the bucket is exhausted before close",
+        );
+
+        // The single serving relay reports closed → full close.
+        lc.on_session_closed(tid(), s, RelayId(1));
+
+        assert!(
+            setup.serving_relays(&tid(), s).is_empty(),
+            "close retired the session→relay membership",
+        );
+        // Relay 1 is still enrolled, yet the closed session's empty serving set trips
+        // the guard: the honest terminal answer is Unavailable, not a resurrection.
+        assert_eq!(
+            session::rehome(&setup, &tid(), s, RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
+            "a closed session refuses re-home even while a relay is live",
+        );
+        assert!(
+            setup.rehome_limiter().check(&tid(), s),
+            "close dropped the limiter bucket, so a fresh burst is available",
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_only_reap_retires_membership_harmlessly() {
+        // A webhook-only state (restart amnesia) has no membership to begin with, so
+        // its idle reap runs the same retirement as a no-op. It must not panic, and
+        // the session stays unavailable to re-home afterward.
+        use crate::session::{self, RehomeOutcome};
+
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url.clone());
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, SHORT);
+        let s = SessionId(1);
+
+        lc.enqueue_webhook(
+            tid(),
+            s,
+            NotifyConfig { url },
+            Bytes::from_static(br#"{"event":"departure"}"#),
+            "departure",
+        );
+        assert!(
+            setup.serving_relays(&tid(), s).is_empty(),
+            "a webhook-only session never had membership",
+        );
+
+        // Let its queued webhook deliver, then wait for the idle reap to remove it.
+        let _ = timeout(Duration::from_secs(2), rx.recv()).await;
+        timeout(SHORT * 20, async {
+            loop {
+                if !lc.contains_state(&tid(), s) {
+                    break;
+                }
+                tokio::time::sleep(SHORT / 4).await;
+            }
+        })
+        .await
+        .expect("the webhook-only state is reaped after its idle grace");
+
+        assert!(setup.serving_relays(&tid(), s).is_empty());
+        assert_eq!(
+            session::rehome(&setup, &tid(), s, RelayId(1), vec![]),
+            RehomeOutcome::Unavailable,
+            "still unavailable after the no-op membership retirement",
         );
     }
 }
