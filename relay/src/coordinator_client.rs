@@ -45,7 +45,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor,
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::version::CONTROL_CLOSE_PROTOCOL_MISMATCH;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -188,6 +188,11 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// decided while the coordinator is down goes out on the next successful
 /// connection rather than being lost.
 ///
+/// `sessions` is the relay's live roster: each heartbeat snapshots it and carries
+/// the connected slots up as [`SessionPresence`] entries, feeding the
+/// coordinator's active-player presence store. Only tenant/session/slot ride the
+/// wire — the relay holds no user identity to leak.
+///
 /// `applied` is the shared last-applied session set ([`AppliedSessions`]): this
 /// loop reconciles it on every descriptor push, and the drain sequence reads it
 /// through [`drained_idle`] to tell an assigned-but-not-yet-dialed session from a
@@ -209,6 +214,7 @@ pub async fn run_descriptor_subscriber(
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
+    sessions: Sessions,
     applied: AppliedSessions,
     notices: UnboundedReceiver<RelayNotice>,
     drain: watch::Receiver<bool>,
@@ -219,6 +225,7 @@ pub async fn run_descriptor_subscriber(
         relay_hello,
         bootstrap_secret,
         control,
+        sessions,
         applied,
         notices,
         drain,
@@ -239,6 +246,7 @@ pub async fn run_descriptor_subscriber_with(
     relay_hello: RelayHello,
     bootstrap_secret: Option<String>,
     control: MeshControl,
+    sessions: Sessions,
     // Mutated in place across connections, so it keeps the persist-across-
     // reconnects semantics the loop-local set had: a session removed while
     // disconnected is left when the next connection's full-set re-sync arrives
@@ -264,6 +272,7 @@ pub async fn run_descriptor_subscriber_with(
             &relay_hello,
             bootstrap_secret.as_deref(),
             &control,
+            &sessions,
             &applied,
             &mut notices,
             &mut pending,
@@ -313,6 +322,7 @@ async fn connect_and_stream(
     relay_hello: &RelayHello,
     secret: Option<&str>,
     control: &MeshControl,
+    sessions: &Sessions,
     applied: &AppliedSessions,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
@@ -368,8 +378,14 @@ async fn connect_and_stream(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat)
-                    .expect("a heartbeat always serializes");
+                // Every beat carries the full current roster — declarative and
+                // self-healing (a lost or reordered beat is corrected by the next
+                // one), bounded by the relay's live slots. A delta scheme is a
+                // scale option, not needed at these payload sizes.
+                let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+                    sessions: heartbeat_presence(sessions),
+                })
+                .expect("a heartbeat always serializes");
                 socket.send(Message::Text(frame.into())).await?;
             }
             message = socket.next() => {
@@ -443,6 +459,20 @@ async fn connect_and_stream(
         }
     }
     Ok(ControlDisconnect::Ordinary)
+}
+
+/// Snapshots the relay's live roster into the [`SessionPresence`] entries a
+/// heartbeat carries — one per session with a connected slot, tenant/session/slot
+/// only (the relay holds no user identity to leak).
+fn heartbeat_presence(sessions: &Sessions) -> Vec<SessionPresence> {
+    crate::routing::live_slots(sessions)
+        .into_iter()
+        .map(|(key, slots)| SessionPresence {
+            tenant: key.tenant,
+            session: key.session,
+            slots,
+        })
+        .collect()
 }
 
 /// Sends a [`RelayToCoordinator::Draining`] up the control connection, asking the
@@ -952,6 +982,7 @@ mod tests {
             ),
             None,
             control,
+            Arc::default(),
             AppliedSessions::default(),
             notices_rx,
             drain_rx,
@@ -1098,6 +1129,7 @@ mod tests {
             drain_hello(),
             None,
             control,
+            Arc::default(),
             AppliedSessions::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
@@ -1154,6 +1186,7 @@ mod tests {
             drain_hello(),
             None,
             control,
+            Arc::default(),
             AppliedSessions::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
@@ -1216,6 +1249,7 @@ mod tests {
             drain_hello(),
             None,
             control,
+            Arc::default(),
             AppliedSessions::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
@@ -1229,6 +1263,78 @@ mod tests {
             .await
             .expect("the reconnect re-sends Draining after the Hello")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_carries_the_live_roster_as_presence() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: read the Hello, then the first heartbeat.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = ws.next().await.unwrap().unwrap();
+            let Message::Text(hello) = hello else {
+                panic!("first frame is the Hello");
+            };
+            assert!(hello.contains("\"type\":\"hello\""));
+            let beat = ws.next().await.unwrap().unwrap();
+            let _ = frame_tx.send(beat);
+        });
+
+        // A slot registered in the roster before the subscriber starts, so the
+        // first beat already carries it. The guard is disarmed and the inbox held
+        // so the slot stays registered for the test's duration.
+        let sessions: Sessions = Arc::default();
+        let (mut guard, _inbox) =
+            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3))
+                .expect("slot 3 registers");
+        guard.disarm();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            Arc::clone(&sessions),
+            AppliedSessions::default(),
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked,
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_millis(50), // beat quickly so the test observes one
+        ));
+
+        let beat = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+            .await
+            .expect("a heartbeat arrives")
+            .unwrap();
+        let Message::Text(text) = beat else {
+            panic!("the heartbeat is a text frame");
+        };
+        let decoded: RelayToCoordinator = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            decoded,
+            RelayToCoordinator::Heartbeat {
+                sessions: vec![SessionPresence {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(7),
+                    slots: vec![rally_point_proto::ids::SlotId(3)],
+                }],
+            },
+            "the beat names the registered (tenant, session, slot)",
+        );
     }
 
     // --- Protocol-version refusal backoff ---
@@ -1284,6 +1390,7 @@ mod tests {
             drain_hello(),
             None,
             control,
+            Arc::default(),
             AppliedSessions::default(),
             mpsc::unbounded_channel().1,
             drain_rx,

@@ -383,6 +383,26 @@ pub fn holds_any_slots(sessions: &Sessions) -> bool {
     !sessions.lock().is_empty()
 }
 
+/// The live roster: every routing group with at least one connected slot, each
+/// paired with its currently-connected slots (sorted, for a stable order).
+///
+/// A slot appears exactly while it is registered — the same property
+/// [`holds_any_slots`] documents — so this is the truth the relay's heartbeat
+/// reports up to the coordinator's active-player presence store: connected right
+/// now, nothing softer. A snapshot taken under the roster lock, cheap at a
+/// relay's scale (a handful of sessions, a dozen slots each).
+pub fn live_slots(sessions: &Sessions) -> Vec<(SessionKey, Vec<SlotId>)> {
+    sessions
+        .lock()
+        .iter()
+        .map(|(key, slots)| {
+            let mut slot_ids: Vec<SlotId> = slots.keys().copied().collect();
+            slot_ids.sort_by_key(|s| s.0);
+            (key.clone(), slot_ids)
+        })
+        .collect()
+}
+
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
 /// without ever blocking on a slow peer.
 ///
@@ -2122,6 +2142,26 @@ mod tests {
         drop(guard);
         // The slot — and the now-empty group — are gone, so it registers anew.
         assert!(register(&sessions, &key(), SlotId(0)).is_some());
+    }
+
+    #[test]
+    fn live_slots_snapshots_registered_slots_per_group() {
+        let sessions: Sessions = Arc::default();
+        assert!(live_slots(&sessions).is_empty(), "a fresh roster is empty");
+
+        let (mut g1, _i1) = register(&sessions, &key(), SlotId(2)).expect("slot 2 registers");
+        let (mut g0, _i0) = register(&sessions, &key(), SlotId(0)).expect("slot 0 registers");
+        g0.disarm();
+        g1.disarm();
+
+        let roster = live_slots(&sessions);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].0, key());
+        assert_eq!(
+            roster[0].1,
+            vec![SlotId(0), SlotId(2)],
+            "the group's connected slots, in sorted order",
+        );
     }
 
     #[test]

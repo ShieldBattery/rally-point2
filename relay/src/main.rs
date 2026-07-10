@@ -360,6 +360,7 @@ async fn main() -> Result<()> {
                 relay_hello,
                 cli.coordinator_secret.clone(),
                 mesh_control.clone(),
+                Arc::clone(&sessions),
                 applied.clone(),
                 notices_rx,
                 drain_rx.clone(),

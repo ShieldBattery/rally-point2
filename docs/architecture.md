@@ -672,6 +672,40 @@ but its `sessionClosed` and reaps do not re-arm — the tenant's **batch livenes
 /sessions/alive`, asking which of a set of sessions the coordinator still holds) is the backstop that
 force-reconciles the ones it no longer does.
 
+### Active-player presence
+
+App servers need to ask "is user U in a live game right now" — to block an in-game player from
+re-queueing — and the coordinator is the one place that can answer it: relays see connections, the tenant
+sees its own session bookkeeping, but only the coordinator holds both the fleet's live view and the
+slot→user refs the tenant supplied at session creation. Presence **rides the heartbeat** the relay already
+sends: each beat carries the relay's live roster — every session with a connected slot, and those slots —
+rather than standing up a new channel, because the beat is already the relay's periodic liveness signal on
+an off-hot-path connection, and piggybacking means presence can never be alive while liveness is dead (or
+vice versa). Each beat carries the **whole current roster** (declarative, like the descriptor sets going
+the other way): a lost or reordered beat is corrected by the next one, and the payload is bounded by the
+relay's live slots. An idle relay's beat is byte-identical to the historical payload-free ping, so version
+skew costs nothing.
+
+The coordinator's store maps `(tenant, session, slot)` to the reporting relay + connection **generation** +
+last-seen time. Applying a beat is a per-relay **replace** fenced by the same generation token that fences
+enrollment: a stale connection's late beat (or its teardown, racing a reconnect) can neither wipe nor
+overwrite what the relay's newer connection reports. Freshness is two-tier: a **control-connection drop
+clears its entries immediately** — the prompt "queueable again" signal for the common case — and a **35s
+TTL** (3.5× the 10s heartbeat, so two lost beats never flap an in-game player to queueable; ≥ the 30s
+connection liveness deadline, so per-entry expiry never fires before the wholesale on-drop clear would)
+covers a connection that is up but silent. Expiry is lazy at query time; nothing sweeps, because the
+replace and the on-drop clear already bound the map by live slots.
+
+The tenant asks over `POST /presence/query` (request-signature authed like `/session/create`), naming its
+own user refs; the coordinator resolves them against the fresh entries through the stored session refs and
+answers per user. The endpoint is deliberately **fail-open**: absence of evidence is `in_game: false`. A
+coordinator restart wipes the store (one heartbeat interval repopulates it), a relay flap clears its
+entries — and in every such window, letting an in-game player queue briefly is today's status quo, while
+locking a legitimate player out of matchmaking is strictly worse. Presence means "connected to a relay
+now": a just-created session whose clients haven't dialed is the tenant's own knowledge, not presence's.
+The PII boundary holds throughout — the wire and the relay carry only tenant/session/slot; user identity
+exists solely in the coordinator's tenant-supplied refs, resolved at query time.
+
 ## Components
 
 | Crate | Role |

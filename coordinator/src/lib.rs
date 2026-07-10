@@ -20,6 +20,10 @@
 //!   notices relays report up their control connections, enrich each with the
 //!   session's stored correlation ids + the tenant's notify config, and POST a
 //!   webhook to the tenant.
+//! - **presence** ([`presence`]) — active-player presence: the connected slots
+//!   relays piggyback on their heartbeats, aggregated so a tenant's app server
+//!   can ask "is user U in a live game" and block an in-game player from
+//!   re-queueing.
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
@@ -38,6 +42,7 @@ pub mod api;
 pub mod descriptors;
 pub mod lifecycle;
 pub mod notify;
+pub mod presence;
 pub mod registry;
 pub mod rehome;
 pub mod session;

@@ -36,8 +36,9 @@
 //!
 //! # Inbound request authentication (tenant → coordinator)
 //!
-//! Every tenant-scoped *mutating* endpoint — `POST /session/create` and `POST
-//! /sessions/alive` — requires an Ed25519 request signature from the tenant's
+//! Every tenant-scoped endpoint that mutates or reads per-player state — `POST
+//! /session/create`, `POST /sessions/alive`, and `POST /presence/query` —
+//! requires an Ed25519 request signature from the tenant's
 //! own client key, the mirror image of the coordinator→tenant webhook
 //! signature. The app server signs each request with its client key
 //! (`SB_RP2_CLIENT_KEY`); the coordinator verifies against the public half it
@@ -80,6 +81,7 @@ use serde::{Deserialize, Serialize};
 use crate::descriptors::SlotClose;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
+use crate::presence;
 use crate::registry;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 use crate::tenant;
@@ -176,6 +178,7 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/session/create", post(create_session))
         .route("/session/rehome", post(rehome_session))
         .route("/sessions/alive", post(sessions_alive))
+        .route("/presence/query", post(presence_query))
         .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
         .route("/relay/control", get(relay_control))
         .with_state(state)
@@ -456,6 +459,134 @@ async fn sessions_alive(
     Ok(Json(SessionsAliveResponse { alive }))
 }
 
+/// The most user refs one presence query may ask about, so a caller cannot make
+/// the coordinator resolve an unbounded list. A matchmaking check asks about one
+/// user (or one party's few), so this is generous headroom — the same posture as
+/// [`MAX_LIVENESS_SESSIONS`].
+const MAX_PRESENCE_USERS: usize = 64;
+
+/// Request body for `POST /presence/query`: a tenant and the user refs to probe —
+/// the tenant's own player ids, the same `external_ref` values it attached to
+/// each slot at session creation.
+#[derive(Debug, Deserialize)]
+struct PresenceQueryRequest {
+    tenant: TenantId,
+    users: Vec<String>,
+}
+
+/// Response body for `POST /presence/query`: one answer per queried user, in
+/// request order.
+#[derive(Debug, Serialize)]
+struct PresenceQueryResponse {
+    users: Vec<UserPresence>,
+}
+
+/// One queried user's presence verdict.
+#[derive(Debug, Serialize)]
+struct UserPresence {
+    /// The queried ref, echoed back.
+    user: String,
+    /// Whether any relay currently reports a slot mapped to this user connected.
+    in_game: bool,
+    /// The sessions the user is present in (the coordinator's tenant-scoped ids,
+    /// which this tenant already knows from its own session responses). Included
+    /// for observability; empty when `in_game` is false.
+    sessions: Vec<u64>,
+}
+
+/// Active-player presence query: which of the given users are connected to a
+/// relay in a live game right now — what a tenant's matchmaker consults to block
+/// an in-game player from re-queueing.
+///
+/// Same tenant request-signature auth as `POST /session/create` (see the module
+/// docs); the `tenant` in the body must match the tenant the signature verifies
+/// under. Rejects an over-cap user list rather than resolve it.
+///
+/// **Fail-open, by design.** Absence of evidence answers `in_game: false`. The
+/// presence store is in-memory truth fed by relay heartbeats: a coordinator
+/// restart wipes it (the next round of beats repopulates it within one ~10s
+/// interval), a relay's control-connection flap clears that relay's entries, and
+/// an expired TTL reads as absent. In every one of those unavailable states the
+/// endpoint must NOT lock players out of matchmaking — letting an in-game player
+/// queue briefly is today's status quo, while locking out a legitimate player is
+/// strictly worse. Callers should treat `true` as authoritative and `false` as
+/// "no evidence".
+///
+/// **Semantics, honestly:** presence means "connected to a relay now". A
+/// just-created session whose clients have not dialed yet is the tenant's own
+/// knowledge (it created it); it does not read as presence here until the
+/// clients connect.
+///
+/// Resolution is coordinator-side only: relays report tenant/session/slot, and
+/// slots map to user refs through the session refs the tenant supplied at
+/// creation — no user identity ever reaches a relay.
+async fn presence_query(
+    State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<PresenceQueryResponse>, StatusCode> {
+    let request: PresenceQueryRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    )?;
+
+    if request.users.len() > MAX_PRESENCE_USERS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // Snapshot the tenant's fresh presence and resolve each (session, slot) to
+    // the tenant's user ref through the stored session refs. A session with no
+    // stored refs (created before a restart wiped them, or with no external_refs
+    // supplied) resolves to no users — fail-open.
+    let fresh = presence::fresh_slots(
+        state.setup.presence(),
+        &request.tenant,
+        std::time::Instant::now(),
+    );
+    let mut sessions_by_user: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+        std::collections::HashMap::new();
+    let mut refs_by_session: std::collections::HashMap<SessionId, Option<session::SessionRefs>> =
+        std::collections::HashMap::new();
+    for (session_id, slot) in fresh {
+        let refs = refs_by_session
+            .entry(session_id)
+            .or_insert_with(|| session::session_refs(&state.setup, &request.tenant, session_id));
+        if let Some(refs) = refs
+            && let Some(user) = refs.slots.get(&slot)
+        {
+            sessions_by_user
+                .entry(user.clone())
+                .or_default()
+                .insert(session_id.0);
+        }
+    }
+
+    let users = request
+        .users
+        .into_iter()
+        .map(|user| {
+            let sessions: Vec<u64> = sessions_by_user
+                .get(&user)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            UserPresence {
+                in_game: !sessions.is_empty(),
+                user,
+                sessions,
+            }
+        })
+        .collect();
+    Ok(Json(PresenceQueryResponse { users }))
+}
+
 /// Response body for `GET /tenant/:tenant/pubkey`.
 ///
 /// camelCase (not the control plane's snake_case): this is tenant-facing
@@ -610,6 +741,13 @@ async fn serve_relay_control(
     )
     .await;
 
+    // The connection ended: clear the presence this connection reported, so its
+    // players read as queueable promptly rather than waiting out the TTL. Fenced
+    // by this connection's exact generation — a stale drop racing a reconnect
+    // removes only its own entries, never the fresh presence the reconnected
+    // connection has already reported — the same race `remove_if_current` closes
+    // for the registry entry itself.
+    presence::clear_connection(setup.presence(), relay_id, generation);
     if registry::remove_if_current(registry, relay_id, generation) {
         tracing::info!(
             relay_id = relay_id.0,
@@ -684,7 +822,8 @@ async fn push_and_watch(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        let action = note_inbound(setup, notices, lifecycle, relay_id, &message);
+                        let action =
+                            note_inbound(setup, notices, lifecycle, relay_id, generation, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                         // A Draining frame additionally runs the drain exchange: mark
@@ -895,14 +1034,35 @@ fn note_inbound(
     notices: &NoticeDedup,
     lifecycle: &Lifecycle,
     relay_id: RelayId,
+    generation: u64,
     message: &Message,
 ) -> InboundAction {
     let Message::Text(text) = message else {
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
-        Ok(RelayToCoordinator::Heartbeat) => {
+        Ok(RelayToCoordinator::Heartbeat { sessions }) => {
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat");
+            // The beat's roster feeds active-player presence — but only from the
+            // relay's CURRENT connection. A stale connection's late beat (a
+            // reconnect raced it) is dropped whole: its roster describes a
+            // superseded view, and applying it would overwrite what the live
+            // connection reports. (The store's own generation fences are the
+            // second line of defense.)
+            if registry::generation_is_current(setup.registry(), relay_id, generation) {
+                presence::apply_heartbeat(
+                    setup.presence(),
+                    relay_id,
+                    generation,
+                    &sessions,
+                    std::time::Instant::now(),
+                );
+            } else {
+                tracing::debug!(
+                    relay_id = relay_id.0,
+                    "dropping a heartbeat roster from a stale control connection",
+                );
+            }
             InboundAction::None
         }
         Ok(RelayToCoordinator::Draining) => {
@@ -1021,7 +1181,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                     // up-frame before the enroll Hello is a protocol violation:
                     // enrollment comes first.
                     Ok(
-                        RelayToCoordinator::Heartbeat
+                        RelayToCoordinator::Heartbeat { .. }
                         | RelayToCoordinator::Draining
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)
@@ -1823,6 +1983,7 @@ mod tests {
             &notices,
             &lifecycle,
             RelayId(2),
+            0, // no live connection generation in this direct-call test
             &result_message(session, 0),
         );
 
@@ -1844,6 +2005,7 @@ mod tests {
             &notices,
             &lifecycle,
             RelayId(1),
+            0, // no live connection generation in this direct-call test
             &result_message(session, 0),
         );
 
@@ -1868,6 +2030,7 @@ mod tests {
             &notices,
             &lifecycle,
             RelayId(2),
+            0, // no live connection generation in this direct-call test
             &result_message(SessionId(4242), 0),
         );
 
@@ -2146,5 +2309,173 @@ mod tests {
             json["relay"]["relay_id"], 2,
             "the recorded replacement is served despite the exhausted bucket",
         );
+    }
+
+    // --- Active-player presence query ---
+
+    /// Creates a one-slot session for `sb-test` whose slot 0 carries the given
+    /// user ref, returning its id. The session homes on the fixture's relay 1.
+    fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
+        crate::session::create_session(
+            &state.setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: Some(user.to_owned()),
+                    observer: false,
+                }],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .session
+    }
+
+    /// The heartbeat roster naming `session`'s slot 0 — what relay 1's beat
+    /// carries while that slot's client is connected.
+    fn slot0_roster(session: SessionId) -> Vec<rally_point_proto::control::SessionPresence> {
+        vec![rally_point_proto::control::SessionPresence {
+            tenant: TenantId("sb-test".to_owned()),
+            session,
+            slots: vec![SlotId(0)],
+        }]
+    }
+
+    /// The signed presence-query body `{tenant, users}`.
+    fn presence_body(tenant: &str, users: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "tenant": tenant, "users": users })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn presence_query_reports_a_beating_user_in_game_and_an_unknown_one_not() {
+        let state = state_with_relay_and_tenant();
+        let session = create_session_with_user(&state, "sb-user-7");
+        // Relay 1's heartbeat reports the slot connected.
+        presence::apply_heartbeat(
+            state.setup.presence(),
+            RelayId(1),
+            1,
+            &slot0_roster(session),
+            std::time::Instant::now(),
+        );
+
+        let body = presence_body("sb-test", &["sb-user-7", "sb-user-9"]);
+        let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let users = json["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2, "one answer per queried user, in order");
+        assert_eq!(users[0]["user"], "sb-user-7");
+        assert_eq!(users[0]["in_game"], true);
+        assert_eq!(
+            users[0]["sessions"].as_array().unwrap(),
+            &vec![serde_json::json!(session.0)],
+            "the present user's session id rides along for observability",
+        );
+        assert_eq!(users[1]["user"], "sb-user-9");
+        assert_eq!(users[1]["in_game"], false, "no evidence means not in game");
+        assert!(users[1]["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn presence_query_reads_an_expired_entry_as_not_in_game() {
+        // A beat older than the TTL no longer counts — fail-open: a silent relay's
+        // players read as queueable rather than locked out.
+        let state = state_with_relay_and_tenant();
+        let session = create_session_with_user(&state, "sb-user-7");
+        let stale = std::time::Instant::now()
+            .checked_sub(presence::PRESENCE_TTL + Duration::from_secs(1))
+            .expect("host uptime exceeds the presence TTL");
+        presence::apply_heartbeat(
+            state.setup.presence(),
+            RelayId(1),
+            1,
+            &slot0_roster(session),
+            stale,
+        );
+
+        let body = presence_body("sb-test", &["sb-user-7"]);
+        let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["users"][0]["in_game"], false);
+    }
+
+    #[tokio::test]
+    async fn presence_query_reads_a_cleared_connection_as_not_in_game() {
+        // The relay's control connection dropped: its presence was cleared
+        // promptly, so its players read as queueable without waiting out the TTL.
+        let state = state_with_relay_and_tenant();
+        let session = create_session_with_user(&state, "sb-user-7");
+        presence::apply_heartbeat(
+            state.setup.presence(),
+            RelayId(1),
+            1,
+            &slot0_roster(session),
+            std::time::Instant::now(),
+        );
+        presence::clear_connection(state.setup.presence(), RelayId(1), 1);
+
+        let body = presence_body("sb-test", &["sb-user-7"]);
+        let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["users"][0]["in_game"], false);
+    }
+
+    #[tokio::test]
+    async fn presence_query_rejects_unsigned_and_wrong_key_requests_alike() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+        let body = presence_body("sb-test", &["sb-user-7"]);
+
+        // No signature headers at all — fails closed.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/presence/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Signed by a key that is not the tenant's enrolled request key — the
+        // same indistinguishable 401.
+        let resp = signed_post(app, "/presence/query", &body, &[0x99; 32]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn presence_query_rejects_an_over_cap_user_list() {
+        // An over-cap list is rejected rather than resolved, past the auth gate —
+        // the same shape as the sessions-alive probe cap.
+        let state = state_with_relay_and_tenant();
+        let too_many: Vec<String> = (0..=MAX_PRESENCE_USERS)
+            .map(|i| format!("sb-user-{i}"))
+            .collect();
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "users": too_many }))
+                .unwrap();
+        let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -658,19 +658,35 @@ pub enum RelayToCoordinator {
     /// The relay's identity and reachable address, sent as the first frame to
     /// enroll into the coordinator's registry.
     Hello(RelayHello),
-    /// A periodic presence ping proving the control connection is still alive.
+    /// A periodic presence ping proving the control connection is still alive,
+    /// carrying the relay's live roster.
     ///
     /// The coordinator resets a per-connection liveness deadline on each one;
     /// when enough are missed — a relay that crashed, or a TCP connection that
     /// died without ever sending a close — the deadline lapses, the coordinator
-    /// drops the connection and deregisters the relay. It carries no payload:
-    /// presence is the whole signal. Richer periodic status (session count, load)
-    /// can ride a later frame, which the forward-compatible envelope already
-    /// accommodates without a wire break.
-    Heartbeat,
+    /// drops the connection and deregisters the relay.
+    ///
+    /// `sessions` piggybacks the relay's **connected slots** on the beat the relay
+    /// already sends: each entry names one session and the slots whose clients are
+    /// connected right now, the whole current truth every time (declarative, so a
+    /// lost or reordered beat is corrected by the next one). The coordinator feeds
+    /// it into its active-player presence store, which tenant app servers query to
+    /// block an in-game player from re-queueing. An idle relay's beat carries no
+    /// entries and serializes exactly as the payload-free ping always did, so an
+    /// older coordinator reads it unchanged.
+    ///
+    /// The frame carries only tenant/session/slot — **never user identity**: the
+    /// relay stays PII-free, and slots are resolved to the tenant's own user refs
+    /// on the coordinator, which already holds them from session creation.
+    Heartbeat {
+        /// The relay's live roster: one entry per session it currently holds a
+        /// connected slot for. Empty (and omitted from the wire) on an idle relay.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sessions: Vec<SessionPresence>,
+    },
     /// The relay has received its shutdown signal and asks the coordinator to
     /// **stop assigning it new sessions**. The control connection itself identifies
-    /// the relay, so — like [`Heartbeat`](Self::Heartbeat) — it carries no payload.
+    /// the relay, so it carries no payload.
     ///
     /// The coordinator marks the relay ineligible for assignment, then answers with
     /// [`DrainAck`](CoordinatorToRelay::DrainAck) after pushing the relay's current
@@ -721,6 +737,25 @@ pub enum RelayToCoordinator {
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
     Unknown,
+}
+
+/// One session's connected slots on one relay, as carried in a
+/// [`RelayToCoordinator::Heartbeat`]'s roster.
+///
+/// A slot appears exactly while its client's link is registered on the relay —
+/// the same liveness the relay's own drain path keys on — so the coordinator's
+/// presence store tracks "connected to a relay now", nothing softer. Deliberately
+/// slot-granular and PII-free: the relay never learns user identity, and the
+/// coordinator resolves slots to the tenant's own user refs from the session
+/// request it already holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPresence {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session with connected slots on the reporting relay.
+    pub session: SessionId,
+    /// The slots whose clients are connected to the reporting relay right now.
+    pub slots: Vec<SlotId>,
 }
 
 /// Whether a departing player left cleanly or was dropped, classified by the
@@ -1098,12 +1133,59 @@ mod tests {
 
     #[test]
     fn relay_to_coordinator_heartbeat_roundtrips_json() {
-        let message = RelayToCoordinator::Heartbeat;
+        let message = RelayToCoordinator::Heartbeat { sessions: vec![] };
         let json = serde_json::to_string(&message).unwrap();
-        // A payload-free presence ping: just the tag, no other fields.
+        // An idle relay's beat is byte-identical to the historical payload-free
+        // ping: just the tag, the empty roster omitted from the wire — so an older
+        // coordinator reads it unchanged.
         assert_eq!(json, r#"{"type":"heartbeat"}"#);
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn a_bare_heartbeat_decodes_with_an_empty_roster() {
+        // A beat from a relay that predates the presence roster carries no
+        // `sessions` field; it must decode with an empty roster, not error.
+        let json = r#"{"type":"heartbeat"}"#;
+        let back: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(back, RelayToCoordinator::Heartbeat { sessions: vec![] });
+    }
+
+    #[test]
+    fn a_presence_bearing_heartbeat_roundtrips_json() {
+        let message = RelayToCoordinator::Heartbeat {
+            sessions: vec![SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                slots: vec![SlotId(0), SlotId(3)],
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"sessions\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn a_presence_bearing_heartbeat_decodes_on_a_pre_presence_decoder() {
+        // A newer relay's roster-bearing beat read by a coordinator whose enum
+        // still has the payload-free unit variant: internally-tagged serde ignores
+        // the unrecognized `sessions` field, so the old build reads a plain
+        // heartbeat rather than erroring — the beat stays a liveness signal.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PrePresenceRelayToCoordinator {
+            Heartbeat,
+            #[serde(other)]
+            #[allow(dead_code)]
+            Unknown,
+        }
+        let json =
+            r#"{"type":"heartbeat","sessions":[{"tenant":"sb-staging","session":42,"slots":[0]}]}"#;
+        let decoded: PrePresenceRelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, PrePresenceRelayToCoordinator::Heartbeat);
     }
 
     #[test]

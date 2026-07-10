@@ -36,6 +36,7 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
 
 use crate::descriptors::{RelayDescriptors, RelayReaps};
+use crate::presence::PresenceStore;
 use crate::registry::{self, RelayRegistry, SessionSetupError};
 use crate::rehome::RehomeLimiter;
 use crate::tenant::{self, TenantStore};
@@ -105,6 +106,11 @@ pub struct SessionSetup {
     /// reconnect. Drained by the relay's control connection alongside the
     /// descriptor set.
     reaps: RelayReaps,
+    /// Active-player presence — the connected slots relays report on their
+    /// heartbeats. Fed by the relay control connections, read by the tenant's
+    /// `POST /presence/query`. Held here alongside the registry it is fenced
+    /// against (both are the coordinator's live view of the fleet).
+    presence: PresenceStore,
     /// The session-id counter, seeded from wall-clock time at construction.
     /// Monotonic within this coordinator's lifetime; scoped per `SessionSetup`
     /// instance. Session ids are unique within a tenant but not globally (two
@@ -166,6 +172,7 @@ impl SessionSetup {
             session_refs: Arc::new(Mutex::new(HashMap::new())),
             descriptors: RelayDescriptors::new(),
             reaps: RelayReaps::new(),
+            presence: crate::presence::new_store(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter,
@@ -195,6 +202,12 @@ impl SessionSetup {
     /// the reap policies push `CloseSlot` directives into it).
     pub fn reaps(&self) -> &RelayReaps {
         &self.reaps
+    }
+
+    /// Exposes the active-player presence store (the control connection applies
+    /// heartbeat rosters into it; the presence-query endpoint reads it).
+    pub fn presence(&self) -> &PresenceStore {
+        &self.presence
     }
 
     /// The relays serving `session`, as recorded at `create_session` — the

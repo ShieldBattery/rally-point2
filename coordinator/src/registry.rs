@@ -135,6 +135,19 @@ pub fn is_available(registry: &RelayRegistry, id: RelayId) -> bool {
         .is_some_and(|r| !r.draining)
 }
 
+/// Whether `generation` is still the generation enrolled for `id` — i.e. the
+/// control connection that enrolled under it is the relay's *current* one, not a
+/// stale predecessor a reconnect has since replaced. The gate a heartbeat's
+/// presence roster passes before it is applied: state reported over a superseded
+/// connection must not overwrite what the live connection reports.
+pub fn generation_is_current(registry: &RelayRegistry, id: RelayId, generation: u64) -> bool {
+    registry
+        .relays
+        .lock()
+        .get(&id)
+        .is_some_and(|r| r.generation == generation)
+}
+
 /// Looks up a relay by id, returning a [`RelayPeer`] (the id, address, and
 /// pinned cert a session descriptor carries — the cert the relay reported at
 /// enrollment, so a peer relay dialing it pins exactly what clients pin).
@@ -390,6 +403,21 @@ mod tests {
         // The live connection's own Draining applies.
         assert!(mark_draining(&reg, RelayId(1), current));
         assert!(!is_available(&reg, RelayId(1)));
+    }
+
+    #[test]
+    fn generation_is_current_tracks_re_enrollment() {
+        let reg = new_registry();
+        let stale = enroll(&reg, hello(1, 14900));
+        assert!(generation_is_current(&reg, RelayId(1), stale));
+
+        // A reconnect re-enrolls with a newer generation: the old one is stale.
+        let current = enroll(&reg, hello(1, 14999));
+        assert!(!generation_is_current(&reg, RelayId(1), stale));
+        assert!(generation_is_current(&reg, RelayId(1), current));
+
+        // An unknown relay has no current generation at all.
+        assert!(!generation_is_current(&reg, RelayId(9), current));
     }
 
     #[test]
