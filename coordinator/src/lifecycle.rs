@@ -33,12 +33,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rally_point_proto::control::{DepartedSlot, DepartureKind, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
+use rally_point_proto::token::ExpiresAt;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -65,6 +66,77 @@ pub const LINGER_REAP_GRACE: Duration = Duration::from_secs(60);
 /// before it is removed. Without this such an entry (and its parked drain task)
 /// would leak for the process lifetime, one per in-flight game across a restart.
 pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
+
+/// The floor under the never-started reap window: how long a freshly created
+/// session is given to actually start — a real client dialing in, reported
+/// either by a relay heartbeat or by an accounting event — before the
+/// coordinator concludes nobody ever will and retires it. Comfortably covers
+/// realistic matchmaking-to-dial latency (queueing, retries, a slow client)
+/// while still bounding an abandoned create's leak to a bounded span rather
+/// than forever.
+///
+/// This is the floor, not the whole story: [`never_started_grace`] takes the
+/// LATER of this and the session's own token expiry (plus
+/// [`NEVER_STARTED_EXPIRY_MARGIN`]), so a session whose tokens are still
+/// legitimately usable is never reaped out from under a client that could
+/// still dial in. Today's only production caller mints tokens with no real
+/// expiry (`ExpiresAt(u64::MAX)`), which reads as "no signal" rather than "584
+/// billion years from now" — see `never_started_grace`'s own doc — so in
+/// practice this floor is what governs every session until a tenant-facing
+/// finite expiry exists.
+pub const NEVER_STARTED_REAP_FLOOR: Duration = Duration::from_secs(15 * 60);
+
+/// Extra margin held past a session's token expiry (when it has a real one)
+/// before the never-started reap fires, so a client racing the exact expiry
+/// instant is not cut off by the reaper before its own token-expiry
+/// rejection would have applied anyway.
+pub const NEVER_STARTED_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+
+/// How long a freshly created session gets before the never-started reap
+/// concludes nobody ever dialed in: the later of `floor` and however long
+/// `expires_at`'s tokens still have left, plus `expiry_margin`. Production
+/// calls always pass [`NEVER_STARTED_REAP_FLOOR`] and
+/// [`NEVER_STARTED_EXPIRY_MARGIN`]; both are parameters (rather than the bare
+/// constants) so a test can shrink the floor without waiting out the
+/// production window.
+///
+/// `u64::MAX` — the sentinel a caller mints when it wants tokens that
+/// effectively never expire (today's only production caller always does) —
+/// is treated as "no real expiry was set", not as a literal ~584-billion-year
+/// deadline: computing a duration from it and taking the max against the
+/// floor would make the floor irrelevant and the reaper never fire, exactly
+/// backwards from the point of having one. Only a genuinely finite
+/// `expires_at` can push the window out past the floor.
+fn never_started_grace(expires_at: ExpiresAt, floor: Duration, expiry_margin: Duration) -> Duration {
+    if expires_at.0 == u64::MAX {
+        return floor;
+    }
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let until_expiry = Duration::from_secs(expires_at.0.saturating_sub(now_unix));
+    floor.max(until_expiry.saturating_add(expiry_margin))
+}
+
+/// One session's ordered dispatch queue's capacity. A session's genuine
+/// notice volume is small and bounded by its slot count: at most one
+/// departure and one result per slot (12 slots, BW's cap), a handful of
+/// desyncs, and the one terminal `sessionClosed`. This is sized with wide
+/// headroom over that — reachable only by a bug or abuse, never by an
+/// honest game — so [`Lifecycle::enqueue_webhook`]'s overflow drop (see its
+/// own doc) is a backstop, not a limit real traffic ever brushes against.
+/// One slot is implicitly reserved for the terminal job: an ordinary notice
+/// only ever fills the queue to `NOTICE_QUEUE_CAPACITY - 1`, so
+/// `sessionClosed` always finds room (see [`Lifecycle::push_terminal`]).
+const NOTICE_QUEUE_CAPACITY: usize = 128;
+
+/// How many non-terminal notices this coordinator has ever dropped from a
+/// full session queue — process-wide, not per-session. Expected to stay at
+/// zero in production; a nonzero value means [`NOTICE_QUEUE_CAPACITY`] was
+/// actually reached, which given its headroom is itself worth alerting on.
+/// Exposed only for tests to observe the drop without scraping logs.
+static DROPPED_NOTICE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A `(tenant, session)` key for the per-session lifecycle map.
 type SessionRef = (TenantId, SessionId);
@@ -106,8 +178,11 @@ struct SessionState {
     /// Whether the final `sessionClosed` webhook has been enqueued, so it fires
     /// exactly once.
     session_closed_enqueued: bool,
-    /// The sender onto the session's ordered dispatch queue.
-    queue: mpsc::UnboundedSender<WebhookJob>,
+    /// The sender onto the session's ordered dispatch queue, bounded to
+    /// [`NOTICE_QUEUE_CAPACITY`] (see [`Lifecycle::enqueue_webhook`] and
+    /// [`Lifecycle::push_terminal`] for how the two kinds of push treat it
+    /// differently).
+    queue: mpsc::Sender<WebhookJob>,
     /// The armed holdout-reap timer, if any (aborted on disarm/re-arm).
     holdout_timer: Option<AbortHandle>,
     /// The armed linger-reap timer, if any.
@@ -117,6 +192,21 @@ struct SessionState {
     /// it measures idle time since the last one; disarmed if the state ever gains a
     /// serving relay (it then has the normal all-relays-closed removal path).
     webhook_timer: Option<AbortHandle>,
+    /// Whether this session has been observed to have actually started: a
+    /// relay's heartbeat reported a connected slot for it
+    /// ([`Lifecycle::on_presence_seen`]), or some accounting event
+    /// (departure/result) arrived — either only possible once a real client
+    /// has dialed in. Distinguishes "created but no client ever showed up"
+    /// from "legitimately still setting up" so [`fire_never_started`] can
+    /// re-check this under the lock rather than trusting its timer's abort
+    /// alone to have won the race against a client dialing in right at the
+    /// edge of the grace window.
+    started: bool,
+    /// The armed never-started reap timer, if any — set at
+    /// [`Lifecycle::register_session`] and disarmed the moment `started`
+    /// becomes true. `None` once the session has started (or been reaped);
+    /// never re-armed after that.
+    never_started_timer: Option<AbortHandle>,
 }
 
 impl SessionState {
@@ -153,6 +243,17 @@ struct Inner {
     holdout_grace: Duration,
     linger_grace: Duration,
     webhook_grace: Duration,
+    /// Each new session's dispatch queue capacity — [`NOTICE_QUEUE_CAPACITY`]
+    /// in production; injectable ([`Lifecycle::with_test_tunables`]) so a
+    /// queue-overflow test doesn't need to push the full production headroom
+    /// through a fake endpoint to observe the drop policy.
+    queue_capacity: usize,
+    /// The never-started reap's floor and expiry margin —
+    /// [`NEVER_STARTED_REAP_FLOOR`] and [`NEVER_STARTED_EXPIRY_MARGIN`] in
+    /// production; injectable ([`Lifecycle::with_test_tunables`]) for the
+    /// same reason as `queue_capacity`.
+    never_started_floor: Duration,
+    never_started_expiry_margin: Duration,
     /// The notice dedup sets to prune when a session's state is removed, wired in
     /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
     /// built without one (a test that never exercises dedup) simply skips pruning.
@@ -185,6 +286,40 @@ impl Lifecycle {
                 holdout_grace,
                 linger_grace,
                 webhook_grace,
+                queue_capacity: NOTICE_QUEUE_CAPACITY,
+                never_started_floor: NEVER_STARTED_REAP_FLOOR,
+                never_started_expiry_margin: NEVER_STARTED_EXPIRY_MARGIN,
+                dedup: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// [`with_graces`](Self::with_graces) plus every other production
+    /// constant a test might need to shrink: the per-session queue capacity
+    /// and the never-started reap's floor and expiry margin. Each defaults
+    /// to its production value in [`with_graces`](Self::with_graces); this
+    /// exists only so a test can override the ones it actually cares about
+    /// without waiting out the real windows.
+    #[cfg(test)]
+    fn with_test_tunables(
+        setup: SessionSetup,
+        holdout_grace: Duration,
+        linger_grace: Duration,
+        webhook_grace: Duration,
+        queue_capacity: usize,
+        never_started_floor: Duration,
+        never_started_expiry_margin: Duration,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                setup,
+                sessions: Mutex::new(HashMap::new()),
+                holdout_grace,
+                linger_grace,
+                webhook_grace,
+                queue_capacity,
+                never_started_floor,
+                never_started_expiry_margin,
                 dedup: OnceLock::new(),
             }),
         }
@@ -198,9 +333,14 @@ impl Lifecycle {
     }
 
     /// Records a freshly created session's serving relays and its player/observer
-    /// slot split, spawning its ordered dispatch queue. Called from
+    /// slot split, spawning its ordered dispatch queue, and arms the
+    /// never-started reap for it (see [`fire_never_started`]). Called from
     /// `create_session`. A repeat call (a session id collision, or a re-create)
     /// replaces the accounting inputs while keeping the existing queue.
+    ///
+    /// `expires_at` is the tokens' expiry the create minted, carried through
+    /// only to size the never-started grace window
+    /// ([`never_started_grace`]) — it is not otherwise interpreted here.
     pub fn register_session(
         &self,
         tenant: TenantId,
@@ -208,10 +348,11 @@ impl Lifecycle {
         serving_relays: Vec<RelayId>,
         player_slots: HashSet<SlotId>,
         observer_slots: HashSet<SlotId>,
+        expires_at: ExpiresAt,
     ) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
-            .entry((tenant, session))
+            .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
         state.serving_relays = serving_relays;
         state.player_slots = player_slots;
@@ -223,6 +364,21 @@ impl Lifecycle {
             && let Some(timer) = state.webhook_timer.take()
         {
             timer.abort();
+        }
+        // A repeat registration re-arms the never-started clock fresh (a
+        // re-create is, from this session's perspective, starting over) --
+        // unless the session is already known to have started, in which case
+        // there is nothing left for this reap to protect against.
+        if let Some(timer) = state.never_started_timer.take() {
+            timer.abort();
+        }
+        if !state.started {
+            let grace = never_started_grace(
+                expires_at,
+                self.inner.never_started_floor,
+                self.inner.never_started_expiry_margin,
+            );
+            state.never_started_timer = Some(self.arm_never_started(tenant, session, grace));
         }
     }
 
@@ -280,6 +436,10 @@ impl Lifecycle {
         if state.player_slots.contains(&slot) {
             state.accounted.insert(slot);
         }
+        // A departure is only possible once a real client has been there —
+        // proof enough to cancel the never-started reap even without a
+        // heartbeat ever having reported this slot connected.
+        self.mark_started(state);
         self.reevaluate_reaps(&tenant, session, state);
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
@@ -315,8 +475,43 @@ impl Lifecycle {
         if state.player_slots.contains(&slot) {
             state.accounted.insert(slot);
         }
+        // A result is only possible once a real client has played -- see the
+        // matching note on `on_departure`.
+        self.mark_started(state);
         self.reevaluate_reaps(&tenant, session, state);
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// Records that some relay's heartbeat reported at least one connected
+    /// slot for `session` — the coordinator's own "a real client is here"
+    /// signal, distinct from any accounting event (a client can stay
+    /// connected a long time before it ever departs or reports a result).
+    /// Cancels the never-started reap timer if one is armed.
+    ///
+    /// Deliberately does NOT lazily create a webhook-only state the way
+    /// `on_departure`/`on_result`/`enqueue_webhook` do: a session this
+    /// coordinator lifetime never registered has no never-started timer to
+    /// cancel in the first place, and heartbeats arrive constantly (every
+    /// live session, every ~10s, from every relay serving it) — spinning up
+    /// a whole state (with its own drain task) just to immediately do
+    /// nothing with it would itself leak one per pre-existing session across
+    /// every coordinator restart until its own idle grace caught up.
+    pub fn on_presence_seen(&self, tenant: TenantId, session: SessionId) {
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get_mut(&(tenant, session)) else {
+            return; // untracked: never registered this lifetime, or already closed
+        };
+        self.mark_started(state);
+    }
+
+    /// Marks `state` as started and cancels its never-started reap timer, if
+    /// one is armed. Idempotent — called from every path that proves a real
+    /// client has been present.
+    fn mark_started(&self, state: &mut SessionState) {
+        state.started = true;
+        if let Some(timer) = state.never_started_timer.take() {
+            timer.abort();
+        }
     }
 
     /// Records a relay's `SessionClosed`. When every assigned serving relay has
@@ -333,21 +528,50 @@ impl Lifecycle {
             return;
         }
         state.session_closed_enqueued = true;
-        // Build the sessionClosed job, enqueue it behind everything already in the
-        // queue, then reap the state: the queue's own sender lives on in the
-        // detached drain task, which delivers the final job and then exits.
+        let state = sessions.remove(&key).expect("just held it");
+        drop(sessions);
+        self.close_and_retire(tenant.clone(), session, state);
+        tracing::info!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            "session fully closed; sessionClosed enqueued",
+        );
+    }
+
+    /// Enqueues the final `sessionClosed` webhook (if the tenant has notify
+    /// config) behind whatever is already in `state`'s queue, then retires
+    /// every piece of this session's coordinator-side state — its reap
+    /// timers, dedup entries, pending reap directives, relay membership and
+    /// descriptors, and the rehome idempotency record.
+    ///
+    /// Shared by the two paths that ever declare a session over: every
+    /// serving relay reporting closed (`on_session_closed`), and a session
+    /// whose never-started grace lapsed with no client ever having dialed in
+    /// (`fire_never_started`) — the tenant learns a session died unborn
+    /// exactly the same way it learns one closed normally. The caller has
+    /// already removed `state` from the session map and taken responsibility
+    /// for whatever gate decided the session is actually over (all relays
+    /// closed, or the never-started grace); this only ever performs the
+    /// retirement itself.
+    fn close_and_retire(&self, tenant: TenantId, session: SessionId, state: SessionState) {
+        // Build the sessionClosed job and enqueue it behind everything already in
+        // the queue: the queue's own sender lives on in the detached drain task,
+        // which delivers the final job and then exits.
         if let Some((config, body)) =
             notify::session_closed_dispatch(&self.inner.setup, &tenant, session)
         {
-            let _ = state.queue.send(WebhookJob {
-                tenant: tenant.clone(),
-                config,
-                body,
-                kind: "sessionClosed",
-            });
+            self.push_terminal(
+                &tenant,
+                session,
+                state.queue.clone(),
+                WebhookJob {
+                    tenant: tenant.clone(),
+                    config,
+                    body,
+                    kind: "sessionClosed",
+                },
+            );
         }
-        let state = sessions.remove(&key).expect("just held it");
-        drop(sessions);
         abort_timers(&state);
         // The session is done: drop its dedup entries so they don't accumulate for
         // the process lifetime, and retire any pending reap directives so they are
@@ -386,16 +610,16 @@ impl Lifecycle {
         }
         self.inner.setup.forget_rehomes(&tenant, session);
         self.inner.setup.rehome_limiter().forget(&tenant, session);
-        tracing::info!(
-            tenant = tenant.as_ref(),
-            session = session.0,
-            "session fully closed; sessionClosed enqueued",
-        );
     }
 
     /// Enqueues a webhook onto the session's ordered dispatch queue, creating a
     /// webhook-only queue on the fly for a session this coordinator lifetime never
     /// created (restart amnesia — the departure still delivers, serialized).
+    ///
+    /// This is the non-terminal (departure/desync/result) path: it may drop
+    /// the notice instead of enqueueing it — see [`push_ordinary`](Self::push_ordinary).
+    /// The terminal `sessionClosed` job is never routed through here; it has
+    /// its own push ([`push_terminal`](Self::push_terminal)) that may not drop.
     pub fn enqueue_webhook(
         &self,
         tenant: TenantId,
@@ -408,13 +632,99 @@ impl Lifecycle {
         let state = sessions
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
-        let _ = state.queue.send(WebhookJob {
-            tenant: tenant.clone(),
-            config,
-            body,
-            kind,
-        });
+        self.push_ordinary(
+            &tenant,
+            session,
+            state,
+            WebhookJob {
+                tenant: tenant.clone(),
+                config,
+                body,
+                kind,
+            },
+        );
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// Pushes a non-terminal notice onto `state`'s queue, reserving its last
+    /// slot for the session's eventual terminal `sessionClosed` job: an
+    /// ordinary notice is sent only while the queue has room to spare beyond
+    /// that one slot, so `sessionClosed` can never itself be the notice an
+    /// overflow drops (see [`push_terminal`](Self::push_terminal)).
+    ///
+    /// On overflow, the notice being pushed — the newest one for the session
+    /// — is the one dropped, loudly (a `warn!` plus [`DROPPED_NOTICE_COUNT`]).
+    /// Everything already queued keeps its place: the queue never reorders,
+    /// and nothing already accepted is evicted to make room. Given
+    /// [`NOTICE_QUEUE_CAPACITY`]'s headroom over any honest session's real
+    /// notice volume, this should only ever fire under a bug or abuse.
+    fn push_ordinary(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        state: &SessionState,
+        job: WebhookJob,
+    ) {
+        // `capacity()` is the number of additional sends the channel can
+        // currently accept; requiring more than 1 before sending is what
+        // keeps the last slot free for the terminal push. Every push onto one
+        // session's queue runs under `self.inner.sessions`'s lock (there is no
+        // other producer that could race this check against the send), so
+        // this is effectively atomic in practice, not just in the common case.
+        if state.queue.capacity() <= 1 {
+            DROPPED_NOTICE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                tenant = tenant.as_ref(),
+                session = session.0,
+                kind = job.kind,
+                capacity = self.inner.queue_capacity,
+                "notice queue full; dropping the newest notice",
+            );
+            return;
+        }
+        let _ = state.queue.try_send(job);
+    }
+
+    /// Pushes the session's terminal `sessionClosed` job onto `queue`. Must
+    /// never be dropped: its delivery is the proof (see the module doc) that
+    /// no earlier notice for the session is still in flight, so silently
+    /// dropping it would break that guarantee for whatever the queue's
+    /// ordering exists to prove in the first place.
+    ///
+    /// [`push_ordinary`](Self::push_ordinary) always leaves this job exactly
+    /// one reserved slot, so the immediate `try_send` below should always
+    /// succeed. The `Full` arm is a last-resort fallback against a bug that
+    /// let something else consume the reserved slot: it awaits capacity on a
+    /// detached task instead of dropping, which still preserves ordering —
+    /// the fallback sends on the very same channel handle, and tokio's mpsc
+    /// serves sends against one channel in the order they were made, however
+    /// long any individual one waits for room.
+    fn push_terminal(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        queue: mpsc::Sender<WebhookJob>,
+        job: WebhookJob,
+    ) {
+        match queue.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                tracing::error!(
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    "sessionClosed found its reserved queue slot occupied; \
+                     awaiting capacity instead of dropping it",
+                );
+                tokio::spawn(async move {
+                    let _ = queue.send(job).await;
+                });
+            }
+            // The drain task already exited (its receiver dropped) — nothing
+            // left to deliver to. Only reachable if this queue's sender
+            // somehow outlived its own drain task, which the drain loop's own
+            // "exit when every sender is dropped" contract should prevent.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     /// Whether the coordinator currently holds live state for `session` — it was
@@ -433,7 +743,7 @@ impl Lifecycle {
     /// Builds a fresh `SessionState` with an ordered dispatch queue whose detached
     /// drain task delivers jobs one at a time (each retry blocking the next).
     fn new_state(&self, serving_relays: Vec<RelayId>) -> SessionState {
-        let (tx, rx) = mpsc::unbounded_channel::<WebhookJob>();
+        let (tx, rx) = mpsc::channel::<WebhookJob>(self.inner.queue_capacity);
         let tenants = self.inner.setup.tenants().clone();
         tokio::spawn(drain_queue(rx, tenants));
         SessionState {
@@ -449,6 +759,8 @@ impl Lifecycle {
             holdout_timer: None,
             linger_timer: None,
             webhook_timer: None,
+            started: false,
+            never_started_timer: None,
         }
     }
 
@@ -661,6 +973,44 @@ impl Lifecycle {
         self.close_slots(&tenant, session, targets, &relays);
     }
 
+    /// Spawns the never-started reap timer: after `grace`, if the session is
+    /// still unstarted, retire it exactly as a normal close would.
+    fn arm_never_started(&self, tenant: TenantId, session: SessionId, grace: Duration) -> AbortHandle {
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            this.fire_never_started(tenant, session);
+        })
+        .abort_handle()
+    }
+
+    /// The never-started timer firing: re-check `started` under the lock
+    /// (the session could have started, or already have been closed some
+    /// other way, at any point during the grace — including in a race with
+    /// this very timer's own abort, which cannot retroactively stop a task
+    /// already past its sleep), then retire the session exactly like a
+    /// normal close, firing its `sessionClosed` webhook so the tenant learns
+    /// the session died unborn rather than simply vanishing.
+    fn fire_never_started(&self, tenant: TenantId, session: SessionId) {
+        let key = (tenant.clone(), session);
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get_mut(&key) else {
+            return; // already retired some other way
+        };
+        state.never_started_timer = None;
+        if state.started {
+            return; // started (or was marked so) during the grace
+        }
+        let state = sessions.remove(&key).expect("just held it");
+        drop(sessions);
+        self.close_and_retire(tenant.clone(), session, state);
+        tracing::info!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            "session reaped: created but never started within its grace window",
+        );
+    }
+
     /// Fans a `CloseSlot` directive out to every serving relay. A relay that does
     /// not hold a named slot ignores it, so naming every serving relay is safe.
     fn close_slots(
@@ -693,12 +1043,15 @@ fn abort_timers(state: &SessionState) {
     if let Some(timer) = &state.webhook_timer {
         timer.abort();
     }
+    if let Some(timer) = &state.never_started_timer {
+        timer.abort();
+    }
 }
 
 /// Drains one session's ordered dispatch queue, delivering each webhook to
 /// completion (its full retry span) before the next. Exits when every sender is
 /// dropped — the session state was reaped — after the last job is delivered.
-async fn drain_queue(mut rx: mpsc::UnboundedReceiver<WebhookJob>, tenants: TenantStore) {
+async fn drain_queue(mut rx: mpsc::Receiver<WebhookJob>, tenants: TenantStore) {
     while let Some(job) = rx.recv().await {
         notify::dispatch(tenants.clone(), job.tenant, job.config, job.body, job.kind).await;
     }
@@ -812,6 +1165,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // Slot 0 accounts (departs); slot 1 is the lone holdout → holdout timer arms.
@@ -840,6 +1194,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped); // arms holdout for slot 1
@@ -866,6 +1221,7 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::from([SlotId(2)]),
+            ExpiresAt(u64::MAX),
         );
 
         // Both players report a result (accounted, but not departed) → linger arms.
@@ -902,6 +1258,7 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // The first serving relay closes: no sessionClosed yet, and still alive.
@@ -944,6 +1301,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // Enqueue a departure webhook (its delivery will hang at the receiver).
@@ -981,6 +1339,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_full_queue_drops_the_newest_notice_but_never_the_terminal_one() {
+        // A small injected capacity so the test can actually fill the queue
+        // without pushing hundreds of notices through a fake endpoint. The
+        // policy under test doesn't depend on the cap's size, only on there
+        // being one.
+        const CAPACITY: usize = 8;
+
+        let gate = StdArc::new(TokioNotify::new());
+        let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
+        let setup = setup_with_notify(url.clone());
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            CAPACITY,
+            HOUR,
+            HOUR,
+        );
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+
+        // The first notice is picked up by the drain task immediately and
+        // hangs at the gate -- once `drain_queue` has dequeued it (proven by
+        // it reaching the receiver), the channel's own buffer is empty again,
+        // so this doesn't itself count against `CAPACITY` below.
+        lc.enqueue_webhook(
+            tid(),
+            s,
+            NotifyConfig { url: url.clone() },
+            bytes::Bytes::from_static(br#"{"event":"first"}"#),
+            "first",
+        );
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the first notice reaches the receiver")
+            .unwrap();
+        assert_eq!(first.event, "first");
+
+        // Fill the queue down to its reserved boundary: CAPACITY - 1 more
+        // ordinary notices exactly exhaust the buffer down to the one slot
+        // `push_ordinary` always leaves free for the terminal job.
+        for i in 0..(CAPACITY - 1) {
+            lc.enqueue_webhook(
+                tid(),
+                s,
+                NotifyConfig { url: url.clone() },
+                bytes::Bytes::from(format!(r#"{{"event":"queued-{i}"}}"#)),
+                "queued",
+            );
+        }
+
+        let dropped_before = DROPPED_NOTICE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        // One more ordinary notice: no room left but the reserved slot, so
+        // this one — the newest — must be dropped rather than enqueued.
+        lc.enqueue_webhook(
+            tid(),
+            s,
+            NotifyConfig { url },
+            bytes::Bytes::from_static(br#"{"event":"overflow"}"#),
+            "overflow",
+        );
+        let dropped_after = DROPPED_NOTICE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            dropped_after,
+            dropped_before + 1,
+            "the overflowing notice was counted as a drop",
+        );
+
+        // The terminal job still finds its reserved slot: the session's one
+        // relay closing pushes sessionClosed successfully even with the
+        // queue otherwise completely full of ordinary notices.
+        lc.on_session_closed(tid(), s, RelayId(1));
+
+        // Release the gate and drain everything queued: each of the CAPACITY
+        // - 1 ordinary notices arrives, in order, the dropped "overflow" one
+        // never does, and sessionClosed is last — proving the cap neither
+        // reordered nor evicted anything that was actually accepted.
+        gate.notify_one();
+        let mut events = Vec::new();
+        for _ in 0..CAPACITY {
+            let received = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("every accepted notice is delivered")
+                .unwrap();
+            events.push(received.event);
+        }
+        assert!(
+            !events.contains(&"overflow".to_owned()),
+            "the dropped notice never reaches the receiver: {events:?}",
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("sessionClosed"),
+            "sessionClosed is delivered last: {events:?}",
+        );
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "nothing arrives after sessionClosed",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_never_started_session_reaps_while_a_started_one_does_not() {
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url);
+        // Only the never-started floor is shrunk; every other grace stays at
+        // production scale so nothing else in this test fires early.
+        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT, HOUR);
+
+        // Session A: registered and never touched again -- no presence, no
+        // accounting -- so it must reap once its grace lapses.
+        let a = SessionId(1);
+        lc.register_session(
+            tid(),
+            a,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+
+        // Session B: a departure arrives before the grace -- proof a real
+        // client was there -- so it must NOT reap.
+        let b = SessionId(2);
+        lc.register_session(
+            tid(),
+            b,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+        lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left);
+
+        // A's sessionClosed fires once its never-started grace lapses, and its
+        // lifecycle state (drain task included) is gone -- not left immortal.
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("session A's sessionClosed fires after its never-started grace")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+        assert!(
+            !lc.contains_state(&tid(), a),
+            "session A's lifecycle state is reaped, not left immortal",
+        );
+
+        // Session B is unaffected: still tracked, no second sessionClosed.
+        assert!(
+            lc.is_alive(&tid(), b),
+            "session B started, so its never-started reap never fires",
+        );
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "no second sessionClosed -- session B is still running",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_never_started_reaper_cancels_on_late_presence() {
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url);
+        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+
+        // A relay heartbeat reports the slot connected -- mirroring
+        // `on_presence_seen`'s real caller -- before the grace lapses.
+        lc.on_presence_seen(tid(), s);
+
+        // Wait comfortably past the (short) grace: nothing fires, the session
+        // stays tracked and alive.
+        tokio::time::sleep(SHORT * 3).await;
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "no sessionClosed: presence cancelled the never-started reap",
+        );
+        assert!(lc.is_alive(&tid(), s));
+        assert!(lc.contains_state(&tid(), s));
+    }
+
+    #[tokio::test]
     async fn is_alive_reports_live_gone_and_unknown() {
         let setup = bare_setup();
         let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
@@ -991,6 +1551,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
         assert!(lc.is_alive(&tid(), live), "a created session is alive");
 
@@ -1123,6 +1684,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // Arm and fire the holdout reap so a directive is pending for relay 1.
@@ -1160,6 +1722,7 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         dedup.departures.lock().insert((tid(), s, SlotId(0)));
@@ -1250,6 +1813,7 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // Membership is recorded; exhaust the session's limiter bucket so its later
@@ -1300,6 +1864,7 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         // create_session staged a descriptor for the sole serving relay.
@@ -1406,6 +1971,7 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
         assert_eq!(setup.serving_relays(&tid(), s), vec![RelayId(1)]);
 
@@ -1452,6 +2018,7 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         registry::remove(setup.registry(), RelayId(1));
@@ -1570,6 +2137,7 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         assert!(registry::mark_draining(setup.registry(), RelayId(2), gen2));
@@ -1617,6 +2185,7 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
+            ExpiresAt(u64::MAX),
         );
 
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(1));

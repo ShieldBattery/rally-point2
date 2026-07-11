@@ -481,6 +481,14 @@ pub struct SessionRequest {
     /// webhook, so the notification names the game without the tenant keeping a
     /// session→game map. Optional so a peer that predates the field still
     /// interops; the control protos don't `deny_unknown_fields`.
+    ///
+    /// Also the create endpoint's idempotency key: a create naming an
+    /// `external_id` that already has a live session returns that session's
+    /// original response rather than minting a duplicate, so an ordinary
+    /// tenant HTTP retry inside the signed-request's replay window is safe.
+    /// A request that omits `external_id` gets no such protection — there is
+    /// nothing to key a replay on — so a retried create with none always
+    /// mints a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     /// Dev/testing only: slots that should home on a *secondary* relay instead of

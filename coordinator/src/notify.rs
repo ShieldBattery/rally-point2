@@ -44,7 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -127,16 +127,30 @@ const BACKOFF_START: Duration = Duration::from_secs(2);
 /// The retry-backoff ceiling.
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
-/// How long one webhook attempt (connect through response headers) is allowed
-/// to run before it counts as failed. `drain_queue` delivers one job at a time
-/// per `(tenant, session)` queue, so an endpoint that accepts the connection
-/// but never responds would otherwise hang the attempt forever — parking that
-/// session's whole queue (every later notice, including `sessionClosed`)
-/// behind it permanently, since neither [`MAX_ATTEMPTS`] nor the backoff ever
-/// gets a chance to run. A timeout here is treated exactly like a transport
-/// error or a non-2xx response: it counts as one failed attempt and feeds the
-/// same retry/backoff path.
+/// How long one whole webhook attempt — connect through the full body read —
+/// is allowed to run before it counts as failed. `drain_queue` delivers one
+/// job at a time per `(tenant, session)` queue, so an endpoint that accepts
+/// the connection but never finishes responding would otherwise hang the
+/// attempt forever — parking that session's whole queue (every later notice,
+/// including `sessionClosed`) behind it permanently, since neither
+/// [`MAX_ATTEMPTS`] nor the backoff ever gets a chance to run. Spans the
+/// entire attempt, not just the headers: a slow-body endpoint (headers arrive
+/// promptly, then the response trickles or never finishes) is exactly as
+/// capable of hanging the queue as one that never responds at all, so the
+/// timeout has to cover both. A timeout here is treated exactly like a
+/// transport error or a non-2xx response: it counts as one failed attempt and
+/// feeds the same retry/backoff path.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest response body one webhook attempt will read before giving up on
+/// it. The coordinator never looks at the response body — only the status
+/// matters — so this exists purely to bound memory against an endpoint that
+/// streams an unbounded (or just very large) body: [`http_body_util::Limited`]
+/// stops accumulating past this many bytes rather than buffering an unbounded
+/// stream to completion. A generous cap well past any sane webhook receiver's
+/// real response (typically empty or a few bytes of JSON); hitting it is
+/// treated exactly like a timeout — one failed attempt, retried.
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
 /// A hyper client built once and shared by every dispatch, rather than
 /// constructed fresh per delivery. hyper/hyper-util clients pool connections
@@ -158,6 +172,24 @@ static WEBHOOK_CLIENT: LazyLock<Client<HttpsConnector<HttpConnector>, Full<Bytes
             .build();
         Client::builder(TokioExecutor::new()).build(https)
     });
+
+/// The most webhook dispatch attempts allowed in flight across the whole
+/// coordinator process at once. Each session's own queue already serializes
+/// its own notices ([`crate::lifecycle`]'s `drain_queue`, one job at a time),
+/// but nothing previously bounded how many *different* sessions' queues could
+/// all be mid-attempt simultaneously — a fleet-wide burst of session churn
+/// (or a fleet-wide slow tenant endpoint) could otherwise hold one open
+/// connection per in-flight session with no ceiling, compounding exactly the
+/// kind of unbounded-body and unbounded-hang risk [`MAX_RESPONSE_BODY_BYTES`]
+/// and [`ATTEMPT_TIMEOUT`] bound per attempt. Fleet-wide, not per-tenant: a
+/// slow or malicious tenant endpoint only ever occupies its own share of this
+/// pool, and every other tenant's dispatches keep moving through the rest.
+const MAX_CONCURRENT_DISPATCHES: usize = 32;
+
+/// The process-wide gate [`MAX_CONCURRENT_DISPATCHES`] enforces. A `const`
+/// initializer needs no lazy setup, unlike [`WEBHOOK_CLIENT`].
+static DISPATCH_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DISPATCHES);
 
 /// The JSON body POSTed to the tenant for a departure. camelCase, matching the
 /// *consumer's* API conventions rather than the relay control plane's snake_case
@@ -755,7 +787,23 @@ pub(crate) async fn dispatch(
             }
         };
 
-        match send_attempt(request, ATTEMPT_TIMEOUT).await {
+        // Acquired fresh for this attempt alone, released before the backoff
+        // sleep below (the permit's scope ends with this block) — a slow or
+        // failing dispatch must not also hold a fleet-wide concurrency slot
+        // idle through its own backoff, which would starve unrelated sessions'
+        // dispatches for no reason (the endpoint isn't even being asked
+        // anything during backoff). The semaphore is a `static` that is never
+        // closed, so acquiring it can only be interrupted by the task itself
+        // being cancelled — which would drop this future before `expect` ever
+        // runs.
+        let outcome = {
+            let _permit = DISPATCH_PERMITS
+                .acquire()
+                .await
+                .expect("DISPATCH_PERMITS is never closed");
+            send_attempt(request, ATTEMPT_TIMEOUT).await
+        };
+        match outcome {
             Ok(status) => {
                 if (200..300).contains(&status) {
                     tracing::debug!(url = %config.url, status, kind, "webhook delivered");
@@ -770,6 +818,15 @@ pub(crate) async fn dispatch(
                     kind,
                     timeout = ?ATTEMPT_TIMEOUT,
                     "webhook attempt timed out; retrying",
+                );
+            }
+            Err(AttemptError::BodyTooLarge) => {
+                tracing::debug!(
+                    url = %config.url,
+                    attempt,
+                    kind,
+                    cap = MAX_RESPONSE_BODY_BYTES,
+                    "webhook response body exceeded the cap; retrying",
                 );
             }
             Err(AttemptError::Transport(error)) => {
@@ -795,31 +852,49 @@ pub(crate) async fn dispatch(
 /// treated identically by the caller (a failed attempt, retried like a
 /// non-2xx status) but are logged distinctly so a hung endpoint is
 /// distinguishable from a refused/reset connection in traces.
+#[derive(Debug)]
 enum AttemptError {
-    /// The attempt did not complete within [`ATTEMPT_TIMEOUT`].
+    /// The attempt did not complete — request through full body read — within
+    /// [`ATTEMPT_TIMEOUT`].
     TimedOut,
+    /// The response body exceeded [`MAX_RESPONSE_BODY_BYTES`] before finishing.
+    BodyTooLarge,
     /// A transport-level error below the HTTP response (connect failure,
     /// reset, etc).
     Transport(hyper_util::client::legacy::Error),
 }
 
-/// Sends one webhook request on the shared [`WEBHOOK_CLIENT`], bounding the
-/// whole attempt (connect through response headers) by `attempt_timeout`. On
-/// a timely response, drains the body so the connection returns to the
-/// client's pool cleanly and returns its status. Split out of `dispatch`'s
-/// retry loop so the timeout behavior is unit-testable without waiting out
-/// the full multi-attempt retry budget.
+/// Sends one webhook request on the shared [`WEBHOOK_CLIENT`] and returns its
+/// status, bounding the *whole* attempt — connect through the full body read
+/// — by one [`tokio::time::timeout`] and the body by [`MAX_RESPONSE_BODY_BYTES`].
+/// Both bounds exist for the same reason: the coordinator never reads the
+/// response body's content (only the status matters), so an endpoint that is
+/// slow or unbounded on either axis must not be able to hang this session's
+/// queue or grow its memory — see each constant's own doc. Split out of
+/// `dispatch`'s retry loop so this behavior is unit-testable without waiting
+/// out the full multi-attempt retry budget.
 async fn send_attempt(
     request: hyper::Request<Full<Bytes>>,
     attempt_timeout: Duration,
 ) -> Result<u16, AttemptError> {
-    match tokio::time::timeout(attempt_timeout, WEBHOOK_CLIENT.request(request)).await {
-        Ok(Ok(response)) => {
-            let status = response.status().as_u16();
-            let _ = response.into_body().collect().await;
-            Ok(status)
-        }
-        Ok(Err(error)) => Err(AttemptError::Transport(error)),
+    let attempt = async {
+        let response = WEBHOOK_CLIENT
+            .request(request)
+            .await
+            .map_err(AttemptError::Transport)?;
+        let status = response.status().as_u16();
+        // The body is never read for its content, only drained so the
+        // connection returns to the client's pool cleanly — capped so an
+        // endpoint streaming (or just sending) an oversized body can't grow
+        // this indefinitely.
+        Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .collect()
+            .await
+            .map_err(|_| AttemptError::BodyTooLarge)?;
+        Ok(status)
+    };
+    match tokio::time::timeout(attempt_timeout, attempt).await {
+        Ok(result) => result,
         Err(_elapsed) => Err(AttemptError::TimedOut),
     }
 }
@@ -1644,6 +1719,185 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the attempt was bounded by its own timeout, not left to hang",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_finishes_times_out_the_whole_attempt_not_just_the_headers() {
+        // Response headers arrive promptly (a 200 whose `Content-Length`
+        // promises far more body than ever actually arrives), then the
+        // connection goes silent. A headers-only timeout would see
+        // `Ok(response)` from the initial `request()` call and move on to an
+        // unbounded body read; the whole-attempt timeout must catch this
+        // instead, exactly like the hung-endpoint case above but with the
+        // hang moved past the headers.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    .await;
+                held.push(stream); // the promised body never actually arrives
+            }
+        });
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let started = Instant::now();
+        let outcome = send_attempt(request, Duration::from_millis(300)).await;
+        assert!(
+            matches!(outcome, Err(AttemptError::TimedOut)),
+            "a body that never finishes must time out the whole attempt, not just the headers",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the attempt was bounded, not left to hang on the body",
+        );
+    }
+
+    // -- Response body cap --
+
+    #[tokio::test]
+    async fn a_response_body_past_the_cap_counts_as_a_failed_attempt() {
+        let app = Router::new().route(
+            "/hook",
+            post(|| async { vec![0u8; MAX_RESPONSE_BODY_BYTES + 4096] }),
+        );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        // A generous timeout so only the body cap, not the attempt timeout,
+        // can be what trips here.
+        let outcome = send_attempt(request, Duration::from_secs(5)).await;
+        assert!(
+            matches!(outcome, Err(AttemptError::BodyTooLarge)),
+            "a response body past the cap must fail the attempt, not buffer to completion; got {outcome:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_body_at_or_under_the_cap_still_delivers() {
+        let app = Router::new().route(
+            "/hook",
+            post(|| async { vec![0u8; MAX_RESPONSE_BODY_BYTES] }),
+        );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let outcome = send_attempt(request, Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome.ok(),
+            Some(200),
+            "a body exactly at the cap is not itself over it",
+        );
+    }
+
+    // -- Dispatch concurrency --
+
+    #[tokio::test]
+    async fn the_dispatch_semaphore_bounds_concurrent_in_flight_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Tracks how many requests are simultaneously inside the handler
+        // (i.e. actually in flight, not just queued), and the high-water mark
+        // across the whole test -- the number the semaphore is responsible
+        // for capping.
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let (current_h, max_h) = (Arc::clone(&current), Arc::clone(&max_seen));
+        let app = Router::new().route(
+            "/hook",
+            post(move || {
+                let current = Arc::clone(&current_h);
+                let max_seen = Arc::clone(&max_h);
+                async move {
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    // Held open long enough that every spawned dispatch below
+                    // has a chance to reach the endpoint (or block on the
+                    // semaphore) before the first ones finish.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("k1".to_owned()),
+            TenantId("t".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+
+        let url = format!("http://{addr}/hook");
+        // Comfortably past MAX_CONCURRENT_DISPATCHES so the cap, if it were
+        // absent, would be visibly exceeded (every request succeeds on its
+        // first attempt, so nothing here depends on retry timing).
+        let overshoot = MAX_CONCURRENT_DISPATCHES + 16;
+        let mut handles = Vec::with_capacity(overshoot);
+        for _ in 0..overshoot {
+            let tenants = tenants.clone();
+            let config = NotifyConfig { url: url.clone() };
+            handles.push(tokio::spawn(dispatch(
+                tenants,
+                TenantId("t".to_owned()),
+                config,
+                Bytes::from_static(b"{}"),
+                "test",
+            )));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let max_seen = max_seen.load(Ordering::SeqCst);
+        assert!(
+            max_seen <= MAX_CONCURRENT_DISPATCHES,
+            "the semaphore must cap concurrent in-flight dispatches at \
+             {MAX_CONCURRENT_DISPATCHES}, but {max_seen} were observed at once",
         );
     }
 }

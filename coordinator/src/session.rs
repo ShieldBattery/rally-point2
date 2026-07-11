@@ -179,6 +179,21 @@ pub struct SessionSetup {
     /// acquires this while already holding one of them. It guards only await-free
     /// sync bodies, so the guard never crosses an await point.
     assignment_lock: Arc<Mutex<()>>,
+    /// Idempotency record for `POST /session/create`: a tenant-scoped
+    /// `external_id` already bound to a still-live session replies with that
+    /// exact original response rather than minting a duplicate — an ordinary
+    /// tenant HTTP retry inside the signed-request's replay window must not
+    /// create a second session for the same game. Checked and (on a fresh
+    /// create) recorded under [`assignment_lock`](Self::assignment_lock), so
+    /// two near-simultaneous requests for the same `external_id` can't both
+    /// race past the check and each mint their own session. Entries are
+    /// removed at the same point session membership is retired
+    /// ([`take_session_membership`](Self::take_session_membership)), so a
+    /// tenant may legitimately reuse an `external_id` once the prior session
+    /// is actually gone (a rematch, say). A request with no `external_id` is
+    /// never recorded here and is therefore never idempotent — see
+    /// [`SessionRequest::external_id`]'s own doc.
+    create_idempotency: Arc<Mutex<HashMap<(TenantId, String), SessionResponse>>>,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -210,6 +225,7 @@ impl SessionSetup {
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter,
             assignment_lock: Arc::new(Mutex::new(())),
+            create_idempotency: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -296,10 +312,28 @@ impl SessionSetup {
     /// the take-and-clear of `session_relays` needs to be atomic (it is the map the
     /// racing rehome re-validates against), so nothing hinges on the two being
     /// retired under one lock.
+    ///
+    /// Also frees the session's `external_id` for reuse: if the taken refs
+    /// carried one, its `create_idempotency` entry is removed too — but only
+    /// if that entry still points at *this* session, so a concurrent create
+    /// that already reused the freed `external_id` for a fresh session (a
+    /// legitimate rematch racing this close) is never evicted by a close that
+    /// started before it.
     pub fn take_session_membership(&self, tenant: &TenantId, session: SessionId) -> Vec<RelayId> {
         let key = (tenant.clone(), session);
         let taken = self.session_relays.lock().remove(&key).unwrap_or_default();
-        self.session_refs.lock().remove(&key);
+        if let Some(refs) = self.session_refs.lock().remove(&key)
+            && let Some(external_id) = refs.external_id
+        {
+            let idem_key = (tenant.clone(), external_id);
+            let mut idempotency = self.create_idempotency.lock();
+            if idempotency
+                .get(&idem_key)
+                .is_some_and(|cached| cached.session == session)
+            {
+                idempotency.remove(&idem_key);
+            }
+        }
         taken
     }
 
@@ -719,6 +753,28 @@ fn create_session_inner(
     // relay's drain mark. See `SessionSetup::assignment_lock`.
     let _assign = setup.lock_assignment();
 
+    // Idempotent replay: a request naming an `external_id` already bound to a
+    // still-live session gets that session's exact original response instead
+    // of a fresh one — an ordinary tenant HTTP retry inside the
+    // signed-request replay window must not mint a duplicate session for the
+    // same game. "Still live" is read the same way `rehome` reads it: a
+    // non-empty serving set (an empty one means the session already closed
+    // and retired its membership, at which point the tenant may legitimately
+    // reuse the `external_id`). Checked under the same assignment lock the
+    // rest of this body holds, so two near-simultaneous requests for the same
+    // `external_id` can't both race past this and each mint their own
+    // session — whichever acquires the lock second either replays the
+    // first's freshly recorded response or, if the first request failed
+    // before recording one, proceeds to mint its own.
+    if let Some(external_id) = &request.external_id {
+        let key = (request.tenant.clone(), external_id.clone());
+        if let Some(cached) = setup.create_idempotency.lock().get(&key).cloned()
+            && !setup.serving_relays(&request.tenant, cached.session).is_empty()
+        {
+            return Ok(cached);
+        }
+    }
+
     validate_request(&request)?;
 
     let (home, secondary) = assign_relays(&setup.registry)?;
@@ -867,13 +923,24 @@ fn create_session_inner(
         });
     }
 
-    Ok(SessionResponse {
+    let response = SessionResponse {
         session,
         home_relay: home,
         slot_homes,
         tokens,
         bounds,
-    })
+    };
+    // Record the exact response a duplicate create for this `external_id`
+    // will replay, still under the assignment lock this whole body holds —
+    // see the idempotency check above for why that matters. A request with
+    // no `external_id` is never recorded (nothing to key a replay on).
+    if let Some(external_id) = &request.external_id {
+        setup
+            .create_idempotency
+            .lock()
+            .insert((request.tenant.clone(), external_id.clone()), response.clone());
+    }
+    Ok(response)
 }
 
 /// Builds the [`SessionDescriptor`] the coordinator pushes to a relay serving
@@ -1793,6 +1860,173 @@ mod tests {
             ExpiresAt(u64::MAX),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_duplicate_create_within_the_window_replays_the_original_response() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        assert_eq!(
+            first, second,
+            "a retried create for the same (tenant, external_id) gets the exact original response back",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_create_mints_no_new_session() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+        let _ = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+
+        // An unrelated fresh create still gets the very next id in sequence --
+        // proof the duplicate above never advanced the session-id counter, so
+        // no session was actually minted for it.
+        let unrelated = create_default_session(&setup);
+        assert_eq!(
+            unrelated.session.0,
+            first.session.0 + 1,
+            "the duplicate consumed no session id of its own",
+        );
+    }
+
+    #[test]
+    fn a_different_external_id_creates_a_genuinely_fresh_session() {
+        let setup = setup_with_two_relays_and_tenant();
+        let first = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let second = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: Some("game-2".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert_ne!(first.session, second.session);
+        assert_ne!(first.tokens, second.tokens);
+    }
+
+    #[test]
+    fn a_different_tenants_matching_external_id_is_not_a_duplicate() {
+        // Tenant-scoped key: two tenants using the same external_id (plausible
+        // if each mints its own game ids independently) must never collide.
+        let setup = setup_with_two_relays_and_tenant();
+        let other_tenant = TenantId("sb-other".to_owned());
+        tenant::enroll(
+            setup.tenants(),
+            KeyId("test-key-2".to_owned()),
+            other_tenant.clone(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+
+        let first = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: Some("shared-id".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let second = create_session(
+            &setup,
+            SessionRequest {
+                tenant: other_tenant,
+                players: two_players(),
+                external_id: Some("shared-id".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert_ne!(first.session, second.session);
+    }
+
+    #[test]
+    fn a_closed_sessions_external_id_can_be_reused() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+
+        // The same retirement path a full close uses: membership (and, with
+        // it, the idempotency entry) is taken.
+        setup.forget_session_membership(&tid(), first.session);
+        assert!(
+            !setup
+                .create_idempotency
+                .lock()
+                .contains_key(&(tid(), "game-1".to_owned())),
+            "retirement must remove the map entry outright, not just leave a stale one \
+             that happens to fail the liveness check -- otherwise a tenant that never \
+             reuses an external_id leaks one entry per closed session forever",
+        );
+
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        assert_ne!(
+            second.session, first.session,
+            "the external_id mints a genuinely new session once the old one is gone",
+        );
+        assert_ne!(second.tokens, first.tokens);
+
+        // The rematch's own external_id is now the one an idempotent retry
+        // would replay -- the entry was replaced, not just vacated.
+        let retried = create_session(&setup, SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        }, ExpiresAt(u64::MAX)).unwrap();
+        assert_eq!(retried, second);
+    }
+
+    #[test]
+    fn no_external_id_is_never_idempotent() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: None,
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        assert_ne!(
+            first.session, second.session,
+            "a request naming no external_id is never replayed, even back to back",
+        );
     }
 
     #[test]

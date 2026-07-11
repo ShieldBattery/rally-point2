@@ -228,12 +228,8 @@ async fn create_session(
         .map(|p| p.slot)
         .collect();
 
-    let resp = session::create_session(
-        &state.setup,
-        request,
-        rally_point_proto::token::ExpiresAt(u64::MAX),
-    )
-    .map_err(|e| {
+    let expires_at = rally_point_proto::token::ExpiresAt(u64::MAX);
+    let resp = session::create_session(&state.setup, request, expires_at).map_err(|e| {
         tracing::warn!(error = %e, "session setup failed");
         match e {
             registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -245,13 +241,17 @@ async fn create_session(
 
     // Arm the session's lifecycle: its serving relay set (the distinct home
     // relays of its slots) and its player/observer slots drive `sessionClosed`
-    // and the reap policies.
+    // and the reap policies. `expires_at` sizes the never-started reap's grace
+    // window (see `lifecycle::never_started_grace`) -- the same value the
+    // tokens above just carried, so the reaper never gives up before a
+    // client's own token would have.
     state.lifecycle.register_session(
         tenant.clone(),
         resp.session,
         state.setup.serving_relays(&tenant, resp.session),
         player_slots,
         observer_slots,
+        expires_at,
     );
 
     tracing::info!(
@@ -1071,6 +1071,14 @@ fn note_inbound(
                     &sessions,
                     std::time::Instant::now(),
                 );
+                // A session with at least one slot connected has a real
+                // client, wherever the roster came from -- the never-started
+                // reap's cancel signal (see `Lifecycle::on_presence_seen`).
+                for session in &sessions {
+                    if !session.slots.is_empty() {
+                        lifecycle.on_presence_seen(session.tenant.clone(), session.session);
+                    }
+                }
             } else {
                 tracing::debug!(
                     relay_id = relay_id.0,
@@ -1699,6 +1707,7 @@ mod tests {
             vec![RelayId(1)],
             std::collections::HashSet::from([SlotId(0)]),
             std::collections::HashSet::new(),
+            rally_point_proto::token::ExpiresAt(u64::MAX),
         );
         let app = router(state);
 
