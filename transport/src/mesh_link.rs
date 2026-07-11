@@ -406,6 +406,19 @@ impl MeshLink {
             .and_then(|s| s.dedup.delivered_through(slot))
     }
 
+    /// Every slot's delivered-through cursor for `session`, for slots that
+    /// have delivered at least one payload on this link. Empty (never an
+    /// error) for a session that isn't open. This is the source the mesh
+    /// ack-cursor push reads: the driver has no independent list of which
+    /// remote slots a session carries, so it reads back exactly what this
+    /// link's own receive state has actually seen.
+    pub fn delivered_through_all(&self, session: SessionId) -> Vec<(SlotId, u64)> {
+        self.sessions
+            .get(&session)
+            .map(|s| s.dedup.delivered_through_all())
+            .unwrap_or_default()
+    }
+
     /// Force-retires every unacked payload in `(session, slot)` up to
     /// `through_seq`, returning how many were dropped, *unless* `through_seq`
     /// is not strictly greater than the last cursor applied for that slot. A
@@ -970,6 +983,103 @@ mod tests {
             sender.send(session, Some(oversize), None),
             Err(MeshLinkError::PayloadTooLarge { .. })
         ));
+    }
+
+    /// `delivered_through_all` is the mesh ack-cursor push's source: it must
+    /// report every slot that has actually delivered something (not just the
+    /// one a caller happens to ask `delivered_through` for), stay empty for a
+    /// session with nothing delivered yet, and never see slots or sessions it
+    /// isn't asked about.
+    #[tokio::test]
+    async fn delivered_through_all_reflects_every_slot_with_a_delivered_prefix() {
+        let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session_a = SessionId(1);
+        let session_b = SessionId(2);
+        sender.open_session(session_a);
+        sender.open_session(session_b);
+        receiver.open_session(session_a);
+        receiver.open_session(session_b);
+
+        // Nothing delivered yet: empty, not an error.
+        assert_eq!(receiver.delivered_through_all(session_a), Vec::new());
+
+        // Each slot needs its own contiguous prefix from seq 0 to register a
+        // delivered-through cursor at all (an isolated high seq just sits in
+        // the out-of-order `ahead` set) -- so slot 2 gets seqs 0..=5 while
+        // slot 0 gets only seq 0, proving the two cursors are independent.
+        sender
+            .send(session_a, Some(turn(0, 0, 0xA0)), None)
+            .unwrap();
+        for seq in 0..=5u64 {
+            let payload = Payload {
+                seq,
+                slot: 2,
+                commands: vec![0xA1].into(),
+                ..Default::default()
+            };
+            sender.send(session_a, Some(payload), None).unwrap();
+        }
+        for _ in 0..7 {
+            receiver.recv().await.unwrap();
+        }
+
+        let mut cursors = receiver.delivered_through_all(session_a);
+        cursors.sort_by_key(|&(slot, _)| slot.0);
+        assert_eq!(cursors, vec![(SlotId(0), 0), (SlotId(2), 5)]);
+
+        // Session B never received anything, so it stays empty even though
+        // session A (sharing the same connection) has state now -- the
+        // session must not enter the reported set.
+        assert_eq!(receiver.delivered_through_all(session_b), Vec::new());
+    }
+
+    /// The physics `MESH_UNACKED_WINDOW_CAP` (relay crate) exists to bound:
+    /// under genuine forward-path loss -- the peer never receives anything at
+    /// all, so its own acks and any ack-cursor push it might send both never
+    /// arrive -- a session's unacked window on this link grows without bound
+    /// as the sender keeps producing. Mirrors the client edge's own
+    /// `forward_path_sustained_loss_trips_the_unacked_window_cap`
+    /// (`client::driver`) at `MeshLink` granularity: the peer's connection
+    /// drains raw datagrams (so quinn's own buffer can't stall the sender)
+    /// but never turns them into a `MeshLink`, so nothing is ever sent back.
+    #[tokio::test]
+    async fn sustained_forward_loss_grows_a_sessions_unacked_window_without_a_beacon_to_rescue_it()
+     {
+        let (mut sender, receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+        let session = SessionId(1);
+        sender.open_session(session);
+
+        let drainer = {
+            let conn = receiver.connection().clone();
+            tokio::spawn(async move {
+                // "Receives" at the transport level (so the sender's datagrams
+                // don't back up) but never becomes a MeshLink -- no dedup
+                // advances, so nothing is ever sent back to the sender.
+                while conn.read_datagram().await.is_ok() {}
+            })
+        };
+
+        for i in 0..300u64 {
+            let payload = Payload {
+                seq: i,
+                slot: 0,
+                commands: vec![i as u8; 4].into(),
+                ..Default::default()
+            };
+            sender.send(session, Some(payload), None).unwrap();
+        }
+
+        assert_eq!(
+            sender.payloads_in_flight(session),
+            300,
+            "with nothing ever received back, every sent turn stays unacked -- \
+             unbounded growth under sustained forward loss, exactly what the \
+             relay's hard cap exists to catch",
+        );
+
+        drop(sender);
+        drainer.abort();
     }
 
     #[test]

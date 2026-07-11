@@ -479,6 +479,46 @@ pub(crate) fn command_channel() -> (
 /// would not come back.
 pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The hard ceiling on one session's payloads sent but not yet known-delivered
+/// on one mesh link -- the relay-pair backstop mirroring the client edge's
+/// `UNACKED_WINDOW_CAP` (`client::driver`, 1024). [`reconcile_ack_cursors`]'s
+/// push-on-advance beacon keeps the window bounded under *reverse*-path loss
+/// (the peer received the turns; its acks back were lost); this cap catches
+/// what the beacon cannot -- sustained *forward*-path loss, where the peer
+/// genuinely hasn't received the turns at all. Tripping resets the link
+/// ([`MeshLinkExit::ConnectionFailed`], the same exit the full forward-queue
+/// takes), which is safe to do because the redial's Join/reconcile and the
+/// resume-cursor exchange (`MeshResumeCursors`) recover every session on the
+/// link from where its own forward-gate left off.
+///
+/// Bounded per session, not per link: the `AckManager` this checks
+/// (`MeshLink::payloads_in_flight`) is itself instantiated per session, one
+/// independent window per `SessionLink` sharing the connection -- summing
+/// them into a single link-wide bound would let one quiet session's slack
+/// mask another session's genuine stall, and a link carrying only one session
+/// would then trip at a fraction of the intended cap.
+///
+/// Sized generously above the client edge's 1024: a client's `Link` carries
+/// one slot's outbound stream, but a mesh session's single `AckManager`
+/// multiplexes every slot this relay-pair jointly forwards for that game (up
+/// to the ~8-slot roster a real game carries). A shared relay-pair outage can
+/// therefore grow several slots' windows at once inside the one instance this
+/// checks, well before any single home client's own 1024-turn cap would have
+/// tripped *that* client's separate link first. 8x -- roughly one player's
+/// worth of headroom per plausible slot -- is generous margin without being
+/// effectively unbounded.
+const MESH_UNACKED_WINDOW_CAP: usize = 8 * 1024;
+
+/// Whether one session's mesh-link unacked window has crossed
+/// [`MESH_UNACKED_WINDOW_CAP`] -- the driver's cue to reset the link rather
+/// than let the window grow further. Mirrors the client edge's own
+/// `check_cap` (`client::driver`) in shape, split out so the arithmetic is
+/// testable on its own, independent of the full select-loop machinery that
+/// applies it.
+fn mesh_window_exhausted(in_flight: usize) -> bool {
+    in_flight > MESH_UNACKED_WINDOW_CAP
+}
+
 /// Why a mesh-link driver exited. The dial-side reconnect supervisor uses this to
 /// distinguish intentional teardown from a dropped connection: only the
 /// latter is worth retrying, since `Idle` means a deliberate wind-down and
@@ -692,6 +732,95 @@ fn resume_cursors_frame(
                 resuming,
             },
         )),
+    }
+}
+
+/// Builds a `MeshAckCursors` mesh control frame for `session`, from `cursors`
+/// -- each entry a slot and this link's own delivered-through cursor for it.
+/// See [`reconcile_ack_cursors`] for the push-on-advance discipline that
+/// drives this, and `MeshControlFrame.mesh_ack_cursors` for why this rides the
+/// control stream rather than a dedicated beacon uni-stream.
+fn ack_cursors_frame(session: SessionId, cursors: Vec<(SlotId, u64)>) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::MeshAckCursors(
+            rally_point_proto::messages::MeshAckCursors {
+                cursors: cursors
+                    .into_iter()
+                    .map(|(slot, delivered_through)| {
+                        rally_point_proto::messages::MeshAckCursor {
+                            slot: u32::from(slot.0),
+                            delivered_through,
+                        }
+                    })
+                    .collect(),
+            },
+        )),
+    }
+}
+
+/// Applies a peer's `MeshAckCursors` push to this link's own transport: for
+/// each named slot, force-retires this link's unacked window through the
+/// peer-confirmed cursor -- the mesh-link counterpart of a client-edge
+/// driver's `Link::retire_through` call off its beacon reader. A no-op for
+/// any other frame kind, a zero session, or a slot id out of `SlotId` range
+/// (defensive; wire values are validated upstream). A cursor for a session
+/// this link hasn't opened is harmless: `MeshLink::retire_through` already
+/// returns `0` for one, matching how every other control-frame kind here
+/// tolerates a stale or unknown session.
+///
+/// Called from [`run_mesh_link`]'s own select branch, before the ordinary
+/// [`dispatch_mesh_control`] -- like [`resume_replay_for_frame`], it needs
+/// direct access to this link's transport state, which that function does
+/// not have.
+fn apply_ack_cursors(link: &mut rally_point_transport::MeshLink, frame: &MeshControlFrame) {
+    if frame.session == 0 {
+        return;
+    }
+    let Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) = &frame.kind else {
+        return;
+    };
+    let session = SessionId(frame.session);
+    for cursor in &cursors.cursors {
+        let Ok(slot) = u8::try_from(cursor.slot).map(SlotId) else {
+            continue;
+        };
+        link.retire_through(session, slot, cursor.delivered_through);
+    }
+}
+
+/// Pushes each joined session's mesh-link delivered-through cursors to the
+/// peer when they've advanced past what it last heard -- the mesh-link
+/// counterpart of the client edge's ack-beacon push. Riding the same flush
+/// tick [`reconcile_presence`] uses (rather than a dedicated timer) keeps this
+/// off the hot datagram path while staying prompt enough to rescue a window
+/// stuck only on lost reverse-path acks before [`MESH_UNACKED_WINDOW_CAP`]
+/// would otherwise trip. Push-on-advance: a slot with nothing new since the
+/// last push sends nothing, so a healthy link stays quiet.
+fn reconcile_ack_cursors(
+    link: &rally_point_transport::MeshLink,
+    control_tx: &MeshControlTx,
+    ack_cursors_sent: &mut HashMap<(SessionId, SlotId), u64>,
+    joined: &HashMap<SessionId, SessionState>,
+) {
+    for &session_id in joined.keys() {
+        let advanced: Vec<(SlotId, u64)> = link
+            .delivered_through_all(session_id)
+            .into_iter()
+            .filter(|&(slot, cursor)| {
+                !matches!(
+                    ack_cursors_sent.get(&(session_id, slot)),
+                    Some(&prev) if prev >= cursor
+                )
+            })
+            .collect();
+        if advanced.is_empty() {
+            continue;
+        }
+        for &(slot, cursor) in &advanced {
+            ack_cursors_sent.insert((session_id, slot), cursor);
+        }
+        let _ = control_tx.send(ack_cursors_frame(session_id, advanced));
     }
 }
 
@@ -1342,6 +1471,14 @@ pub async fn run_mesh_link(
     // pushed on change (reconciled against the local slot roster on every
     // flush tick and on each Join), so a stable roster sends nothing.
     let mut presence_sent: HashMap<rally_point_proto::ids::SessionId, u32> = HashMap::new();
+
+    // The last delivered-through cursor pushed to the peer per (session, slot)
+    // -- the mesh-link ack-beacon's own "last_sent", mirroring the client
+    // edge's `flush_beacon`. Tracked here (rather than inside `MeshLink`,
+    // which is transport state, not a record of what's already been shared)
+    // so a repeat cursor push-on-advance check costs a hash lookup, not a
+    // stream write the peer's monotonic guard would just discard anyway.
+    let mut ack_cursors_sent: HashMap<(SessionId, SlotId), u64> = HashMap::new();
     // Whether the peer's presence reader task is still feeding reports. Once
     // it ends (the peer's stream closed or errored), `recv()` returns `None`
     // on every poll — an always-ready future that would spin the loop —
@@ -1528,6 +1665,12 @@ pub async fn run_mesh_link(
                         // and sent before the ordinary dispatch below, which
                         // has no link to send a reply over (see
                         // `resume_replay_for_frame`'s own doc).
+                        // A peer's push of its own link-level receive cursors:
+                        // force-retire this link's unacked window through them
+                        // before anything else touches the frame. Needs direct
+                        // link access `dispatch_mesh_control` doesn't have, so
+                        // it's handled here, like the resume-cursor reply below.
+                        apply_ack_cursors(&mut link, &frame);
                         if let Some((key, payloads)) =
                             resume_replay_for_frame(&frame, &joined, &mesh_for_dispatch)
                             && !send_resume_replay(
@@ -1606,7 +1749,17 @@ pub async fn run_mesh_link(
             _ = tokio::time::sleep_until(next_flush) => {
                 let now = tokio::time::Instant::now();
                 let mut failed = None;
+                let mut window_exhausted = false;
                 for (&session_id, state) in joined.iter_mut() {
+                    // Checked every tick, independent of this session's own
+                    // flush deadline: a stuck window is a safety-net condition
+                    // the driver must not sit on for up to a whole flush cycle
+                    // longer than necessary. See `MESH_UNACKED_WINDOW_CAP` for
+                    // why this reads per session, not summed across the link.
+                    if mesh_window_exhausted(link.payloads_in_flight(session_id)) {
+                        window_exhausted = true;
+                        break;
+                    }
                     if state.flush_deadline > now {
                         continue;
                     }
@@ -1617,6 +1770,16 @@ pub async fn run_mesh_link(
                         break;
                     }
                     state.flush_deadline = now + routing::FLUSH_INTERVAL;
+                }
+                if window_exhausted {
+                    // The ack-cursor beacon (`reconcile_ack_cursors`, below)
+                    // could not keep this session's window bounded -- a
+                    // genuine forward gap, not lost reverse-path acks. Reset
+                    // the whole link like the full-forward-queue case: the
+                    // redial's Join/reconcile and resume-cursor exchange
+                    // recover every session on it, including this one.
+                    tracing::warn!("mesh unacked window exceeded cap; resetting link");
+                    break MeshLinkExit::ConnectionFailed;
                 }
                 if let Some(error) = failed {
                     tracing::info!(%error, "mesh flush failed; closing link");
@@ -1638,6 +1801,11 @@ pub async fn run_mesh_link(
                     tracing::info!("mesh presence push failed; closing link");
                     break MeshLinkExit::ConnectionFailed;
                 }
+                // Reconcile this link's own receive cursors on the same tick:
+                // push each session's per-slot delivered-through advance to
+                // the peer, so lost reverse-path acks alone can't grow its
+                // view of our unacked window without bound.
+                reconcile_ack_cursors(&link, &control_forward_tx, &mut ack_cursors_sent, &joined);
                 continue;
             }
             // A presence report from the peer: how many live home clients it
@@ -2150,6 +2318,11 @@ fn dispatch_mesh_control(
             // function has access to. Nothing left to update here: unlike every
             // other kind, a resume ask carries no session state to fold, only a
             // reply to send.
+        }
+        Some(mesh_control_frame::Kind::MeshAckCursors(_)) => {
+            // Handled before this dispatch runs, by `apply_ack_cursors` in the
+            // driver's own select branch — it force-retires this link's own
+            // transport state, which this function has no access to.
         }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
@@ -3788,5 +3961,268 @@ mod tests {
             rx.try_recv().is_err(),
             "no desync notice: the duplicate delivery did not perturb ordinal alignment",
         );
+    }
+
+    #[test]
+    fn mesh_window_exhausted_trips_only_strictly_past_the_cap() {
+        assert!(!mesh_window_exhausted(0));
+        assert!(!mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP));
+        assert!(mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP + 1));
+    }
+
+    fn self_signed() -> (
+        Vec<rally_point_transport::rustls::pki_types::CertificateDer<'static>>,
+        rally_point_transport::rustls::pki_types::PrivateKeyDer<'static>,
+        rally_point_transport::rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = rally_point_transport::rustls::pki_types::PrivateKeyDer::try_from(
+            cert.signing_key.serialize_der(),
+        )
+        .unwrap();
+        (vec![cert_der.clone()], key, cert_der)
+    }
+
+    /// A loopback mesh-link QUIC connection, wrapped as a [`MeshLink`]. Only one
+    /// side is needed for the ack-cursor tests below: `apply_ack_cursors` and
+    /// `reconcile_ack_cursors` operate purely on in-memory transport state
+    /// (`payloads_in_flight`, `delivered_through_all`, `retire_through`), so
+    /// what matters is a genuinely established connection to build a
+    /// `MeshLink` from, not a live peer on the other end.
+    async fn connected_mesh_link() -> (
+        rally_point_transport::MeshLink,
+        rally_point_transport::quinn::Endpoint,
+        rally_point_transport::quinn::Endpoint,
+    ) {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        use rally_point_transport::quic::{mesh_client_config, server_config};
+        use rally_point_transport::quinn;
+
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+        let mut roots = rally_point_transport::rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = mesh_client_config(roots).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+
+        (
+            rally_point_transport::MeshLink::new(client_conn),
+            client,
+            server,
+        )
+    }
+
+    /// A minimal `SessionState` for `reconcile_ack_cursors`'s `joined` map --
+    /// a real `MeshLinkRegistration` (needed so its `Drop` doesn't panic) but
+    /// otherwise inert: nothing in this test drains the registry it points at.
+    fn bare_session_state(key: SessionKey) -> SessionState {
+        let links = new_mesh_links();
+        let (fwd, _fwd_rx) = mpsc::channel(8);
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+        let registration = register_mesh_link(&links, key.clone(), fwd, ctl, Arc::new(Notify::new()));
+        SessionState {
+            key,
+            flush_deadline: tokio::time::Instant::now(),
+            _registration: registration,
+        }
+    }
+
+    /// `apply_ack_cursors` force-retires exactly the named slots' unacked
+    /// windows through the peer-confirmed cursor, ignores a frame naming a
+    /// different session or the wrong kind, and tolerates a malformed slot id
+    /// rather than panicking -- the mesh-link counterpart of a client-edge
+    /// driver's beacon-reader-fed `retire_through` call.
+    #[tokio::test]
+    async fn apply_ack_cursors_retires_the_named_slots_unacked_window() {
+        let (mut link, _client_ep, _server_ep) = connected_mesh_link().await;
+        let session = SessionId(1);
+        link.open_session(session);
+
+        for slot in [0u8, 1] {
+            for seq in 0..3u64 {
+                let payload = Payload {
+                    seq,
+                    slot: u32::from(slot),
+                    commands: vec![0xAA].into(),
+                    ..Default::default()
+                };
+                link.send(session, Some(payload), None).unwrap();
+            }
+        }
+        assert_eq!(link.payloads_in_flight(session), 6);
+
+        // A frame for a different session is a no-op.
+        let other_session_frame = ack_cursors_frame(SessionId(2), vec![(SlotId(0), 2)]);
+        apply_ack_cursors(&mut link, &other_session_frame);
+        assert_eq!(link.payloads_in_flight(session), 6);
+
+        // Retire only slot 0 through seq 1 (seq 2 stays in flight); slot 1 is
+        // untouched.
+        let frame = ack_cursors_frame(session, vec![(SlotId(0), 1)]);
+        apply_ack_cursors(&mut link, &frame);
+        assert_eq!(
+            link.payloads_in_flight(session),
+            4,
+            "slot 0's seqs 0 and 1 retired; its seq 2 and all of slot 1 remain",
+        );
+
+        // A malformed slot id (out of u8 range) in the cursor list is
+        // skipped, not a panic; the rest of the frame still applies.
+        let mixed = MeshControlFrame {
+            session: session.0,
+            kind: Some(mesh_control_frame::Kind::MeshAckCursors(
+                rally_point_proto::messages::MeshAckCursors {
+                    cursors: vec![
+                        rally_point_proto::messages::MeshAckCursor {
+                            slot: 300,
+                            delivered_through: 0,
+                        },
+                        rally_point_proto::messages::MeshAckCursor {
+                            slot: 1,
+                            delivered_through: 2,
+                        },
+                    ],
+                },
+            )),
+        };
+        apply_ack_cursors(&mut link, &mixed);
+        assert_eq!(
+            link.payloads_in_flight(session),
+            1,
+            "slot 1 fully retired despite the malformed entry alongside it; \
+             only slot 0's seq 2 remains",
+        );
+    }
+
+    /// `reconcile_ack_cursors` pushes a session's advanced cursors exactly
+    /// once each, stays quiet once the peer has heard the latest value, and
+    /// resumes pushing on the next genuine advance -- the push-on-advance
+    /// discipline the mesh-link ack-beacon needs to stay off the hot path on
+    /// a healthy, quiet link.
+    #[tokio::test]
+    async fn reconcile_ack_cursors_pushes_only_on_advance() {
+        let key = control_key();
+        let session = key.session;
+
+        // `delivered_through_all` reads receive state, so this needs a real
+        // sender-to-receiver round trip (mirroring the transport-level
+        // tests), not just one side of a connection.
+        let (mut sender, mut receiver, _e1, _e2) = connected_mesh_link_pair().await;
+        receiver.open_session(session);
+        sender.open_session(session);
+        sender
+            .send(session, Some(turn_payload(0, 0)), None)
+            .unwrap();
+        receiver.recv().await.unwrap();
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut sent: HashMap<(SessionId, SlotId), u64> = HashMap::new();
+        let mut joined = HashMap::new();
+        joined.insert(session, bare_session_state(key.clone()));
+
+        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        let frame = control_rx.try_recv().expect("the fresh cursor is pushed");
+        match frame.kind {
+            Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {
+                assert_eq!(cursors.cursors.len(), 1);
+                assert_eq!(cursors.cursors[0].slot, 0);
+                assert_eq!(cursors.cursors[0].delivered_through, 0);
+            }
+            other => panic!("expected MeshAckCursors, got {other:?}"),
+        }
+
+        // Nothing advanced: a second reconcile with no new receipt sends
+        // nothing.
+        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        assert!(
+            control_rx.try_recv().is_err(),
+            "no advance since the last push -- the beacon stays quiet",
+        );
+
+        // A genuine advance (seq 1) is pushed again.
+        sender
+            .send(session, Some(turn_payload(0, 1)), None)
+            .unwrap();
+        receiver.recv().await.unwrap();
+        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        let frame = control_rx.try_recv().expect("the advance is pushed");
+        match frame.kind {
+            Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {
+                assert_eq!(cursors.cursors[0].delivered_through, 1);
+            }
+            other => panic!("expected MeshAckCursors, got {other:?}"),
+        }
+    }
+
+    /// A second loopback mesh-link pair (both sides), for the one test above
+    /// that needs a real receive to observe `delivered_through_all` advance —
+    /// distinct from `connected_mesh_link`, which only needs one live side.
+    pub(crate) async fn connected_mesh_link_pair() -> (
+        rally_point_transport::MeshLink,
+        rally_point_transport::MeshLink,
+        rally_point_transport::quinn::Endpoint,
+        rally_point_transport::quinn::Endpoint,
+    ) {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        use rally_point_transport::quic::{mesh_client_config, server_config};
+        use rally_point_transport::quinn;
+
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+        let mut roots = rally_point_transport::rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = mesh_client_config(roots).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accept.await.unwrap();
+
+        (
+            rally_point_transport::MeshLink::new(client_conn),
+            rally_point_transport::MeshLink::new(server_conn),
+            client,
+            server,
+        )
+    }
+
+    fn turn_payload(slot: u8, seq: u64) -> Payload {
+        Payload {
+            seq,
+            slot: u32::from(slot),
+            commands: vec![0xAA].into(),
+            ..Default::default()
+        }
     }
 }

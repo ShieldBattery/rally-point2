@@ -488,6 +488,20 @@ impl Dedup {
         self.slots.get(&slot).and_then(|s| s.delivered_through)
     }
 
+    /// Every slot's delivered-through cursor, for slots that have delivered at
+    /// least one payload. Unlike the client edge (which tracks its own set of
+    /// known peer slots independently, from the turns it produces), a mesh
+    /// link's driver has no such side list of "which remote slots does this
+    /// session carry" -- the slots this returns are exactly the ones this
+    /// `Dedup` instance has actually seen traffic for, which is the complete
+    /// and only set the mesh ack-cursor push needs.
+    pub(crate) fn delivered_through_all(&self) -> Vec<(SlotId, u64)> {
+        self.slots
+            .iter()
+            .filter_map(|(&slot, s)| s.delivered_through.map(|cursor| (slot, cursor)))
+            .collect()
+    }
+
     /// Records `(slot, seq)` as delivered and reports whether it's new, a
     /// duplicate, or out of the receive window.
     pub(crate) fn accept(&mut self, slot: SlotId, seq: u64) -> Delivery {

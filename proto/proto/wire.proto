@@ -743,6 +743,24 @@ message MeshControlFrame {
     // window are not recovered. Bounded to session start and the
     // abandoned/stall machinery's own timers, not indefinite.
     MeshResumeCursors mesh_resume_cursors = 12;
+
+    // The sending relay's per-slot delivered-through cursors for THIS mesh
+    // link's own datagram transport -- the mesh-link counterpart of the
+    // client-edge ack-beacon. Each cursor is the top of the contiguous run of
+    // turns this relay's link-level transport has received from the peer for
+    // one slot; the peer force-advances that slot's unacked window past it,
+    // exactly as `Link::retire_through` does for a client-edge link. Carried
+    // on this stream (rather than a dedicated uni-stream, as the client edge
+    // uses) because one mesh connection multiplexes many sessions' transport
+    // state behind a single QUIC datagram path -- this frame's `session`
+    // field is what a bare per-slot cursor cannot supply on its own. Declared
+    // over reverse-path acks specifically: it rescues a window that is stuck
+    // only because the peer's acks were lost, not one stuck by a genuine
+    // forward gap (the peer truly hasn't received the turns) -- that case is
+    // the hard cap's job, not this frame's. Push-on-advance, like every other
+    // cursor share here. Not re-broadcast -- each side answers only for its
+    // own receive state.
+    MeshAckCursors mesh_ack_cursors = 13;
   }
 }
 
@@ -798,6 +816,26 @@ message MeshResumeCursor {
   // this link, another mesh link, or, if `origin_slot` is the sender's own
   // client, the client edge itself -- and must not be replayed again.
   uint64 next_seq = 2;
+}
+
+// One relay's per-slot delivered-through cursors for one mesh link's own
+// datagram transport. See `MeshControlFrame.mesh_ack_cursors` for the sharing
+// discipline.
+message MeshAckCursors {
+  // The sender's per-slot cursors, complete as of this frame (declarative,
+  // like `MeshResumeCursors` -- a lost frame is corrected by the next one).
+  repeated MeshAckCursor cursors = 1;
+}
+
+// One slot's delivered-through cursor within a `MeshAckCursors` frame.
+message MeshAckCursor {
+  // The slot this cursor covers.
+  uint32 slot = 1;
+
+  // The top of the contiguous run of turns this relay's mesh-link transport
+  // has received from the peer for `slot`. Monotonic per (link, slot); the
+  // receiver's `retire_through` guard rejects a non-advancing value.
+  uint64 delivered_through = 2;
 }
 
 // A relay's announcement to its mesh peers that one of its home clients has
