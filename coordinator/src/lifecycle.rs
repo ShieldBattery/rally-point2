@@ -36,7 +36,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rally_point_proto::control::{DepartedSlot, DepartureKind, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::ExpiresAt;
@@ -401,6 +401,14 @@ impl Lifecycle {
     /// `dead` (an already-applied swap, or an id unrelated to this session), is
     /// left untouched — the call is idempotent, so a caller need not track
     /// whether it already applied a given swap.
+    ///
+    /// After mutating the set, the all-relays-closed condition is re-evaluated:
+    /// a `SessionClosed` recorded before this swap was tested against the
+    /// pre-swap serving set — which still named the now-dead relay — so the
+    /// condition can first become satisfiable only once the swap lands, and no
+    /// later close is guaranteed to arrive to re-trigger the check. Dropping the
+    /// dead relay in the "`r_new` already present" branch can newly satisfy it
+    /// too, so the re-evaluation runs on every branch that changed the set.
     pub fn on_rehome(&self, tenant: &TenantId, session: SessionId, dead: RelayId, r_new: RelayId) {
         if dead == r_new {
             return;
@@ -417,6 +425,7 @@ impl Lifecycle {
         } else {
             state.serving_relays[pos] = r_new;
         }
+        self.finish_if_all_closed(sessions, tenant.clone(), session);
     }
 
     /// Records a slot's departure: accounts the slot (if a player), notes it
@@ -522,12 +531,43 @@ impl Lifecycle {
     /// closed, enqueues the final `sessionClosed` webhook (behind every prior
     /// notice in queue order) and reaps the session's state.
     pub fn on_session_closed(&self, tenant: TenantId, session: SessionId, relay_id: RelayId) {
-        let key = (tenant.clone(), session);
         let mut sessions = self.inner.sessions.lock();
-        let Some(state) = sessions.get_mut(&key) else {
+        let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
             return; // an unknown session (restart amnesia): no serving set to close
         };
         state.closed_relays.insert(relay_id);
+        self.finish_if_all_closed(sessions, tenant, session);
+    }
+
+    /// If every serving relay has now reported closed — and the terminal webhook
+    /// has not already been enqueued — declares the session over: sets the
+    /// enqueued guard, enqueues `sessionClosed` behind everything already in the
+    /// queue, and retires the session's state. A no-op otherwise: some relay is
+    /// still open, the terminal webhook already fired, or the state was already
+    /// removed by an earlier close.
+    ///
+    /// Every mutation that can newly satisfy the all-relays-closed condition
+    /// funnels through here so the evaluation is never dropped on the floor: a
+    /// relay reporting closed ([`on_session_closed`](Self::on_session_closed))
+    /// and a re-home swapping the cached serving set
+    /// ([`on_rehome`](Self::on_rehome)).
+    ///
+    /// Takes the held `sessions` guard by value rather than a `&mut` to it so it
+    /// can enforce the retire discipline [`close_and_retire`](Self::close_and_retire)
+    /// depends on: the state is removed from the map and the session lock is
+    /// fully dropped BEFORE `close_and_retire` runs, because that path acquires
+    /// the relay-membership, descriptor, and rehome locks and must never hold
+    /// the session lock while doing so.
+    fn finish_if_all_closed(
+        &self,
+        mut sessions: MutexGuard<'_, HashMap<SessionRef, SessionState>>,
+        tenant: TenantId,
+        session: SessionId,
+    ) {
+        let key = (tenant.clone(), session);
+        let Some(state) = sessions.get_mut(&key) else {
+            return; // already retired by an earlier close, or never tracked
+        };
         if !state.all_relays_closed() || state.session_closed_enqueued {
             return;
         }
@@ -2221,6 +2261,92 @@ mod tests {
             .expect("sessionClosed fires once both the replacement and the surviving relay close")
             .unwrap();
         assert_eq!(got.event, "sessionClosed");
+    }
+
+    #[tokio::test]
+    async fn a_close_recorded_before_a_rehome_swap_is_re_evaluated_when_the_swap_lands() {
+        // The exact window a re-home can strand: the replacement relay reports
+        // `SessionClosed` after `session::rehome` has published its resumed
+        // descriptor (so the relay is already serving) but before the lifecycle
+        // swaps it into the cached serving set. That close is recorded while the
+        // cached set still names only the dead relay, so all-relays-closed is
+        // false when it lands -- and no further close is coming. The swap itself
+        // must re-evaluate the condition, or the session's state and its terminal
+        // `sessionClosed` webhook are stranded for the process lifetime.
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url);
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+
+        // The replacement's close arrives first, evaluated against the pre-swap
+        // set [R1]; nothing finishes yet.
+        lc.on_session_closed(tid(), s, RelayId(2));
+        assert!(
+            lc.is_alive(&tid(), s),
+            "a close from a not-yet-swapped-in relay does not finish the session on its own",
+        );
+
+        // The swap lands: [R1] becomes [R2], which is already closed. The
+        // re-evaluation must now recognize all-relays-closed and retire.
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the swap re-evaluates the recorded close and delivers sessionClosed")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+        assert!(
+            !lc.is_alive(&tid(), s),
+            "a fully-closed session is not alive"
+        );
+        assert!(
+            !lc.contains_state(&tid(), s),
+            "the session's lifecycle state and drain queue are reaped, not stranded",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rehome_dropping_the_dead_relay_re_evaluates_when_the_target_already_serves() {
+        // A split session on [R1, R2] where R2 has already reported closed. When
+        // the home relay R1 dies and the group re-homes onto R2 -- already a
+        // serving member -- the swap drops R1 rather than adding a duplicate,
+        // leaving [R2], which is closed. That drop newly satisfies
+        // all-relays-closed, so the "target already present" branch must
+        // re-evaluate too.
+        let (url, mut rx) = spawn_receiver(None).await;
+        let setup = setup_with_notify(url);
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+            ExpiresAt(u64::MAX),
+        );
+
+        lc.on_session_closed(tid(), s, RelayId(2));
+        assert!(lc.is_alive(&tid(), s), "R1 has not closed yet");
+
+        // Re-home R1 onto the already-serving R2: the set becomes [R2], all closed.
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("dropping the dead relay leaves only closed relays and finishes the session")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+        assert!(
+            !lc.is_alive(&tid(), s),
+            "a fully-closed session is not alive"
+        );
     }
 
     #[tokio::test]
