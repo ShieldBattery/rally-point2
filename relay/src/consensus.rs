@@ -877,6 +877,60 @@ impl PartialOrd<u64> for RateLimitedCounter {
     }
 }
 
+/// A per-key token bucket for a per-slot admission rate cap. Generalizes the
+/// chat rate cap's original shape (a whole-token counter plus a last-refill
+/// instant, rather than a fractional accumulator -- integer refill counts
+/// avoid floating-point drift across a long-running session, and whole-token
+/// granularity costs nothing observable at the cadence these caps run at) so
+/// every admission path with its own per-slot rate need — chat, and now
+/// lobby commands — shares one tested implementation instead of each growing
+/// its own copy, mirroring why [`RateLimitedCounter`] is `pub(crate)` here.
+pub(crate) struct TokenBucket {
+    /// Tokens currently available, capped at `burst`.
+    tokens: u32,
+    /// The instant the tokens above were last refilled up to.
+    last_refill: std::time::Instant,
+    /// The bucket's capacity: how many admissions may burst back-to-back
+    /// before refill catches up.
+    burst: u32,
+    /// How often one additional token is added, up to `burst`.
+    refill_interval: std::time::Duration,
+}
+
+impl TokenBucket {
+    /// A fresh bucket starts full — a slot's first admissions after joining
+    /// (or after this bucket is first created for it) are not penalized for
+    /// a session it just started participating in.
+    pub(crate) fn new(burst: u32, refill_interval: std::time::Duration) -> Self {
+        Self {
+            tokens: burst,
+            last_refill: std::time::Instant::now(),
+            burst,
+            refill_interval,
+        }
+    }
+
+    /// Refills whole elapsed `refill_interval`s since the last refill (capped
+    /// at `burst`), then attempts to take one token. Returns `false` — taking
+    /// nothing — when the bucket is still empty after refilling.
+    pub(crate) fn try_take(&mut self) -> bool {
+        let elapsed = self.last_refill.elapsed();
+        let interval_ms = self.refill_interval.as_millis().max(1);
+        let intervals = elapsed.as_millis() / interval_ms;
+        if intervals > 0 {
+            let intervals = u32::try_from(intervals).unwrap_or(self.burst);
+            self.tokens = self.tokens.saturating_add(intervals).min(self.burst);
+            self.last_refill += self.refill_interval * intervals;
+        }
+        if self.tokens == 0 {
+            false
+        } else {
+            self.tokens -= 1;
+            true
+        }
+    }
+}
+
 /// The per-session sync-checksum comparator. Lives on the authority relay's
 /// [`DecisionMaker`] and is fed one call per turn (via
 /// [`DecisionMaker::observe_sync`], called exactly once per distinct
@@ -8277,5 +8331,39 @@ mod tests {
             m.sync.malformed_kind_warns >= 1,
             "the malformed kind was flagged",
         );
+    }
+
+    #[test]
+    fn token_bucket_admits_a_full_burst_then_recovers_after_refill() {
+        let burst = 4;
+        let interval = std::time::Duration::from_millis(200);
+        let mut bucket = TokenBucket::new(burst, interval);
+
+        for _ in 0..burst {
+            assert!(bucket.try_take());
+        }
+        assert!(
+            !bucket.try_take(),
+            "the burst is exhausted; the next admission is rejected",
+        );
+
+        std::thread::sleep(interval + std::time::Duration::from_millis(50));
+        assert!(bucket.try_take(), "one interval refilled at least one token");
+    }
+
+    #[test]
+    fn token_bucket_never_refills_past_its_burst_cap() {
+        let burst = 2;
+        let interval = std::time::Duration::from_millis(10);
+        let mut bucket = TokenBucket::new(burst, interval);
+
+        // Idle far longer than many refill intervals: the bucket must still
+        // cap at `burst`, not accumulate an unbounded backlog of tokens.
+        std::thread::sleep(interval * 50);
+        let mut admitted = 0;
+        while bucket.try_take() {
+            admitted += 1;
+        }
+        assert_eq!(admitted, burst as usize);
     }
 }

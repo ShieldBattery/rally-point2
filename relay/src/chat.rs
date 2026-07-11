@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::GameChat;
 
-use crate::consensus::RateLimitedCounter;
+use crate::consensus::{RateLimitedCounter, TokenBucket};
 use crate::routing::SessionKey;
 
 /// Depth of one member's chat-push channel. Chat is bursty but small (a human
@@ -98,56 +98,11 @@ pub struct ChatSession {
     /// Per-authoring-slot token buckets for the rate cap. Keyed separately from
     /// `members` (and outliving a member's own deregistration — see
     /// [`deregister_member`]) so a slot's budget is not reset by a reconnect.
-    limiters: HashMap<SlotId, RateLimiter>,
+    limiters: HashMap<SlotId, TokenBucket>,
     /// Per-slot rate-limited warn counter for the size-cap violation.
     size_warns: HashMap<SlotId, RateLimitedCounter>,
     /// Per-slot rate-limited warn counter for the rate-cap violation.
     rate_warns: HashMap<SlotId, RateLimitedCounter>,
-}
-
-/// A per-slot token bucket for the chat rate cap. Deliberately a whole-token
-/// counter plus a last-refill instant rather than a fractional accumulator:
-/// chat's cadence is loose enough (a human typing) that whole-token granularity
-/// costs nothing observable, and integer refill counts avoid floating-point
-/// drift across a long-running session.
-struct RateLimiter {
-    /// Tokens currently available, capped at [`CHAT_RATE_BURST`].
-    tokens: u32,
-    /// The instant the tokens above were last refilled up to.
-    last_refill: Instant,
-}
-
-impl RateLimiter {
-    /// A fresh limiter starts with a full burst available — a slot's first
-    /// messages after joining are not penalized for a session it just started
-    /// participating in.
-    fn new() -> Self {
-        Self {
-            tokens: CHAT_RATE_BURST,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Refills whole elapsed [`CHAT_RATE_REFILL_INTERVAL`]s since the last
-    /// refill (capped at the burst size), then attempts to take one token.
-    /// Returns `false` — taking nothing — when the bucket is still empty after
-    /// refilling.
-    fn try_take(&mut self) -> bool {
-        let elapsed = self.last_refill.elapsed();
-        let interval_ms = CHAT_RATE_REFILL_INTERVAL.as_millis().max(1);
-        let intervals = elapsed.as_millis() / interval_ms;
-        if intervals > 0 {
-            let intervals = u32::try_from(intervals).unwrap_or(CHAT_RATE_BURST);
-            self.tokens = self.tokens.saturating_add(intervals).min(CHAT_RATE_BURST);
-            self.last_refill += CHAT_RATE_REFILL_INTERVAL * intervals;
-        }
-        if self.tokens == 0 {
-            false
-        } else {
-            self.tokens -= 1;
-            true
-        }
-    }
 }
 
 /// Registers a member for `key` and returns the receiver its slot-link task
@@ -211,7 +166,7 @@ pub fn admit(registry: &ChatRegistry, key: &SessionKey, slot: SlotId, text_len: 
     if !session
         .limiters
         .entry(slot)
-        .or_insert_with(RateLimiter::new)
+        .or_insert_with(|| TokenBucket::new(CHAT_RATE_BURST, CHAT_RATE_REFILL_INTERVAL))
         .try_take()
     {
         if session.rate_warns.entry(slot).or_default().observe() {

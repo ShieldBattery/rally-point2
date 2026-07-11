@@ -1465,19 +1465,27 @@ pub async fn run_slot_link(
                             consensus::record_result(&decision_makers, &key, slot, payload.to_vec());
                         }
                     }
-                    // The client's lobby command. Bind it to the authenticated
-                    // slot — never the client-asserted `slot` on the wire, exactly
-                    // as `validate_turn` rebinds a turn's slot — then deliver it to
+                    // The client's lobby command. Admit it against the relay's
+                    // per-slot rate cap first — a failure drops the command
+                    // without closing the link, mirroring chat. An admitted
+                    // command is bound to the authenticated slot — never the
+                    // client-asserted `slot` on the wire, exactly as
+                    // `validate_turn` rebinds a turn's slot — then delivered to
                     // local members (appended to the per-session replay log and
-                    // fanned to every other local member; the author is not echoed,
-                    // its own game echoes locally) and forward one copy across each
-                    // mesh link serving the session so peer relays fan it to their
-                    // locals. The bytes are opaque; the relay frames nothing of its
-                    // own around them.
+                    // fanned to every other local member; the author is not
+                    // echoed, its own game echoes locally) and, only if that
+                    // delivery was itself admitted (the session's log cap can
+                    // still refuse it), forwarded once across each mesh link
+                    // serving the session so peer relays fan it to their
+                    // locals. The bytes are opaque; the relay frames nothing of
+                    // its own around them.
                     Some(ControlInbound::Lobby(mut command)) => {
-                        command.slot = u32::from(slot.0);
-                        crate::lobby::deliver(&lobby, &key, command.clone());
-                        crate::mesh::fan_out_lobby_command(&mesh_links, &key, command);
+                        if crate::lobby::admit(&lobby, &key, slot) {
+                            command.slot = u32::from(slot.0);
+                            if crate::lobby::deliver(&lobby, &key, command.clone()) {
+                                crate::mesh::fan_out_lobby_command(&mesh_links, &key, command);
+                            }
+                        }
                     }
                     // The client's in-game chat message. Admit it against the
                     // relay's size and rate caps first — either failure drops

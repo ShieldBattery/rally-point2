@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -48,6 +49,7 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::LobbyCommand;
 
+use crate::consensus::{RateLimitedCounter, TokenBucket};
 use crate::routing::SessionKey;
 
 /// Depth of one member's lobby-push channel. Sized above [`LOBBY_LOG_MAX_COMMANDS`]
@@ -67,6 +69,28 @@ const LOBBY_LOG_MAX_COMMANDS: usize = 1024;
 /// misbehaving client can pin across the log even if each command is small; like
 /// the count cap, it is far above any real lobby.
 const LOBBY_LOG_MAX_BYTES: usize = 256 * 1024;
+
+/// The lobby rate cap's burst size, mirroring [`crate::chat`]'s
+/// [`TokenBucket`]-based admission but sized for lobby traffic rather than
+/// chat's human-typing cadence. Setup is a burst authored by one slot (almost
+/// always the host): a full 8-player lobby's slot, color, race, and team
+/// assignments plus the game-init that seeds the synced RNG is on the order
+/// of thirty commands, all emitted back-to-back the moment the host's UI
+/// populates, with nothing pacing them (unlike chat, no human types that
+/// fast). 32 covers that whole burst from a single slot with a little room to
+/// spare, while still bounding a flooding client to a small, cheap admission
+/// check per command.
+const LOBBY_RATE_BURST: u32 = 32;
+
+/// The lobby rate cap's refill rate: one additional token every this long, up
+/// to [`LOBBY_RATE_BURST`]. Ordinary post-setup lobby traffic is a member's own
+/// occasional request (a ready toggle, a race or team change) — nothing close
+/// to chat's typing cadence, let alone a flood. 200ms (5/sec sustained) is
+/// generous enough that a player rapidly clicking through settings is never
+/// throttled, while still keeping a misbehaving or hostile client's sustained
+/// rate an order of magnitude below what could meaningfully grow the mesh
+/// control channel or the local push queues.
+const LOBBY_RATE_REFILL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Every session's lobby state on this relay, keyed like the turn roster by
 /// `(tenant, session)`. A plain (non-async) mutex is deliberate, matching the
@@ -100,6 +124,12 @@ pub struct LobbySession {
     /// sender, drained by the member's slot-link task and written to its control
     /// stream.
     members: HashMap<SlotId, mpsc::Sender<LobbyCommand>>,
+    /// Per-authoring-slot token buckets for the rate cap. Keyed separately from
+    /// `members` (and outliving a member's own deregistration) so a slot's
+    /// budget is not reset by a reconnect, mirroring [`crate::chat`].
+    limiters: HashMap<SlotId, TokenBucket>,
+    /// Per-slot rate-limited warn counter for the rate-cap violation.
+    rate_warns: HashMap<SlotId, RateLimitedCounter>,
 }
 
 /// Registers a member for `key` and returns the receiver its slot-link task
@@ -162,6 +192,40 @@ pub fn end_session(registry: &LobbyRegistry, key: &SessionKey) {
     registry.lock().remove(key);
 }
 
+/// Checks whether one client-authored lobby command from `slot` in `key`'s
+/// session may proceed to [`deliver`]: `slot`'s token bucket has budget.
+/// Only ever called at the client edge, before `deliver` and the mesh
+/// fan-out — mirroring [`crate::chat::admit`], a mesh-received command has
+/// already passed its origin relay's `admit` and goes straight to `deliver`
+/// (see [`crate::mesh::dispatch_mesh_control`]'s `LobbyCommand` arm), so
+/// re-checking here would only re-penalize an already-admitted command
+/// against a second, independent bucket keyed on the same slot.
+///
+/// A failing command is dropped by the caller without closing the
+/// connection; the failure logs through a rate-limited counter so a spam
+/// burst produces O(log n) log lines rather than one per command.
+pub fn admit(registry: &LobbyRegistry, key: &SessionKey, slot: SlotId) -> bool {
+    let mut registry = registry.lock();
+    let session = registry.entry(key.clone()).or_default();
+    if session
+        .limiters
+        .entry(slot)
+        .or_insert_with(|| TokenBucket::new(LOBBY_RATE_BURST, LOBBY_RATE_REFILL_INTERVAL))
+        .try_take()
+    {
+        return true;
+    }
+    if session.rate_warns.entry(slot).or_default().observe() {
+        tracing::warn!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = slot.0,
+            "dropping lobby command; slot exceeded its lobby rate cap",
+        );
+    }
+    false
+}
+
 /// Delivers one lobby command to `key`'s local members: appends it to the replay
 /// log and fans it out to every member except its author.
 ///
@@ -174,14 +238,20 @@ pub fn end_session(registry: &LobbyRegistry, key: &SessionKey) {
 /// under the one lock [`register_member`] snapshots under, so a concurrent join
 /// sees this command in exactly one of {its replay snapshot, its live tail}.
 ///
-/// A command that would carry the session past either cap is dropped (the session
-/// is misbehaving); the relay warns once and stops appending, so a late joiner
-/// still replays a consistent prefix.
-pub fn deliver(registry: &LobbyRegistry, key: &SessionKey, command: LobbyCommand) {
+/// Only ever called after [`admit`] has already cleared a client-authored
+/// command (or, for a mesh-received one, unconditionally — see `admit`'s
+/// docs); this function's own admission concern is the session-wide log cap,
+/// independent of any one slot's rate. Returns whether the command was
+/// admitted and delivered — the caller's cue for whether to also forward a
+/// copy across the mesh: a command this relay refused was never added to its
+/// own log or fanned to its own locals, so a peer that received it anyway
+/// would be out of sync with every relay that refused it.
+pub fn deliver(registry: &LobbyRegistry, key: &SessionKey, command: LobbyCommand) -> bool {
     let mut registry = registry.lock();
     let session = registry.entry(key.clone()).or_default();
+
     if session.overflowed {
-        return;
+        return false;
     }
     let new_bytes = command.payload.len();
     if session.log.len() >= LOBBY_LOG_MAX_COMMANDS
@@ -195,7 +265,7 @@ pub fn deliver(registry: &LobbyRegistry, key: &SessionKey, command: LobbyCommand
             bytes = session.log_bytes,
             "lobby command log exceeded its cap; dropping this and further lobby commands",
         );
-        return;
+        return false;
     }
     session.log.push(command.clone());
     session.log_bytes += new_bytes;
@@ -218,6 +288,7 @@ pub fn deliver(registry: &LobbyRegistry, key: &SessionKey, command: LobbyCommand
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -362,5 +433,59 @@ mod tests {
         end_session(&registry, &k);
         let mut after = register_member(&registry, &k, SlotId(1));
         assert_eq!(drain(&mut after), vec![]);
+    }
+
+    #[test]
+    fn a_burst_past_the_rate_cap_is_rejected_then_recovers_after_refill() {
+        let registry = new_lobby_registry();
+        let k = key();
+        let slot = SlotId(0);
+
+        // The first LOBBY_RATE_BURST commands in a burst are all admitted --
+        // covering a full lobby's worth of setup commands from one slot.
+        for _ in 0..LOBBY_RATE_BURST {
+            assert!(admit(&registry, &k, slot));
+        }
+        // The next one, still within the burst window, is rejected.
+        assert!(!admit(&registry, &k, slot));
+
+        // After a refill interval passes, at least one more token is available.
+        std::thread::sleep(LOBBY_RATE_REFILL_INTERVAL + std::time::Duration::from_millis(50));
+        assert!(admit(&registry, &k, slot));
+    }
+
+    #[test]
+    fn the_rate_cap_is_independent_per_slot() {
+        let registry = new_lobby_registry();
+        let k = key();
+        for _ in 0..LOBBY_RATE_BURST {
+            assert!(admit(&registry, &k, SlotId(0)));
+        }
+        assert!(!admit(&registry, &k, SlotId(0)), "slot 0 exhausted its burst");
+        // A different slot has its own, untouched budget.
+        assert!(admit(&registry, &k, SlotId(1)));
+    }
+
+    #[test]
+    fn deliver_reports_admit_or_refuse_and_the_caller_gates_mesh_fan_out_on_it() {
+        // `deliver`'s own admission concern is the session-wide log cap, not
+        // the rate cap (that's `admit`, checked separately by the caller
+        // before `deliver` is ever reached). Exhaust the log cap directly, so
+        // `deliver` itself is what refuses, without touching the rate cap.
+        let registry = new_lobby_registry();
+        let k = key();
+        // A distinct authoring slot per command so no one slot's rate cap
+        // interferes with filling the session-wide log cap.
+        for i in 0..LOBBY_LOG_MAX_COMMANDS {
+            let slot = (i % 200) as u32; // cycle slots well past any u8 rate cap window
+            assert!(
+                deliver(&registry, &k, command(slot, 0)),
+                "command {i} should still be under the log cap",
+            );
+        }
+        assert!(
+            !deliver(&registry, &k, command(250, 0)),
+            "the log cap is now exhausted; deliver refuses",
+        );
     }
 }

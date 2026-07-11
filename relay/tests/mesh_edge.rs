@@ -567,6 +567,111 @@ async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), Any
     Ok(())
 }
 
+/// Reads control frames until one is a `SlotConnectivity` naming `(slot,
+/// connected)`, skipping every other frame kind. Panics on timeout. Mirrors
+/// `client_edge.rs`'s helper of the same name (a separate integration test
+/// binary, so not shared).
+async fn wait_for_connectivity(
+    reader: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+    slot: SlotId,
+    connected: bool,
+) {
+    use rally_point_transport::control::ControlInbound;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.recv())
+            .await
+            .expect("a connectivity frame arrives before the timeout")
+            .expect("the control stream stays open");
+        if let ControlInbound::Connectivity(change) = frame
+            && change.slot == u32::from(slot.0)
+            && change.connected == connected
+        {
+            return;
+        }
+    }
+}
+
+/// A member spamming lobby commands past the relay's per-slot rate cap gets
+/// only the admitted prefix relayed to a cross-relay peer — the over-cap
+/// remainder never reaches the mesh control channel at all (not merely
+/// delayed) — and a departure that follows right on the spam's heels still
+/// reaches that peer promptly, proving the refused burst left nothing queued
+/// ahead of it to back up behind. Mirrors
+/// `lobby_commands_reach_same_relay_and_cross_relay_peers_in_order`'s
+/// cross-relay setup.
+#[tokio::test]
+async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_still_gets_through()
+-> Result<(), AnyError> {
+    // Mirrors the private `lobby::LOBBY_RATE_BURST` (see the sibling flood
+    // tests' own comments on this pattern, e.g. mesh.rs's
+    // `routing::FORWARD_CAPACITY` mirror).
+    const LOBBY_RATE_BURST: usize = 32;
+
+    let tenant = make_tenant();
+    let session = SessionId(3);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+
+    // The spammer (slot 0) is on A; the observing peer (slot 1) is on B, so
+    // the mesh control channel is genuinely exercised, not just local fan-out.
+    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+
+    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Fire well past the burst, back to back with no pacing -- exactly the
+    // shape a flooding or buggy client produces.
+    for i in 0..(LOBBY_RATE_BURST + 20) {
+        rally_point_transport::control::send_control_lobby(
+            &mut host_send,
+            LobbyCommand {
+                slot: 99,
+                payload: vec![i as u8].into(),
+            },
+        )
+        .await?;
+    }
+
+    // The peer receives exactly the admitted prefix -- the refused remainder
+    // was never handed to `fan_out_lobby_command` at all.
+    let mut received = Vec::new();
+    for _ in 0..LOBBY_RATE_BURST {
+        received.push(next_lobby(&mut peer_b_rx).await.1[0]);
+    }
+    assert_eq!(
+        received,
+        (0..LOBBY_RATE_BURST as u8).collect::<Vec<_>>(),
+        "exactly the admitted prefix, in order",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_lobby(&mut peer_b_rx))
+            .await
+            .is_err(),
+        "nothing past the burst ever reaches the mesh -- not delayed, dropped outright",
+    );
+
+    // The spammer's own link now dies. Explicitly closed (not just dropped):
+    // `open_lobby_streams`'s reader task holds its own clone of the
+    // connection, so a plain `drop(host)` would leave that clone alive and
+    // the connection would linger rather than close promptly. If the refused
+    // burst had queued anything ahead of this on the shared mesh control
+    // channel, the departure would be stuck behind it; it arrives promptly
+    // instead.
+    host.close(0u32.into(), b"done");
+    wait_for_connectivity(&mut peer_b_rx, SlotId(0), false).await;
+
+    Ok(())
+}
+
 /// A game-chat message a member authors on relay A reaches a cross-relay peer on
 /// relay B, in order, stamped with the author's slot and with its scope fields
 /// (`target_kind`/`target_slot`) preserved verbatim across the mesh hop — the
