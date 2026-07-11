@@ -523,6 +523,10 @@ pub struct PlayerHandoff {
     /// means no preference (the fallback pick outright). Additive: a handoff that
     /// predates the field carries no region, and the control protos don't
     /// `deny_unknown_fields`.
+    ///
+    /// Regions are the production placement mechanism, so a request in which *any*
+    /// player carries a region is placed by region and ignores the dev-only
+    /// [`SessionRequest::dev_relay_split`] entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionId>,
 }
@@ -563,6 +567,13 @@ pub struct SessionRequest {
     /// when a second relay is enrolled; otherwise the split collapses to the single
     /// available home. Empty on every production request. Optional so a peer that
     /// predates the field still interops.
+    ///
+    /// This is the region-blind escape hatch: per-slot
+    /// [`region`](PlayerHandoff::region)s are the production placement mechanism,
+    /// so a request that carries **any**
+    /// player region ignores `dev_relay_split` entirely and places by region
+    /// instead. Forcing a cross-relay session through the production path is then a
+    /// matter of giving the slots different regions rather than setting this.
     #[serde(default)]
     pub dev_relay_split: Vec<SlotId>,
 }
@@ -588,11 +599,12 @@ pub struct PlayerToken {
 /// A per-slot home-relay override in a [`SessionResponse`]: a slot that homes on
 /// a relay other than the session's primary [`SessionResponse::home_relay`].
 ///
-/// Only a dev-forced cross-relay split ([`SessionRequest::dev_relay_split`])
-/// produces these; a production session has none, so every slot homes on the
-/// primary. Multi-relay redundancy is per-player home relays plus the mesh: a
-/// relay named here always homes at least one slot, so it is never assigned to a
-/// session it serves no player in.
+/// A single-region (or single-relay) session produces none — every slot homes on
+/// the primary. These appear for a genuine cross-region session (each player's
+/// home relay is in their own region) or the dev-forced cross-relay split
+/// ([`SessionRequest::dev_relay_split`]). Multi-relay redundancy is per-player
+/// home relays plus the mesh: a relay named here always homes at least one slot,
+/// so it is never assigned to a session it serves no player in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotHome {
     /// The slot this override applies to.
@@ -604,11 +616,12 @@ pub struct SlotHome {
 /// The coordinator's response to a session request: the session id, the
 /// relay topology, the per-player tokens, and the consensus policy bounds.
 ///
-/// The home relay is the one clients connect to. A session is single-relay by
-/// default (every slot homes on `home_relay`); `slot_homes` overrides the home
-/// for individual slots, the dev-forced cross-relay split. Multi-relay
-/// redundancy is per-player home relays plus the mesh: a relay that serves a
-/// session always homes at least one of its slots. The relay topology drives the
+/// The home relay is the one clients connect to. A same-region session is
+/// single-relay (every slot homes on `home_relay`); `slot_homes` overrides the
+/// home for individual slots — a cross-region session's per-player home relays,
+/// or the dev-forced cross-relay split. Multi-relay redundancy is per-player home
+/// relays plus the mesh: a relay that serves a session always homes at least one
+/// of its slots. The relay topology drives the
 /// mesh edge — each serving relay receives a [`SessionDescriptor`] naming its
 /// peers, and the lower-id side of each pair dials. The policy bounds are pushed
 /// to each relay's decision-maker.
@@ -620,8 +633,9 @@ pub struct SessionResponse {
     /// homes here except those overridden in `slot_homes`.
     pub home_relay: RelayEndpoint,
     /// Per-slot home overrides: slots that home on a relay other than
-    /// `home_relay`. Empty on a production session; populated only for a
-    /// dev-forced cross-relay split ([`SessionRequest::dev_relay_split`]).
+    /// `home_relay`. Empty for a same-region (single-relay) session; populated for
+    /// a cross-region session (each slot's home in its own region) or a dev-forced
+    /// cross-relay split ([`SessionRequest::dev_relay_split`]).
     #[serde(default)]
     pub slot_homes: Vec<SlotHome>,
     /// One token per player, matching the slots in the request.

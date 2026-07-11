@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    DepartedSlot, PlayerToken, RelayEndpoint, RelayPeer, SessionDescriptor, SessionRequest,
-    SessionResponse, SlotExternalRef, SlotHome, TenantId,
+    DepartedSlot, PlayerToken, RegionId, RelayEndpoint, RelayEntry, RelayPeer, SessionDescriptor,
+    SessionRequest, SessionResponse, SlotExternalRef, SlotHome, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
@@ -103,6 +103,14 @@ pub struct SessionRefs {
     /// false alarm: the id being enrolled is not enough, the cert its clients
     /// hold must still be the one currently live.
     pub relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
+    /// Each serving relay's region at the time it was picked, keyed by relay id
+    /// (`None` for an untagged relay). Recorded at session creation and updated
+    /// for the replacement relay on every re-home, alongside `relay_certs`, so a
+    /// re-home can prefer a live relay in the *dead* relay's region for the
+    /// replacement — keeping a re-homed slot near where it was placed — before
+    /// falling back to a region-blind pick. A `BTreeMap` for the same
+    /// deterministic-order reason as `homes`.
+    pub relay_regions: std::collections::BTreeMap<RelayId, Option<RegionId>>,
 }
 
 /// A create request reduced to the fields that shape the session it mints,
@@ -128,6 +136,9 @@ pub struct SessionRefs {
 /// - each player's `external_ref` — stored per slot and echoed into
 ///   departure/result webhooks, so replaying the first roster's refs for a
 ///   different roster would mislabel the players.
+/// - each player's `region` — selects the slot's home relay, so the same
+///   `external_id` retried with different per-slot regions reads as a genuine
+///   roster mismatch (a `409`), not a replay.
 /// - `dev_relay_split` — decides which slots home on the secondary relay,
 ///   shaping the response's `slot_homes` and the session's serving-relay set.
 ///
@@ -148,13 +159,14 @@ struct CreateFingerprint {
 /// One player's contribution to a [`CreateFingerprint`]: the fields of a
 /// [`PlayerHandoff`](rally_point_proto::control::PlayerHandoff) that shape the
 /// session (its slot, the pubkey its token binds, whether it is an observer,
-/// and its tenant correlation ref).
+/// its tenant correlation ref, and its requested region).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FingerprintPlayer {
     slot: SlotId,
     client_pubkey: ClientPublicKey,
     observer: bool,
     external_ref: Option<String>,
+    region: Option<RegionId>,
 }
 
 impl CreateFingerprint {
@@ -170,6 +182,7 @@ impl CreateFingerprint {
                 client_pubkey: p.client_pubkey,
                 observer: p.observer,
                 external_ref: p.external_ref.clone(),
+                region: p.region.clone(),
             })
             .collect();
         players.sort_by_key(|p| p.slot);
@@ -529,7 +542,8 @@ pub fn recorded_rehome(
 ///
 /// The replacement `R_new` is chosen as a live relay **already serving** the
 /// session if one exists (earliest in the authority order, which the serving set
-/// records home-first), else the lowest-id live registered relay. The dead relay
+/// records home-first), else the lowest-id available relay in the **dead relay's
+/// recorded region**, else the lowest-id available relay overall. The dead relay
 /// is replaced **in place** in the serving set — which is also the descriptors'
 /// authority order — so `R_new` inherits its rank, and every serving relay's
 /// descriptor is rebuilt as a `resumed` (rehome) descriptor seeding
@@ -661,10 +675,22 @@ fn rehome_inner(
         return RehomeOutcome::Unavailable;
     }
 
+    // The dead relay's recorded region, so the replacement can prefer a live relay
+    // in the same region — keeping a re-homed slot near where it was placed. `None`
+    // for an untagged dead relay (or a session with no recorded region), which
+    // simply skips straight to the region-blind fallback.
+    let dead_region: Option<RegionId> = setup
+        .session_refs
+        .lock()
+        .get(&key)
+        .and_then(|refs| refs.relay_regions.get(&dead_relay).cloned())
+        .flatten();
+
     // Pick the replacement: prefer a live *available* relay already serving the
-    // session (earliest in the authority order), else the lowest-id live available
-    // registered relay. A draining relay is never chosen — it asked to stop taking
-    // new work, and re-homing a whole group onto it would be exactly that.
+    // session (earliest in the authority order), else the lowest-id available relay
+    // in the dead relay's region, else the lowest-id available relay overall. A
+    // draining relay is never chosen — it asked to stop taking new work, and
+    // re-homing a whole group onto it would be exactly that.
     //
     // The dead relay's own id is a legal candidate here: reaching this point means
     // it either is not enrolled at all (genuinely gone, so `is_available` below
@@ -679,7 +705,11 @@ fn rehome_inner(
         .or_else(|| {
             let mut entries = registry::available_entries(&setup.registry);
             entries.sort_by_key(|e| e.relay_id);
-            entries.first().map(|e| e.relay_id)
+            dead_region
+                .as_ref()
+                .and_then(|region| entries.iter().find(|e| e.region.as_ref() == Some(region)))
+                .or_else(|| entries.first())
+                .map(|e| e.relay_id)
         });
     let Some(r_new) = r_new else {
         return RehomeOutcome::Unavailable;
@@ -764,6 +794,10 @@ fn rehome_inner(
         refs.relay_certs.remove(&dead_relay);
         refs.relay_certs
             .insert(r_new, cert_fingerprint(&new_entry.cert_der));
+        // Record R_new's region the same way, so a later re-home off R_new
+        // prefers *its* region, and the dead relay's stale entry does not linger.
+        refs.relay_regions.remove(&dead_relay);
+        refs.relay_regions.insert(r_new, new_entry.region.clone());
     }
 
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
@@ -822,13 +856,16 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// Creates a game session from an app-server request: assigns relays, mints
 /// tokens, and returns the response the app server hands to its clients.
 ///
-/// Every slot homes on the primary relay — the lowest-id registered relay
-/// (deterministic for a given fleet state) — except any listed in the request's
-/// dev-only [`dev_relay_split`](SessionRequest::dev_relay_split), which home on
-/// the secondary (next-lowest) relay instead, to force a cross-relay meshed
-/// session in testing. Each player gets a token signed by its tenant's key,
-/// binding the client pubkey to the slot and session. The bounds come from the
-/// tenant's enrolled policy.
+/// Each slot homes on a live relay in the region it requested
+/// ([`PlayerHandoff::region`](rally_point_proto::control::PlayerHandoff::region)),
+/// falling back to the lowest-id available relay when it named no region or its
+/// region has no live relay. A request that carries no region at all instead runs
+/// the region-blind dev path, where every slot homes on the lowest-id relay
+/// except those the dev-only
+/// [`dev_relay_split`](SessionRequest::dev_relay_split) moves onto the secondary
+/// to force a cross-relay meshed session in testing. Each player gets a token
+/// signed by its tenant's key, binding the client pubkey to the slot and session.
+/// The bounds come from the tenant's enrolled policy.
 ///
 /// Records the session's relay membership — the distinct home relays of its
 /// slots — so [`descriptor_for`] can list only the relays actually serving this
@@ -917,7 +954,19 @@ fn create_session_inner(
 
     validate_request(&request)?;
 
-    let (home, secondary) = assign_relays(&setup.registry)?;
+    // Placement: each slot homes on a relay in the region it requested when one
+    // is live, else the region-blind fallback (the lowest-id available relay). A
+    // request that carries any per-slot region is placed by region and ignores
+    // `dev_relay_split` — regions are the production placement mechanism, the
+    // split a region-less dev escape hatch — while a request with no region at all
+    // runs the dev-split path unchanged, so today's behavior is byte-for-byte
+    // preserved.
+    let any_region = request.players.iter().any(|p| p.region.is_some());
+    let placement = if any_region {
+        place_by_region(&setup.registry, &request)?
+    } else {
+        place_dev_split(&setup.registry, &request)?
+    };
 
     if !tenant::is_enrolled(&setup.tenants, &request.tenant) {
         return Err(SessionSetupError::TenantNotFound(request.tenant));
@@ -926,46 +975,14 @@ fn create_session_inner(
     let session = next_session_id(setup);
     let bounds = tenant::bounds(&setup.tenants, &request.tenant).expect("checked enrollment above");
 
-    // The dev cross-relay split: slots the request flagged home on the secondary
-    // relay instead of the primary. Honored only when a second relay is enrolled;
-    // otherwise the split collapses and every slot homes on the primary.
-    let slot_homes: Vec<SlotHome> = match &secondary {
-        Some(secondary) => request
-            .players
-            .iter()
-            .filter(|p| request.dev_relay_split.contains(&p.slot))
-            .map(|p| SlotHome {
-                slot: p.slot,
-                relay: secondary.clone(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    // Record which relays serve this session: the distinct home relays of its
-    // slots. That is the primary, plus the secondary when at least one slot homes
-    // there — a serving relay always homes at least one slot. `descriptor_for`
-    // reads this to build per-relay mesh-peer lists.
-    //
-    // Every slot not moved to the secondary homes on the primary, so the primary
-    // is serving unless the split moved *every* slot off it (a degenerate dev
-    // split naming all slots). Recording a relay that homes no slot would break
-    // the "every serving relay homes a slot" invariant: it would never register a
-    // slot, so never report `SessionClosed`, and the session's lifecycle would
-    // never close.
-    let relay_ids: Vec<RelayId> = {
-        let mut ids = Vec::new();
-        if slot_homes.len() < request.players.len() {
-            ids.push(home.relay_id);
-        }
-        if let Some(secondary) = &secondary
-            && !slot_homes.is_empty()
-            && secondary.relay_id != home.relay_id
-        {
-            ids.push(secondary.relay_id);
-        }
-        ids
-    };
+    let Placement {
+        home,
+        slot_homes,
+        relay_ids,
+        homes,
+        relay_certs,
+        relay_regions,
+    } = placement;
 
     // Test seam: a drain mark racing this create lands wholly before or after,
     // because it contends on the assignment lock this body holds (production no-op).
@@ -993,39 +1010,14 @@ fn create_session_inner(
             .map(|p| p.slot)
             .collect(),
         expected: request.players.iter().map(|p| p.slot).collect(),
-        // Every slot not listed in `slot_homes` (computed above) homes on the
-        // primary; reusing that already-computed set here — rather than
-        // re-deriving "is this slot in `dev_relay_split` and is there a
-        // secondary" — keeps the two in lockstep by construction.
-        homes: request
-            .players
-            .iter()
-            .map(|p| {
-                let relay_id = slot_homes
-                    .iter()
-                    .find(|split| split.slot == p.slot)
-                    .map_or(home.relay_id, |split| split.relay.relay_id);
-                (p.slot, relay_id)
-            })
-            .collect(),
-        // Every serving relay's cert, fingerprinted, so a later re-home can tell
-        // a restarted-in-place relay (same id, new cert) apart from a false
-        // alarm. Looked up from `home`/`secondary` rather than the registry
-        // again, so this reflects exactly the cert the tokens just minted (and
-        // the response about to be returned) already commit the clients to.
-        relay_certs: relay_ids
-            .iter()
-            .filter_map(|&id| {
-                if id == home.relay_id {
-                    Some((id, cert_fingerprint(&home.cert_der)))
-                } else {
-                    secondary
-                        .as_ref()
-                        .filter(|s| s.relay_id == id)
-                        .map(|s| (id, cert_fingerprint(&s.cert_der)))
-                }
-            })
-            .collect(),
+        // The per-slot home assignment, each serving relay's client-cert
+        // fingerprint (so a later re-home tells a restart-in-place apart from a
+        // false alarm), and each serving relay's region (so a re-home can prefer
+        // the dead relay's region) — all produced together by the placement so
+        // they stay in lockstep with the tokens minted and the response returned.
+        homes,
+        relay_certs,
+        relay_regions,
     };
     setup
         .session_refs
@@ -1285,6 +1277,219 @@ fn assign_relays(
     let home = RelayEndpoint::from(&entries[0]);
     let secondary = entries.get(1).map(RelayEndpoint::from);
     Ok((home, secondary))
+}
+
+/// A session's relay placement, distilled into the response shape and the
+/// coordinator-side records the descriptors and a later re-home read. Both the
+/// region-aware and the dev-split paths produce one, so the rest of
+/// [`create_session`] is placement-agnostic.
+struct Placement {
+    /// The session's primary home relay — the response's `home_relay`, where the
+    /// most slots home (ties broken by lowest relay id).
+    home: RelayEndpoint,
+    /// Per-slot overrides for the slots homing on a relay other than `home`.
+    slot_homes: Vec<SlotHome>,
+    /// The session's serving relays in authority order — `home` first, then the
+    /// rest by ascending id. The distinct assigned homes, so every serving relay
+    /// homes at least one slot.
+    relay_ids: Vec<RelayId>,
+    /// Every slot's assigned home relay id.
+    homes: std::collections::BTreeMap<SlotId, RelayId>,
+    /// Each serving relay's client-cert fingerprint, for a later re-home's
+    /// restart-in-place detection.
+    relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
+    /// Each serving relay's region at pick time, so a re-home can prefer the dead
+    /// relay's region for the replacement.
+    relay_regions: std::collections::BTreeMap<RelayId, Option<RegionId>>,
+}
+
+/// Region-aware placement: home each slot on a live relay in the region it
+/// requested, falling back to the region-blind pick (the lowest-id available
+/// relay overall) for a slot that named no region, or whose region has no live
+/// relay. Slots sharing a region share that region's relay, so a same-region
+/// game stays single-relay while a cross-region game produces the meshed
+/// `slot_homes` shape.
+///
+/// The response's `home_relay` is the relay assigned the most slots (ties broken
+/// by lowest relay id); `slot_homes` overrides every slot assigned elsewhere. By
+/// construction the serving set is exactly the distinct assigned homes and every
+/// serving relay homes at least one slot.
+fn place_by_region(
+    registry: &RelayRegistry,
+    request: &SessionRequest,
+) -> Result<Placement, SessionSetupError> {
+    let mut entries = registry::available_entries(registry);
+    if entries.is_empty() {
+        return Err(SessionSetupError::NoRelaysAvailable);
+    }
+    // Ascending id, so "first in a region" and "first overall" are both the
+    // deterministic lowest-id pick.
+    entries.sort_by_key(|e| e.relay_id);
+    let fallback = &entries[0];
+
+    // Assign each slot: the lowest-id available relay in its requested region if
+    // one exists, else the region-blind fallback.
+    let slot_relay: Vec<(SlotId, &RelayEntry)> = request
+        .players
+        .iter()
+        .map(|player| {
+            let entry = player
+                .region
+                .as_ref()
+                .and_then(|region| entries.iter().find(|e| e.region.as_ref() == Some(region)))
+                .unwrap_or(fallback);
+            (player.slot, entry)
+        })
+        .collect();
+
+    // The home relay is the one assigned the most slots; a lowest-id tie-break
+    // keeps the pick deterministic. Counting through a `BTreeMap` iterates ids
+    // ascending, so `Reverse(id)` in the key makes the smallest id win a tie.
+    let mut counts: std::collections::BTreeMap<RelayId, usize> = std::collections::BTreeMap::new();
+    for (_, entry) in &slot_relay {
+        *counts.entry(entry.relay_id).or_insert(0) += 1;
+    }
+    let home_id = *counts
+        .iter()
+        .max_by_key(|(id, count)| (**count, std::cmp::Reverse(**id)))
+        .map(|(id, _)| id)
+        .expect("a non-empty player list always assigns at least one slot");
+
+    // Serving relays in authority order: home first, then the rest ascending
+    // (`counts` keys are already ascending).
+    let mut relay_ids = vec![home_id];
+    relay_ids.extend(counts.keys().copied().filter(|&id| id != home_id));
+
+    let entry_for = |id: RelayId| -> &RelayEntry {
+        entries
+            .iter()
+            .find(|e| e.relay_id == id)
+            .expect("a serving relay is always one of the assigned entries")
+    };
+
+    let home = RelayEndpoint::from(entry_for(home_id));
+    let slot_homes: Vec<SlotHome> = slot_relay
+        .iter()
+        .filter(|(_, entry)| entry.relay_id != home_id)
+        .map(|(slot, entry)| SlotHome {
+            slot: *slot,
+            relay: RelayEndpoint::from(*entry),
+        })
+        .collect();
+    let homes = slot_relay
+        .iter()
+        .map(|(slot, entry)| (*slot, entry.relay_id))
+        .collect();
+    let relay_certs = relay_ids
+        .iter()
+        .map(|&id| (id, cert_fingerprint(&entry_for(id).cert_der)))
+        .collect();
+    let relay_regions = relay_ids
+        .iter()
+        .map(|&id| (id, entry_for(id).region.clone()))
+        .collect();
+
+    Ok(Placement {
+        home,
+        slot_homes,
+        relay_ids,
+        homes,
+        relay_certs,
+        relay_regions,
+    })
+}
+
+/// The region-blind (dev / loopback) placement: every slot homes on the primary
+/// relay (lowest-id available), except those the request's
+/// [`dev_relay_split`](SessionRequest::dev_relay_split) moves onto the secondary
+/// (next-lowest) to force a cross-relay meshed session in testing. This is the
+/// pre-region behavior verbatim, run only when no player named a region.
+fn place_dev_split(
+    registry: &RelayRegistry,
+    request: &SessionRequest,
+) -> Result<Placement, SessionSetupError> {
+    let (home, secondary) = assign_relays(registry)?;
+
+    // Slots the split flagged home on the secondary — honored only when a second
+    // relay is enrolled; otherwise the split collapses and every slot homes on
+    // the primary.
+    let slot_homes: Vec<SlotHome> = match &secondary {
+        Some(secondary) => request
+            .players
+            .iter()
+            .filter(|p| request.dev_relay_split.contains(&p.slot))
+            .map(|p| SlotHome {
+                slot: p.slot,
+                relay: secondary.clone(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // The distinct home relays: the primary (serving unless the split moved every
+    // slot off it), plus the secondary when at least one slot homes there. A
+    // serving relay always homes at least one slot.
+    let relay_ids: Vec<RelayId> = {
+        let mut ids = Vec::new();
+        if slot_homes.len() < request.players.len() {
+            ids.push(home.relay_id);
+        }
+        if let Some(secondary) = &secondary
+            && !slot_homes.is_empty()
+            && secondary.relay_id != home.relay_id
+        {
+            ids.push(secondary.relay_id);
+        }
+        ids
+    };
+
+    // Every slot not in `slot_homes` homes on the primary; reusing that set keeps
+    // `homes` in lockstep with the overrides by construction.
+    let homes = request
+        .players
+        .iter()
+        .map(|p| {
+            let relay_id = slot_homes
+                .iter()
+                .find(|split| split.slot == p.slot)
+                .map_or(home.relay_id, |split| split.relay.relay_id);
+            (p.slot, relay_id)
+        })
+        .collect();
+
+    // Each serving relay's cert, looked up from the `home`/`secondary` endpoints
+    // rather than the registry again, so it reflects exactly the cert the tokens
+    // just minted (and the response about to be returned) commit the clients to.
+    let relay_certs = relay_ids
+        .iter()
+        .filter_map(|&id| {
+            if id == home.relay_id {
+                Some((id, cert_fingerprint(&home.cert_der)))
+            } else {
+                secondary
+                    .as_ref()
+                    .filter(|s| s.relay_id == id)
+                    .map(|s| (id, cert_fingerprint(&s.cert_der)))
+            }
+        })
+        .collect();
+
+    // Each serving relay's region, from its current registry entry — the endpoints
+    // above don't carry it (region is coordinator-side placement state, never sent
+    // to clients or peers), so it is read back here at pick time.
+    let relay_regions = relay_ids
+        .iter()
+        .map(|&id| (id, registry::entry(registry, id).and_then(|e| e.region)))
+        .collect();
+
+    Ok(Placement {
+        home,
+        slot_homes,
+        relay_ids,
+        homes,
+        relay_certs,
+        relay_regions,
+    })
 }
 
 /// The maximum slot id (11: BW supports 12 network participants — 8 players
@@ -3438,6 +3643,282 @@ mod tests {
                 staged.contains(session),
                 "every Ok session is staged in the relay's outbox at the drain point",
             );
+        }
+    }
+
+    // --- Region-aware placement ---
+
+    /// Enrolls a relay tagged with `region` (or untagged when `None`), under the
+    /// id-derived fake cert.
+    fn enroll_relay_in_region(reg: &RelayRegistry, id: u64, port: u16, region: Option<&str>) {
+        let mut hello = RelayHello::new(
+            RelayId(id),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            ProtocolVersion::CURRENT,
+            fake_cert(id),
+        );
+        if let Some(region) = region {
+            hello = hello.with_region(RegionId(region.to_owned()));
+        }
+        registry::enroll(reg, hello);
+    }
+
+    /// A player in `slot` requesting `region` (or none), with an id-derived pubkey.
+    fn player_in_region(slot: u8, region: Option<&str>) -> PlayerHandoff {
+        PlayerHandoff {
+            slot: SlotId(slot),
+            client_pubkey: ClientPublicKey([slot; 32]),
+            external_ref: None,
+            observer: false,
+            region: region.map(|r| RegionId(r.to_owned())),
+        }
+    }
+
+    /// A tenant-enrolled setup with the given region-tagged relays.
+    fn setup_with_region_relays(relays: &[(u64, u16, Option<&str>)]) -> SessionSetup {
+        let reg = registry::new_registry();
+        for &(id, port, region) in relays {
+            enroll_relay_in_region(&reg, id, port, region);
+        }
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        SessionSetup::new(reg, tenants)
+    }
+
+    /// Creates a session from `players` (region-tagged), returning the response.
+    fn create_region_session(setup: &SessionSetup, players: Vec<PlayerHandoff>) -> SessionResponse {
+        create_session(
+            setup,
+            SessionRequest {
+                tenant: tid(),
+                players,
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response
+    }
+
+    #[test]
+    fn region_placement_homes_each_slot_in_its_region() {
+        // Two relays in two regions, one slot each: each slot homes on its region's
+        // relay, producing the meshed cross-region shape.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ],
+        );
+
+        // One slot each is a tie, so the home is the lowest-id relay (region-a's 1).
+        assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        // Slot 1 (region-b) is overridden onto relay 2, with its pinned cert.
+        assert_eq!(resp.slot_homes.len(), 1);
+        assert_eq!(resp.slot_homes[0].slot, SlotId(1));
+        assert_eq!(resp.slot_homes[0].relay.relay_id, RelayId(2));
+        assert_eq!(resp.slot_homes[0].relay.cert_der, fake_cert(2));
+        // Both relays serve the meshed session.
+        let serving: std::collections::HashSet<_> = setup
+            .serving_relays(&tid(), resp.session)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            serving,
+            std::collections::HashSet::from([RelayId(1), RelayId(2)]),
+        );
+    }
+
+    #[test]
+    fn a_slot_whose_region_has_no_relay_falls_back_to_the_global_pick() {
+        // Only region-a has relays; a slot asking for region-b falls back to the
+        // lowest-id available relay overall — today's region-blind pick.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-a"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ],
+        );
+
+        // region-a's lowest-id relay is 1; the unlit region-b slot falls back to the
+        // global lowest-id pick, which is also relay 1 — so a single-relay session.
+        assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        assert!(
+            resp.slot_homes.is_empty(),
+            "both slots land on relay 1, so there are no overrides",
+        );
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
+    }
+
+    #[test]
+    fn the_home_relay_is_the_plurality_pick_not_merely_the_lowest_id() {
+        // relay 2 (region-b) is assigned two slots, relay 1 (region-a) one: the home
+        // is the plurality relay 2, even though relay 1 has the lower id.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, Some("region-b")),
+                player_in_region(1, Some("region-b")),
+                player_in_region(2, Some("region-a")),
+            ],
+        );
+
+        assert_eq!(
+            resp.home_relay.relay_id,
+            RelayId(2),
+            "the plurality relay is the home even though it is not the lowest id",
+        );
+        // Only the region-a slot (2) is overridden, onto relay 1.
+        assert_eq!(resp.slot_homes.len(), 1);
+        assert_eq!(resp.slot_homes[0].slot, SlotId(2));
+        assert_eq!(resp.slot_homes[0].relay.relay_id, RelayId(1));
+    }
+
+    #[test]
+    fn dev_relay_split_is_ignored_when_any_player_names_a_region() {
+        // Slot 0 asks for region-a; slot 1 names no region but is in dev_relay_split.
+        // Because a region is present anywhere in the request, the split is ignored
+        // entirely: slot 1 falls back to the global pick (relay 1), not relay 2.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: vec![
+                    player_in_region(0, Some("region-a")),
+                    player_in_region(1, None),
+                ],
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response;
+
+        assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        assert!(
+            resp.slot_homes.is_empty(),
+            "the dev split is ignored, so slot 1 stays on the global pick (relay 1)",
+        );
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
+    }
+
+    #[test]
+    fn placement_records_each_serving_relays_region() {
+        // The serving relays' regions are recorded so a later re-home can prefer the
+        // dead relay's region.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ],
+        );
+        let refs = session_refs(&setup, &tid(), resp.session).unwrap();
+        assert_eq!(
+            refs.relay_regions.get(&RelayId(1)),
+            Some(&Some(RegionId("region-a".to_owned()))),
+        );
+        assert_eq!(
+            refs.relay_regions.get(&RelayId(2)),
+            Some(&Some(RegionId("region-b".to_owned()))),
+        );
+    }
+
+    #[test]
+    fn a_conflicting_create_differing_only_in_a_players_region_is_refused() {
+        // Region selects a slot's home relay, so the same external_id reused with a
+        // different per-slot region is a genuine roster mismatch (409), not a replay.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let original = SessionRequest {
+            tenant: tid(),
+            players: vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-a")),
+            ],
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
+
+        let mut changed = original.clone();
+        changed.players[1].region = Some(RegionId("region-b".to_owned()));
+        assert_eq!(
+            create_session(&setup, changed, ExpiresAt(u64::MAX)).unwrap_err(),
+            SessionSetupError::IdempotentCreateMismatch,
+        );
+
+        // The original roster still replays, so the conflict left the cache intact.
+        assert!(
+            create_session(&setup, original, ExpiresAt(u64::MAX))
+                .unwrap()
+                .replayed,
+        );
+    }
+
+    #[test]
+    fn rehome_prefers_a_replacement_in_the_dead_relays_region() {
+        // relay 2 (region-b) homes the single-slot session; the spares are relay 1
+        // (region-a) and relay 3 (region-b). When relay 2 dies and no serving relay
+        // is left to take over, the replacement is the region-b spare (relay 3), not
+        // the lower-id region-a relay 1.
+        let setup = setup_with_region_relays(&[
+            (1, 14900, Some("region-a")),
+            (2, 14901, Some("region-b")),
+            (3, 14902, Some("region-b")),
+        ]);
+        let resp = create_region_session(&setup, vec![player_in_region(0, Some("region-b"))]);
+        assert_eq!(resp.home_relay.relay_id, RelayId(2));
+
+        registry::remove(setup.registry(), RelayId(2));
+        match rehome(&setup, &tid(), resp.session, RelayId(2), vec![]) {
+            RehomeOutcome::NewTarget(ep) => assert_eq!(
+                ep.relay_id,
+                RelayId(3),
+                "the replacement is the region-b spare, not the lower-id region-a relay",
+            ),
+            other => panic!("expected NewTarget(relay 3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehome_falls_back_to_any_relay_when_the_dead_region_has_no_live_relay() {
+        // relay 2 (region-b) homes the session; the only spare is relay 1 (region-a).
+        // When relay 2 dies, region-b has no live relay, so the replacement is the
+        // region-blind fallback (relay 1).
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(&setup, vec![player_in_region(0, Some("region-b"))]);
+        assert_eq!(resp.home_relay.relay_id, RelayId(2));
+
+        registry::remove(setup.registry(), RelayId(2));
+        match rehome(&setup, &tid(), resp.session, RelayId(2), vec![]) {
+            RehomeOutcome::NewTarget(ep) => assert_eq!(
+                ep.relay_id,
+                RelayId(1),
+                "with no live relay in the dead region, any available relay takes over",
+            ),
+            other => panic!("expected NewTarget(relay 1), got {other:?}"),
         }
     }
 }
