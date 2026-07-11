@@ -286,6 +286,14 @@ impl SlotInbox {
     pub(crate) fn try_recv_connectivity(&mut self) -> Option<(SlotId, bool)> {
         self.conn_push_rx.try_recv().ok()
     }
+
+    /// Non-blockingly pulls the next synced leave pushed to this slot, for a
+    /// cross-module test asserting whether (or that nothing) was fanned out.
+    /// `None` when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_leave(&mut self) -> Option<LeaveDirective> {
+        self.leave_push_rx.try_recv().ok()
+    }
 }
 
 /// Identifies one game's routing group. Session ids are unique only *within* a
@@ -2643,6 +2651,7 @@ mod tests {
             buffer_turns: 6,
             apply_at_frame: 40,
             decision_seq: 5,
+            authority_relay_id: None,
         };
         let stamped = Payload {
             buffer_directive: Some(stamp),

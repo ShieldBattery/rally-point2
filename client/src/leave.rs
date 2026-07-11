@@ -112,16 +112,25 @@ impl LeaveTracker {
         {
             // Same slot already tracked: the relay's contract is that every
             // directive for a slot carries the same apply frame + reason, so a
-            // disagreement is a relay bug worth catching in tests. Either way we
-            // keep the first (already possibly surfaced) — never re-open a slot.
-            debug_assert!(
-                existing.directive.apply_at_frame == directive.apply_at_frame
-                    && existing.directive.reason == directive.reason,
-                "conflicting leave directives for slot {}: {:?} vs {:?}",
-                directive.slot,
-                existing.directive,
-                directive,
-            );
+            // disagreement is a relay bug. Either way we keep the first
+            // (already possibly surfaced) — never re-open a slot; convergence
+            // by single-sourcing (first copy seen wins, per slot) still holds
+            // regardless of which client saw which conflicting copy. This is a
+            // runtime check, not a `debug_assert!`: a contract violation this
+            // serious must be observable in a release build, not silently
+            // swallowed the moment debug assertions are compiled out.
+            if existing.directive.apply_at_frame != directive.apply_at_frame
+                || existing.directive.reason != directive.reason
+            {
+                tracing::error!(
+                    slot = directive.slot,
+                    kept = ?existing.directive,
+                    conflicting = ?directive,
+                    "conflicting leave directives for the same slot; keeping the first, \
+                     the session's authority relay violated its own single-copy-per-slot \
+                     contract",
+                );
+            }
             return;
         }
         self.leaves.push(TrackedLeave {
@@ -303,6 +312,48 @@ mod tests {
         // A legitimate slot 0 leave still applies normally afterward.
         tracker.observe(&leave(0, DROPPED, 100, 2));
         assert_eq!(tracker.take_due(100), vec![(SlotId(0), DROPPED)]);
+    }
+
+    /// A relay contract violation — two directives for the same slot naming
+    /// different apply frames/reasons — must not panic (this used to be a
+    /// `debug_assert!`, which would abort a debug build outright, so this
+    /// scenario could never even run under `cargo test`'s own debug profile)
+    /// and must never re-open the slot: the first directive seen is kept and
+    /// surfaces normally, and the conflicting one is dropped without
+    /// mutating anything.
+    #[test]
+    fn a_conflicting_directive_never_reopens_the_slot_and_keeps_the_first() {
+        let mut tracker = LeaveTracker::new();
+        tracker.observe(&leave(2, DROPPED, 100, 1));
+
+        // A conflicting copy: same slot, different reason AND apply frame.
+        tracker.observe(&leave(2, LEFT, 150, 2));
+
+        // Not due before the FIRST directive's own apply frame.
+        assert!(tracker.take_due(99).is_empty(), "not due until frame 100");
+
+        // At frame 100 (the first directive's apply frame), it surfaces with
+        // the first directive's own reason -- never the conflicting one's.
+        assert_eq!(tracker.take_due(100), vec![(SlotId(2), DROPPED)]);
+        // The conflicting directive's frame (150) never independently fires
+        // anything -- the slot already surfaced and does not re-open.
+        assert!(tracker.take_due(150).is_empty());
+    }
+
+    /// The same conflict, but the conflicting copy arrives BEFORE the frame
+    /// the first directive named -- it still must not move the apply frame
+    /// or reason the slot eventually surfaces with.
+    #[test]
+    fn a_conflicting_directive_arriving_early_does_not_change_the_kept_apply_frame() {
+        let mut tracker = LeaveTracker::new();
+        tracker.observe(&leave(2, DROPPED, 100, 1));
+        tracker.observe(&leave(2, LEFT, 50, 2)); // conflicting, earlier frame
+
+        // Must not surface at the conflicting (earlier) frame.
+        assert!(tracker.take_due(50).is_empty());
+        assert!(tracker.take_due(99).is_empty());
+        // Surfaces at the FIRST directive's own frame, with its own reason.
+        assert_eq!(tracker.take_due(100), vec![(SlotId(2), DROPPED)]);
     }
 
     #[test]

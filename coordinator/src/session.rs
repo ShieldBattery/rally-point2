@@ -1058,15 +1058,48 @@ pub fn session_refs(
         .cloned()
 }
 
+/// The largest `external_id`/`external_ref` the coordinator accepts. ShieldBattery's
+/// own correlation ids (a stringified `gameId`/`SbUserId`) are short fixed-shape
+/// strings — well under a hundred bytes — so this is generous headroom, not a tight
+/// fit; a request naming something longer is either a caller bug or abuse, and the
+/// tenant is already authenticated, so this is cheap defense, not a real limit on
+/// legitimate use.
+const MAX_EXTERNAL_STRING_LEN: usize = 256;
+
+/// The largest `dev_relay_split` the coordinator accepts: no more entries than a
+/// session can possibly have slots for ([`MAX_SLOT`] + 1). A dev-only field
+/// (production requests always send it empty), but the tenant-authenticated cheap
+/// defense applies here too — nothing legitimate ever needs more.
+const MAX_DEV_RELAY_SPLIT_LEN: usize = MAX_SLOT as usize + 1;
+
 /// Validates a session request before any work is done.
 fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     if request.players.is_empty() {
         return Err(SessionSetupError::NoPlayers);
     }
+    let mut seen_slots = std::collections::HashSet::with_capacity(request.players.len());
     for player in &request.players {
         if player.slot.0 > MAX_SLOT {
             return Err(SessionSetupError::SlotOutOfRange(player.slot.0 as u16));
         }
+        if !seen_slots.insert(player.slot.0) {
+            return Err(SessionSetupError::DuplicateSlot(player.slot.0 as u16));
+        }
+        if let Some(external_ref) = &player.external_ref
+            && external_ref.len() > MAX_EXTERNAL_STRING_LEN
+        {
+            return Err(SessionSetupError::ExternalRefTooLong(player.slot.0 as u16));
+        }
+    }
+    if let Some(external_id) = &request.external_id
+        && external_id.len() > MAX_EXTERNAL_STRING_LEN
+    {
+        return Err(SessionSetupError::ExternalIdTooLong);
+    }
+    if request.dev_relay_split.len() > MAX_DEV_RELAY_SPLIT_LEN {
+        return Err(SessionSetupError::DevRelaySplitTooLong(
+            request.dev_relay_split.len(),
+        ));
     }
     Ok(())
 }
@@ -1477,6 +1510,110 @@ mod tests {
             ExpiresAt(u64::MAX),
         );
         assert_eq!(result.unwrap_err(), SessionSetupError::SlotOutOfRange(12));
+    }
+
+    #[test]
+    fn two_players_naming_the_same_slot_is_rejected() {
+        let setup = setup_with_two_relays_and_tenant();
+        let player = |slot: u8| PlayerHandoff {
+            slot: SlotId(slot),
+            client_pubkey: ClientPublicKey([slot; 32]),
+            external_ref: None,
+            observer: false,
+        };
+
+        let result = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![player(0), player(1), player(0)],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert_eq!(result.unwrap_err(), SessionSetupError::DuplicateSlot(0));
+    }
+
+    #[test]
+    fn an_oversized_external_id_is_rejected() {
+        let setup = setup_with_two_relays_and_tenant();
+        let result = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert_eq!(result.unwrap_err(), SessionSetupError::ExternalIdTooLong);
+
+        // Exactly at the cap is fine.
+        let ok = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN)),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn an_oversized_external_ref_is_rejected() {
+        let setup = setup_with_two_relays_and_tenant();
+        let result = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([1; 32]),
+                        external_ref: Some("y".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
+                        observer: false,
+                    },
+                ],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert_eq!(result.unwrap_err(), SessionSetupError::ExternalRefTooLong(1));
+    }
+
+    #[test]
+    fn an_oversized_dev_relay_split_is_rejected() {
+        let setup = setup_with_two_relays_and_tenant();
+        // More entries than any session could have slots for.
+        let oversized_split: Vec<SlotId> = (0..(MAX_DEV_RELAY_SPLIT_LEN + 1) as u8)
+            .map(SlotId)
+            .collect();
+        let result = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: oversized_split,
+            },
+            ExpiresAt(u64::MAX),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            SessionSetupError::DevRelaySplitTooLong(MAX_DEV_RELAY_SPLIT_LEN + 1),
+        );
     }
 
     #[test]

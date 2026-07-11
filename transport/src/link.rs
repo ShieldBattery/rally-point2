@@ -1199,6 +1199,7 @@ mod tests {
                     buffer_turns: 6,
                     apply_at_frame: 512,
                     decision_seq: 3,
+                    authority_relay_id: None,
                 }),
                 commands: vec![0x0C].into(),
             }))
@@ -1224,6 +1225,7 @@ mod tests {
                 buffer_turns: 6,
                 apply_at_frame: 512,
                 decision_seq: 3,
+                authority_relay_id: None,
             }),
         );
         assert_eq!(delivered[1].buffer_directive, None);

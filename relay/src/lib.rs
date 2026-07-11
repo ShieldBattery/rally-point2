@@ -31,28 +31,41 @@
 //!   `SessionDescriptor` into targeted `Join`/`Leave` on the links serving that
 //!   session. Robust to whether a link or its descriptor arrives first.
 //! - **coordinator_client** ([`coordinator_client`]) — the relay side of the
-//!   coordinator→relay control transport: polls the coordinator for this relay's
-//!   current session-descriptor set and feeds each descriptor to the
-//!   `mesh_control` Join source, reconciling membership as sessions come and go.
+//!   coordinator→relay control transport: a held WebSocket connection the relay
+//!   dials out, over which the coordinator pushes this relay's current
+//!   session-descriptor set (on connect and again on every change, no polling).
+//!   Each set is fed to the `mesh_control` Join source, reconciling membership
+//!   as sessions come and go.
 //! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
 //!   relay-side core that turns game-wide network conditions into a buffer-size
-//!   change, scheduled at an agreed future turn. Authority is an injected input
-//!   (single-relay = `SelfRelay`) until multi-relay liveness lands with the mesh
-//!   wiring + coordinator; the coordinator only sets *bounds*.
+//!   change, scheduled at an agreed future turn. Authority is an injected input,
+//!   computed by the caller from the coordinator descriptor's priority order and
+//!   the live-player presence relays track among themselves — the first relay in
+//!   that order still serving players is the authority, with handoff on presence
+//!   change and no coordinator round-trip; the coordinator only sets *bounds*.
+//!   The same layer also carries desync detection (a comparator across relays'
+//!   independent views of the turn stream) and synced player-leaves (an agreed
+//!   apply frame every survivor's client applies identically).
 //! - **delivery** ([`delivery`]) — end-to-end turn-delivery tracking: the
 //!   per-pair fold of client-claimed beacon cursors (origin turns reaching each
 //!   destination client), hop inference, and the clamped cushion it feeds the
 //!   latency-buffer decision.
-//! - **turn log** — persist + replicate the per-game turn log; the same
-//!   "replay from cursor X" primitive serves failover and (future) observers.
+//! - **turn_ring** ([`turn_ring`]) — a bounded, local, per-session record of
+//!   the turns a relay has forwarded, kept only long enough to replay a
+//!   reconnecting client's missed turns from its last-delivered cursor. Local
+//!   and ephemeral, not persisted or replicated across relays.
 //! - **flight recorder** ([`flight_recorder`]) — per-game observability:
 //!   bounded per-session events + link-health samples + turn-stream counters
 //!   (summaries only, never payload bytes), flushed as a self-describing JSON
 //!   blob on session close and wholesale before a drain exits.
 //!
-//! The client edge — authorization, validation, single-relay routing, the
-//! consensus decision core, and the mesh-edge connection half — is built; the
-//! stateful layers above the decision core are not yet. The binary half
+//! Beyond what the bullets above name directly, the relay also negotiates
+//! protocol versions on connect, coordinates its own drain on shutdown (finish
+//! in-flight sessions, refuse new ones, tell the coordinator it's going),
+//! tracks per-slot presence across the mesh, dials peers over whichever of
+//! IPv4/IPv6 the pair shares, and resumes a mesh link's turn stream from a
+//! cursor after a peer reconnects — each living alongside the module it most
+//! directly serves rather than as a bullet of its own. The binary half
 //! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
@@ -74,7 +87,6 @@ pub mod turn_ring;
 pub mod validation;
 
 pub mod consensus;
-// TODO: pub mod turn_log;         // replicated, bounded + flushed
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
 // TODO: reconcile with the Fargate task def + per-game IP rotation.

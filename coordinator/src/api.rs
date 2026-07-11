@@ -192,8 +192,13 @@ pub fn router(state: CoordinatorState) -> Router {
 /// Reads the raw body (rather than a `Json` extractor) so the signature covers
 /// exactly the bytes on the wire.
 ///
-/// Token expiry is set to `u64::MAX` for now (dev/loopback). Production sets
-/// it to the game session lifetime plus margin.
+/// Token expiry is set to `u64::MAX` for now (dev/loopback). Production must
+/// set it to the game session lifetime plus margin -- this is no longer just a
+/// token concern: the never-started reaper's grace window (see
+/// `lifecycle::never_started_grace`) reads `u64::MAX` as "no real expiry was
+/// set" and falls back to a fixed floor, so a real expiry here is also what
+/// lets that reaper size its window from the session's actual lifetime
+/// instead of the floor alone.
 async fn create_session(
     State(state): State<CoordinatorState>,
     method: Method,
@@ -235,7 +240,11 @@ async fn create_session(
             registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
             registry::SessionSetupError::TenantNotFound(_)
             | registry::SessionSetupError::SlotOutOfRange(_)
-            | registry::SessionSetupError::NoPlayers => StatusCode::BAD_REQUEST,
+            | registry::SessionSetupError::NoPlayers
+            | registry::SessionSetupError::DuplicateSlot(_)
+            | registry::SessionSetupError::ExternalIdTooLong
+            | registry::SessionSetupError::ExternalRefTooLong(_)
+            | registry::SessionSetupError::DevRelaySplitTooLong(_) => StatusCode::BAD_REQUEST,
         }
     })?;
 

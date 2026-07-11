@@ -210,15 +210,23 @@ impl AckManager {
             packet.payloads.push(p.clone());
         }
 
-        // Refill with still-unacked payloads, oldest-seq-first within each slot.
-        // The key is `(slot, seq)`, so a BTreeMap iteration visits each slot's
-        // payloads in ascending seq order — the turns whose loss would stall a peer
-        // soonest within that slot. The fresh payload isn't in
-        // `unacked_payloads` yet, so it can't double up. When a near-MTU stream
-        // keeps the budget full for a long run this under-covers the newer
-        // unacked turns; spreading coverage by `send_count` (re-sending the
-        // least-sent ones) is a future refinement, which is why it is tracked.
-        for sent in self.unacked_payloads.values_mut() {
+        // Refill with still-unacked payloads, least-resent-first: a run of
+        // packets where the budget fills before every unacked payload fits
+        // must not let the same subset starve everything ranked after it —
+        // `(slot, seq)` iteration order (a BTreeMap's natural order) would do
+        // exactly that, systematically favoring low slot numbers and low
+        // seqs over a long near-MTU stream. Sorting by `send_count` instead
+        // means whichever payloads got the least redundancy coverage so far
+        // are the ones a tight budget spends its room on next, spreading
+        // coverage fairly across every slot over time. The sort is stable,
+        // so payloads tied on `send_count` (the common case: a fresh burst,
+        // or right after every payload was just sent once) still refill in
+        // their underlying `(slot, seq)` order — oldest per slot first,
+        // exactly as before. The fresh payload isn't in `unacked_payloads`
+        // yet, so it can't double up.
+        let mut candidates: Vec<&mut SentPayload> = self.unacked_payloads.values_mut().collect();
+        candidates.sort_by_key(|sent| sent.send_count);
+        for sent in candidates {
             let element = payload_element_len(sent.encoded_len);
             if used + element > max_packet_len {
                 continue;
@@ -689,23 +697,28 @@ mod tests {
     #[test]
     fn redundancy_repacks_unacked_payloads_within_a_slot() {
         // With a real budget, each new packet should re-carry the earlier
-        // unacked payloads alongside the fresh one.
+        // unacked payloads alongside the fresh one, least-resent-first: seq 0
+        // rode packet 2's redundancy already (send_count 2 by the time packet
+        // 3 builds) while seq 1 has only ever been sent once as its own fresh
+        // payload (send_count 1) -- so seq 1 refills before seq 0.
         let mut manager = AckManager::new();
         manager.build_outgoing(Some(test_payload(0, 0)), MTU);
         manager.build_outgoing(Some(test_payload(0, 1)), MTU);
         let third = manager.build_outgoing(Some(test_payload(0, 2)), MTU);
 
-        // Fresh payload (seq 2) plus the two still-unacked ones (seq 0, 1).
+        // Fresh payload (seq 2) plus the two still-unacked ones, least-resent
+        // first (seq 1, then seq 0).
         let seqs: Vec<u64> = third.payloads.iter().map(|p| p.seq).collect();
-        assert_eq!(seqs, vec![2, 0, 1]);
+        assert_eq!(seqs, vec![2, 1, 0]);
     }
 
     #[test]
     fn redundancy_refills_across_slots_oldest_per_slot_first() {
-        // Two slots each with unacked payloads. Refill visits slot 0's oldest
-        // then slot 1's oldest (BTreeMap order on (slot, seq)), not a single
-        // global seq order — the correct semantics when each slot has its own
-        // seq space.
+        // Two slots each with one unacked payload, tied on send_count (both
+        // sent exactly once, as their own fresh payload). A tie falls back to
+        // the underlying BTreeMap order on (slot, seq) — slot 0 before slot
+        // 1, not a single global seq order (each slot has its own seq space,
+        // so seq alone would be meaningless across slots).
         let mut manager = AckManager::new();
         manager.build_outgoing(Some(test_payload(0, 100)), 0); // slot 0, high seq
         manager.build_outgoing(Some(test_payload(1, 5)), 0); // slot 1, low seq
@@ -720,6 +733,59 @@ mod tests {
         // Slot 0's seq 100 comes before slot 1's seq 5 because the key orders by
         // slot first — "oldest per slot", not "lowest seq globally".
         assert_eq!(keys, vec![(0, 100), (1, 5)]);
+    }
+
+    /// A tight, permanently-full budget must not let low slot numbers
+    /// monopolize redundancy coverage forever: over a long run where the
+    /// budget only ever fits ONE redundant payload per packet, every slot's
+    /// unacked payload should get roughly equal turns, not lose every single
+    /// time to whichever slot happens to sort first. Regression coverage for
+    /// the fairness fix — with the old `(slot, seq)` iteration order, slot
+    /// 0's payload would win every refill and slots 1-3 would never be
+    /// re-carried at all for as long as the budget stayed this tight.
+    #[test]
+    fn a_permanently_tight_budget_spreads_redundancy_coverage_across_slots() {
+        let mut manager = AckManager::new();
+        // Four slots, each with one unacked payload that is never touched
+        // again as "fresh" -- from here on each is purely along for the
+        // redundancy ride, competing for the same tight budget.
+        for slot in 0u8..4 {
+            manager.build_outgoing(Some(test_payload(slot, 0)), MTU);
+        }
+        assert_eq!(manager.payloads_in_flight(), 4);
+
+        // A tight budget -- `lone_packet_len` sizes a packet for exactly one
+        // payload under worst-case header state, so real (smaller) headers
+        // can occasionally leave room for a second small element too. Either
+        // way, which candidate(s) get chosen each round is the fairness
+        // question: count how many times each slot's payload is picked
+        // across many rounds.
+        let tight_budget = lone_packet_len(&test_payload(0, 0));
+
+        let mut picks_per_slot = [0u32; 4];
+        for _ in 0..40 {
+            let packet = manager.build_outgoing(None, tight_budget);
+            assert!(
+                !packet.payloads.is_empty() && packet.payloads.len() <= 2,
+                "expected a tight pick of one or two candidates, got {}",
+                packet.payloads.len(),
+            );
+            for payload in &packet.payloads {
+                picks_per_slot[payload.slot as usize] += 1;
+            }
+        }
+
+        // Fair spreading: every slot's payload gets picked repeatedly across
+        // the 40 rounds -- none is starved. With the old `(slot, seq)`
+        // iteration order, slot 0 would win literally every round and slots
+        // 1-3 would sit at 0 picks for as long as the budget stayed tight.
+        for (slot, &picks) in picks_per_slot.iter().enumerate() {
+            assert!(
+                picks > 0,
+                "slot {slot} was never picked across 40 rounds of a tight budget -- \
+                 starved instead of getting a fair share of redundancy coverage",
+            );
+        }
     }
 
     #[test]

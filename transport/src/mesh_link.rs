@@ -54,6 +54,21 @@ use crate::link::{Dedup, Delivery, LinkError, Received};
 /// stays in this const — it is bounded and small.
 const MESH_PACKET_OVERHEAD: usize = 16;
 
+/// The exact wire cost of embedding `conditions` as the `MeshPacket.conditions`
+/// field: the field's own tag (1 byte -- field number 3 fits a 1-byte tag),
+/// its length-delimiter varint, and its encoded body. `LinkConditions::encoded_len`
+/// alone -- what [`MeshLink::send`] and [`MeshLink::payload_fits`] used to
+/// budget against -- is only the body; a prost message's `encoded_len` never
+/// includes the tag/length-prefix that wraps it when it's embedded as a field
+/// of another message, so using it bare under-counted this field's real wire
+/// cost by a few bytes. Not a live bug: [`MESH_PACKET_OVERHEAD`]'s own margin
+/// (worst case ~10 bytes, budgeted at 16) has always absorbed the shortfall,
+/// but the accounting was wrong on its own terms, not merely generous.
+fn conditions_element_len(conditions: &LinkConditions) -> usize {
+    let body_len = conditions.encoded_len();
+    1 + prost::encoding::encoded_len_varint(body_len as u64) + body_len
+}
+
 /// Whether this relay should be the one to dial `peer_id` on the mesh, given
 /// its own `our_id`.
 ///
@@ -271,10 +286,10 @@ impl MeshLink {
         // Measure the conditions sidecar's exact wire cost so the redundancy
         // budget that defends lockstep latency is never stolen by a fixed
         // worst-case reservation. A small or absent sidecar leaves the budget
-        // intact; a large one reserves exactly what it needs. `encoded_len` on
-        // the optional message field counts its tag + length prefix + body, so
-        // no separate framing allowance is needed.
-        let conditions_overhead = conditions.as_ref().map(|c| c.encoded_len()).unwrap_or(0);
+        // intact; a large one reserves exactly what it needs. See
+        // `conditions_element_len` for why this is the field's tag + length
+        // prefix + body, not `encoded_len` alone.
+        let conditions_overhead = conditions.as_ref().map(conditions_element_len).unwrap_or(0);
         // The inner Packet's own field tag + varint length prefix can't be
         // probed without the packet itself, so MESH_PACKET_OVERHEAD covers it —
         // bounded (≤3 bytes for any packet under ~16MB) and small.
@@ -338,7 +353,7 @@ impl MeshLink {
             .connection
             .max_datagram_size()
             .ok_or(MeshLinkError::DatagramsUnsupported)?;
-        let conditions_overhead = conditions.map(|c| c.encoded_len()).unwrap_or(0);
+        let conditions_overhead = conditions.map(conditions_element_len).unwrap_or(0);
         let packet_budget = datagram_budget
             .saturating_sub(conditions_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
@@ -1029,6 +1044,33 @@ mod tests {
 
         drop(sender);
         let _ = drain.await;
+    }
+
+    /// `conditions_element_len` accounts for the field tag and length-prefix
+    /// varint that wrap `LinkConditions` when it's embedded as
+    /// `MeshPacket.conditions`, not just the message's own body
+    /// (`LinkConditions::encoded_len` alone). One slot's worth of conditions is
+    /// small enough that the length-prefix varint is a single byte, so the
+    /// expected overhead is exactly `1 (tag) + 1 (length varint) + body_len`.
+    #[test]
+    fn conditions_element_len_accounts_for_the_tag_and_length_prefix_not_just_the_body() {
+        let conditions = LinkConditions {
+            slots: vec![rally_point_proto::messages::SlotConditions {
+                slot: 0,
+                rtt_us: 12_000,
+                lost_packets: 3,
+                sent_packets: 1000,
+            }],
+        };
+        let body_len = conditions.encoded_len();
+        // A single-slot conditions message is well under 128 bytes, so its
+        // length-delimiter varint is exactly one byte.
+        assert!(body_len < 128, "test assumption: a one-byte length varint");
+        assert_eq!(
+            conditions_element_len(&conditions),
+            body_len + 2,
+            "tag (1) + length-prefix varint (1) + body -- not the body alone",
+        );
     }
 
     /// `payload_fits` sizes against the same budget `send` applies: a routine

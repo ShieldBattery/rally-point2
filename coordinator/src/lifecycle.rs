@@ -646,6 +646,32 @@ impl Lifecycle {
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
+    /// Ensures a lazily-created webhook-only lifecycle state exists for
+    /// `(tenant, session)` and its idle reap is armed, without enqueuing any
+    /// webhook — the minimal half of [`enqueue_webhook`]'s lazy creation, for
+    /// a caller that must remember it saw something for this session
+    /// regardless of whether that something is ultimately deliverable.
+    ///
+    /// A notice-dedup set (e.g. desync ordinals) that records `(tenant,
+    /// session, ...)` on first sight, before knowing whether the notice will
+    /// resolve to an actual webhook, needs exactly this: without a session
+    /// state, the dedup entry has no retirement path at all (this
+    /// coordinator lifetime's normal all-relays-closed removal, and
+    /// `prune_dedup` alongside it, both require an existing
+    /// [`SessionState`]) — a notice this coordinator can never resolve a
+    /// notify config or a `gameId` ref for (a tenant with no webhook
+    /// configured, or a session outside this coordinator's session store)
+    /// would otherwise leak that dedup entry for the life of the process.
+    /// Calling this unconditionally on first sight closes that gap
+    /// regardless of how the notice is later resolved.
+    pub fn ensure_orphan_tracked(&self, tenant: TenantId, session: SessionId) {
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((tenant.clone(), session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
     /// Pushes a non-terminal notice onto `state`'s queue, reserving its last
     /// slot for the session's eventual terminal `sessionClosed` job: an
     /// ordinary notice is sent only while the queue has room to spare beyond
@@ -847,9 +873,10 @@ impl Lifecycle {
     }
 
     /// Whether a lifecycle state currently exists for `(tenant, session)` — a test
-    /// hook for asserting a state was reaped (its map entry removed).
+    /// hook for asserting a state was reaped (its map entry removed), or created
+    /// (including webhook-only, unlike [`is_alive`](Self::is_alive)).
     #[cfg(test)]
-    fn contains_state(&self, tenant: &TenantId, session: SessionId) -> bool {
+    pub(crate) fn contains_state(&self, tenant: &TenantId, session: SessionId) -> bool {
         self.inner
             .sessions
             .lock()

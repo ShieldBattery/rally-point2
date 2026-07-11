@@ -333,11 +333,30 @@ message BufferDirective {
   // Orders decisions within a session. The authority increments this for every
   // decision it broadcasts, so the turn stream's out-of-order delivery and
   // redundant re-carries can interleave a superseded directive's copies with
-  // its replacement's without ambiguity. The client rule is exactly: keep the
+  // its replacement's without ambiguity. The client rule is: keep the
   // directive with the highest `decision_seq` seen so far, apply it at its
-  // `apply_at_frame`, and ignore everything with a lower or equal seq — even
-  // when two directives name the same `apply_at_frame`.
+  // `apply_at_frame`, and ignore everything with a lower seq. On an EQUAL
+  // seq, `authority_relay_id` below breaks the tie.
   uint32 decision_seq = 3;
+
+  // The deciding relay's own id — the deterministic tie-break for two
+  // directives that land on the same `decision_seq`. Each relay's
+  // `decision_seq` count starts fresh from where it takes buffer authority,
+  // so during the brief window where two relays can both believe they hold
+  // it (an acknowledged staggered-handoff race, not a steady-state
+  // condition), each can independently mint the same seq with a different
+  // `buffer_turns` — without this field a client keeps whichever equal-seq
+  // copy happens to arrive first, so two clients can converge on different
+  // buffers. On an equal seq, the client keeps the directive with the
+  // HIGHER `authority_relay_id` — deterministic, and needs no extra
+  // coordination, since relay ids are already globally unique and known to
+  // the deciding relay at stamp time. `optional` (rather than a plain
+  // `uint64` defaulting to 0) so a directive from a relay running code that
+  // predates this field is distinguishable from one that genuinely has id
+  // 0: absent always loses a tie to a directive that sets it, so a
+  // partially-upgraded fleet degrades no worse than the old arrival-order
+  // tie-break, never worse.
+  optional uint64 authority_relay_id = 4;
 }
 
 // A relay-authored instruction to apply a synced player-leave at an agreed

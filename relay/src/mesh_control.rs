@@ -326,6 +326,12 @@ impl MeshControl {
             descriptor.homed_slots.iter().copied().collect(),
             held_slots,
         );
+        // Stamps this relay's own id onto the maker so a buffer directive it
+        // queues as authority carries the deterministic decision_seq
+        // tie-break (see `BufferDirective.authority_relay_id`). Idempotent;
+        // run on every descriptor push, not just creation, since `sync_maker`
+        // itself re-syncs an existing maker the same way.
+        consensus::set_own_relay_id(&self.decision_makers, &key, self.our_id);
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
         // A rehome descriptor (coordinator-mediated failover) resumes an
         // already-running session onto this relay. Seed the departures the

@@ -542,6 +542,15 @@ pub fn handle_desync(
     let is_new = dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.sync_ordinal));
+    if is_new {
+        // Every dedup entry inserted above must correspond to a lifecycle
+        // state that will eventually retire it -- otherwise a notice this
+        // coordinator can never resolve (dropped below as `NoNotifyConfig`
+        // or `NoExternalId`, which never reaches `enqueue_dispatch`, the
+        // path that would normally supply that state) leaks the entry for
+        // the life of the process. See `Lifecycle::ensure_orphan_tracked`.
+        lifecycle.ensure_orphan_tracked(notice.tenant.clone(), notice.session);
+    }
 
     let (config, external_id, stored) = match resolve_notice_prefix(
         setup,
@@ -1531,6 +1540,7 @@ mod tests {
         // Neither the notice nor the stored session has a gameId.
         let mut notice = desync(session, 1, false);
         notice.external_id = None;
+        let tenant = notice.tenant.clone();
         handle_desync(&setup, &dedup.desyncs, &lifecycle, notice);
 
         assert!(
@@ -1538,6 +1548,20 @@ mod tests {
                 .await
                 .is_err(),
             "no gameId from the notice or the stored session -> dropped",
+        );
+
+        // Dropped, but not orphaned: the dedup entry this call inserted has a
+        // lifecycle state to eventually retire it, even though no webhook was
+        // ever enqueued for this session.
+        assert!(
+            dedup.desyncs.lock().contains(&(tenant.clone(), session, 1)),
+            "the dedup entry was recorded",
+        );
+        assert!(
+            lifecycle.contains_state(&tenant, session),
+            "a lifecycle state exists to eventually retire the dedup entry above -- \
+             without it, an unresolvable desync notice would leak its dedup entry \
+             for the life of the process",
         );
     }
 

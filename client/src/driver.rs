@@ -151,8 +151,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 /// the driver trips [`DriverError::UnackedWindowExhausted`] rather than let seqs
 /// race ahead until the relay's receive window rejects them as
 /// `PayloadOutOfWindow` and drops the link (the status-quo unbounded-growth
-/// failure). Surfacing the condition is the buildable half; the resync it
-/// triggers is gated on the open failover design (D11).
+/// failure). Unlike a link or control-stream failure, this is deliberately
+/// terminal rather than routed into the reconnect loop (see
+/// [`is_link_failure`]) — the peer being genuinely behind is not something a
+/// re-dial fixes on its own.
 ///
 /// Sat below the relay's receive window (4096) so it trips *before* a hard
 /// reject, with margin for the packets in flight between the trip and any
@@ -374,10 +376,11 @@ pub enum DriverError {
     /// side-channel retired everything the peer confirmed it received — the
     /// peer is genuinely behind, not just ack-starved. This is the sustained
     /// forward-loss case redundancy cannot cover: turns are being produced
-    /// faster than the peer can receive them. Surfacing it is the buildable
-    /// half; the resync it triggers (reconnect + replay-from-cursor) is gated
-    /// on the open failover design (D11). Dropping further turns to keep the
-    /// window bounded would desync lockstep, so the driver stops instead.
+    /// faster than the peer can receive them. Treated as terminal rather than
+    /// fed into the reconnect loop's replay-from-cursor recovery, unlike a
+    /// link or control-stream failure — see [`is_link_failure`]. Dropping
+    /// further turns to keep the window bounded would desync lockstep, so the
+    /// driver stops instead.
     #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
     UnackedWindowExhausted { in_flight: usize, cap: usize },
     /// The outbound outage buffer crossed [`OUTAGE_OUTBOUND_BUFFER_CAP`] while
@@ -1487,8 +1490,8 @@ async fn flush_delivered_cursors(
 /// Returns `true` if the unacked window has crossed the hard cap — the
 /// sustained forward-loss case the beacon cannot rescue (the peer is genuinely
 /// behind, not just ack-starved). The caller surfaces
-/// [`DriverError::UnackedWindowExhausted`]; the resync it triggers is gated on
-/// the open failover design (D11).
+/// [`DriverError::UnackedWindowExhausted`], which the reconnect loop treats as
+/// terminal rather than re-dialing (see [`is_link_failure`]).
 fn check_cap(in_flight: usize) -> bool {
     in_flight > UNACKED_WINDOW_CAP
 }
@@ -3107,6 +3110,7 @@ mod tests {
                 buffer_turns: 4,
                 apply_at_frame: 64,
                 decision_seq: 1,
+                authority_relay_id: None,
             }),
         };
         link_b.send(Some(stamped.clone())).unwrap();

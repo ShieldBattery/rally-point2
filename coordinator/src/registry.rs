@@ -253,6 +253,19 @@ pub enum SessionSetupError {
     /// The player list is empty.
     #[error("session request has no players")]
     NoPlayers,
+    /// Two players in the request name the same slot — the coordinator has no
+    /// way to tell which one actually occupies it.
+    #[error("duplicate slot {0} in the player list")]
+    DuplicateSlot(u16),
+    /// The request's `external_id` exceeds the coordinator's length cap.
+    #[error("external_id exceeds the maximum length")]
+    ExternalIdTooLong,
+    /// A player's `external_ref` exceeds the coordinator's length cap.
+    #[error("external_ref for slot {0} exceeds the maximum length")]
+    ExternalRefTooLong(u16),
+    /// `dev_relay_split` names more slots than a session could ever have.
+    #[error("dev_relay_split names {0} slots, more than any session can have")]
+    DevRelaySplitTooLong(usize),
 }
 
 #[cfg(test)]

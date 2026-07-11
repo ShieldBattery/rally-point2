@@ -166,7 +166,7 @@ use rally_point_proto::control::{
     BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot, ResultEcho,
     ResultNotice, TenantId,
 };
-use rally_point_proto::ids::{GameFrameCount, SessionId, SlotId};
+use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -606,6 +606,16 @@ pub struct DecisionMaker {
     /// re-covering after churn never re-fires and a late-registering local slot
     /// still gets a re-push.
     started: bool,
+    /// This relay's own id, stamped onto every `BufferDirective` this maker
+    /// queues as the deterministic tie-break for two directives that land on
+    /// the same `decision_seq` (see [`queue_directive`](Self::queue_directive)
+    /// and [`set_own_relay_id`](Self::set_own_relay_id)). `None` until set —
+    /// `DecisionMaker::new` has no relay id to seed it with (`sync_maker`'s
+    /// many callers, mostly tests that don't care about the tie-break, would
+    /// all need updating otherwise); the one production caller
+    /// (`MeshControl`) sets it once, right after creating or syncing the
+    /// maker, from the id it already carries.
+    own_relay_id: Option<RelayId>,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -1690,6 +1700,7 @@ impl DecisionMaker {
             homed_slots: HashSet::new(),
             live_slots: HashSet::new(),
             started: false,
+            own_relay_id: None,
         }
     }
 
@@ -2095,7 +2106,13 @@ impl DecisionMaker {
     /// mesh hop, then runs `decide` if this relay is the authority.
     fn ingest(&mut self, conditions: &LinkConditions, mesh_rtt_us: u32) -> Option<Decision> {
         for slot in &conditions.slots {
-            let id = SlotId(slot.slot as u8);
+            // A truncating cast would alias an out-of-range wire slot onto a
+            // different, valid slot's tracked RTT/loss state, corrupting that
+            // slot's decision inputs instead of merely dropping the malformed
+            // sample. Skip it (defensive — wire values are validated upstream).
+            let Ok(id) = u8::try_from(slot.slot).map(SlotId) else {
+                continue;
+            };
             // A departed slot's stale sample can still be in flight (a mesh
             // datagram raced the departure); re-creating its entry would
             // resurrect state its departure deliberately retired — the same
@@ -2236,6 +2253,14 @@ impl DecisionMaker {
             buffer_turns: new_buffer,
             apply_at_frame: applied_frame.0,
             decision_seq: self.decision_seq,
+            // The deterministic tie-break for the staggered-handoff window
+            // where two relays can both briefly believe they hold authority:
+            // each stamps its own `decision_seq` count from where IT started,
+            // so two independent relays can collide on the same seq with
+            // different `buffer_turns`. Clients break the tie by relay id
+            // (see `directive::DirectiveTracker`) rather than by whichever
+            // copy happened to arrive first.
+            authority_relay_id: self.own_relay_id.map(|id| id.0),
         });
 
         Decision {
@@ -2914,6 +2939,14 @@ impl DecisionMaker {
     /// starts being admissible, with no accumulation across descriptors.
     pub fn set_homed_slots(&mut self, homed: HashSet<SlotId>) {
         self.homed_slots = homed;
+    }
+
+    /// Records this relay's own id, stamped onto every `BufferDirective` this
+    /// maker queues from here on (see [`queue_directive`](Self::queue_directive)).
+    /// Idempotent — the caller's own id never changes for a running relay
+    /// process, so calling this again on every descriptor push is harmless.
+    pub fn set_own_relay_id(&mut self, id: RelayId) {
+        self.own_relay_id = Some(id);
     }
 
     /// Whether `slot` is admissible on this relay: the homed set is empty
@@ -3724,7 +3757,18 @@ pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId
 /// cache — fires one departure notice up the coordinator connection. A redundant
 /// copy (a second mesh path, a reconcile-on-join re-send) inserts nothing and
 /// fires nothing, so the coordinator sees at most one notice per relay per slot.
-pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) {
+///
+/// Returns whether it was a first insert (mirroring
+/// [`DecisionMaker::observe_leave`]'s own `#[must_use]`) — `#[must_use]` here
+/// too, so a caller can't silently forward a directive this relay's own
+/// consensus just rejected: `false` covers both an ordinary redundant copy
+/// (harmless to skip re-forwarding — it was already fanned out on the first
+/// insert) and a genuine conflicting duplicate for the slot (an authority
+/// bug this relay's cache just caught), and a caller that fans out
+/// regardless would hand clients a directive this relay's own state
+/// disagrees with.
+#[must_use]
+pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) -> bool {
     let inserted = match registry.lock().get_mut(key) {
         Some(maker) => maker.observe_leave(leave),
         None => false,
@@ -3732,6 +3776,7 @@ pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveD
     if inserted {
         registry.notify_departure(departure_notice(registry, key, leave));
     }
+    inserted
 }
 
 /// The last game frame observed on `slot`'s validated turns for the session, if
@@ -4050,6 +4095,15 @@ pub fn ingest_remote_conditions(
 /// has been applied everywhere, or no maker exists for the session.
 pub fn active_directive(registry: &DecisionMakers, key: &SessionKey) -> Option<BufferDirective> {
     registry.lock().get_mut(key)?.active_directive()
+}
+
+/// Records `id` as the session's own relay id on its maker, if one exists
+/// (see [`DecisionMaker::set_own_relay_id`]). A no-op when the session has no
+/// maker yet — nothing to stamp until one is created.
+pub fn set_own_relay_id(registry: &DecisionMakers, key: &SessionKey, id: RelayId) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.set_own_relay_id(id);
+    }
 }
 
 /// Decides a synced player-leave for `slot` on the session's authority relay and
@@ -4897,6 +4951,86 @@ mod tests {
         assert_eq!(maker.active_directive(), None, "and stays retired");
     }
 
+    /// A directive carries no `authority_relay_id` until
+    /// `set_own_relay_id` is called -- `DecisionMaker::new` has no relay id
+    /// to seed it with. Once set, every subsequently queued directive stamps
+    /// it, including a decision the control law queues on its own (not just
+    /// the caller re-affirming).
+    #[test]
+    fn a_directive_carries_no_relay_id_until_one_is_set_then_stamps_every_decision() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let _ = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 10)
+            .expect("a raise fires");
+        assert_eq!(
+            maker.active_directive().unwrap().authority_relay_id,
+            None,
+            "no relay id set yet",
+        );
+
+        maker.set_own_relay_id(RelayId(7));
+        let d2 = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 200)
+            .expect("a further raise fires");
+        assert_eq!(
+            maker.active_directive(),
+            Some(BufferDirective {
+                buffer_turns: d2.buffer.0,
+                apply_at_frame: d2.applied_frame.0,
+                decision_seq: 2,
+                authority_relay_id: Some(7),
+            }),
+        );
+    }
+
+    /// Two decision-makers with different relay ids, both promoted
+    /// `SelfRelay` during the acknowledged staggered-handoff window, stamp a
+    /// directive at the SAME `decision_seq` (each mints its own count from
+    /// where it took authority) with different `buffer_turns` -- the exact
+    /// wire collision the client-side tie-break exists to resolve. This
+    /// proves the relay's own half of the fix: the two stamps are
+    /// distinguishable by `authority_relay_id`, which is all a client needs
+    /// (see `client::directive`'s own tests for the convergence proof).
+    #[test]
+    fn two_relays_racing_authority_stamp_a_genuine_collision_distinguishable_by_relay_id() {
+        let mut relay_a = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        relay_a.set_own_relay_id(RelayId(1));
+        let mut relay_b = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        relay_b.set_own_relay_id(RelayId(2));
+
+        // Both independently raise at their own first decision -- each mints
+        // decision_seq 1, from its own count, with a different target.
+        ingest_at(&mut relay_a, &conditions(0, 150_000, 0, 100), 10).expect("A raises");
+        ingest_at(&mut relay_b, &conditions(0, 600_000, 0, 100), 10).expect("B raises");
+        let stamp_a = relay_a.active_directive().unwrap();
+        let stamp_b = relay_b.active_directive().unwrap();
+
+        assert_eq!(stamp_a.decision_seq, 1);
+        assert_eq!(stamp_b.decision_seq, 1);
+        assert_ne!(
+            stamp_a.buffer_turns, stamp_b.buffer_turns,
+            "a genuine collision: same seq, different decisions",
+        );
+        assert_eq!(stamp_a.authority_relay_id, Some(1));
+        assert_eq!(stamp_b.authority_relay_id, Some(2));
+    }
+
     /// The broadcast outlives a one-sided stretch of traffic: while one slot
     /// is stalled, the session frame (the minimum) doesn't advance, so the
     /// directive keeps stamping every turn the other slot produces until the
@@ -5093,6 +5227,7 @@ mod tests {
             buffer_turns: 5,
             apply_at_frame: 100,
             decision_seq: 7,
+            authority_relay_id: None,
         });
         assert_eq!(
             maker.buffer(),
@@ -5440,7 +5575,10 @@ mod tests {
             apply_at_frame: 90,
             leave_seq: 7,
         };
-        observe_leave(&registry, &k, &leave);
+        assert!(
+            observe_leave(&registry, &k, &leave),
+            "first insert for the slot",
+        );
         let notice = recv_departure(&mut rx);
         assert_eq!(notice.slot, SlotId(2));
         assert_eq!(
@@ -5453,7 +5591,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         // A redundant copy is not a first insert, so it fires nothing.
-        observe_leave(&registry, &k, &leave);
+        assert!(
+            !observe_leave(&registry, &k, &leave),
+            "a redundant copy is not a first insert",
+        );
         assert!(rx.try_recv().is_err(), "no re-fire for a redundant copy");
     }
 
@@ -5640,7 +5781,7 @@ mod tests {
             apply_at_frame: 88,
             leave_seq: 7,
         };
-        observe_leave(&registry, &k, &leave);
+        assert!(observe_leave(&registry, &k, &leave), "first insert");
 
         let notice = recv_departure(&mut rx);
         assert_eq!(notice.external_id, Some("game-1".to_owned()));
@@ -7142,6 +7283,45 @@ mod tests {
             None,
             "no live slot has conditions to size from"
         );
+    }
+
+    /// A `LinkConditions` sidecar's slot field is a raw wire `u32`, unvalidated
+    /// by the transport layer (unlike a turn payload's slot, which the link
+    /// layer already rejects out-of-range before delivery). A slot past `u8`
+    /// range must be skipped rather than truncated onto a real slot's tracked
+    /// RTT/loss state.
+    #[test]
+    fn conditions_ingest_skips_an_out_of_range_slot_without_corrupting_a_real_one() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+
+        let mut batch = conditions(5, 150_000, 0, 100);
+        // 300 truncates to 44 (300 % 256) under a bare `as u8` cast -- if slot 44
+        // ever exists, that would alias this malformed sample onto it. Neither
+        // slot 44 nor slot 300 should end up tracked.
+        batch.slots.push(rally_point_proto::messages::SlotConditions {
+            slot: 300,
+            rtt_us: 999_999,
+            lost_packets: 0,
+            sent_packets: 1,
+        });
+
+        let _ = maker.ingest_local(&batch);
+
+        assert!(
+            maker.slots.contains_key(&SlotId(5)),
+            "the well-formed slot in the same batch is still ingested"
+        );
+        assert!(
+            !maker.slots.contains_key(&SlotId(44)),
+            "the out-of-range slot must not alias onto slot 44 (300 truncated)"
+        );
+        assert_eq!(maker.slots.len(), 1, "only the valid slot was tracked");
     }
 
     /// The Join-time reconcile always includes a cached leave — even when the

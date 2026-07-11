@@ -990,7 +990,22 @@ pub(crate) fn broadcast_leaves(
     leaves: Vec<LeaveDirective>,
 ) {
     for leave in leaves {
-        let slot = SlotId(leave.slot as u8);
+        // Every leave reaching this point was already accepted by this
+        // relay's own consensus (`decide_leave`/`observe_leave`), which
+        // validates the slot before caching it -- so this should always
+        // succeed. Refusing gracefully rather than truncating keeps that
+        // true by construction instead of by this call path's current
+        // shape, so a future caller that skips consensus can't silently
+        // alias a leave onto the wrong slot.
+        let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = leave.slot,
+                "synced leave broadcast names a slot id out of range; dropping",
+            );
+            continue;
+        };
         routing::fan_out_leave(sessions, key, slot, leave);
         fan_out_leave_directive(mesh_links, key, leave);
     }
@@ -2118,10 +2133,11 @@ fn dispatch_mesh_control(
             );
         }
         Some(mesh_control_frame::Kind::LeaveDirective(leave)) => {
-            crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave);
             let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
-                // Out of `u8` range: `observe_leave` above already ignored it
-                // (its own checked conversion); nothing to fan out either.
+                // Out of `u8` range: `observe_leave` below would reject it the
+                // same way internally, but check here first so this specific
+                // case gets its own diagnostic rather than reading as an
+                // ordinary rejected/redundant directive.
                 tracing::warn!(
                     session = session_id.0,
                     slot = leave.slot,
@@ -2129,6 +2145,17 @@ fn dispatch_mesh_control(
                 );
                 return;
             };
+            // A `false` here means this relay's own consensus state didn't
+            // accept the directive as new: either an ordinary redundant copy
+            // (already fanned out on its own first insert, so re-forwarding
+            // is unnecessary) or -- the case that matters -- a genuine
+            // conflicting duplicate for the slot, which must never reach
+            // local clients. Forwarding it anyway would hand them a decision
+            // this relay's own cache just flagged as disagreeing with what it
+            // already holds.
+            if !crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave) {
+                return;
+            }
             routing::fan_out_leave(sessions, &key, slot, leave);
         }
         Some(mesh_control_frame::Kind::OversizeTurn(payload)) => {
@@ -2689,6 +2716,69 @@ mod tests {
                 shutdown: Arc::new(Notify::new()),
             });
         (forward_rx, control_rx)
+    }
+
+    /// A synced leave's slot is a raw wire `u32`. A malformed one past `u8`
+    /// range must be dropped entirely -- neither pushed to local survivors nor
+    /// broadcast across the mesh -- rather than forwarded with a slot id that
+    /// can't name any real player. A well-formed leave in the same batch must
+    /// still go through normally.
+    #[test]
+    fn broadcast_leaves_drops_an_out_of_range_slot_and_still_delivers_the_rest() {
+        let sessions = routing::Sessions::default();
+        let mesh_links = new_mesh_links();
+        let key = control_key();
+
+        // Slot 0 is the one that actually left; slot 1 is the surviving peer
+        // that should hear about it.
+        let (_reg0, _inbox0) = routing::register(&sessions, &key, SlotId(0)).unwrap();
+        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1)).unwrap();
+        let (_forward_rx, mut control_rx) = register_link_channels(&mesh_links, &key);
+
+        let real_leave = LeaveDirective {
+            slot: 0,
+            reason: 0,
+            apply_at_frame: 10,
+            leave_seq: 1,
+        };
+        let malformed_leave = LeaveDirective {
+            slot: 300,
+            reason: 0,
+            apply_at_frame: 10,
+            leave_seq: 2,
+        };
+
+        broadcast_leaves(
+            &sessions,
+            &mesh_links,
+            &key,
+            vec![real_leave, malformed_leave],
+        );
+
+        assert_eq!(
+            inbox1.try_recv_leave(),
+            Some(real_leave),
+            "the well-formed departure still reaches the surviving slot"
+        );
+        assert_eq!(
+            inbox1.try_recv_leave(),
+            None,
+            "the malformed leave was never pushed to any survivor"
+        );
+        let frame = control_rx
+            .try_recv()
+            .expect("the well-formed leave is still broadcast across the mesh");
+        assert!(
+            matches!(
+                frame.kind,
+                Some(mesh_control_frame::Kind::LeaveDirective(d)) if d == real_leave
+            ),
+            "the one mesh frame sent is the well-formed leave",
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "the malformed leave was never broadcast across the mesh"
+        );
     }
 
     /// Bundles the registries a `dispatch_mesh_control` test already built
@@ -3616,6 +3706,106 @@ mod tests {
         // No echo back out to the mesh on either path.
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// A mesh-received `LeaveDirective` that this relay's own consensus state
+    /// accepts (a first insert for the slot) is fanned to local survivors; one
+    /// that conflicts with what this relay already cached (a different
+    /// reason or apply frame for the same slot -- an authority bug) is
+    /// dropped at this relay's own edge, never reaching local clients.
+    /// Forwarding a rejected directive would hand survivors a decision this
+    /// relay's own state just flagged as disagreeing with the one it already
+    /// holds.
+    #[test]
+    fn a_leave_directive_dispatch_forwards_only_the_accepted_copy_never_a_rejected_conflict() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        // A maker for the session -- `observe_leave` (a Peer-relay concern:
+        // only a non-authority relay observes a leave off the mesh) is a
+        // no-op with no maker to cache into, so one must exist first.
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+
+        // A local survivor (slot 5) that must hear an accepted leave and must
+        // NOT hear a rejected, conflicting one.
+        let (mut guard, mut inbox) =
+            routing::register(&sessions, &key, SlotId(5)).expect("slot 5 registers");
+        guard.disarm();
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        let first = LeaveDirective {
+            slot: 0,
+            reason: 3,
+            apply_at_frame: 90,
+            leave_seq: 7,
+        };
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
+        };
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+        assert_eq!(
+            inbox.try_recv_leave(),
+            Some(first),
+            "the first, accepted copy is fanned to the local survivor",
+        );
+
+        // A second, CONFLICTING directive for the same slot -- a different
+        // reason and apply frame, the authority-bug shape `observe_leave`
+        // rejects. It must never reach the local survivor.
+        let conflicting = LeaveDirective {
+            slot: 0,
+            reason: 6, // any reason differing from `first`'s -- the conflict is what matters
+            apply_at_frame: 150,
+            leave_seq: 8,
+        };
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::LeaveDirective(conflicting)),
+        };
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+        assert_eq!(
+            inbox.try_recv_leave(),
+            None,
+            "a rejected, conflicting directive must never be forwarded",
+        );
+
+        // An ordinary redundant copy of the FIRST directive is likewise not
+        // re-forwarded (already delivered once) -- but this is the harmless
+        // case, not the bug this test guards.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
+        };
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+        assert_eq!(inbox.try_recv_leave(), None, "no re-forward of a redundant copy");
     }
 
     /// A `SlotConnectivity{connected: true}` arriving over the mesh is a slot coming
