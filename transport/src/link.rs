@@ -256,7 +256,7 @@ impl Link {
     /// seq below `anchor` as already delivered so the window's base is `anchor`
     /// rather than 0.
     ///
-    /// A fresh link's [`Dedup`] anchors the receive window at seq 0 — correct for a
+    /// A fresh link's `Dedup` anchors the receive window at seq 0 — correct for a
     /// client whose slot stream genuinely starts there. But a session **re-homed**
     /// onto a fresh relay resumes its slot's seq stream mid-way (it kept counting
     /// across the move and re-injects only a recent retention ring, never seq 0

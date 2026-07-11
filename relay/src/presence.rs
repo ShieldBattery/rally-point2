@@ -195,7 +195,7 @@ pub fn all_empty(registry: &PresenceRegistry, key: &SessionKey) -> bool {
 /// The presence-change hooks call this so authority follows the reports; a
 /// session with no presence entry, or no decision-maker, is left untouched and
 /// yields no leaves. The caller pushes any returned leaves down local survivors
-/// and across the mesh (see [`crate::mesh::broadcast_leaves`]).
+/// and across the mesh (see `mesh::broadcast_leaves`).
 ///
 /// `held_slots` is the set of this relay's slots whose drop is still held
 /// undecided (read from the drop-hold registry by the caller, which holds it). A

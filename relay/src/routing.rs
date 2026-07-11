@@ -426,7 +426,7 @@ fn deregister(sessions: &Sessions, key: &SessionKey, slot: SlotId) -> bool {
 /// to know when the relay is idle enough to exit.
 ///
 /// A group entry is created only when a slot registers and dropped the moment its
-/// last slot deregisters (see [`deregister`]), so the map is empty *exactly* when no
+/// last slot deregisters (see `deregister`), so the map is empty *exactly* when no
 /// slot is held. A session ending therefore shrinks this — the last slot's link task
 /// deregisters on exit — which is what lets the drain wait converge.
 pub fn holds_any_slots(sessions: &Sessions) -> bool {
@@ -710,7 +710,7 @@ pub fn announce_slot_present(
 /// which. The closed link then flows through the ordinary link-death path (a synced
 /// leave, a departure notice), which is what makes the reap self-resolving.
 ///
-/// Signals rather than yanking the roster entry, exactly like [`fan_out`]'s lagging-
+/// Signals rather than yanking the roster entry, exactly like `fan_out`'s lagging-
 /// peer path: the slot stays occupied until its own task acts on the signal and
 /// deregisters itself, so no replacement can register a second sender in the interim.
 pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {

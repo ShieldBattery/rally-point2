@@ -31,7 +31,7 @@ const SLOT_TAKEN_CLOSE: u32 = 0x02;
 /// left cleanly — so the game has moved on without it. Distinct from every transport-error close
 /// so a reconnecting client can tell "you were dropped, the session is over for
 /// you" from a mere connection failure and stop retrying. Contrast
-/// [`SLOT_TAKEN_CLOSE`], which means the slot is *still connected* by a live
+/// `SLOT_TAKEN_CLOSE`, which means the slot is *still connected* by a live
 /// connection (a genuine double-connect), not gone.
 pub const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 

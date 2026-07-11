@@ -2,7 +2,7 @@
 //! and spawn a [`mesh::run_mesh_link`] driver on it.
 //!
 //! This is the connection layer of the mesh — everything *below* the
-//! [`MeshCommand`] Join/Leave stream that `run_mesh_link` consumes. It owns
+//! [`MeshCommand`](mesh::MeshCommand) Join/Leave stream that `run_mesh_link` consumes. It owns
 //! the two ways a mesh link's QUIC connection comes into being:
 //!
 //! - **Accept** ([`run_mesh_accept`]): peer relays that dial this relay arrive
@@ -10,11 +10,11 @@
 //!   (ALPN `rp2-mesh/N`). This task drains them, wraps each as a `MeshLink`,
 //!   and spawns a driver. The higher-id side of a relay-pair ends up here.
 //! - **Dial** ([`run_mesh_dial`]): this relay dials a peer relay when the
-//!   [`should_dial_mesh`] tie-break says it is the lower id, wraps the
+//!   [`should_dial_mesh`](rally_point_transport::should_dial_mesh) tie-break says it is the lower id, wraps the
 //!   connection, and spawns a driver. The lower-id side ends up here.
 //!
 //! Both halves are deliberately symmetric in what they *produce* — one
-//! `(peer id, `[`MeshCommand`]` sender)` pair per established link — and differ
+//! `(peer id, `[`MeshCommand`](mesh::MeshCommand)` sender)` pair per established link — and differ
 //! only in which side initiates the TCP/QUIC handshake. The tie-break
 //! (`lower id dials higher`) guarantees exactly one side of a relay-pair dials,
 //! so exactly one QUIC connection completes per pair and there is no redundant
@@ -26,7 +26,7 @@
 //!
 //! The dialer knows whom it dialed; the acceptor sees only an inbound connection
 //! from an ephemeral source port. So right after connecting, the dialer sends a
-//! [`MeshHello`](rally_point_proto::mesh::MeshHello) on a fresh unidirectional
+//! [`MeshHello`] on a fresh unidirectional
 //! stream announcing its id, and the acceptor reads it. Both halves then surface
 //! the peer's id alongside the command sender, so the Join source can label each
 //! link by which peer it reaches. This is *labeling*, not the dial tie-break —
@@ -36,8 +36,8 @@
 //!
 //! # The Join source is pluggable
 //!
-//! Each established link surfaces `(peer id, `[`MeshCommand`]` sender)`. Today
-//! the integration test drives [`MeshCommand::Join`] on the sender directly
+//! Each established link surfaces `(peer id, `[`MeshCommand`](mesh::MeshCommand)` sender)`. Today
+//! the integration test drives [`MeshCommand::Join`](mesh::MeshCommand::Join) on the sender directly
 //! (mirroring `mesh_edge.rs`'s in-process harness). In production the
 //! [`MeshControl`](crate::mesh_control::MeshControl) Join source consumes the
 //! coordinator's session descriptors and sends `Join`/`Leave` on the sender for
@@ -197,12 +197,12 @@ pub struct MeshDial {
 ///
 /// For each peer-relay QUIC connection the client-edge accept loop dispatched to
 /// `mesh_accept` (ALPN `rp2-mesh/N`), this reads the dialer's identity hello,
-/// wraps the connection as a [`MeshLink`], spawns a [`mesh::run_mesh_link`]
+/// wraps the connection as a [`MeshLink`](rally_point_transport::MeshLink), spawns a [`mesh::run_mesh_link`]
 /// driver on it, and surfaces `(peer id, `[`MeshCommand`](mesh::MeshCommand)`
 /// sender)` over `links` — one per established link. The peer id comes from the
 /// hello (the acceptor cannot otherwise tell which relay dialed it); the sender
 /// is the handle the test (today) or [`MeshControl`](crate::mesh_control::MeshControl)
-/// (the coordinator's session descriptors) uses to send [`MeshCommand::Join`]
+/// (the coordinator's session descriptors) uses to send [`MeshCommand::Join`](mesh::MeshCommand::Join)
 /// for the specific link serving a session.
 ///
 /// This is the *higher-id* side of a relay-pair: it stays in its accept loop and
@@ -367,10 +367,11 @@ pub const MESH_REDIAL_DELAY: Duration = Duration::from_secs(2);
 /// connection fails, surfacing `(peer id, `[`MeshCommand`](mesh::MeshCommand)`
 /// sender)` over `links` on each (re)established link. The peer id is the
 /// configured `peer_id` — the dialer already knows whom it dialed — and the dialer
-/// announces that id to the peer (a [`MeshHello`](rally_point_proto::mesh::MeshHello))
+/// announces that id to the peer (a [`MeshHello`])
 /// so the accepting side can label its own end of the link.
 ///
-/// This is the *lower-id* side of a relay-pair: the [`should_dial_mesh`]
+/// This is the *lower-id* side of a relay-pair: the
+/// [`should_dial_mesh`](rally_point_transport::should_dial_mesh)
 /// tie-break (`our_id < peer_id`) is checked before dialing, and if it returns
 /// `false` this is a no-op (the peer will dial us — we stay in the accept loop).
 /// Two relays with the same id is a misconfiguration: `should_dial_mesh`

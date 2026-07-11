@@ -320,7 +320,7 @@ impl SignedToken {
     ///
     /// Returns an error if the `kid` or tenant string exceeds [`MAX_STRING_LEN`]
     /// (which can only happen if the token was built via [`KeyId`] or
-    /// [`TenantId`](crate::control::TenantId) without the checked constructors).
+    /// [`TenantId`] without the checked constructors).
     /// Appends the bytes to `out`; the caller owns the buffer.
     pub fn signed_message(&self, out: &mut Vec<u8>) -> Result<(), TokenError> {
         encode_signed_range(out, TOKEN_VERSION, &self.kid, &self.claims)

@@ -27,8 +27,8 @@
 //! # Feeding the buffer (and the adversarial bound)
 //!
 //! The worst pair lag and the session's max hop count feed the latency-buffer
-//! decision as a **clamped additive cushion** ([`cushion_turns`]
-//! (DeliveryTracking::cushion_turns)) on the control law's target — the law
+//! decision as a **clamped additive cushion**
+//! ([`cushion_turns`](DeliveryTracking::cushion_turns)) on the control law's target — the law
 //! itself is untouched, and the cushion rides into the existing `BufferBounds`
 //! clamp. Beacon cursors are **client-claimed**: a malicious client can only
 //! *understate its own* delivery — the same bounded push-the-buffer-up lever it

@@ -1781,9 +1781,9 @@ impl DecisionMaker {
 
     /// The seq-aware sibling of [`observe_frame`](Self::observe_frame): records the
     /// same monotone per-slot frame **and** appends `(seq, frame)` to the slot's
-    /// bounded [`frame_history`](SlotState::frame_history), so a leave decided
+    /// bounded `frame_history`, so a leave decided
     /// later can clamp its apply frame to a survivor-reachable ceiling (see
-    /// [`reachable_frame`](Self::reachable_frame)). **Every production
+    /// `reachable_frame`). **Every production
     /// frame-observation on the leave path must go through this**, not the
     /// seq-less `observe_frame`, or the clamp has no history to work from and a
     /// slot's inflated `game_frame_count` could schedule a leave past a
@@ -2438,7 +2438,7 @@ impl DecisionMaker {
     /// The apply frame is one past the departing slot's last observed frame --
     /// the exact step remaining clients stall at waiting for a turn that will
     /// never come, so the leave unstalls them right there -- **clamped down** to
-    /// the home-authored reachability ceiling ([`Departure::reachable_frame`]) so
+    /// the home-authored reachability ceiling (`Departure`'s `reachable_frame`) so
     /// a slot that inflates its own `game_frame_count` before leaving cannot
     /// schedule the leave past a frame the survivors can reach (which would
     /// strand them). In the honest case `last_frame ≤ ceiling`, so the clamp is a
@@ -2447,7 +2447,7 @@ impl DecisionMaker {
     /// *early* drop (never a stall) — harmless because the ceiling is
     /// single-sourced, so every client agrees. The session frame is the basis
     /// only when the slot never produced a framed turn; it is never folded in as
-    /// a max (see [`leave_base_frame`] for why that would strand stalled
+    /// a max (see `leave_base_frame` for why that would strand stalled
     /// survivors) and is not clamped (no `last_frame` to inflate). Both the last
     /// frame and the ceiling come from the slot's departure record -- surviving
     /// `remove_slot` -- so every relay, including one promoted mid-handoff,
@@ -2474,7 +2474,7 @@ impl DecisionMaker {
     /// [`Authority::Peer`] on every relay — so an authority-gated decide would leave
     /// the departures undecided forever. There are no clients left to desync, so
     /// whichever relay's abandoned-session timer fires decides its own record; the
-    /// same per-slot dedup ([`commit_leave`] / [`observe_leave`] / the coordinator's
+    /// same per-slot dedup (`commit_leave` / [`observe_leave`] / the coordinator's
     /// notice dedup) that makes an ordinary decide idempotent makes this safe even
     /// when several relays' timers fire at once. Records the departure first, like
     /// [`decide_leave`].
@@ -2558,7 +2558,7 @@ impl DecisionMaker {
 
     /// Whether any departure still promises a reconnect on this relay: recorded,
     /// not yet decided, of a slot this relay homes
-    /// ([`admits_slot`](Self::admits_slot)), and named in `held` — the caller's
+    /// (`admits_slot`), and named in `held` — the caller's
     /// current set of pending drop holds. All three conditions mirror the
     /// re-register admission gate (`server.rs`): only a departed-but-held slot
     /// is admitted back, only on its home relay, and a decided leave refuses it
@@ -2591,7 +2591,7 @@ impl DecisionMaker {
     }
 
     /// Records a slot departure without deciding a leave for it, and retires the
-    /// slot's live state (see [`note_departure`]). Every relay calls this when it
+    /// slot's live state (see `note_departure`). Every relay calls this when it
     /// learns a slot left (its own home client, or a peer's `SlotDeparted`), so a
     /// later authority promotion can re-derive the leave even on a relay that was
     /// never the authority. `last_frame` is the departing slot's last observed
@@ -3008,7 +3008,7 @@ impl DecisionMaker {
     }
 
     /// Records this relay's own id, stamped onto every `BufferDirective` this
-    /// maker queues from here on (see [`queue_directive`](Self::queue_directive)).
+    /// maker queues from here on (see `queue_directive`).
     /// Idempotent — the caller's own id never changes for a running relay
     /// process, so calling this again on every descriptor push is harmless.
     pub fn set_own_relay_id(&mut self, id: RelayId) {
@@ -3277,7 +3277,7 @@ pub enum RelayNotice {
 /// coordinator is configured and is simply absent when the relay runs standalone
 /// (no coordinator to notify), where firing is a no-op.
 ///
-/// It also holds each session's **correlation ids** ([`SessionExternalRefs`]),
+/// It also holds each session's **correlation ids** (`SessionExternalRefs`),
 /// populated from the coordinator's descriptor at apply time
 /// ([`set_session_refs`](Self::set_session_refs)) so a departure notice can be
 /// self-describing (carry its own `external_id`/`external_ref`) without the
@@ -3803,7 +3803,7 @@ pub fn result_for(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> 
 
 /// The reachability ceiling for a leave's apply frame at `slot`'s departure —
 /// the highest game frame every surviving slot has provably executed (see
-/// [`DecisionMaker::reachable_frame`]). Read on the departing slot's home relay,
+/// `DecisionMaker`'s `reachable_frame`). Read on the departing slot's home relay,
 /// *before* the departure is recorded (which retires the slot's live state), to
 /// fill both the departure record and the `SlotDeparted` frame the peers
 /// receive, so every relay clamps to the identical value. `None` when no maker
@@ -3874,7 +3874,7 @@ pub fn is_authority(registry: &DecisionMakers, key: &SessionKey) -> bool {
 }
 
 /// Whether `slot` is admissible on this relay per `key`'s session descriptor
-/// (see [`DecisionMaker::admits_slot`]) — read at client admission (`server.rs`)
+/// (see `DecisionMaker`'s `admits_slot`) — read at client admission (`server.rs`)
 /// to refuse a token authorized for a slot the coordinator did not assign here.
 ///
 /// `true` (admit) when no maker exists for the session: this is the same
@@ -3919,7 +3919,7 @@ pub fn reinstate_slot(registry: &DecisionMakers, key: &SessionKey, slot: SlotId)
 }
 
 /// The slots whose leave `key`'s decision-maker has already decided or cached (see
-/// [`DecisionMaker::decided_slots`]). Empty when no maker exists. Read at a
+/// `DecisionMaker`'s `decided_slots`). Empty when no maker exists. Read at a
 /// session-emptied teardown to filter the drop-hold sweep: a hold for a decided
 /// slot is safe to discard, one for an undecided slot must survive (see
 /// [`crate::drop_hold::DropHolds::end_session`]).
@@ -3950,7 +3950,7 @@ pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
 
 /// This relay's known leave state for `key` — every recorded departure and every
 /// cached leave — for re-announcing to a freshly (re)joined mesh link. Empty when
-/// no maker exists. See [`DecisionMaker::leave_reconcile`].
+/// no maker exists. See `DecisionMaker`'s `leave_reconcile`.
 #[allow(clippy::type_complexity)]
 pub fn leave_reconcile(
     registry: &DecisionMakers,
@@ -3999,7 +3999,7 @@ pub fn observe_frame(
 /// The seq-aware sibling of [`observe_frame`]: records the same per-slot frame
 /// **and** the turn's transport seq into the slot's bounded frame history, so a
 /// later leave can clamp its apply frame to a survivor-reachable ceiling (see
-/// [`DecisionMaker::reachable_frame`]). **Every production frame-observation on
+/// `DecisionMaker`'s `reachable_frame`). **Every production frame-observation on
 /// the leave path calls this**, never the seq-less `observe_frame` (which is
 /// test-only), so the clamp always has history to work from. A no-op when no
 /// maker exists.

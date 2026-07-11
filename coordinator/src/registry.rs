@@ -189,7 +189,7 @@ pub fn available_entries(registry: &RelayRegistry) -> Vec<RelayEntry> {
 }
 
 /// The number of registered relays. Zero means no relay has phoned home — a
-/// session request will fail with [`NoRelaysAvailable`].
+/// session request will fail with [`SessionSetupError::NoRelaysAvailable`].
 pub fn len(registry: &RelayRegistry) -> usize {
     registry.relays.lock().len()
 }

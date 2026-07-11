@@ -3,10 +3,10 @@
 //!
 //! A [`MeshLink`] owns one `quinn::Connection` and a registry of [`SessionLink`]
 //! instances — one per game active on that relay-pair. Every datagram on the
-//! connection is a [`MeshPacket`](rally_point_proto::messages::MeshPacket): a
-//! session id plus the per-link [`Packet`](rally_point_proto::messages::Packet)
+//! connection is a [`MeshPacket`]: a
+//! session id plus the per-link [`Packet`]
 //! for that session. The link demultiplexes by session: each session's
-//! [`AckManager`] and [`Dedup`] instance only ever sees its own session's
+//! [`AckManager`] and `Dedup` instance only ever sees its own session's
 //! packets, so the origin `(slot, seq)` identity is unambiguous within an
 //! instance — the session never enters the dedup/ack/retirement key.
 //!
@@ -105,7 +105,7 @@ pub struct MeshLink {
 }
 
 /// One session's per-link transport state on a mesh link: its own
-/// [`AckManager`] and [`Dedup`], independent of every other session's. The
+/// [`AckManager`] and `Dedup`, independent of every other session's. The
 /// `(slot, seq)` identity is unambiguous within an instance because the
 /// instance only ever sees one session's payloads.
 pub struct SessionLink {
@@ -156,7 +156,7 @@ pub enum MeshLinkError {
     PayloadOutOfWindow { slot: SlotId, seq: u64 },
     /// A payload's wire slot does not fit in a [`SlotId`] (0..=255) — a
     /// malformed or hostile packet. See
-    /// [`LinkError::MalformedSlot`](crate::link::LinkError::MalformedSlot).
+    /// [`LinkError::MalformedSlot`].
     #[error("payload names slot {0}, out of range for a SlotId (0..=255)")]
     MalformedSlot(u32),
     /// A received packet's acks were internally inconsistent. A peer-relay bug
@@ -207,7 +207,7 @@ pub struct MeshReceived {
     /// Per-client conditions the peer relay observed on its home clients this
     /// datagram, or `None` when the peer sent no conditions (an ack-only
     /// flush, or it has no local clients). See
-    /// [`LinkConditions`](rally_point_proto::messages::LinkConditions).
+    /// [`LinkConditions`].
     pub conditions: Option<LinkConditions>,
 }
 
@@ -265,7 +265,7 @@ impl MeshLink {
     /// budget — so the redundancy budget that defends lockstep latency is never
     /// stolen by a fixed worst-case reservation, and ack-only flushes (which
     /// carry no conditions) keep their full budget. The inner `Packet` is then
-    /// built to the budget *minus* [`MESH_PACKET_OVERHEAD`] (the inner-Packet
+    /// built to the budget *minus* `MESH_PACKET_OVERHEAD` (the inner-Packet
     /// field tag + length prefix that can't be probed without the packet
     /// itself), so the `MeshPacket` wrapper fits the datagram even when
     /// redundancy fills the inner packet — the client-edge [`Link::send`](crate::Link::send)

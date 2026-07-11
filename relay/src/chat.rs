@@ -19,7 +19,7 @@
 //!
 //! **Two admission caps, enforced at the relay, not by this module.** A
 //! client-authored message must pass a size cap ([`CHAT_TEXT_MAX_BYTES`]) and a
-//! per-slot rate cap ([`RateLimiter`]) before the relay ever calls [`deliver`] on
+//! per-slot rate cap (`TokenBucket`) before the relay ever calls [`deliver`] on
 //! it or forwards it across the mesh — see [`admit`]. A mesh-received message
 //! skips `admit` entirely: the origin relay already ran its own client-authored
 //! copy through the same checks, so re-checking here would only re-penalize an

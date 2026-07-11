@@ -29,6 +29,18 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
   test:
     name: build + test (${{ matrix.os }})
     strategy:

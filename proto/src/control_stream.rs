@@ -30,7 +30,7 @@
 
 use prost::Message;
 
-/// The largest encoded [`ControlFrame`] a reader will accept, and the largest
+/// The largest encoded [`ControlFrame`](crate::messages::ControlFrame) a reader will accept, and the largest
 /// a writer will produce. Bounds the allocation an attacker-supplied length
 /// prefix can demand. Generous against its resident: an oversize turn is one
 /// game step's command bytes — a few hundred bytes past the ~1200-byte

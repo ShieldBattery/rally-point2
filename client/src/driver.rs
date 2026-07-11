@@ -376,18 +376,18 @@ pub enum DriverError {
     /// buffer just drops them.
     #[error("game stopped draining a correctness-critical channel; its buffer is full")]
     GameStalled,
-    /// The unacked window crossed [`UNACKED_WINDOW_CAP`] even after the beacon
+    /// The unacked window crossed `UNACKED_WINDOW_CAP` even after the beacon
     /// side-channel retired everything the peer confirmed it received — the
     /// peer is genuinely behind, not just ack-starved. This is the sustained
     /// forward-loss case redundancy cannot cover: turns are being produced
     /// faster than the peer can receive them. Treated as terminal rather than
     /// fed into the reconnect loop's replay-from-cursor recovery, unlike a
-    /// link or control-stream failure — see [`is_link_failure`]. Dropping
+    /// link or control-stream failure — see `is_link_failure`. Dropping
     /// further turns to keep the window bounded would desync lockstep, so the
     /// driver stops instead.
     #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
     UnackedWindowExhausted { in_flight: usize, cap: usize },
-    /// The outbound outage buffer crossed [`OUTAGE_OUTBOUND_BUFFER_CAP`] while
+    /// The outbound outage buffer crossed `OUTAGE_OUTBOUND_BUFFER_CAP` while
     /// the link was down — the game kept producing turns faster than the
     /// driver could hold them across the outage. Surfaced as a terminal error
     /// rather than silently discarding the oldest buffered turn: a dropped
@@ -416,7 +416,7 @@ pub enum DriverError {
 
 impl LinkDriver {
     /// Wraps a connected [`Link`] in a driver, returning it with the game thread's
-    /// [`TurnChannels`]. Uses [`TURN_CHANNEL_CAPACITY`] for each direction.
+    /// [`TurnChannels`]. Uses `TURN_CHANNEL_CAPACITY` for each direction.
     pub fn new(link: Link) -> (Self, TurnChannels) {
         Self::with_capacity(link, TURN_CHANNEL_CAPACITY)
     }
@@ -1770,7 +1770,7 @@ pub enum RehomeOutcome {
     Stay,
     /// No live relay can take the session over yet (or the session is unknown to the
     /// coordinator). Keep the same-relay backoff and let the driver re-ask on the
-    /// [`ESCALATE_RETRY`] cadence.
+    /// `ESCALATE_RETRY` cadence.
     Unavailable,
 }
 
@@ -1785,7 +1785,7 @@ pub type RehomeFuture<'a> = Pin<Box<dyn Future<Output = RehomeOutcome> + Send + 
 /// The driver calls [`rehome`](Self::rehome) only once the game has started (it
 /// tracks the relay's `SessionStart` directive itself) and only after same-relay
 /// re-dials have failed long enough — immediately on a cert/pin rejection (a
-/// restarted relay serving a fresh cert), otherwise after [`ESCALATE_AFTER`]. The
+/// restarted relay serving a fresh cert), otherwise after `ESCALATE_AFTER`. The
 /// implementation is where the embedder enforces "only once the game has started"
 /// as well, does the coordinator `POST /session/rehome` round-trip, and — for a
 /// [`RehomeOutcome::NewTarget`] — builds the fresh [`ClientEndpoint`] pinning the
@@ -1827,12 +1827,12 @@ pub struct Reconnect {
     /// unreachable (see [`RehomeProvider`]).
     pub rehome: Option<Arc<dyn RehomeProvider>>,
     /// How long same-relay re-dials must keep failing before the driver escalates to
-    /// the re-home provider. `None` uses [`ESCALATE_AFTER`]; set it only to tune the
+    /// the re-home provider. `None` uses `ESCALATE_AFTER`; set it only to tune the
     /// escalation aggressiveness (or shorten it in a test). A cert/pin rejection
     /// escalates immediately regardless.
     pub escalate_after: Option<Duration>,
     /// How often the driver re-escalates while the provider answers `Unavailable` or
-    /// a re-home dial keeps failing. `None` uses [`ESCALATE_RETRY`].
+    /// a re-home dial keeps failing. `None` uses `ESCALATE_RETRY`.
     pub escalate_retry: Option<Duration>,
 }
 

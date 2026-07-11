@@ -31,8 +31,8 @@
 //! permanently diverged after a single dropped command. `Join`/`Leave` are
 //! idempotent on the driver, so a redundant re-send is harmless.
 //!
-//! The command channel is unbounded (see
-//! [`command_channel`](crate::mesh::command_channel)), so a send to a live link
+//! The command channel is unbounded (see `command_channel` in the mesh
+//! module), so a send to a live link
 //! cannot fail under load — the command is enqueued for the driver and `joined`
 //! advances. The only send failure is a *closed* channel (the driver exited):
 //! that link is dropped from the registry, intent kept, so a reconnect under the

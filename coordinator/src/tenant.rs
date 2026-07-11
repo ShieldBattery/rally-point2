@@ -1,5 +1,5 @@
 //! Per-tenant signing keys: the coordinator's counterpart to the relay's
-//! [`Registry`](rally_point_relay::auth::Registry).
+//! `auth::Registry`.
 //!
 //! The relay verifies tokens; the coordinator signs them. Each tenant has its
 //! own Ed25519 signing key, registered here with a `kid` that the relay looks

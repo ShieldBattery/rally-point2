@@ -96,14 +96,14 @@ enum ControlDisconnect {
 /// The sessions the last-applied descriptor set named — the subscriber's removal
 /// detector, shared as a handle so the drain path can read it.
 ///
-/// [`reconcile`] replaces its contents on every pushed set (and it persists across
+/// `reconcile` replaces its contents on every pushed set (and it persists across
 /// reconnects, so a session removed while disconnected is left on the next full-set
 /// re-sync). The coordinated-drain sequence reads it through [`drained_idle`]: a
 /// session the coordinator assigned to this relay appears here the moment its
 /// descriptor push is applied — *before* any client dials — so an empty applied set
 /// at DrainAck time means the coordinator's post-mark truth names this relay in no
 /// session at all. The DrainAck contract guarantees the pre-ack descriptor push is
-/// processed (through [`apply_message`]/[`reconcile`], updating this set) before
+/// processed (through `apply_message`/`reconcile`, updating this set) before
 /// the ack flips the drain-acked signal — same socket, sequential loop — so the set
 /// is authoritative at exactly the moment the drain sequence consults it.
 ///

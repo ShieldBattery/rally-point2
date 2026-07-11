@@ -12,7 +12,7 @@
 //!
 //! The ring is bounded two ways — a turn *count* and a total *byte* budget,
 //! whichever binds first — and drops oldest-first on overflow. The count bound is
-//! sized to a nominal outage window (see [`RING_WINDOW_SECS`]): over that window a
+//! sized to a nominal outage window (see `RING_WINDOW_SECS`): over that window a
 //! session of the most slots SC:R allows produces at most `window_secs × turns/s ×
 //! slots` turns, so a ring sized to that (with headroom) covers the reconnect. An
 //! outage can outlast that window — a disconnect is no longer bounded by any timer

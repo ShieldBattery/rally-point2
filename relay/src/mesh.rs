@@ -3,14 +3,15 @@
 //! A relay's client edge ([`routing`]) fans each validated turn out to the
 //! session's local slots. The mesh adds a second fan-out path: to connected peer
 //! relays, so a turn one relay receives from a local client reaches every other
-//! relay's local clients too. Each relay↔relay link is a [`MeshLink`] — one QUIC
+//! relay's local clients too. Each relay↔relay link is a
+//! [`MeshLink`](rally_point_transport::MeshLink) — one QUIC
 //! connection shared across every game both relays jointly serve, with per-session
 //! transport state.
 //!
 //! Because a turn can reach a relay by more than one mesh path (A→B directly, and
 //! A→C→B), the relay dedups **topologically**: it forwards each turn to its local
 //! clients exactly once, on whichever copy arrives first. [`MeshSeen`] is that
-//! session-level dedup — distinct from the per-link [`Dedup`] on each mesh link,
+//! session-level dedup — distinct from the per-link `Dedup` on each mesh link,
 //! which drops redundant copies *within* one link. The origin `(slot, seq)`
 //! identity is stable across the mesh because no hop restamps it, so the two
 //! dedup layers collapse duplicates at different granularities without conflict.
@@ -51,7 +52,7 @@ use crate::routing::{self, SessionKey};
 /// The prefix-slide lets it forget old seqs without unbounded growth: a late
 /// redundant copy of a retired seq is dropped as `<= delivered_through` rather
 /// than re-checked against a growing set. The out-of-prefix sparse set that
-/// backs that slide is itself capped ([`SPARSE_SEEN_CAP`]): a seq stream that
+/// backs that slide is itself capped (`SPARSE_SEEN_CAP`): a seq stream that
 /// leaves permanent gaps below its high-water mark — an authenticated peer that
 /// keeps reconnecting with an advancing resume anchor is the motivating case —
 /// would otherwise pin those gaps in the set for the life of the session, so
@@ -652,7 +653,7 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 }
 
 /// Delivers `payload` to every peer-relay mesh link serving `key`, without ever
-/// blocking on a slow peer. Mirrors [`routing::fan_out`] but for mesh links
+/// blocking on a slow peer. Mirrors `routing::fan_out` but for mesh links
 /// instead of local slots.
 ///
 /// Fans out to **all** mesh links for the session — including the one a turn
@@ -667,11 +668,11 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 /// queue is: a local client's own transport re-carries a dropped datagram from
 /// its own unacked window, but this queue feeds the mesh link's `AckManager` —
 /// a turn dropped here never enters it, so the link has nothing to re-carry on
-/// its own. So, like [`routing::fan_out`]'s lagging peer, a full queue signals
-/// the link to reset (see [`MeshLinkTx::shutdown`]) rather than silently
+/// its own. So, like `routing::fan_out`'s lagging peer, a full queue signals
+/// the link to reset (see `MeshLinkTx`'s `shutdown` field) rather than silently
 /// dropping the turn: the dial supervisor redials, the Join-time reconcile
 /// re-syncs leave state, and each side's resume-cursor exchange on that fresh
-/// link (see [`reconcile_resume_cursors_on_join`]) replays whatever the
+/// link (see `reconcile_resume_cursors_on_join`) replays whatever the
 /// peer's forward-gate is still missing from this relay's own
 /// locally-originated turns — turning what would otherwise be a permanent
 /// per-(slot, seq) gap into a recovered one. Never a per-packet retransmit:
@@ -1450,7 +1451,7 @@ async fn send_resume_replay(
     true
 }
 
-/// Drives a shared [`MeshLink`] for every session both relays jointly serve on
+/// Drives a shared [`MeshLink`](rally_point_transport::MeshLink) for every session both relays jointly serve on
 /// a relay-pair's single QUIC connection.
 ///
 /// A near-twin of [`routing::run_slot_link`] but for the mesh edge:

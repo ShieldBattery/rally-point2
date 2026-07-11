@@ -4,7 +4,8 @@
 //!
 //! A dropped slot's departure is recorded and announced immediately (so every
 //! relay knows it left and survivors learn who disconnected), but the decision
-//! that removes it from lockstep — the permanent [`LeaveDirective`] — is **never
+//! that removes it from lockstep — the permanent
+//! [`LeaveDirective`](rally_point_proto::messages::LeaveDirective) — is **never
 //! made automatically**. A disconnect drop is always a human decision: after a
 //! slot has been gone a while, any single surviving member sends a `RequestDrop`
 //! for it, and the session's authority relay honors that request once the hold

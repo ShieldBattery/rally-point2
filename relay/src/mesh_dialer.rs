@@ -1,7 +1,7 @@
 //! On-demand mesh dialing: keep a dial supervisor alive per higher-id peer the
 //! coordinator's descriptors say this relay should currently mesh with.
 //!
-//! The connection half ([`mesh_edge`](crate::mesh_edge)) knows *how* to dial a
+//! The connection half ([`mesh_edge`]) knows *how* to dial a
 //! peer and keep that one link healthy ([`run_mesh_dial`](crate::mesh_edge::run_mesh_dial)),
 //! but it is told *which* peer to dial once, at startup. In production the peer set
 //! is not known at startup — relays churn under scale-to-zero and games pair
@@ -54,7 +54,7 @@
 //! independently self-signed relays mesh with no shared root or out-of-band cert
 //! distribution. The configured [`DialerConfig::roots`] are the fallback for a
 //! peer whose descriptor carried no cert (a coordinator that predates the
-//! field); see [`dial_roots`].
+//! field); see `dial_roots`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -82,7 +82,7 @@ pub struct DialerConfig {
     /// The TLS SNI to verify on each peer's certificate.
     pub server_name: String,
     /// Fallback roots to trust a peer's certificate against, used only when the
-    /// peer's descriptor carried no pinned cert (see [`dial_roots`]). A
+    /// peer's descriptor carried no pinned cert (see `dial_roots`). A
     /// descriptor-carried pin wins over these.
     pub roots: RootCertStore,
     /// The relay's session routing state, shared into each link driver.

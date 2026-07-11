@@ -32,7 +32,6 @@ pub mod mesh;
 pub mod token;
 pub mod version;
 
-/// Sans-I/O codec for the ack-beacon side-channel.
 pub mod beacon;
 pub mod control_stream;
 

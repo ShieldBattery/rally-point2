@@ -197,7 +197,7 @@ pub fn end_session(registry: &LobbyRegistry, key: &SessionKey) {
 /// Only ever called at the client edge, before `deliver` and the mesh
 /// fan-out — mirroring [`crate::chat::admit`], a mesh-received command has
 /// already passed its origin relay's `admit` and goes straight to `deliver`
-/// (see [`crate::mesh::dispatch_mesh_control`]'s `LobbyCommand` arm), so
+/// (see `dispatch_mesh_control`'s `LobbyCommand` arm in the mesh module), so
 /// re-checking here would only re-penalize an already-admitted command
 /// against a second, independent bucket keyed on the same slot.
 ///

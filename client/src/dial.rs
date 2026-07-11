@@ -179,7 +179,7 @@ impl ClientEndpoint {
     /// still arrive out of order, so doing that ordering is the job of the driver
     /// above the link ([`LinkDriver`](crate::LinkDriver)), not of this dial.
     ///
-    /// The whole dial is bounded by [`CONNECT_TIMEOUT`] so a relay that accepts the
+    /// The whole dial is bounded by `CONNECT_TIMEOUT` so a relay that accepts the
     /// connection but then stalls cannot hang the caller; use
     /// [`connect_with_timeout`](Self::connect_with_timeout) to set the bound.
     pub async fn connect(

@@ -75,7 +75,7 @@ pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 /// while still bounding an abandoned create's leak to a bounded span rather
 /// than forever.
 ///
-/// This is the floor, not the whole story: [`never_started_grace`] takes the
+/// This is the floor, not the whole story: `never_started_grace` takes the
 /// LATER of this and the session's own token expiry (plus
 /// [`NEVER_STARTED_EXPIRY_MARGIN`]), so a session whose tokens are still
 /// legitimately usable is never reaped out from under a client that could
@@ -338,13 +338,13 @@ impl Lifecycle {
 
     /// Records a freshly created session's serving relays and its player/observer
     /// slot split, spawning its ordered dispatch queue, and arms the
-    /// never-started reap for it (see [`fire_never_started`]). Called from
+    /// never-started reap for it (see `fire_never_started`). Called from
     /// `create_session`. A repeat call (a session id collision, or a re-create)
     /// replaces the accounting inputs while keeping the existing queue.
     ///
     /// `expires_at` is the tokens' expiry the create minted, carried through
     /// only to size the never-started grace window
-    /// ([`never_started_grace`]) — it is not otherwise interpreted here.
+    /// (`never_started_grace`) — it is not otherwise interpreted here.
     pub fn register_session(
         &self,
         tenant: TenantId,
@@ -661,9 +661,9 @@ impl Lifecycle {
     /// created (restart amnesia — the departure still delivers, serialized).
     ///
     /// This is the non-terminal (departure/desync/result) path: it may drop
-    /// the notice instead of enqueueing it — see [`push_ordinary`](Self::push_ordinary).
+    /// the notice instead of enqueueing it — see `push_ordinary`.
     /// The terminal `sessionClosed` job is never routed through here; it has
-    /// its own push ([`push_terminal`](Self::push_terminal)) that may not drop.
+    /// its own push (`push_terminal`) that may not drop.
     pub fn enqueue_webhook(
         &self,
         tenant: TenantId,
@@ -692,7 +692,7 @@ impl Lifecycle {
 
     /// Ensures a lazily-created webhook-only lifecycle state exists for
     /// `(tenant, session)` and its idle reap is armed, without enqueuing any
-    /// webhook — the minimal half of [`enqueue_webhook`]'s lazy creation, for
+    /// webhook — the minimal half of [`enqueue_webhook`](Self::enqueue_webhook)'s lazy creation, for
     /// a caller that must remember it saw something for this session
     /// regardless of whether that something is ultimately deliverable.
     ///
@@ -702,7 +702,7 @@ impl Lifecycle {
     /// state, the dedup entry has no retirement path at all (this
     /// coordinator lifetime's normal all-relays-closed removal, and
     /// `prune_dedup` alongside it, both require an existing
-    /// [`SessionState`]) — a notice this coordinator can never resolve a
+    /// `SessionState`) — a notice this coordinator can never resolve a
     /// notify config or a `gameId` ref for (a tenant with no webhook
     /// configured, or a session outside this coordinator's session store)
     /// would otherwise leak that dedup entry for the life of the process.

@@ -413,8 +413,9 @@ impl SessionSetup {
     /// - A rehome that completed **before** this take had already added its target
     ///   relay to the membership, so that relay is in the vec this take returns — the
     ///   close's descriptor removal over the returned set therefore covers the
-    ///   resumed descriptor that rehome pushed, and the close's [`forget_rehomes`]
-    ///   (run after the take) clears the idempotency entry it recorded.
+    ///   resumed descriptor that rehome pushed, and the close's
+    ///   [`forget_rehomes`](Self::forget_rehomes) (run after the take) clears the
+    ///   idempotency entry it recorded.
     ///
     /// Retiring `session_relays` is also what refuses a *later* re-home for the
     /// closed session: with no serving relays recorded, [`rehome`]'s
@@ -467,7 +468,7 @@ impl SessionSetup {
     /// Locks the assignment lock — the outermost lock that linearizes an
     /// assignment's pick→commit span against a relay's drain mark (see the field
     /// docs). The coordinator's control connection acquires it around
-    /// [`registry::mark_draining`](crate::registry::mark_draining) so a drain mark
+    /// [`registry::mark_draining`] so a drain mark
     /// lands wholly before or wholly after any in-flight `create_session`/`rehome`.
     /// Returns a guard held only across await-free sync work.
     pub fn lock_assignment(&self) -> parking_lot::MutexGuard<'_, ()> {
@@ -501,7 +502,7 @@ pub enum RehomeOutcome {
 /// [`rehome`] path) or when the recorded target has since left the registry.
 ///
 /// A fully-closed session never matches: its recorded rehomes are cleared by
-/// [`forget_rehomes`] at close, at the same moment its membership is retired. This
+/// [`forget_rehomes`](SessionSetup::forget_rehomes) at close, at the same moment its membership is retired. This
 /// is the lock-free sibling of the identical lookup inside [`rehome`], which runs
 /// there under the rehomes lock so the read-and-mutate stays atomic; a shared
 /// helper cannot be reused there without re-entering that lock.
@@ -841,7 +842,7 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// still-live session replays that session's original response (with `replayed
 /// == true`) rather than minting a duplicate, and the caller must then skip
 /// arming the session's lifecycle a second time. A replay is honored only when
-/// the request matches the original roster's [`CreateFingerprint`]; the same
+/// the request matches the original roster's `CreateFingerprint`; the same
 /// `external_id` presented with a different roster is refused with
 /// [`SessionSetupError::IdempotentCreateMismatch`].
 ///

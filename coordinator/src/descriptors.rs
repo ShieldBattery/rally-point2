@@ -13,7 +13,7 @@
 //! Each relay's entry holds its *current* descriptor set — the descriptor for
 //! every session it should serve, replaced in place when a session's topology
 //! changes, dropped when the session ends. The set lives in a
-//! [`watch`](tokio::sync::watch) channel: a connected relay's task subscribes,
+//! [`watch`] channel: a connected relay's task subscribes,
 //! and a change wakes it to push the new set. `watch` keeps only the latest
 //! value, which is exactly right for declarative state — a relay that was briefly
 //! slow or disconnected re-syncs to the current truth rather than replaying a
