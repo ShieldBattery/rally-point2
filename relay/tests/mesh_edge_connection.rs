@@ -846,6 +846,109 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
     Ok(())
 }
 
+/// The mesh-forward-queue half of finding C2: a congested link's shared forward
+/// queue filling must reset the link, not silently drop the fresh turn — a
+/// dropped turn never enters the link's `AckManager`, so its own redundancy has
+/// nothing to re-carry and the peer relay's clients would stall on a permanent
+/// per-(slot, seq) gap forever. Mirrors
+/// [`dial_redials_after_the_peer_control_stream_dies`], but forces the reset by
+/// flooding `fan_out_to_mesh` past the shared queue's capacity instead of
+/// severing the control stream — the established link must still exit
+/// `ConnectionFailed` and the dial supervisor must still redial.
+///
+/// The flood loop below has no `.await` in it, and `#[tokio::test]` defaults to
+/// the current-thread runtime: cooperative scheduling can't preempt A's driver
+/// task mid-loop to drain the queue, so every send lands before the driver ever
+/// gets a chance to empty it — the fill is deterministic, not a timing race.
+#[tokio::test]
+async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(9);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // A (id 1) dials; B (id 2) accepts. B stays up throughout, so the redial can
+    // reconnect to it. B's real driver never runs here (its accept channel is
+    // drained directly), so nothing on B's side ever drains what A sends it —
+    // irrelevant to this test, since the queue that fills is A's own outbound
+    // `MeshLinkTx::forward`, drained only by A's driver.
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let dial = mesh_edge::MeshDial {
+        our_id: RelayId(1),
+        peer_id: RelayId(2),
+        peer_addrs: vec![relay_b.addr],
+        server_name: "localhost".to_owned(),
+        roots,
+    };
+    // A short redial delay so the test doesn't wait the production interval.
+    tokio::spawn(mesh_edge::run_mesh_dial_with(
+        dial,
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+        Duration::from_millis(50),
+    ));
+
+    // The first dial connects: B accepts a connection and A surfaces a link
+    // labeled with B's id.
+    let _conn1 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "B did not accept A's first dial within 2s")?
+        .ok_or("B's accept channel closed")?;
+    let (peer1, cmds_a) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface its first link within 2s")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer1, RelayId(2), "A's first link reaches B");
+
+    // Join the session so `fan_out_to_mesh` finds a registered target, then let
+    // A's driver actually process the command and register.
+    cmds_a.send(mesh::MeshCommand::Join(key.clone()))?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Mirrors the private `routing::FORWARD_CAPACITY` (not visible to an
+    // external integration test, like `CONTROL_STREAM_LOST_CLOSE` elsewhere in
+    // this suite).
+    const FORWARD_CAPACITY: usize = 1024;
+
+    // Flood past the shared forward queue's capacity in one synchronous burst —
+    // see the doc comment above for why this reliably fills it rather than
+    // racing A's driver's own drain.
+    for _ in 0..(FORWARD_CAPACITY + 8) {
+        mesh::fan_out_to_mesh(
+            &relay_a.mesh.links,
+            &key,
+            Payload {
+                ..Default::default()
+            },
+        );
+    }
+
+    // A's driver must treat the full queue as a link failure and redial, exactly
+    // like a dropped connection: B accepts a second connection, and A surfaces a
+    // fresh link.
+    let _conn2 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "A did not redial after its forward queue filled")?
+        .ok_or("B's accept channel closed")?;
+    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface a link after redialing")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
+
+    drop(relay_a);
+    Ok(())
+}
+
 /// The on-demand dialer establishes a mesh link to a peer the coordinator's
 /// descriptors name, and re-establishes it after the link ends — the production
 /// path that closes the "idle teardown then a new session leaves the pair

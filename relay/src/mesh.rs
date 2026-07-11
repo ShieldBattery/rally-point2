@@ -33,7 +33,7 @@ use rally_point_proto::messages::{
     GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, RequestDrop,
     SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::routing::{self, SessionKey};
 
@@ -373,6 +373,13 @@ pub struct MeshLinkTx {
     forward: MeshForwardTx,
     /// Unbounded control-frame channel (synced-leave propagation, never dropped).
     control: MeshControlTx,
+    /// Signals this link's driver to reset when its shared forward queue is
+    /// full — see [`fan_out_to_mesh`]. One `Notify` per link (shared by every
+    /// session registered on it, since they all drain the same queue), cloned
+    /// in here so a full-queue observation for *this* session's entry resets
+    /// only the one congested link, never a sibling peer link serving the same
+    /// session. Mirrors [`crate::routing::SlotEntry`]'s `shutdown` field.
+    shutdown: Arc<Notify>,
 }
 
 /// Hands out a process-unique id for each mesh-link registration. A session's
@@ -435,35 +442,43 @@ pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// `CommandChannelClosed` means the relay itself is shutting the link down.
 ///
 /// `ConnectionFailed` covers every transport-level exit — a QUIC idle
-/// timeout, a read/send error, a keepalive that stopped round-tripping, or the
+/// timeout, a read/send error, a keepalive that stopped round-tripping, the
 /// peer's control-stream reader ending while the rest of the connection was
-/// still alive (a one-sided reset, an over-cap frame, a decode failure). Those
-/// all surface the same from the driver's perspective (the link is gone); the
-/// reconnect supervisor treats them all as retryable.
+/// still alive (a one-sided reset, an over-cap frame, a decode failure), or
+/// this link's own shared forward queue filling (a congested peer whose
+/// dropped turn would otherwise leave the peer's clients stalled forever).
+/// Those all surface the same from the driver's perspective (the link is
+/// gone, or no longer trustworthy); the reconnect supervisor treats them all
+/// as retryable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshLinkExit {
     /// The link had at least one session, went empty, and stayed empty past
     /// [`IDLE_TIMEOUT`]. An intentional wind-down, not a failure.
     Idle,
-    /// The connection failed: a recv/send error, QUIC idle timeout, or a dead
-    /// control-stream reader. The peer is unreachable, dead, or the link is no
-    /// longer trustworthy for correctness-critical traffic.
+    /// The connection failed: a recv/send error, QUIC idle timeout, a dead
+    /// control-stream reader, or a full forward queue reset. The peer is
+    /// unreachable, dead, or the link is no longer trustworthy for
+    /// correctness-critical traffic.
     ConnectionFailed,
     /// The command channel closed (the relay is tearing the link down — its
     /// `MeshCommand` sender was dropped). An intentional shutdown.
     CommandChannelClosed,
 }
 
-/// Registers one peer-relay link's `(forward, control)` senders for `key`,
-/// appending them as a new element in that session's fan-out vec, and returns the
-/// RAII guard that removes *only this* element when dropped. Each session's entry
-/// holds one element per connected peer relay, so registering must never clobber
-/// the peers already serving the session.
+/// Registers one peer-relay link's `(forward, control)` senders and its
+/// reset signal for `key`, appending them as a new element in that session's
+/// fan-out vec, and returns the RAII guard that removes *only this* element
+/// when dropped. Each session's entry holds one element per connected peer
+/// relay, so registering must never clobber the peers already serving the
+/// session. `shutdown` is the link's own `Notify` (shared across every session
+/// registered on it), so [`fan_out_to_mesh`] can reset exactly this link on a
+/// full forward queue without touching any sibling peer link.
 fn register_mesh_link(
     links: &MeshLinks,
     key: SessionKey,
     forward: MeshForwardTx,
     control: MeshControlTx,
+    shutdown: Arc<Notify>,
 ) -> MeshLinkRegistration {
     let id = next_mesh_link_id();
     links
@@ -474,6 +489,7 @@ fn register_mesh_link(
             id,
             forward,
             control,
+            shutdown,
         });
     MeshLinkRegistration {
         links: links.clone(),
@@ -507,19 +523,51 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 /// echo arrives, is seen as `Duplicate`, and is dropped before it reaches local
 /// clients. This is why the flood-with-dedup model requires marking on *every*
 /// forward-to-local, not just mesh ingress.
+///
+/// A full forward queue is *not* the same recoverable case a full local slot
+/// queue is: a local client's own transport re-carries a dropped datagram from
+/// its own unacked window, but this queue feeds the mesh link's `AckManager` —
+/// a turn dropped here never enters it, so the link has nothing to re-carry and
+/// the peer relay's clients see a permanent per-(slot, seq) gap, stalled in
+/// lockstep forever. So, like [`routing::fan_out`]'s lagging peer, a full queue
+/// signals the link to reset (see [`MeshLinkTx::shutdown`]) rather than
+/// silently dropping the turn: the dial supervisor redials and the Join-time
+/// reconcile re-syncs leave state on the fresh link, turning an unbounded
+/// silent gap into a loud, bounded one — a reset link, not a wedged one that
+/// keeps eating turns forever. Never a per-packet retransmit.
+///
+/// TODO(mesh-resume): a turn dropped here (or in flight at any mesh link
+/// death) is still lost until a mesh-side resume-from-cursor replay from the
+/// turn ring exists. `turn_ring::replay` today has exactly one caller — the
+/// client-facing reconnect in `routing.rs` — so the reset above recovers the
+/// *link*, not the dropped turn itself.
 pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
-    let targets: Vec<MeshForwardTx> = {
+    let targets: Vec<(MeshForwardTx, Arc<Notify>)> = {
         let roster = links.lock();
         match roster.get(key) {
-            Some(mesh_txs) => mesh_txs.iter().map(|tx| tx.forward.clone()).collect(),
+            Some(mesh_txs) => mesh_txs
+                .iter()
+                .map(|tx| (tx.forward.clone(), Arc::clone(&tx.shutdown)))
+                .collect(),
             None => Vec::new(),
         }
     };
-    for tx in targets {
+    for (tx, shutdown) in targets {
         // Tag with the session id so the driver's merged receiver can demux.
-        // A full mesh forward queue is a slow peer relay — signal it later, for
-        // now just drop (the per-link transport re-carries what was already sent).
-        let _ = tx.try_send((key.session, payload.clone()));
+        match tx.try_send((key.session, payload.clone())) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    "mesh forward queue full; resetting the congested link",
+                );
+                shutdown.notify_one();
+            }
+            // The driver already exited (a redial, if warranted, is already
+            // in motion via whatever ended it); nothing more to signal.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -1086,6 +1134,15 @@ pub async fn run_mesh_link(
     let (forward_tx, mut forward_rx) =
         mpsc::channel::<(rally_point_proto::ids::SessionId, Payload)>(routing::FORWARD_CAPACITY);
 
+    // This link's reset signal: `fan_out_to_mesh` notifies it when this shared
+    // forward queue is full, since a dropped fresh turn never enters the
+    // `AckManager` for this link's transport to re-carry — a permanent gap for
+    // the peer, not a recoverable one. One `Notify` per link, cloned into the
+    // mesh-links registry for each session registered on it (mirroring
+    // `forward_tx`/`control_forward_tx` above), so a reset here only ever
+    // affects this one relay-pair link.
+    let shutdown = Arc::new(Notify::new());
+
     // Per-session driver state, keyed by the wire's bare session id. Each entry
     // carries its full SessionKey so fan-out/conditions stay tenant-correct.
     // The collision guard runs on Join: if two tenants share a session id, the
@@ -1344,6 +1401,19 @@ pub async fn run_mesh_link(
                     None => break MeshLinkExit::CommandChannelClosed,
                 }
             }
+            // `fan_out_to_mesh` found this shared forward queue full and
+            // notified: a dropped fresh turn here never enters this link's
+            // `AckManager`, so its transport has nothing to re-carry and the
+            // peer would stall on a permanent gap. Reset the link instead —
+            // the dial supervisor redials and the Join-time reconcile
+            // re-syncs leave state on the fresh link, turning an unbounded
+            // silent gap into a loud, bounded reset. This recovers the link,
+            // not the dropped turn itself — see the `TODO(mesh-resume)` on
+            // `fan_out_to_mesh`.
+            _ = shutdown.notified() => {
+                tracing::info!("mesh forward queue was full; resetting link");
+                break MeshLinkExit::ConnectionFailed;
+            }
             _ = tokio::time::sleep_until(next_flush) => {
                 let now = tokio::time::Instant::now();
                 let mut failed = None;
@@ -1479,6 +1549,7 @@ pub async fn run_mesh_link(
                             key.clone(),
                             forward_tx.clone(),
                             control_forward_tx.clone(),
+                            Arc::clone(&shutdown),
                         );
                         // Re-send this relay's known leave state for the session
                         // down the fresh registration, so a link that died and
@@ -2200,6 +2271,10 @@ mod tests {
                 id: next_mesh_link_id(),
                 forward,
                 control,
+                // Unobserved by every caller of this helper (none of them test
+                // the reset signal); a fresh, otherwise-untouched `Notify` per
+                // registration keeps them independent regardless.
+                shutdown: Arc::new(Notify::new()),
             });
         (forward_rx, control_rx)
     }
@@ -2250,11 +2325,23 @@ mod tests {
         // entry, so the session's vec holds one element per peer.
         let (peer_b_fwd, mut peer_b_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
         let (peer_b_ctl, _peer_b_ctl_rx) = mpsc::unbounded_channel();
-        let reg_b = register_mesh_link(&links, key.clone(), peer_b_fwd, peer_b_ctl);
+        let reg_b = register_mesh_link(
+            &links,
+            key.clone(),
+            peer_b_fwd,
+            peer_b_ctl,
+            Arc::new(Notify::new()),
+        );
 
         let (peer_c_fwd, mut peer_c_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
         let (peer_c_ctl, _peer_c_ctl_rx) = mpsc::unbounded_channel();
-        let reg_c = register_mesh_link(&links, key.clone(), peer_c_fwd, peer_c_ctl);
+        let reg_c = register_mesh_link(
+            &links,
+            key.clone(),
+            peer_c_fwd,
+            peer_c_ctl,
+            Arc::new(Notify::new()),
+        );
 
         assert_eq!(
             links.lock().get(&key).map(Vec::len),
@@ -2292,6 +2379,83 @@ mod tests {
         assert!(
             links.lock().get(&key).is_none(),
             "the session key is removed once its last link deregisters",
+        );
+    }
+
+    /// The bug this guards: a full mesh forward queue used to just drop the fresh
+    /// turn (`let _ = tx.try_send(...)`) — a turn that never enters the link's
+    /// `AckManager` has nothing for that link's redundancy to re-carry, so the
+    /// peer relay's clients see a permanent per-(slot, seq) gap and stall in
+    /// lockstep forever. The fix mirrors `routing::fan_out`'s lagging-peer path:
+    /// a full queue resets the congested link (via its `Notify`) instead of
+    /// silently dropping into it, so the dial supervisor redials a fresh
+    /// connection. Also proves the reset is scoped to *only* the congested
+    /// link — a healthy sibling peer link serving the same session keeps
+    /// receiving every turn and is never signaled.
+    #[tokio::test]
+    async fn fan_out_to_mesh_resets_a_full_link_and_keeps_delivering_to_a_healthy_one() {
+        let links = new_mesh_links();
+        let key = control_key();
+
+        // Peer B is drained every turn and so never fills; peer C is never
+        // drained and fills.
+        let (peer_b_fwd, mut peer_b_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
+        let (peer_b_ctl, _peer_b_ctl_rx) = mpsc::unbounded_channel();
+        let peer_b_shutdown = Arc::new(Notify::new());
+        let _reg_b = register_mesh_link(
+            &links,
+            key.clone(),
+            peer_b_fwd,
+            peer_b_ctl,
+            Arc::clone(&peer_b_shutdown),
+        );
+
+        let (peer_c_fwd, _peer_c_rx) = mpsc::channel(routing::FORWARD_CAPACITY);
+        let (peer_c_ctl, _peer_c_ctl_rx) = mpsc::unbounded_channel();
+        let peer_c_shutdown = Arc::new(Notify::new());
+        let _reg_c = register_mesh_link(
+            &links,
+            key.clone(),
+            peer_c_fwd,
+            peer_c_ctl,
+            Arc::clone(&peer_c_shutdown),
+        );
+
+        // Fan out past peer C's capacity.
+        let mut delivered_to_b = 0;
+        for _ in 0..(routing::FORWARD_CAPACITY + 8) {
+            fan_out_to_mesh(
+                &links,
+                &key,
+                Payload {
+                    ..Default::default()
+                },
+            );
+            if peer_b_rx.try_recv().is_ok() {
+                delivered_to_b += 1;
+            }
+        }
+
+        // The healthy peer received every turn — the congested one never
+        // blocked it.
+        assert_eq!(delivered_to_b, routing::FORWARD_CAPACITY + 8);
+
+        // The congested peer's link was signaled to reset...
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer_c_shutdown.notified(),
+        )
+        .await
+        .expect("peer C's full queue must signal its link to reset");
+        // ...but peer B's link — never full — was never touched.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                peer_b_shutdown.notified(),
+            )
+            .await
+            .is_err(),
+            "a healthy sibling link must not be reset by another link's full queue",
         );
     }
 
