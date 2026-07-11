@@ -366,11 +366,15 @@ pub enum DriverError {
     /// rebuilds every stream from scratch, exactly like a broken link.
     #[error("control stream reader ended")]
     ControlStreamLost,
-    /// The game stopped draining received turns and the inbound buffer filled, so
-    /// the relay's turns have nowhere to go. The driver surfaces this instead of
-    /// blocking on the handoff — parking there would also stall its acks and
-    /// outbound turns — so the caller can tear down or resync.
-    #[error("game stopped draining received turns; inbound buffer full")]
+    /// The game stopped draining a correctness-critical driver → game channel
+    /// and its buffer filled — the inbound turn stream, or one of the reliable
+    /// deliveries whose loss would corrupt game state (a synced leave, a lobby
+    /// command, the session-start directive). The driver surfaces this instead
+    /// of blocking on the handoff — parking there would also stall its acks and
+    /// outbound turns — so the caller can tear down or resync. Best-effort
+    /// deliveries (chat, connectivity display changes) never trip this: a full
+    /// buffer just drops them.
+    #[error("game stopped draining a correctness-critical channel; its buffer is full")]
     GameStalled,
     /// The unacked window crossed [`UNACKED_WINDOW_CAP`] even after the beacon
     /// side-channel retired everything the peer confirmed it received — the
@@ -630,12 +634,15 @@ impl LinkDriver {
                     // A no-op when the connection itself is what died.
                     link.connection()
                         .close(0u32.into(), b"re-dialing after link failure");
-                    let _ = seam.connectivity.send((own_slot, false)).await;
+                    // Best-effort like every connectivity delivery: a game not
+                    // draining its display changes must not park the reconnect
+                    // loop before it even starts re-dialing.
+                    let _ = push_to_game(&seam.connectivity, (own_slot, false));
                     match reconnect_link(&mut rc, &mut link, &mut seam, &mut state, &mut backoff)
                         .await
                     {
                         Reconnected::Resumed => {
-                            let _ = seam.connectivity.send((own_slot, true)).await;
+                            let _ = push_to_game(&seam.connectivity, (own_slot, true));
                             // Loop: run the next session over the rebound link.
                         }
                         Reconnected::Terminal(error) => return Err(error),
@@ -950,12 +957,17 @@ impl LinkDriver {
                         // A relay-pushed synced leave: hand it to the game's leave
                         // tracker. This is the delivery path a drop needs — the turn
                         // stream has stalled, but the reliable control stream still
-                        // flows. Dropping it (game gone) is a clean shutdown.
-                        Some(ControlInbound::Leave(leave)) => {
-                            if leaves.send(leave).await.is_err() {
-                                return Ok(());
+                        // flows. Correctness-critical: a lost leave strands lockstep
+                        // on a slot that will never send another turn, so a game
+                        // that stopped draining these is a stall, not a skip.
+                        Some(ControlInbound::Leave(leave)) => match push_to_game(leaves, leave) {
+                            GamePush::Sent => {}
+                            GamePush::Full => {
+                                tracing::warn!("game stopped draining synced leaves");
+                                return Err(DriverError::GameStalled);
                             }
-                        }
+                            GamePush::Closed => return Ok(()),
+                        },
                         // A client only ever *sends* a leave intent up; it never
                         // receives one back (the relay is the only recipient).
                         // Ignore a stray one, mirroring how the relay edge
@@ -983,8 +995,10 @@ impl LinkDriver {
                         // with the author's slot. Hand it to the game tagged with
                         // that slot so it applies the bytes to that member's lobby
                         // turn. Replayed earlier commands and live ones arrive on
-                        // this one path, in order. Dropping it (game gone) is a
-                        // clean shutdown.
+                        // this one path, in order. Correctness-critical: a lost
+                        // setup command leaves a member's pre-game state
+                        // incomplete, so a game that stopped draining these is a
+                        // stall, not a skip.
                         Some(ControlInbound::Lobby(command)) => {
                             // A slot id past `u8` range names no real member; a
                             // truncating cast would misattribute the command. Drop
@@ -996,20 +1010,25 @@ impl LinkDriver {
                                 );
                                 continue;
                             };
-                            if lobby_in
-                                .send((SlotId(slot_id), command.payload.to_vec()))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(());
+                            match push_to_game(
+                                lobby_in,
+                                (SlotId(slot_id), command.payload.to_vec()),
+                            ) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::warn!("game stopped draining lobby commands");
+                                    return Err(DriverError::GameStalled);
+                                }
+                                GamePush::Closed => return Ok(()),
                             }
                         }
                         // An in-game chat message another member authored,
                         // relay-stamped with the author's slot — the mid-game
                         // counterpart to the lobby branch above. No replay here
                         // (chat keeps no log): every message that arrives on
-                        // this path is live. Dropping it (game gone) is a clean
-                        // shutdown.
+                        // this path is live. Best-effort: a full buffer just
+                        // drops the message — chat has no state a lost line
+                        // could corrupt, and it must never stall the turns.
                         Some(ControlInbound::Chat(chat)) => {
                             // As above: a slot id past `u8` range names no real
                             // member; drop it rather than misattribute it.
@@ -1025,30 +1044,45 @@ impl LinkDriver {
                                 target_slot: chat.target_slot,
                                 text: chat.text,
                             };
-                            if chat_in.send((SlotId(slot_id), out)).await.is_err() {
-                                return Ok(());
+                            match push_to_game(chat_in, (SlotId(slot_id), out)) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::debug!(
+                                        "dropping game-chat message; the game is not draining chat"
+                                    );
+                                }
+                                GamePush::Closed => return Ok(()),
                             }
                         }
                         // The relay-driven session-start directive: every expected
                         // slot has connected, so the game may begin. Hand it to the
                         // game thread; a repeat (a re-push on late register or an
-                        // authority handoff) is idempotent for the game. Dropping it
-                        // (game gone) is a clean shutdown.
+                        // authority handoff) is idempotent for the game.
+                        // Correctness-critical: a game waiting on a start it never
+                        // hears waits forever, so a full buffer here is a stall.
                         Some(ControlInbound::SessionStart) => {
                             // The game has started: from here a dead home relay may
                             // escalate to coordinator-mediated failover. Latched, and
                             // kept across reconnects via the persistent state.
                             *game_started = true;
-                            if session_start.send(()).await.is_err() {
-                                return Ok(());
+                            match push_to_game(session_start, ()) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::warn!(
+                                        "game stopped draining session-start directives"
+                                    );
+                                    return Err(DriverError::GameStalled);
+                                }
+                                GamePush::Closed => return Ok(()),
                             }
                         }
                         // A relay-pushed slot-connectivity change: a member's link
                         // died or (re)registered. Hand it to the game thread tagged
                         // with the slot; the game drives its "player X disconnected"
                         // display off it, independent of the synced leave. Best-
-                        // effort — an unknown slot is the game's no-op, and dropping
-                        // it (game gone) is a clean shutdown.
+                        // effort — an unknown slot is the game's no-op, and a full
+                        // buffer just drops the change (a stale display beats a
+                        // stalled session; the synced leave rides its own path).
                         Some(ControlInbound::Connectivity(change)) => {
                             // A slot id past `u8` range names no real member; a
                             // truncating cast would misattribute the change. Drop it
@@ -1060,12 +1094,14 @@ impl LinkDriver {
                                 );
                                 continue;
                             };
-                            if connectivity
-                                .send((SlotId(slot_id), change.connected))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(());
+                            match push_to_game(connectivity, (SlotId(slot_id), change.connected)) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::debug!(
+                                        "dropping connectivity change; the game is not draining them"
+                                    );
+                                }
+                                GamePush::Closed => return Ok(()),
                             }
                         }
                         Some(ControlInbound::OversizeTurn(payload)) => {
@@ -2268,6 +2304,34 @@ fn is_cert_rejection(error: &DialError) -> bool {
         || text.contains("bad_certificate")
 }
 
+/// How a non-blocking driver → game push resolved. Every driver → game delivery
+/// besides the ordered turn stream goes through [`push_to_game`]: the driver's
+/// one loop also carries turns and acks, so it must never park on an embedder
+/// channel — a retained-but-undrained receiver would stall the whole session
+/// with it. What a `Full` buffer means is the caller's policy: a
+/// correctness-critical delivery (a synced leave, a lobby command, the
+/// session-start directive) surfaces [`DriverError::GameStalled`], exactly as
+/// the turn path does, while a best-effort one (chat, a connectivity display
+/// change) is simply dropped.
+enum GamePush {
+    /// The value is in the channel's buffer.
+    Sent,
+    /// The channel's buffer is full — the game has stopped draining it (the
+    /// depths are sized generously past each channel's real traffic).
+    Full,
+    /// The game dropped its receiver: a clean stop.
+    Closed,
+}
+
+/// Offers `value` to a driver → game channel without ever awaiting.
+fn push_to_game<T>(tx: &mpsc::Sender<T>, value: T) -> GamePush {
+    match tx.try_send(value) {
+        Ok(()) => GamePush::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => GamePush::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => GamePush::Closed,
+    }
+}
+
 /// The outcome of a backoff wait between reconnect attempts.
 enum WaitOutcome {
     /// The backoff delay elapsed; time to (re)dial.
@@ -2837,6 +2901,103 @@ mod tests {
             joined.is_ok(),
             "a game teardown during the ask ends the driver cleanly: {joined:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn an_undrained_leave_channel_surfaces_a_stall_instead_of_parking() {
+        // The driver's one loop carries turns and acks; a send into a
+        // correctness-critical game channel whose receiver is retained but
+        // never drained must surface as a stall, not park the loop (and the
+        // whole session with it) on the wedged consumer.
+        use rally_point_transport::control::send_control_leave;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // Push more synced leaves than the channel holds, with the receiver
+        // (inside `chan_a`) alive but never drained.
+        let (mut ctrl_send, _our_recv) = link_b.connection().open_bi().await.unwrap();
+        for i in 0..(LEAVE_CHANNEL_CAPACITY as u32 + 4) {
+            send_control_leave(
+                &mut ctrl_send,
+                LeaveDirective {
+                    slot: i,
+                    reason: 0,
+                    apply_at_frame: 0,
+                    leave_seq: i + 1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver parked on the wedged leave consumer")
+            .unwrap();
+        assert!(
+            matches!(joined, Err(DriverError::GameStalled)),
+            "a wedged correctness-critical consumer is a stall: {joined:?}",
+        );
+        drop(chan_a);
+    }
+
+    #[tokio::test]
+    async fn undrained_best_effort_channels_drop_instead_of_stalling_turns() {
+        // Chat and connectivity are best-effort: a receiver that is retained
+        // but never drained costs only the overflowing messages — the turn
+        // stream (and the driver's acks with it) must keep flowing.
+        use rally_point_proto::messages::GameChat;
+        use rally_point_transport::control::send_control_chat;
+
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        // Hold every game-side channel half open; only `inbound` is drained.
+        let TurnChannels {
+            outbound: _outbound,
+            mut inbound,
+            result_expected: _result_expected,
+            leaves: _leaves,
+            leave_intent: _leave_intent,
+            result: _result,
+            lobby_out: _lobby_out,
+            lobby_in: _lobby_in,
+            chat_out: _chat_out,
+            chat_in: _chat_in,
+            request_drop: _request_drop,
+            session_start: _session_start,
+            connectivity: _connectivity,
+        } = chan_a;
+
+        // Flood chat far past its buffer with nothing draining it.
+        let (mut ctrl_send, _our_recv) = link_b.connection().open_bi().await.unwrap();
+        for i in 0..(CHAT_CHANNEL_CAPACITY + 50) {
+            send_control_chat(
+                &mut ctrl_send,
+                GameChat {
+                    slot: 1,
+                    target_kind: 0,
+                    target_slot: 0,
+                    text: format!("m{i}"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // A turn sent after the flood still reaches the game: the overflow was
+        // dropped, not parked on.
+        link_b.send(Some(turn(0, &[0xAB]))).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+            .await
+            .expect("turns must still flow past a wedged chat consumer")
+            .expect("the driver must still be running");
+        assert_eq!(got.commands[0], 0xAB);
+
+        drop(inbound);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     #[test]
