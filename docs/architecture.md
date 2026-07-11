@@ -521,9 +521,10 @@ oversize diverts — by a relay-wide 10s sampling tick). It **observes only**: n
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
 
-**What it never records:** raw turn/command bytes and chat. Summaries only — which, with the relay's
-standing PII rule (no user identity ever reaches a relay), keeps every blob **pseudonymous**: slot-keyed,
-content-free.
+**What it never records:** raw turn/command bytes and chat. Summaries only. User identity *does* transit
+a relay — end-of-game result reports ride the turn path as opaque tenant payloads that carry account
+ids — but the relay never parses or persists those bytes, and the recorder never captures payload bytes
+at all, so every blob stays **pseudonymous**: slot-keyed, content-free.
 
 **Flush protocol.** A recording becomes one versioned, self-describing JSON blob (header:
 tenant/session/relay identity, start/flush timestamps, overflow counts; body: events + samples) handed to
@@ -537,11 +538,12 @@ tenant-first prefix is the structural hook for tenant-scoped read authorization 
 discard. The **read path is not built**: investigating a blob today means opening the JSON; tenant-facing
 reads land with the durable store, scoped by that same path prefix.
 
-**Retention + PII — PROPOSAL (not yet ratified; Travis to confirm):** blobs are inherently pseudonymous
-(slot-keyed, no user identity, no payload bytes), so user erasure never touches flight data — the
-session↔user join lives only in the tenant's own records and happens tenant-side at read time. Retention:
-**14 days** via store lifecycle (an S3 rule when the durable store lands; the dev file sink has none —
-files sit until deleted by hand), with an optional longer pin (30–90 days) for desync-flagged sessions.
+**Retention + PII:** blobs are pseudonymous (slot-keyed, no user identity, no payload bytes — see above),
+so user erasure never touches flight data — the session↔user join lives only in the tenant's own records
+and happens tenant-side at read time. Retention: **14 days** via store lifecycle (the durable store is
+**DO Spaces** — S3-compatible, including lifecycle expiration rules; the dev file sink has none — files
+sit until deleted by hand), with an optional **30-day** pin for desync-flagged sessions, for the
+investigations that aren't immediate (a recurring desync analyzed in a batch weeks later).
 
 ### Control plane: the coordinator
 
