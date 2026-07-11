@@ -606,6 +606,16 @@ pub struct DecisionMaker {
     /// re-covering after churn never re-fires and a late-registering local slot
     /// still gets a re-push.
     started: bool,
+    /// Whether this relay has already reported its own closure for the session
+    /// (the `SessionClosed` notice the coordinator's all-relays-closed
+    /// retirement counts). The session-emptied close can be evaluated from
+    /// several places — the last local slot's link teardown, a held drop's
+    /// decision arriving over the mesh, the abandoned-session force-decide —
+    /// and whichever evaluation runs the close claims this latch, so the
+    /// others (and any later re-evaluation) don't repeat it. Cleared when a
+    /// slot link starts serving the session again: the relay is serving once
+    /// more, so its next emptying must be reported anew.
+    close_reported: bool,
     /// This relay's own id, stamped onto every `BufferDirective` this maker
     /// queues as the deterministic tie-break for two directives that land on
     /// the same `decision_seq` (see [`queue_directive`](Self::queue_directive)
@@ -1700,6 +1710,7 @@ impl DecisionMaker {
             homed_slots: HashSet::new(),
             live_slots: HashSet::new(),
             started: false,
+            close_reported: false,
             own_relay_id: None,
         }
     }
@@ -2469,7 +2480,28 @@ impl DecisionMaker {
     /// [`decide_leave`].
     pub fn force_decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
         self.note_departure(slot, None, None, None, reason);
-        self.commit_leave(slot, reason)
+        if let Some(directive) = self.commit_leave(slot, reason) {
+            return Some(directive);
+        }
+        if self.decided_leaves.contains_key(&slot) {
+            return None; // already decided or cached — the ordinary dedup
+        }
+        // No framed turn was ever observed (a pre-frame abandonment).
+        // `commit_leave` holds in that state because live survivors schedule
+        // the removal against the apply frame — but an abandoned session has no
+        // survivors left to schedule, so the frame is cosmetic (exactly as on a
+        // rehome's `seed_departed`), and leaving the departure undecided
+        // forever would strand everything keyed on its decision: the slot's
+        // drop hold, and the session-emptied close waiting on it.
+        self.next_leave_seq += 1;
+        let directive = LeaveDirective {
+            slot: u32::from(slot.0),
+            reason,
+            apply_at_frame: 0,
+            leave_seq: self.next_leave_seq,
+        };
+        self.decided_leaves.insert(slot, directive);
+        Some(directive)
     }
 
     /// The decision-and-cache step shared by [`decide_leave`] (behind the authority
@@ -2522,6 +2554,40 @@ impl DecisionMaker {
         self.departures
             .keys()
             .any(|slot| !self.decided_leaves.contains_key(slot))
+    }
+
+    /// Whether any departure still promises a reconnect on this relay: recorded,
+    /// not yet decided, of a slot this relay homes
+    /// ([`admits_slot`](Self::admits_slot)), and named in `held` — the caller's
+    /// current set of pending drop holds. All three conditions mirror the
+    /// re-register admission gate (`server.rs`): only a departed-but-held slot
+    /// is admitted back, only on its home relay, and a decided leave refuses it
+    /// terminally. So the session-emptied close waits on exactly these — a
+    /// peer-homed slot's hold (kept for authority-handoff robustness) and an
+    /// undecided departure whose hold is gone (a clean leave releases it) defer
+    /// nothing. With an empty homed set (unenforced — dev/legacy descriptors),
+    /// every slot counts, matching `admits_slot`'s permissive default: a relay
+    /// that would admit any slot's reconnect must also wait on it.
+    pub fn has_reconnectable_departure(&self, held: &HashSet<SlotId>) -> bool {
+        self.departures.keys().any(|slot| {
+            !self.decided_leaves.contains_key(slot)
+                && self.admits_slot(*slot)
+                && held.contains(slot)
+        })
+    }
+
+    /// Claims the one session-closed report for this session: `true` exactly once
+    /// until [`reopen_close_report`](Self::reopen_close_report) clears the latch.
+    /// See the `close_reported` field.
+    pub fn claim_close_report(&mut self) -> bool {
+        !std::mem::replace(&mut self.close_reported, true)
+    }
+
+    /// Clears the session-closed latch because this relay is serving the session
+    /// again — its next emptying is a new fact the coordinator must hear. See the
+    /// `close_reported` field.
+    pub fn reopen_close_report(&mut self) {
+        self.close_reported = false;
     }
 
     /// Records a slot departure without deciding a leave for it, and retires the
@@ -4157,6 +4223,43 @@ pub fn has_undecided_departure(registry: &DecisionMakers, key: &SessionKey) -> b
         .lock()
         .get(key)
         .is_some_and(DecisionMaker::has_undecided_departure)
+}
+
+/// Whether any departure still promises a reconnect on this relay (see
+/// [`DecisionMaker::has_reconnectable_departure`]) — the condition that defers
+/// the session-emptied close. `held` is the caller's current set of pending
+/// drop holds. `false` when no maker exists: with no departure records there is
+/// no reconnect promise to wait on.
+pub fn has_reconnectable_departure(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    held: &HashSet<SlotId>,
+) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.has_reconnectable_departure(held))
+}
+
+/// Claims the one session-closed report for `key` (see
+/// [`DecisionMaker::claim_close_report`]): `true` means the caller runs the close,
+/// `false` that an earlier evaluation already did. `true` when no maker exists —
+/// with nowhere to latch, every emptying reports, which is also the only close
+/// such a session (no descriptor, no decide paths) can ever reach.
+pub fn claim_close_report(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_none_or(DecisionMaker::claim_close_report)
+}
+
+/// Clears `key`'s session-closed latch because a slot link is serving the session
+/// again (see [`DecisionMaker::reopen_close_report`]). A no-op when no maker
+/// exists.
+pub fn reopen_close_report(registry: &DecisionMakers, key: &SessionKey) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.reopen_close_report();
+    }
 }
 
 /// Force-decides every undecided departure for a fully-abandoned session — one
@@ -7183,6 +7286,146 @@ mod tests {
         assert!(
             !slot_homed(&registry, &key(), SlotId(1)),
             "slot 1 is not in the homed set, so this relay refuses it",
+        );
+    }
+
+    /// A departure defers the session-emptied close only while it mirrors the
+    /// re-register admission gate: recorded, undecided, of a homed slot, and
+    /// still held. A peer-homed slot's drop (held purely for authority-handoff
+    /// robustness), an unheld departure (a clean leave released its hold), and
+    /// a decided one (a peer authority's directive here) all defer nothing.
+    #[test]
+    fn a_reconnectable_departure_requires_homed_held_and_undecided() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(0)].into_iter().collect(),
+            HashSet::new(),
+        );
+        let held_both: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
+
+        // A peer-homed slot drops: undecided session-wide and held, but its
+        // reconnect (if any) lands on its own home relay.
+        record_departure(&registry, &k, SlotId(1), None, None, None, DROPPED);
+        assert!(has_undecided_departure(&registry, &k));
+        assert!(!has_reconnectable_departure(&registry, &k, &held_both));
+
+        // This relay's own homed slot drops: while held, the close must wait —
+        // but with the hold gone (a clean leave releases it), nothing can be
+        // admitted back, so nothing waits.
+        record_departure(&registry, &k, SlotId(0), None, None, None, DROPPED);
+        assert!(has_reconnectable_departure(&registry, &k, &held_both));
+        assert!(!has_reconnectable_departure(&registry, &k, &HashSet::new()));
+
+        // The homed slot's leave is decided (a peer authority's directive): a
+        // reconnect is refused terminally now, so even a lingering hold defers
+        // nothing.
+        assert!(observe_leave(
+            &registry,
+            &k,
+            &LeaveDirective {
+                slot: 0,
+                reason: DROPPED,
+                apply_at_frame: 1,
+                leave_seq: 1,
+            },
+        ));
+        assert!(!has_reconnectable_departure(&registry, &k, &held_both));
+        assert!(
+            has_undecided_departure(&registry, &k),
+            "the peer-homed drop is still undecided session-wide",
+        );
+    }
+
+    /// With an empty homed set (unenforced — a legacy/dev descriptor), every
+    /// held undecided slot counts, matching `slot_homed`'s permissive
+    /// admission: a relay that would admit any slot's reconnect must also wait
+    /// on any slot's held drop.
+    #[test]
+    fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
+        assert!(!has_reconnectable_departure(&registry, &k, &held));
+        record_departure(&registry, &k, SlotId(3), None, None, None, DROPPED);
+        assert!(has_reconnectable_departure(&registry, &k, &held));
+    }
+
+    /// The abandoned-session force-decide commits even before any framed turn
+    /// was observed: an abandoned session has no survivors to schedule the
+    /// removal, so the apply frame is cosmetic, and holding the decision (as an
+    /// ordinary decide does pre-frame) would strand the slot's hold — and the
+    /// session close waiting on it — forever.
+    #[test]
+    fn force_decide_leave_commits_with_no_frame_basis() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+        assert_eq!(
+            maker.decide_leave(SlotId(0), DROPPED),
+            None,
+            "an ordinary decide holds without a frame basis (and as a peer)",
+        );
+        let directive = maker
+            .force_decide_leave(SlotId(0), DROPPED)
+            .expect("the force-decide commits regardless");
+        assert_eq!(directive.apply_at_frame, 0, "cosmetic pre-frame apply");
+        assert_eq!(
+            maker.force_decide_leave(SlotId(0), DROPPED),
+            None,
+            "a duplicate force-decide dedups",
+        );
+        assert!(!maker.has_undecided_departure());
+    }
+
+    /// The session-closed report latches once per emptying and reopens when the
+    /// relay serves the session again — and with no maker to latch on, every
+    /// claim succeeds (the only close such a session can reach).
+    #[test]
+    fn claim_close_report_latches_once_until_reopened() {
+        let registry = new_decision_makers();
+        let k = key();
+        assert!(claim_close_report(&registry, &k));
+        assert!(
+            claim_close_report(&registry, &k),
+            "no maker: every emptying reports",
+        );
+
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        assert!(claim_close_report(&registry, &k), "the first claim wins");
+        assert!(
+            !claim_close_report(&registry, &k),
+            "a second evaluation finds the close already reported",
+        );
+        reopen_close_report(&registry, &k);
+        assert!(
+            claim_close_report(&registry, &k),
+            "serving again reopens the latch for the next emptying",
         );
     }
 

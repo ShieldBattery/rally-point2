@@ -1980,6 +1980,151 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     assert!(!drop_holds.is_pending(&key, SlotId(0)));
 }
 
+/// The structural companion to the hold-sweep case above: the same last-slot
+/// disconnect that marks the hold also empties the local roster — and while
+/// that hold promises a reconnect, the emptying must not report `SessionClosed`
+/// (on a single-relay session the coordinator would retire the session on the
+/// spot, refusing the promised reconnect) nor drop the session's serving state
+/// (the lobby log and replay ring are what make the admitted resume whole).
+/// End to end through the real gate: the close is deferred, the reconnected
+/// client is replayed the lobby log, and the close then fires exactly once,
+/// when the client later leaves cleanly.
+#[tokio::test]
+async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_state() {
+    use rally_point_relay::consensus::{self, Authority, RelayNotice};
+    use rally_point_relay::presence::{self, Candidate};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{
+        ControlInbound, send_control_leave_intent, spawn_control_reader,
+    };
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(312);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // A single local slot over an expected {0} set, this relay the authority and
+    // first in its own presence order: slot 0 arriving is full coverage, so the
+    // session starts — the deferral applies only to a started session, whose
+    // abandoned-session timer bounds it.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let drop_holds = mesh.drop_holds.clone();
+    let lobby = mesh.lobby.clone();
+    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
+    makers.set_notice_notifier(notice_tx);
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0)].into_iter().collect(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+    presence::set_order(&mesh.presence, &key, vec![Candidate::SelfRelay]);
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the session never started", || {
+        consensus::session_started(&makers, &key)
+    })
+    .await;
+
+    // A framed turn gives the session a frame basis (a clean leave's decide
+    // schedules against it), and a lobby command goes into the replay log the
+    // reconnect below must still find.
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    // A peer-authored lobby command into the replay log (a member's own
+    // commands are skipped on its replay, so the survivable content must be
+    // authored by another slot — here injected as a mesh delivery would be).
+    rally_point_relay::lobby::deliver(
+        &lobby,
+        &key,
+        rally_point_proto::messages::LobbyCommand {
+            slot: 1,
+            payload: vec![0xAB, 0xCD].into(),
+        },
+    );
+    // Let the relay validate the turn before the blip.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The blip: a real disconnect of the relay's only local slot.
+    drop(slot0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(
+        deadline,
+        "the relay never recorded the disconnected slot's departure and hold",
+        || {
+            consensus::slot_departed(&makers, &key, SlotId(0))
+                && drop_holds.is_pending(&key, SlotId(0))
+        },
+    )
+    .await;
+
+    // The emptying ran, the hold is pending — and no close was reported.
+    while let Ok(notice) = notice_rx.try_recv() {
+        assert!(
+            !matches!(notice, RelayNotice::SessionClosed { .. }),
+            "no close may be reported while the slot's drop is held",
+        );
+    }
+
+    // Re-dial through the real gate: admitted (the hold), and the lobby log —
+    // which the emptying must not have dropped — replays to the returning member.
+    let slot0b = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut ctrl0b = spawn_control_reader(slot0b.connection().clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, ctrl0b.recv())
+            .await
+            .expect("the lobby log was not replayed to the reconnected member")
+            .expect("control stream closed early");
+        if let ControlInbound::Lobby(command) = frame {
+            assert_eq!(&command.payload[..], &[0xAB, 0xCD]);
+            assert_eq!(command.slot, 1, "the replayed command keeps its author");
+            break;
+        }
+    }
+
+    // The client leaves cleanly: the emptying now has nothing held, so the
+    // close runs — exactly once.
+    let (mut leave_send, _unused_recv) = slot0b.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut closes = 0usize;
+    loop {
+        match tokio::time::timeout_at(deadline, notice_rx.recv()).await {
+            Ok(Some(RelayNotice::SessionClosed { .. })) => {
+                closes += 1;
+                // A duplicate close would ride the same teardown, so a short
+                // quiesce window after the first is enough to catch one.
+                deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            // Quiesced: nothing more is coming within the window.
+            Err(_) => break,
+        }
+    }
+    assert_eq!(closes, 1, "the clean emptying reported exactly one close");
+}
+
 /// The mass-blip variant: every slot in a session drops together (a shared uplink
 /// hiccup), arming the abandoned-session timer -- and then one of them reconnects
 /// inside the window. The reconnect must be admitted through the real gate, the

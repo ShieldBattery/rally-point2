@@ -1880,14 +1880,7 @@ pub async fn run_mesh_link(
                             // session-wide (the last live relay reporting zero),
                             // arming the abandoned-session timer — or refilled it,
                             // cancelling it.
-                            routing::reconcile_abandon(
-                                &drop_holds,
-                                &decision_makers,
-                                &sessions,
-                                &mesh_links,
-                                &presence,
-                                &state.key,
-                            );
+                            routing::reconcile_abandon(&sessions, &mesh_for_dispatch, &state.key);
                         }
                     }
                     None => presence_alive = false,
@@ -2164,6 +2157,10 @@ fn dispatch_mesh_control(
                 return;
             }
             routing::fan_out_leave(sessions, &key, slot, leave);
+            // A peer authority deciding a slot this relay homes may have been
+            // the last undecided departure deferring this relay's
+            // session-emptied close — re-evaluate it.
+            routing::maybe_close_emptied_session(sessions, mesh, &key);
         }
         Some(mesh_control_frame::Kind::OversizeTurn(payload)) => {
             let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
@@ -2315,6 +2312,11 @@ fn dispatch_mesh_control(
                 target,
                 request.requester,
             );
+            // An honored request just decided a held drop; if it was the last
+            // undecided departure deferring this relay's session-emptied close
+            // (the requester survives on a peer relay, so the local roster can
+            // be empty here), re-evaluate the close.
+            routing::maybe_close_emptied_session(sessions, mesh, &key);
         }
         Some(mesh_control_frame::Kind::DeliveryCursors(delivery)) => {
             // A peer-homed destination's delivered-through cursors: fold each
