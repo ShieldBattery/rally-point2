@@ -461,7 +461,10 @@ mod tests {
         for _ in 0..LOBBY_RATE_BURST {
             assert!(admit(&registry, &k, SlotId(0)));
         }
-        assert!(!admit(&registry, &k, SlotId(0)), "slot 0 exhausted its burst");
+        assert!(
+            !admit(&registry, &k, SlotId(0)),
+            "slot 0 exhausted its burst"
+        );
         // A different slot has its own, untouched budget.
         assert!(admit(&registry, &k, SlotId(1)));
     }

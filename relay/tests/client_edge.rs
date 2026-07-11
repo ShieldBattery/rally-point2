@@ -768,9 +768,7 @@ async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end(
 
     match tokio::time::timeout(Duration::from_secs(5), client_connection.closed()).await {
         Ok(_reason) => {}
-        Err(_) => panic!(
-            "the client never observed the connection end after a coordinator reap"
-        ),
+        Err(_) => panic!("the client never observed the connection end after a coordinator reap"),
     }
 }
 
@@ -1705,8 +1703,8 @@ async fn an_absurd_resume_anchor_is_refused_not_applied() {
     // own read failing with the connection closed, or a successful handshake
     // followed by the closed connection on the first subsequent recv. Either
     // way, the load-bearing proof is the close code and reason below.
-    let handshake_outcome = handshake(&connection, &token, &client_key, &[(SlotId(0), u64::MAX)])
-        .await;
+    let handshake_outcome =
+        handshake(&connection, &token, &client_key, &[(SlotId(0), u64::MAX)]).await;
 
     if handshake_outcome.is_ok() {
         let mut link = Link::new(connection.clone());

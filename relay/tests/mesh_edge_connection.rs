@@ -982,9 +982,9 @@ async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
 #[tokio::test]
 async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchange()
 -> Result<(), AnyError> {
+    use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus;
     use rally_point_relay::turn_ring::TurnOrigin;
-    use rally_point_proto::control::BufferBounds;
 
     let tenant = make_tenant();
     let session = SessionId(9);
@@ -1134,8 +1134,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     let mut seen = std::collections::HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !seen.contains(&triggering_seq) && tokio::time::Instant::now() < deadline {
-        let Ok(Ok(received)) =
-            tokio::time::timeout(Duration::from_secs(2), client_b.recv()).await
+        let Ok(Ok(received)) = tokio::time::timeout(Duration::from_secs(2), client_b.recv()).await
         else {
             break;
         };
@@ -1460,8 +1459,8 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
 /// and its disconnect empties the session, whose close-time flush lands the
 /// blob at the file sink's tenant-scoped path.
 #[tokio::test]
-async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close(
-) -> Result<(), AnyError> {
+async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close()
+-> Result<(), AnyError> {
     use rally_point_relay::flight_recorder::{FileSink, FlightBlob, FlightEvent};
 
     let tenant = make_tenant();
@@ -1615,8 +1614,8 @@ async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(),
 /// destination's beacon stops while the origin keeps producing, that pair's
 /// lag grows.
 #[tokio::test]
-async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag(
-) -> Result<(), AnyError> {
+async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
+-> Result<(), AnyError> {
     use rally_point_relay::consensus;
     use std::collections::HashMap;
 

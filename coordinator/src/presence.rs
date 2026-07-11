@@ -258,9 +258,6 @@ mod tests {
 
         // A fresh beat re-stamps it: present again.
         apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), past_ttl);
-        assert_eq!(
-            fresh_now(&store, past_ttl),
-            vec![(SessionId(1), SlotId(0))],
-        );
+        assert_eq!(fresh_now(&store, past_ttl), vec![(SessionId(1), SlotId(0))],);
     }
 }

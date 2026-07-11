@@ -504,7 +504,10 @@ mod tests {
         // again, so it knows to stand down rather than act a second time.
         let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
         holds.hold(key(), SlotId(3));
-        assert!(holds.release(&key(), SlotId(3)), "the first release claims it");
+        assert!(
+            holds.release(&key(), SlotId(3)),
+            "the first release claims it"
+        );
         assert!(
             !holds.release(&key(), SlotId(3)),
             "a second release for the same slot finds nothing left to claim",
@@ -551,7 +554,10 @@ mod tests {
             called = true;
             true
         });
-        assert!(!reinstated, "no hold was pending, so there is nothing to claim");
+        assert!(
+            !reinstated,
+            "no hold was pending, so there is nothing to claim"
+        );
         assert!(
             !called,
             "reinstate must never run when there was no hold to claim it against",
@@ -593,7 +599,10 @@ mod tests {
             .filter(|&won| won)
             .count();
         assert_eq!(wins, 1, "exactly one concurrent claimant wins the hold");
-        assert!(!holds.is_pending(&key(), SlotId(3)), "the hold is gone either way");
+        assert!(
+            !holds.is_pending(&key(), SlotId(3)),
+            "the hold is gone either way"
+        );
     }
 
     #[test]

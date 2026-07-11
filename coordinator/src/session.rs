@@ -769,7 +769,9 @@ fn create_session_inner(
     if let Some(external_id) = &request.external_id {
         let key = (request.tenant.clone(), external_id.clone());
         if let Some(cached) = setup.create_idempotency.lock().get(&key).cloned()
-            && !setup.serving_relays(&request.tenant, cached.session).is_empty()
+            && !setup
+                .serving_relays(&request.tenant, cached.session)
+                .is_empty()
         {
             return Ok(cached);
         }
@@ -935,10 +937,10 @@ fn create_session_inner(
     // see the idempotency check above for why that matters. A request with
     // no `external_id` is never recorded (nothing to key a replay on).
     if let Some(external_id) = &request.external_id {
-        setup
-            .create_idempotency
-            .lock()
-            .insert((request.tenant.clone(), external_id.clone()), response.clone());
+        setup.create_idempotency.lock().insert(
+            (request.tenant.clone(), external_id.clone()),
+            response.clone(),
+        );
     }
     Ok(response)
 }
@@ -1590,7 +1592,10 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         );
-        assert_eq!(result.unwrap_err(), SessionSetupError::ExternalRefTooLong(1));
+        assert_eq!(
+            result.unwrap_err(),
+            SessionSetupError::ExternalRefTooLong(1)
+        );
     }
 
     #[test]
@@ -2140,12 +2145,17 @@ mod tests {
 
         // The rematch's own external_id is now the one an idempotent retry
         // would replay -- the entry was replaced, not just vacated.
-        let retried = create_session(&setup, SessionRequest {
-            tenant: tid(),
-            players: two_players(),
-            external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
-        }, ExpiresAt(u64::MAX)).unwrap();
+        let retried = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
         assert_eq!(retried, second);
     }
 
@@ -2829,7 +2839,12 @@ mod tests {
         let reg = registry::new_registry();
         let generation = registry::enroll(
             &reg,
-            RelayHello::new(RelayId(1), addr(14900), ProtocolVersion::CURRENT, fake_cert(1)),
+            RelayHello::new(
+                RelayId(1),
+                addr(14900),
+                ProtocolVersion::CURRENT,
+                fake_cert(1),
+            ),
         );
         let tenants = tenant::new_store();
         tenant::enroll(
@@ -2847,11 +2862,21 @@ mod tests {
         let reg = registry::new_registry();
         let g1 = registry::enroll(
             &reg,
-            RelayHello::new(RelayId(1), addr(14900), ProtocolVersion::CURRENT, fake_cert(1)),
+            RelayHello::new(
+                RelayId(1),
+                addr(14900),
+                ProtocolVersion::CURRENT,
+                fake_cert(1),
+            ),
         );
         let g2 = registry::enroll(
             &reg,
-            RelayHello::new(RelayId(2), addr(14901), ProtocolVersion::CURRENT, fake_cert(2)),
+            RelayHello::new(
+                RelayId(2),
+                addr(14901),
+                ProtocolVersion::CURRENT,
+                fake_cert(2),
+            ),
         );
         let tenants = tenant::new_store();
         tenant::enroll(
@@ -3043,7 +3068,10 @@ mod tests {
         }
 
         let created = created.lock();
-        assert!(!created.is_empty(), "some creates committed before the drain");
+        assert!(
+            !created.is_empty(),
+            "some creates committed before the drain"
+        );
         for session in created.iter() {
             assert!(
                 staged.contains(session),

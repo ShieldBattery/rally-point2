@@ -1157,7 +1157,11 @@ mod tests {
         let inverted = BufferBounds { min: 8, max: 2 };
         assert_eq!(inverted.clamp(0), 2, "swapped bounds treat 2 as the floor");
         assert_eq!(inverted.clamp(5), 5, "5 already falls within [2, 8]");
-        assert_eq!(inverted.clamp(99), 8, "swapped bounds treat 8 as the ceiling");
+        assert_eq!(
+            inverted.clamp(99),
+            8,
+            "swapped bounds treat 8 as the ceiling"
+        );
     }
 
     #[test]

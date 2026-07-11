@@ -247,9 +247,9 @@ async fn main() -> Result<()> {
                 dir.clone(),
             )));
         }
-        None => tracing::info!(
-            "no --flight-dir configured; flight recordings are discarded at flush"
-        ),
+        None => {
+            tracing::info!("no --flight-dir configured; flight recordings are discarded at flush")
+        }
     }
     tokio::spawn(rally_point_relay::flight_recorder::run_sampler(
         flight.clone(),
@@ -478,9 +478,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing a SIGTERM handler");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing a SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}

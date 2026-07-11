@@ -107,7 +107,11 @@ pub const NEVER_STARTED_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// floor would make the floor irrelevant and the reaper never fire, exactly
 /// backwards from the point of having one. Only a genuinely finite
 /// `expires_at` can push the window out past the floor.
-fn never_started_grace(expires_at: ExpiresAt, floor: Duration, expiry_margin: Duration) -> Duration {
+fn never_started_grace(
+    expires_at: ExpiresAt,
+    floor: Duration,
+    expiry_margin: Duration,
+) -> Duration {
     if expires_at.0 == u64::MAX {
         return floor;
     }
@@ -1002,7 +1006,12 @@ impl Lifecycle {
 
     /// Spawns the never-started reap timer: after `grace`, if the session is
     /// still unstarted, retire it exactly as a normal close would.
-    fn arm_never_started(&self, tenant: TenantId, session: SessionId, grace: Duration) -> AbortHandle {
+    fn arm_never_started(
+        &self,
+        tenant: TenantId,
+        session: SessionId,
+        grace: Duration,
+    ) -> AbortHandle {
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
@@ -1376,15 +1385,7 @@ mod tests {
         let gate = StdArc::new(TokioNotify::new());
         let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
         let setup = setup_with_notify(url.clone());
-        let lc = Lifecycle::with_test_tunables(
-            setup,
-            HOUR,
-            HOUR,
-            HOUR,
-            CAPACITY,
-            HOUR,
-            HOUR,
-        );
+        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, CAPACITY, HOUR, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -1483,7 +1484,15 @@ mod tests {
         let setup = setup_with_notify(url);
         // Only the never-started floor is shrunk; every other grace stays at
         // production scale so nothing else in this test fires early.
-        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT, HOUR);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            SHORT,
+            HOUR,
+        );
 
         // Session A: registered and never touched again -- no presence, no
         // accounting -- so it must reap once its grace lapses.
@@ -1539,7 +1548,15 @@ mod tests {
     async fn the_never_started_reaper_cancels_on_late_presence() {
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
-        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT, HOUR);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            SHORT,
+            HOUR,
+        );
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -2020,7 +2037,10 @@ mod tests {
             .expect("sessionClosed is delivered once the swapped-in relay closes")
             .unwrap();
         assert_eq!(got.event, "sessionClosed");
-        assert!(!lc.is_alive(&tid(), s), "a fully-closed session is not alive");
+        assert!(
+            !lc.is_alive(&tid(), s),
+            "a fully-closed session is not alive"
+        );
         assert!(
             !lc.contains_state(&tid(), s),
             "the session's lifecycle state and drain queue are reaped, not left immortal",
@@ -2155,7 +2175,10 @@ mod tests {
         )
         .unwrap();
         let s = resp.session;
-        assert_eq!(setup.serving_relays(&tid(), s), vec![RelayId(1), RelayId(2)]);
+        assert_eq!(
+            setup.serving_relays(&tid(), s),
+            vec![RelayId(1), RelayId(2)]
+        );
 
         let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
         lc.register_session(
@@ -2227,7 +2250,10 @@ mod tests {
         );
 
         lc.on_session_closed(tid(), s, RelayId(1));
-        assert!(!lc.is_alive(&tid(), s), "both original members closing finishes it");
+        assert!(
+            !lc.is_alive(&tid(), s),
+            "both original members closing finishes it"
+        );
     }
 
     #[tokio::test]

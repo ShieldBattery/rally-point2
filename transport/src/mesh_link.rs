@@ -1175,7 +1175,7 @@ mod tests {
     /// but never turns them into a `MeshLink`, so nothing is ever sent back.
     #[tokio::test]
     async fn sustained_forward_loss_grows_a_sessions_unacked_window_without_a_beacon_to_rescue_it()
-     {
+    {
         let (mut sender, receiver, _client_ep, _server_ep) = connected_mesh_links().await;
         let session = SessionId(1);
         sender.open_session(session);

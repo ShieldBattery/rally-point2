@@ -682,7 +682,10 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
     socket.send(Message::Text(draining.into())).await.unwrap();
     // Its set is empty (it serves no session), and the ack still arrives after it.
     let set = read_until_drain_ack(&mut socket).await;
-    assert!(set.is_empty(), "a relay serving nothing drains with an empty set");
+    assert!(
+        set.is_empty(),
+        "a relay serving nothing drains with an empty set"
+    );
 
     // A fresh session homes on relay 2 — relay 1 (lower id, normally the primary) is
     // draining and excluded from the pick.
@@ -753,9 +756,10 @@ async fn expect_version_refusal_close(
         frame.reason,
     );
     assert!(
-        frame
-            .reason
-            .contains(&format!("local supports {}", ProtocolVersion::MIN_SUPPORTED)),
+        frame.reason.contains(&format!(
+            "local supports {}",
+            ProtocolVersion::MIN_SUPPORTED
+        )),
         "the reason names the coordinator's window: {}",
         frame.reason,
     );
@@ -852,7 +856,10 @@ async fn a_newer_relay_with_an_overlapping_window_downgrades_and_enrolls() {
 
     // The enrolled relay is assignable: a session create succeeds and homes on it.
     let session = create_one_slot_session(&setup);
-    assert_eq!(setup.serving_relays(&TenantId(TENANT.to_owned()), session), vec![RelayId(9)]);
+    assert_eq!(
+        setup.serving_relays(&TenantId(TENANT.to_owned()), session),
+        vec![RelayId(9)]
+    );
 }
 
 #[tokio::test]

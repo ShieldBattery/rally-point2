@@ -613,7 +613,12 @@ async fn dial_and_serve(
     let (mut control_send, control_recv) = match connection.open_bi().await {
         Ok(halves) => halves,
         Err(error) => {
-            log_dial_retry(&connection, *peer_id, "mesh control stream open failed", &error);
+            log_dial_retry(
+                &connection,
+                *peer_id,
+                "mesh control stream open failed",
+                &error,
+            );
             return DialOutcome::Retry;
         }
     };
@@ -719,8 +724,12 @@ mod tests {
     /// dispatch in production); the dial side is kept alive by the caller via
     /// the returned endpoints but is never made to speak, so the accepted
     /// connection just sits there as a stalled, unauthenticated mesh peer.
-    async fn silent_mesh_connection()
-    -> (quinn::Connection, quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+    async fn silent_mesh_connection() -> (
+        quinn::Connection,
+        quinn::Connection,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
         use rally_point_transport::quic::mesh_client_config;
 
         let (chain, key, ca) = self_signed();
@@ -773,8 +782,7 @@ mod tests {
     /// once the connection ends. Proves the wiring, not just the mechanism
     /// part one already covers.
     #[tokio::test]
-    async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_handshake()
-     {
+    async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_handshake() {
         // Part one: mechanism.
         let mut held = Vec::new();
         for _ in 0..MESH_ACCEPT_CONCURRENCY {

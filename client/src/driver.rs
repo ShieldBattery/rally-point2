@@ -2462,7 +2462,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_control_stream_reader_surfaces_as_a_link_failure_while_the_connection_stays_up()
-     {
+    {
         // The bug this guards: the control stream is the only channel a synced
         // `LeaveDirective`, `SessionStart`, and `SlotConnectivity` ever arrive on.
         // If its reader task ends while the connection is otherwise healthy (a
@@ -2482,8 +2482,7 @@ mod tests {
         let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
         let _ = peer_control_send.finish();
 
-        let result =
-            LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0)).await;
+        let result = LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0)).await;
         assert!(
             matches!(result, Err(DriverError::ControlStreamLost)),
             "expected ControlStreamLost, got {result:?}",

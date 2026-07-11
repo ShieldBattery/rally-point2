@@ -1888,7 +1888,9 @@ fn announce_departure(
 ) {
     let roster_guard = (reason == LEAVE_REASON_DROPPED).then(|| sessions.lock());
     if let Some(roster) = &roster_guard
-        && roster.get(key).is_some_and(|slots| slots.contains_key(&slot))
+        && roster
+            .get(key)
+            .is_some_and(|slots| slots.contains_key(&slot))
     {
         // A reconnect already reclaimed this seat; its own post-register
         // admission (current state, not a stale snapshot) is the sole authority
@@ -3406,11 +3408,13 @@ mod tests {
         // Slot 0 re-registers: claim its hold and reinstate its departure
         // atomically, and report the roster live again — the server's
         // re-register path — then reconcile.
-        assert!(holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
-            &makers,
-            &k,
-            SlotId(0)
-        )));
+        assert!(
+            holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
+                &makers,
+                &k,
+                SlotId(0)
+            ))
+        );
         crate::presence::record_own(&presence, &k, 1);
         reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
         assert!(

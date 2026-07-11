@@ -1198,9 +1198,7 @@ mod tests {
 
     #[test]
     fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
-        use crate::delivery::{
-            DeliveryHome, E2E_LAG_CUSHION_CAP_TURNS, EXTRA_HOP_CUSHION_TURNS,
-        };
+        use crate::delivery::{DeliveryHome, E2E_LAG_CUSHION_CAP_TURNS, EXTRA_HOP_CUSHION_TURNS};
         use rally_point_proto::ids::GameFrameCount;
         use rally_point_proto::messages::{LinkConditions, SlotConditions};
 

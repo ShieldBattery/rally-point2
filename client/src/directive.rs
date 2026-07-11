@@ -316,7 +316,10 @@ mod tests {
         tracker.observe(&directive_from(8, 100, 1, Some(20)), 90);
         // A colliding copy from the losing relay, arriving after: no effect.
         tracker.observe(&directive_from(4, 100, 1, Some(10)), 91);
-        assert_eq!(tracker.take_due(100), Some(directive_from(8, 100, 1, Some(20))));
+        assert_eq!(
+            tracker.take_due(100),
+            Some(directive_from(8, 100, 1, Some(20)))
+        );
     }
 
     #[test]
@@ -327,14 +330,20 @@ mod tests {
         let mut tracker = DirectiveTracker::new();
         tracker.observe(&directive_from(8, 100, 1, Some(20)), 90);
         tracker.observe(&directive_from(4, 100, 1, None), 91);
-        assert_eq!(tracker.take_due(100), Some(directive_from(8, 100, 1, Some(20))));
+        assert_eq!(
+            tracker.take_due(100),
+            Some(directive_from(8, 100, 1, Some(20)))
+        );
 
         // And the reverse: the id-less one arrives first, the identified one
         // still displaces it.
         let mut tracker = DirectiveTracker::new();
         tracker.observe(&directive_from(4, 100, 1, None), 90);
         tracker.observe(&directive_from(8, 100, 1, Some(20)), 91);
-        assert_eq!(tracker.take_due(100), Some(directive_from(8, 100, 1, Some(20))));
+        assert_eq!(
+            tracker.take_due(100),
+            Some(directive_from(8, 100, 1, Some(20)))
+        );
     }
 
     #[test]
@@ -359,7 +368,10 @@ mod tests {
         // reject it correctly.
         let mut tracker = DirectiveTracker::new();
         tracker.observe(&directive_from(8, 100, 1, Some(20)), 90);
-        assert_eq!(tracker.take_due(100), Some(directive_from(8, 100, 1, Some(20))));
+        assert_eq!(
+            tracker.take_due(100),
+            Some(directive_from(8, 100, 1, Some(20)))
+        );
 
         // The losing relay's copy arrives late, after the winner already
         // applied. It must not resurrect a (now-past) pending change.
@@ -368,6 +380,9 @@ mod tests {
 
         // A later, genuinely higher seq still displaces normally.
         tracker.observe(&directive_from(6, 200, 2, Some(10)), 150);
-        assert_eq!(tracker.take_due(200), Some(directive_from(6, 200, 2, Some(10))));
+        assert_eq!(
+            tracker.take_due(200),
+            Some(directive_from(6, 200, 2, Some(10)))
+        );
     }
 }

@@ -272,7 +272,12 @@ impl CursorShare {
     /// cursor never emits: the beacon re-pushing an unchanged value carries no
     /// new information. A first-ever cursor for an origin is an advance even at
     /// seq 0 (delivered-through 0 is the first turn confirmed, not nothing).
-    pub fn advance(&mut self, origin: SlotId, seq: u64, now: Instant) -> Option<Vec<(SlotId, u64)>> {
+    pub fn advance(
+        &mut self,
+        origin: SlotId,
+        seq: u64,
+        now: Instant,
+    ) -> Option<Vec<(SlotId, u64)>> {
         if let Some(&current) = self.cursors.get(&origin)
             && seq <= current
         {
@@ -421,15 +426,24 @@ mod tests {
         assert_eq!(first, Some(vec![(slot(0), 1)]));
 
         // Two rapid advances inside the interval emit nothing further.
-        assert_eq!(share.advance(slot(0), 2, t0 + Duration::from_millis(50)), None);
-        assert_eq!(share.advance(slot(0), 3, t0 + Duration::from_millis(100)), None);
+        assert_eq!(
+            share.advance(slot(0), 2, t0 + Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            share.advance(slot(0), 3, t0 + Duration::from_millis(100)),
+            None
+        );
 
         // The next advance past the interval carries the complete current map.
         let later = share.advance(slot(0), 4, t0 + Duration::from_millis(300));
         assert_eq!(later, Some(vec![(slot(0), 4)]));
 
         // A non-advancing re-push emits nothing even past the interval.
-        assert_eq!(share.advance(slot(0), 4, t0 + Duration::from_secs(10)), None);
+        assert_eq!(
+            share.advance(slot(0), 4, t0 + Duration::from_secs(10)),
+            None
+        );
     }
 
     #[test]

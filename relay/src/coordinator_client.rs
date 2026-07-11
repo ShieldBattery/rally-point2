@@ -1055,12 +1055,9 @@ mod tests {
 
         // A held slot blocks the drain even with an empty applied set (e.g. a
         // post-restart session the coordinator no longer tracks).
-        let (_guard, _inbox) = crate::routing::register(
-            &sessions,
-            &key(1),
-            rally_point_proto::ids::SlotId(0),
-        )
-        .expect("slot 0 registers");
+        let (_guard, _inbox) =
+            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+                .expect("slot 0 registers");
         assert!(
             !drained_idle(&sessions, &applied),
             "a held slot blocks the drain regardless of the applied set",
@@ -1125,7 +1122,11 @@ mod tests {
 
         let (drain_tx, drain_rx) = watch::channel(false);
         let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
-        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
@@ -1182,7 +1183,11 @@ mod tests {
 
         let (_drain_tx, drain_rx) = watch::channel(false);
         let (drain_acked_tx, mut drain_acked_rx) = watch::channel(false);
-        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
@@ -1245,7 +1250,11 @@ mod tests {
         // re-asserted on every connection right after the Hello.
         let (_drain_tx, drain_rx) = watch::channel(true);
         let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
-        let control = MeshControl::new(RelayId(1), std::sync::Arc::default(), std::sync::Arc::default());
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),

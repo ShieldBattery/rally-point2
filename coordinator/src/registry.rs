@@ -129,11 +129,7 @@ pub fn mark_draining(registry: &RelayRegistry, id: RelayId, generation: u64) -> 
 /// in the registry and not draining. A draining relay reads as unavailable here
 /// even though it stays enrolled and keeps serving its existing sessions.
 pub fn is_available(registry: &RelayRegistry, id: RelayId) -> bool {
-    registry
-        .relays
-        .lock()
-        .get(&id)
-        .is_some_and(|r| !r.draining)
+    registry.relays.lock().get(&id).is_some_and(|r| !r.draining)
 }
 
 /// Whether `generation` is still the generation enrolled for `id` — i.e. the
@@ -390,7 +386,10 @@ mod tests {
         assert!(is_available(&reg, RelayId(1)));
 
         assert!(mark_draining(&reg, RelayId(1), generation));
-        assert!(!is_available(&reg, RelayId(1)), "a marked relay is unavailable");
+        assert!(
+            !is_available(&reg, RelayId(1)),
+            "a marked relay is unavailable"
+        );
         // Idempotent: re-marking under the same generation still reports applied.
         assert!(mark_draining(&reg, RelayId(1), generation));
         // Still enrolled — draining excludes only new assignments, not the entry.
@@ -468,8 +467,15 @@ mod tests {
 
         mark_draining(&reg, RelayId(1), g1);
         // available_entries drops the draining relay; all_entries keeps it.
-        let available: Vec<_> = available_entries(&reg).into_iter().map(|e| e.relay_id).collect();
+        let available: Vec<_> = available_entries(&reg)
+            .into_iter()
+            .map(|e| e.relay_id)
+            .collect();
         assert_eq!(available, vec![RelayId(2)]);
-        assert_eq!(all_entries(&reg).len(), 2, "the draining relay stays enrolled");
+        assert_eq!(
+            all_entries(&reg).len(),
+            2,
+            "the draining relay stays enrolled"
+        );
     }
 }

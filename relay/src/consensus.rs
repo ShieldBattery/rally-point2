@@ -4965,8 +4965,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        let _ = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 10)
-            .expect("a raise fires");
+        let _ = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 10).expect("a raise fires");
         assert_eq!(
             maker.active_directive().unwrap().authority_relay_id,
             None,
@@ -7173,8 +7172,14 @@ mod tests {
             [SlotId(0), SlotId(2)].into_iter().collect(),
             HashSet::new(),
         );
-        assert!(slot_homed(&registry, &key(), SlotId(0)), "slot 0 is homed here");
-        assert!(slot_homed(&registry, &key(), SlotId(2)), "slot 2 is homed here");
+        assert!(
+            slot_homed(&registry, &key(), SlotId(0)),
+            "slot 0 is homed here"
+        );
+        assert!(
+            slot_homed(&registry, &key(), SlotId(2)),
+            "slot 2 is homed here"
+        );
         assert!(
             !slot_homed(&registry, &key(), SlotId(1)),
             "slot 1 is not in the homed set, so this relay refuses it",
@@ -7304,12 +7309,14 @@ mod tests {
         // 300 truncates to 44 (300 % 256) under a bare `as u8` cast -- if slot 44
         // ever exists, that would alias this malformed sample onto it. Neither
         // slot 44 nor slot 300 should end up tracked.
-        batch.slots.push(rally_point_proto::messages::SlotConditions {
-            slot: 300,
-            rtt_us: 999_999,
-            lost_packets: 0,
-            sent_packets: 1,
-        });
+        batch
+            .slots
+            .push(rally_point_proto::messages::SlotConditions {
+                slot: 300,
+                rtt_us: 999_999,
+                lost_packets: 0,
+                sent_packets: 1,
+            });
 
         let _ = maker.ingest_local(&batch);
 
@@ -8528,7 +8535,10 @@ mod tests {
         );
 
         std::thread::sleep(interval + std::time::Duration::from_millis(50));
-        assert!(bucket.try_take(), "one interval refilled at least one token");
+        assert!(
+            bucket.try_take(),
+            "one interval refilled at least one token"
+        );
     }
 
     #[test]

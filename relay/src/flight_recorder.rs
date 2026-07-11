@@ -658,7 +658,10 @@ impl FlightRecorder {
         if keys.is_empty() {
             return;
         }
-        tracing::info!(sessions = keys.len(), "flushing flight recordings for drain");
+        tracing::info!(
+            sessions = keys.len(),
+            "flushing flight recordings for drain"
+        );
         let completed = AtomicU64::new(0);
         let flushes = keys.iter().map(|key| {
             let completed = &completed;

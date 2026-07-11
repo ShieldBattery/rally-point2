@@ -698,10 +698,12 @@ pub(crate) fn fan_out_delivery_cursors(
                     dest_slot: u32::from(dest.0),
                     cursors: cursors
                         .iter()
-                        .map(|&(origin, seq)| rally_point_proto::messages::DeliveryCursor {
-                            origin_slot: u32::from(origin.0),
-                            delivered_seq: seq,
-                        })
+                        .map(
+                            |&(origin, seq)| rally_point_proto::messages::DeliveryCursor {
+                                origin_slot: u32::from(origin.0),
+                                delivered_seq: seq,
+                            },
+                        )
                         .collect(),
                 },
             )),
@@ -724,10 +726,12 @@ fn resume_cursors_frame(
             rally_point_proto::messages::MeshResumeCursors {
                 cursors: cursors
                     .into_iter()
-                    .map(|(slot, next_seq)| rally_point_proto::messages::MeshResumeCursor {
-                        origin_slot: u32::from(slot.0),
-                        next_seq,
-                    })
+                    .map(
+                        |(slot, next_seq)| rally_point_proto::messages::MeshResumeCursor {
+                            origin_slot: u32::from(slot.0),
+                            next_seq,
+                        },
+                    )
                     .collect(),
                 resuming,
             },
@@ -747,12 +751,12 @@ fn ack_cursors_frame(session: SessionId, cursors: Vec<(SlotId, u64)>) -> MeshCon
             rally_point_proto::messages::MeshAckCursors {
                 cursors: cursors
                     .into_iter()
-                    .map(|(slot, delivered_through)| {
-                        rally_point_proto::messages::MeshAckCursor {
+                    .map(
+                        |(slot, delivered_through)| rally_point_proto::messages::MeshAckCursor {
                             slot: u32::from(slot.0),
                             delivered_through,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
             },
         )),
@@ -1267,7 +1271,11 @@ fn resume_replay_for_frame(
     let cursors: HashMap<SlotId, u64> = resume
         .cursors
         .iter()
-        .filter_map(|c| u8::try_from(c.origin_slot).ok().map(|s| (SlotId(s), c.next_seq)))
+        .filter_map(|c| {
+            u8::try_from(c.origin_slot)
+                .ok()
+                .map(|s| (SlotId(s), c.next_seq))
+        })
         .collect();
     let payloads = mesh.turn_ring.replay_local(&key, &cursors, resume.resuming);
     (!payloads.is_empty()).then_some((key, payloads))
@@ -1315,12 +1323,11 @@ async fn send_turn_over_link(
             session: session_id.0,
             kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
         };
-        if let Err(error) =
-            rally_point_transport::mesh_control_stream::send_mesh_control_frame(
-                control_send,
-                &frame,
-            )
-            .await
+        if let Err(error) = rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+            control_send,
+            &frame,
+        )
+        .await
         {
             tracing::info!(%error, context, "mesh control send failed; closing link");
             return false;
@@ -3168,7 +3175,10 @@ mod tests {
         let frame = control_rx.try_recv().expect("a frame was sent");
         match frame.kind {
             Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
-                assert!(resume.cursors.is_empty(), "no slot formed a contiguous prefix");
+                assert!(
+                    resume.cursors.is_empty(),
+                    "no slot formed a contiguous prefix"
+                );
                 assert!(
                     resume.resuming,
                     "the gap does not erase the session's forward-gate history",
@@ -3805,7 +3815,11 @@ mod tests {
             kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
         };
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
-        assert_eq!(inbox.try_recv_leave(), None, "no re-forward of a redundant copy");
+        assert_eq!(
+            inbox.try_recv_leave(),
+            None,
+            "no re-forward of a redundant copy"
+        );
     }
 
     /// A `SlotConnectivity{connected: true}` arriving over the mesh is a slot coming
@@ -4227,7 +4241,8 @@ mod tests {
         let links = new_mesh_links();
         let (fwd, _fwd_rx) = mpsc::channel(8);
         let (ctl, _ctl_rx) = mpsc::unbounded_channel();
-        let registration = register_mesh_link(&links, key.clone(), fwd, ctl, Arc::new(Notify::new()));
+        let registration =
+            register_mesh_link(&links, key.clone(), fwd, ctl, Arc::new(Notify::new()));
         SessionState {
             key,
             flush_deadline: tokio::time::Instant::now(),
