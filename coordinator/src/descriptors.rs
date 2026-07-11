@@ -285,6 +285,7 @@ mod tests {
             slot_refs: vec![],
             observer_slots: vec![],
             expected_slots: vec![],
+            homed_slots: vec![],
             resumed: false,
             departed_slots: vec![],
         }

@@ -35,6 +35,21 @@ const SLOT_TAKEN_CLOSE: u32 = 0x02;
 /// connection (a genuine double-connect), not gone.
 pub const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 
+/// QUIC application close code for a connection the relay refuses because its
+/// authorized slot is not among the session descriptor's [`homed_slots`]
+/// (non-empty) for this relay. A token binds tenant/session/slot/key but not
+/// the specific relay, so this is the home-relay-binding gate: without it, a
+/// misrouted (or malicious) client presenting a token for a slot homed on a
+/// *different* relay in a true multi-relay session could register here too,
+/// feeding this relay's clients a competing view of that slot's turns —
+/// exactly the split the mesh's topological dedup cannot detect or prevent
+/// (it only suppresses the echo, on each side, of what looks like a duplicate
+/// turn). Distinct from every other close so a misrouted client is
+/// diagnosable rather than looking like a generic double-connect or refusal.
+///
+/// [`homed_slots`]: rally_point_proto::control::SessionDescriptor::homed_slots
+pub const SLOT_NOT_HOMED_CLOSE: u32 = 0x08;
+
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
 /// state no matter how fast they arrive, so an unauthenticated flood can't grow
@@ -76,6 +91,15 @@ enum ConnError {
     /// re-register is refused terminally.
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} already departed the game")]
     SlotDeparted {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// The authorized slot is not among the session descriptor's homed set for
+    /// this relay — a misrouted client (or a token replayed against the wrong
+    /// relay in a multi-relay session).
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} is not homed on this relay")]
+    SlotNotHomed {
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
@@ -240,6 +264,33 @@ async fn serve_connection(
         tenant: authorized.tenant.clone(),
         session: authorized.session,
     };
+
+    // Home-relay binding gate: refuse a client whose authorized slot the
+    // coordinator did not assign to this relay. A token binds
+    // tenant/session/slot/key but not the relay itself, so without this a
+    // misrouted (or malicious) client could register the same slot on two
+    // relays in a true multi-relay session, feeding each a different turn at
+    // the same (slot, seq) -- a split the mesh's topological dedup only
+    // suppresses the symptom of, on each side, never detects or prevents.
+    //
+    // `slot_homed` admits (`true`) when no descriptor has arrived yet for
+    // this session, or one arrived with an empty homed set (legacy, dev-mode,
+    // a coordinator that predates the field) -- so this preserves today's
+    // descriptor-arrival-race behavior exactly: a client dialing before any
+    // descriptor exists for its session is admitted unconditionally, with no
+    // new wait or window introduced here. Enforcement only ever refuses once
+    // a non-empty homed set says this slot belongs to a different relay.
+    if !consensus::slot_homed(&mesh.decision_makers, &key, authorized.slot) {
+        connection.close(
+            VarInt::from_u32(SLOT_NOT_HOMED_CLOSE),
+            b"slot not homed on this relay",
+        );
+        return Err(ConnError::SlotNotHomed {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    }
 
     // Cheap pre-register fast-fail against the slot's departure state, before
     // touching the roster at all: a departure recorded with no hold pending means

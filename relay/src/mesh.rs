@@ -2520,6 +2520,7 @@ mod tests {
             crate::consensus::Authority::SelfRelay,
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         // The authority decided one slot's leave (caches a directive and records a
         // departure), and separately recorded a bare departure for another slot.
@@ -2580,6 +2581,7 @@ mod tests {
             &key,
             BufferBounds::new(0, 20).unwrap(),
             crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
@@ -2911,6 +2913,7 @@ mod tests {
             crate::consensus::Authority::SelfRelay,
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         // The target slot dropped: a frame basis for its leave, a recorded departure,
         // and a hold this relay marked. `test_mesh_state` uses a zero unlock floor,
@@ -2987,6 +2990,7 @@ mod tests {
             &key,
             BufferBounds::new(0, 20).unwrap(),
             crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
@@ -3066,6 +3070,7 @@ mod tests {
             &key,
             BufferBounds::new(1, 6).unwrap(),
             Authority::SelfRelay,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );

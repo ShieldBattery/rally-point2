@@ -419,6 +419,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         slot_refs: vec![],
         observer_slots: vec![],
         expected_slots: vec![],
+        homed_slots: vec![],
         resumed: false,
         departed_slots: vec![],
     });
@@ -437,6 +438,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         slot_refs: vec![],
         observer_slots: vec![],
         expected_slots: vec![],
+        homed_slots: vec![],
         resumed: false,
         departed_slots: vec![],
     });
@@ -546,6 +548,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         slot_refs: vec![],
         observer_slots: vec![],
         expected_slots: vec![],
+        homed_slots: vec![],
         resumed: false,
         departed_slots: vec![],
     };
@@ -1480,6 +1483,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag(
         slot_refs: vec![],
         observer_slots: vec![],
         expected_slots: vec![],
+        homed_slots: vec![],
         resumed: false,
         departed_slots: vec![],
     };

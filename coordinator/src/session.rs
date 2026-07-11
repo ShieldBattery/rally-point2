@@ -80,6 +80,18 @@ pub struct SessionRefs {
     /// session-start directive. Recorded here, alongside the other correlation
     /// state, so it survives the same restart/persistence paths.
     pub expected: Vec<SlotId>,
+    /// Every slot's assigned home relay — the per-relay-per-slot data
+    /// [`SessionDescriptor::homed_slots`] is filtered from
+    /// ([`build_descriptor`] keeps only the entries matching the relay a
+    /// descriptor is being built for). A `BTreeMap`, not a `HashMap`, so the
+    /// filtered `homed_slots` a descriptor carries is in a deterministic
+    /// (ascending slot) order rather than hash order — descriptors are
+    /// compared in tests, and a relay's admission check reads the set
+    /// unordered anyway, but nothing is served by leaving the order to chance.
+    /// [`rehome`] reassigns the dead relay's entries onto the replacement
+    /// before rebuilding descriptors, so this always reflects current
+    /// membership, not just the session's original assignment.
+    pub homes: std::collections::BTreeMap<SlotId, RelayId>,
 }
 
 use std::sync::Arc;
@@ -512,6 +524,27 @@ fn rehome_inner(
     // latest-wins current state, and a session it left must not remain in its set.
     setup.descriptors.remove(dead_relay, tenant, session);
 
+    // Move every slot's home-relay assignment from the dead relay onto R_new,
+    // so the rebuilt descriptors below bind those slots to their new home
+    // instead of a relay that no longer serves them — otherwise R_new's
+    // descriptor would omit them from `homed_slots` and the client's own
+    // reconnect to R_new would be refused as misrouted. A separate lock
+    // acquisition from the `session_relays` mutation above, following
+    // `take_session_membership`'s established precedent (see its doc): only
+    // `session_relays` needs to be atomic with a racing close's
+    // re-validation, and that already passed by this point, so a close
+    // landing exactly here would simply retire this whole `session_refs`
+    // entry afterward regardless of what this leaves in `homes`. Must still
+    // run before the descriptor-rebuild loop below, which is what this
+    // position guarantees.
+    if let Some(refs) = setup.session_refs.lock().get_mut(&key) {
+        for home_relay in refs.homes.values_mut() {
+            if *home_relay == dead_relay {
+                *home_relay = r_new;
+            }
+        }
+    }
+
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
     // seeding the departed slots, and push each. Record R_new's first so it is
     // staged for its control connection before this returns, shrinking the
@@ -691,6 +724,21 @@ fn create_session_inner(
             .map(|p| p.slot)
             .collect(),
         expected: request.players.iter().map(|p| p.slot).collect(),
+        // Every slot not listed in `slot_homes` (computed above) homes on the
+        // primary; reusing that already-computed set here — rather than
+        // re-deriving "is this slot in `dev_relay_split` and is there a
+        // secondary" — keeps the two in lockstep by construction.
+        homes: request
+            .players
+            .iter()
+            .map(|p| {
+                let relay_id = slot_homes
+                    .iter()
+                    .find(|split| split.slot == p.slot)
+                    .map_or(home.relay_id, |split| split.relay.relay_id);
+                (p.slot, relay_id)
+            })
+            .collect(),
     };
     setup
         .session_refs
@@ -822,6 +870,16 @@ pub fn build_descriptor(
             .collect(),
         observer_slots: refs.observers,
         expected_slots: refs.expected,
+        // Only the slots homed on THIS relay — `refs.homes` covers every slot
+        // in the session, so filter to this descriptor's `relay_id`. Iterating
+        // a `BTreeMap` yields ascending slot order, so this is deterministic
+        // without an explicit sort.
+        homed_slots: refs
+            .homes
+            .into_iter()
+            .filter(|&(_, home_relay)| home_relay == relay_id)
+            .map(|(slot, _)| slot)
+            .collect(),
         resumed,
         departed_slots,
     })
@@ -1308,6 +1366,13 @@ mod tests {
         // or the presence-driven handoff would crown different authorities.
         assert_eq!(desc.authority_order, vec![RelayId(1), RelayId(2)]);
         assert_eq!(desc2.authority_order, desc.authority_order);
+
+        // The home-relay-binding gate (finding A1): each relay's descriptor
+        // names only the slots the coordinator actually assigned to it, not
+        // the whole session's slot set. Slot 0 stayed on the primary (relay
+        // 1); slot 1 split onto the secondary (relay 2).
+        assert_eq!(desc.homed_slots, vec![SlotId(0)]);
+        assert_eq!(desc2.homed_slots, vec![SlotId(1)]);
     }
 
     #[test]
@@ -1683,6 +1748,11 @@ mod tests {
             "the seeded departure rides it"
         );
         assert_eq!(staged[0].authority_order, vec![RelayId(2)]);
+        assert_eq!(
+            staged[0].homed_slots,
+            vec![SlotId(0), SlotId(1)],
+            "both slots homed on the dead relay move onto R_new's descriptor",
+        );
     }
 
     #[test]
@@ -1727,6 +1797,19 @@ mod tests {
             endpoint.relay_id,
             RelayId(2),
             "a live relay already serving the session is preferred over an idle one",
+        );
+
+        // Relay 2's rebuilt descriptor gains slot 0 (moved off the dead relay
+        // 1) in addition to its own original slot 1 -- the home-relay-binding
+        // gate (finding A1) must follow a rehome, not just a session's
+        // original assignment, or R_new would refuse the very slot it was
+        // just handed.
+        let staged = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].homed_slots,
+            vec![SlotId(0), SlotId(1)],
+            "the moved slot (0) and R_new's original slot (1) are both homed there now",
         );
     }
 

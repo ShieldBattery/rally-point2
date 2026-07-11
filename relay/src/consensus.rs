@@ -583,6 +583,17 @@ pub struct DecisionMaker {
     /// never fires one. Descriptor-driven, so it survives authority changes
     /// (like `observers`).
     expected_slots: HashSet<SlotId>,
+    /// The slots the coordinator assigned to home on THIS relay (from the
+    /// session descriptor). Empty means unenforced — a standalone relay, a
+    /// dev-injected descriptor, or a coordinator that predates the field —
+    /// exactly like `expected_slots` empty disables the start directive. Read
+    /// by [`slot_homed`] at client admission, in `server.rs`, to refuse a
+    /// token authorized for a slot this relay does not home: a token binds
+    /// tenant/session/slot/key but not the relay, so without this check the
+    /// same slot could register on two relays in a true multi-relay session.
+    /// Descriptor-driven, so it survives authority changes (like
+    /// `expected_slots`).
+    homed_slots: HashSet<SlotId>,
     /// The slots this relay has seen registered anywhere in the session: its own
     /// registered slots plus the ones peer relays reported via `SlotPresent`.
     /// Every relay accumulates it (not just the authority) so a relay promoted
@@ -1622,6 +1633,7 @@ impl DecisionMaker {
             results: HashMap::new(),
             sync: SyncTracker::default(),
             expected_slots: HashSet::new(),
+            homed_slots: HashSet::new(),
             live_slots: HashSet::new(),
             started: false,
         }
@@ -2839,6 +2851,23 @@ impl DecisionMaker {
         self.expected_slots = expected;
     }
 
+    /// Replaces the session's homed-slot set from the coordinator descriptor —
+    /// the slots the coordinator assigned to THIS relay. Descriptor-driven like
+    /// [`set_expected_slots`](Self::set_expected_slots): the first descriptor
+    /// seeds it, a later one (e.g. a rehome) replaces it wholesale, so a slot
+    /// moved off this relay stops being admissible here and one moved onto it
+    /// starts being admissible, with no accumulation across descriptors.
+    pub fn set_homed_slots(&mut self, homed: HashSet<SlotId>) {
+        self.homed_slots = homed;
+    }
+
+    /// Whether `slot` is admissible on this relay: the homed set is empty
+    /// (unenforced — see the field's doc) or contains `slot`. Read by
+    /// [`slot_homed`] at client admission.
+    fn admits_slot(&self, slot: SlotId) -> bool {
+        self.homed_slots.is_empty() || self.homed_slots.contains(&slot)
+    }
+
     /// Records that `slot` is present — registered on some relay serving the
     /// session (this relay's own roster, or a peer's `SlotPresent`) — and returns
     /// whether the session-start directive should now be emitted session-wide.
@@ -3357,7 +3386,8 @@ fn now_ms() -> u64 {
 /// by this descriptor starts with that set (so its observer slots are excluded
 /// from the desync comparator from the first turn — a single-relay session that
 /// only ever receives one push therefore never loses them), and an existing
-/// maker has its set replaced to follow a changed descriptor.
+/// maker has its set replaced to follow a changed descriptor. `homed_slots` is
+/// applied the same way — see [`DecisionMaker::set_homed_slots`].
 ///
 /// A promotion can *freshly derive* a leave for a departure no relay ever
 /// cached before (the directive never escaped the dead authority) -- that is
@@ -3373,6 +3403,7 @@ pub fn sync_maker(
     authority: Authority,
     observers: HashSet<SlotId>,
     expected_slots: HashSet<SlotId>,
+    homed_slots: HashSet<SlotId>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let (leaves, fresh) = {
@@ -3382,6 +3413,7 @@ pub fn sync_maker(
                 let maker = existing.get_mut();
                 maker.set_observers(observers);
                 maker.set_expected_slots(expected_slots);
+                maker.set_homed_slots(homed_slots);
                 maker.sync(bounds, authority)
             }
             Entry::Vacant(vacant) => {
@@ -3392,11 +3424,13 @@ pub fn sync_maker(
                     authority,
                     observers,
                 ));
-                // Seed the expected-slot set as part of creation — a maker created
-                // by this descriptor starts with it, so a single-relay session (one
-                // push, before any client dials) never loses it, exactly as the
-                // observer set is seeded above.
+                // Seed the expected-slot and homed-slot sets as part of
+                // creation — a maker created by this descriptor starts with
+                // them, so a single-relay session (one push, before any
+                // client dials) never loses them, exactly as the observer set
+                // is seeded above.
                 maker.set_expected_slots(expected_slots);
+                maker.set_homed_slots(homed_slots);
                 (Vec::new(), Vec::new())
             }
         }
@@ -3664,6 +3698,26 @@ pub fn is_authority(registry: &DecisionMakers, key: &SessionKey) -> bool {
         .lock()
         .get(key)
         .is_some_and(DecisionMaker::is_authority)
+}
+
+/// Whether `slot` is admissible on this relay per `key`'s session descriptor
+/// (see [`DecisionMaker::admits_slot`]) — read at client admission (`server.rs`)
+/// to refuse a token authorized for a slot the coordinator did not assign here.
+///
+/// `true` (admit) when no maker exists for the session: this is the same
+/// permissive default `slot_departed`/`is_authority` use for a session this
+/// relay knows nothing about yet, and it is what preserves today's
+/// descriptor-arrival-race behavior — a client dialing before the relay has
+/// received any descriptor for the session must be admitted exactly as before
+/// this check existed, not stalled or refused waiting for one. Enforcement
+/// only engages once a maker exists AND its homed set is non-empty (see the
+/// field's doc on [`DecisionMaker`]); a legacy/dev descriptor (or one that
+/// never arrived) leaves it permissive.
+pub fn slot_homed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_none_or(|maker| maker.admits_slot(slot))
 }
 
 /// Whether a departure has been recorded for `slot` in `key`'s decision-maker (see
@@ -5080,6 +5134,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         {
             let makers = registry.lock();
@@ -5097,6 +5152,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -5122,6 +5178,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         {
             let mut makers = registry.lock();
@@ -5137,6 +5194,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         assert_eq!(
             active_directive(&registry, &k),
@@ -5162,6 +5220,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
@@ -5200,6 +5259,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5241,6 +5301,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5281,6 +5342,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -5312,6 +5374,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         record_departure(
@@ -5363,6 +5426,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -5397,6 +5461,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -5427,6 +5492,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -5466,6 +5532,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         registry.set_session_refs(
             &k,
@@ -5506,6 +5573,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -5542,6 +5610,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5589,6 +5658,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5633,6 +5703,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5658,6 +5729,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5692,6 +5764,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5738,6 +5811,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5786,6 +5860,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5815,6 +5890,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
@@ -5902,6 +5978,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -5932,6 +6009,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -6721,6 +6799,99 @@ mod tests {
         assert_eq!(fresh, leaves, "re-derived on promotion — a fresh insert");
     }
 
+    // -- Home-relay binding (finding A1: `slot_homed` gates client admission) --
+
+    /// No maker exists yet for the session — the descriptor-arrival race: a
+    /// client can dial before this relay has received any descriptor. Must
+    /// admit, exactly like `slot_departed`/`is_authority`'s "no maker" default,
+    /// so this check introduces no new wait or refusal window.
+    #[test]
+    fn slot_homed_admits_when_no_maker_exists() {
+        let registry = new_decision_makers();
+        assert!(slot_homed(&registry, &key(), SlotId(0)));
+    }
+
+    /// A maker exists but its homed set is empty — a legacy/dev descriptor, or
+    /// one that never carried the field. Empty means unenforced, so every slot
+    /// is admitted regardless.
+    #[test]
+    fn slot_homed_admits_every_slot_when_the_homed_set_is_empty() {
+        let registry = new_decision_makers();
+        let _ = sync_maker(
+            &registry,
+            &key(),
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(), // empty homed_slots: unenforced
+        );
+        assert!(slot_homed(&registry, &key(), SlotId(0)));
+        assert!(slot_homed(&registry, &key(), SlotId(7)));
+    }
+
+    /// A non-empty homed set admits only the slots it names and refuses every
+    /// other — the actual enforcement a production multi-relay descriptor
+    /// turns on.
+    #[test]
+    fn slot_homed_refuses_a_slot_absent_from_a_non_empty_homed_set() {
+        let registry = new_decision_makers();
+        let _ = sync_maker(
+            &registry,
+            &key(),
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(0), SlotId(2)].into_iter().collect(),
+        );
+        assert!(slot_homed(&registry, &key(), SlotId(0)), "slot 0 is homed here");
+        assert!(slot_homed(&registry, &key(), SlotId(2)), "slot 2 is homed here");
+        assert!(
+            !slot_homed(&registry, &key(), SlotId(1)),
+            "slot 1 is not in the homed set, so this relay refuses it",
+        );
+    }
+
+    /// A rehome (or any later descriptor) replaces the homed set wholesale --
+    /// a slot moved off this relay stops being admissible, and one moved onto
+    /// it starts being admissible, with no accumulation across pushes.
+    #[test]
+    fn slot_homed_follows_a_later_descriptors_reassignment() {
+        let registry = new_decision_makers();
+        let _ = sync_maker(
+            &registry,
+            &key(),
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(0)].into_iter().collect(),
+        );
+        assert!(slot_homed(&registry, &key(), SlotId(0)));
+        assert!(!slot_homed(&registry, &key(), SlotId(1)));
+
+        // A later push (e.g. a rehome) moves slot 1 onto this relay and slot 0
+        // off it.
+        let _ = sync_maker(
+            &registry,
+            &key(),
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(1)].into_iter().collect(),
+        );
+        assert!(
+            !slot_homed(&registry, &key(), SlotId(0)),
+            "slot 0 moved off this relay",
+        );
+        assert!(
+            slot_homed(&registry, &key(), SlotId(1)),
+            "slot 1 moved onto this relay",
+        );
+    }
+
     // -- Departed-slot lifecycle (slot leaves the live roster, never resurrects) --
 
     /// A departure retires the slot from the live roster on every relay, so the
@@ -7056,6 +7227,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::from([SlotId(2)]),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -7103,6 +7275,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             expected,
+            HashSet::new(),
         );
 
         // No directive until the last expected slot completes the set.
@@ -7138,6 +7311,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -7159,6 +7333,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             expected,
+            HashSet::new(),
         );
 
         // Both expected slots register, but a peer relay never fires.
@@ -7188,6 +7363,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             expected,
+            HashSet::new(),
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         // Slot 0 departs, retiring it from the live-slot set.
@@ -7212,6 +7388,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             expected,
+            HashSet::new(),
         );
         assert!(!session_started(&registry, &k));
         mark_session_started(&registry, &k);
@@ -7780,6 +7957,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
         );
         registry.set_session_refs(
             &k,

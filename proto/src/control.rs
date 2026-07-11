@@ -628,6 +628,26 @@ pub struct SessionDescriptor {
     /// exactly like `observer_slots`. Defaults empty for backward compatibility.
     #[serde(default)]
     pub expected_slots: Vec<SlotId>,
+    /// The slots the coordinator has assigned to home on **this** relay. A
+    /// relay refuses a client's admission for a slot authorized in its token
+    /// but absent from this set — a token binds tenant/session/slot/key but not
+    /// the relay, so without this a misrouted (or malicious) client could
+    /// register the same slot on two relays serving a true multi-relay
+    /// session, feeding each a different turn at the same `(slot, seq)`; the
+    /// mesh's topological dedup would then suppress each side's view of the
+    /// other, silently diverging the two relays' client populations.
+    ///
+    /// **Empty means unenforced** — not "no slot may register here." This is
+    /// the legacy/dev default: a coordinator that predates this field, and any
+    /// dev harness that injects a descriptor by hand (most of this codebase's
+    /// tests), decodes/constructs an empty set, and admission proceeds exactly
+    /// as before the field existed. Enforcement activates only once the
+    /// coordinator populates a genuinely non-empty set for a session — which a
+    /// production multi-relay descriptor always does (every player slot is
+    /// assigned a home relay by construction), so real cross-relay traffic is
+    /// covered without disturbing single-relay or dev-injected sessions.
+    #[serde(default)]
+    pub homed_slots: Vec<SlotId>,
     /// Whether this descriptor re-homes an **already-running** session onto the
     /// relay (coordinator-mediated failover). A relay that receives a `resumed`
     /// descriptor treats the session as already started: it seeds the started
@@ -1246,6 +1266,7 @@ mod tests {
                 slot_refs: vec![],
                 observer_slots: vec![],
                 expected_slots: vec![],
+                homed_slots: vec![],
                 resumed: false,
                 departed_slots: vec![],
             }],
@@ -1455,6 +1476,7 @@ mod tests {
             }],
             observer_slots: vec![SlotId(1)],
             expected_slots: vec![SlotId(0), SlotId(1)],
+            homed_slots: vec![SlotId(0)],
             resumed: true,
             departed_slots: vec![DepartedSlot {
                 slot: SlotId(2),
@@ -1529,6 +1551,7 @@ mod tests {
             slot_refs: vec![],
             observer_slots: vec![],
             expected_slots: vec![],
+            homed_slots: vec![],
             resumed: false,
             departed_slots: vec![],
         };
@@ -1537,6 +1560,7 @@ mod tests {
         assert!(json.contains("\"slot_refs\":[]"));
         assert!(json.contains("\"observer_slots\":[]"));
         assert!(json.contains("\"expected_slots\":[]"));
+        assert!(json.contains("\"homed_slots\":[]"));
     }
 
     #[test]
@@ -1573,6 +1597,26 @@ mod tests {
             "a descriptor that predates the expected-slots field decodes to no \
              expected_slots, not a decode error — the start directive is simply off",
         );
+        assert!(
+            back.homed_slots.is_empty(),
+            "a descriptor that predates the homed-slots field decodes to no \
+             homed_slots, not a decode error — home-relay binding is simply unenforced",
+        );
+    }
+
+    #[test]
+    fn session_descriptor_with_homed_slots_decodes_the_set() {
+        // A descriptor from a coordinator that carries the homed-slot set: the
+        // slots assigned to this relay decode back verbatim, so the relay's
+        // admission check can enforce against it.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6},
+            "homed_slots":[0,2]
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(back.homed_slots, vec![SlotId(0), SlotId(2)]);
     }
 
     #[test]

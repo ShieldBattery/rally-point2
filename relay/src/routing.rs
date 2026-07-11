@@ -2516,6 +2516,7 @@ mod tests {
             Authority::Peer,
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         // A local client to fan out to.
@@ -2665,6 +2666,7 @@ mod tests {
             key,
             BufferBounds::new(0, 20).unwrap(),
             Authority::SelfRelay,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
@@ -3042,6 +3044,7 @@ mod tests {
             Authority::SelfRelay,
             std::collections::HashSet::new(),
             [SlotId(0), SlotId(1)].into_iter().collect(),
+            std::collections::HashSet::new(),
         );
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
         consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
@@ -3197,6 +3200,7 @@ mod tests {
             Authority::SelfRelay,
             std::collections::HashSet::new(),
             [SlotId(0), SlotId(1)].into_iter().collect(),
+            std::collections::HashSet::new(),
         );
         consensus::mark_session_started(&makers, &k);
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));

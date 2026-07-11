@@ -286,6 +286,7 @@ impl MeshControl {
             authority,
             descriptor.observer_slots.iter().copied().collect(),
             descriptor.expected_slots.iter().copied().collect(),
+            descriptor.homed_slots.iter().copied().collect(),
         );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
         // A rehome descriptor (coordinator-mediated failover) resumes an
@@ -526,6 +527,7 @@ mod tests {
             slot_refs: vec![],
             observer_slots: vec![],
             expected_slots: vec![],
+            homed_slots: vec![],
             resumed: false,
             departed_slots: vec![],
         }

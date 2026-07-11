@@ -318,6 +318,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
@@ -397,6 +398,7 @@ async fn fires_session_start_when_every_expected_slot_connects() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -464,6 +466,7 @@ async fn a_late_slot_receives_session_start_on_register() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -790,6 +793,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -865,6 +869,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -929,6 +934,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
@@ -1020,6 +1026,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
@@ -1130,6 +1137,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -1202,6 +1210,7 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
@@ -1456,6 +1465,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1636,6 +1646,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1682,6 +1693,69 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
             "the re-register is refused with the terminal departed close code",
         ),
         other => panic!("expected the terminal departed application close, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_slot_not_homed_on_this_relay_is_refused() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::server::SLOT_NOT_HOMED_CLOSE;
+
+    // The home-relay-binding gate (finding A1): a token binds
+    // tenant/session/slot/key but not the specific relay, so without this a
+    // misrouted (or malicious) client could register the same slot on two
+    // relays in a true multi-relay session, feeding each a different turn at
+    // the same (slot, seq) -- exactly the split the mesh's topological dedup
+    // can only mask the symptom of, never prevent. The descriptor's homed set
+    // is the fix: a slot absent from a non-empty set is refused before the
+    // handshake ever completes, while a slot present in it (or a set left
+    // empty, the legacy/dev default) is admitted exactly as before this
+    // check existed.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(302);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // The descriptor assigns only slot 0 to this relay -- standing in for a
+    // multi-relay session where slot 1 is homed elsewhere.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        [SlotId(0)].into_iter().collect(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    // Slot 0 is homed here: admitted normally.
+    let _slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+
+    // Slot 1 is homed elsewhere: refused before the handshake ever completes,
+    // distinct from every other close code so a misrouted client is
+    // diagnosable.
+    let client_key = keypair();
+    let token = mint_token(&tenant, session, SlotId(1), client_key.public);
+    let redial = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    assert!(
+        handshake(&redial, &token, &client_key, &[]).await.is_err(),
+        "a slot not homed on this relay is never acknowledged",
+    );
+    match redial.closed().await {
+        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+            u32::try_from(u64::from(app.error_code)).unwrap(),
+            SLOT_NOT_HOMED_CLOSE,
+            "the misrouted slot is refused with the not-homed close code",
+        ),
+        other => panic!("expected the not-homed application close, got {other:?}"),
     }
 }
 
@@ -1740,6 +1814,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
@@ -1828,6 +1903,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);
 
