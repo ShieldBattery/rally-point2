@@ -174,7 +174,8 @@ async fn coordinator_with_session(
         },
         ExpiresAt(u64::MAX),
     )
-    .unwrap();
+    .unwrap()
+    .response;
 
     // Keep a handle to the outbox before the setup moves into the router state.
     let outbox = setup.clone();
@@ -576,6 +577,7 @@ fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
         ExpiresAt(u64::MAX),
     )
     .unwrap()
+    .response
     .session
 }
 
@@ -704,7 +706,8 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
         },
         ExpiresAt(u64::MAX),
     )
-    .unwrap();
+    .unwrap()
+    .response;
     assert_eq!(
         resp.home_relay.relay_id,
         RelayId(2),

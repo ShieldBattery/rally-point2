@@ -33,7 +33,7 @@ use rally_point_proto::control::{
     SessionResponse, SlotExternalRef, SlotHome, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
-use rally_point_proto::token::ExpiresAt;
+use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
 
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::presence::PresenceStore;
@@ -103,6 +103,114 @@ pub struct SessionRefs {
     /// false alarm: the id being enrolled is not enough, the cert its clients
     /// hold must still be the one currently live.
     pub relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
+}
+
+/// A create request reduced to the fields that shape the session it mints,
+/// normalized so two requests that would produce the same session compare
+/// equal. This is the canonical form the create-idempotency cache checks an
+/// incoming replay against: a retry of the same logical create reproduces an
+/// identical fingerprint, whereas a second create that reuses the same
+/// `external_id` for a *different* game does not, and is refused rather than
+/// silently handed the first game's tokens (see
+/// [`SessionSetupError::IdempotentCreateMismatch`]).
+///
+/// The idempotency key is `(tenant, external_id)`, so those two are equal by
+/// construction on any cache hit and are deliberately **excluded** here. Every
+/// other field of the [`SessionRequest`] that changes the minted response or
+/// the session state the coordinator records is included:
+///
+/// - each player's `slot` and `client_pubkey` — the token minted for a slot
+///   binds that pubkey, so a differing roster mints non-interchangeable tokens.
+/// - each player's `observer` flag — it selects the slot into the session's
+///   observer set ([`SessionDescriptor::observer_slots`]) and the lifecycle's
+///   player/observer split, shaping recorded state even though it alters no
+///   token.
+/// - each player's `external_ref` — stored per slot and echoed into
+///   departure/result webhooks, so replaying the first roster's refs for a
+///   different roster would mislabel the players.
+/// - `dev_relay_split` — decides which slots home on the secondary relay,
+///   shaping the response's `slot_homes` and the session's serving-relay set.
+///
+/// Equality is plain struct equality ([`PartialEq`]), never a hash: a hash
+/// collision must not be able to bind two genuinely different rosters to one
+/// cached response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateFingerprint {
+    /// The request's players, sorted by slot so request order does not matter.
+    /// A request cannot name a slot twice (`validate_request` rejects a
+    /// duplicate), so the slot totally orders this list.
+    players: Vec<FingerprintPlayer>,
+    /// The dev cross-relay split, sorted so the same set in a different order
+    /// still matches.
+    dev_relay_split: Vec<SlotId>,
+}
+
+/// One player's contribution to a [`CreateFingerprint`]: the fields of a
+/// [`PlayerHandoff`](rally_point_proto::control::PlayerHandoff) that shape the
+/// session (its slot, the pubkey its token binds, whether it is an observer,
+/// and its tenant correlation ref).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FingerprintPlayer {
+    slot: SlotId,
+    client_pubkey: ClientPublicKey,
+    observer: bool,
+    external_ref: Option<String>,
+}
+
+impl CreateFingerprint {
+    /// Reduces a request to its canonical fingerprint, sorting the players by
+    /// slot and the dev split so two semantically identical requests that
+    /// differ only in ordering still compare equal.
+    fn from_request(request: &SessionRequest) -> Self {
+        let mut players: Vec<FingerprintPlayer> = request
+            .players
+            .iter()
+            .map(|p| FingerprintPlayer {
+                slot: p.slot,
+                client_pubkey: p.client_pubkey,
+                observer: p.observer,
+                external_ref: p.external_ref.clone(),
+            })
+            .collect();
+        players.sort_by_key(|p| p.slot);
+        let mut dev_relay_split = request.dev_relay_split.clone();
+        dev_relay_split.sort_unstable();
+        Self {
+            players,
+            dev_relay_split,
+        }
+    }
+}
+
+/// A recorded create-idempotency entry: the response a matching replay returns,
+/// and the [`CreateFingerprint`] of the request that produced it. The
+/// fingerprint is what distinguishes an honest retry (same roster → replay the
+/// response) from an `external_id` collision (different roster → refuse).
+#[derive(Debug, Clone)]
+struct CachedCreate {
+    /// The fingerprint of the request that created the cached session.
+    fingerprint: CreateFingerprint,
+    /// The exact response a matching replay returns.
+    response: SessionResponse,
+}
+
+/// The outcome of [`create_session`]: the response to hand the app server, and
+/// whether it was replayed from the create-idempotency cache rather than freshly
+/// minted.
+///
+/// `replayed` lets the api handler tell a fresh create from an idempotent retry:
+/// a fresh create arms the session's lifecycle accounting, while a replay must
+/// **not** — the original create already registered it, and re-registering would
+/// reset the live session's never-started clock and overwrite its serving-relay
+/// set with a possibly-stale one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedSession {
+    /// The session response the app server hands to its clients.
+    pub response: SessionResponse,
+    /// Whether `response` was replayed from the idempotency cache (a retry of a
+    /// create for an `external_id` already bound to a live session) rather than
+    /// freshly minted.
+    pub replayed: bool,
 }
 
 /// The SHA-256 fingerprint of a relay's DER-encoded certificate — the compact
@@ -183,17 +291,22 @@ pub struct SessionSetup {
     /// `external_id` already bound to a still-live session replies with that
     /// exact original response rather than minting a duplicate — an ordinary
     /// tenant HTTP retry inside the signed-request's replay window must not
-    /// create a second session for the same game. Checked and (on a fresh
-    /// create) recorded under [`assignment_lock`](Self::assignment_lock), so
-    /// two near-simultaneous requests for the same `external_id` can't both
-    /// race past the check and each mint their own session. Entries are
-    /// removed at the same point session membership is retired
+    /// create a second session for the same game. Each entry caches the
+    /// original response *and* the [`CreateFingerprint`] of the request that
+    /// produced it, so a replay is honored only when the incoming request's
+    /// fingerprint matches: a second create that reuses the `external_id` for a
+    /// different roster is a conflict, not a retry, and must not be handed the
+    /// first roster's tokens. Checked and (on a fresh create) recorded under
+    /// [`assignment_lock`](Self::assignment_lock), so two near-simultaneous
+    /// requests for the same `external_id` can't both race past the check and
+    /// each mint their own session. Entries are removed at the same point
+    /// session membership is retired
     /// ([`take_session_membership`](Self::take_session_membership)), so a
     /// tenant may legitimately reuse an `external_id` once the prior session
     /// is actually gone (a rematch, say). A request with no `external_id` is
     /// never recorded here and is therefore never idempotent — see
     /// [`SessionRequest::external_id`]'s own doc.
-    create_idempotency: Arc<Mutex<HashMap<(TenantId, String), SessionResponse>>>,
+    create_idempotency: Arc<Mutex<HashMap<(TenantId, String), CachedCreate>>>,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -329,7 +442,7 @@ impl SessionSetup {
             let mut idempotency = self.create_idempotency.lock();
             if idempotency
                 .get(&idem_key)
-                .is_some_and(|cached| cached.session == session)
+                .is_some_and(|cached| cached.response.session == session)
             {
                 idempotency.remove(&idem_key);
             }
@@ -723,6 +836,15 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// Token expiry is set to `expires_at` — the caller decides the lifetime
 /// (typically game session duration plus margin).
 ///
+/// Returns a [`CreatedSession`] whose `replayed` flag tells a fresh mint from
+/// an idempotent retry: a create naming an `external_id` already bound to a
+/// still-live session replays that session's original response (with `replayed
+/// == true`) rather than minting a duplicate, and the caller must then skip
+/// arming the session's lifecycle a second time. A replay is honored only when
+/// the request matches the original roster's [`CreateFingerprint`]; the same
+/// `external_id` presented with a different roster is refused with
+/// [`SessionSetupError::IdempotentCreateMismatch`].
+///
 /// The whole body runs under the assignment lock (see
 /// [`SessionSetup::lock_assignment`]), so the registry read that picks relays and
 /// the commit that records membership and stages descriptors are atomic against a
@@ -733,7 +855,7 @@ pub fn create_session(
     setup: &SessionSetup,
     request: SessionRequest,
     expires_at: ExpiresAt,
-) -> Result<SessionResponse, SessionSetupError> {
+) -> Result<CreatedSession, SessionSetupError> {
     create_session_inner(setup, request, expires_at, || {})
 }
 
@@ -747,7 +869,7 @@ fn create_session_inner(
     request: SessionRequest,
     expires_at: ExpiresAt,
     before_commit: impl FnOnce(),
-) -> Result<SessionResponse, SessionSetupError> {
+) -> Result<CreatedSession, SessionSetupError> {
     // Hold the outermost assignment lock across this entire (await-free) body, so
     // the registry read below and the commit that follows cannot interleave with a
     // relay's drain mark. See `SessionSetup::assignment_lock`.
@@ -766,14 +888,29 @@ fn create_session_inner(
     // session — whichever acquires the lock second either replays the
     // first's freshly recorded response or, if the first request failed
     // before recording one, proceeds to mint its own.
+    //
+    // A replay is honored only when the incoming request's fingerprint matches
+    // the one that created the live session. An `external_id` still bound to a
+    // live session but presented with a *different* roster is a collision, not
+    // a retry: replaying would hand the caller the first roster's tokens, and
+    // proceeding to mint would overwrite the live session's lifecycle
+    // accounting — so the mismatch is refused outright and the cached entry is
+    // left untouched.
     if let Some(external_id) = &request.external_id {
         let key = (request.tenant.clone(), external_id.clone());
-        if let Some(cached) = setup.create_idempotency.lock().get(&key).cloned()
+        let cached = setup.create_idempotency.lock().get(&key).cloned();
+        if let Some(cached) = cached
             && !setup
-                .serving_relays(&request.tenant, cached.session)
+                .serving_relays(&request.tenant, cached.response.session)
                 .is_empty()
         {
-            return Ok(cached);
+            if cached.fingerprint == CreateFingerprint::from_request(&request) {
+                return Ok(CreatedSession {
+                    response: cached.response,
+                    replayed: true,
+                });
+            }
+            return Err(SessionSetupError::IdempotentCreateMismatch);
         }
     }
 
@@ -933,16 +1070,23 @@ fn create_session_inner(
         bounds,
     };
     // Record the exact response a duplicate create for this `external_id`
-    // will replay, still under the assignment lock this whole body holds —
-    // see the idempotency check above for why that matters. A request with
-    // no `external_id` is never recorded (nothing to key a replay on).
+    // will replay, alongside the fingerprint a replay must match, still under
+    // the assignment lock this whole body holds — see the idempotency check
+    // above for why that matters. A request with no `external_id` is never
+    // recorded (nothing to key a replay on).
     if let Some(external_id) = &request.external_id {
         setup.create_idempotency.lock().insert(
             (request.tenant.clone(), external_id.clone()),
-            response.clone(),
+            CachedCreate {
+                fingerprint: CreateFingerprint::from_request(&request),
+                response: response.clone(),
+            },
         );
     }
-    Ok(response)
+    Ok(CreatedSession {
+        response,
+        replayed: false,
+    })
 }
 
 /// Builds the [`SessionDescriptor`] the coordinator pushes to a relay serving
@@ -1227,7 +1371,9 @@ mod tests {
             dev_relay_split: Vec::new(),
         };
 
-        let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
+        let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
 
         // Home is the lowest-id relay, carrying the cert it reported at enrollment
         // so clients can pin it. Without a dev split every slot homes there, so the
@@ -1263,7 +1409,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         assert_eq!(resp.home_relay.relay_id, RelayId(1));
         assert_eq!(
@@ -1307,7 +1454,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_eq!(
             setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
             vec![RelayId(1)],
@@ -1336,7 +1484,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert!(
             resp.slot_homes.is_empty(),
             "a split with no second relay collapses to a single-relay session",
@@ -1364,7 +1513,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         // Every slot moved to the secondary (relay 2); only it serves.
         assert_eq!(
@@ -1404,7 +1554,9 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let resp = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
+        let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
 
         // Seed the relay registry with the tenant's verifying key.
         let (kid, pubkey) =
@@ -1498,7 +1650,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_eq!(resp.tokens.len(), 12);
 
         let result = create_session(
@@ -1636,7 +1789,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         // Relay 1's peers are the other relays serving this session → relay 2.
         let desc = descriptor_for(
@@ -1714,7 +1868,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         let desc = descriptor_for(
             &setup,
@@ -1755,7 +1910,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         let desc = descriptor_for(
             &setup,
@@ -1801,7 +1957,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         let desc = descriptor_for(
             &setup,
@@ -1858,7 +2015,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         // Home=1, secondary=2. Relay 3 is registered but not in the session.
         let desc = descriptor_for(
@@ -1887,7 +2045,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         // The split's secondary home is the relay slot 1 was moved onto.
         let secondary_relay = resp.slot_homes[0].relay.relay_id;
@@ -1947,8 +2106,12 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX)).unwrap();
-        let r2 = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
+        let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        let r2 = create_session(&setup, req, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
         assert_ne!(r1.session, r2.session);
     }
 
@@ -1973,10 +2136,14 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX)).unwrap();
+        let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
 
         let after = setup_with_two_relays_and_tenant();
-        let new = create_session(&after, req, ExpiresAt(u64::MAX)).unwrap();
+        let new = create_session(&after, req, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
         assert!(
             new.session.0 >= old.session.0,
             "a fresh coordinator's ids never start below the old one's",
@@ -2002,6 +2169,7 @@ mod tests {
             ExpiresAt(u64::MAX),
         )
         .unwrap()
+        .response
     }
 
     #[test]
@@ -2013,8 +2181,12 @@ mod tests {
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
         };
-        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
-        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
         assert_eq!(
             first, second,
             "a retried create for the same (tenant, external_id) gets the exact original response back",
@@ -2030,8 +2202,12 @@ mod tests {
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
         };
-        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
-        let _ = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        let _ = create_session(&setup, request, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
 
         // An unrelated fresh create still gets the very next id in sequence --
         // proof the duplicate above never advanced the session-id counter, so
@@ -2057,7 +2233,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         let second = create_session(
             &setup,
             SessionRequest {
@@ -2068,7 +2245,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_ne!(first.session, second.session);
         assert_ne!(first.tokens, second.tokens);
     }
@@ -2097,7 +2275,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         let second = create_session(
             &setup,
             SessionRequest {
@@ -2108,7 +2287,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_ne!(first.session, second.session);
     }
 
@@ -2121,7 +2301,9 @@ mod tests {
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
         };
-        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
 
         // The same retirement path a full close uses: membership (and, with
         // it, the idempotency entry) is taken.
@@ -2136,7 +2318,9 @@ mod tests {
              reuses an external_id leaks one entry per closed session forever",
         );
 
-        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
         assert_ne!(
             second.session, first.session,
             "the external_id mints a genuinely new session once the old one is gone",
@@ -2155,7 +2339,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_eq!(retried, second);
     }
 
@@ -2168,12 +2353,172 @@ mod tests {
             external_id: None,
             dev_relay_split: Vec::new(),
         };
-        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
-        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
         assert_ne!(
             first.session, second.session,
             "a request naming no external_id is never replayed, even back to back",
         );
+    }
+
+    #[test]
+    fn a_matching_replay_reports_replayed_while_the_first_create_does_not() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+        assert!(
+            !first.replayed,
+            "the create that actually minted the session is a fresh mint, not a replay",
+        );
+        let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        assert!(
+            second.replayed,
+            "a retry with the identical roster is served from the idempotency cache",
+        );
+        assert_eq!(
+            first.response, second.response,
+            "the replay hands back the exact original response",
+        );
+    }
+
+    #[test]
+    fn a_replay_matches_regardless_of_player_order() {
+        // The fingerprint sorts players by slot, so a retry that lists the same
+        // roster in a different order is still an idempotent replay, not a
+        // conflict -- request order carries no meaning.
+        let setup = setup_with_two_relays_and_tenant();
+        let players = two_players();
+        let mut reversed = players.clone();
+        reversed.reverse();
+
+        let first = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players,
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let second = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: reversed,
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert!(
+            second.replayed,
+            "the same roster in a different order is the same request, so it replays",
+        );
+        assert_eq!(first.response, second.response);
+    }
+
+    #[test]
+    fn a_conflicting_create_reusing_a_live_external_id_for_a_different_roster_is_refused() {
+        let setup = setup_with_two_relays_and_tenant();
+        let original = SessionRequest {
+            tenant: tid(),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let first = create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
+
+        // The same external_id, still bound to the live session, but a different
+        // roster: slot 1's client pubkey differs, so the tokens the first create
+        // minted authorize different clients than this roster asks for. Handing
+        // them back, or overwriting the live session's accounting, would both be
+        // wrong -- so the create is refused.
+        let conflicting = SessionRequest {
+            tenant: tid(),
+            players: vec![
+                PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: None,
+                    observer: false,
+                },
+                PlayerHandoff {
+                    slot: SlotId(1),
+                    client_pubkey: ClientPublicKey([0xCC; 32]),
+                    external_ref: None,
+                    observer: false,
+                },
+            ],
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let err = create_session(&setup, conflicting, ExpiresAt(u64::MAX)).unwrap_err();
+        assert_eq!(err, SessionSetupError::IdempotentCreateMismatch);
+
+        // The refused conflict minted nothing: an unrelated fresh create still
+        // gets the very next id in sequence, so the conflict advanced no counter.
+        let unrelated = create_default_session(&setup);
+        assert_eq!(
+            unrelated.session.0,
+            first.response.session.0 + 1,
+            "the refused conflict consumed no session id of its own",
+        );
+
+        // It also left the cached entry untouched: a retry with the ORIGINAL
+        // roster still replays the first response.
+        let replay = create_session(&setup, original, ExpiresAt(u64::MAX)).unwrap();
+        assert!(
+            replay.replayed,
+            "the conflict must not have evicted or overwritten the original cache entry",
+        );
+        assert_eq!(replay.response, first.response);
+    }
+
+    #[test]
+    fn a_conflicting_create_differing_only_in_the_observer_flag_is_refused() {
+        // The observer flag shapes recorded state (the session's observer set and
+        // its lifecycle player/observer split) even though it alters no token, so a
+        // roster that flips it is a distinct request, not a retry.
+        let setup = setup_with_two_relays_and_tenant();
+        let players = two_players();
+        let mut with_observer = players.clone();
+        with_observer[1].observer = true;
+
+        create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players,
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let err = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: with_observer,
+                external_id: Some("game-1".to_owned()),
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap_err();
+        assert_eq!(err, SessionSetupError::IdempotentCreateMismatch);
     }
 
     #[test]
@@ -2263,7 +2608,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         // serving == {1, 2}; kill the home relay 1.
         registry::remove(setup.registry(), RelayId(1));
 
@@ -2452,7 +2798,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         let refs = session_refs(&setup, &tid(), resp.session).unwrap();
         assert_eq!(
@@ -2564,7 +2911,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert!(!setup.serving_relays(&tid(), resp.session).is_empty());
         assert!(session_refs(&setup, &tid(), resp.session).is_some());
 
@@ -2617,7 +2965,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert!(
             setup
                 .descriptors()
@@ -2800,7 +3149,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
 
         // The session response's endpoints carry the set, primary unchanged.
         assert_eq!(resp.home_relay.relay_addr, v4_1);
@@ -3004,7 +3354,7 @@ mod tests {
                 .descriptors()
                 .current_for(RelayId(1))
                 .iter()
-                .any(|d| d.session == resp.session),
+                .any(|d| d.session == resp.response.session),
             "A committed before B could mark, so A's session is staged in the outbox",
         );
         assert!(
@@ -3041,7 +3391,7 @@ mod tests {
                         },
                         ExpiresAt(u64::MAX),
                     ) {
-                        created.lock().push(resp.session);
+                        created.lock().push(resp.response.session);
                     }
                 }
             }));

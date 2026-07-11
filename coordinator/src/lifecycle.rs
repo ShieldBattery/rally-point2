@@ -1837,7 +1837,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         (setup, resp.session)
     }
 
@@ -1992,7 +1993,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         (setup, resp.session)
     }
 
@@ -2173,7 +2175,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         let s = resp.session;
         assert_eq!(
             setup.serving_relays(&tid(), s),

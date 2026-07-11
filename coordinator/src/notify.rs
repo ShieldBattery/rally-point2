@@ -1114,7 +1114,8 @@ mod tests {
             },
             ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         (setup, resp.session)
     }
 

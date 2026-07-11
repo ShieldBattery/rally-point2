@@ -234,10 +234,14 @@ async fn create_session(
         .collect();
 
     let expires_at = rally_point_proto::token::ExpiresAt(u64::MAX);
-    let resp = session::create_session(&state.setup, request, expires_at).map_err(|e| {
+    let session::CreatedSession {
+        response: resp,
+        replayed,
+    } = session::create_session(&state.setup, request, expires_at).map_err(|e| {
         tracing::warn!(error = %e, "session setup failed");
         match e {
             registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
+            registry::SessionSetupError::IdempotentCreateMismatch => StatusCode::CONFLICT,
             registry::SessionSetupError::TenantNotFound(_)
             | registry::SessionSetupError::SlotOutOfRange(_)
             | registry::SessionSetupError::NoPlayers
@@ -248,20 +252,27 @@ async fn create_session(
         }
     })?;
 
-    // Arm the session's lifecycle: its serving relay set (the distinct home
-    // relays of its slots) and its player/observer slots drive `sessionClosed`
-    // and the reap policies. `expires_at` sizes the never-started reap's grace
-    // window (see `lifecycle::never_started_grace`) -- the same value the
-    // tokens above just carried, so the reaper never gives up before a
-    // client's own token would have.
-    state.lifecycle.register_session(
-        tenant.clone(),
-        resp.session,
-        state.setup.serving_relays(&tenant, resp.session),
-        player_slots,
-        observer_slots,
-        expires_at,
-    );
+    // Arm the session's lifecycle only on a fresh mint: its serving relay set
+    // (the distinct home relays of its slots) and its player/observer slots
+    // drive `sessionClosed` and the reap policies. `expires_at` sizes the
+    // never-started reap's grace window (see `lifecycle::never_started_grace`)
+    // -- the same value the tokens above just carried, so the reaper never
+    // gives up before a client's own token would have.
+    //
+    // A replayed create must skip this: the original create already registered
+    // this session, and re-registering would reset its never-started clock and
+    // overwrite its serving-relay accounting with a freshly-read set, corrupting
+    // the live session's lifecycle on nothing more than a duplicate retry.
+    if !replayed {
+        state.lifecycle.register_session(
+            tenant.clone(),
+            resp.session,
+            state.setup.serving_relays(&tenant, resp.session),
+            player_slots,
+            observer_slots,
+            expires_at,
+        );
+    }
 
     tracing::info!(
         session = %resp.session,
@@ -1520,6 +1531,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_endpoint_replays_a_duplicate_and_keeps_one_live_session() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state.clone());
+
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+
+        let resp = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let first: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let second: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first, second,
+            "a retry of the same create replays the exact original response",
+        );
+        assert!(
+            state
+                .lifecycle
+                .is_alive(&TenantId("sb-test".to_owned()), first.session),
+            "the replayed create leaves the one original session live and undisturbed",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_endpoint_conflicts_on_a_reused_live_id_with_a_different_roster() {
+        let state = state_with_relay_and_tenant();
+        let app = router(state.clone());
+
+        let original = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let body = serde_json::to_vec(&original).unwrap();
+        let resp = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        // The same external_id, still bound to the live session, but slot 1 now
+        // carries a different client pubkey: a different game reusing a live id.
+        // The coordinator maps this to 409 rather than minting a duplicate or
+        // handing back the first game's tokens.
+        let conflicting = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: vec![
+                PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: None,
+                    observer: false,
+                },
+                PlayerHandoff {
+                    slot: SlotId(1),
+                    client_pubkey: ClientPublicKey([0xCC; 32]),
+                    external_ref: None,
+                    observer: false,
+                },
+            ],
+            external_id: Some("game-1".to_owned()),
+            dev_relay_split: Vec::new(),
+        };
+        let body = serde_json::to_vec(&conflicting).unwrap();
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        assert!(
+            state
+                .lifecycle
+                .is_alive(&TenantId("sb-test".to_owned()), created.session),
+            "the refused conflict must leave the original session's accounting intact",
+        );
+    }
+
+    #[tokio::test]
     async fn create_session_rejects_an_unsigned_request() {
         let state = state_with_relay_and_tenant();
         let app = router(state);
@@ -1957,7 +2067,8 @@ mod tests {
             },
             rally_point_proto::token::ExpiresAt(u64::MAX),
         )
-        .unwrap();
+        .unwrap()
+        .response;
         let lifecycle = Lifecycle::new(setup.clone());
         (setup, notify::new_dedup(), lifecycle, resp.session)
     }
@@ -2111,6 +2222,7 @@ mod tests {
         };
         crate::session::create_session(&state.setup, req, ExpiresAt(u64::MAX))
             .unwrap()
+            .response
             .session
     }
 
@@ -2364,6 +2476,7 @@ mod tests {
             ExpiresAt(u64::MAX),
         )
         .unwrap()
+        .response
         .session
     }
 
