@@ -67,7 +67,7 @@ use rally_point_proto::mesh::{MESH_HELLO_LEN, MeshHello};
 use rally_point_proto::version::{self, MESH_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
 use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::mesh::{self, MeshState};
 use crate::presence;
@@ -79,6 +79,40 @@ use crate::routing::Sessions;
 /// a peer that connects and then stays silent from pinning an accept task open,
 /// mirroring the client edge's authorization-handshake timeout.
 const MESH_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many mesh accept-side handshakes ([`recv_mesh_hello`] through the
+/// control-stream `accept_bi`) may be in flight at once, fleet-wide on this
+/// relay.
+///
+/// A dedicated cap, not the client edge's `MAX_PENDING_HANDSHAKES` admission
+/// semaphore (`server::serve_with_max_pending`): that one is sized for
+/// thousands of *players*, dropped before this handshake even starts (mesh
+/// connections are routed off the client edge's ALPN dispatch, which frees
+/// its own permit immediately — mesh peers were never meant to compete for
+/// client capacity). A relay fleet has few legitimate peers -- a handful of
+/// other relays, not thousands of players -- so a small dedicated bound is
+/// the right shape here: 8 is comfortably above any real fleet's concurrent
+/// (re)connect burst while still bounding how many QUIC connections an
+/// attacker speaking `MESH_ALPN` (no mesh auth exists yet, see the module
+/// docs) can hold open in a stalled, pre-link handshake state at once.
+///
+/// Held only across the handshake window this const is named for -- acquired
+/// before [`recv_mesh_hello`], dropped once the connection is ready to become
+/// a `MeshLink` and [`mesh::run_mesh_link`] takes over its lifetime. Never
+/// held across the established link's own lifetime, which can run for the
+/// life of the relay-pair. A connection past the cap simply waits its turn
+/// (the semaphore queues acquires) rather than being refused outright: unlike
+/// the client edge's admission bound (sized to shed load fast under a flood
+/// of real players), the failure mode here is a handful of concurrently
+/// (re)connecting peers, which is exactly what queueing resolves on its own
+/// within the existing hello/control timeouts below -- and every acquired
+/// permit is bounded to at most those timeouts' worth of hold time, so a
+/// stalled or hostile connection can only ever camp on one permit for a
+/// bounded window, never indefinitely.
+const MESH_ACCEPT_CONCURRENCY: usize = 8;
+
+/// The process-wide gate [`MESH_ACCEPT_CONCURRENCY`] enforces.
+static MESH_ACCEPT_PERMITS: Semaphore = Semaphore::const_new(MESH_ACCEPT_CONCURRENCY);
 
 /// Why the post-connect identity hello exchange failed. Logged, and the link is
 /// abandoned — one peer that will not identify itself does not end the relay.
@@ -194,6 +228,16 @@ pub async fn run_mesh_accept(
         let mesh = mesh.clone();
         let links = links.clone();
         tokio::spawn(async move {
+            // Gate the handshake window behind the dedicated mesh-accept cap
+            // before any handshake work begins -- queues rather than refusing
+            // outright (see `MESH_ACCEPT_CONCURRENCY`'s doc), and is dropped
+            // below before the link driver takes over, never held across the
+            // established link's own lifetime.
+            let accept_permit = MESH_ACCEPT_PERMITS
+                .acquire()
+                .await
+                .expect("MESH_ACCEPT_PERMITS is never closed");
+
             let (peer_id, hello_stream) = match recv_mesh_hello(&connection).await {
                 Ok((hello, stream)) => {
                     // The acceptor is the version-enforcement point for the pair:
@@ -277,6 +321,13 @@ pub async fn run_mesh_accept(
             };
             let peer_control_rx =
                 rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
+
+            // The handshake window this permit bounds is over: the connection
+            // is about to become a `MeshLink` and hand off to the driver,
+            // which owns its lifetime from here on (potentially the life of
+            // the relay-pair) -- freeing the slot for the next handshake now,
+            // not when this task itself eventually ends.
+            drop(accept_permit);
 
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
@@ -639,5 +690,154 @@ async fn dial_and_serve(
             );
             DialOutcome::Stop
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use rally_point_transport::quic::server_config;
+    use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    use super::*;
+
+    fn self_signed() -> (
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        CertificateDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        (vec![cert_der.clone()], key, cert_der)
+    }
+
+    /// A loopback QUIC connection negotiated on `MESH_ALPN`, mirroring the
+    /// integration tests' own helper -- only the accept side is returned
+    /// (what `run_mesh_accept` would receive off the client edge's ALPN
+    /// dispatch in production); the dial side is kept alive by the caller via
+    /// the returned endpoints but is never made to speak, so the accepted
+    /// connection just sits there as a stalled, unauthenticated mesh peer.
+    async fn silent_mesh_connection()
+    -> (quinn::Connection, quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+        use rally_point_transport::quic::mesh_client_config;
+
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+        let mut roots = rally_point_transport::rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = mesh_client_config(roots).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        // Returned, not just dropped here: quinn's `Connection` triggers an
+        // implicit close of that side when its last handle drops, which
+        // would immediately end the "silent" connection this helper exists
+        // to hold open.
+        let client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accept.await.unwrap();
+
+        (server_conn, client_conn, client, server)
+    }
+
+    /// `MESH_ACCEPT_PERMITS` is a process-wide `static`, so both halves of
+    /// this coverage run inside ONE test function rather than two -- cargo
+    /// test runs `#[tokio::test]` functions in parallel by default, and two
+    /// separate tests both reading/mutating the same static would interfere
+    /// with each other's `available_permits()` readings. Nothing else in
+    /// this binary touches this static.
+    ///
+    /// Part one: the semaphore mechanism itself -- exactly
+    /// [`MESH_ACCEPT_CONCURRENCY`] permits are available, a request past that
+    /// queues (does not fail outright -- there is no `try_acquire` refusal
+    /// path here, unlike the client edge's admission bound), and releasing
+    /// one lets a queued acquire through.
+    ///
+    /// Part two: `run_mesh_accept` actually threads a connection's handshake
+    /// window through the semaphore -- accepting a real (but silent, never
+    /// sending its hello) mesh connection holds exactly one permit for as
+    /// long as the connection is alive and unidentified, and releases it
+    /// once the connection ends. Proves the wiring, not just the mechanism
+    /// part one already covers.
+    #[tokio::test]
+    async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_handshake()
+     {
+        // Part one: mechanism.
+        let mut held = Vec::new();
+        for _ in 0..MESH_ACCEPT_CONCURRENCY {
+            held.push(MESH_ACCEPT_PERMITS.acquire().await.unwrap());
+        }
+        assert_eq!(MESH_ACCEPT_PERMITS.available_permits(), 0);
+
+        // A request past the cap does not resolve while every permit is held.
+        let waiter = tokio::spawn(async { MESH_ACCEPT_PERMITS.acquire().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a request past the cap must queue, not be refused or admitted early",
+        );
+
+        // Releasing one held permit lets the queued request through.
+        held.pop();
+        let unblocked = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("the queued acquire completes once a permit frees up")
+            .unwrap();
+        drop(unblocked);
+        drop(held);
+        assert_eq!(
+            MESH_ACCEPT_PERMITS.available_permits(),
+            MESH_ACCEPT_CONCURRENCY,
+            "every permit released back to the pool before part two begins",
+        );
+
+        // Part two: the real wiring.
+        let (mesh_accept_tx, mesh_accept_rx) = mpsc::channel(1);
+        let (links_tx, _links_rx) = mpsc::channel(1);
+        let accept_task = tokio::spawn(run_mesh_accept(
+            mesh_accept_rx,
+            Sessions::default(),
+            mesh::new_mesh_state(),
+            links_tx,
+        ));
+
+        let (silent_conn, _client_conn, _client_ep, _server_ep) = silent_mesh_connection().await;
+        mesh_accept_tx.send(silent_conn.clone()).await.unwrap();
+
+        // Give the spawned per-connection task time to acquire its permit and
+        // start (and block on) `recv_mesh_hello`.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            MESH_ACCEPT_PERMITS.available_permits(),
+            MESH_ACCEPT_CONCURRENCY - 1,
+            "one permit held for the one stalled, unidentified connection",
+        );
+
+        // End the connection outright (rather than waiting the full
+        // `MESH_HELLO_TIMEOUT`) so `recv_mesh_hello` fails fast and the task
+        // returns, releasing its permit.
+        silent_conn.close(quinn::VarInt::from_u32(0), b"test done");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            MESH_ACCEPT_PERMITS.available_permits(),
+            MESH_ACCEPT_CONCURRENCY,
+            "the permit is released once the stalled connection ends",
+        );
+
+        drop(mesh_accept_tx);
+        let _ = accept_task.await;
     }
 }
