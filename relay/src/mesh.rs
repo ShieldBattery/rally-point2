@@ -50,12 +50,29 @@ use crate::routing::{self, SessionKey};
 ///
 /// The prefix-slide lets it forget old seqs without unbounded growth: a late
 /// redundant copy of a retired seq is dropped as `<= delivered_through` rather
-/// than re-checked against a growing set.
+/// than re-checked against a growing set. The out-of-prefix sparse set that
+/// backs that slide is itself capped ([`SPARSE_SEEN_CAP`]): a seq stream that
+/// leaves permanent gaps below its high-water mark — an authenticated peer that
+/// keeps reconnecting with an advancing resume anchor is the motivating case —
+/// would otherwise pin those gaps in the set for the life of the session, so
+/// beyond the cap the prefix collapses forward over the lowest gap rather than
+/// hold it forever.
 #[derive(Default)]
 pub struct MeshSeen {
     /// Per-slot forward-gate state.
     slots: HashMap<SlotId, SlotSeen>,
 }
+
+/// The largest number of out-of-prefix seqs one slot's forward gate holds before
+/// it collapses its contiguous prefix forward to reclaim the space. Sized to the
+/// transport's per-slot receive window (`RECEIVE_WINDOW` in
+/// `rally_point_transport`, 4096): a link that legitimately runs that far ahead
+/// of its contiguous prefix is already treated as broken there, so a sparse set
+/// grown this deep is not in-flight reordering but permanent gaps — seqs that
+/// will never arrive to fill them. Holding them forever is a memory-growth
+/// vector on an authenticated-but-hostile peer; the cap bounds each slot's sparse
+/// set to this many entries, independent of how far the seqs ahead of it climb.
+const SPARSE_SEEN_CAP: usize = 4096;
 
 /// One slot's topological-dedup state.
 struct SlotSeen {
@@ -64,6 +81,8 @@ struct SlotSeen {
     /// Forwarded seqs above the prefix, kept until the gaps below them fill.
     /// Mirrors `Dedup::SlotDedup::ahead` so out-of-order mesh arrival doesn't
     /// cause a false "new" on a seq that was already forwarded out of order.
+    /// Bounded to [`SPARSE_SEEN_CAP`] entries: past that the prefix collapses
+    /// forward over the lowest gap (see [`SlotSeen::collapse_to_cap`]).
     ahead: BTreeSet<u64>,
 }
 
@@ -101,13 +120,50 @@ impl MeshSeen {
         }
 
         // Absorb any now-contiguous run into the forwarded prefix, so old seqs
-        // can be forgotten.
-        let mut next = base;
-        while state.ahead.remove(&next) {
-            state.forwarded_through = Some(next);
+        // can be forgotten, then bound the sparse remainder so a stream of
+        // permanent gaps can't grow it without limit.
+        state.absorb_contiguous_run();
+        state.collapse_to_cap();
+        Seen::New
+    }
+}
+
+impl SlotSeen {
+    /// Folds the run of seqs sitting immediately above the contiguous prefix out
+    /// of the sparse set and into the prefix. Called after a fresh seq lands: if
+    /// it closed the gap the prefix was stalled behind, the whole run above it
+    /// becomes contiguous and the seqs below can be forgotten.
+    fn absorb_contiguous_run(&mut self) {
+        let mut next = self.forwarded_through.map_or(0, |t| t + 1);
+        while self.ahead.remove(&next) {
+            self.forwarded_through = Some(next);
             next += 1;
         }
-        Seen::New
+    }
+
+    /// Bounds the sparse out-of-prefix set to [`SPARSE_SEEN_CAP`] by collapsing
+    /// the prefix forward over the lowest sparse seq (and any run contiguous
+    /// above it) whenever the set is over the cap. The gap swallowed by that
+    /// advance — every seq between the old prefix top and that lowest sparse seq
+    /// — is thereafter reported as seen, so a turn that later arrives in it reads
+    /// as a `Duplicate`, never a fresh forward.
+    ///
+    /// That is the safe failure direction for an echo guard. A gap left this far
+    /// below the highest seen seq never fills in normal operation — its turn is
+    /// lost for good, or the only thing that would arrive there is a replay — and
+    /// the two ways to be wrong about it are not symmetric: a false `Duplicate`
+    /// merely drops a re-forward, while a false `New` re-floods the mesh with an
+    /// already-delivered turn, a duplicate into a lockstep slot that desyncs it.
+    /// Collapsing chooses the `Duplicate` side deliberately.
+    fn collapse_to_cap(&mut self) {
+        while self.ahead.len() > SPARSE_SEEN_CAP {
+            let lowest = self
+                .ahead
+                .pop_first()
+                .expect("a set over a positive cap is non-empty");
+            self.forwarded_through = Some(lowest);
+            self.absorb_contiguous_run();
+        }
     }
 }
 
@@ -2607,6 +2663,115 @@ mod tests {
             assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
         }
         assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::Duplicate);
+    }
+
+    /// Reaches into one slot's private forward-gate state so the sparse-set tests
+    /// can assert on the exact bound; the `mark_forwarded` API deliberately
+    /// exposes only the `New`/`Duplicate` verdict, not the representation.
+    fn slot_ahead_len(seen: &MeshSeen, slot: SlotId) -> usize {
+        seen.slots.get(&slot).map_or(0, |s| s.ahead.len())
+    }
+
+    #[test]
+    fn ordinary_in_order_and_small_reorder_traffic_never_grows_the_sparse_set() {
+        // The common case must be untouched by the cap: an in-order stream keeps
+        // an empty sparse set (each seq folds straight into the prefix), and a
+        // small reorder window holds only the handful of seqs still ahead of the
+        // gap, collapsing to empty the moment the gap fills.
+        let mut seen = MeshSeen::new();
+        for seq in 0..1000 {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(
+                slot_ahead_len(&seen, SlotId(0)),
+                0,
+                "in-order holds nothing"
+            );
+        }
+
+        // Deliver a small window out of order: 1005..1010 arrive before 1000..1005.
+        for seq in 1005..1010 {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+        }
+        assert!(
+            slot_ahead_len(&seen, SlotId(0)) <= SPARSE_SEEN_CAP,
+            "a small reorder window stays far under the cap",
+        );
+        for seq in 1000..1005 {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+        }
+        assert_eq!(
+            slot_ahead_len(&seen, SlotId(0)),
+            0,
+            "the filled gap collapses the sparse set back to empty",
+        );
+    }
+
+    #[test]
+    fn gap_heavy_traffic_never_exceeds_the_sparse_cap() {
+        // Every other seq is dropped, so the gap below the high-water mark never
+        // fills and each arrival lands in the sparse set. Left unbounded the set
+        // would grow one entry per arrival for the life of the session; the cap
+        // holds it flat.
+        let mut seen = MeshSeen::new();
+        // seq 0 forms the prefix; from there only even seqs arrive, leaving every
+        // odd seq a permanent gap.
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        for seq in (2..20_000).step_by(2) {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert!(
+                slot_ahead_len(&seen, SlotId(0)) <= SPARSE_SEEN_CAP,
+                "sparse set stayed within the cap after seq {seq}",
+            );
+        }
+        // Well past the cap's worth of arrivals, it is pinned at the bound, not
+        // growing with the seq stream.
+        assert_eq!(slot_ahead_len(&seen, SlotId(0)), SPARSE_SEEN_CAP);
+    }
+
+    #[test]
+    fn collapsing_preserves_duplicate_verdicts_for_already_seen_seqs() {
+        // The seqs the collapse swallows into the prefix must still read as
+        // duplicates: a re-forward of one of them arriving after the collapse is
+        // dropped, exactly as it would have been before the prefix moved.
+        let mut seen = MeshSeen::new();
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        // Push enough even seqs to force at least one collapse.
+        let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
+        for seq in (2..=last).step_by(2) {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+        }
+        // Every even seq that has ever been forwarded is still a duplicate,
+        // whether the collapse swept it into the prefix or it remains in the
+        // sparse set.
+        for seq in (0..=last).step_by(2) {
+            assert_eq!(
+                seen.mark_forwarded(SlotId(0), seq),
+                Seen::Duplicate,
+                "a re-forward of already-seen seq {seq} must not re-flood",
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_seq_arriving_after_the_collapse_is_treated_as_a_duplicate() {
+        // A seq in a gap the collapse has already swallowed reads as a duplicate
+        // even though it was never actually forwarded — the safe direction: the
+        // echo guard would rather drop a lost/replayed gap turn than re-flood the
+        // mesh with what it can no longer prove is new.
+        let mut seen = MeshSeen::new();
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
+        for seq in (2..=last).step_by(2) {
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+        }
+        // The prefix has collapsed forward over the low odd gaps. A low odd seq —
+        // one that was skipped and never forwarded — now arrives late and is
+        // rejected as below the collapsed prefix.
+        assert_eq!(
+            seen.mark_forwarded(SlotId(0), 1),
+            Seen::Duplicate,
+            "a swallowed gap seq is seen, not fresh",
+        );
     }
 
     #[test]
