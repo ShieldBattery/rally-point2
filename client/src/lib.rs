@@ -27,11 +27,13 @@
 //! synced player-leave directives that ride the same envelope: at-most-one leave
 //! per slot, surfaced at its apply frame.
 //!
-//! TODO: resync frame kinds on the control stream (the stream and its
-//! extensible `ControlFrame` framing exist; oversize turns, lobby commands, and
-//! in-game chat are residents already); reconnect + resync-from-cursor (the
-//! unacked-window cap that triggers it is in place, the mechanism is gated on
-//! the open failover design).
+//! [`LinkDriver::run_reconnecting`] drives reconnect + resync-from-cursor: a
+//! link or control-stream failure re-dials the home relay and replays from
+//! each slot's last-delivered turn, falling back to coordinator-mediated
+//! rehoming ([`RehomeProvider`]) when the original relay can't be reached. A
+//! sustained forward-loss condition ([`DriverError::UnackedWindowExhausted`])
+//! is deliberately terminal rather than routed through that same recovery —
+//! see its doc for why.
 
 /// Re-export of the shared protocol contracts, so consumers depend on a single
 /// `rally_point_client` surface rather than pulling in `rally-point-proto`
