@@ -705,6 +705,44 @@ message MeshControlFrame {
     // it -- the home relay sent a copy to every session peer, the same no-echo
     // rule the other kinds follow.
     DeliveryCursors delivery_cursors = 11;
+
+    // One relay's per-session resume cursors for the mesh datagram path: for
+    // each origin slot this session has ever forwarded a turn for, the next
+    // seq this relay's forward-gate still needs. Sent once by each side after
+    // its link (re)establishes and Join/reconcile completes -- turns flow
+    // both directions on a pair, so each side answers for itself, never for
+    // the peer. The receiver replays only turns that originated at ITS OWN
+    // client edge -- never a turn it itself received from the mesh -- so a
+    // reply can never echo something back onto the mesh. Not re-broadcast:
+    // each side answers only the peer that asked.
+    //
+    // An origin slot absent from `cursors` means one of two things, told
+    // apart by `resuming`:
+    //
+    // - `resuming` false: a session this relay has no forward-gate history
+    //   for at all (a first Join, or one that predates this link entirely) --
+    //   the absent slot asks for NO replay. A peer with nothing recorded yet
+    //   wants only new turns, not a backfill (a newly-added relay's own
+    //   clients get their backfill from their own client-side reconnect, not
+    //   from a mesh peer).
+    // - `resuming` true: this relay DOES have forward-gate history for the
+    //   session (evidence of prior mesh exchange), so an absent slot is not
+    //   "unknown" -- it is a slot this relay's own gap-tracking never formed a
+    //   contiguous prefix for (nothing arrived yet, or what did arrived with
+    //   a gap below it -- the exact shape a mesh-side death with no other
+    //   re-carrier leaves behind, unlike a client's own inbound gaps, which
+    //   its home relay's live link redundancy would otherwise catch). The
+    //   receiver replays that slot's turns from the very start; the asker's
+    //   own dedup absorbs any overlap with whatever sparse, out-of-order
+    //   turns it already has.
+    //
+    // The one gap this does not close: a session with NO forward-gate history
+    // on EITHER side of a link death (nothing from any path ever reached this
+    // relay for it) still reads as a first join (`resuming` false) and asks
+    // for nothing, so turns produced and lost in that narrow pre-history
+    // window are not recovered. Bounded to session start and the
+    // abandoned/stall machinery's own timers, not indefinite.
+    MeshResumeCursors mesh_resume_cursors = 12;
   }
 }
 
@@ -730,6 +768,36 @@ message DeliveryCursor {
   // The highest origin seq the destination has confirmed received. Monotonic
   // per (destination, origin): a receiver ignores a regressing value.
   uint64 delivered_seq = 2;
+}
+
+// One relay's per-session resume cursors for the mesh datagram path. See
+// `MeshControlFrame.mesh_resume_cursors` for the sharing discipline and the
+// two `resuming`-dependent meanings an absent slot carries.
+message MeshResumeCursors {
+  // The sender's per-origin-slot resume cursors, complete as of this frame.
+  repeated MeshResumeCursor cursors = 1;
+
+  // Whether the sender has ANY forward-gate history for this session --
+  // whether its `cursors` above came from a session it has actually
+  // exchanged mesh traffic for, not a session it is joining fresh. Decides
+  // what an origin slot absent from `cursors` means: nothing (a fresh join)
+  // when false, everything-from-the-start (a real gap this relay's own
+  // gap-tracking never closed) when true. Defaults to `false` on the wire, so
+  // a peer that predates this field is read as never resuming -- the
+  // conservative, no-replay reading.
+  bool resuming = 2;
+}
+
+// One origin slot's resume cursor within a `MeshResumeCursors` frame.
+message MeshResumeCursor {
+  // The origin slot this cursor covers.
+  uint32 origin_slot = 1;
+
+  // The next seq the sender's forward-gate still needs from `origin_slot`.
+  // Every earlier seq has already reached the sender's locals by some path --
+  // this link, another mesh link, or, if `origin_slot` is the sender's own
+  // client, the client edge itself -- and must not be replayed again.
+  uint64 next_seq = 2;
 }
 
 // A relay's announcement to its mesh peers that one of its home clients has

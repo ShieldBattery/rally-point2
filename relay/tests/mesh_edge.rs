@@ -879,6 +879,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
         &key,
         SlotId(0),
         oversize.clone(),
+        rally_point_relay::turn_ring::TurnOrigin::Local,
     );
 
     // Client B receives the turn on its control stream: two divert hops (mesh

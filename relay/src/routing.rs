@@ -1003,6 +1003,7 @@ pub async fn run_slot_link(
                                 &key,
                                 slot,
                                 payload,
+                                crate::turn_ring::TurnOrigin::Local,
                             );
                         }
                         Err(error) => {
@@ -1422,6 +1423,7 @@ pub async fn run_slot_link(
                                     &key,
                                     slot,
                                     payload,
+                                    crate::turn_ring::TurnOrigin::Local,
                                 );
                             }
                             Err(error) => {
@@ -2580,6 +2582,7 @@ mod tests {
             &k,
             SlotId(0),
             stamped,
+            crate::turn_ring::TurnOrigin::Mesh,
         );
 
         let delivered = inbox
@@ -2638,6 +2641,7 @@ mod tests {
             &k,
             SlotId(0),
             duplicate,
+            crate::turn_ring::TurnOrigin::Mesh,
         );
         assert!(
             inbox.forward_rx.try_recv().is_err(),

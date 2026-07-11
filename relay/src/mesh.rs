@@ -144,6 +144,49 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
     roster.remove(key);
 }
 
+/// A snapshot of `key`'s forward-gate cursors, as "next needed seq" per slot —
+/// the seq immediately past each slot's contiguous forwarded-to-locals prefix.
+/// A slot with no contiguous prefix (nothing forwarded yet, or a gap below
+/// what has) is omitted entirely, not given a `0`. What an absent slot then
+/// asks of the reply depends on [`has_resumable_state`] alongside this
+/// snapshot: nothing, for a session with no forward-gate history at all
+/// (a fresh join); that slot's turns from the very start, for a session that
+/// does (see the wire frame's own doc for the full two-mode story — this
+/// snapshot only ever answers "how far did I get", never "should an absent
+/// slot mean nothing or everything").
+///
+/// Read from the same registry [`mark_forwarded`](MeshSeen::mark_forwarded)
+/// writes, so the snapshot reflects exactly what this session has actually
+/// delivered to its locals so far — by any path, not just this one link —
+/// which is what makes it safe to read straight from here rather than from
+/// any one mesh link's own transport state: a link dying and redialing never
+/// touches this registry, so the cursors it hands the fresh link on rejoin are
+/// unaffected by the death that made rejoining necessary in the first place.
+pub fn resume_cursor_snapshot(registries: &SeenRegistries, key: &SessionKey) -> Vec<(SlotId, u64)> {
+    let roster = registries.lock();
+    let Some(seen) = roster.get(key) else {
+        return Vec::new();
+    };
+    seen.slots
+        .iter()
+        .filter_map(|(&slot, state)| state.forwarded_through.map(|through| (slot, through + 1)))
+        .collect()
+}
+
+/// Whether `key` has ANY forward-gate history at all — an entry in the same
+/// registry [`resume_cursor_snapshot`] reads, regardless of whether any slot
+/// in it has formed a contiguous prefix yet. This is the `resuming` a
+/// resume-cursor ask carries: `true` means "I have genuinely exchanged mesh
+/// traffic for this session before" (even if every slot in the accompanying
+/// snapshot is gapped or absent), which is what licenses a resume reply to
+/// treat an absent slot as "everything from the start" rather than "nothing
+/// asked for" — see the wire frame's own doc. `false` — no entry at all — is
+/// indistinguishable from a first Join, so the conservative first-join
+/// reading (nothing) is exactly what a session with no history should get.
+pub fn has_resumable_state(registries: &SeenRegistries, key: &SessionKey) -> bool {
+    registries.lock().contains_key(key)
+}
+
 /// Live mesh links for every session on this relay: each `SessionKey` → the
 /// channels that reach each connected peer-relay's mesh-link task for that
 /// session. A turn fanned out to the mesh goes to every peer relay serving that
@@ -527,20 +570,17 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 /// A full forward queue is *not* the same recoverable case a full local slot
 /// queue is: a local client's own transport re-carries a dropped datagram from
 /// its own unacked window, but this queue feeds the mesh link's `AckManager` —
-/// a turn dropped here never enters it, so the link has nothing to re-carry and
-/// the peer relay's clients see a permanent per-(slot, seq) gap, stalled in
-/// lockstep forever. So, like [`routing::fan_out`]'s lagging peer, a full queue
-/// signals the link to reset (see [`MeshLinkTx::shutdown`]) rather than
-/// silently dropping the turn: the dial supervisor redials and the Join-time
-/// reconcile re-syncs leave state on the fresh link, turning an unbounded
-/// silent gap into a loud, bounded one — a reset link, not a wedged one that
-/// keeps eating turns forever. Never a per-packet retransmit.
-///
-/// TODO(mesh-resume): a turn dropped here (or in flight at any mesh link
-/// death) is still lost until a mesh-side resume-from-cursor replay from the
-/// turn ring exists. `turn_ring::replay` today has exactly one caller — the
-/// client-facing reconnect in `routing.rs` — so the reset above recovers the
-/// *link*, not the dropped turn itself.
+/// a turn dropped here never enters it, so the link has nothing to re-carry on
+/// its own. So, like [`routing::fan_out`]'s lagging peer, a full queue signals
+/// the link to reset (see [`MeshLinkTx::shutdown`]) rather than silently
+/// dropping the turn: the dial supervisor redials, the Join-time reconcile
+/// re-syncs leave state, and each side's resume-cursor exchange on that fresh
+/// link (see [`reconcile_resume_cursors_on_join`]) replays whatever the
+/// peer's forward-gate is still missing from this relay's own
+/// locally-originated turns — turning what would otherwise be a permanent
+/// per-(slot, seq) gap into a recovered one. Never a per-packet retransmit:
+/// the recovery is resume-from-cursor on the next Join, not acknowledgement
+/// of this specific drop.
 pub fn fan_out_to_mesh(links: &MeshLinks, key: &SessionKey, payload: Payload) {
     let targets: Vec<(MeshForwardTx, Arc<Notify>)> = {
         let roster = links.lock();
@@ -627,6 +667,32 @@ pub(crate) fn fan_out_delivery_cursors(
             )),
         },
     );
+}
+
+/// Builds a `MeshResumeCursors` mesh control frame for `session`, from
+/// `cursors` — each entry an origin slot and the next seq this relay's
+/// forward-gate still needs from it — and `resuming`, which decides what an
+/// absent slot means to the receiver (see the wire frame's own doc).
+fn resume_cursors_frame(
+    session: SessionId,
+    cursors: Vec<(SlotId, u64)>,
+    resuming: bool,
+) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+            rally_point_proto::messages::MeshResumeCursors {
+                cursors: cursors
+                    .into_iter()
+                    .map(|(slot, next_seq)| rally_point_proto::messages::MeshResumeCursor {
+                        origin_slot: u32::from(slot.0),
+                        next_seq,
+                    })
+                    .collect(),
+                resuming,
+            },
+        )),
+    }
 }
 
 /// Announces a departed slot to every peer relay serving `key`: the home relay
@@ -896,6 +962,7 @@ pub fn forward_turn(
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
+    origin: crate::turn_ring::TurnOrigin,
 ) {
     if let Some(payload) = deliver_turn_to_locals(
         sessions,
@@ -905,6 +972,7 @@ pub fn forward_turn(
         key,
         slot,
         payload,
+        origin,
     ) {
         fan_out_to_mesh(mesh_links, key, payload);
     }
@@ -914,13 +982,20 @@ pub fn forward_turn(
 /// stamping, and fan-out to this relay's local slots — everything except the
 /// mesh flood. Returns the (possibly stamped) payload when it was fresh, so
 /// [`forward_turn`] can flood it onward, or `None` for a topological duplicate
-/// already delivered via an earlier path.
+/// already delivered via an earlier path. `origin` names where this specific
+/// delivery arrived from — the client edge or the mesh — and is recorded
+/// alongside the turn in the replay ring, not re-derived from anything else
+/// (see [`crate::turn_ring::TurnOrigin`]).
 ///
 /// Also the whole receive step for an oversize turn arriving over the mesh
 /// control stream: the origin relay diverted a copy to *every* link serving the
 /// session itself, so the receiver delivers locally and deliberately does not
 /// re-flood — re-broadcasting would only produce the echo the dedup exists to
 /// drop (harmless, but pure waste on a reliable stream).
+// Same escape hatch as `forward_turn` just above (see its own comment): one
+// more reference (`origin`) alongside its existing bundle-worthy set, not
+// worth the call-site churn of a struct.
+#[allow(clippy::too_many_arguments)]
 fn deliver_turn_to_locals(
     sessions: &routing::Sessions,
     seen: &SeenRegistries,
@@ -929,6 +1004,7 @@ fn deliver_turn_to_locals(
     key: &SessionKey,
     slot: SlotId,
     mut payload: Payload,
+    origin: crate::turn_ring::TurnOrigin,
 ) -> Option<Payload> {
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
         // Only the duplicate (mesh-echo) branch touches the recorder's maps —
@@ -979,7 +1055,7 @@ fn deliver_turn_to_locals(
     // session has started: pre-start lobby traffic has its own ordered replay log
     // and must not be double-buffered here.
     if crate::consensus::session_started(decision_makers, key) {
-        turn_ring.record(key, &payload);
+        turn_ring.record(key, &payload, origin);
     }
     Some(payload)
 }
@@ -1017,6 +1093,154 @@ pub struct MeshControlIo {
     pub tx: rally_point_transport::quinn::SendStream,
     /// The peer's control frames, assembled off its recv half by a reader task.
     pub rx: mpsc::Receiver<MeshControlFrame>,
+}
+
+/// Whether `frame` is a resume-cursor ask, and if so, the local-origin turns
+/// this relay's own client edge produced that the peer's cursors say it's
+/// still missing, paired with the session they belong to. `None` for any
+/// other frame kind, a session this link hasn't joined, or a resume ask this
+/// relay has nothing to answer (an empty replay list — the ordinary case for
+/// a session with no locally-homed slots). The frame's own `resuming` flag
+/// governs a slot absent from its cursors — see
+/// [`crate::turn_ring::TurnRing::replay_local`]'s doc for the two meanings
+/// that carries.
+///
+/// Reads straight from the turn ring rather than mutating any session state,
+/// so — unlike [`dispatch_mesh_control`] — this never needs to run inside
+/// that function; [`run_mesh_link`]'s own select branch calls it separately,
+/// before the dispatch, because the reply it computes has to go out over
+/// *this* link directly (see [`send_resume_replay`]), which `dispatch_mesh_control`
+/// has no way to do.
+fn resume_replay_for_frame(
+    frame: &MeshControlFrame,
+    joined: &HashMap<SessionId, SessionState>,
+    mesh: &MeshState,
+) -> Option<(SessionKey, Vec<Payload>)> {
+    let Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) = &frame.kind else {
+        return None;
+    };
+    let key = joined.get(&SessionId(frame.session))?.key.clone();
+    let cursors: HashMap<SlotId, u64> = resume
+        .cursors
+        .iter()
+        .filter_map(|c| u8::try_from(c.origin_slot).ok().map(|s| (SlotId(s), c.next_seq)))
+        .collect();
+    let payloads = mesh.turn_ring.replay_local(&key, &cursors, resume.resuming);
+    (!payloads.is_empty()).then_some((key, payloads))
+}
+
+/// Sends one turn over `link`'s datagram path for `key`'s session, diverting
+/// to the reliable control stream when it doesn't fit — mirroring the client
+/// edge's own oversize divert. Shared by a freshly forwarded turn and a
+/// resume-cursor replay, so a replayed turn enters the link's `AckManager` and
+/// rides its redundancy exactly like a live one: no special bypass a live
+/// send doesn't also go through. `context` only labels the failure log
+/// (`"forward"` or `"resume replay"`); the send logic itself is identical
+/// either way.
+///
+/// Returns whether the link is still good. `false` is the caller's cue to
+/// close it, exactly as a live send failure already does; a payload that
+/// slips past the divert pre-check as oversize is logged and treated as
+/// delivered (there is nothing to retry it with), not a link failure.
+async fn send_turn_over_link(
+    link: &mut rally_point_transport::MeshLink,
+    control_send: &mut rally_point_transport::quinn::SendStream,
+    key: &SessionKey,
+    payload: Payload,
+    conditions: Option<LinkConditions>,
+    context: &'static str,
+) -> bool {
+    let session_id = key.session;
+    let fits = match link.payload_fits(&payload, conditions.as_ref()) {
+        Ok(fits) => fits,
+        Err(error) => {
+            tracing::info!(%error, context, "mesh send failed; closing link");
+            return false;
+        }
+    };
+    if !fits {
+        tracing::debug!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = payload.slot,
+            seq = payload.seq,
+            context,
+            "diverting oversize turn to the mesh control stream",
+        );
+        let frame = MeshControlFrame {
+            session: session_id.0,
+            kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
+        };
+        if let Err(error) =
+            rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+                control_send,
+                &frame,
+            )
+            .await
+        {
+            tracing::info!(%error, context, "mesh control send failed; closing link");
+            return false;
+        }
+        return true;
+    }
+    match link.send(session_id, Some(payload), conditions) {
+        Ok(_) => true,
+        // The pre-check above diverts anything that can never ride a
+        // datagram, so this arm is reachable only if the path budget moved
+        // between the check and the send (no await separates them, so in
+        // practice it isn't). The payload was consumed by the failed send;
+        // log it loudly rather than pretend it was delivered.
+        Err(rally_point_transport::MeshLinkError::PayloadTooLarge { needed, budget }) => {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                needed,
+                budget,
+                context,
+                "oversize turn slipped past the divert pre-check; dropped",
+            );
+            true
+        }
+        Err(error) => {
+            tracing::info!(%error, context, "mesh send failed; closing link");
+            false
+        }
+    }
+}
+
+/// Sends every payload in `payloads` over `link`'s datagram path for `key`, in
+/// order, stopping at the first link-fatal failure — the resume-reply analog
+/// of the live forward branch's own per-turn send, going straight out this
+/// link rather than through the shared, `try_send`-based forward queue: a
+/// large replay pumped through that bounded queue could itself fill it and
+/// trip the very full-queue reset this exists to recover from. Samples the
+/// outgoing conditions sidecar once for the whole batch — a backlog
+/// catch-up burst does not need per-turn-fresh telemetry — rather than
+/// resampling for each payload. Returns whether every payload sent (or was
+/// diverted) without a link-fatal error.
+async fn send_resume_replay(
+    link: &mut rally_point_transport::MeshLink,
+    control_send: &mut rally_point_transport::quinn::SendStream,
+    conditions: &ConditionsRegistry,
+    key: &SessionKey,
+    payloads: Vec<Payload>,
+) -> bool {
+    let outgoing = snapshot_conditions(conditions, key);
+    for payload in payloads {
+        if !send_turn_over_link(
+            link,
+            control_send,
+            key,
+            payload,
+            outgoing.clone(),
+            "resume replay",
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Drives a shared [`MeshLink`] for every session both relays jointly serve on
@@ -1251,6 +1475,7 @@ pub async fn run_mesh_link(
                                 &key,
                                 slot,
                                 payload,
+                                crate::turn_ring::TurnOrigin::Mesh,
                             );
                         }
                         continue;
@@ -1297,13 +1522,33 @@ pub async fn run_mesh_link(
             // complete frame off a cancel-safe path; `recv` is cancel-safe.
             received = peer_control_rx.recv() => {
                 match received {
-                    Some(frame) => dispatch_mesh_control(
-                        frame,
-                        peer_id,
-                        &joined,
-                        &sessions,
-                        &mesh_for_dispatch,
-                    ),
+                    Some(frame) => {
+                        // A resume-cursor ask answers with turns THIS relay
+                        // originated, sent straight out this link — computed
+                        // and sent before the ordinary dispatch below, which
+                        // has no link to send a reply over (see
+                        // `resume_replay_for_frame`'s own doc).
+                        if let Some((key, payloads)) =
+                            resume_replay_for_frame(&frame, &joined, &mesh_for_dispatch)
+                            && !send_resume_replay(
+                                &mut link,
+                                &mut control_send,
+                                &conditions,
+                                &key,
+                                payloads,
+                            )
+                            .await
+                        {
+                            break MeshLinkExit::ConnectionFailed;
+                        }
+                        dispatch_mesh_control(
+                            frame,
+                            peer_id,
+                            &joined,
+                            &sessions,
+                            &mesh_for_dispatch,
+                        );
+                    }
                     // The reader task ended: a one-sided stream reset, an
                     // over-cap frame, a decode failure, or a clean EOF. This
                     // stream is the only channel `SlotDeparted`,
@@ -1329,72 +1574,17 @@ pub async fn run_mesh_link(
                         };
                         let key = state.key.clone();
                         let outgoing = snapshot_conditions(&conditions, &key);
-                        // Too large for any mesh datagram on this path: divert to
-                        // the reliable control stream, whose QUIC reliability
-                        // replaces redundancy for this turn — the mesh twin of the
-                        // client edge's divert. Written directly on the stream
-                        // rather than through the merged outbound channel: this
-                        // driver owns the send half, select! runs one branch to
-                        // completion at a time so frames never interleave, and
-                        // queueing behind pending control frames would only delay
-                        // a turn the datagram path (which this replaces) imposes
-                        // no such ordering on. A write failure closes the link —
-                        // nothing re-carries a diverted turn.
-                        let fits = match link.payload_fits(&payload, outgoing.as_ref()) {
-                            Ok(fits) => fits,
-                            Err(error) => {
-                                tracing::info!(%error, "mesh send failed; closing link");
-                                break MeshLinkExit::ConnectionFailed;
-                            }
-                        };
-                        if !fits {
-                            tracing::debug!(
-                                tenant = key.tenant.as_ref(),
-                                session = key.session.0,
-                                slot = payload.slot,
-                                seq = payload.seq,
-                                "diverting oversize turn to the mesh control stream",
-                            );
-                            let frame = MeshControlFrame {
-                                session: session_id.0,
-                                kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
-                            };
-                            if let Err(error) =
-                                rally_point_transport::mesh_control_stream::send_mesh_control_frame(
-                                    &mut control_send,
-                                    &frame,
-                                )
-                                .await
-                            {
-                                tracing::info!(%error, "mesh control send failed; closing link");
-                                break MeshLinkExit::ConnectionFailed;
-                            }
-                            continue;
-                        }
-                        match link.send(session_id, Some(payload), outgoing) {
-                            Ok(_) => {}
-                            // The pre-check above diverts anything that can never
-                            // ride a datagram, so this arm is reachable only if
-                            // the path budget moved between the check and the send
-                            // (no await separates them, so in practice it isn't).
-                            // The payload was consumed by the failed send; log it
-                            // loudly rather than pretend it was delivered.
-                            Err(rally_point_transport::MeshLinkError::PayloadTooLarge {
-                                needed,
-                                budget,
-                            }) => {
-                                tracing::warn!(
-                                    tenant = key.tenant.as_ref(),
-                                    session = key.session.0,
-                                    needed,
-                                    budget,
-                                    "oversize turn slipped past the divert pre-check; dropped",
-                                );
-                            }
-                            Err(error) => {
-                                tracing::info!(%error, "mesh send failed; closing link");
-                                break MeshLinkExit::ConnectionFailed;
-                            }
+                        if !send_turn_over_link(
+                            &mut link,
+                            &mut control_send,
+                            &key,
+                            payload,
+                            outgoing,
+                            "forward",
+                        )
+                        .await
+                        {
+                            break MeshLinkExit::ConnectionFailed;
                         }
                         continue;
                     }
@@ -1403,13 +1593,12 @@ pub async fn run_mesh_link(
             }
             // `fan_out_to_mesh` found this shared forward queue full and
             // notified: a dropped fresh turn here never enters this link's
-            // `AckManager`, so its transport has nothing to re-carry and the
-            // peer would stall on a permanent gap. Reset the link instead —
-            // the dial supervisor redials and the Join-time reconcile
-            // re-syncs leave state on the fresh link, turning an unbounded
-            // silent gap into a loud, bounded reset. This recovers the link,
-            // not the dropped turn itself — see the `TODO(mesh-resume)` on
-            // `fan_out_to_mesh`.
+            // `AckManager`, so its transport has nothing to re-carry on its
+            // own. Reset the link instead — the dial supervisor redials, the
+            // Join-time reconcile re-syncs leave state, and the resume-cursor
+            // exchange on the fresh link replays this relay's own
+            // locally-originated turns the peer's forward-gate is still
+            // missing, closing the gap this very reset opened.
             _ = shutdown.notified() => {
                 tracing::info!("mesh forward queue was full; resetting link");
                 break MeshLinkExit::ConnectionFailed;
@@ -1556,6 +1745,15 @@ pub async fn run_mesh_link(
                         // redialed (its `joined` empty again) reconverges. All of
                         // these are idempotent (dedup by slot everywhere).
                         reconcile_leaves_on_join(&decision_makers, &control_forward_tx, &key);
+                        // Ask the peer, over the same fresh registration, to
+                        // replay whatever this relay's forward-gate is still
+                        // missing for the session — the resume-cursor mesh
+                        // counterpart of the leave re-sync just above.
+                        reconcile_resume_cursors_on_join(
+                            &seen_registries,
+                            &control_forward_tx,
+                            &key,
+                        );
                         joined.insert(
                             session_id,
                             SessionState {
@@ -1660,6 +1858,11 @@ pub async fn run_mesh_link(
 ///   session authority and the target slot's drop has stood past the unlock floor;
 ///   a non-authority ignores it (the authority is among the broadcast's
 ///   receivers). Not re-broadcast across the mesh — no echo, like the arms above.
+/// - **`MeshResumeCursors`**: the peer's per-origin-slot resume cursors.
+///   Answered before this function ever runs — the reply is a replay of this
+///   relay's own turns, sent directly over the link that received the ask, not
+///   a session-state fold this dispatch performs. This arm exists only so the
+///   match stays exhaustive.
 ///
 /// Kept defensive like the datagram path: a zero session id is malformed and a
 /// session this link has not joined has no key to act under; both are logged at
@@ -1796,6 +1999,7 @@ fn dispatch_mesh_control(
                 &key,
                 slot,
                 payload,
+                crate::turn_ring::TurnOrigin::Mesh,
             );
         }
         Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
@@ -1939,6 +2143,14 @@ fn dispatch_mesh_control(
                 );
             }
         }
+        Some(mesh_control_frame::Kind::MeshResumeCursors(_)) => {
+            // Handled before this dispatch runs, by `resume_replay_for_frame` +
+            // `send_resume_replay` in the driver's own select branch — the reply
+            // must go out over this driver's own link, not through anything this
+            // function has access to. Nothing left to update here: unlike every
+            // other kind, a resume ask carries no session state to fold, only a
+            // reply to send.
+        }
         // A kind this build predates (or the empty keepalive, already dropped by
         // the reader): nothing to do.
         None => {
@@ -1986,6 +2198,33 @@ fn reconcile_leaves_on_join(
     if crate::consensus::session_started(decision_makers, key) {
         let _ = control_tx.send(session_start_frame(key.session));
     }
+}
+
+/// Sends this relay's resume cursors for `key` down a freshly registered
+/// link's control channel — the mesh counterpart of
+/// [`reconcile_leaves_on_join`], closing the gap a redialed link's fresh
+/// transport state otherwise leaves: turns in flight or queued at the moment
+/// the old link died are gone from that link's own state, but this session's
+/// forward-gate cursors survive it (see [`resume_cursor_snapshot`]), so the
+/// fresh link can still ask for exactly what's missing. Every Join sends one.
+///
+/// The frame's `resuming` flag ([`has_resumable_state`]) is what keeps a
+/// first join and a real mid-game recovery from being confused with each
+/// other even though both can produce the exact same (empty) cursor list: a
+/// first join has no forward-gate entry at all, so `resuming` is `false` and
+/// the empty cursors ask for nothing; a session recovering from a death whose
+/// every slot happens to be gapped or never-seen also has an empty cursor
+/// list, but its forward-gate entry exists (`resuming` true), so the SAME
+/// empty list instead asks the peer to replay every slot it can, from the
+/// start.
+fn reconcile_resume_cursors_on_join(
+    seen: &SeenRegistries,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    let cursors = resume_cursor_snapshot(seen, key);
+    let resuming = has_resumable_state(seen, key);
+    let _ = control_tx.send(resume_cursors_frame(key.session, cursors, resuming));
 }
 
 /// Pushes each joined session's live home-client count to the peer when it
@@ -2560,6 +2799,398 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_cursor_snapshot_is_the_forward_gate_prefix_plus_one() {
+        let seen = new_seen_registries();
+        let key = control_key();
+        // Slot 0 has a contiguous 0..3 prefix; slot 1 has forwarded nothing yet
+        // (an out-of-order arrival alone, still gapped at 0) and so has no
+        // prefix at all; slot 2 has forwarded exactly seq 0.
+        for seq in 0..3 {
+            mark_seen(&seen, &key, SlotId(0), seq);
+        }
+        mark_seen(&seen, &key, SlotId(1), 5); // gapped: no contiguous prefix yet
+        mark_seen(&seen, &key, SlotId(2), 0);
+
+        let mut cursors = resume_cursor_snapshot(&seen, &key);
+        cursors.sort_by_key(|&(slot, _)| slot);
+        assert_eq!(
+            cursors,
+            vec![(SlotId(0), 3), (SlotId(2), 1)],
+            "slot 1's gapped, prefix-less state is absent, not zeroed",
+        );
+        // Slot 1's omission is not the same as "nothing known about this
+        // session" -- the session has genuine forward-gate history (this
+        // relay HAS exchanged mesh traffic for it), which is exactly what
+        // licenses a resume reply to answer the omitted slot from the start
+        // rather than read the omission as a first join.
+        assert!(
+            has_resumable_state(&seen, &key),
+            "a gapped slot still counts as forward-gate history for the session",
+        );
+    }
+
+    #[test]
+    fn resume_cursor_snapshot_of_an_untouched_session_is_empty() {
+        let seen = new_seen_registries();
+        let key = control_key();
+        assert!(resume_cursor_snapshot(&seen, &key).is_empty());
+        assert!(
+            !has_resumable_state(&seen, &key),
+            "no forward-gate entry at all reads as a first join, not a resume",
+        );
+    }
+
+    #[test]
+    fn reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join() {
+        // A session this relay has never forwarded anything for -- a first
+        // Join, or a peer that predates this link entirely -- sends a frame
+        // with no cursors AND `resuming = false`, which the wire's own doc
+        // marks as "replay nothing", never as "replay from the very start".
+        let seen = new_seen_registries();
+        let key = control_key();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+        reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+
+        let frame = control_rx.try_recv().expect("a frame was sent");
+        assert_eq!(frame.session, key.session.0);
+        match frame.kind {
+            Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
+                assert!(resume.cursors.is_empty());
+                assert!(!resume.resuming, "no forward-gate history to resume from");
+            }
+            other => panic!("expected MeshResumeCursors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_resume_cursors_on_join_sends_the_current_snapshot() {
+        let seen = new_seen_registries();
+        let key = control_key();
+        mark_seen(&seen, &key, SlotId(0), 0);
+        mark_seen(&seen, &key, SlotId(0), 1);
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+
+        let frame = control_rx.try_recv().expect("a frame was sent");
+        match frame.kind {
+            Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
+                assert_eq!(resume.cursors.len(), 1);
+                assert_eq!(resume.cursors[0].origin_slot, 0);
+                assert_eq!(resume.cursors[0].next_seq, 2);
+                assert!(resume.resuming, "the session has forward-gate history");
+            }
+            other => panic!("expected MeshResumeCursors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wholly_gapped_session_still_sends_an_empty_but_resuming_frame() {
+        // The case a naive "cursors is empty means fresh join" reading would
+        // get wrong: every slot this relay has EVER seen for the session is
+        // still gapped (no contiguous prefix on any of them), so the cursor
+        // list is empty exactly like a first join's -- but the session has
+        // real forward-gate history, so `resuming` must still be true. This
+        // is what stops that history from being silently dropped on the floor
+        // when the shape of the data alone can't tell the two cases apart.
+        let seen = new_seen_registries();
+        let key = control_key();
+        mark_seen(&seen, &key, SlotId(0), 5); // arrived, but gapped below 5
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+
+        let frame = control_rx.try_recv().expect("a frame was sent");
+        match frame.kind {
+            Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
+                assert!(resume.cursors.is_empty(), "no slot formed a contiguous prefix");
+                assert!(
+                    resume.resuming,
+                    "the gap does not erase the session's forward-gate history",
+                );
+            }
+            other => panic!("expected MeshResumeCursors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
+        // The ring holds a mix of origins for the same slot (whichever copy won
+        // the topological dedup); a resume reply must carry only the `Local`
+        // ones -- the no-echo rule a mesh reply is not allowed to violate.
+        let mesh = new_mesh_state();
+        let key = control_key();
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 0,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+        );
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 1,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Mesh,
+        );
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 2,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+        );
+
+        let mut joined = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: register_mesh_link(
+                    &mesh.links,
+                    key.clone(),
+                    mpsc::channel(1).0,
+                    mpsc::unbounded_channel().0,
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+            },
+        );
+
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+                rally_point_proto::messages::MeshResumeCursors {
+                    cursors: vec![rally_point_proto::messages::MeshResumeCursor {
+                        origin_slot: 0,
+                        next_seq: 0,
+                    }],
+                    // A listed slot's cursor is honored by seq either way --
+                    // `resuming` only changes the answer for a slot the
+                    // cursors omit, and every recorded slot here is listed.
+                    resuming: false,
+                },
+            )),
+        };
+
+        let (got_key, payloads) =
+            resume_replay_for_frame(&frame, &joined, &mesh).expect("something to replay");
+        assert_eq!(got_key, key);
+        assert_eq!(
+            payloads.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 2],
+            "only the two locally-originated seqs are replayed",
+        );
+    }
+
+    #[test]
+    fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resuming() {
+        // The mesh-side counterpart of `TurnRing::replay_local`'s own unit test,
+        // but exercised through the actual wire frame and `resume_replay_for_frame`
+        // -- proves the `resuming` bit is correctly read off the frame and
+        // threaded through, not just that `TurnRing` honors it in isolation.
+        let mesh = new_mesh_state();
+        let key = control_key();
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 0,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+        );
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 1,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+        );
+
+        let mut joined = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: register_mesh_link(
+                    &mesh.links,
+                    key.clone(),
+                    mpsc::channel(1).0,
+                    mpsc::unbounded_channel().0,
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+            },
+        );
+
+        // Slot 0 is entirely unlisted in both asks -- this relay's own
+        // gap-tracking never formed a contiguous prefix for it before the
+        // asker's link died.
+        let non_resuming_ask = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+                rally_point_proto::messages::MeshResumeCursors {
+                    cursors: vec![],
+                    resuming: false,
+                },
+            )),
+        };
+        assert!(
+            resume_replay_for_frame(&non_resuming_ask, &joined, &mesh).is_none(),
+            "a first-join ask with an unlisted slot still replays nothing for it",
+        );
+
+        let resuming_ask = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+                rally_point_proto::messages::MeshResumeCursors {
+                    cursors: vec![],
+                    resuming: true,
+                },
+            )),
+        };
+        let (_, payloads) = resume_replay_for_frame(&resuming_ask, &joined, &mesh)
+            .expect("a resuming ask replays the unlisted slot from the start");
+        assert_eq!(
+            payloads.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            vec![0, 1],
+        );
+    }
+
+    #[test]
+    fn resume_replay_is_none_for_an_unjoined_session_or_an_empty_result() {
+        let mesh = new_mesh_state();
+        let key = control_key();
+        let joined = HashMap::new();
+
+        let empty_ask = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+                rally_point_proto::messages::MeshResumeCursors {
+                    cursors: vec![],
+                    resuming: false,
+                },
+            )),
+        };
+        assert!(
+            resume_replay_for_frame(&empty_ask, &joined, &mesh).is_none(),
+            "an unjoined session has no key to reply under",
+        );
+
+        // A different frame kind is never mistaken for a resume ask.
+        let other = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SessionStart(
+                rally_point_proto::messages::SessionStart::default(),
+            )),
+        };
+        assert!(resume_replay_for_frame(&other, &joined, &mesh).is_none());
+    }
+
+    #[test]
+    fn a_first_joins_empty_cursors_ask_for_no_replay_even_on_a_populated_ring() {
+        // A first-join peer's cursor frame carries no entries AND `resuming =
+        // false` (proven by
+        // `reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join`
+        // above); this proves the receiving side honors that absent-means-nothing
+        // semantic even when it has plenty it COULD reply with -- a newly-added
+        // relay's own clients get their backfill from their own client-side
+        // reconnect, not from a mesh peer's unsolicited replay. Contrast
+        // `resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resuming`,
+        // where the identical empty cursor list means the opposite because
+        // `resuming` is true there.
+        let mesh = new_mesh_state();
+        let key = control_key();
+        mesh.turn_ring.record(
+            &key,
+            &Payload {
+                slot: 0,
+                seq: 0,
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+        );
+
+        let mut joined = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: register_mesh_link(
+                    &mesh.links,
+                    key.clone(),
+                    mpsc::channel(1).0,
+                    mpsc::unbounded_channel().0,
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+            },
+        );
+
+        let first_join_ask = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
+                rally_point_proto::messages::MeshResumeCursors {
+                    cursors: vec![],
+                    resuming: false,
+                },
+            )),
+        };
+        assert!(
+            resume_replay_for_frame(&first_join_ask, &joined, &mesh).is_none(),
+            "a non-resuming empty cursor map replays nothing, regardless of what the ring holds",
+        );
+    }
+
+    #[test]
+    fn resume_cursor_snapshot_survives_the_links_own_registration_ending() {
+        // The forward-gate cursors live in `SeenRegistries`, a session-keyed
+        // registry entirely separate from `MeshLinks` -- a link dying (its
+        // `MeshLinkRegistration` dropping) must not touch the cursors a fresh
+        // link on the same session will read on its own next Join.
+        let seen = new_seen_registries();
+        let links = new_mesh_links();
+        let key = control_key();
+
+        mark_seen(&seen, &key, SlotId(0), 0);
+        mark_seen(&seen, &key, SlotId(0), 1);
+        let before = resume_cursor_snapshot(&seen, &key);
+
+        // A link registers for the session, then dies (its registration drops,
+        // deregistering it from `MeshLinks` -- the RAII path a redial's old
+        // link and this test both exercise).
+        let registration = register_mesh_link(
+            &links,
+            key.clone(),
+            mpsc::channel(1).0,
+            mpsc::unbounded_channel().0,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        drop(registration);
+        assert!(
+            links.lock().get(&key).is_none(),
+            "the dead link's registration is gone from MeshLinks",
+        );
+
+        assert_eq!(
+            resume_cursor_snapshot(&seen, &key),
+            before,
+            "the cursors a fresh link's Join will read are unaffected by the dead link",
+        );
+    }
+
     /// An oversize turn arriving over the mesh control stream folds back into
     /// the normal receive path — its frame feeds the consensus coordinate and
     /// the topological dedup marks it delivered (so a copy arriving by any
@@ -3093,7 +3724,8 @@ mod tests {
                 &turn_ring,
                 &key,
                 SlotId(0),
-                first.clone()
+                first.clone(),
+                crate::turn_ring::TurnOrigin::Local,
             )
             .is_some(),
             "the first delivery is fresh",
@@ -3106,7 +3738,8 @@ mod tests {
                 &turn_ring,
                 &key,
                 SlotId(0),
-                first
+                first,
+                crate::turn_ring::TurnOrigin::Local,
             )
             .is_none(),
             "the redelivery is caught by mark_seen and never reaches the comparator",
@@ -3126,6 +3759,7 @@ mod tests {
             &key,
             SlotId(1),
             sync_payload(0, 1, 0, value),
+            crate::turn_ring::TurnOrigin::Local,
         );
         for ordinal in 1..12u8 {
             deliver_turn_to_locals(
@@ -3136,6 +3770,7 @@ mod tests {
                 &key,
                 SlotId(0),
                 sync_payload(u64::from(ordinal), 0, ordinal, value),
+                crate::turn_ring::TurnOrigin::Local,
             );
             deliver_turn_to_locals(
                 &sessions,
@@ -3145,6 +3780,7 @@ mod tests {
                 &key,
                 SlotId(1),
                 sync_payload(u64::from(ordinal), 1, ordinal, value),
+                crate::turn_ring::TurnOrigin::Local,
             );
         }
 

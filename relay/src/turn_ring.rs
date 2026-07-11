@@ -77,11 +77,37 @@ const TURN_RING_MAX_TURNS: usize =
 /// the count bound.
 const TURN_RING_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Where a recorded turn reached this relay from — stamped once, at the
+/// moment it wins the topological dedup and is recorded here, rather than
+/// re-derived later from some other state. Re-deriving it later (e.g. from
+/// whether the origin slot is *currently* a locally-registered client) would
+/// get a genuinely mesh-delivered turn wrong in the window right around a
+/// re-home or a race between a client's own send and a redundant mesh copy of
+/// the same turn: the topological dedup keeps whichever copy of a `(slot,
+/// seq)` arrives first, and for a slot homed here that can legitimately be
+/// the mesh copy if it happens to win the race — so "is this slot local" is
+/// not the same question as "did THIS entry arrive locally". A resume reply
+/// must answer the second question, entry by entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOrigin {
+    /// Delivered by this relay's own client edge — a local client produced it.
+    Local,
+    /// Delivered by a peer relay over the mesh — forwarded, not originated
+    /// here, regardless of which slot it is homed on.
+    Mesh,
+}
+
+/// One recorded turn plus where it came in from.
+struct Entry {
+    payload: Payload,
+    origin: TurnOrigin,
+}
+
 /// One session's recorded turns, oldest at the front. `bytes` tracks the running
 /// sum of the turns' command lengths so eviction never rescans the deque.
 #[derive(Default)]
 struct SessionRing {
-    turns: VecDeque<Payload>,
+    turns: VecDeque<Entry>,
     bytes: usize,
 }
 
@@ -92,16 +118,16 @@ impl SessionRing {
         payload.commands.len()
     }
 
-    /// Records `payload` and evicts oldest turns until both the count and byte
-    /// bounds hold.
-    fn record(&mut self, payload: Payload) {
+    /// Records `payload` (tagged with where it came from) and evicts oldest
+    /// turns until both the count and byte bounds hold.
+    fn record(&mut self, payload: Payload, origin: TurnOrigin) {
         self.bytes += Self::cost(&payload);
-        self.turns.push_back(payload);
+        self.turns.push_back(Entry { payload, origin });
         while self.turns.len() > TURN_RING_MAX_TURNS || self.bytes > TURN_RING_MAX_BYTES {
             let Some(evicted) = self.turns.pop_front() else {
                 break;
             };
-            self.bytes -= Self::cost(&evicted);
+            self.bytes -= Self::cost(&evicted.payload);
         }
     }
 }
@@ -121,17 +147,19 @@ impl TurnRing {
         Self::default()
     }
 
-    /// Records one forwarded turn for `key`. Called once per distinct `(slot, seq)`
-    /// — at the single fan-out choke point, after the topological dedup — so a turn
-    /// the mesh delivers by more than one path is recorded exactly once. The caller
-    /// gates this on the session having started; pre-start lobby traffic has its own
-    /// replay log and must not be double-buffered here.
-    pub fn record(&self, key: &SessionKey, payload: &Payload) {
+    /// Records one forwarded turn for `key`, tagged with where it came from
+    /// (see [`TurnOrigin`]). Called once per distinct `(slot, seq)` — at the
+    /// single fan-out choke point, after the topological dedup — so a turn
+    /// the mesh delivers by more than one path is recorded exactly once,
+    /// under whichever origin the winning copy actually arrived by. The
+    /// caller gates this on the session having started; pre-start lobby
+    /// traffic has its own replay log and must not be double-buffered here.
+    pub fn record(&self, key: &SessionKey, payload: &Payload, origin: TurnOrigin) {
         self.sessions
             .lock()
             .entry(key.clone())
             .or_default()
-            .record(payload.clone());
+            .record(payload.clone(), origin);
     }
 
     /// The recorded turns a reconnecting client has not yet received, oldest-first.
@@ -141,21 +169,77 @@ impl TurnRing {
     /// and its seq is at or past that slot's cursor. A slot absent from `cursors` is
     /// not replayed (the client did not ask to resume it), so an empty map — a fresh
     /// dial — replays nothing. Oldest-first preserves each slot's seq order for the
-    /// client's per-slot reorder buffer.
+    /// client's per-slot reorder buffer. Every origin qualifies: a reconnecting
+    /// client wants everything it missed regardless of which mesh path (if any)
+    /// first delivered it here.
+    ///
+    /// A client's own inbound gaps have a second re-carrier besides this replay
+    /// — its own unacked-window redundancy, riding its live home-relay link — so
+    /// an absent slot here always safely means "nothing to replay", with no
+    /// resume-vs-fresh distinction to make. [`replay_local`](Self::replay_local)
+    /// (the mesh peer's reply) has no such second re-carrier and needs one; see
+    /// its own doc.
     pub fn replay(&self, key: &SessionKey, cursors: &HashMap<SlotId, u64>) -> Vec<Payload> {
+        self.matching(key, cursors, None, false)
+    }
+
+    /// Like [`replay`](Self::replay), but additionally restricted to turns this
+    /// relay recorded as [`TurnOrigin::Local`] — the reply a resume-cursor ask
+    /// from a mesh peer gets, so the reply can only ever carry turns this
+    /// relay's own client edge produced, never one it itself received from the
+    /// mesh. That is what keeps a resume reply from becoming an echo: a mesh
+    /// peer's cursors are answered only with what genuinely originated here.
+    ///
+    /// `resuming` decides what a slot absent from `cursors` means, and it is
+    /// not the same "nothing to replay" [`replay`](Self::replay) can always
+    /// assume: a mesh peer's own inbound gaps have no second re-carrier once
+    /// the link that would have re-carried them has died (unlike a client's,
+    /// covered by its still-live home-relay link's own redundancy), so an
+    /// asker with genuine prior history for the session (`resuming` true)
+    /// needs an absent slot answered from the very start — its own dedup
+    /// absorbs whatever sparse overlap it already has — while an asker with
+    /// none at all (`resuming` false: a first Join, or one predating this
+    /// link) still gets nothing for an absent slot, exactly as `replay` would.
+    pub fn replay_local(
+        &self,
+        key: &SessionKey,
+        cursors: &HashMap<SlotId, u64>,
+        resuming: bool,
+    ) -> Vec<Payload> {
+        self.matching(key, cursors, Some(TurnOrigin::Local), resuming)
+    }
+
+    /// Shared body for [`replay`](Self::replay) and
+    /// [`replay_local`](Self::replay_local): every recorded turn at or past its
+    /// slot's cursor, oldest-first, additionally restricted to `origin` when one
+    /// is given. `replay_absent_from_zero` governs a slot absent from `cursors`:
+    /// excluded when `false` (the cursor asker never named it), included from
+    /// seq 0 when `true` (an asker with real history whose own gap-tracking
+    /// simply never covered this slot).
+    fn matching(
+        &self,
+        key: &SessionKey,
+        cursors: &HashMap<SlotId, u64>,
+        origin: Option<TurnOrigin>,
+        replay_absent_from_zero: bool,
+    ) -> Vec<Payload> {
         let sessions = self.sessions.lock();
         let Some(ring) = sessions.get(key) else {
             return Vec::new();
         };
         ring.turns
             .iter()
-            .filter(|payload| {
-                u8::try_from(payload.slot)
-                    .ok()
-                    .and_then(|slot| cursors.get(&SlotId(slot)))
-                    .is_some_and(|cursor| payload.seq >= *cursor)
+            .filter(|entry| origin.is_none_or(|want| entry.origin == want))
+            .filter(|entry| {
+                let Ok(slot) = u8::try_from(entry.payload.slot) else {
+                    return false;
+                };
+                match cursors.get(&SlotId(slot)) {
+                    Some(&cursor) => entry.payload.seq >= cursor,
+                    None => replay_absent_from_zero,
+                }
             })
-            .cloned()
+            .map(|entry| entry.payload.clone())
             .collect()
     }
 
@@ -206,6 +290,13 @@ mod tests {
         }
     }
 
+    /// [`TurnRing::record`] with the origin most of these tests don't care
+    /// about — they exercise the cursor/bound mechanics, which behave
+    /// identically regardless of origin.
+    fn record_local(ring: &TurnRing, key: &SessionKey, payload: &Payload) {
+        ring.record(key, payload, TurnOrigin::Local);
+    }
+
     #[test]
     fn the_count_bound_is_at_least_the_full_nominal_window() {
         // The whole point of deriving the bound from the nominal window is that the
@@ -228,10 +319,10 @@ mod tests {
         let k = key();
         // Slot 0 produces seqs 0..4; slot 1 produces seqs 0..2.
         for seq in 0..4 {
-            ring.record(&k, &turn(0, seq, 8));
+            record_local(&ring, &k, &turn(0, seq, 8));
         }
         for seq in 0..2 {
-            ring.record(&k, &turn(1, seq, 8));
+            record_local(&ring, &k, &turn(1, seq, 8));
         }
 
         // A client that has slot 0 through seq 1 and slot 2 not at all: replay slot
@@ -247,7 +338,7 @@ mod tests {
         let ring = TurnRing::new();
         let k = key();
         for seq in 0..5 {
-            ring.record(&k, &turn(0, seq, 8));
+            record_local(&ring, &k, &turn(0, seq, 8));
         }
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
         let seqs: Vec<u64> = ring.replay(&k, &cursors).iter().map(|p| p.seq).collect();
@@ -258,7 +349,7 @@ mod tests {
     fn an_empty_cursor_map_replays_nothing() {
         let ring = TurnRing::new();
         let k = key();
-        ring.record(&k, &turn(0, 0, 8));
+        record_local(&ring, &k, &turn(0, 0, 8));
         assert!(ring.replay(&k, &HashMap::new()).is_empty());
     }
 
@@ -271,7 +362,7 @@ mod tests {
         // seqs are the ones dropped.
         let overflow = 5;
         for seq in 0..(TURN_RING_MAX_TURNS + overflow) as u64 {
-            ring.record(&k, &turn(0, seq, 1));
+            record_local(&ring, &k, &turn(0, seq, 1));
         }
         assert_eq!(
             ring.len(&k),
@@ -298,7 +389,7 @@ mod tests {
         let big = 64 * 1024;
         let per = TURN_RING_MAX_BYTES / big;
         for seq in 0..(per + 3) as u64 {
-            ring.record(&k, &turn(0, seq, big));
+            record_local(&ring, &k, &turn(0, seq, big));
         }
         assert!(ring.len(&k) <= per, "the byte bound capped the count");
         assert!(
@@ -323,9 +414,98 @@ mod tests {
     fn ending_a_session_drops_its_ring() {
         let ring = TurnRing::new();
         let k = key();
-        ring.record(&k, &turn(0, 0, 8));
+        record_local(&ring, &k, &turn(0, 0, 8));
         ring.end_session(&k);
         assert_eq!(ring.len(&k), 0);
         assert!(ring.replay(&k, &[(SlotId(0), 0)].into()).is_empty());
+    }
+
+    #[test]
+    fn replay_local_excludes_mesh_delivered_entries() {
+        // A slot's turns can be recorded under either origin depending on which
+        // copy actually won the topological dedup, regardless of which slot they
+        // are for. `replay` (the client-facing form) doesn't care; `replay_local`
+        // (the mesh resume-reply form) must only ever return the `Local` ones.
+        let ring = TurnRing::new();
+        let k = key();
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh);
+        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local);
+
+        let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
+        assert_eq!(
+            ring.replay(&k, &cursors)
+                .iter()
+                .map(|p| p.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the client-facing replay includes every origin",
+        );
+        assert_eq!(
+            ring.replay_local(&k, &cursors, false)
+                .iter()
+                .map(|p| p.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 2],
+            "the mesh resume reply skips the mesh-delivered entry",
+        );
+    }
+
+    #[test]
+    fn replay_local_of_an_all_mesh_slot_is_empty() {
+        // A slot every recorded entry arrived by mesh (this relay never hosts
+        // that slot's client) has nothing this relay may reply with — a mesh
+        // peer's ask for it is answered by whichever relay actually homes it.
+        // True regardless of `resuming`: a listed cursor is honored by seq, an
+        // absent one by `resuming`, but the origin filter excludes every entry
+        // here either way.
+        let ring = TurnRing::new();
+        let k = key();
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Mesh);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh);
+
+        let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
+        assert!(ring.replay_local(&k, &cursors, false).is_empty());
+        assert!(ring.replay_local(&k, &cursors, true).is_empty());
+
+        let no_cursor: HashMap<SlotId, u64> = HashMap::new();
+        assert!(
+            ring.replay_local(&k, &no_cursor, true).is_empty(),
+            "an all-mesh slot has nothing Local to replay even unlisted-from-0",
+        );
+    }
+
+    #[test]
+    fn replay_local_answers_an_unlisted_slot_from_zero_only_when_resuming() {
+        // The gap a mesh-side death leaves behind with no other re-carrier:
+        // this relay's Local turns for slot 0 were never listed in the
+        // asker's cursors at all (its own forward-gate tracking never formed
+        // a contiguous prefix for that slot). A non-resuming ask (first Join)
+        // gets nothing for it, exactly like any other absent slot; a resuming
+        // ask (real prior history, just not for this slot) gets everything
+        // from the start, relying on the asker's own dedup to absorb whatever
+        // sparse overlap it already has.
+        let ring = TurnRing::new();
+        let k = key();
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Local);
+        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local);
+
+        // Slot 0 is entirely absent from the cursor map -- unlisted, not
+        // listed-at-zero.
+        let cursors: HashMap<SlotId, u64> = HashMap::new();
+
+        assert!(
+            ring.replay_local(&k, &cursors, false).is_empty(),
+            "a non-resuming ask replays nothing for an unlisted slot",
+        );
+        assert_eq!(
+            ring.replay_local(&k, &cursors, true)
+                .iter()
+                .map(|p| p.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "a resuming ask replays an unlisted slot's Local turns from the start",
+        );
     }
 }
