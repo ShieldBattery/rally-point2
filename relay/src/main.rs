@@ -25,7 +25,7 @@ use std::time::Duration;
 use clap::Parser;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
-use rally_point_proto::control::RelayHello;
+use rally_point_proto::control::{RegionId, RelayHello};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::ProtocolVersion;
 use rally_point_relay::config::{
@@ -154,6 +154,15 @@ struct Cli {
     /// production.
     #[arg(long, env = "RELAY_FLIGHT_DIR")]
     flight_dir: Option<std::path::PathBuf>,
+
+    /// The region this relay serves, sent to the coordinator in the enroll
+    /// `Hello`. Must be one of the coordinator's configured region ids, or the
+    /// coordinator refuses the control connection (close code 4002) — a typo'd tag
+    /// that silently serves nobody is worse than a failed enroll. Absent = an
+    /// untagged relay (dev/loopback, or a coordinator with no region config): it
+    /// enrolls unconditionally and is only ever the region-blind fallback pick.
+    #[arg(long, env = "RELAY_REGION")]
+    region: Option<String>,
 }
 
 /// How long the drain sequence waits for the coordinator's `DrainAck` before
@@ -382,7 +391,7 @@ async fn main() -> Result<()> {
             // coordinator's version instead of being refused, and the complete
             // advertised address set (empty for a single-address relay), so a
             // dual-stack relay's consumers can pick a family.
-            let relay_hello = RelayHello::new(
+            let mut relay_hello = RelayHello::new(
                 RelayId(our_id),
                 advertise_addr,
                 ProtocolVersion::CURRENT,
@@ -390,6 +399,9 @@ async fn main() -> Result<()> {
             )
             .with_min_protocol(ProtocolVersion::MIN_SUPPORTED)
             .with_relay_addrs(advertise_addrs);
+            if let Some(region) = &cli.region {
+                relay_hello = relay_hello.with_region(RegionId(region.clone()));
+            }
             tracing::info!(
                 relay_id = our_id,
                 advertise = %advertise_addr,

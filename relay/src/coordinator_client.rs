@@ -47,7 +47,7 @@ use parking_lot::Mutex;
 use rally_point_proto::control::{
     CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
-use rally_point_proto::version::CONTROL_CLOSE_PROTOCOL_MISMATCH;
+use rally_point_proto::version::{CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -91,6 +91,12 @@ enum ControlDisconnect {
     /// (close code [`CONTROL_CLOSE_PROTOCOL_MISMATCH`]). Redial only after the far
     /// longer [`VERSION_REFUSED_RECONNECT_DELAY`] — nothing changes until a deploy.
     VersionRefused,
+    /// The coordinator refused the connection because this relay's `--region` is
+    /// not in its configured region list (close code
+    /// [`CONTROL_CLOSE_UNKNOWN_REGION`]). Like a version mismatch, hot-retrying
+    /// changes nothing — the fix is a config/deploy correction — so it backs off
+    /// the same [`VERSION_REFUSED_RECONNECT_DELAY`] rather than the ordinary delay.
+    RegionRefused,
 }
 
 /// The sessions the last-applied descriptor set named — the subscriber's removal
@@ -290,8 +296,12 @@ pub async fn run_descriptor_subscriber_with(
                 reconnect_delay
             }
             // Already logged (with the coordinator's reason) where the close frame
-            // was read; only the far longer backoff is decided here.
-            Ok(ControlDisconnect::VersionRefused) => version_refused_delay,
+            // was read; only the far longer backoff is decided here. A version
+            // mismatch and an unknown region are both operator-fix-not-redial
+            // refusals, so they share the long backoff.
+            Ok(ControlDisconnect::VersionRefused | ControlDisconnect::RegionRefused) => {
+                version_refused_delay
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -418,6 +428,20 @@ async fn connect_and_stream(
                                 "coordinator refused our protocol version; backing off until a deploy resolves the skew",
                             );
                             return Ok(ControlDisconnect::VersionRefused);
+                        }
+                        // An unknown-region refusal is the sibling of the version
+                        // mismatch: the coordinator will keep refusing until its
+                        // region config (or this relay's `--region`) is corrected, so
+                        // back off long rather than hot-redialing the same refusal.
+                        if let Some(frame) = &frame
+                            && u16::from(frame.code) == CONTROL_CLOSE_UNKNOWN_REGION
+                        {
+                            tracing::error!(
+                                relay_id = relay_id.0,
+                                reason = %frame.reason,
+                                "coordinator refused our region; backing off until the region config is fixed",
+                            );
+                            return Ok(ControlDisconnect::RegionRefused);
                         }
                         break;
                     }
@@ -1441,6 +1465,39 @@ mod tests {
         assert!(
             gap >= Duration::from_millis(400),
             "a version refusal must wait the refusal backoff, not the ordinary \
+             reconnect delay (observed gap: {gap:?})",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_region_close_waits_the_refusal_backoff_before_redialing() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        // The coordinator refuses every connection with the unknown-region close —
+        // like a version mismatch, a redial changes nothing until the config is
+        // fixed, so the relay must wait the long refusal backoff, not the ordinary
+        // reconnect delay.
+        let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
+            code: CloseCode::from(CONTROL_CLOSE_UNKNOWN_REGION),
+            reason: "unknown region: region-z".into(),
+        }))
+        .await;
+
+        spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
+
+        let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the first dial arrives")
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the relay eventually redials")
+            .unwrap();
+        let gap = second.duration_since(first);
+        assert!(
+            gap >= Duration::from_millis(400),
+            "an unknown-region refusal must wait the refusal backoff, not the ordinary \
              reconnect delay (observed gap: {gap:?})",
         );
     }
