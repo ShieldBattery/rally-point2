@@ -199,15 +199,37 @@ impl AckManager {
         // so we never overrun the datagram budget.
         let mut used = packet.encoded_len();
 
+        // The `(slot, seq)` of every payload placed in this packet, in push order,
+        // so the sent-packets record keys on the same `SlotId` each payload was
+        // tracked under instead of narrowing the wire slot a second time.
+        let mut payload_keys: Vec<(SlotId, u64)> = Vec::new();
+
         // The fresh payload is included verbatim. Its `(slot, seq)` origin identity
-        // is already assigned upstream and is never rewritten here.
-        let fresh = payload.map(|p| {
-            let len = p.encoded_len();
-            (p, len)
+        // is already assigned upstream and is never rewritten here. Its wire slot
+        // must fit a `SlotId` to be tracked without aliasing onto a different
+        // slot's bookkeeping: a truncating narrowing would map slot `256 + n` onto
+        // slot `n`'s window while the wire payload kept its original value. The send
+        // layer refuses an out-of-range slot before building a packet for it, so a
+        // payload reaching here with one is malformed and is dropped from both the
+        // wire and the bookkeeping together — never tracked under an aliased key
+        // while riding a datagram.
+        let fresh = payload.and_then(|p| match u8::try_from(p.slot) {
+            Ok(raw) => {
+                let len = p.encoded_len();
+                Some((SlotId(raw), p, len))
+            }
+            Err(_) => {
+                tracing::debug!(
+                    slot = p.slot,
+                    "dropping outbound payload whose slot is out of SlotId range"
+                );
+                None
+            }
         });
-        if let Some((p, len)) = &fresh {
+        if let Some((slot, p, len)) = &fresh {
             used += payload_element_len(*len);
             packet.payloads.push(p.clone());
+            payload_keys.push((*slot, p.seq));
         }
 
         // Refill with still-unacked payloads, least-resent-first: a run of
@@ -224,9 +246,10 @@ impl AckManager {
         // their underlying `(slot, seq)` order — oldest per slot first,
         // exactly as before. The fresh payload isn't in `unacked_payloads`
         // yet, so it can't double up.
-        let mut candidates: Vec<&mut SentPayload> = self.unacked_payloads.values_mut().collect();
-        candidates.sort_by_key(|sent| sent.send_count);
-        for sent in candidates {
+        let mut candidates: Vec<(&(SlotId, u64), &mut SentPayload)> =
+            self.unacked_payloads.iter_mut().collect();
+        candidates.sort_by_key(|(_, sent)| sent.send_count);
+        for (key, sent) in candidates {
             let element = payload_element_len(sent.encoded_len);
             if used + element > max_packet_len {
                 continue;
@@ -234,12 +257,13 @@ impl AckManager {
             sent.send_count += 1;
             used += element;
             packet.payloads.push(sent.payload.clone());
+            payload_keys.push(*key);
         }
 
         // Record the fresh payload as unacked only after the redundancy pass.
-        if let Some((p, len)) = fresh {
+        if let Some((slot, p, len)) = fresh {
             self.unacked_payloads.insert(
-                (SlotId(p.slot as u8), p.seq),
+                (slot, p.seq),
                 SentPayload {
                     send_count: 1,
                     encoded_len: len,
@@ -251,11 +275,7 @@ impl AckManager {
         self.sent_packets.insert(
             u64::from(packet.seq),
             SentPacket {
-                payload_slots_seqs: packet
-                    .payloads
-                    .iter()
-                    .map(|p| (SlotId(p.slot as u8), p.seq))
-                    .collect(),
+                payload_slots_seqs: payload_keys.into(),
             },
         );
 
@@ -351,7 +371,19 @@ impl AckManager {
     /// it.
     pub fn reinject_unacked(&mut self, payload: Payload) {
         use std::collections::btree_map::Entry;
-        let key = (SlotId(payload.slot as u8), payload.seq);
+        // The wire slot must fit a `SlotId` to be tracked without aliasing onto a
+        // different slot's window: a truncating narrowing would map slot `256 + n`
+        // onto slot `n`. A turn a client produced always names its own in-range
+        // slot, so one that does not is malformed and is dropped rather than
+        // re-injected under an aliased key.
+        let Ok(raw) = u8::try_from(payload.slot) else {
+            tracing::debug!(
+                slot = payload.slot,
+                "dropping re-injected payload whose slot is out of SlotId range"
+            );
+            return;
+        };
+        let key = (SlotId(raw), payload.seq);
         if let Entry::Vacant(vacant) = self.unacked_payloads.entry(key) {
             let encoded_len = payload.encoded_len();
             vacant.insert(SentPayload {
@@ -692,6 +724,44 @@ mod tests {
         assert_eq!(manager.payloads_in_flight(), 1);
         manager.reinject_unacked(test_payload(0, 0));
         assert_eq!(manager.payloads_in_flight(), 1);
+    }
+
+    #[test]
+    fn an_out_of_range_slot_does_not_alias_another_slots_bookkeeping() {
+        // A wire slot past `u8` range narrows to a valid slot under a raw `as u8`
+        // (256 becomes slot 0), so tracking it would silently poison that slot's
+        // window while the forwarded wire payload kept its original slot. It must
+        // instead be dropped from the bookkeeping entirely.
+        let mut manager = AckManager::new();
+        // A genuine slot-0 turn establishes slot 0's window at seq 5.
+        manager.build_outgoing(Some(test_payload(0, 5)), MTU);
+        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(5));
+
+        // Slot 256 aliases onto slot 0 under a truncating cast; seq 3 would then
+        // become slot 0's new oldest unacked seq.
+        let aliasing = Payload {
+            seq: 3,
+            slot: 256,
+            commands: vec![0u8; 4].into(),
+            ..Default::default()
+        };
+        let packet = manager.build_outgoing(Some(aliasing), MTU);
+
+        // Slot 0's bookkeeping is untouched: its oldest unacked seq is still 5, and
+        // only the one genuine turn is in flight.
+        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(5));
+        assert_eq!(manager.payloads_in_flight(), 1);
+        // The malformed payload rode no datagram either, so the packet carries only
+        // the genuine slot-0 turn as redundancy.
+        assert!(
+            packet.payloads.iter().all(|p| p.slot == 0 && p.seq == 5),
+            "the out-of-range payload must not ride the wire: {:?}",
+            packet
+                .payloads
+                .iter()
+                .map(|p| (p.slot, p.seq))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

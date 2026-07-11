@@ -304,6 +304,14 @@ impl MeshLink {
         // [`payload_fits`](Self::payload_fits) and diverts oversize turns to the
         // mesh control stream before ever calling `send`.
         if let Some(p) = &payload {
+            // A wire slot that doesn't fit a `SlotId` can't be tracked without
+            // narrowing it onto a different, valid slot's bookkeeping, so it is
+            // refused whole before any send-side state is built for it — the
+            // outbound mirror of the ingress path's rejection of an out-of-range
+            // received slot.
+            if u8::try_from(p.slot).is_err() {
+                return Err(MeshLinkError::MalformedSlot(p.slot));
+            }
             let needed = crate::ack_manager::lone_packet_len(p);
             if needed > packet_budget {
                 return Err(MeshLinkError::PayloadTooLarge {

@@ -317,6 +317,15 @@ impl Link {
         // that payload fit when checked, is registered, and its refusal is a
         // recoverable loss the next (smaller) bundle re-carries.
         if let Some(p) = &payload {
+            // A wire slot that doesn't fit a `SlotId` can't be tracked without
+            // narrowing it onto a different, valid slot's bookkeeping, so it is
+            // refused whole before any send-side state is built for it — the
+            // outbound mirror of the ingress path's rejection of an out-of-range
+            // received slot. The real game client only ever stamps its own in-range
+            // slot, so this is a malformed or hostile payload.
+            if u8::try_from(p.slot).is_err() {
+                return Err(LinkError::MalformedSlot(p.slot));
+            }
             let needed = crate::ack_manager::lone_packet_len(p);
             if needed > budget {
                 return Err(LinkError::PayloadTooLarge { needed, budget });
@@ -1355,6 +1364,27 @@ mod tests {
             Err(LinkError::MalformedSlot(slot)) => assert_eq!(slot, 300),
             other => panic!("expected MalformedSlot, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_rejects_a_payload_whose_wire_slot_does_not_fit_a_slot_id() {
+        let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
+
+        // A wire slot past `u8` range is refused before any send-side state is
+        // built for it, rather than narrowed onto a different, valid slot's
+        // bookkeeping (`300 as u8` would alias onto slot 44).
+        let malformed = Payload {
+            seq: 0,
+            slot: 300,
+            commands: vec![1].into(),
+            ..Default::default()
+        };
+        match client.send(Some(malformed)) {
+            Err(LinkError::MalformedSlot(slot)) => assert_eq!(slot, 300),
+            other => panic!("expected MalformedSlot, got {other:?}"),
+        }
+        // Nothing was tracked: the refused turn never entered the unacked window.
+        assert_eq!(client.payloads_in_flight(), 0);
     }
 
     #[tokio::test]
