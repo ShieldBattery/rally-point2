@@ -517,7 +517,18 @@ impl LinkDriver {
         // re-dials (so no resume anchor is ever computed from the unacked window).
         // It stamps slot 0 — the value the embedder already sends and the relay
         // rewrites to the authorized slot on ingress — preserving prior behavior.
-        Self::session(&mut link, &mut seam, &mut state, SlotId(0)).await
+        let result = Self::session(&mut link, &mut seam, &mut state, SlotId(0)).await;
+        // Every exit ends this driver, so close the connection on the error
+        // exits too (`session` already closed it on `Ok`): the relay's
+        // slot-liveness signal is the connection, not this driver's local
+        // state, so an unclosed handle would hold the relay-side slot until
+        // QUIC's own idle timeout. Done here, not inside `session`, so the
+        // error's classification always reads the connection state the failure
+        // actually left behind.
+        if result.is_err() {
+            link.connection().close(0u32.into(), b"driver ended");
+        }
+        result
     }
 
     /// Runs the link and, on a mid-session link failure, re-dials the home relay
@@ -607,6 +618,18 @@ impl LinkDriver {
                 Ok(()) => return Ok(()),
                 // A link/stream failure: keep the channels alive and re-dial.
                 Err(error) if is_link_failure(&error) => {
+                    // Close the failed connection now that it is classified.
+                    // After a control-stream-only death the connection is still
+                    // alive, and the relay's slot-liveness signal is the
+                    // connection — an unclosed one holds the roster seat, so
+                    // the immediate re-dial below would bounce off SLOT_TAKEN
+                    // until QUIC's idle timeout. Closed here, never inside
+                    // `session`, so classification (and the distinction between
+                    // a dead control stream and a dead connection it rests on)
+                    // always reads the state the failure actually left behind.
+                    // A no-op when the connection itself is what died.
+                    link.connection()
+                        .close(0u32.into(), b"re-dialing after link failure");
                     let _ = seam.connectivity.send((own_slot, false)).await;
                     match reconnect_link(&mut rc, &mut link, &mut seam, &mut state, &mut backoff)
                         .await
@@ -621,8 +644,13 @@ impl LinkDriver {
                 }
                 // A non-link failure (stalled game, exhausted window) or a terminal
                 // relay refusal surfaced from within the session: reconnecting can't
-                // help, so end.
-                Err(error) => return Err(error),
+                // help, so end — closing the connection, which may be perfectly
+                // healthy, so the relay frees this slot promptly instead of
+                // serving a driver that has given up until its idle timeout.
+                Err(error) => {
+                    link.connection().close(0u32.into(), b"driver ended");
+                    return Err(error);
+                }
             }
         }
     }
@@ -663,12 +691,13 @@ impl LinkDriver {
         // QUIC's own idle timeout. Closing here wakes those readers, freeing
         // them and the slot promptly.
         //
-        // Deliberately NOT done on an `Err` exit: a link/control-stream
-        // failure's own reconnect path re-dials a fresh connection (or the
-        // driver ends and every handle simply drops), and closing the
-        // now-failed connection out from under the caller here would blur the
-        // "control stream died, connection didn't" distinction the reconnect
-        // classification (`is_link_failure`) and its own tests rely on.
+        // Deliberately NOT done on an `Err` exit: closing the connection out
+        // from under the caller here would blur the "control stream died,
+        // connection didn't" distinction the reconnect classification
+        // (`is_link_failure`) and its own tests rely on. The callers own the
+        // error-path close instead -- `run`/`run_reconnecting` close the
+        // connection once the error is classified, so the relay-side slot is
+        // freed promptly there too.
         if result.is_ok() {
             link.connection().close(0u32.into(), b"session ended");
         }
@@ -2492,9 +2521,12 @@ mod tests {
             "a dead control stream must be reconnect-eligible, like a broken link",
         );
 
-        // The connection itself was never closed -- proof this is a control-
-        // stream-only death, not a whole-link failure in disguise: the
-        // reconnect loop's own re-dial is what actually tears it down.
+        // The connection itself was never closed by `session` -- proof this is
+        // a control-stream-only death, not a whole-link failure in disguise.
+        // The close is the caller's job, after classification:
+        // `run_reconnecting` closes it before re-dialing (see the test below),
+        // and closing it in here instead would destroy the very distinction
+        // this asserts.
         assert!(
             link.connection().close_reason().is_none(),
             "the underlying connection must stay alive; only the control stream died",
@@ -2503,6 +2535,81 @@ mod tests {
         // Held for the whole test so the game-facing channel halves stay open
         // throughout `session()` -- nothing here exercises them, but a premature
         // drop would close `seam`'s peers and risk a different, unrelated exit.
+        drop(chan_a);
+    }
+
+    /// A token-shaped identity for driving `run_reconnecting` against fakes: the
+    /// signature is never presented to a verifier here, so a zeroed one is fine —
+    /// the driver itself only reads the claims (its own slot, the expiry).
+    fn fake_identity(slot: SlotId) -> crate::identity::Identity {
+        use rally_point_proto::control::TenantId;
+        use rally_point_proto::ids::SessionId;
+        use rally_point_proto::token::{
+            ClientPublicKey, ExpiresAt, KeyId, Signature, SignedToken, TokenClaims,
+        };
+
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let claims = TokenClaims::new(
+            TenantId("test".to_owned()),
+            SessionId(1),
+            slot,
+            ExpiresAt(u64::MAX),
+            ClientPublicKey([0; 32]),
+        );
+        let token = SignedToken {
+            kid: KeyId::new("test-key".to_owned()).unwrap(),
+            claims,
+            signature: Signature([0; 64]),
+        };
+        crate::identity::Identity::from_pkcs8(token, pkcs8.as_ref()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial() {
+        // The relay's slot-liveness signal is the connection, not the client's
+        // local stream state: after a control-stream-only death the old
+        // connection is still fully alive relay-side, holding the roster seat.
+        // Unless the reconnect loop closes it once the failure is classified,
+        // the immediate re-dial bounces off SLOT_TAKEN until the relay's QUIC
+        // idle timeout finally notices. The peer here stands in for the relay:
+        // it must observe a deliberate application close, promptly.
+        let (link_a, link_b, ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+
+        // The re-dial target is unreachable on purpose: this test is about the
+        // OLD connection's fate at classification time, not the re-dial (whose
+        // own success paths the resume/re-home tests cover).
+        let reconnect = Reconnect {
+            endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
+            relay_addr: (Ipv4Addr::LOCALHOST, 1).into(),
+            server_name: "localhost".to_owned(),
+            relay_id: 7,
+            identity: fake_identity(SlotId(0)),
+            rehome: None,
+            escalate_after: None,
+            escalate_retry: None,
+        };
+        let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
+
+        // The peer opens its control stream (as the relay does) and finishes it
+        // at once: control stream dead, connection alive — the split that
+        // classifies as a reconnect-eligible link failure.
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        let _ = peer_control_send.finish();
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), link_b.connection().closed())
+            .await
+            .expect("the old connection was never closed after classification");
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "closed deliberately by the reconnect loop, not lost: {closed:?}",
+        );
+
+        // The driver is now parked re-dialing the unreachable target; the
+        // re-dial paths themselves are covered elsewhere.
+        task.abort();
         drop(chan_a);
     }
 
@@ -3269,6 +3376,17 @@ mod tests {
             Ok(joined) => assert!(matches!(joined.unwrap(), Err(DriverError::GameStalled))),
             Err(_) => panic!("driver hung on a stalled consumer instead of surfacing it"),
         }
+
+        // A terminal error ends the driver, and the ended driver must not keep
+        // holding its relay-side slot: the peer sees a deliberate close, not a
+        // connection lingering until the QUIC idle timeout.
+        let closed = tokio::time::timeout(Duration::from_secs(5), link_b.connection().closed())
+            .await
+            .expect("the ended driver never closed its connection");
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "closed deliberately by the driver, not lost: {closed:?}",
+        );
     }
 
     #[tokio::test]
