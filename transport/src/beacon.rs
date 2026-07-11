@@ -63,16 +63,28 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> mpsc::Receiver<(Slo
                     match beacon::decode_frame(&buf) {
                         Ok(frame) => {
                             // Non-blocking offer: a stuck driver (not draining)
-                            // can't stall the reader. If the channel fills, the
-                            // cursor is monotonic per slot so the latest survives
-                            // via the channel's later entries; an dropped
-                            // intermediate is harmless.
-                            if tx.try_send(frame).is_err() {
-                                // Channel closed (driver dropped its receiver) or
-                                // full (driver fell behind on beacons). Either way
-                                // stop reading — a full channel means the driver
-                                // isn't keeping up and beacons aren't the priority.
-                                return;
+                            // can't stall the reader. A momentarily full channel
+                            // must not permanently kill reverse-path retirement,
+                            // so a full channel drops just this frame and keeps
+                            // reading; only a dropped receiver ends the task.
+                            match tx.try_send(frame) {
+                                Ok(()) => {}
+                                // The driver fell briefly behind and its channel
+                                // is full. Drop this one cursor and keep reading:
+                                // the cursor is monotonic per slot and
+                                // `flush_beacon` pushes on advance, so the next
+                                // delivery advance re-sends a strictly higher
+                                // cursor for the slot — a dropped intermediate
+                                // loses nothing durable, and the reader stays
+                                // alive to carry that later value once the driver
+                                // drains. Returning here instead would strand the
+                                // link on lost acks for its whole lifetime, right
+                                // when the beacon should be rescuing it from the
+                                // terminal unacked-window cap.
+                                Err(mpsc::error::TrySendError::Full(_)) => {}
+                                // The driver dropped its receiver: the task is
+                                // orphaned with nowhere to forward, so stop.
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
                             }
                         }
                         // A malformed slot (out of SlotId range). Drop the frame
@@ -116,5 +128,126 @@ pub async fn flush_beacon(
         if beacon_send.write_all(&frame).await.is_ok() {
             last_sent.insert(slot, cursor);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::quic::{client_config, server_config};
+
+    fn self_signed() -> (
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        CertificateDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        (vec![cert_der.clone()], key, cert_der)
+    }
+
+    /// Brings up a loopback QUIC connection, returning both raw ends plus the
+    /// endpoints (kept alive by the caller). The first connection is the beacon
+    /// writer (opens the uni-stream), the second is handed to the reader.
+    async fn connected_connections() -> (
+        quinn::Connection,
+        quinn::Connection,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
+        let (chain, key, ca) = self_signed();
+        let server_cfg = server_config(chain, key).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = client_config(roots).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accept.await.unwrap();
+
+        (client_conn, server_conn, client, server)
+    }
+
+    /// A driver that briefly stops draining fills the forwarding channel. The
+    /// reader must drop the overflow and stay alive, so that a *later* cursor —
+    /// the one the beacon exists to deliver — still reaches the driver once it
+    /// resumes. The old code returned unconditionally on a full channel, which
+    /// permanently killed reverse-path retirement and stranded the link on a lost
+    /// ack until the unacked-window cap tripped.
+    #[tokio::test]
+    async fn full_channel_drops_frames_but_keeps_reading() {
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+
+        // The reader lazily accepts the peer's beacon uni-stream and forwards
+        // each cursor over the returned channel (depth 256).
+        let mut rx = spawn_beacon_reader(reader_conn);
+
+        // Flood one slot with far more cursors than the channel can hold, without
+        // draining `rx`. The reader forwards the prefix, fills the channel, then
+        // must hit `Full` on the remainder.
+        let mut send = writer_conn.open_uni().await.unwrap();
+        const FLOOD: u64 = 400;
+        for cursor in 0..FLOOD {
+            send.write_all(&beacon::encode_frame(SlotId(0), cursor))
+                .await
+                .unwrap();
+        }
+
+        // Give the reader time to drain the stream into the (now full) channel and
+        // drop the overflow. If it had exited, dropping its `connection` would
+        // close the link and fail the writes below.
+        sleep(Duration::from_millis(200)).await;
+
+        // Drain the forwarded prefix so the channel has room again.
+        while rx.try_recv().is_ok() {}
+
+        // A later delivery advance pushes a strictly higher cursor. It must reach
+        // the driver — proof the reader survived the full channel.
+        send.write_all(&beacon::encode_frame(SlotId(0), 9999))
+            .await
+            .unwrap();
+
+        // Look for 9999 under one overall timeout, tolerating stragglers: the
+        // drain above races the reader task, so a pre-drain cursor it was still
+        // forwarding can land in the channel after the drain and arrive first.
+        // That's not the behavior under test, so skip anything that isn't 9999
+        // rather than asserting on the very first frame.
+        let delivered = timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(frame) if frame.1 == 9999 => return Some(frame),
+                    Some(_stale) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("the reader must still be forwarding after a full channel");
+        assert_eq!(
+            delivered,
+            Some((SlotId(0), 9999)),
+            "a briefly full channel must not permanently kill the beacon reader",
+        );
     }
 }
