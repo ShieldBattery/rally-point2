@@ -680,6 +680,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
         HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
         HashSet::new(),
+        HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -803,6 +804,7 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
         Authority::SelfRelay,
         HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        HashSet::new(),
         HashSet::new(),
     );
 
@@ -960,6 +962,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
         HashSet::new(),
+        HashSet::new(),
     );
     let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
 
@@ -973,6 +976,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         Authority::SelfRelay,
         HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        HashSet::new(),
         HashSet::new(),
     );
     consensus::mark_session_started(&mesh_b.decision_makers, &key);
@@ -1114,6 +1118,7 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
         Authority::SelfRelay,
         HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        HashSet::new(),
         HashSet::new(),
     );
     consensus::mark_session_started(&mesh.decision_makers, &key);

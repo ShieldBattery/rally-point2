@@ -319,6 +319,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
@@ -399,6 +400,7 @@ async fn fires_session_start_when_every_expected_slot_connects() {
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -466,6 +468,7 @@ async fn a_late_slot_receives_session_start_on_register() {
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0)].into_iter().collect(),
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
 
@@ -794,6 +797,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -870,6 +874,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -934,6 +939,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
@@ -1026,6 +1032,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
@@ -1138,6 +1145,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -1210,6 +1218,7 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
@@ -1312,13 +1321,12 @@ async fn an_over_cap_oversize_turn_is_rejected_and_never_reaches_the_peer() {
 
 #[tokio::test]
 async fn a_dead_control_stream_reader_closes_the_slot_link() {
-    // The relay-side half of finding B2: the client's control stream is the
-    // only channel `RequestDrop` and a clean leave-intent ever arrive on. If
-    // its reader task ends while the connection is otherwise alive -- here a
-    // clean EOF, no reset -- the relay must close the connection so the
-    // client's reconnect machinery takes over with fresh streams, rather than
-    // just disarming and serving datagrams forever while permanently losing
-    // both of those.
+    // The client's control stream is the only channel `RequestDrop` and a
+    // clean leave-intent ever arrive on. If its reader task ends while the
+    // connection is otherwise alive -- here a clean EOF, no reset -- the relay
+    // must close the connection so the client's reconnect machinery takes
+    // over with fresh streams, rather than just disarming and serving
+    // datagrams forever while permanently losing both of those.
     //
     // Mirrors the private `routing::CONTROL_STREAM_LOST_CLOSE`, the same way
     // the decided-departure test below mirrors `server::SLOT_DEPARTED_CLOSE`
@@ -1465,6 +1473,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
 
@@ -1647,6 +1656,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
         std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1702,16 +1712,15 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
     use rally_point_relay::routing::SessionKey;
     use rally_point_relay::server::SLOT_NOT_HOMED_CLOSE;
 
-    // The home-relay-binding gate (finding A1): a token binds
-    // tenant/session/slot/key but not the specific relay, so without this a
-    // misrouted (or malicious) client could register the same slot on two
-    // relays in a true multi-relay session, feeding each a different turn at
-    // the same (slot, seq) -- exactly the split the mesh's topological dedup
-    // can only mask the symptom of, never prevent. The descriptor's homed set
-    // is the fix: a slot absent from a non-empty set is refused before the
-    // handshake ever completes, while a slot present in it (or a set left
-    // empty, the legacy/dev default) is admitted exactly as before this
-    // check existed.
+    // A token binds tenant/session/slot/key but not the specific relay, so
+    // without this check a misrouted (or malicious) client could register the
+    // same slot on two relays in a true multi-relay session, feeding each a
+    // different turn at the same (slot, seq) -- exactly the split the mesh's
+    // topological dedup can only mask the symptom of, never prevent. The
+    // descriptor's homed set is the fix: a slot absent from a non-empty set
+    // is refused before the handshake ever completes, while a slot present in
+    // it (or a set left empty, the legacy/dev default) is admitted exactly as
+    // before this check existed.
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(302);
     let key = SessionKey {
@@ -1731,6 +1740,7 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         [SlotId(0)].into_iter().collect(),
+        std::collections::HashSet::new(),
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1779,13 +1789,16 @@ async fn wait_until(
     }
 }
 
-/// Regression coverage for the critical bug an adversarial review found in the
-/// manual-drop commit: `end_slot_link`'s session-emptied teardown swept away the
-/// very hold its own disconnect had just marked, because the old sweep discarded
-/// *every* hold for the session rather than only the decided ones. On a session
-/// split across relays, each relay's local roster holds only its own slot(s), so
-/// **every** disconnect empties it and hits this teardown — a single connected
-/// slot reproduces the exact condition without needing a second relay.
+/// `end_slot_link`'s session-emptied teardown must not sweep away a hold its
+/// own disconnect just marked: the sweep may only discard *decided* holds, not
+/// every hold for the session, or a client reconnecting into that same window
+/// would find its drop hold already erased — with the departure record still
+/// standing, that reads as an already-decided leave, so the admission gate
+/// would wrongly refuse the very client the hold exists to let back in. On a
+/// session split across relays, each relay's local roster holds only its own
+/// slot(s), so **every** disconnect empties it and hits this teardown — a
+/// single connected slot reproduces the exact condition without needing a
+/// second relay.
 ///
 /// Drives the real teardown (a genuine disconnect, not a hand-simulated
 /// hold+release) and the real admission gate (`server.rs`'s `serve_connection`,
@@ -1814,6 +1827,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
         &key,
         rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
         Authority::SelfRelay,
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
@@ -1903,6 +1917,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
         Authority::SelfRelay,
         std::collections::HashSet::new(),
         [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);

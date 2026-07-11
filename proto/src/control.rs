@@ -396,8 +396,21 @@ impl BufferBounds {
     }
 
     /// Clamp `value` into `[min, max]`.
+    ///
+    /// `new` rejects an inverted range, but these bounds can also reach here
+    /// straight off the wire (`BufferBounds` derives `Deserialize` for the
+    /// coordinator→relay descriptor/response payloads, bypassing `new`'s
+    /// validation entirely), so a corrupted or malicious coordinator could
+    /// hand this an inverted `min > max` — which `u32::clamp` panics on. Treat
+    /// the bounds as swapped rather than trust their field order, so a caller
+    /// never has to re-validate before calling this.
     pub fn clamp(&self, value: u32) -> u32 {
-        value.clamp(self.min, self.max)
+        let (min, max) = if self.min <= self.max {
+            (self.min, self.max)
+        } else {
+            (self.max, self.min)
+        };
+        value.clamp(min, max)
     }
 }
 
@@ -1124,6 +1137,32 @@ mod tests {
         assert_eq!(b.clamp(0), 2);
         assert_eq!(b.clamp(5), 5);
         assert_eq!(b.clamp(99), 8);
+    }
+
+    #[test]
+    fn buffer_bounds_clamp_does_not_panic_on_an_inverted_range() {
+        // `new` rejects `min > max`, but `Deserialize` is derived and bypasses
+        // it entirely -- a corrupted or malicious coordinator payload can still
+        // hand `clamp` an inverted range. `u32::clamp` panics if `min > max`;
+        // `BufferBounds::clamp` must not, regardless of how the value reached
+        // it.
+        let inverted = BufferBounds { min: 8, max: 2 };
+        assert_eq!(inverted.clamp(0), 2, "swapped bounds treat 2 as the floor");
+        assert_eq!(inverted.clamp(5), 5, "5 already falls within [2, 8]");
+        assert_eq!(inverted.clamp(99), 8, "swapped bounds treat 8 as the ceiling");
+    }
+
+    #[test]
+    fn buffer_bounds_with_inverted_fields_decodes_and_still_clamps_safely() {
+        // `Deserialize` is derived directly on `BufferBounds` (it crosses the
+        // coordinator/relay wire boundary), so it never runs `new`'s
+        // validation -- an inverted `min > max` from a corrupted or malicious
+        // coordinator decodes without error. The clamp call downstream must
+        // still not panic.
+        let json = r#"{"min":8,"max":2}"#;
+        let decoded: BufferBounds = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, BufferBounds { min: 8, max: 2 });
+        assert_eq!(decoded.clamp(99), 8);
     }
 
     #[test]

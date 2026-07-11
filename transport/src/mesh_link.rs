@@ -139,6 +139,11 @@ pub enum MeshLinkError {
     /// than the receive window allows — the peer is racing too far ahead.
     #[error("payload (slot {}, seq {seq}) is beyond the receive window", slot.0)]
     PayloadOutOfWindow { slot: SlotId, seq: u64 },
+    /// A payload's wire slot does not fit in a [`SlotId`] (0..=255) — a
+    /// malformed or hostile packet. See
+    /// [`LinkError::MalformedSlot`](crate::link::LinkError::MalformedSlot).
+    #[error("payload names slot {0}, out of range for a SlotId (0..=255)")]
+    MalformedSlot(u32),
     /// A received packet's acks were internally inconsistent. A peer-relay bug
     /// (the mesh trusts its peer); the driver decides whether to drop the session.
     #[error(transparent)]
@@ -161,6 +166,7 @@ impl From<LinkError> for MeshLinkError {
             LinkError::PayloadOutOfWindow { slot, seq } => {
                 MeshLinkError::PayloadOutOfWindow { slot, seq }
             }
+            LinkError::MalformedSlot(slot) => MeshLinkError::MalformedSlot(slot),
             LinkError::Ack(error) => MeshLinkError::Ack(error),
         }
     }
@@ -442,7 +448,12 @@ impl SessionLink {
 
         let mut fresh = Vec::new();
         for payload in packet.payloads {
-            let slot = SlotId(payload.slot as u8);
+            // A truncating cast would alias an out-of-range wire slot onto a
+            // different, valid slot's dedup key — corrupting that slot's
+            // window instead of merely rejecting the malformed one.
+            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                return Err(LinkError::MalformedSlot(payload.slot));
+            };
             match self.dedup.accept(slot, payload.seq) {
                 Delivery::New => fresh.push(payload),
                 Delivery::Duplicate => {}

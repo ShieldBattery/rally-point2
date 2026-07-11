@@ -2739,14 +2739,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_inbound_turn_with_an_out_of_range_slot_is_dropped() {
+    async fn a_datagram_turn_with_an_out_of_range_slot_ends_the_link_as_a_failure() {
         use prost::Message;
         use rally_point_proto::messages::Packet;
 
         // A payload whose slot id overflows `u8` names no real slot; a truncating
         // cast would alias it onto `slot % 256` and corrupt that player's turn
-        // stream. The driver must drop it, handing the game nothing — this covers
-        // both inbound paths' guard by exercising the datagram one.
+        // stream. The transport layer refuses the whole packet rather than risk
+        // that aliasing, which surfaces here as a link failure -- reconnect-
+        // eligible, not a turn silently dropped while the link limps on.
         let (link_a, link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
@@ -2766,11 +2767,51 @@ mod tests {
         .encode_to_vec();
         link_b.connection().send_datagram(raw.into()).unwrap();
 
+        // Nothing is ever delivered to the game...
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), inbound.recv())
+                .await
+                .unwrap()
+                .is_none(),
+            "an out-of-range inbound slot must not be delivered to the game",
+        );
+        // ...because the link itself ended as a failure, not a clean stop.
+        match task.await.unwrap() {
+            Err(DriverError::Link(_)) => {}
+            other => panic!("expected a link failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversize_turn_with_an_out_of_range_slot_is_dropped() {
+        // The control-stream divert path has its own guard, independent of the
+        // datagram path's transport-layer rejection: a payload arriving this
+        // way is already past `Link`'s dedup (this stream carries no dedup key
+        // of its own), so the driver itself must reject an out-of-range slot
+        // here rather than alias it onto a different player's turn stream.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut inbound = chan_a.inbound;
+
+        let (mut control_send, _recv) = link_b.connection().open_bi().await.unwrap();
+        send_control_turn(
+            &mut control_send,
+            Payload {
+                seq: 0,
+                slot: 256,
+                commands: vec![0xEE].into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
         assert!(
             tokio::time::timeout(Duration::from_millis(300), inbound.recv())
                 .await
                 .is_err(),
-            "an out-of-range inbound slot must not be delivered to the game"
+            "an out-of-range oversize-turn slot must not be delivered to the game",
         );
 
         drop(chan_a.outbound);

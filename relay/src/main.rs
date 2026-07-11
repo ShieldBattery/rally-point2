@@ -339,7 +339,13 @@ async fn main() -> Result<()> {
         // Wire the turn-path handles so a descriptor-driven authority promotion
         // (e.g. the coordinator dropping a crashed former authority) can
         // re-broadcast any synced leave that authority never delivered.
-        .with_broadcast(Arc::clone(&sessions), mesh_state.links.clone());
+        .with_broadcast(Arc::clone(&sessions), mesh_state.links.clone())
+        // Wire the real drop-hold registry so that same promotion skips a slot
+        // whose drop is still held undecided, exactly like the presence-driven
+        // promotion already does — without this, a descriptor re-push racing a
+        // reconnect would decide (and broadcast) a leave for a slot a client is
+        // actively returning to.
+        .with_drop_holds(mesh_state.drop_holds.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it

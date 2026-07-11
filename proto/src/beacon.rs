@@ -64,12 +64,19 @@ pub fn encode_frame(slot: SlotId, delivered_through: u64) -> [u8; BEACON_FRAME_L
 
 /// Decodes one beacon frame's `(slot, delivered-through)` cursor.
 ///
-/// `bytes` must be exactly [`BEACON_FRAME_LEN`] long; the reader is responsible
-/// for assembling a complete frame before calling this (a dedicated read-loop
-/// task that forwards complete frames over a channel — see the transport
-/// `Link`), so partial reads never reach here. The slot is narrowed to a `u8`;
-/// a frame whose slot does not fit is malformed and rejected by the reader.
-pub fn decode_frame(bytes: &[u8]) -> Result<(SlotId, u64), BadSlot> {
+/// `bytes` must be exactly [`BEACON_FRAME_LEN`] long. The dedicated read-loop
+/// task that forwards complete frames over a channel (see the transport
+/// `Link`) only ever calls this with a buffer `read_exact` filled to exactly
+/// that length, but the check here is what makes that a guarantee this
+/// function enforces rather than an assumption every future or alternate
+/// caller has to get right on its own — a caller handed a raw, unvalidated
+/// byte slice (off a fuzzer, a differently-shaped stream, a hand-rolled test)
+/// gets a decode error instead of an indexing panic. The slot is narrowed to a
+/// `u8`; a frame whose slot does not fit is malformed and rejected too.
+pub fn decode_frame(bytes: &[u8]) -> Result<(SlotId, u64), DecodeFrameError> {
+    if bytes.len() != BEACON_FRAME_LEN {
+        return Err(DecodeFrameError::BadLength(bytes.len()));
+    }
     let mut slot_buf = [0u8; 4];
     slot_buf.copy_from_slice(&bytes[0..4]);
     let mut cursor_buf = [0u8; 8];
@@ -79,18 +86,27 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(SlotId, u64), BadSlot> {
     u8::try_from(slot_raw)
         .map(SlotId)
         .map(|slot| (slot, cursor))
-        .map_err(|_| BadSlot(slot_raw))
+        .map_err(|_| DecodeFrameError::BadSlot(slot_raw))
 }
 
-/// A beacon frame carried a slot that does not fit in a [`SlotId`].
-///
-/// The wire field is `u32` (matching `Payload.slot`), but a live game never has
-/// more than 256 slots, so a value above 255 is a malformed or hostile stream.
-/// The reader drops the frame rather than let a garbage slot reach
-/// `retire_through`.
+/// Why a beacon frame failed to decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("beacon slot {0} is out of range for a SlotId (0..=255)")]
-pub struct BadSlot(pub u32);
+pub enum DecodeFrameError {
+    /// The byte slice handed to [`decode_frame`] was not exactly
+    /// [`BEACON_FRAME_LEN`] long. The frame is fixed-width with no length
+    /// prefix, so any other length is malformed input, not a value this
+    /// function can interpret.
+    #[error("beacon frame is {0} bytes, not the required {BEACON_FRAME_LEN}")]
+    BadLength(usize),
+    /// The frame carried a slot that does not fit in a [`SlotId`].
+    ///
+    /// The wire field is `u32` (matching `Payload.slot`), but a live game
+    /// never has more than 256 slots, so a value above 255 is a malformed or
+    /// hostile stream. The reader drops the frame rather than let a garbage
+    /// slot reach `retire_through`.
+    #[error("beacon slot {0} is out of range for a SlotId (0..=255)")]
+    BadSlot(u32),
+}
 
 #[cfg(test)]
 mod tests {
@@ -112,6 +128,30 @@ mod tests {
         // A slot above 255 can't be a SlotId; the reader drops the frame.
         let mut buf = encode_frame(SlotId(0), 0);
         buf[0..4].copy_from_slice(&300u32.to_le_bytes());
-        assert_eq!(decode_frame(&buf), Err(BadSlot(300)));
+        assert_eq!(decode_frame(&buf), Err(DecodeFrameError::BadSlot(300)));
+    }
+
+    #[test]
+    fn rejects_a_buffer_of_the_wrong_length_instead_of_panicking() {
+        let full = encode_frame(SlotId(3), 42);
+
+        // Too short: every truncation up to (but not including) the full
+        // length must return an error, not index out of bounds.
+        for len in 0..full.len() {
+            assert_eq!(
+                decode_frame(&full[..len]),
+                Err(DecodeFrameError::BadLength(len)),
+                "a {len}-byte buffer must be refused, not panic",
+            );
+        }
+
+        // Too long is equally malformed -- the frame is fixed-width with no
+        // length prefix, so there is no way to interpret trailing bytes.
+        let mut too_long = full.to_vec();
+        too_long.push(0xFF);
+        assert_eq!(
+            decode_frame(&too_long),
+            Err(DecodeFrameError::BadLength(too_long.len())),
+        );
     }
 }

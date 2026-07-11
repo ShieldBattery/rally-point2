@@ -82,6 +82,15 @@ pub enum LinkError {
     /// the receive window allows — the peer is racing too far ahead (a dead link
     #[error("payload (slot {}, seq {seq}) is beyond the receive window", slot.0)]
     PayloadOutOfWindow { slot: SlotId, seq: u64 },
+    /// A payload's wire slot does not fit in a [`SlotId`] (0..=255). A live game
+    /// never has more than 256 slots, so this is a malformed or hostile packet —
+    /// narrowing it with a raw cast instead would truncate/alias it onto a
+    /// different, valid slot's dedup and receive-window state. Refused like
+    /// [`PayloadOutOfWindow`](Self::PayloadOutOfWindow): the whole packet is
+    /// rejected and the link closed, rather than silently dropping just this
+    /// payload and risking a permanent gap in that slot's seq stream.
+    #[error("payload names slot {0}, out of range for a SlotId (0..=255)")]
+    MalformedSlot(u32),
     /// A received packet's acks were internally inconsistent. Attacker-facing
     /// callers (the relay) typically drop the peer on this.
     #[error(transparent)]
@@ -375,7 +384,12 @@ impl Link {
 
         let mut fresh = Vec::new();
         for payload in packet.payloads {
-            let slot = SlotId(payload.slot as u8);
+            // A truncating cast would alias an out-of-range wire slot onto a
+            // different, valid slot's dedup key — corrupting that slot's
+            // window instead of merely rejecting the malformed one.
+            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                return Err(LinkError::MalformedSlot(payload.slot));
+            };
             match self.dedup.accept(slot, payload.seq) {
                 Delivery::New => fresh.push(payload),
                 Delivery::Duplicate => {}
@@ -1080,6 +1094,35 @@ mod tests {
                 assert_eq!(seq, u64::MAX);
             }
             other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_payload_whose_wire_slot_does_not_fit_a_slot_id() {
+        let (client, mut server, _client_ep, _server_ep) = connected_links().await;
+
+        // A wire slot past `u8` range must be refused, not silently truncated
+        // onto a different, valid slot's dedup state (`300 as u8` would alias
+        // onto slot 44).
+        let malformed = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![Payload {
+                seq: 0,
+                slot: 300,
+                commands: vec![1].into(),
+                ..Default::default()
+            }],
+        };
+        client
+            .connection()
+            .send_datagram(malformed.encode_to_vec().into())
+            .unwrap();
+
+        match server.recv().await {
+            Err(LinkError::MalformedSlot(slot)) => assert_eq!(slot, 300),
+            other => panic!("expected MalformedSlot, got {other:?}"),
         }
     }
 

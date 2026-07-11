@@ -1823,6 +1823,14 @@ impl DecisionMaker {
     /// new bounds. A relay losing authority drops any directive it was still
     /// broadcasting -- only the authority stamps.
     ///
+    /// `held_slots` is this relay's set of undecided drop holds, exactly as
+    /// [`set_authority`](Self::set_authority) takes it -- a descriptor-driven
+    /// promotion races a reconnection on this relay exactly the way a
+    /// presence-driven one does (a client can be mid-reconnect when the
+    /// coordinator's descriptor happens to re-push and promote this relay), so
+    /// it must skip a held slot's departure the same way. The caller (which
+    /// owns the drop-hold registry) passes the current held set in.
+    ///
     /// Returns the synced leaves a promotion (Peer -> SelfRelay) must (re)broadcast
     /// -- see [`set_authority`](Self::set_authority); empty otherwise. The second
     /// element names which of those are **freshly derived** by this call (a first
@@ -1834,17 +1842,10 @@ impl DecisionMaker {
         &mut self,
         bounds: BufferBounds,
         authority: Authority,
+        held_slots: &HashSet<SlotId>,
     ) -> (Vec<LeaveDirective>, Vec<LeaveDirective>) {
         self.bounds = bounds;
-        // The descriptor-push promotion path has no local drop-hold registry in
-        // hand (it is driven from the mesh control plane, which does not carry the
-        // per-relay hold state), so it treats every undecided departure as
-        // immediately decidable — today's behavior. The promotion that races a
-        // reconnection on a single relay is the presence-driven one
-        // ([`set_authority`](Self::set_authority)), which is handed the real
-        // held-slot set; a descriptor that drops the former authority is a
-        // coordinator membership decision, not a link blip.
-        self.set_authority(authority, &HashSet::new())
+        self.set_authority(authority, held_slots)
     }
 
     /// Applies a fresh authority verdict without touching the bounds, returning
@@ -3395,7 +3396,13 @@ fn now_ms() -> u64 {
 /// `observe_leave` firing one, so it fires exactly one departure notice too;
 /// a verbatim re-broadcast of an already-cached directive fires nothing (the
 /// relay that cached it first already reported it).
+///
+/// `held_slots` is this relay's current set of undecided drop holds, read by
+/// the caller from the drop-hold registry (see [`DecisionMaker::sync`]) --
+/// only meaningful on the reconcile path (a fresh maker has nothing recorded
+/// yet to hold back).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn sync_maker(
     registry: &DecisionMakers,
     key: &SessionKey,
@@ -3404,6 +3411,7 @@ pub fn sync_maker(
     observers: HashSet<SlotId>,
     expected_slots: HashSet<SlotId>,
     homed_slots: HashSet<SlotId>,
+    held_slots: HashSet<SlotId>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let (leaves, fresh) = {
@@ -3414,7 +3422,7 @@ pub fn sync_maker(
                 maker.set_observers(observers);
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
-                maker.sync(bounds, authority)
+                maker.sync(bounds, authority, &held_slots)
             }
             Entry::Vacant(vacant) => {
                 let maker = vacant.insert(DecisionMaker::new(
@@ -5135,6 +5143,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         {
             let makers = registry.lock();
@@ -5153,6 +5162,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -5162,6 +5172,65 @@ mod tests {
             Authority::Peer,
             "authority follows the current relay set",
         );
+    }
+
+    /// At the registry-level free function: a descriptor re-push that promotes
+    /// this relay must thread the caller's real held-slot set through to the
+    /// maker, not silently drop it. A slot's drop hold is the token a
+    /// reconnecting client's return still redeems; passing the maker an empty
+    /// set regardless of what the caller (here, an "apply_descriptor"
+    /// stand-in) actually knows from the drop-hold registry would let the
+    /// promotion decide (and broadcast) a leave for that slot anyway.
+    #[test]
+    fn sync_maker_promotion_skips_a_held_departure() {
+        let registry = new_decision_makers();
+        let k = key();
+        // First push: this relay starts as a peer (not yet authority).
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::Peer,
+            HashSet::new(),
+            std::collections::HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        consensus_observe_and_hold(&registry, &k);
+
+        // A re-push promotes this relay while slot 1's drop is held -- the
+        // caller (standing in for `MeshControl::apply_descriptor`, which reads
+        // the real drop-hold registry) passes the held set in.
+        let held_slots = HashSet::from([SlotId(1)]);
+        let leaves = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            std::collections::HashSet::new(),
+            HashSet::new(),
+            held_slots,
+        );
+        assert!(
+            leaves.is_empty(),
+            "a descriptor-driven promotion must not decide a held departure",
+        );
+        let makers = registry.lock();
+        assert!(
+            makers.get(&k).unwrap().has_departure(SlotId(1)),
+            "the departure record survives, undecided, for a later manual request",
+        );
+    }
+
+    /// Test-only helper for [`sync_maker_promotion_skips_a_held_departure`]:
+    /// observes a frame and records an undecided departure for slot 1, mirroring
+    /// what a real disconnect does before a promotion races it.
+    fn consensus_observe_and_hold(registry: &DecisionMakers, key: &SessionKey) {
+        let mut makers = registry.lock();
+        let maker = makers.get_mut(key).unwrap();
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
     }
 
     /// A relay demoted by a re-push stops broadcasting: only the authority
@@ -5179,6 +5248,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         {
             let mut makers = registry.lock();
@@ -5194,6 +5264,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         assert_eq!(
@@ -5220,6 +5291,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         assert!(registry.lock().contains_key(&k));
@@ -5259,6 +5331,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5302,6 +5375,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5343,6 +5417,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -5374,6 +5449,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -5427,6 +5503,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -5462,6 +5539,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -5492,6 +5570,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
 
@@ -5532,6 +5611,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         registry.set_session_refs(
@@ -5574,6 +5654,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -5610,6 +5691,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5659,6 +5741,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5704,6 +5787,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5729,6 +5813,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5764,6 +5849,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5811,6 +5897,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5861,6 +5948,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -5890,6 +5978,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -5979,6 +6068,7 @@ mod tests {
             HashSet::new(),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
 
         registry.set_session_refs(
@@ -6009,6 +6099,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -6102,7 +6193,7 @@ mod tests {
         assert_eq!(d.apply_at_frame, 41, "one past the session frame fallback");
     }
 
-    // -- Leave apply-frame clamp (Finding A): an inflated departing frame must
+    // -- Leave apply-frame clamp: an inflated departing frame must
     //    not schedule the leave past a frame the survivors can reach. Frames are
     //    stamped one-per-turn (`frame = 100 + seq`); a survivor legitimately
     //    *leads* the departing slot by the buffer depth before it stalls. --
@@ -6491,6 +6582,45 @@ mod tests {
         );
     }
 
+    /// A descriptor-driven promotion (`sync`, called on every coordinator
+    /// descriptor push) must not decide a departure whose drop is still an
+    /// undecided hold on this relay: that hold is a reconnecting client's
+    /// admission token, and deciding here would defeat the reconnect exactly
+    /// as it would for the presence-driven promotion path. Mirrors
+    /// [`a_promotion_skips_a_held_departure_and_a_request_still_decides_it`]
+    /// exactly, but through `sync` (the descriptor-push path) instead of
+    /// `set_authority` directly (the presence-driven path) -- a descriptor
+    /// re-push can race a reconnection on this relay exactly like a presence
+    /// flap can, so it must respect the same held set.
+    #[test]
+    fn a_descriptor_push_promotion_skips_a_held_departure() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.observe_frame(SlotId(0), GameFrameCount(40));
+        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+
+        // A descriptor re-push promotes this relay while slot 1's drop is still
+        // held: the promotion must decide nothing for it.
+        let held_slots = HashSet::from([SlotId(1)]);
+        let (leaves, fresh) = maker.sync(bounds(0, 20), Authority::SelfRelay, &held_slots);
+        assert!(
+            leaves.is_empty() && fresh.is_empty(),
+            "a held departure is not decided by a descriptor-driven promotion",
+        );
+        assert!(
+            maker.has_departure(SlotId(1)),
+            "the departure record is kept for a manual request to decide from",
+        );
+
+        // An honored manual request still decides it -- the record was never
+        // marked decided, so it is not lost.
+        let decided = maker
+            .decide_leave(SlotId(1), DROPPED)
+            .expect("an honored request decides the held leave");
+        assert_eq!(decided.slot, 1);
+        assert_eq!(decided.apply_at_frame, 51, "one past the stored last frame");
+    }
+
     /// With two undecided departures on a promoting relay, only the one whose drop
     /// is *not* held is decided; the held one is left for a manual request. This is
     /// the crux that keeps a presence flap from deciding a reconnecting slot's drop
@@ -6691,12 +6821,13 @@ mod tests {
     /// Two relays independently force-deciding the same fully-abandoned slot (see
     /// `force_decide_leave`) agree on `reason` and `apply_at_frame` — the decision
     /// itself — but assign `leave_seq` from their own local counters, so the two
-    /// directives can disagree on it alone. That is not a genuine conflict (the
-    /// blemish an adversarial review flagged: it used to warn as if it were one),
-    /// so the outcome here is identical to any other duplicate: the first cached
-    /// directive wins and the observation is not a fresh insert. This test can't
-    /// assert the log level directly (no tracing-capture harness in this crate),
-    /// but pins the behavioral half of the fix.
+    /// directives can disagree on it alone. `leave_seq` is a per-relay ordinal, not
+    /// part of the decision the two relays must agree on, so a mismatch there is
+    /// not a genuine conflict and must not be logged as one; the outcome here is
+    /// identical to any other duplicate: the first cached directive wins and the
+    /// observation is not a fresh insert. This test can't assert the log level
+    /// directly (no tracing-capture harness in this crate), but pins the
+    /// behavioral half of that distinction.
     #[test]
     fn observe_leave_agreeing_on_substance_but_not_leave_seq_is_not_a_conflict() {
         let mut maker =
@@ -6799,7 +6930,7 @@ mod tests {
         assert_eq!(fresh, leaves, "re-derived on promotion — a fresh insert");
     }
 
-    // -- Home-relay binding (finding A1: `slot_homed` gates client admission) --
+    // -- Home-relay binding: `slot_homed` gates client admission --
 
     /// No maker exists yet for the session — the descriptor-arrival race: a
     /// client can dial before this relay has received any descriptor. Must
@@ -6825,6 +6956,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(), // empty homed_slots: unenforced
+            HashSet::new(),
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(slot_homed(&registry, &key(), SlotId(7)));
@@ -6844,6 +6976,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             [SlotId(0), SlotId(2)].into_iter().collect(),
+            HashSet::new(),
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)), "slot 0 is homed here");
         assert!(slot_homed(&registry, &key(), SlotId(2)), "slot 2 is homed here");
@@ -6867,6 +7000,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             [SlotId(0)].into_iter().collect(),
+            HashSet::new(),
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(!slot_homed(&registry, &key(), SlotId(1)));
@@ -6881,6 +7015,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             [SlotId(1)].into_iter().collect(),
+            HashSet::new(),
         );
         assert!(
             !slot_homed(&registry, &key(), SlotId(0)),
@@ -7228,6 +7363,7 @@ mod tests {
             HashSet::from([SlotId(2)]),
             std::collections::HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -7276,6 +7412,7 @@ mod tests {
             HashSet::new(),
             expected,
             HashSet::new(),
+            HashSet::new(),
         );
 
         // No directive until the last expected slot completes the set.
@@ -7312,6 +7449,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -7333,6 +7471,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             expected,
+            HashSet::new(),
             HashSet::new(),
         );
 
@@ -7364,6 +7503,7 @@ mod tests {
             HashSet::new(),
             expected,
             HashSet::new(),
+            HashSet::new(),
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         // Slot 0 departs, retiring it from the live-slot set.
@@ -7388,6 +7528,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
             expected,
+            HashSet::new(),
             HashSet::new(),
         );
         assert!(!session_started(&registry, &k));
@@ -7957,6 +8098,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
             std::collections::HashSet::new(),
+            HashSet::new(),
             HashSet::new(),
         );
         registry.set_session_refs(

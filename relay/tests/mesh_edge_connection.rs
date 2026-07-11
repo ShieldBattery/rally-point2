@@ -771,9 +771,9 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
     Ok(())
 }
 
-/// The mesh-side half of finding B2: a peer's control-stream reader ending while
-/// the connection stays otherwise alive must be treated as a link failure, not a
-/// degradation limped through — otherwise the pair permanently loses
+/// A peer's control-stream reader ending while the connection stays otherwise
+/// alive must be treated as a link failure, not a degradation limped through —
+/// otherwise the pair permanently loses
 /// `SlotDeparted`/`LeaveDirective`/oversize-turn/delivery-cursor traffic between
 /// them. Mirrors [`dial_redials_after_the_link_connection_fails`] exactly, but
 /// kills the link by finishing the peer's control stream (a clean EOF, no reset,
@@ -849,11 +849,10 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
     Ok(())
 }
 
-/// The mesh-forward-queue half of finding C2: a congested link's shared forward
-/// queue filling must reset the link, not silently drop the fresh turn — a
-/// dropped turn never enters the link's `AckManager`, so its own redundancy has
-/// nothing to re-carry and the peer relay's clients would stall on a permanent
-/// per-(slot, seq) gap forever. Mirrors
+/// A congested link's shared forward queue filling must reset the link, not
+/// silently drop the fresh turn — a dropped turn never enters the link's
+/// `AckManager`, so its own redundancy has nothing to re-carry and the peer
+/// relay's clients would stall on a permanent per-(slot, seq) gap forever. Mirrors
 /// [`dial_redials_after_the_peer_control_stream_dies`], but forces the reset by
 /// flooding `fan_out_to_mesh` past the shared queue's capacity instead of
 /// severing the control stream — the established link must still exit

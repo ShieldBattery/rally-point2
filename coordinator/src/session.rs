@@ -1367,10 +1367,11 @@ mod tests {
         assert_eq!(desc.authority_order, vec![RelayId(1), RelayId(2)]);
         assert_eq!(desc2.authority_order, desc.authority_order);
 
-        // The home-relay-binding gate (finding A1): each relay's descriptor
-        // names only the slots the coordinator actually assigned to it, not
-        // the whole session's slot set. Slot 0 stayed on the primary (relay
-        // 1); slot 1 split onto the secondary (relay 2).
+        // Each relay's descriptor names only the slots the coordinator
+        // actually assigned to it, not the whole session's slot set -- a relay
+        // uses this to refuse a client whose token authorizes a slot homed
+        // elsewhere. Slot 0 stayed on the primary (relay 1); slot 1 split onto
+        // the secondary (relay 2).
         assert_eq!(desc.homed_slots, vec![SlotId(0)]);
         assert_eq!(desc2.homed_slots, vec![SlotId(1)]);
     }
@@ -1800,10 +1801,10 @@ mod tests {
         );
 
         // Relay 2's rebuilt descriptor gains slot 0 (moved off the dead relay
-        // 1) in addition to its own original slot 1 -- the home-relay-binding
-        // gate (finding A1) must follow a rehome, not just a session's
-        // original assignment, or R_new would refuse the very slot it was
-        // just handed.
+        // 1) in addition to its own original slot 1 -- the homed-slot set must
+        // follow a rehome, not just freeze at a session's original
+        // assignment, or R_new's own admission check would refuse the very
+        // slot it was just handed.
         let staged = setup.descriptors().current_for(RelayId(2));
         assert_eq!(staged.len(), 1);
         assert_eq!(

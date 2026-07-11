@@ -61,6 +61,7 @@ use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
 use crate::consensus::{self, Authority, DecisionMakers};
+use crate::drop_hold::DropHolds;
 use crate::mesh::{self, MeshCommand, MeshLinks};
 use crate::presence::{self, Candidate, PresenceRegistry};
 use crate::routing::{SessionKey, Sessions};
@@ -90,6 +91,16 @@ pub struct MeshControl {
     /// descriptor driver); wired to the real ones with [`with_broadcast`](Self::with_broadcast).
     sessions: Sessions,
     mesh_links: MeshLinks,
+    /// This relay's undecided drop holds, read on every `apply_descriptor` so a
+    /// descriptor-driven promotion skips a slot whose drop a client could still
+    /// return from — the same protection the presence-driven promotion
+    /// ([`presence::recompute`]) already gets from its caller. A fresh,
+    /// never-shared registry by default (a control plane with no turn path —
+    /// tests, a standalone descriptor driver): it is always empty, so
+    /// `apply_descriptor` degrades to treating every undecided departure as
+    /// immediately decidable, exactly like the behavior this replaces. Wired to
+    /// the real per-relay registry with [`with_drop_holds`](Self::with_drop_holds).
+    drop_holds: DropHolds,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -150,6 +161,15 @@ impl MeshControl {
             presence,
             sessions: Sessions::default(),
             mesh_links: crate::mesh::new_mesh_links(),
+            // A fresh, never-shared registry: nothing ever holds anything in
+            // it, so `apply_descriptor` reads an always-empty held set unless
+            // `with_drop_holds` wires the real one. Production values are used
+            // even for this placeholder purely so its unlock/abandon timings
+            // are never surprising if something did reach it unwired.
+            drop_holds: DropHolds::new(
+                crate::drop_hold::DROP_UNLOCK,
+                crate::drop_hold::ABANDONED_SESSION_TIMEOUT,
+            ),
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 desired: HashMap::new(),
@@ -170,6 +190,17 @@ impl MeshControl {
     pub fn with_broadcast(mut self, sessions: Sessions, mesh_links: MeshLinks) -> Self {
         self.sessions = sessions;
         self.mesh_links = mesh_links;
+        self
+    }
+
+    /// Wires the real per-relay drop-hold registry, so a descriptor-driven
+    /// authority promotion skips a slot whose drop is still held undecided —
+    /// the same protection the presence-driven promotion already has. The
+    /// production relay calls this with the same [`DropHolds`] the turn path
+    /// holds (via `MeshState`); a control plane with no turn path leaves the
+    /// harmless placeholder from [`new`](Self::new).
+    pub fn with_drop_holds(mut self, drop_holds: DropHolds) -> Self {
+        self.drop_holds = drop_holds;
         self
     }
 
@@ -279,6 +310,12 @@ impl MeshControl {
         // created by this push starts with them excluded from the desync
         // comparator, so a single-relay session (one push, before any client
         // dials) never loses its observer set; a re-push replaces the set.
+        //
+        // The current held-slot set is read from the drop-hold registry right
+        // before syncing, so a promotion here skips a slot whose drop a client
+        // could still return from — exactly like the presence-driven promotion
+        // (`presence::recompute`), which gets the same set from its own caller.
+        let held_slots = self.drop_holds.pending_slots(&key);
         let leaves = consensus::sync_maker(
             &self.decision_makers,
             &key,
@@ -287,6 +324,7 @@ impl MeshControl {
             descriptor.observer_slots.iter().copied().collect(),
             descriptor.expected_slots.iter().copied().collect(),
             descriptor.homed_slots.iter().copied().collect(),
+            held_slots,
         );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
         // A rehome descriptor (coordinator-mediated failover) resumes an

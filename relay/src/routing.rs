@@ -1733,6 +1733,14 @@ fn end_slot_link(
         // Same for the forwarded-turn replay ring: no local slot remains to resume,
         // so nothing more will be replayed from it.
         mesh.turn_ring.end_session(key);
+        // Same for this session's topological-dedup (echo guard) state: no local
+        // slot remains to forward to, so there is nothing left for it to gate.
+        // Its entry is created lazily on the first turn forwarded for the
+        // session (there is no explicit "join" counterpart to pair this with),
+        // but this is the same "last local slot gone" trigger every other
+        // per-session registry above already tears down on, so its lifetime
+        // matches theirs.
+        crate::mesh::deregister_seen(&mesh.seen, key);
         // Same for request limiters, and for any hold whose slot's leave is already
         // decided — but NOT for an undecided hold: the disconnect just above may
         // itself have marked one (this relay's own last local slot leaving is
@@ -2389,6 +2397,34 @@ mod tests {
     }
 
     #[test]
+    fn session_emptying_teardown_drops_the_seen_registry_entry() {
+        // `mesh.seen`'s entry for a session is created lazily on the first
+        // turn forwarded (there is no explicit "join" to pair a deregister
+        // with) and must be dropped once the relay's last local slot for the
+        // session leaves -- otherwise it outlives every other per-session
+        // registry the same teardown clears, leaking one `MeshSeen` per
+        // session for the process lifetime.
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        let k = key();
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        g0.disarm();
+
+        crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
+        assert!(
+            mesh.seen.lock().contains_key(&k),
+            "marking a turn forwarded creates the session's entry",
+        );
+
+        // The only local slot leaves: the session-emptying teardown fires.
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), false);
+        assert!(
+            !mesh.seen.lock().contains_key(&k),
+            "the emptied session's seen-registry entry must not survive its teardown",
+        );
+    }
+
+    #[test]
     fn holds_any_slots_tracks_registration_and_release() {
         // The drain-idle predicate: empty until a slot registers, empty again once it
         // is freed — so the coordinated-drain wait converges when the last slot leaves.
@@ -2517,6 +2553,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
 
         // A local client to fan out to.
@@ -2560,7 +2597,11 @@ mod tests {
             let mut registry = makers.lock();
             let maker = registry.get_mut(&k).unwrap();
             maker.observe_frame(SlotId(0), rally_point_proto::ids::GameFrameCount(1));
-            let _ = maker.sync(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay);
+            let _ = maker.sync(
+                BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+                &std::collections::HashSet::new(),
+            );
         }
         consensus::ingest_local_conditions(
             &makers,
@@ -2666,6 +2707,7 @@ mod tests {
             key,
             BufferBounds::new(0, 20).unwrap(),
             Authority::SelfRelay,
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
@@ -3045,6 +3087,7 @@ mod tests {
             std::collections::HashSet::new(),
             [SlotId(0), SlotId(1)].into_iter().collect(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
         );
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
         consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
@@ -3200,6 +3243,7 @@ mod tests {
             Authority::SelfRelay,
             std::collections::HashSet::new(),
             [SlotId(0), SlotId(1)].into_iter().collect(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
         consensus::mark_session_started(&makers, &k);
