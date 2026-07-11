@@ -459,18 +459,37 @@ impl SessionLink {
         // high seq could shut the window on the older redundant seqs it carries.
         packet.payloads.sort_by_key(|p| (p.slot, p.seq));
 
+        // Transactional commit: see `Link::process_incoming`'s matching
+        // comment for why a mid-packet failure must roll back every payload
+        // this packet already `accept`ed, not just stop processing — the
+        // same bug (dedup silently believing a payload was delivered that
+        // this call never actually returned in `fresh`) is reachable here
+        // too, since this mirrors that loop exactly.
+        let touched: Vec<SlotId> = {
+            let mut seen = std::collections::BTreeSet::new();
+            packet
+                .payloads
+                .iter()
+                .filter_map(|p| u8::try_from(p.slot).ok().map(SlotId))
+                .filter(|slot| seen.insert(*slot))
+                .collect()
+        };
+        let snapshot = self.dedup.snapshot(&touched);
+
         let mut fresh = Vec::new();
         for payload in packet.payloads {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's dedup key — corrupting that slot's
             // window instead of merely rejecting the malformed one.
             let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                self.dedup.restore(snapshot);
                 return Err(LinkError::MalformedSlot(payload.slot));
             };
             match self.dedup.accept(slot, payload.seq) {
                 Delivery::New => fresh.push(payload),
                 Delivery::Duplicate => {}
                 Delivery::OutOfWindow => {
+                    self.dedup.restore(snapshot);
                     return Err(LinkError::PayloadOutOfWindow {
                         slot,
                         seq: payload.seq,
@@ -709,6 +728,75 @@ mod tests {
             other => panic!("expected ZeroSession, got {other:?}"),
         }
     }
+
+    /// The mesh-link counterpart of `Link`'s transactional-recv regression
+    /// test: a packet whose earlier payload is genuinely in-window but whose
+    /// later payload is out of window must roll back the whole packet's
+    /// dedup commit, not leave the earlier payload marked delivered while
+    /// discarding it from the returned `fresh`.
+    #[tokio::test]
+    async fn a_mid_packet_out_of_window_payload_rolls_back_the_session_link_too() {
+        let (sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(1);
+        receiver.open_session(session);
+
+        let mesh_packet = MeshPacket {
+            session: session.0,
+            packet: Some(Packet {
+                seq: 0,
+                ack: None,
+                ack_bits: 0,
+                payloads: vec![
+                    turn(0, 0, 0xAA),
+                    Payload {
+                        seq: u64::MAX,
+                        slot: 0,
+                        commands: vec![0xBB].into(),
+                        ..Default::default()
+                    },
+                ],
+            }),
+            conditions: None,
+        };
+        sender
+            .connection()
+            .send_datagram(mesh_packet.encode_to_vec().into())
+            .unwrap();
+
+        match receiver.recv().await {
+            Err(MeshLinkError::PayloadOutOfWindow { slot, seq }) => {
+                assert_eq!(slot, SlotId(0));
+                assert_eq!(seq, u64::MAX);
+            }
+            other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+        }
+        assert_eq!(
+            receiver.delivered_through(session, SlotId(0)),
+            None,
+            "the in-window payload's provisional accept rolls back with the packet",
+        );
+
+        // Redelivered alone, the same seq is accepted as new.
+        let retry = MeshPacket {
+            session: session.0,
+            packet: Some(Packet {
+                seq: 1,
+                ack: None,
+                ack_bits: 0,
+                payloads: vec![turn(0, 0, 0xAA)],
+            }),
+            conditions: None,
+        };
+        sender
+            .connection()
+            .send_datagram(retry.encode_to_vec().into())
+            .unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.delivery.fresh.len(), 1);
+        assert_eq!(receiver.delivered_through(session, SlotId(0)), Some(0));
+    }
+
     /// The inner `Packet` is built to `max_datagram_size() - MESH_PACKET_OVERHEAD`
     /// so the `MeshPacket` wrapper still fits the datagram even when
     /// `build_outgoing` fills the inner packet with redundancy under sustained

@@ -116,6 +116,29 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 /// window (4096) so it trips before a hard reject.
 const UNACKED_WINDOW_CAP: usize = 1024;
 
+/// A sane ceiling on a client-supplied resume-cursor anchor -- the same-relay
+/// resume dial's own-slot cursor read off `resume_cursors` before it ever
+/// reaches [`Link::anchor_receive_window`]. The handshake's own
+/// `MAX_RESUME_CURSORS` bounds how many entries a client may present
+/// (`proto::handshake`, the failover-hardening gate); this bounds what one
+/// entry's *value* may be, which that gate does not touch at all.
+///
+/// An anchor is the oldest seq the client claims it will re-send, feeding
+/// straight into the dedup prefix fold (`Dedup::accept`/`anchor`). A hostile
+/// or corrupted anchor near `u64::MAX`, paired with a payload at a seq near
+/// it, drives that fold's arithmetic to its own ceiling -- the transport
+/// layer now saturates rather than panics/wraps there (defense in depth),
+/// but the real gate belongs here, at the one place an unvalidated client
+/// value is about to become authoritative window state: reject it outright
+/// before it can ever reach the fold.
+///
+/// A real client's anchor is its retention ring's front or its oldest
+/// unacked seq — at the turn rate (tens per second) even a session running
+/// for a full day is nowhere near this. Sized with enormous headroom (a
+/// billion turns is ~1.3 continuous years at 24/sec) so no legitimate resume
+/// is ever caught by it.
+const MAX_SANE_RESUME_ANCHOR: u64 = 1_000_000_000;
+
 // The native SC:R `pending_leave_reason` value for a *dropped* player (shows
 // "player was dropped") lives in `consensus`, which also classifies a departure
 // notice from it — one source of truth for the dropped-vs-left boundary. A
@@ -142,6 +165,12 @@ const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 /// plain transport error (only [`crate::server::SLOT_DEPARTED_CLOSE`] gets
 /// special client-side handling).
 const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
+
+/// QUIC application close code for a connection refused because its presented
+/// resume-cursor anchor exceeds [`MAX_SANE_RESUME_ANCHOR`]. Distinct from
+/// [`INVALID_TURN_CLOSE`] (which means a live turn failed validation, not a
+/// resume-time value) so it's diagnosable in logs.
+const RESUME_ANCHOR_INVALID_CLOSE: u32 = 0x09;
 
 /// Whether a client's `GameResult` control frame should be forwarded to
 /// `consensus::record_result`, or dropped at ingress before it ever reaches the
@@ -899,6 +928,30 @@ pub async fn run_slot_link(
     // replayed its own turns). Absent (a fresh dial or a peer-only reconnect), this
     // is a no-op and the window bases at 0 as before.
     if let Some(anchor) = resume_cursors.remove(&slot) {
+        // Reject rather than clamp-and-continue: a client's own-slot anchor
+        // this far beyond anything a real session could ever produce is a
+        // corrupted or hostile value on a connection that hasn't sent a
+        // single turn yet, not a resume worth attempting. Task-isolated to
+        // this one connection -- see `MAX_SANE_RESUME_ANCHOR`. This slot may
+        // already have been announced present/connected above, so it gets
+        // the same full departure/close protocol every other early exit here
+        // runs, not a bare return.
+        if anchor > MAX_SANE_RESUME_ANCHOR {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                anchor,
+                cap = MAX_SANE_RESUME_ANCHOR,
+                "resume-cursor anchor exceeds the sane ceiling; refusing the reconnect",
+            );
+            link.connection().close(
+                VarInt::from_u32(RESUME_ANCHOR_INVALID_CLOSE),
+                b"resume anchor out of range",
+            );
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
+            return;
+        }
         link.anchor_receive_window(slot, anchor);
     }
 
@@ -1638,6 +1691,21 @@ pub async fn run_slot_link(
         }
     }
 
+    // Every exit path above converges here. Some already closed the
+    // connection with a specific reason code (an invalid turn, an isolated
+    // slot, an out-of-range resume anchor); a redundant close on one already
+    // closing is a no-op. The paths that didn't — a plain client disconnect
+    // (`link.recv()`'s own `Err` arm), a maintenance-flush send failure, and
+    // notably the lagging-slot isolation signal (whose own comment above
+    // says "close the link" but never actually did) — need this: the beacon
+    // and control-stream reader tasks spawned above each hold their own
+    // `connection.clone()`, parked on `accept_uni`/`accept_bi`, so `link`'s
+    // own handle going out of scope at the end of this function is never the
+    // last one. Without an explicit close, the connection — and the
+    // relay-side slot it's still notionally serving — lingers until QUIC's
+    // own idle timeout instead of freeing promptly.
+    link.connection()
+        .close(VarInt::from_u32(0), b"slot link ended");
     end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
 }
 

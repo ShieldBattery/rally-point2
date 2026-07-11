@@ -382,18 +382,45 @@ impl Link {
         // alongside.
         packet.payloads.sort_by_key(|p| (p.slot, p.seq));
 
+        // Transactional commit: snapshot every slot this packet's payloads
+        // name (before any of them are `accept`ed) so a payload that fails
+        // partway through the packet — out of window, or a malformed slot —
+        // can be rolled back cleanly, restoring dedup to exactly the state it
+        // was in before this packet. Without this, an earlier payload in the
+        // SAME packet that was already `accept`ed (and so is remembered as
+        // delivered) would be dropped from the returned `fresh` on the error
+        // return below, while dedup keeps believing it reached the consumer
+        // — a permanent, silent gap: a later reconnect's replay re-sends that
+        // seq, dedup rejects it as a duplicate, and the consumer never
+        // receives a turn it was never actually handed. Malformed payloads
+        // don't themselves touch dedup, but an earlier payload in the same
+        // packet may already have, so the same rollback applies to that path
+        // too.
+        let touched: Vec<SlotId> = {
+            let mut seen = std::collections::BTreeSet::new();
+            packet
+                .payloads
+                .iter()
+                .filter_map(|p| u8::try_from(p.slot).ok().map(SlotId))
+                .filter(|slot| seen.insert(*slot))
+                .collect()
+        };
+        let snapshot = self.dedup.snapshot(&touched);
+
         let mut fresh = Vec::new();
         for payload in packet.payloads {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's dedup key — corrupting that slot's
             // window instead of merely rejecting the malformed one.
             let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                self.dedup.restore(snapshot);
                 return Err(LinkError::MalformedSlot(payload.slot));
             };
             match self.dedup.accept(slot, payload.seq) {
                 Delivery::New => fresh.push(payload),
                 Delivery::Duplicate => {}
                 Delivery::OutOfWindow => {
+                    self.dedup.restore(snapshot);
                     return Err(LinkError::PayloadOutOfWindow {
                         slot,
                         seq: payload.seq,
@@ -462,7 +489,8 @@ pub(crate) struct Dedup {
 }
 
 /// One slot's receive-side dedup state.
-struct SlotDedup {
+#[derive(Clone)]
+pub(crate) struct SlotDedup {
     /// Top of the contiguous delivered prefix; `None` until seq 0 is delivered.
     delivered_through: Option<u64>,
     /// Delivered seqs above the prefix, kept until the gaps below them fill.
@@ -511,7 +539,18 @@ impl Dedup {
         });
 
         // The lowest seq not yet part of the contiguous delivered prefix.
-        let base = state.delivered_through.map_or(0, |t| t + 1);
+        // Saturating, not `+ 1` outright: a `delivered_through` of `u64::MAX`
+        // is already a nonsense value no real game can ever legitimately
+        // reach (that many turns dwarfs the lifetime of any session by many
+        // orders of magnitude) -- the real gate against it is the relay's
+        // resume-cursor anchor validation (see `Link::anchor_receive_window`'s
+        // caller in `routing.rs`), which clamps a client-supplied anchor
+        // before it ever reaches here. This saturation is the defense-in-depth
+        // backstop: if that gate were ever missing or wrong, the fold below
+        // degrades to "everything from here on is duplicate or out of
+        // window" rather than panicking (debug) or wrapping (release) into a
+        // corrupted, silently-wrong window.
+        let base = state.delivered_through.map_or(0, |t| t.saturating_add(1));
 
         if seq < base {
             return Delivery::Duplicate;
@@ -523,13 +562,52 @@ impl Dedup {
             return Delivery::Duplicate;
         }
 
-        // Absorb any now-contiguous run into the delivered prefix.
+        // Absorb any now-contiguous run into the delivered prefix. Stops
+        // rather than overflows if the run reaches `u64::MAX` -- the same
+        // saturating-boundary reasoning as `base` above; there is no valid
+        // seq beyond it to keep absorbing anyway.
         let mut next = base;
-        while state.ahead.remove(&next) {
+        loop {
+            if !state.ahead.remove(&next) {
+                break;
+            }
             state.delivered_through = Some(next);
-            next += 1;
+            let Some(after) = next.checked_add(1) else {
+                break;
+            };
+            next = after;
         }
         Delivery::New
+    }
+
+    /// Snapshots the current dedup state for exactly `slots`, so a caller that
+    /// provisionally mutates some of them while processing a batch (a packet's
+    /// payloads, sorted and `accept`ed one at a time) can undo the whole batch
+    /// atomically with [`restore`](Self::restore) if a later entry in the same
+    /// batch turns out invalid. `None` for a slot with no entry yet, so a
+    /// restore can tell "existed but was empty" from "was created by this
+    /// batch and must be removed outright."
+    pub(crate) fn snapshot(&self, slots: &[SlotId]) -> Vec<(SlotId, Option<SlotDedup>)> {
+        slots
+            .iter()
+            .map(|&slot| (slot, self.slots.get(&slot).cloned()))
+            .collect()
+    }
+
+    /// Restores exactly the slots a prior [`snapshot`](Self::snapshot) captured
+    /// to their captured state, removing an entry that did not exist when the
+    /// snapshot was taken. Slots outside the snapshot are untouched.
+    pub(crate) fn restore(&mut self, snapshot: Vec<(SlotId, Option<SlotDedup>)>) {
+        for (slot, state) in snapshot {
+            match state {
+                Some(state) => {
+                    self.slots.insert(slot, state);
+                }
+                None => {
+                    self.slots.remove(&slot);
+                }
+            }
+        }
     }
 
     /// Anchors `slot`'s receive window at `anchor`: sets the delivered prefix top to
@@ -618,6 +696,32 @@ mod tests {
         assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New); // prefix top = 0, base = 1
         assert_eq!(dedup.accept(SlotId(0), 9), Delivery::OutOfWindow); // 9 - 1 >= 8
         assert_eq!(dedup.accept(SlotId(0), 8), Delivery::New); // 8 - 1 < 8, still in window
+    }
+
+    /// An anchor at the u64 ceiling, followed by a payload at the u64 ceiling,
+    /// must not panic (debug) or silently wrap the window (release) — the
+    /// defense-in-depth backstop for a resume anchor that somehow reaches
+    /// this far unclamped (the real gate is the relay's own anchor
+    /// validation; this only proves the fold itself can't be driven into
+    /// undefined-by-overflow territory if that gate were ever bypassed).
+    #[test]
+    fn accept_and_anchor_never_overflow_at_the_u64_ceiling() {
+        let mut dedup = Dedup::with_window(8);
+        dedup.anchor(SlotId(0), u64::MAX);
+        // Anchoring at u64::MAX sets delivered_through to u64::MAX - 1, so the
+        // window's base is u64::MAX. A payload at u64::MAX itself is exactly
+        // at that base (seq - base == 0), so it's accepted, and the absorb
+        // loop's `next.checked_add(1)` must stop cleanly at the ceiling
+        // rather than overflow.
+        assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::New);
+        assert_eq!(dedup.delivered_through(SlotId(0)), Some(u64::MAX));
+        // A repeat at the exact ceiling isn't cleanly classified as a
+        // duplicate (there's no representable "one past u64::MAX" to compare
+        // against), but the property this test exists for is that it does
+        // not panic or corrupt state: `delivered_through` stays at the
+        // ceiling either way.
+        let _ = dedup.accept(SlotId(0), u64::MAX);
+        assert_eq!(dedup.delivered_through(SlotId(0)), Some(u64::MAX));
     }
 
     #[test]
@@ -732,6 +836,117 @@ mod tests {
         assert_eq!(link.delivered_through(SlotId(1)), Some(8000));
         // Nothing was ever keyed under the wire slot 0.
         assert_eq!(link.delivered_through(SlotId(0)), None);
+    }
+
+    /// A packet whose earlier payloads are genuinely in-window but whose LAST
+    /// payload is out of window must not leave dedup believing the earlier
+    /// ones were delivered: the whole packet rolls back, so the caller can
+    /// re-receive them later rather than losing them to a permanent silent
+    /// gap. This is the core transactional-recv regression: the old code
+    /// committed each payload to dedup as it went and only bailed on the
+    /// offending one, discarding the already-accepted payloads from the
+    /// return value while dedup kept them marked delivered.
+    #[tokio::test]
+    async fn a_mid_packet_out_of_window_payload_rolls_back_the_whole_packets_dedup_commit() {
+        let (raw, _peer, _ea, _eb) = connected_connections().await;
+        let mut link = Link::new(raw);
+
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                // Genuinely in-window and would be delivered on its own.
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xAA].into(),
+                    ..Default::default()
+                },
+                // Far beyond the receive window -- the whole packet fails.
+                Payload {
+                    seq: u64::MAX,
+                    slot: 0,
+                    commands: vec![0xBB].into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        match link.process_incoming(packet) {
+            Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
+                assert_eq!(slot, SlotId(0));
+                assert_eq!(seq, u64::MAX);
+            }
+            other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+        }
+
+        // The rollback: slot 0 must show no delivered prefix at all -- the
+        // seq-0 payload was never actually handed to a caller (it's absent
+        // from every `Received.fresh` this test ever saw), so dedup must not
+        // remember it as delivered either.
+        assert_eq!(
+            link.delivered_through(SlotId(0)),
+            None,
+            "the in-window payload's provisional accept must be rolled back \
+             along with the packet that failed",
+        );
+
+        // Proof it's genuinely recoverable: the same seq, redelivered alone
+        // in a fresh packet, is accepted as new -- not rejected as a
+        // duplicate of something the caller never actually received.
+        let retry = Packet {
+            seq: 1,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![Payload {
+                seq: 0,
+                slot: 0,
+                commands: vec![0xAA].into(),
+                ..Default::default()
+            }],
+        };
+        let received = link.process_incoming(retry).unwrap();
+        assert_eq!(received.fresh.len(), 1, "the payload is deliverable again");
+        assert_eq!(link.delivered_through(SlotId(0)), Some(0));
+    }
+
+    /// The same rollback, but the packet-ending failure is a malformed slot
+    /// (out of `u8` range) rather than an out-of-window seq -- an earlier
+    /// payload for a DIFFERENT, valid slot in the same packet must also be
+    /// rolled back, not left half-committed.
+    #[tokio::test]
+    async fn a_trailing_malformed_slot_rolls_back_an_earlier_valid_slots_commit_too() {
+        let (raw, _peer, _ea, _eb) = connected_connections().await;
+        let mut link = Link::new(raw);
+
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xAA].into(),
+                    ..Default::default()
+                },
+                Payload {
+                    seq: 0,
+                    slot: 300, // out of u8 range
+                    commands: vec![0xBB].into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        match link.process_incoming(packet) {
+            Err(LinkError::MalformedSlot(300)) => {}
+            other => panic!("expected MalformedSlot(300), got {other:?}"),
+        }
+        assert_eq!(
+            link.delivered_through(SlotId(0)),
+            None,
+            "slot 0's earlier commit rolls back alongside the malformed payload",
+        );
     }
 
     #[tokio::test]

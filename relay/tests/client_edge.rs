@@ -722,6 +722,58 @@ async fn refuses_connections_beyond_the_handshake_limit() {
     );
 }
 
+/// A coordinator reap (`routing::close_slots`, the same signal a holdout reap
+/// fires) actually closes the client's QUIC connection promptly, not just the
+/// relay's own internal roster bookkeeping. Before the fix, `run_slot_link`'s
+/// `shutdown.notified()` arm broke its serve loop without ever calling
+/// `connection.close()` (despite its own comment saying it would) — the
+/// beacon and control-stream reader tasks it spawned each held their own
+/// `connection.clone()`, so the connection lingered until QUIC's own idle
+/// timeout instead of freeing promptly. This test builds its own minimal
+/// relay directly (rather than through `start_relay`/`start_relay_with_mesh`,
+/// which don't expose the `Sessions` handle `close_slots` needs) so it can
+/// reach the same signal a real coordinator reap would send.
+#[tokio::test]
+async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end() {
+    use rally_point_relay::routing::{self, SessionKey};
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(12);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let (chain, key_der, ca) = self_signed();
+    let server_cfg = server_config(chain, key_der).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let sessions = routing::Sessions::default();
+    tokio::spawn(server::serve(
+        endpoint,
+        Arc::new(registry_for(&[&tenant])),
+        Arc::clone(&sessions),
+        rally_point_relay::mesh::new_mesh_state(),
+        None,
+    ));
+    let endpoint = client_endpoint(&ca);
+
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let client_connection = slot0.connection().clone();
+    // Let the relay finish registering the slot before reaping it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    routing::close_slots(&sessions, &key, &[SlotId(0)]);
+
+    match tokio::time::timeout(Duration::from_secs(5), client_connection.closed()).await {
+        Ok(_reason) => {}
+        Err(_) => panic!(
+            "the client never observed the connection end after a coordinator reap"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn frees_the_slot_when_a_client_disconnects() {
     let tenant = make_tenant(KID, TENANT);
@@ -1629,6 +1681,60 @@ async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_close
         slot1.connection().close_reason().is_none(),
         "the resumed nonzero-slot link must survive its first past-window turn",
     );
+}
+
+/// A client presenting an absurd own-slot resume-cursor anchor (near the u64
+/// ceiling) is refused outright rather than let that value become the dedup
+/// window's base -- the real gate the transport-level saturating arithmetic
+/// is only a backstop for. Task-isolated: only the presenting connection is
+/// closed, never the relay itself.
+#[tokio::test]
+async fn an_absurd_resume_anchor_is_refused_not_applied() {
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(321);
+
+    let client_key = keypair();
+    let token = mint_token(&tenant, session, SlotId(0), client_key.public);
+    let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+
+    // The relay applies the anchor (and closes the connection over it) only
+    // after the handshake ack -- but the close can race the ack's own
+    // delivery, so this accepts either observable outcome: the handshake's
+    // own read failing with the connection closed, or a successful handshake
+    // followed by the closed connection on the first subsequent recv. Either
+    // way, the load-bearing proof is the close code and reason below.
+    let handshake_outcome = handshake(&connection, &token, &client_key, &[(SlotId(0), u64::MAX)])
+        .await;
+
+    if handshake_outcome.is_ok() {
+        let mut link = Link::new(connection.clone());
+        let _ = tokio::time::timeout(Duration::from_secs(2), link.recv()).await;
+    }
+    // `close_reason` reflects the local endpoint's own processed state, which
+    // can lag slightly behind the read/write error already observed above;
+    // poll briefly rather than risk a one-shot race.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let close = loop {
+        if let Some(reason) = connection.close_reason() {
+            break Some(reason);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    match close {
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
+            assert_eq!(
+                close.error_code,
+                quinn::VarInt::from_u32(0x09),
+                "closed with the dedicated resume-anchor-invalid code",
+            );
+        }
+        other => panic!("expected the connection closed over the absurd anchor, got {other:?}"),
+    }
 }
 
 #[tokio::test]

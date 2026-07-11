@@ -380,6 +380,20 @@ pub enum DriverError {
     /// window bounded would desync lockstep, so the driver stops instead.
     #[error("unacked window exhausted: {in_flight} payloads in flight exceeds the {cap}-turn cap")]
     UnackedWindowExhausted { in_flight: usize, cap: usize },
+    /// The outbound outage buffer crossed [`OUTAGE_OUTBOUND_BUFFER_CAP`] while
+    /// the link was down — the game kept producing turns faster than the
+    /// driver could hold them across the outage. Surfaced as a terminal error
+    /// rather than silently discarding the oldest buffered turn: a dropped
+    /// turn here is a genuine game-produced command, and the resumed session
+    /// assigns the *surviving* turns gapless origin seqs — so a silent drop
+    /// leaves no gap for any peer to ever detect, just a quietly shorter turn
+    /// stream. A game producing this many turns during a genuinely dead link,
+    /// without its own lockstep stalling first, is already abnormal; ending
+    /// the session loudly beats a silent divergence.
+    #[error(
+        "outbound outage buffer exhausted: {buffered} turns produced during the outage exceeds the {cap}-turn cap"
+    )]
+    OutageBufferExhausted { buffered: usize, cap: usize },
     /// The relay refused a re-dial because this slot's leave was already decided
     /// (a survivor's drop request was honored, or it left cleanly), so the game has
     /// moved on without this client. Terminal for the reconnect loop — no dial can bring the
@@ -632,6 +646,33 @@ impl LinkDriver {
     /// complete `(slot, cursor)` over an mpsc channel, whose `recv` *is*
     /// cancel-safe.
     async fn session(
+        link: &mut Link,
+        seam: &mut GameSeam,
+        state: &mut LoopState,
+        own_slot: SlotId,
+    ) -> Result<(), DriverError> {
+        let result = Self::session_body(link, seam, state, own_slot).await;
+        // A clean stop closes the connection here: the detached beacon and
+        // control-stream reader tasks each hold their own `connection.clone()`,
+        // parked on `accept_uni`/`accept_bi`, so `link`'s own handle going out
+        // of scope alone is never the last one -- without this, a clean exit
+        // leaves the connection (and the relay-side slot it holds) open until
+        // QUIC's own idle timeout. Closing here wakes those readers, freeing
+        // them and the slot promptly.
+        //
+        // Deliberately NOT done on an `Err` exit: a link/control-stream
+        // failure's own reconnect path re-dials a fresh connection (or the
+        // driver ends and every handle simply drops), and closing the
+        // now-failed connection out from under the caller here would blur the
+        // "control stream died, connection didn't" distinction the reconnect
+        // classification (`is_link_failure`) and its own tests rely on.
+        if result.is_ok() {
+            link.connection().close(0u32.into(), b"session ended");
+        }
+        result
+    }
+
+    async fn session_body(
         link: &mut Link,
         seam: &mut GameSeam,
         state: &mut LoopState,
@@ -1203,6 +1244,19 @@ impl LinkDriver {
                 // so it is the same reconnect trigger as an undeliverable oversize
                 // turn — except once our leave intent is out, the relay closing
                 // the stream under this write is the expected confirmation.
+                //
+                // Unlike an oversize turn, a lobby command is never retained for
+                // redelivery on a resume: `LobbyCommand` carries no seq or other
+                // origin identity, and the relay's lobby log neither dedups nor
+                // rejects a byte-identical repeat — it is simply appended and
+                // fanned out again as a second, indistinguishable command. Ever
+                // resending one (even only the "recent tail") risks silently
+                // corrupting setup state (a double-applied slot/color/ready
+                // toggle), which is worse than the narrow gap this leaves: a
+                // drop between this write succeeding locally and the relay
+                // actually processing it, on a same-relay resume, can still lose
+                // a lobby command with no retry. Known and intentionally out of
+                // scope until lobby commands carry real delivery confirmation.
                 bytes = lobby_out.recv(), if lobby_out_alive => {
                     match bytes {
                         Some(bytes) => {
@@ -1816,6 +1870,12 @@ async fn reconnect_link(
         match wait_backoff(backoff, seam, state).await {
             WaitOutcome::Elapsed => {}
             WaitOutcome::GameGone => return Reconnected::GameGone,
+            WaitOutcome::BufferExhausted => {
+                return Reconnected::Terminal(DriverError::OutageBufferExhausted {
+                    buffered: state.outbound_buffer.len(),
+                    cap: OUTAGE_OUTBOUND_BUFFER_CAP,
+                });
+            }
         }
         let cursors = resume_cursors(&state.next_seq);
         // The relay builds a brand-new receive dedup on *every* re-dial (a fresh
@@ -1850,9 +1910,24 @@ async fn reconnect_link(
         {
             Ok(fresh) => {
                 // A same-relay resume: the old link's receive dedup and unacked
-                // window carry over. No retention re-injection — the same relay
-                // still holds this session's turn ring.
+                // window carry over, and the datagram/ack path needs no
+                // retention re-injection — the same relay still holds this
+                // session's turn ring, and `same_relay_anchor` above already
+                // covers the unacked tail. An OVERSIZE turn is different: it
+                // never rode the datagram/ack path at all (there is no
+                // per-turn acknowledgment for a control-stream write), so a
+                // drop between the local `write_all` succeeding and the relay
+                // actually processing it is invisible to everything else here
+                // — re-divert every still-retained oversize turn onto the
+                // fresh connection's control stream, exactly as a re-home
+                // does. See `redivert_oversize_retention_on_same_relay_resume`
+                // for why this is safe to run unconditionally. Checked after
+                // rebind, against the fresh connection's own datagram budget
+                // — mirroring the re-home path's own rebind-then-reinject
+                // order — though an oversize turn is definitionally oversize
+                // on any realistic path.
                 link.rebind(fresh.connection().clone());
+                redivert_oversize_retention_on_same_relay_resume(link, state);
                 backoff.reset();
                 return Reconnected::Resumed;
             }
@@ -2058,6 +2133,49 @@ fn reinject_retention(link: &mut Link, state: &mut LoopState) {
     }
 }
 
+/// Re-divert this session's still-retained OVERSIZE turns onto a same-relay
+/// resume's control stream — the same-connection counterpart of
+/// [`reinject_retention`]'s oversize half.
+///
+/// A same-relay resume deliberately does NOT touch the datagram/unacked
+/// window at all: the old relay's own turn ring is still intact for
+/// ordinary-sized turns, and `reconnect_link`'s `same_relay_anchor` already
+/// covers the unacked tail via the rebound link's own redundancy. Re-injecting
+/// the retention ring's ordinary-sized turns on top of that — as a re-home
+/// does — would risk a permanent prefix gap (see the `same_relay_anchor`
+/// comment in `reconnect_link`); that risk is real and this function does not
+/// touch it.
+///
+/// An oversize turn is different in kind, not just size: it never rode the
+/// datagram/ack path in the first place (there is no acknowledgment for a
+/// control-stream write to check against), so there is no equivalent gap risk
+/// here — a turn the relay already fanned out is simply deduped again on
+/// arrival (the relay's ingress dedup keys on origin `(slot, seq)` regardless
+/// of which path delivered it, exactly as a datagram-delivered turn would
+/// be), and one the relay never received before the drop is finally
+/// delivered. Safe and cheap to run unconditionally on every same-relay
+/// resume, not gated on anything provably missing — there is no
+/// acknowledgment to check in the first place. A turn already staged (from a
+/// prior resume whose own redivert only partially drained before failing
+/// again) is not re-staged, so a run of same-relay failures doesn't grow the
+/// pending list without bound.
+fn redivert_oversize_retention_on_same_relay_resume(link: &Link, state: &mut LoopState) {
+    let LoopState {
+        retention,
+        pending_control_redivert,
+        ..
+    } = state;
+    for turn in retention.iter() {
+        if matches!(link.payload_fits(turn), Ok(false))
+            && !pending_control_redivert
+                .iter()
+                .any(|staged| staged.slot == turn.slot && staged.seq == turn.seq)
+        {
+            pending_control_redivert.push(turn.clone());
+        }
+    }
+}
+
 /// Best-effort classification of a dial failure as a TLS certificate / pin
 /// rejection — a relay that restarted with a fresh keypair, which no same-relay
 /// retry can ever get past, so escalation need not wait out the timed window. It
@@ -2083,13 +2201,21 @@ enum WaitOutcome {
     Elapsed,
     /// The game tore down its seam; abandon reconnection.
     GameGone,
+    /// The outage buffer crossed [`OUTAGE_OUTBOUND_BUFFER_CAP`]; the driver
+    /// stops rather than silently drop a game-produced turn.
+    BufferExhausted,
 }
 
 /// Waits the next backoff delay before a reconnect attempt, while still servicing
-/// the game's outbound turns — buffering them (bounded, drop-oldest) so a resumed
-/// session can flush them — and watching for the game tearing down (its outbound
-/// sender or inbound receiver dropped). Other game→driver channels park in their
-/// own buffers during the brief outage and are drained when the session resumes.
+/// the game's outbound turns — buffering them (bounded) so a resumed session can
+/// flush them — and watching for the game tearing down (its outbound sender or
+/// inbound receiver dropped). Other game→driver channels park in their own buffers
+/// during the brief outage and are drained when the session resumes.
+///
+/// A turn produced past [`OUTAGE_OUTBOUND_BUFFER_CAP`] is not dropped: dropping it
+/// here would be silent (the resumed session assigns the survivors gapless origin
+/// seqs, so no peer could ever detect the loss), so the caller ends the driver
+/// instead — see [`DriverError::OutageBufferExhausted`].
 async fn wait_backoff(
     backoff: &mut Backoff,
     seam: &mut GameSeam,
@@ -2105,10 +2231,7 @@ async fn wait_backoff(
                 Some(turn) => {
                     state.outbound_buffer.push_back(turn);
                     if state.outbound_buffer.len() > OUTAGE_OUTBOUND_BUFFER_CAP {
-                        state.outbound_buffer.pop_front();
-                        tracing::warn!(
-                            "outbound outage buffer full; dropping the oldest produced turn"
-                        );
+                        return WaitOutcome::BufferExhausted;
                     }
                 }
                 // The game dropped its outbound sender: a teardown.
@@ -2463,6 +2586,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
+        // On a SAME-relay resume (unlike a re-home), ordinary-sized retained
+        // turns must NOT be touched at all — the old
+        // relay's own turn ring already covers them, and re-injecting them
+        // into the datagram window risks the permanent prefix gap
+        // `reconnect_link`'s own `same_relay_anchor` comment describes. Only
+        // the oversize subset — which never rode the datagram/ack path and so
+        // carries no such risk — gets staged for the resumed connection's
+        // control stream.
+        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+        let mut state = LoopState::new(Arc::new(AtomicBool::new(false)));
+
+        state.retention.push_back(turn(0, &[0x01])); // datagram-sized
+        state.retention.push_back(turn(1, &vec![0x42; 4096])); // oversize
+
+        redivert_oversize_retention_on_same_relay_resume(&link_a, &mut state);
+
+        assert_eq!(
+            link_a.payloads_in_flight(),
+            0,
+            "same-relay resume never touches the datagram/unacked window",
+        );
+        assert_eq!(state.pending_control_redivert.len(), 1);
+        assert_eq!(state.pending_control_redivert[0].seq, 1);
+
+        // A second call (mirroring a run of failed same-relay resumes before
+        // one finally succeeds) does not re-stage an already-staged turn.
+        redivert_oversize_retention_on_same_relay_resume(&link_a, &mut state);
+        assert_eq!(
+            state.pending_control_redivert.len(),
+            1,
+            "an already-staged oversize turn is not duplicated on a later resume",
+        );
+    }
+
+    /// End-to-end proof that a same-relay resume actually redelivers a
+    /// retained oversize turn: drives a real session that sends one, then
+    /// simulates the resume path directly (mirroring what `reconnect_link`
+    /// does on `Ok(fresh)`) and confirms the peer receives it on the fresh
+    /// connection's control stream — a drop between the local `write_all`
+    /// and the relay's own processing is now recovered rather than silently
+    /// losing the turn.
+    #[tokio::test]
+    async fn a_same_relay_resume_redelivers_an_oversize_turn_the_relay_never_got() {
+        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+
+        // The oversize turn is sent once (mirroring the driver's own one-time
+        // control-stream write) and retained, but — simulating a drop right
+        // after that write — never actually reaches a peer control reader on
+        // the original connection (none is spawned for it here).
+        let oversize = turn(0, &vec![0x42; 4096]);
+        chan_a.outbound.send(oversize.clone()).await.unwrap();
+        drop(chan_a.outbound);
+        let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+        LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0))
+            .await
+            .expect("session stops cleanly once the outbound seam closes");
+        assert_eq!(
+            state.retention.len(),
+            1,
+            "the oversize turn was retained when it was first sent",
+        );
+
+        // The same-relay resume: rebind (a fresh connection to keep the test
+        // self-contained; a real same-relay resume rebinds the SAME relay's
+        // address, but the mechanics under test — retention staging and the
+        // control-stream redeliver — don't depend on which address it is),
+        // then redivert.
+        let (fresh_a, fresh_b, _fea, _feb) = connected_links().await;
+        link.rebind(fresh_a.connection().clone());
+        redivert_oversize_retention_on_same_relay_resume(&link, &mut state);
+        assert_eq!(state.pending_control_redivert.len(), 1);
+
+        // `session`'s own top-of-function drain (the existing
+        // `redivert_pending_control` call) is what a real resume relies on;
+        // exercise it directly here to prove the staged turn actually crosses
+        // the wire.
+        let mut control_rx = spawn_control_reader(fresh_b.connection().clone());
+        let (mut control_send, _recv) = link.connection().open_bi().await.unwrap();
+        redivert_pending_control(&mut control_send, &mut state.pending_control_redivert)
+            .await
+            .unwrap();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the retained oversize turn never crossed the resumed control stream")
+            .expect("control reader closed early");
+        match delivered {
+            ControlInbound::OversizeTurn(payload) => {
+                assert_eq!(payload.seq, oversize.seq);
+                assert_eq!(payload.commands.len(), 4096);
+            }
+            other => panic!("expected an oversize turn on the control stream, got {other:?}"),
+        }
+    }
+
     /// Splits a [`LinkDriver`] into the pieces [`session`](LinkDriver::session)
     /// takes directly, so a test can drive exactly one session on an explicit
     /// `own_slot` and then inspect the link and loop state afterward — state that
@@ -2502,6 +2723,43 @@ mod tests {
         (link, seam, state)
     }
 
+    /// A turn produced past [`OUTAGE_OUTBOUND_BUFFER_CAP`] during an outage
+    /// must not be silently dropped: `wait_backoff` surfaces
+    /// `WaitOutcome::BufferExhausted` the moment the buffer crosses the cap,
+    /// with every turn up to and including the one that tipped it over still
+    /// in `state.outbound_buffer` (nothing discarded on the way).
+    #[tokio::test]
+    async fn wait_backoff_reports_buffer_exhausted_once_the_outage_buffer_overflows() {
+        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (_link, mut seam, mut state) = into_session_parts(driver_a);
+        let mut backoff = Backoff::new();
+
+        // Fill to exactly the cap, then one more to tip it over. `wait_backoff`
+        // processes queued turns one at a time in its own loop, so pre-filling
+        // the channel is equivalent to a real caller producing them one by one
+        // during the outage.
+        for i in 0..=OUTAGE_OUTBOUND_BUFFER_CAP {
+            chan_a
+                .outbound
+                .send(turn(0, &[(i % 256) as u8]))
+                .await
+                .unwrap();
+        }
+
+        match wait_backoff(&mut backoff, &mut seam, &mut state).await {
+            WaitOutcome::BufferExhausted => {}
+            WaitOutcome::Elapsed => panic!("expected BufferExhausted, got Elapsed"),
+            WaitOutcome::GameGone => panic!("expected BufferExhausted, got GameGone"),
+        }
+        assert_eq!(
+            state.outbound_buffer.len(),
+            OUTAGE_OUTBOUND_BUFFER_CAP + 1,
+            "nothing was dropped on the way to the trip -- every produced turn is \
+             still buffered, proving the exhaustion is reported, not silently eaten",
+        );
+    }
+
     /// Drives one session on `own_slot`, feeding it one small datagram turn per
     /// entry in `turns` and then closing the outbound seam so the session returns.
     /// The peer link is never driven, so nothing acks: every sent turn stays in the
@@ -2521,7 +2779,13 @@ mod tests {
         }
         drop(chan_a.outbound);
         let (mut link, mut seam, mut state) = into_session_parts(driver_a);
-        LinkDriver::session(&mut link, &mut seam, &mut state, own_slot)
+        // `session_body`, not `session`: this helper's whole contract (see its
+        // doc above) is inspecting the connection after the session ends, and
+        // `session`'s own clean-exit close would race that inspection over
+        // the unreliable datagram path -- exactly the hazard closing on a
+        // clean exit is supposed to be safe to do in production, just not
+        // compatible with a test that wants to keep reading afterward.
+        LinkDriver::session_body(&mut link, &mut seam, &mut state, own_slot)
             .await
             .expect("session stops cleanly once the outbound seam closes");
         (link, state, link_b, ea, eb)
@@ -3034,6 +3298,34 @@ mod tests {
             Err(_) => panic!("driver kept running after its receiver was dropped"),
         }
         drop(chan_a.outbound);
+    }
+
+    /// A clean driver exit actually closes the connection, rather than
+    /// leaving it open until QUIC's own idle timeout. `link_a` itself is
+    /// moved into the spawned driver task and unobservable afterward, so
+    /// this checks the one place the close is externally visible: the
+    /// peer's own connection sees it end. Before the fix, this timed out —
+    /// the beacon and control-stream reader tasks each held their own
+    /// `connection.clone()` parked on `accept_*`, so nothing ever told the
+    /// peer the link was actually done.
+    #[tokio::test]
+    async fn a_clean_stop_closes_the_connection_so_the_peer_observes_it_end() {
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let peer_connection = link_b.connection().clone();
+        let task = tokio::spawn(driver_a.run());
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        assert!(task.await.unwrap().is_ok());
+
+        match tokio::time::timeout(Duration::from_secs(5), peer_connection.closed()).await {
+            Ok(_reason) => {}
+            Err(_) => panic!(
+                "the peer never observed the connection end -- the driver's clean exit \
+                 did not actually close it"
+            ),
+        }
     }
 
     #[tokio::test]
