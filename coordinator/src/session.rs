@@ -1352,12 +1352,14 @@ mod tests {
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,
                 observer: false,
+                region: None,
             },
             PlayerHandoff {
                 slot: SlotId(1),
                 client_pubkey: ClientPublicKey([0xBB; 32]),
                 external_ref: None,
                 observer: false,
+                region: None,
             },
         ]
     }
@@ -1639,6 +1641,7 @@ mod tests {
             client_pubkey: ClientPublicKey([slot; 32]),
             external_ref: None,
             observer: false,
+            region: None,
         };
 
         let resp = create_session(
@@ -1676,6 +1679,7 @@ mod tests {
             client_pubkey: ClientPublicKey([slot; 32]),
             external_ref: None,
             observer: false,
+            region: None,
         };
 
         let result = create_session(
@@ -1733,12 +1737,14 @@ mod tests {
                         client_pubkey: ClientPublicKey([0; 32]),
                         external_ref: None,
                         observer: false,
+                        region: None,
                     },
                     PlayerHandoff {
                         slot: SlotId(1),
                         client_pubkey: ClientPublicKey([1; 32]),
                         external_ref: Some("y".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
                         observer: false,
+                        region: None,
                     },
                 ],
                 external_id: None,
@@ -1854,6 +1860,7 @@ mod tests {
                         client_pubkey: ClientPublicKey([0xAA; 32]),
                         external_ref: Some("sb-user-7".to_owned()),
                         observer: false,
+                        region: None,
                     },
                     PlayerHandoff {
                         slot: SlotId(1),
@@ -1862,6 +1869,7 @@ mod tests {
                         // An observer: it must show up in the descriptor's
                         // observer_slots so relays exclude it from desync checks.
                         observer: true,
+                        region: None,
                     },
                 ],
                 external_id: Some("game-99".to_owned()),
@@ -2454,12 +2462,14 @@ mod tests {
                     client_pubkey: ClientPublicKey([0xAA; 32]),
                     external_ref: None,
                     observer: false,
+                    region: None,
                 },
                 PlayerHandoff {
                     slot: SlotId(1),
                     client_pubkey: ClientPublicKey([0xCC; 32]),
                     external_ref: None,
                     observer: false,
+                    region: None,
                 },
             ],
             external_id: Some("game-1".to_owned()),

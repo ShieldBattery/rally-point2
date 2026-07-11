@@ -87,6 +87,20 @@ pub fn negotiate(
 /// reconnect — a version mismatch is fixed by a deploy, not a redial.
 pub const CONTROL_CLOSE_PROTOCOL_MISMATCH: u16 = 4001;
 
+/// WebSocket close code the coordinator sends when it refuses a relay's control
+/// connection because the relay enrolled tagged with a region the coordinator's
+/// configuration does not list — including the case where the coordinator has no
+/// region config at all. In the same private-use range (4000–4999) as
+/// [`CONTROL_CLOSE_PROTOCOL_MISMATCH`], the sibling refusal that happens at the
+/// same enroll seam.
+///
+/// A cross-component contract: the coordinator sends it (with a reason naming the
+/// offered region) *instead of enrolling*, since a typo'd region tag that
+/// silently serves nobody is worse than a failed enroll. The relay's coordinator
+/// client recognizes it and backs off far longer than a normal reconnect — like a
+/// version mismatch, the fix is a config/deploy change, not a redial.
+pub const CONTROL_CLOSE_UNKNOWN_REGION: u16 = 4002;
+
 /// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
 /// whose advertised protocol version does not [`negotiate`] against its own.
 /// Sent before the link driver is ever spawned, so an incompatible pair never

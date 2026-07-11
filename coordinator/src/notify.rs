@@ -1108,6 +1108,7 @@ mod tests {
                     client_pubkey: ClientPublicKey([0xAA; 32]),
                     external_ref: slot0_ref.map(str::to_owned),
                     observer: false,
+                    region: None,
                 }],
                 external_id: external_id.map(str::to_owned),
                 dev_relay_split: Vec::new(),

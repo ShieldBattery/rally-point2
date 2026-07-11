@@ -62,6 +62,32 @@ impl AsRef<str> for TenantId {
     }
 }
 
+/// Identifies a coordinator-configured relay region — an opaque placement label,
+/// deliberately *not* an AWS region name so a non-AWS region stays expressible.
+///
+/// A relay enrolls tagged with the region it serves; the coordinator validates
+/// that tag against its configured region list (an unknown one is refused,
+/// [`crate::version::CONTROL_CLOSE_UNKNOWN_REGION`]). A session slot names the
+/// region the player wants their home relay in, and the coordinator homes the
+/// slot on a relay enrolled in that region — falling back to a region-blind pick
+/// when the region names no live relay. The string is the wire name everywhere
+/// (`"us-east"`, not `us-east-1`); its allowed shape (charset, length) is
+/// enforced where the coordinator loads its region config, not by this type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegionId(pub String);
+
+impl From<RegionId> for String {
+    fn from(rid: RegionId) -> String {
+        rid.0
+    }
+}
+
+impl AsRef<str> for RegionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Relay registry (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
@@ -124,6 +150,16 @@ pub struct RelayHello {
     /// pre-dual-stack form).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_addrs: Vec<SocketAddr>,
+    /// The region this relay serves, if it was launched with one. The
+    /// coordinator validates it against its configured region list at enroll and
+    /// refuses the connection ([`crate::version::CONTROL_CLOSE_UNKNOWN_REGION`])
+    /// for a region it does not recognize — a typo'd tag silently serving nobody
+    /// is worse than a failed enroll. Absent means an untagged relay (dev /
+    /// loopback, or a fleet with no region config): it enrolls unconditionally
+    /// and is only ever the region-blind fallback pick. Additive, so an untagged
+    /// hello stays byte-identical to the pre-region form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<RegionId>,
 }
 
 impl RelayHello {
@@ -134,8 +170,8 @@ impl RelayHello {
     /// [`with_relay_addrs`](Self::with_relay_addrs)).
     ///
     /// Provided because `RelayHello` is `#[non_exhaustive]`: future fields
-    /// (e.g. capabilities, region) can be added without breaking external
-    /// callers that construct it.
+    /// (e.g. capabilities) can be added without breaking external callers that
+    /// construct it.
     pub fn new(
         relay_id: RelayId,
         relay_addr: SocketAddr,
@@ -149,6 +185,7 @@ impl RelayHello {
             cert_der,
             min_protocol: None,
             relay_addrs: Vec::new(),
+            region: None,
         }
     }
 
@@ -165,6 +202,15 @@ impl RelayHello {
     /// `relay_addr`), in the relay's preference order — the dual-stack advertise.
     pub fn with_relay_addrs(mut self, relay_addrs: Vec<SocketAddr>) -> Self {
         self.relay_addrs = relay_addrs;
+        self
+    }
+
+    /// Tags this hello with the region the relay serves, so the coordinator homes
+    /// region-matching session slots on it. Left unset (via [`new`](Self::new)),
+    /// the relay is untagged — it enrolls unconditionally and is only ever the
+    /// region-blind fallback pick.
+    pub fn with_region(mut self, region: RegionId) -> Self {
+        self.region = Some(region);
         self
     }
 }
@@ -196,6 +242,16 @@ pub struct RelayEntry {
     /// every endpoint/peer built from this entry advertises the full set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_addrs: Vec<SocketAddr>,
+    /// The region this relay enrolled tagged with (from [`RelayHello::region`]),
+    /// or `None` for an untagged relay. The coordinator reads it when placing a
+    /// session's slots — a slot requesting this region homes here — and when a
+    /// re-home prefers the dead relay's region for the replacement pick. It is
+    /// deliberately *not* propagated into the [`RelayPeer`]/[`RelayEndpoint`] a
+    /// descriptor or session response carries: a relay never needs to know its
+    /// peers' regions, and a client never needs its relay's, so the region stays
+    /// coordinator-side placement state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<RegionId>,
 }
 
 impl From<&RelayEntry> for RelayPeer {
@@ -459,6 +515,16 @@ pub struct PlayerHandoff {
     /// the field still interops, exactly like `external_ref`'s optionality.
     #[serde(default)]
     pub observer: bool,
+    /// The tenant's assertion of which configured region this player wants their
+    /// home relay in. The coordinator homes the slot on a relay enrolled in this
+    /// region when one is live, else falls back to its region-blind pick — the
+    /// region is a preference, not a requirement, so an unrecognized or unserved
+    /// region degrades to the fallback rather than failing the session. Absent
+    /// means no preference (the fallback pick outright). Additive: a handoff that
+    /// predates the field carries no region, and the control protos don't
+    /// `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<RegionId>,
 }
 
 /// A request from an app server to stand up a game session: which tenant, how
@@ -1186,6 +1252,7 @@ mod tests {
             cert_der: vec![0x30, 0x82, 0xAA, 0xBB],
             min_protocol: None,
             relay_addrs: vec![],
+            region: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         // An unset window bottom stays off the wire (a one-version window).
@@ -1224,6 +1291,60 @@ mod tests {
         let back: RelayHello = serde_json::from_str(json).unwrap();
         assert_eq!(back.min_protocol, None);
         assert_eq!(back.protocol, ProtocolVersion(2));
+    }
+
+    #[test]
+    fn relay_hello_with_region_roundtrips_and_omits_when_absent() {
+        // A tagged relay carries its region on the wire; an untagged one keeps the
+        // field off entirely, so an untagged hello stays byte-identical to the
+        // pre-region form.
+        let tagged = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        )
+        .with_region(RegionId("us-east".to_owned()));
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert!(json.contains("\"region\":\"us-east\""));
+        assert_eq!(serde_json::from_str::<RelayHello>(&json).unwrap(), tagged);
+
+        let untagged = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        );
+        assert!(!serde_json::to_string(&untagged).unwrap().contains("region"));
+    }
+
+    #[test]
+    fn player_handoff_region_is_omitted_when_absent_and_decodes_to_none() {
+        // An untagged handoff keeps `region` off the wire, and a handoff from an app
+        // server that predates the field decodes with `region` defaulting to None
+        // (no preference, the coordinator's fallback pick).
+        let handoff = PlayerHandoff {
+            slot: SlotId(0),
+            client_pubkey: ClientPublicKey([0xAA; 32]),
+            external_ref: None,
+            observer: false,
+            region: None,
+        };
+        let json = serde_json::to_string(&handoff).unwrap();
+        assert!(!json.contains("region"));
+        let back: PlayerHandoff = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.region, None);
+
+        let tagged = PlayerHandoff {
+            region: Some(RegionId("us-west".to_owned())),
+            ..handoff
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert!(json.contains("\"region\":\"us-west\""));
+        assert_eq!(
+            serde_json::from_str::<PlayerHandoff>(&json).unwrap(),
+            tagged
+        );
     }
 
     #[test]
@@ -1738,6 +1859,7 @@ mod tests {
             client_pubkey: ClientPublicKey([0x42; 32]),
             external_ref: Some("sb-user-77".to_owned()),
             observer: false,
+            region: None,
         };
         let json = serde_json::to_string(&h).unwrap();
         let back: PlayerHandoff = serde_json::from_str(&json).unwrap();
@@ -1780,6 +1902,7 @@ mod tests {
                 client_pubkey: ClientPublicKey([0x11; 32]),
                 external_ref: None,
                 observer: false,
+                region: None,
             }],
             external_id: None,
             dev_relay_split: Vec::new(),

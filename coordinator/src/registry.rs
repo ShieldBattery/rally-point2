@@ -89,6 +89,7 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
         protocol: hello.protocol,
         cert_der: hello.cert_der,
         relay_addrs: hello.relay_addrs,
+        region: hello.region,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
     registry.relays.lock().insert(
