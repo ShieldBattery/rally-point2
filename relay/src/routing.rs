@@ -1722,6 +1722,32 @@ fn end_slot_link(
 /// impossible. Recording the departure captures the slot's last observed frame
 /// into its record — the leave's apply-frame basis — and retires the slot's live
 /// state in the decision-maker.
+///
+/// For a *disconnect* (`reason` == [`LEAVE_REASON_DROPPED`]) this guards against
+/// a reconnect that has already reclaimed the slot's roster seat by the time this
+/// runs — the gap between `end_slot_link`'s earlier `deregister` and this call is
+/// only a handful of synchronous instructions, but on a multi-threaded runtime a
+/// concurrent `serve_connection` can still land its own `register` in it. The
+/// roster lock is held across the presence check and the whole announcement
+/// below, so a `register` racing this disconnect can't land in the gap:
+/// whichever of the two acquires the roster lock first is authoritative. If this
+/// disconnect wins (the seat is still empty), it announces normally, and a
+/// reconnect that registers moments later (`server.rs`) reads the fresh hold and
+/// reinstates. If the reconnect wins (the seat is already reoccupied), announcing
+/// here would record a departure and mark a hold against a slot that is, as of
+/// this check, already live again — an orphaned record would wrongly refuse
+/// every later reconnect for the slot (nothing ever clears a record with no
+/// hold to release), and an orphaned hold would let a survivor's `RequestDrop`
+/// honor a drop against a connected player — so this stands down instead. Every
+/// call this reaches into below (`consensus::record_departure`,
+/// `mesh::fan_out_slot_departed`, `hold_or_decide_leave`'s DROPPED branch) touches
+/// only its own lock, never this roster's, so holding it across them cannot
+/// deadlock or reenter it. A clean leave (`reason` != `LEAVE_REASON_DROPPED`)
+/// never takes this guard: it is announced by the still-connected client's own
+/// control-stream handler, so no concurrent register for the same slot can be
+/// racing it, and its own decide path (`decide_and_broadcast_leave` →
+/// `fan_out_leave`) needs the roster lock itself — holding it here too would
+/// deadlock.
 fn announce_departure(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
@@ -1731,6 +1757,16 @@ fn announce_departure(
     slot: SlotId,
     reason: u32,
 ) {
+    let roster_guard = (reason == LEAVE_REASON_DROPPED).then(|| sessions.lock());
+    if let Some(roster) = &roster_guard
+        && roster.get(key).is_some_and(|slots| slots.contains_key(&slot))
+    {
+        // A reconnect already reclaimed this seat; its own post-register
+        // admission (current state, not a stale snapshot) is the sole authority
+        // on this slot now.
+        return;
+    }
+
     // Read the last observed frame, the reachability ceiling, and the slot's
     // retained end-of-game result before recording retires the slot's live state;
     // all fill the departure record and the SlotDeparted the peers receive. The
@@ -1808,9 +1844,14 @@ pub(crate) fn hold_or_decide_leave(
             crate::flight_recorder::FlightEvent::DropHeld { slot: slot.0 },
         );
     } else {
-        // A clean leave supersedes any pending drop hold for this slot, then
-        // decides immediately.
-        drop_holds.release(key, slot);
+        // A clean leave supersedes any pending drop hold for this slot -- and
+        // decides regardless of whether one was even there: unlike an honored
+        // `RequestDrop` or the abandoned-session force-decide, a clean
+        // leave-intent's decision is never contingent on winning a claim over
+        // the hold -- a slot leaving cleanly for the first time (no drop ever
+        // observed) still decides here. So `release`'s bool return is
+        // informational only in this branch, not a gate.
+        let _ = drop_holds.release(key, slot);
         decide_and_broadcast_leave(decision_makers, sessions, mesh_links, key, slot, reason);
     }
 }
@@ -1913,10 +1954,22 @@ fn handle_drop_request(
 /// mesh `RequestDrop` frame (a peer's request). A non-authority does nothing: the
 /// request was broadcast to every relay, so the one authority among the receivers
 /// is the single relay that acts. On the authority, a hold past the floor is
-/// released and the synced leave decided with the DROPPED reason; the decide path
-/// dedups, so a duplicate request after the decide is a harmless no-op. A hold
-/// short of the floor, or no hold at all (the slot reconnected or left cleanly), is
-/// ignored — logged with the elapsed-vs-floor so a refused click is diagnosable.
+/// claimed and, if the claim succeeds, the synced leave decided with the DROPPED
+/// reason; the decide path also dedups, so a duplicate request after the decide
+/// is a harmless no-op. A hold short of the floor, or no hold at all (the slot
+/// reconnected or left cleanly), is ignored — logged with the elapsed-vs-floor so
+/// a refused click is diagnosable.
+///
+/// `held_for`'s read and `release`'s claim below are two separate lock
+/// acquisitions, not one atomic check-and-take — a concurrent reconnect's
+/// `DropHolds::take_if_pending` (`server.rs`) can slip in between them and claim
+/// the same hold first. That is exactly why the claim is checked: `release`
+/// returning `false` means this call lost that race, and it must stand down
+/// rather than decide anyway. Deciding unconditionally here would be a genuine
+/// correctness bug, not just redundant work — `consensus::decide_leave` records
+/// (or *re-records*) the departure before it checks anything, so calling it after
+/// a reconnect's `reinstate_slot` already cleared the record would resurrect a
+/// departure, and then commit a leave, against a slot that is live again.
 pub(crate) fn honor_drop_request(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
@@ -1933,23 +1986,37 @@ pub(crate) fn honor_drop_request(
     }
     match drop_holds.held_for(key, target) {
         Some(elapsed) if elapsed >= drop_holds.unlock() => {
-            drop_holds.release(key, target);
-            decide_and_broadcast_leave(
-                decision_makers,
-                sessions,
-                mesh_links,
-                key,
-                target,
-                LEAVE_REASON_DROPPED,
-            );
-            tracing::info!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                target = target.0,
-                requester,
-                held_ms = elapsed.as_millis(),
-                "honoring manual drop request",
-            );
+            if drop_holds.release(key, target) {
+                decide_and_broadcast_leave(
+                    decision_makers,
+                    sessions,
+                    mesh_links,
+                    key,
+                    target,
+                    LEAVE_REASON_DROPPED,
+                );
+                tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    target = target.0,
+                    requester,
+                    held_ms = elapsed.as_millis(),
+                    "honoring manual drop request",
+                );
+            } else {
+                // Lost the claim: a concurrent reconnect (or another relay's
+                // honor of this same broadcast request) released the hold
+                // first. The slot may already be live again, so standing down
+                // -- not deciding anyway -- is what keeps this from
+                // resurrecting a departure record for a connected player.
+                tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    target = target.0,
+                    requester,
+                    "drop request lost the claim race; the hold was already released",
+                );
+            }
         }
         Some(elapsed) => tracing::info!(
             tenant = key.tenant.as_ref(),
@@ -2098,6 +2165,18 @@ pub(crate) fn reconcile_abandon(
 /// dedups away (already decided) has no directive here, so its hold — if somehow
 /// still present — is left for the next teardown's decided-sweep, not touched
 /// twice for no reason.
+///
+/// This release is cleanup, not a claim gate — unlike [`honor_drop_request`], it
+/// does not need to check the boolean before deciding, because
+/// `decide_abandoned_departures` already committed these decisions atomically
+/// under the decision-maker's own lock (see that function's doc comment): a
+/// concurrent reconnect's `reinstate_slot` for the same slot either ran entirely
+/// before this call started (that slot has nothing undecided left to force-decide
+/// here) or entirely after (`reinstate_slot`'s `decided_leaves` guard refuses it,
+/// since this call already decided it). So by the time this loop runs, every
+/// slot in `leaves` is irreversibly decided regardless of what its hold looks
+/// like; releasing is just freeing the now-stale entry, whether or not it's
+/// still there.
 fn decide_and_broadcast_abandoned(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &crate::consensus::DecisionMakers,
@@ -2115,7 +2194,7 @@ fn decide_and_broadcast_abandoned(
         );
         for leave in &leaves {
             if let Ok(slot) = u8::try_from(leave.slot) {
-                drop_holds.release(key, SlotId(slot));
+                let _ = drop_holds.release(key, SlotId(slot));
             }
         }
         crate::mesh::broadcast_leaves(sessions, mesh_links, key, leaves);
@@ -2849,6 +2928,51 @@ mod tests {
         );
     }
 
+    /// Guards against the stale-snapshot race the `serve_connection` admission fix
+    /// closes: if a reconnect for the same slot wins the roster race and registers
+    /// before this (now-stale) disconnect teardown reaches `announce_departure`,
+    /// the disconnect must not mark a hold or record a departure for it. Doing so
+    /// would orphan a hold against a connected player — a later `RequestDrop`
+    /// could honor a drop against them — and would leave a permanent departure
+    /// record with no hold to ever release it, wrongly refusing every later
+    /// reconnect for the slot.
+    #[tokio::test]
+    async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconnected() {
+        let k = key();
+        let (sessions, mesh_links, makers, _inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+
+        // Simulate a reconnect for slot 1 winning the roster race: it registers
+        // before this (stale, racing) disconnect teardown reaches the
+        // announcement below -- mirroring a concurrent `serve_connection`
+        // acquiring the roster lock first.
+        let (mut reconnect_guard, _reconnect_inbox) =
+            register(&sessions, &k, SlotId(1)).expect("the reconnect claims the roster seat");
+        reconnect_guard.disarm();
+
+        // The disconnect's teardown -- unaware the seat was already reclaimed --
+        // reaches its announcement.
+        announce_departure(
+            &holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &k,
+            SlotId(1),
+            LEAVE_REASON_DROPPED,
+        );
+
+        assert!(
+            !holds.is_pending(&k, SlotId(1)),
+            "no hold was marked against the already-reconnected slot",
+        );
+        assert!(
+            !consensus::slot_departed(&makers, &k, SlotId(1)),
+            "no departure record was written against the already-reconnected slot -- \
+             an orphaned record would wrongly refuse every later reconnect for the slot",
+        );
+    }
+
     /// The reconnection race caught live: on a single relay, both clients' links
     /// blip and both re-dial. As the roster empties and refills, presence flaps the
     /// buffer authority to `Peer` and back — and the promotion on the way back must
@@ -2934,12 +3058,19 @@ mod tests {
             "the emptied roster demoted the relay to a peer",
         );
 
-        // Slot 0 re-registers while its drop is still held: register, then release +
-        // reinstate as the server does, then report presence — which re-promotes.
+        // Slot 0 re-registers while its drop is still held: register, then claim +
+        // reinstate atomically as the server does, then report presence — which
+        // re-promotes.
         let (mut r0, _ri0) = register(&sessions, &k, SlotId(0)).expect("slot 0 re-registers");
         r0.disarm();
-        holds.release(&k, SlotId(0));
-        assert!(consensus::reinstate_slot(&makers, &k, SlotId(0)));
+        assert!(
+            holds.take_if_pending(&k, SlotId(0), || consensus::reinstate_slot(
+                &makers,
+                &k,
+                SlotId(0)
+            )),
+            "the hold was pending and reinstate succeeded",
+        );
         report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
         assert!(
             makers.lock().get(&k).unwrap().is_authority(),
@@ -2949,8 +3080,14 @@ mod tests {
         // Slot 1 re-registers too.
         let (mut r1, _ri1) = register(&sessions, &k, SlotId(1)).expect("slot 1 re-registers");
         r1.disarm();
-        holds.release(&k, SlotId(1));
-        assert!(consensus::reinstate_slot(&makers, &k, SlotId(1)));
+        assert!(
+            holds.take_if_pending(&k, SlotId(1), || consensus::reinstate_slot(
+                &makers,
+                &k,
+                SlotId(1)
+            )),
+            "the hold was pending and reinstate succeeded",
+        );
         report_own_presence(&presence, &makers, &sessions, &mesh_links, &holds, &k);
 
         // The whole flap decided no leave, and the session continues with both slots.
@@ -3094,10 +3231,14 @@ mod tests {
         reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
         assert!(holds.abandon_armed(&k));
 
-        // Slot 0 re-registers: release its hold, reinstate its departure, and report
-        // the roster live again — the server's re-register path — then reconcile.
-        holds.release(&k, SlotId(0));
-        assert!(crate::consensus::reinstate_slot(&makers, &k, SlotId(0)));
+        // Slot 0 re-registers: claim its hold and reinstate its departure
+        // atomically, and report the roster live again — the server's
+        // re-register path — then reconcile.
+        assert!(holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
+            &makers,
+            &k,
+            SlotId(0)
+        )));
         crate::presence::record_own(&presence, &k, 1);
         reconcile_abandon(&holds, &makers, &sessions, &mesh_links, &presence, &k);
         assert!(

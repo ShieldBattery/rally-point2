@@ -1779,17 +1779,26 @@ fn dispatch_mesh_control(
             // A `connected` of true is a slot coming *back* — a client that
             // re-registered on the origin relay while its drop was still undecided.
             // This relay marked its own hold on the slot's earlier `SlotDeparted`, so
-            // release it: the symmetric "it's back" signal that reaches a peer-homed
+            // claim it: the symmetric "it's back" signal that reaches a peer-homed
             // authority (or any peer holding a marker) so the drop can never later be
             // honored. A no-op when no hold is pending — a fresh connect, or a slot
             // this relay never held.
+            //
+            // Claims and reinstates atomically (`take_if_pending`), mirroring the
+            // home relay's own re-register (`server.rs`), rather than the separate
+            // release-then-reinstate this used to be: this relay may itself be the
+            // session's authority, in which case a concurrent `RequestDrop` (or the
+            // abandoned-session force-decide) for the same slot races this exactly
+            // the way it races a re-register, and the hold's removal must be the
+            // one linearization point both sides claim against so only one of them
+            // ever acts. The claim's own success/failure needs no further handling
+            // here — this relay isn't making an admission decision, only mirroring
+            // the origin's; `reinstate_slot`'s effect (or lack of one, if a
+            // concurrent decide already won) is what matters.
             if change.connected {
-                mesh.drop_holds.release(&key, slot);
-                // The slot is back, so discard the departure this relay recorded
-                // from its earlier `SlotDeparted` — otherwise a later promotion
-                // here would re-derive a leave for a slot that has returned. The
-                // symmetric local step runs at the home relay's own re-register.
-                crate::consensus::reinstate_slot(&mesh.decision_makers, &key, slot);
+                let _ = mesh.drop_holds.take_if_pending(&key, slot, || {
+                    crate::consensus::reinstate_slot(&mesh.decision_makers, &key, slot)
+                });
             }
         }
         Some(mesh_control_frame::Kind::RequestDrop(request)) => {

@@ -241,20 +241,18 @@ async fn serve_connection(
         session: authorized.session,
     };
 
-    // Classify a re-register against the slot's departure state before touching the
-    // roster. A slot whose link died is deregistered before its drop hold is marked,
-    // so its roster seat is free either way — the departure record and the hold,
-    // not the roster, tell a resumable reconnect apart from a decided one:
-    //   - a departure recorded AND its drop still held → the client is returning
-    //     while the drop is undecided: release the hold below and register it as a
-    //     normal reconnection (the session-start re-push and connectivity fan-out
-    //     that a register already fires are exactly what a resume needs);
-    //   - a departure recorded AND no hold pending → the leave was already decided
-    //     (an honored drop request, or a clean leave): the game has moved on without
-    //     this slot, so refuse the re-register terminally with a close the client
-    //     can distinguish from a transport error;
-    //   - no departure recorded → a fresh dial (or a still-live double-connect the
-    //     roster refuses below): the ordinary path.
+    // Cheap pre-register fast-fail against the slot's departure state, before
+    // touching the roster at all: a departure recorded with no hold pending means
+    // the leave was already decided (an honored drop request, or a clean leave),
+    // so the re-register is hopeless and can be refused before spending a roster
+    // slot on it. This is a snapshot — read before `register` below, and never
+    // reused after it — which is sound only because decided-ness is monotonic (a
+    // decided leave never becomes undecided again): if this snapshot is stale by
+    // the time it's checked, it can only be stale in the direction of a hold that
+    // has SINCE been claimed by a concurrent reconnect or decide, never the other
+    // way, so a "departed" read here is never a false positive. The real
+    // admission decision — the one this snapshot must never be reused for — is
+    // below, keyed on current state after `register` succeeds.
     let departed = consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot);
     let hold_pending = mesh.drop_holds.is_pending(&key, authorized.slot);
     if departed && !hold_pending {
@@ -282,32 +280,67 @@ async fn serve_connection(
         });
     };
 
-    // The slot is ours now, so release any pending drop hold: this client came
-    // back while its drop was still undecided, so it must never be dropped. The
-    // mesh half of the release — a peer-homed authority holding its own marker —
-    // rides the connectivity(true) that `run_slot_link` broadcasts on register (see
-    // the mesh `SlotConnectivity` handler); this call covers this relay's own hold.
-    if departed && hold_pending {
-        mesh.drop_holds.release(&key, authorized.slot);
-        // Discard the departure record too: the client is back, so the slot is no
-        // longer gone. This must happen before the promotion that `run_slot_link`
-        // may trigger below — a re-registered slot's hold is already released, so
-        // the promotion's held-slot skip cannot protect it; clearing the record is
-        // what keeps the promotion from re-deriving its leave.
-        consensus::reinstate_slot(&mesh.decision_makers, &key, authorized.slot);
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            slot = authorized.slot.0,
-            "client re-registered while its drop was undecided; releasing the hold",
-        );
-    }
-
+    // Write the handshake ack BEFORE touching any hold/departure state. A write
+    // failure here returns via `?` with NOTHING mutated: `registration` is still
+    // armed, so its guard frees the roster seat on drop (see `SlotRegistration`),
+    // and neither a hold nor a departure record was ever claimed or cleared —
+    // there is nothing to roll back, and nothing left inconsistent for a later
+    // retry to trip over. The old ordering used to release the hold and reinstate
+    // the slot first and write the ack after, so a write failure here would leave
+    // the drop's hold gone and its departure record cleared with no client ever
+    // actually connected — unrecoverable, since nothing was left to decide
+    // against and no hold to admit a future retry's resume.
     handshake_send
         .write_all(&[HANDSHAKE_OK])
         .await
         .map_err(AuthError::from)?;
     let _ = handshake_send.finish();
+
+    // Now decide this slot's admission against CURRENT state, not the
+    // pre-register snapshot above — reusing that snapshot here is exactly the bug
+    // this reorder fixes: a concurrent decide path (a survivor's `RequestDrop`
+    // honored, or the abandoned-session timer's force-decide) can honor the
+    // slot's drop in the gap between the snapshot and here, and a snapshot-keyed
+    // release+reinstate would blindly resurrect a slot the session has already
+    // moved on without — while a fresh hold, marked by this same slot's OLD link
+    // finally dying in that same gap, would never be released as this connection
+    // takes over. `take_if_pending` is the fix: it re-checks the hold and, if
+    // still pending, reinstates the slot — atomically, under one lock
+    // acquisition — so this reconnect and every decide path (an honored
+    // `RequestDrop`, the abandoned-session force-decide, a superseding clean
+    // leave) race the SAME linearization point, the hold's removal, and whichever
+    // side wins is the one, and only one, side that acts.
+    let reinstated = mesh.drop_holds.take_if_pending(&key, authorized.slot, || {
+        consensus::reinstate_slot(&mesh.decision_makers, &key, authorized.slot)
+    });
+    if reinstated {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = authorized.slot.0,
+            "client re-registered while its drop was undecided; claimed the hold and reinstated",
+        );
+    } else if consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot) {
+        // Either there was no hold to claim (a clean leave already decided this
+        // slot with no hold ever marked) or a concurrent decide path won the
+        // claim moments ago (the hold was pending but `reinstate_slot` found the
+        // leave already committed) — either way the leave is final. Refuse
+        // without disarming `registration`: the guard frees the roster seat on
+        // drop exactly as the pre-register fast-fail's refusal would have, and
+        // the client sees the same terminal close either way.
+        connection.close(
+            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+            b"slot already departed",
+        );
+        return Err(ConnError::SlotDeparted {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    }
+    // Neither a hold nor a departure record: a plain fresh admission (or a
+    // resumed one whose hold and record another path already cleared) —
+    // proceed exactly as a first-time dial would.
 
     registration.disarm();
 

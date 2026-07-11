@@ -51,13 +51,23 @@
 //! hold too (see `routing::decide_and_broadcast_abandoned`), so nothing here
 //! outlives that window undecided.
 //!
-//! Release covers three orderings. A clean-leave intent arriving while a drop's
-//! hold for the same slot is still pending releases the hold and decides
-//! immediately, so the "left" outcome wins over the held "dropped" one. A client
-//! that re-registers while its drop is held releases it too, reinstating the slot
-//! rather than removing it. An honored manual request — whether from a live
-//! survivor's `RequestDrop` or the abandoned-session timer's force-decide —
-//! releases the hold it just decided.
+//! Release covers three orderings, and — because two of them can race a
+//! concurrent claimant for the very same hold — [`release`](DropHolds::release)
+//! reports whether it actually found and removed a pending entry, so every path
+//! that decides a leave off a hold treats that boolean as a claim: only the side
+//! that actually removed the entry may act on it, and a side that finds it
+//! already gone must stand down rather than decide (or resurrect) a departure
+//! for a slot that may already be live again. A clean-leave intent arriving
+//! while a drop's hold for the same slot is still pending releases the hold and
+//! decides immediately regardless of the claim — a clean leave is authoritative
+//! on its own, never contingent on a hold having existed — so the "left" outcome
+//! wins over the held "dropped" one. A client that re-registers while its drop
+//! is held claims the hold atomically with reinstating the slot (see
+//! [`take_if_pending`](DropHolds::take_if_pending)), rather than a separate
+//! release-then-reinstate whose gap a concurrent decide could land in. An
+//! honored manual request — whether from a live survivor's `RequestDrop` or the
+//! abandoned-session timer's force-decide — claims the hold before deciding
+//! against it, standing down if it lost the claim.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -198,13 +208,67 @@ impl DropHolds {
             .or_insert_with(Instant::now);
     }
 
-    /// Releases the hold on `(key, slot)`, if one is pending. A no-op otherwise.
-    /// Called when a clean-leave intent supersedes a drop, when a client
-    /// re-registers within its hold, and when the authority honors a drop request
-    /// for the slot.
-    pub fn release(&self, key: &SessionKey, slot: SlotId) {
+    /// Releases the hold on `(key, slot)`, if one is pending, and reports whether
+    /// it found one to release. Called when a clean-leave intent supersedes a
+    /// drop (where the boolean is informational only — a clean leave decides
+    /// either way), when the authority honors a drop request for the slot (where
+    /// the boolean gates the decision), and by
+    /// [`take_if_pending`](Self::take_if_pending) internally for a re-registering
+    /// client.
+    ///
+    /// The boolean is this hold's claim signal: `true` means *this* call is the
+    /// one that removed a still-pending entry, so the caller — and only the
+    /// caller — owns whatever happens next for this slot. `false` means the hold
+    /// was already gone (a concurrent claimant, or nothing was ever held), so the
+    /// caller must not decide (or resurrect) a departure on the strength of a
+    /// hold it did not actually win.
+    #[must_use]
+    pub fn release(&self, key: &SessionKey, slot: SlotId) -> bool {
         // The map key is owned; clone the session key to look it up.
-        self.holds.lock().remove(&(key.clone(), slot));
+        self.holds.lock().remove(&(key.clone(), slot)).is_some()
+    }
+
+    /// Atomically decides a re-registering slot's fate against its hold: if a
+    /// hold is pending, runs `reinstate` (the caller's `consensus::reinstate_slot`)
+    /// and removes the hold entry, all inside one acquisition of the holds lock,
+    /// then returns whatever `reinstate` reported. Returns `false` outright, never
+    /// calling `reinstate`, when no hold is pending.
+    ///
+    /// This is the single linearization point a reconnect races every decide path
+    /// against: whichever side observes the hold present — this call, an honored
+    /// `RequestDrop`'s [`release`](Self::release), or the abandoned-session
+    /// force-decide — is the one, and only one, side that acts on it, because the
+    /// removal happens under the same lock the presence check ran under, so no
+    /// concurrent caller can find the hold still pending once it is gone.
+    ///
+    /// Running `reinstate` *inside* the lock, before the entry is removed, is
+    /// what closes the narrower window the module docs describe: an external
+    /// reader of [`pending_slots`](Self::pending_slots) (an authority promotion's
+    /// re-derive) takes the same lock, so it can never observe "hold gone,
+    /// departure record still present" — it either reads before this call (hold
+    /// present, record present: an ordinary undecided drop) or after (hold gone,
+    /// and — because `reinstate` already ran — the record gone too).
+    ///
+    /// `reinstate` returning `false` (the slot's leave was already decided under
+    /// `consensus`'s own lock — a concurrent `RequestDrop` or abandoned-session
+    /// force-decide won a photo finish) still removes the hold: a hold whose slot
+    /// just got decided against it is exactly as resolved as one this call
+    /// reinstated, and nothing should ever act on it again.
+    #[must_use]
+    pub fn take_if_pending(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        reinstate: impl FnOnce() -> bool,
+    ) -> bool {
+        let map_key = (key.clone(), slot);
+        let mut holds = self.holds.lock();
+        if !holds.contains_key(&map_key) {
+            return false;
+        }
+        let reinstated = reinstate();
+        holds.remove(&map_key);
+        reinstated
     }
 
     /// Whether an undecided drop is currently held for `(key, slot)`. Read at
@@ -422,11 +486,114 @@ mod tests {
     fn releasing_a_hold_clears_it() {
         let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
         holds.hold(key(), SlotId(3));
-        holds.release(&key(), SlotId(3));
+        assert!(
+            holds.release(&key(), SlotId(3)),
+            "the first release claims a genuinely pending hold",
+        );
         assert!(!holds.is_pending(&key(), SlotId(3)));
         assert!(holds.held_for(&key(), SlotId(3)).is_none());
         // Releasing an absent hold is a no-op, never a panic.
-        holds.release(&key(), SlotId(9));
+        assert!(!holds.release(&key(), SlotId(9)));
+    }
+
+    #[test]
+    fn a_second_release_finds_nothing_to_claim() {
+        // The claim semantics that close the split-brain race: once a hold is
+        // released, a second release for the same slot -- a concurrent decide
+        // path that lost the race -- must see `false`, not silently "succeed"
+        // again, so it knows to stand down rather than act a second time.
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        holds.hold(key(), SlotId(3));
+        assert!(holds.release(&key(), SlotId(3)), "the first release claims it");
+        assert!(
+            !holds.release(&key(), SlotId(3)),
+            "a second release for the same slot finds nothing left to claim",
+        );
+    }
+
+    #[test]
+    fn take_if_pending_reinstates_and_removes_the_hold() {
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        holds.hold(key(), SlotId(3));
+
+        let reinstated = holds.take_if_pending(&key(), SlotId(3), || true);
+        assert!(reinstated, "reinstate succeeded, so the claim reports true");
+        assert!(
+            !holds.is_pending(&key(), SlotId(3)),
+            "the hold is removed once claimed, regardless of reinstate's outcome",
+        );
+    }
+
+    #[test]
+    fn take_if_pending_still_removes_the_hold_when_reinstate_loses_the_photo_finish() {
+        // `reinstate` returning false models `consensus::reinstate_slot` finding
+        // the slot's leave already decided under its own lock -- a concurrent
+        // `RequestDrop` or abandoned-session force-decide won the race. The hold
+        // is still removed (it is exactly as resolved as one this call
+        // reinstated), but the caller's overall claim reports false so it knows
+        // to refuse the reconnect rather than admit it.
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        holds.hold(key(), SlotId(3));
+
+        let reinstated = holds.take_if_pending(&key(), SlotId(3), || false);
+        assert!(!reinstated, "reinstate lost the photo finish");
+        assert!(
+            !holds.is_pending(&key(), SlotId(3)),
+            "the hold is still removed even though reinstate reported false",
+        );
+    }
+
+    #[test]
+    fn take_if_pending_never_calls_reinstate_when_nothing_is_pending() {
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        let mut called = false;
+        let reinstated = holds.take_if_pending(&key(), SlotId(3), || {
+            called = true;
+            true
+        });
+        assert!(!reinstated, "no hold was pending, so there is nothing to claim");
+        assert!(
+            !called,
+            "reinstate must never run when there was no hold to claim it against",
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_on_the_same_hold_have_exactly_one_winner() {
+        // The property every decide path (an honored `RequestDrop`, the
+        // abandoned-session force-decide) and every reconnect's `take_if_pending`
+        // rests on: whichever thread's `release`/`take_if_pending` call actually
+        // acquires the holds lock first wins the claim, and every other
+        // concurrent claimant on the exact same `(key, slot)` must lose. This
+        // drives genuine OS-thread contention (not just async interleaving) at
+        // the primitive level, since the higher-level routing functions this
+        // backs (`honor_drop_request`, `serve_connection`'s admission) have no
+        // seam to inject a race into deterministically.
+        use std::sync::Barrier;
+
+        let holds = Arc::new(DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT));
+        holds.hold(key(), SlotId(3));
+
+        const CLAIMANTS: usize = 8;
+        let barrier = Arc::new(Barrier::new(CLAIMANTS));
+        let handles: Vec<_> = (0..CLAIMANTS)
+            .map(|_| {
+                let holds = Arc::clone(&holds);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    holds.release(&key(), SlotId(3))
+                })
+            })
+            .collect();
+
+        let wins: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|&won| won)
+            .count();
+        assert_eq!(wins, 1, "exactly one concurrent claimant wins the hold");
+        assert!(!holds.is_pending(&key(), SlotId(3)), "the hold is gone either way");
     }
 
     #[test]
