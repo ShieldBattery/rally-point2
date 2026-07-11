@@ -1581,6 +1581,17 @@ const ESCALATE_AFTER: Duration = Duration::from_secs(10);
 /// coordinator is re-asked at least twice before the game would give up on the slot.
 const ESCALATE_RETRY: Duration = Duration::from_secs(15);
 
+/// The driver's own bound on one [`RehomeProvider::rehome`] ask. The provider is
+/// embedder code doing an app-server/coordinator round-trip and is expected to
+/// enforce its own HTTP timeout well under this — the driver's bound exists so a
+/// provider that hangs anyway (a stuck app-server call, a lost response) cannot
+/// freeze reconnection, teardown observation, and the outage-buffer cap with it.
+/// A timed-out ask is treated exactly as [`RehomeOutcome::Unavailable`]: resume
+/// the same-relay backoff and re-ask on the [`ESCALATE_RETRY`] cadence. Sized to
+/// fit the ~45s BW stall-drop budget ([`ESCALATE_AFTER`]'s doc): 10s to the first
+/// escalation + this bound + a ≤3s dial still leaves budget for one retry ask.
+const REHOME_PROVIDER_DEADLINE: Duration = Duration::from_secs(20);
+
 /// The driver's half of the game seam: the channels a [`LinkDriver`] owns to
 /// exchange turns and control with the game thread. Bundled so a session runs over
 /// them by reference and they outlive a reconnect that swaps the underlying link.
@@ -1985,92 +1996,120 @@ async fn reconnect_link(
                     if Instant::now() >= next_escalate_at {
                         escalated_once = true;
                         // The driver owns the current relay id: name the relay it is
-                        // actually homed on as the dead one, never a guess.
-                        match provider.rehome(rc.target.relay_id).await {
-                            RehomeOutcome::Stay => {
-                                // The relay is live after all: resume same-relay
-                                // backoff, resetting the escalation window.
-                                next_escalate_at = Instant::now() + rc.escalate_after;
-                                tracing::info!("re-home escalation: coordinator says stay");
+                        // actually homed on as the dead one, never a guess. The ask
+                        // runs under the driver's own deadline with the seam still
+                        // serviced (see `await_rehome`), so a hung provider cannot
+                        // freeze reconnection with it.
+                        let answer = await_rehome(
+                            &provider,
+                            rc.target.relay_id,
+                            REHOME_PROVIDER_DEADLINE,
+                            seam,
+                            state,
+                        )
+                        .await;
+                        match answer {
+                            EscalationWait::GameGone => return Reconnected::GameGone,
+                            EscalationWait::BufferExhausted => {
+                                return Reconnected::Terminal(DriverError::OutageBufferExhausted {
+                                    buffered: state.outbound_buffer.len(),
+                                    cap: OUTAGE_OUTBOUND_BUFFER_CAP,
+                                });
                             }
-                            RehomeOutcome::Unavailable => {
+                            EscalationWait::TimedOut => {
                                 next_escalate_at = Instant::now() + rc.escalate_retry;
                                 tracing::info!(
-                                    "re-home escalation: no relay available yet; re-asking later",
+                                    "re-home escalation: provider deadline elapsed; re-asking later",
                                 );
                             }
-                            RehomeOutcome::NewTarget {
-                                relay_id,
-                                endpoint,
-                                relay_addr,
-                                server_name,
-                            } => {
-                                // The replacement relay has never seen this client, so
-                                // its receive-side dedup for our own slot would base at
-                                // seq 0 and reject our resumed (already high) seq stream
-                                // once it passed the window — dropping the link, and with
-                                // every re-homed slot crossing the window together, the
-                                // whole group. Declare our own-slot resume anchor at the
-                                // oldest seq we will actually re-send, so the relay bases
-                                // the window there and the resumed stream is accepted. Two
-                                // sources feed that re-send: the rebound link keeps its
-                                // unacked window (the redundancy pass re-carries it) and
-                                // `reinject_retention` re-adds the retained ring, so the
-                                // anchor is the lower of the oldest-unacked seq and the
-                                // retention front (see `rehome_own_slot_anchor`). No source
-                                // means nothing to re-send, so no anchor is needed (the
-                                // window bases at 0, correct for a slot that never sent).
-                                let mut rehome_cursors = cursors.clone();
-                                if let Some(anchor) = rehome_own_slot_anchor(
-                                    link.oldest_unacked_seq(own_slot),
-                                    state.retention.front().map(|turn| turn.seq),
-                                ) {
-                                    rehome_cursors.push((own_slot, anchor));
+                            EscalationWait::Answered(outcome) => match outcome {
+                                RehomeOutcome::Stay => {
+                                    // The relay is live after all: resume same-relay
+                                    // backoff, resetting the escalation window.
+                                    next_escalate_at = Instant::now() + rc.escalate_after;
+                                    tracing::info!("re-home escalation: coordinator says stay");
                                 }
-                                match endpoint
-                                    .reconnect_with_timeout(
-                                        relay_addr,
-                                        &server_name,
-                                        &rc.identity,
-                                        &rehome_cursors,
-                                        RECONNECT_DIAL_TIMEOUT,
-                                    )
-                                    .await
-                                {
-                                    Ok(fresh) => {
-                                        // A re-home resume onto a fresh relay: rebind, then
-                                        // re-inject the retained turns so the new relay's
-                                        // empty ring re-carries them to peers. Only now —
-                                        // on a *successful* dial — does the driver adopt
-                                        // the new relay id, so a failed dial never leaves
-                                        // it naming a relay it isn't homed on.
-                                        link.rebind(fresh.connection().clone());
-                                        reinject_retention(link, state);
-                                        rc.target = ReconnectTarget {
-                                            endpoint,
+                                RehomeOutcome::Unavailable => {
+                                    next_escalate_at = Instant::now() + rc.escalate_retry;
+                                    tracing::info!(
+                                        "re-home escalation: no relay available yet; re-asking later",
+                                    );
+                                }
+                                RehomeOutcome::NewTarget {
+                                    relay_id,
+                                    endpoint,
+                                    relay_addr,
+                                    server_name,
+                                } => {
+                                    // The replacement relay has never seen this client, so
+                                    // its receive-side dedup for our own slot would base at
+                                    // seq 0 and reject our resumed (already high) seq stream
+                                    // once it passed the window — dropping the link, and with
+                                    // every re-homed slot crossing the window together, the
+                                    // whole group. Declare our own-slot resume anchor at the
+                                    // oldest seq we will actually re-send, so the relay bases
+                                    // the window there and the resumed stream is accepted. Two
+                                    // sources feed that re-send: the rebound link keeps its
+                                    // unacked window (the redundancy pass re-carries it) and
+                                    // `reinject_retention` re-adds the retained ring, so the
+                                    // anchor is the lower of the oldest-unacked seq and the
+                                    // retention front (see `rehome_own_slot_anchor`). No source
+                                    // means nothing to re-send, so no anchor is needed (the
+                                    // window bases at 0, correct for a slot that never sent).
+                                    let mut rehome_cursors = cursors.clone();
+                                    if let Some(anchor) = rehome_own_slot_anchor(
+                                        link.oldest_unacked_seq(own_slot),
+                                        state.retention.front().map(|turn| turn.seq),
+                                    ) {
+                                        rehome_cursors.push((own_slot, anchor));
+                                    }
+                                    match endpoint
+                                        .reconnect_with_timeout(
                                             relay_addr,
-                                            server_name,
-                                            relay_id,
-                                        };
-                                        backoff.reset();
-                                        tracing::info!(
-                                            relay = %relay_addr,
-                                            "re-homed onto a replacement relay",
-                                        );
-                                        return Reconnected::Resumed;
-                                    }
-                                    Err(DialError::SlotDeparted) => {
-                                        return Reconnected::Terminal(DriverError::SlotDeparted);
-                                    }
-                                    Err(new_error) => {
-                                        next_escalate_at = Instant::now() + rc.escalate_retry;
-                                        tracing::info!(
-                                            %new_error,
-                                            "re-home dial failed; retrying the old relay meanwhile",
-                                        );
+                                            &server_name,
+                                            &rc.identity,
+                                            &rehome_cursors,
+                                            RECONNECT_DIAL_TIMEOUT,
+                                        )
+                                        .await
+                                    {
+                                        Ok(fresh) => {
+                                            // A re-home resume onto a fresh relay: rebind, then
+                                            // re-inject the retained turns so the new relay's
+                                            // empty ring re-carries them to peers. Only now —
+                                            // on a *successful* dial — does the driver adopt
+                                            // the new relay id, so a failed dial never leaves
+                                            // it naming a relay it isn't homed on.
+                                            link.rebind(fresh.connection().clone());
+                                            reinject_retention(link, state);
+                                            rc.target = ReconnectTarget {
+                                                endpoint,
+                                                relay_addr,
+                                                server_name,
+                                                relay_id,
+                                            };
+                                            backoff.reset();
+                                            tracing::info!(
+                                                relay = %relay_addr,
+                                                "re-homed onto a replacement relay",
+                                            );
+                                            return Reconnected::Resumed;
+                                        }
+                                        Err(DialError::SlotDeparted) => {
+                                            return Reconnected::Terminal(
+                                                DriverError::SlotDeparted,
+                                            );
+                                        }
+                                        Err(new_error) => {
+                                            next_escalate_at = Instant::now() + rc.escalate_retry;
+                                            tracing::info!(
+                                                %new_error,
+                                                "re-home dial failed; retrying the old relay meanwhile",
+                                            );
+                                        }
                                     }
                                 }
-                            }
+                            },
                         }
                     }
                 }
@@ -2268,6 +2307,56 @@ async fn wait_backoff(
                 }
                 // The game dropped its outbound sender: a teardown.
                 None => return WaitOutcome::GameGone,
+            },
+        }
+    }
+}
+
+/// The outcome of awaiting the re-home provider while the seam stays serviced.
+enum EscalationWait {
+    /// The provider answered.
+    Answered(RehomeOutcome),
+    /// The provider did not answer within the deadline; the caller treats this
+    /// exactly as [`RehomeOutcome::Unavailable`] (the pending ask is dropped —
+    /// the next escalation asks afresh).
+    TimedOut,
+    /// The game tore down its seam; abandon reconnection.
+    GameGone,
+    /// The outage buffer crossed [`OUTAGE_OUTBOUND_BUFFER_CAP`]; the driver
+    /// stops rather than silently drop a game-produced turn.
+    BufferExhausted,
+}
+
+/// Awaits one [`RehomeProvider::rehome`] ask under `deadline`, servicing the
+/// game seam exactly as [`wait_backoff`] does — buffering outbound turns
+/// (bounded) and watching for the game tearing down. The provider is embedder
+/// code awaiting an app-server round-trip; without this the whole reconnect
+/// loop would be parked on that future, blind to game teardown and to the
+/// outage-buffer cap for as long as it takes — forever, if it hangs.
+async fn await_rehome(
+    provider: &Arc<dyn RehomeProvider>,
+    dead_relay_id: u64,
+    deadline: Duration,
+    seam: &mut GameSeam,
+    state: &mut LoopState,
+) -> EscalationWait {
+    let deadline = Instant::now() + deadline;
+    let mut ask = provider.rehome(dead_relay_id);
+    loop {
+        tokio::select! {
+            outcome = &mut ask => return EscalationWait::Answered(outcome),
+            _ = sleep_until(deadline) => return EscalationWait::TimedOut,
+            // The game dropped its inbound receiver: a teardown.
+            _ = seam.inbound.closed() => return EscalationWait::GameGone,
+            produced = seam.outbound.recv() => match produced {
+                Some(turn) => {
+                    state.outbound_buffer.push_back(turn);
+                    if state.outbound_buffer.len() > OUTAGE_OUTBOUND_BUFFER_CAP {
+                        return EscalationWait::BufferExhausted;
+                    }
+                }
+                // The game dropped its outbound sender: a teardown.
+                None => return EscalationWait::GameGone,
             },
         }
     }
@@ -2611,6 +2700,141 @@ mod tests {
         // re-dial paths themselves are covered elsewhere.
         task.abort();
         drop(chan_a);
+    }
+
+    /// A provider whose ask never resolves — the embedder's app-server call
+    /// hanging — with a signal for when the driver actually asked.
+    struct HangingProvider {
+        asked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl HangingProvider {
+        fn new() -> (Arc<Self>, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Arc::new(Self {
+                    asked: std::sync::Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+    }
+
+    impl RehomeProvider for HangingProvider {
+        fn rehome(&self, _dead_relay_id: u64) -> RehomeFuture<'_> {
+            if let Some(tx) = self.asked.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
+        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (_link, mut seam, mut state) = into_session_parts(driver_a);
+        let (provider, _asked) = HangingProvider::new();
+        let provider: Arc<dyn RehomeProvider> = provider;
+
+        let waited = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rehome(
+                &provider,
+                7,
+                Duration::from_millis(50),
+                &mut seam,
+                &mut state,
+            ),
+        )
+        .await
+        .expect("the ask must be bounded by the driver's own deadline");
+        assert!(
+            matches!(waited, EscalationWait::TimedOut),
+            "a hung ask times out rather than parking the loop",
+        );
+        drop(chan_a);
+    }
+
+    #[tokio::test]
+    async fn game_teardown_is_observed_while_a_provider_ask_is_pending() {
+        let (link_a, _link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (_link, mut seam, mut state) = into_session_parts(driver_a);
+        let (provider, _asked) = HangingProvider::new();
+        let provider: Arc<dyn RehomeProvider> = provider;
+
+        // The game tears down mid-ask: drop its half of the seam shortly after
+        // the await starts.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(chan_a);
+        });
+        let waited = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rehome(&provider, 7, Duration::from_secs(60), &mut seam, &mut state),
+        )
+        .await
+        .expect("teardown must be observable while the ask is pending");
+        assert!(
+            matches!(waited, EscalationWait::GameGone),
+            "the seam stays serviced during the ask",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
+        // End to end through `run_reconnecting`: the home relay dies mid-game,
+        // escalation asks a provider that never answers, and the game then
+        // tears down. The driver must end cleanly — observing the teardown
+        // through the pending ask — instead of parking on the embedder's
+        // future forever.
+        use rally_point_transport::control::send_control_session_start;
+
+        let (link_a, link_b, ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (provider, asked) = HangingProvider::new();
+
+        let reconnect = Reconnect {
+            endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
+            // Unreachable: every same-relay re-dial fails, so escalation is
+            // reached on the first attempt (the zero window below).
+            relay_addr: (Ipv4Addr::LOCALHOST, 1).into(),
+            server_name: "localhost".to_owned(),
+            relay_id: 7,
+            identity: fake_identity(SlotId(0)),
+            rehome: Some(provider),
+            escalate_after: Some(Duration::ZERO),
+            escalate_retry: Some(Duration::from_millis(100)),
+        };
+        let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
+
+        // The peer plays the relay far enough to start the game (escalation is
+        // gated on `SessionStart`), then its connection dies — a link failure.
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        send_control_session_start(&mut peer_control_send)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        link_b.connection().close(0u32.into(), b"relay died");
+
+        // Wait until the driver is actually parked on the provider, then tear
+        // the game down. Without the seam staying serviced through the ask,
+        // the teardown would never be observed and the driver would hang.
+        tokio::time::timeout(Duration::from_secs(15), asked)
+            .await
+            .expect("escalation never asked the provider")
+            .unwrap();
+        drop(chan_a);
+
+        let joined = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the driver stayed frozen on the hung provider")
+            .unwrap();
+        assert!(
+            joined.is_ok(),
+            "a game teardown during the ask ends the driver cleanly: {joined:?}",
+        );
     }
 
     #[test]
