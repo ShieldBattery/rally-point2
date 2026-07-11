@@ -12,7 +12,7 @@ use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::tenant::NotifyConfig;
-use rally_point_coordinator::{notify, registry, session, tenant};
+use rally_point_coordinator::{notify, regions, registry, session, tenant};
 use rally_point_proto::control::{BufferBounds, TenantId};
 use rally_point_proto::token::KeyId;
 
@@ -30,6 +30,16 @@ struct Cli {
     /// the coordinator refuses to start unless `--allow-insecure-control` is set.
     #[arg(long, env = "COORDINATOR_BOOTSTRAP_SECRET")]
     bootstrap_secret: Option<String>,
+
+    /// Path to a JSON file listing the placement regions this coordinator allows
+    /// (`{"regions": [{"id", "display_name", "beacon", "fallback"}, ...]}`). The
+    /// file order is the client's display order. Loaded and validated at startup;
+    /// an invalid file (empty list, duplicate id, malformed id, empty field)
+    /// fails the coordinator to start. Absent = no regions configured: relay
+    /// region tags are refused and every session slot falls back to the
+    /// region-blind pick — the dev / loopback posture.
+    #[arg(long, env = "COORDINATOR_REGIONS")]
+    regions: Option<std::path::PathBuf>,
 
     /// Run the relay control endpoint with **no authentication**. Required to
     /// start without `--bootstrap-secret`; for trusted dev/loopback only. The
@@ -133,6 +143,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point coordinator starting");
 
+    // Load the region config if one was given. Fail startup on an invalid file:
+    // a coordinator that cannot trust its region list would mis-place or wrongly
+    // refuse relays. No `--regions` = an empty config, region behavior dormant.
+    let regions = match &cli.regions {
+        Some(path) => {
+            let config = regions::RegionsConfig::load(path)
+                .with_context(|| format!("loading region config {}", path.display()))?;
+            tracing::info!(
+                path = %path.display(),
+                count = config.regions().len(),
+                "loaded region config",
+            );
+            config
+        }
+        None => regions::RegionsConfig::default(),
+    };
+
     let tenants = tenant::new_store();
     if cli.dev_tenant {
         enroll_dev_tenant(&tenants, &cli)?;
@@ -169,6 +196,7 @@ async fn main() -> Result<()> {
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
+        regions,
     };
 
     let app = api::router(state);

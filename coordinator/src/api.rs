@@ -74,7 +74,9 @@ use rally_point_proto::control::{
     SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
-use rally_point_proto::version::{self, CONTROL_CLOSE_PROTOCOL_MISMATCH};
+use rally_point_proto::version::{
+    self, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +84,7 @@ use crate::descriptors::SlotClose;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
 use crate::presence;
+use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 use crate::tenant;
@@ -170,6 +173,11 @@ pub struct CoordinatorState {
     /// before its connection is dropped and it is deregistered (see
     /// [`LIVENESS_TIMEOUT`]). A field so tests can shorten it.
     pub liveness_timeout: Duration,
+    /// The configured placement regions (immutable after startup). Read by
+    /// `GET /regions` to serve the client-facing list, and at relay enroll to
+    /// refuse a relay tagged with a region not listed here. Empty (the default,
+    /// when no `--regions` file is given) leaves every region behavior dormant.
+    pub regions: RegionsConfig,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -180,6 +188,7 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/sessions/alive", post(sessions_alive))
         .route("/presence/query", post(presence_query))
         .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
+        .route("/regions", get(regions))
         .route("/relay/control", get(relay_control))
         .with_state(state)
 }
@@ -655,6 +664,18 @@ async fn tenant_pubkey(
     }))
 }
 
+/// Serves the coordinator's configured region list as `{"regions": [...]}` (ids,
+/// display names, and ping targets), in the file's display order.
+///
+/// **Unauthenticated GET**, following the `GET /tenant/:tenant/pubkey`
+/// precedent: the request-signature scheme covers body-carrying mutations, and
+/// this list is client-public by design — the SB server forwards it verbatim to
+/// every game client. An empty body (`{"regions": []}`) is the honest answer for
+/// a coordinator with no `--regions` config.
+async fn regions(State(state): State<CoordinatorState>) -> Json<RegionsConfig> {
+    Json(state.regions.clone())
+}
+
 /// Accepts a relay's persistent control connection (a WebSocket).
 ///
 /// Authenticates against the bootstrap secret before the upgrade — a rejected
@@ -683,6 +704,7 @@ async fn relay_control(
     let lifecycle = state.lifecycle.clone();
     let hello_timeout = state.hello_timeout;
     let liveness_timeout = state.liveness_timeout;
+    let regions = state.regions.clone();
     ws.on_upgrade(move |socket| {
         serve_relay_control(
             socket,
@@ -691,6 +713,7 @@ async fn relay_control(
             lifecycle,
             hello_timeout,
             liveness_timeout,
+            regions,
         )
     })
 }
@@ -718,6 +741,7 @@ async fn serve_relay_control(
     lifecycle: Lifecycle,
     hello_timeout: Duration,
     liveness_timeout: Duration,
+    regions: RegionsConfig,
 ) {
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
@@ -755,6 +779,30 @@ async fn serve_relay_control(
             return;
         }
     };
+    // Validate the relay's advertised region before enrolling: a hello carrying a
+    // region the coordinator's config does not list — including the case where no
+    // regions are configured at all — is refused, since a typo'd region tag that
+    // silently serves nobody is worse than a failed enroll. A hello with no region
+    // always enrolls (dev / loopback, or a fleet with no region config). The relay
+    // recognizes the close code and backs off long, treating it as a config fix
+    // rather than a redial.
+    if let Some(region) = &hello.region
+        && !regions.contains(region)
+    {
+        tracing::warn!(
+            relay_id = hello.relay_id.0,
+            region = region.as_ref(),
+            "refusing relay control connection: region not in the coordinator's config",
+        );
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CONTROL_CLOSE_UNKNOWN_REGION,
+                reason: format!("unknown region: {}", region.as_ref()).into(),
+            })))
+            .await;
+        return;
+    }
+
     let relay_id = hello.relay_id;
     let registry = setup.registry();
     let generation = registry::enroll(registry, hello);
@@ -1487,6 +1535,7 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
+            regions: RegionsConfig::default(),
         }
     }
 
@@ -1885,6 +1934,7 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
+            regions: RegionsConfig::default(),
         };
         let app = router(state);
 
@@ -1942,6 +1992,7 @@ mod tests {
             control_auth: ControlAuth::Open,
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
+            regions: RegionsConfig::default(),
         };
         let app = router(state);
 
@@ -1993,6 +2044,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn get_regions(app: Router) -> serde_json::Value {
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/regions")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn regions_endpoint_returns_the_configured_list() {
+        // The unauthenticated GET serves the config verbatim (snake_case), in file
+        // order — the shape the SB server forwards to every client.
+        let mut state = state_with_relay_and_tenant();
+        state.regions = crate::regions::RegionsConfig::from_json(
+            r#"{"regions": [
+                {"id": "us-east", "display_name": "US East", "beacon": "e:20000", "fallback": "e:443"},
+                {"id": "eu-west", "display_name": "EU West", "beacon": "w:20000", "fallback": "w:443"}
+            ]}"#,
+        )
+        .unwrap();
+        let json = get_regions(router(state)).await;
+
+        let regions = json["regions"].as_array().unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0]["id"], "us-east", "file order is preserved");
+        assert_eq!(regions[0]["display_name"], "US East");
+        assert_eq!(regions[0]["beacon"], "e:20000");
+        assert_eq!(regions[0]["fallback"], "e:443");
+        assert_eq!(regions[1]["id"], "eu-west");
+    }
+
+    #[tokio::test]
+    async fn regions_endpoint_is_empty_without_config() {
+        // No config = an empty list, not an error — the region-blind posture.
+        let json = get_regions(router(state_with_relay_and_tenant())).await;
+        assert_eq!(json["regions"].as_array().unwrap().len(), 0);
     }
 
     // -- Notice reporter authorization (cross-tenant forgery guard) --

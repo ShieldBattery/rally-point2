@@ -13,16 +13,19 @@ use std::time::Duration;
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::lifecycle::Lifecycle;
+use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, CoordinatorToRelay, PlayerHandoff, RelayHello, RelayToCoordinator, ResultNotice,
-    SessionDescriptor, SessionRequest, TenantId,
+    BufferBounds, CoordinatorToRelay, PlayerHandoff, RegionId, RelayHello, RelayToCoordinator,
+    ResultNotice, SessionDescriptor, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
-use rally_point_proto::version::{CONTROL_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
+use rally_point_proto::version::{
+    CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
+};
 use rally_point_relay::consensus::RelayNotice;
 use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
@@ -118,6 +121,7 @@ async fn serve_bare_coordinator(
         control_auth: ControlAuth::Open,
         hello_timeout,
         liveness_timeout,
+        regions: RegionsConfig::default(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -193,6 +197,7 @@ async fn coordinator_with_session(
         control_auth,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
+        regions: RegionsConfig::default(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -550,6 +555,7 @@ async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (Strin
         control_auth: ControlAuth::Open,
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
+        regions: RegionsConfig::default(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -867,6 +873,155 @@ async fn a_newer_relay_with_an_overlapping_window_downgrades_and_enrolls() {
     assert_eq!(
         setup.serving_relays(&TenantId(TENANT.to_owned()), session),
         vec![RelayId(9)]
+    );
+}
+
+// --- Region validation at the enroll Hello ---
+
+/// Serves a coordinator with the given region config (and the test tenant
+/// enrolled, no relays pre-enrolled), returning the base URL and a setup handle so
+/// a test can inspect the registry after an enroll attempt.
+async fn serve_coordinator_with_regions(regions: RegionsConfig) -> (String, SessionSetup) {
+    let reg = registry::new_registry();
+    let tenants = tenant::new_store();
+    tenant::enroll(
+        &tenants,
+        KeyId("test-key-1".to_owned()),
+        TenantId(TENANT.to_owned()),
+        BufferBounds::new(1, 6).unwrap(),
+    )
+    .unwrap();
+    let setup = session::SessionSetup::new(reg, tenants);
+    let handle = setup.clone();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let app = api::router(CoordinatorState {
+        setup,
+        notices: notify::new_dedup(),
+        lifecycle,
+        control_auth: ControlAuth::Open,
+        hello_timeout: api::HELLO_TIMEOUT,
+        liveness_timeout: LIVENESS,
+        regions,
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// A two-region config (`region-a`, `region-b`) for the enroll-validation tests.
+fn two_region_config() -> RegionsConfig {
+    RegionsConfig::from_json(
+        r#"{"regions": [
+            {"id": "region-a", "display_name": "Region A", "beacon": "a:20000", "fallback": "a:443"},
+            {"id": "region-b", "display_name": "Region B", "beacon": "b:20000", "fallback": "b:443"}
+        ]}"#,
+    )
+    .unwrap()
+}
+
+/// Reads the coordinator's answer to a Hello tagged with an unknown region and
+/// asserts it is the unknown-region close — code [`CONTROL_CLOSE_UNKNOWN_REGION`]
+/// with a reason naming the offered region — arriving as the FIRST frame.
+async fn expect_unknown_region_close(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    offered_region: &str,
+) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let answer = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator answers the tagged Hello promptly")
+        .expect("a frame arrives before the stream ends")
+        .unwrap();
+    let Message::Close(Some(frame)) = answer else {
+        panic!("expected an unknown-region close frame, got {answer:?}");
+    };
+    assert_eq!(u16::from(frame.code), CONTROL_CLOSE_UNKNOWN_REGION);
+    assert!(
+        frame.reason.contains(offered_region),
+        "the reason names the offered region: {}",
+        frame.reason,
+    );
+}
+
+#[tokio::test]
+async fn a_region_less_hello_enrolls_even_with_a_region_config() {
+    // An untagged relay always enrolls — regions are for tagged relays; a
+    // region-less hello is the dev/loopback and region-blind-fallback path.
+    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
+    let mut socket = connect_and_send_hello(&base_url, relay_hello(9, 14909)).await;
+    // The first frame down is the enrolled path's descriptor re-sync, not a close.
+    let first = timeout(Duration::from_secs(5), {
+        use futures_util::StreamExt;
+        socket.next()
+    })
+    .await
+    .expect("the coordinator answers")
+    .expect("a frame arrives")
+    .unwrap();
+    assert!(
+        matches!(first, tokio_tungstenite::tungstenite::Message::Text(t) if t.contains("\"type\":\"descriptors\""))
+    );
+    assert!(
+        wait_for_enrollment(setup.registry(), RelayId(9)).await,
+        "an untagged relay enrolls",
+    );
+}
+
+#[tokio::test]
+async fn a_valid_region_enrolls_and_lands_in_the_registry_entry() {
+    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
+    let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    let _ = timeout(Duration::from_secs(5), {
+        use futures_util::StreamExt;
+        socket.next()
+    })
+    .await;
+    assert!(
+        wait_for_enrollment(setup.registry(), RelayId(9)).await,
+        "a relay in a configured region enrolls",
+    );
+    let entry = registry::entry(setup.registry(), RelayId(9)).expect("relay 9 enrolled");
+    assert_eq!(
+        entry.region,
+        Some(RegionId("region-a".to_owned())),
+        "the registry entry carries the enrolled region",
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_region_is_refused_and_never_enrolled() {
+    // A typo'd region tag is refused rather than silently serving nobody.
+    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
+    let hello = relay_hello(9, 14909).with_region(RegionId("region-z".to_owned()));
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    expect_unknown_region_close(&mut socket, "region-z").await;
+    assert!(
+        registry::peer(setup.registry(), RelayId(9)).is_none(),
+        "a relay tagged with an unknown region is never enrolled",
+    );
+}
+
+#[tokio::test]
+async fn any_region_is_refused_when_no_regions_are_configured() {
+    // With no region config at all, a region tag is unrecognizable, so a tagged
+    // relay is refused — the empty-config case of the unknown-region rule.
+    let (base_url, setup) = serve_coordinator_with_regions(RegionsConfig::default()).await;
+    let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
+    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    expect_unknown_region_close(&mut socket, "region-a").await;
+    assert!(
+        registry::peer(setup.registry(), RelayId(9)).is_none(),
+        "with no region config a tagged relay is never enrolled",
     );
 }
 

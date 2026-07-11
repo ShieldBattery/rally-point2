@@ -43,6 +43,7 @@ pub mod descriptors;
 pub mod lifecycle;
 pub mod notify;
 pub mod presence;
+pub mod regions;
 pub mod registry;
 pub mod rehome;
 pub mod session;
