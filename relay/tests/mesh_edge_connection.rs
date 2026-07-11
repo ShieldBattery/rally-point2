@@ -768,6 +768,84 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
     Ok(())
 }
 
+/// The mesh-side half of finding B2: a peer's control-stream reader ending while
+/// the connection stays otherwise alive must be treated as a link failure, not a
+/// degradation limped through — otherwise the pair permanently loses
+/// `SlotDeparted`/`LeaveDirective`/oversize-turn/delivery-cursor traffic between
+/// them. Mirrors [`dial_redials_after_the_link_connection_fails`] exactly, but
+/// kills the link by finishing the peer's control stream (a clean EOF, no reset,
+/// no whole-connection close) instead of closing the connection outright — the
+/// established link must still exit `ConnectionFailed` and the dial supervisor
+/// must still redial.
+#[tokio::test]
+async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyError> {
+    let tenant = make_tenant();
+
+    // A (id 1) dials; B (id 2) accepts. B stays up throughout, so the redial can
+    // reconnect to it.
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+
+    let (links_a_tx, mut links_a_rx) =
+        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(relay_b.ca.clone()).unwrap();
+    let dial = mesh_edge::MeshDial {
+        our_id: RelayId(1),
+        peer_id: RelayId(2),
+        peer_addrs: vec![relay_b.addr],
+        server_name: "localhost".to_owned(),
+        roots,
+    };
+    // A short redial delay so the test doesn't wait the production interval.
+    tokio::spawn(mesh_edge::run_mesh_dial_with(
+        dial,
+        Arc::clone(&relay_a.sessions),
+        relay_a.mesh.clone(),
+        links_a_tx,
+        Duration::from_millis(50),
+    ));
+
+    // The first dial connects: B accepts a connection and A surfaces a link
+    // labeled with B's id. B's real driver never runs here (its accept channel
+    // is drained directly), so nothing has yet accepted A's (the dialer's) mesh
+    // control stream from B's side of the wire.
+    let conn1 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "B did not accept A's first dial within 2s")?
+        .ok_or("B's accept channel closed")?;
+    let (peer1, _cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface its first link within 2s")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer1, RelayId(2), "A's first link reaches B");
+
+    // The mesh control stream is one bidirectional stream the dialer (A) opens
+    // and writes an establishing frame on right away — which is why B's
+    // `accept_bi` below completes promptly even though B's real driver never
+    // ran. Accept B's paired half of that same stream, then immediately finish
+    // B's send direction: a clean EOF on the stream A's `peer_control_rx`
+    // reads, with the connection itself left fully alive.
+    let (mut b_control_send, _unused) = conn1.accept_bi().await?;
+    b_control_send.finish()?;
+
+    // A's driver must treat that as a link failure and redial, exactly like the
+    // whole-connection-close case: B accepts a second connection, and A surfaces
+    // a fresh link.
+    let _conn2 = tokio::time::timeout(Duration::from_secs(2), relay_b.mesh_accept_rx.recv())
+        .await
+        .map_err(|_| "A did not redial after its peer's control stream died")?
+        .ok_or("B's accept channel closed")?;
+    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+        .await
+        .map_err(|_| "A did not surface a link after redialing")?
+        .ok_or("A's links channel closed")?;
+    assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
+
+    drop(relay_a);
+    Ok(())
+}
+
 /// The on-demand dialer establishes a mesh link to a peer the coordinator's
 /// descriptors name, and re-establishes it after the link ends — the production
 /// path that closes the "idle teardown then a new session leaves the pair

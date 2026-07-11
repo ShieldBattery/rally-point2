@@ -435,16 +435,19 @@ pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// `CommandChannelClosed` means the relay itself is shutting the link down.
 ///
 /// `ConnectionFailed` covers every transport-level exit — a QUIC idle
-/// timeout, a read/send error, or a keepalive that stopped round-tripping.
-/// Those surface the same from the driver's perspective (the link is gone);
-/// the reconnect supervisor treats them all as retryable.
+/// timeout, a read/send error, a keepalive that stopped round-tripping, or the
+/// peer's control-stream reader ending while the rest of the connection was
+/// still alive (a one-sided reset, an over-cap frame, a decode failure). Those
+/// all surface the same from the driver's perspective (the link is gone); the
+/// reconnect supervisor treats them all as retryable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshLinkExit {
     /// The link had at least one session, went empty, and stayed empty past
     /// [`IDLE_TIMEOUT`]. An intentional wind-down, not a failure.
     Idle,
-    /// The connection failed: a recv/send error or QUIC idle timeout. The
-    /// peer is unreachable or dead.
+    /// The connection failed: a recv/send error, QUIC idle timeout, or a dead
+    /// control-stream reader. The peer is unreachable, dead, or the link is no
+    /// longer trustworthy for correctness-critical traffic.
     ConnectionFailed,
     /// The command channel closed (the relay is tearing the link down — its
     /// `MeshCommand` sender was dropped). An intentional shutdown.
@@ -1054,11 +1057,6 @@ pub async fn run_mesh_link(
         tx: mut control_send,
         rx: mut peer_control_rx,
     } = mesh_control_io;
-    // Mirrors `presence_alive`: a `None` from the peer's control reader task
-    // (its stream closed) disarms the branch, not spin the loop. A dead control
-    // stream is not itself a link failure; that surfaces via the datagram path.
-    let mut peer_control_alive = true;
-
     // One merged outbound control channel for every session on this link:
     // `fan_out_control` pushes a `MeshControlFrame` (self-describing via its
     // session field) here, and the driver writes it on the shared control stream.
@@ -1240,7 +1238,7 @@ pub async fn run_mesh_link(
             // synced leave its authority authored, or an oversize turn its
             // datagram path could not carry. The reader task assembled the
             // complete frame off a cancel-safe path; `recv` is cancel-safe.
-            received = peer_control_rx.recv(), if peer_control_alive => {
+            received = peer_control_rx.recv() => {
                 match received {
                     Some(frame) => dispatch_mesh_control(
                         frame,
@@ -1249,7 +1247,21 @@ pub async fn run_mesh_link(
                         &sessions,
                         &mesh_for_dispatch,
                     ),
-                    None => peer_control_alive = false,
+                    // The reader task ended: a one-sided stream reset, an
+                    // over-cap frame, a decode failure, or a clean EOF. This
+                    // stream is the only channel `SlotDeparted`,
+                    // `LeaveDirective`, an oversize-turn divert, and delivery
+                    // cursors ever arrive on from this peer, so losing it is a
+                    // link failure like any other here, not a degradation to
+                    // limp on through -- ending the driver lets the dial
+                    // supervisor (`dial_and_serve`) redial a fresh connection
+                    // and every stream comes up new. Harmless if the
+                    // connection was already dying for the same reason this
+                    // reader ended.
+                    None => {
+                        tracing::info!("mesh control stream reader ended; closing link");
+                        break MeshLinkExit::ConnectionFailed;
+                    }
                 }
             }
             forwarded = forward_rx.recv() => {

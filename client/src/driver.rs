@@ -356,6 +356,14 @@ pub enum DriverError {
     /// trigger as a broken link.
     #[error("oversize turn could not be diverted: {0}")]
     ControlStream(#[from] ControlSendError),
+    /// The control-stream reader task ended while the connection was otherwise
+    /// alive — a one-sided stream reset, an over-cap frame, a decode failure, or
+    /// a clean EOF. This is the only channel a synced `LeaveDirective`,
+    /// `SessionStart`, and `SlotConnectivity` ever arrive on, so losing it is
+    /// not a degradation the driver can quietly limp on through: reconnecting
+    /// rebuilds every stream from scratch, exactly like a broken link.
+    #[error("control stream reader ended")]
+    ControlStreamLost,
     /// The game stopped draining received turns and the inbound buffer filled, so
     /// the relay's turns have nowhere to go. The driver surfaces this instead of
     /// blocking on the handoff — parking there would also stall its acks and
@@ -686,9 +694,6 @@ impl LinkDriver {
             .await
             .map_err(|error| DriverError::Link(LinkError::from(error)))?;
         let mut control_rx = spawn_control_reader(link.connection().clone());
-        // Mirrors `beacon_alive`: once the reader task ends, its channel is an
-        // always-ready `None` that would spin the loop, so the branch disarms.
-        let mut control_alive = true;
         // The highest cursor the client has pushed to the peer, per slot. Push
         // only on advance so a healthy link with a static receive prefix sends
         // nothing.
@@ -762,12 +767,12 @@ impl LinkDriver {
                 .maybe_send(&mut control_send, outbound, link)
                 .await?;
         }
-        // Mirrors `beacon_alive`/`control_alive`: the game signals at most once, so
-        // this disarms on the channel's first resolution (the real signal, or the
-        // sender dropping without one) rather than only on `None` — either way
-        // there is nothing further to receive, and leaving the branch armed past
-        // that would either spin on a closed channel or just poll a channel that
-        // will never produce anything else.
+        // Mirrors `beacon_alive`: the game signals at most once, so this disarms
+        // on the channel's first resolution (the real signal, or the sender
+        // dropping without one) rather than only on `None` — either way there is
+        // nothing further to receive, and leaving the branch armed past that
+        // would either spin on a closed channel or just poll a channel that will
+        // never produce anything else.
         let mut leave_intent_alive = true;
 
         // Mirrors `leave_intent_alive`: the game hands over a result at most
@@ -865,7 +870,7 @@ impl LinkDriver {
                 // delivery. It then joins the same per-slot reorder buffer, so
                 // the game sees one ordered stream regardless of which path
                 // each turn took.
-                received = control_rx.recv(), if control_alive => {
+                received = control_rx.recv() => {
                     match received {
                         // A relay-pushed synced leave: hand it to the game's leave
                         // tracker. This is the delivery path a drop needs — the turn
@@ -1021,14 +1026,27 @@ impl LinkDriver {
                                 .await;
                             }
                         }
-                        // The reader task ended (stream closed or a framing
-                        // violation). Not itself fatal — the link may be fine
-                        // and most sessions never see an oversize turn — but
-                        // one that later needs the stream will stall, so it is
-                        // worth a log line before the branch disarms.
+                        // The reader task ended: a one-sided stream reset, an
+                        // over-cap frame, a decode failure, or a clean EOF. This
+                        // is the only channel a synced `LeaveDirective`,
+                        // `SessionStart`, and `SlotConnectivity` ever arrive on
+                        // — unlike the beacon side-channel (a pure one-way
+                        // cursor feed a real link failure surfaces separately
+                        // via `link.recv()`), nothing else in this loop will
+                        // ever notice this is gone. So this ends the session
+                        // rather than disarming and limping on: treated as a
+                        // link failure, the reconnect loop re-dials and
+                        // `session` re-spawns a fresh control reader from
+                        // scratch on the rebound link. `absorb_link_close`
+                        // still applies — the connection may be closing for
+                        // the very reason this reader ended (e.g. right after
+                        // our own leave intent was processed), in which case
+                        // this becomes the same clean stop `link.recv()`'s
+                        // error arm would have produced.
                         None => {
                             tracing::info!("control stream reader ended");
-                            control_alive = false;
+                            return announcer
+                                .absorb_link_close(Err(DriverError::ControlStreamLost));
                         }
                     }
                 }
@@ -1723,7 +1741,10 @@ fn resume_cursors(next_seq: &HashMap<SlotId, u64>) -> Vec<(SlotId, u64)> {
 /// re-dial through, as opposed to a terminal condition (a stalled game, an
 /// exhausted window, a relay refusal) reconnecting cannot fix.
 fn is_link_failure(error: &DriverError) -> bool {
-    matches!(error, DriverError::Link(_) | DriverError::ControlStream(_))
+    matches!(
+        error,
+        DriverError::Link(_) | DriverError::ControlStream(_) | DriverError::ControlStreamLost
+    )
 }
 
 /// Whether the identity's authorization token has expired against the wall clock —
@@ -2311,6 +2332,53 @@ mod tests {
         drop(chan_b.outbound);
         let _ = task_a.await;
         let _ = task_b.await;
+    }
+
+    #[tokio::test]
+    async fn a_dead_control_stream_reader_surfaces_as_a_link_failure_while_the_connection_stays_up()
+     {
+        // The bug this guards: the control stream is the only channel a synced
+        // `LeaveDirective`, `SessionStart`, and `SlotConnectivity` ever arrive on.
+        // If its reader task ends while the connection is otherwise healthy (a
+        // one-sided reset, an over-cap frame, a decode failure, or here a clean
+        // EOF), the old code just disarmed the branch and limped on with
+        // datagrams alone -- silently losing all three for the rest of the
+        // session. The fix treats it as a link failure the same way
+        // `link.recv()`'s own error arm does.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+
+        // The peer opens its outbound control stream -- mirroring the relay's own
+        // `open_bi()` in `routing::run_slot_link` -- then immediately finishes it:
+        // a clean EOF with the connection itself left fully alive, exactly the
+        // "control stream dead, link fine" split this bug is about.
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        let _ = peer_control_send.finish();
+
+        let result =
+            LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0)).await;
+        assert!(
+            matches!(result, Err(DriverError::ControlStreamLost)),
+            "expected ControlStreamLost, got {result:?}",
+        );
+        assert!(
+            is_link_failure(result.as_ref().unwrap_err()),
+            "a dead control stream must be reconnect-eligible, like a broken link",
+        );
+
+        // The connection itself was never closed -- proof this is a control-
+        // stream-only death, not a whole-link failure in disguise: the
+        // reconnect loop's own re-dial is what actually tears it down.
+        assert!(
+            link.connection().close_reason().is_none(),
+            "the underlying connection must stay alive; only the control stream died",
+        );
+
+        // Held for the whole test so the game-facing channel halves stay open
+        // throughout `session()` -- nothing here exercises them, but a premature
+        // drop would close `seam`'s peers and risk a different, unrelated exit.
+        drop(chan_a);
     }
 
     #[test]

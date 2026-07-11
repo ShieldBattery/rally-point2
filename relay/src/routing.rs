@@ -130,6 +130,19 @@ const UNACKED_WINDOW_CAP: usize = 1024;
 /// waits for once it has sent its intent.
 const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 
+/// QUIC application close code for a connection the relay closes on its own
+/// initiative because the client's control-stream reader ended while the
+/// connection was otherwise alive (a one-sided stream reset, an over-cap
+/// frame, a decode failure, or a clean EOF). That stream is the only channel
+/// `RequestDrop` and a clean leave-intent arrive on, so losing it is a link
+/// failure, not a degradation to limp on through: closing the connection here
+/// pushes the client into its ordinary reconnect path, which redials and
+/// reopens every stream fresh. Distinct from every other close code so it is
+/// diagnosable in logs, though the client's driver treats it exactly like a
+/// plain transport error (only [`crate::server::SLOT_DEPARTED_CLOSE`] gets
+/// special client-side handling).
+const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
+
 /// Whether a client's `GameResult` control frame should be forwarded to
 /// `consensus::record_result`, or dropped at ingress before it ever reaches the
 /// decision-maker. A zero-length payload is the wire sentinel a `SlotDeparted`
@@ -809,9 +822,6 @@ pub async fn run_slot_link(
     };
     let mut control_rx =
         rally_point_transport::control::spawn_control_reader(link.connection().clone());
-    // Mirrors `beacon_alive` below: a `None` from an ended reader task must
-    // disarm the branch, not spin the loop.
-    let mut control_alive = true;
     // Whether this slot's leave-push channel still has a sender. It lives in the
     // roster while the slot is registered, so `None` is unreachable during the
     // loop; the flag disarms the branch defensively so a closed channel can't spin.
@@ -1261,7 +1271,7 @@ pub async fn run_slot_link(
             // link's dedup first (a duplicate must not double-forward; a seq
             // beyond the window closes the link exactly as on the datagram
             // path), then validate and forward it like any other turn.
-            received = control_rx.recv(), if control_alive => {
+            received = control_rx.recv() => {
                 match received {
                     // A client only ever *sends* oversize turns up; it never sends
                     // a leave (those are relay → client only). Ignore a stray one.
@@ -1504,7 +1514,32 @@ pub async fn run_slot_link(
                             wire_target,
                         );
                     }
-                    None => control_alive = false,
+                    // The reader task ended: a one-sided stream reset, an
+                    // over-cap frame, a decode failure, or a clean EOF. This
+                    // stream is the only channel `RequestDrop` and a clean
+                    // leave-intent ever arrive on -- unlike the beacon
+                    // side-channel below (a pure one-way cursor feed whose loss
+                    // a real link failure surfaces separately via
+                    // `link.recv()`), nothing else in this loop will ever
+                    // notice this is gone. Disarming and limping on would
+                    // silently strand an F10 quit as a drop+hold and lose
+                    // `RequestDrop` outright, so instead close the connection
+                    // and let the client's ordinary reconnect path rebuild
+                    // every stream fresh -- harmless if the connection was
+                    // already dying for the same reason this reader ended.
+                    None => {
+                        tracing::info!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "control stream reader ended; closing so the client reconnects with fresh streams",
+                        );
+                        link.connection().close(
+                            VarInt::from_u32(CONTROL_STREAM_LOST_CLOSE),
+                            b"control stream lost",
+                        );
+                        break 'serve;
+                    }
                 }
             }
             // The client pushed a delivered-through cursor over the beacon stream.

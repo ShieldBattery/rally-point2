@@ -1302,6 +1302,48 @@ async fn an_over_cap_oversize_turn_is_rejected_and_never_reaches_the_peer() {
 }
 
 #[tokio::test]
+async fn a_dead_control_stream_reader_closes_the_slot_link() {
+    // The relay-side half of finding B2: the client's control stream is the
+    // only channel `RequestDrop` and a clean leave-intent ever arrive on. If
+    // its reader task ends while the connection is otherwise alive -- here a
+    // clean EOF, no reset -- the relay must close the connection so the
+    // client's reconnect machinery takes over with fresh streams, rather than
+    // just disarming and serving datagrams forever while permanently losing
+    // both of those.
+    //
+    // Mirrors the private `routing::CONTROL_STREAM_LOST_CLOSE`, the same way
+    // the decided-departure test below mirrors `server::SLOT_DEPARTED_CLOSE`
+    // (that one is `pub` and imported directly; this one isn't, so the value
+    // is hardcoded here).
+    const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
+
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(206);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+
+    // Open the client's outbound control stream -- the one the relay's
+    // `control_rx` reads -- then immediately finish it: a clean EOF with the
+    // connection itself left fully alive, exactly the "control stream dead,
+    // link fine" split this bug is about.
+    let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    let _ = ctrl0_send.finish();
+
+    // The relay closes the whole connection in response.
+    expect_closed(&mut slot0).await;
+    match slot0.connection().closed().await {
+        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+            u32::try_from(u64::from(app.error_code)).unwrap(),
+            CONTROL_STREAM_LOST_CLOSE,
+            "the relay closes with the control-stream-lost code",
+        ),
+        other => panic!("expected an application close, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn acks_a_one_way_sender_with_no_peer_traffic() {
     let tenant = make_tenant(KID, TENANT);
     let (addr, ca) = start_relay(registry_for(&[&tenant]));
