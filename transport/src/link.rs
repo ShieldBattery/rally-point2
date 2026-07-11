@@ -547,23 +547,29 @@ impl Dedup {
             ahead: BTreeSet::new(),
         });
 
-        // The lowest seq not yet part of the contiguous delivered prefix.
-        // Saturating, not `+ 1` outright: a `delivered_through` of `u64::MAX`
-        // is already a nonsense value no real game can ever legitimately
-        // reach (that many turns dwarfs the lifetime of any session by many
-        // orders of magnitude) -- the real gate against it is the relay's
-        // resume-cursor anchor validation (see `Link::anchor_receive_window`'s
-        // caller in `routing.rs`), which clamps a client-supplied anchor
-        // before it ever reaches here. This saturation is the defense-in-depth
-        // backstop: if that gate were ever missing or wrong, the fold below
-        // degrades to "everything from here on is duplicate or out of
-        // window" rather than panicking (debug) or wrapping (release) into a
-        // corrupted, silently-wrong window.
-        let base = state.delivered_through.map_or(0, |t| t.saturating_add(1));
-
-        if seq < base {
+        // A seq at or below the contiguous delivered prefix has already been
+        // handed to the consumer. Comparing against `delivered_through` directly,
+        // rather than a "next expected" seq derived by adding one, is what keeps a
+        // prefix top of `u64::MAX` a duplicate when it repeats: there is no seq
+        // above `u64::MAX` for a "next expected" to hold, so deriving one would
+        // have to clamp back onto `u64::MAX` and misread the repeat as new. A
+        // `u64::MAX` prefix is itself a value no real game can reach (that many
+        // turns dwarfs any session's lifetime by orders of magnitude); the real
+        // gate against it is the relay's resume-cursor anchor validation (see
+        // `Link::anchor_receive_window`'s caller in `routing.rs`), which clamps a
+        // client-supplied anchor before it can reach here. This is the
+        // defense-in-depth backstop for the fold itself.
+        if let Some(delivered) = state.delivered_through
+            && seq <= delivered
+        {
             return Delivery::Duplicate;
         }
+
+        // The lowest seq not yet part of the contiguous delivered prefix. `seq` is
+        // strictly above any existing prefix top (checked above), so that top is
+        // below `u64::MAX` and this `+ 1` cannot overflow.
+        let base = state.delivered_through.map_or(0, |t| t + 1);
+
         if seq - base >= self.window {
             return Delivery::OutOfWindow;
         }
@@ -571,10 +577,9 @@ impl Dedup {
             return Delivery::Duplicate;
         }
 
-        // Absorb any now-contiguous run into the delivered prefix. Stops
-        // rather than overflows if the run reaches `u64::MAX` -- the same
-        // saturating-boundary reasoning as `base` above; there is no valid
-        // seq beyond it to keep absorbing anyway.
+        // Absorb any now-contiguous run into the delivered prefix. Stops rather
+        // than overflows if the run reaches `u64::MAX`; there is no valid seq
+        // beyond it to keep absorbing anyway.
         let mut next = base;
         loop {
             if !state.ahead.remove(&next) {
@@ -724,12 +729,25 @@ mod tests {
         // rather than overflow.
         assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::New);
         assert_eq!(dedup.delivered_through(SlotId(0)), Some(u64::MAX));
-        // A repeat at the exact ceiling isn't cleanly classified as a
-        // duplicate (there's no representable "one past u64::MAX" to compare
-        // against), but the property this test exists for is that it does
-        // not panic or corrupt state: `delivered_through` stays at the
-        // ceiling either way.
-        let _ = dedup.accept(SlotId(0), u64::MAX);
+        // A repeat at the exact ceiling is a duplicate: it sits at the prefix
+        // top, which is compared directly rather than against a "one past
+        // u64::MAX" that can't be represented. State is unchanged.
+        assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::Duplicate);
+        assert_eq!(dedup.delivered_through(SlotId(0)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_repeated_u64_max_seq_is_a_duplicate_not_a_fresh_delivery() {
+        // With the prefix top anchored at the u64 ceiling, a re-sent seq at the
+        // ceiling must dedup as a duplicate, not be re-delivered as new every
+        // time it arrives. Deriving a "next expected" seq by adding one to the
+        // prefix top would have to clamp back onto the ceiling and then read the
+        // repeat as a fresh delivery.
+        let mut dedup = Dedup::with_window(8);
+        dedup.anchor(SlotId(0), u64::MAX);
+        assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(0), u64::MAX), Delivery::Duplicate);
         assert_eq!(dedup.delivered_through(SlotId(0)), Some(u64::MAX));
     }
 
