@@ -391,6 +391,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-beacon"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
