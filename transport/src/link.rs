@@ -34,7 +34,7 @@ use prost::Message;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{Packet, Payload};
 
-use crate::ack_manager::{AckError, AckManager};
+use crate::ack_manager::{AckError, AckManager, PacketSeqExhausted};
 
 /// How far ahead of the contiguous delivered prefix a peer's payload seq may be
 /// before the link is treated as broken. The redundancy stream keeps that prefix
@@ -95,6 +95,13 @@ pub enum LinkError {
     /// callers (the relay) typically drop the peer on this.
     #[error(transparent)]
     Ack(#[from] AckError),
+    /// The connection's `u32` packet sequence space is exhausted — every seq has
+    /// been assigned. Unreachable within one game at the turn rate (years of
+    /// play), so it means the connection is broken: terminal, and the reconnect
+    /// machinery must reset onto a fresh connection (a new seq space) rather than
+    /// wrap, which would silently corrupt acking.
+    #[error(transparent)]
+    PacketSeqExhausted(#[from] PacketSeqExhausted),
 }
 
 impl Link {
@@ -332,7 +339,7 @@ impl Link {
             }
         }
 
-        let packet = self.acks.build_outgoing(payload, budget);
+        let packet = self.acks.build_outgoing(payload, budget)?;
         // Everything in the packet except the fresh turn is a redundant re-carry.
         let redundant = packet.payloads.len() - usize::from(had_fresh);
         let encoded = packet.encode_to_vec();

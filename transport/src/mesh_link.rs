@@ -36,7 +36,7 @@ use prost::Message;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, MeshPacket, Packet, Payload};
 
-use crate::ack_manager::{AckError, AckManager};
+use crate::ack_manager::{AckError, AckManager, PacketSeqExhausted};
 use crate::link::{Dedup, Delivery, LinkError, Received};
 
 /// Worst-case byte overhead a `MeshPacket` adds around the inner `Packet` when
@@ -163,6 +163,10 @@ pub enum MeshLinkError {
     /// (the mesh trusts its peer); the driver decides whether to drop the session.
     #[error(transparent)]
     Ack(#[from] AckError),
+    /// The session's `u32` packet sequence space is exhausted — see
+    /// [`LinkError::PacketSeqExhausted`].
+    #[error(transparent)]
+    PacketSeqExhausted(#[from] PacketSeqExhausted),
 }
 
 impl From<LinkError> for MeshLinkError {
@@ -183,6 +187,7 @@ impl From<LinkError> for MeshLinkError {
             }
             LinkError::MalformedSlot(slot) => MeshLinkError::MalformedSlot(slot),
             LinkError::Ack(error) => MeshLinkError::Ack(error),
+            LinkError::PacketSeqExhausted(error) => MeshLinkError::PacketSeqExhausted(error),
         }
     }
 }
@@ -320,7 +325,7 @@ impl MeshLink {
                 });
             }
         }
-        let packet = session_link.acks.build_outgoing(payload, packet_budget);
+        let packet = session_link.acks.build_outgoing(payload, packet_budget)?;
         // Everything in the packet except the fresh turn is a redundant re-carry.
         let redundant = packet.payloads.len() - usize::from(had_fresh);
 
