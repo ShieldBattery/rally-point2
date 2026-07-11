@@ -92,6 +92,27 @@ pub struct SessionRefs {
     /// before rebuilding descriptors, so this always reflects current
     /// membership, not just the session's original assignment.
     pub homes: std::collections::BTreeMap<SlotId, RelayId>,
+    /// The SHA-256 fingerprint of the DER certificate each serving relay's
+    /// clients currently pin, keyed by relay id. Recorded at session creation
+    /// for the primary home and any dev-split secondary, and updated for the
+    /// replacement relay on every re-home (including a same-id restart, where
+    /// it captures the relay's fresh cert under its unchanged id). A relay
+    /// restart mints a new cert under the same id, so this — not the relay's
+    /// enroll generation, which also bumps on a benign reconnect of an
+    /// unchanged cert — is what tells a stay-or-move decision apart from a
+    /// false alarm: the id being enrolled is not enough, the cert its clients
+    /// hold must still be the one currently live.
+    pub relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
+}
+
+/// The SHA-256 fingerprint of a relay's DER-encoded certificate — the compact
+/// form a session records to remember which cert its clients pinned to a
+/// relay, rather than carrying the full DER bytes through every session's
+/// state for a plain byte comparison.
+fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
+    out
 }
 
 use std::sync::Arc;
@@ -380,6 +401,24 @@ pub fn rehome(
     rehome_inner(setup, tenant, session, dead_relay, departed_slots, || {})
 }
 
+/// Whether `relay`'s currently-presented cert (`current_der`) still matches the
+/// cert `session`'s clients pinned to it, per the fingerprint recorded in
+/// [`SessionRefs::relay_certs`]. A session with no recorded cert for `relay` (a
+/// gap no caller in this module is expected to leave) reads as matching, so an
+/// incomplete record cannot itself force a spurious move off a healthy relay.
+fn cert_matches_pin(
+    setup: &SessionSetup,
+    key: &(TenantId, SessionId),
+    relay: RelayId,
+    current_der: &[u8],
+) -> bool {
+    let refs = setup.session_refs.lock();
+    match refs.get(key).and_then(|refs| refs.relay_certs.get(&relay)) {
+        Some(&recorded) => recorded == cert_fingerprint(current_der),
+        None => true,
+    }
+}
+
 /// [`rehome`]'s body, with a test seam `before_mutation` invoked after the
 /// replacement relay is chosen but before the `session_relays` mutation — the exact
 /// window in which a concurrent full close can land. Production passes a no-op; a
@@ -434,14 +473,27 @@ fn rehome_inner(
         return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
     }
 
-    // The named relay is still enrolled *and* still serving this session: a genuine
-    // false alarm, so the coordinator authoritatively overrules the client's belief
-    // and tells it to stay. The serving-set guard is what distinguishes this from
-    // the already-re-homed straggler above: a relay that is enrolled but no longer
-    // in the serving set was moved off in a prior re-home (handled by the
-    // idempotency lookup), not a false alarm — falling into Stay there would pin the
-    // straggler to a relay this session no longer uses.
-    if serving.contains(&dead_relay) && registry::entry(&setup.registry, dead_relay).is_some() {
+    // The named relay is still enrolled, still serving this session, and the cert
+    // its clients pinned still matches what it currently presents: a genuine false
+    // alarm, so the coordinator authoritatively overrules the client's belief and
+    // tells it to stay. The serving-set guard is what distinguishes this from the
+    // already-re-homed straggler above: a relay that is enrolled but no longer in
+    // the serving set was moved off in a prior re-home (handled by the idempotency
+    // lookup), not a false alarm — falling into Stay there would pin the straggler
+    // to a relay this session no longer uses.
+    //
+    // Enrolled-under-this-id is not, by itself, enough: a relay that restarted in
+    // place re-enrolls under the same id with a fresh self-signed cert, and every
+    // client still holding the old pin can never accept it — answering Stay would
+    // wedge them dialing a cert they can never pass. The cert comparison catches
+    // that case and falls through to a replacement pick instead. The relay's
+    // enroll *generation* is deliberately not the signal: it also bumps on a
+    // benign control-WS reconnect that keeps the same cert, where Stay remains the
+    // right answer, so generation alone cannot tell the two apart.
+    if serving.contains(&dead_relay)
+        && let Some(entry) = registry::entry(&setup.registry, dead_relay)
+        && cert_matches_pin(setup, &key, dead_relay, &entry.cert_der)
+    {
         return RehomeOutcome::Stay;
     }
 
@@ -465,10 +517,17 @@ fn rehome_inner(
     // session (earliest in the authority order), else the lowest-id live available
     // registered relay. A draining relay is never chosen — it asked to stop taking
     // new work, and re-homing a whole group onto it would be exactly that.
+    //
+    // The dead relay's own id is a legal candidate here: reaching this point means
+    // it either is not enrolled at all (genuinely gone, so `is_available` below
+    // already excludes it) or is enrolled under a cert that no longer matches the
+    // pin (the stay-check above ruled out a match) — the restart-in-place case,
+    // where the relay is live, enrolled, available, and its own fresh cert is
+    // exactly the valid target every serving client needs to move onto.
     let r_new = serving
         .iter()
         .copied()
-        .find(|&id| id != dead_relay && registry::is_available(&setup.registry, id))
+        .find(|&id| registry::is_available(&setup.registry, id))
         .or_else(|| {
             let mut entries = registry::available_entries(&setup.registry);
             entries.sort_by_key(|e| e.relay_id);
@@ -488,7 +547,11 @@ fn rehome_inner(
     // Move every slot homed on the dead relay onto R_new: replace the dead relay
     // in place in the serving set (which is also the authority order), so the
     // rebuilt descriptors rank R_new where the dead relay stood. If R_new was
-    // already serving, drop the dead entry rather than list it twice.
+    // already serving under a *different* id, drop the dead entry rather than
+    // list it twice. A same-id replacement (the relay restarted in place) needs
+    // neither move: its id already occupies its slot in the set, so membership
+    // is left exactly as it is — only its recorded cert and descriptor, updated
+    // below, actually change.
     //
     // Re-validate under the `session_relays` lock we are about to mutate: our
     // `serving` snapshot was taken before this lock, so a full close could have
@@ -506,7 +569,9 @@ fn rehome_inner(
         if !members.contains(&dead_relay) {
             return RehomeOutcome::Unavailable;
         }
-        if members.contains(&r_new) {
+        if dead_relay == r_new {
+            // Same id, membership unchanged.
+        } else if members.contains(&r_new) {
             members.retain(|&id| id != dead_relay);
         } else {
             for id in members.iter_mut() {
@@ -517,32 +582,40 @@ fn rehome_inner(
         }
     }
 
-    // The dead relay is no longer a member. Drop its descriptor outbox entry for
-    // this session so that if it re-enrolls later it is not re-synced a descriptor
-    // for a session it no longer serves (the surviving relays get the resumed push
-    // below). Safe even if the dead relay is disconnected — the outbox is
-    // latest-wins current state, and a session it left must not remain in its set.
+    // The dead relay's descriptor outbox entry for this session is stale — for a
+    // different-id replacement it is no longer a member at all; for a same-id
+    // restart its old descriptor predates the cert change and slot moves this
+    // re-home is about to apply. Drop it now so that a relay reconnecting with
+    // stale outbox state is not re-synced the pre-rehome descriptor before the
+    // rebuild below re-records the current one. Safe even if the relay is
+    // disconnected — the outbox is latest-wins current state.
     setup.descriptors.remove(dead_relay, tenant, session);
 
-    // Move every slot's home-relay assignment from the dead relay onto R_new,
-    // so the rebuilt descriptors below bind those slots to their new home
-    // instead of a relay that no longer serves them — otherwise R_new's
-    // descriptor would omit them from `homed_slots` and the client's own
-    // reconnect to R_new would be refused as misrouted. A separate lock
-    // acquisition from the `session_relays` mutation above, following
+    // Move every slot's home-relay assignment from the dead relay onto R_new (a
+    // same-id replacement reassigns each entry to its own unchanged id, a
+    // harmless no-op), so the rebuilt descriptors below bind those slots to
+    // their new home instead of a relay that no longer serves them — otherwise
+    // R_new's descriptor would omit them from `homed_slots` and the client's own
+    // reconnect to R_new would be refused as misrouted. Record R_new's cert here
+    // too, replacing whatever this session had on file for the dead relay's id,
+    // so the next Stay-check for R_new's id compares against the cert it
+    // presents now rather than the one this re-home just moved off. A separate
+    // lock acquisition from the `session_relays` mutation above, following
     // `take_session_membership`'s established precedent (see its doc): only
-    // `session_relays` needs to be atomic with a racing close's
-    // re-validation, and that already passed by this point, so a close
-    // landing exactly here would simply retire this whole `session_refs`
-    // entry afterward regardless of what this leaves in `homes`. Must still
-    // run before the descriptor-rebuild loop below, which is what this
-    // position guarantees.
+    // `session_relays` needs to be atomic with a racing close's re-validation,
+    // and that already passed by this point, so a close landing exactly here
+    // would simply retire this whole `session_refs` entry afterward regardless
+    // of what this leaves in `homes`/`relay_certs`. Must still run before the
+    // descriptor-rebuild loop below, which is what this position guarantees.
     if let Some(refs) = setup.session_refs.lock().get_mut(&key) {
         for home_relay in refs.homes.values_mut() {
             if *home_relay == dead_relay {
                 *home_relay = r_new;
             }
         }
+        refs.relay_certs.remove(&dead_relay);
+        refs.relay_certs
+            .insert(r_new, cert_fingerprint(&new_entry.cert_der));
     }
 
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
@@ -737,6 +810,24 @@ fn create_session_inner(
                     .find(|split| split.slot == p.slot)
                     .map_or(home.relay_id, |split| split.relay.relay_id);
                 (p.slot, relay_id)
+            })
+            .collect(),
+        // Every serving relay's cert, fingerprinted, so a later re-home can tell
+        // a restarted-in-place relay (same id, new cert) apart from a false
+        // alarm. Looked up from `home`/`secondary` rather than the registry
+        // again, so this reflects exactly the cert the tokens just minted (and
+        // the response about to be returned) already commit the clients to.
+        relay_certs: relay_ids
+            .iter()
+            .filter_map(|&id| {
+                if id == home.relay_id {
+                    Some((id, cert_fingerprint(&home.cert_der)))
+                } else {
+                    secondary
+                        .as_ref()
+                        .filter(|s| s.relay_id == id)
+                        .map(|s| (id, cert_fingerprint(&s.cert_der)))
+                }
             })
             .collect(),
     };
@@ -973,13 +1064,19 @@ mod tests {
     }
 
     fn enroll_relay(reg: &RelayRegistry, id: u64, port: u16) {
+        enroll_relay_with_cert(reg, id, port, fake_cert(id));
+    }
+
+    /// Enrolls (or re-enrolls) a relay under an explicit cert, so a test can
+    /// simulate a same-id restart under a fresh one.
+    fn enroll_relay_with_cert(reg: &RelayRegistry, id: u64, port: u16, cert_der: Vec<u8>) {
         registry::enroll(
             reg,
             RelayHello::new(
                 RelayId(id),
                 SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
                 ProtocolVersion::CURRENT,
-                fake_cert(id),
+                cert_der,
             ),
         );
     }
@@ -1863,6 +1960,129 @@ mod tests {
                 &registry::entry(setup.registry(), RelayId(2)).unwrap()
             )),
             "the recorded replacement overrules the re-enrolled dead relay's liveness",
+        );
+    }
+
+    #[test]
+    fn rehome_replaces_a_same_id_relay_that_restarted_with_a_new_cert() {
+        // The home relay restarts in place: same id, but a fresh self-signed cert
+        // from the new process. Every client's pin was to the old cert, which it
+        // can never match, so even though the id is still enrolled and still
+        // serving, the coordinator must treat this as a mismatch and hand back the
+        // same id under its new cert rather than Stay.
+        // Relays 5 and 6 (rather than the usual 1 and 2) so a lower-id relay can
+        // enroll later without becoming the session's original home -- proving the
+        // replacement pick reaches for the restarted relay's own id rather than
+        // drifting to whichever live relay happens to sort lowest.
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 5, 14900);
+        enroll_relay(&reg, 6, 14901);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = create_default_session(&setup);
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(5)]);
+
+        // A new, lower-id relay enrolls after the session was created. It must not
+        // steal the replacement pick away from the restarted relay's own id.
+        enroll_relay(setup.registry(), 1, 14899);
+        enroll_relay_with_cert(setup.registry(), 5, 14900, vec![0xEE; 4]);
+
+        let departed = vec![DepartedSlot {
+            slot: SlotId(0),
+            kind: DepartureKind::Dropped,
+        }];
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(5), departed.clone())
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            endpoint.relay_id,
+            RelayId(5),
+            "the restarted relay is its own valid replacement, not the newly-idle lower-id relay 1"
+        );
+        assert_eq!(
+            endpoint.cert_der,
+            vec![0xEE; 4],
+            "the response carries the relay's fresh cert"
+        );
+        assert_eq!(
+            setup.serving_relays(&tid(), resp.session),
+            vec![RelayId(5)],
+            "membership is unchanged -- the id never left the serving set",
+        );
+
+        let staged = setup.descriptors().current_for(RelayId(5));
+        assert_eq!(staged.len(), 1);
+        assert!(
+            staged[0].resumed,
+            "a resumed descriptor is re-pushed to the restarted relay"
+        );
+        assert_eq!(staged[0].departed_slots, departed);
+        assert_eq!(
+            staged[0].homed_slots,
+            vec![SlotId(0), SlotId(1)],
+            "both slots stay homed on the relay under its unchanged id",
+        );
+
+        let refs = session_refs(&setup, &tid(), resp.session).unwrap();
+        assert_eq!(
+            refs.relay_certs.get(&RelayId(5)),
+            Some(&cert_fingerprint(&[0xEE; 4])),
+            "the recorded pin is updated to the relay's fresh cert",
+        );
+    }
+
+    #[test]
+    fn rehome_stays_when_a_relay_reconnects_under_an_unchanged_cert() {
+        // A benign control-WS reconnect re-enrolls the same id under a NEW
+        // generation but the SAME cert -- a connection blip, not a restart. The
+        // enroll generation is deliberately not the signal for a cert change, so
+        // this must still answer Stay.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+
+        enroll_relay(setup.registry(), 1, 14900); // same id, same fake_cert(1)
+
+        assert_eq!(
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+            RehomeOutcome::Stay,
+        );
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
+    }
+
+    #[test]
+    fn create_session_records_each_serving_relays_cert_for_a_split_session() {
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players(),
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+
+        let refs = session_refs(&setup, &tid(), resp.session).unwrap();
+        assert_eq!(
+            refs.relay_certs.get(&RelayId(1)),
+            Some(&cert_fingerprint(&fake_cert(1))),
+            "the primary home's cert is recorded",
+        );
+        assert_eq!(
+            refs.relay_certs.get(&RelayId(2)),
+            Some(&cert_fingerprint(&fake_cert(2))),
+            "the split secondary's cert is recorded too",
         );
     }
 

@@ -346,7 +346,11 @@ enum NoticePrefix {
     Resolved {
         config: NotifyConfig,
         external_id: String,
-        stored: Option<SessionRefs>,
+        /// Boxed: `SessionRefs` grew a per-relay cert map alongside its other
+        /// per-session state, which otherwise makes this the far larger of
+        /// [`NoticePrefix`]'s variants and bloats every value of the enum to
+        /// that size regardless of which variant it holds.
+        stored: Box<Option<SessionRefs>>,
     },
 }
 
@@ -376,7 +380,7 @@ fn resolve_notice_prefix(
     NoticePrefix::Resolved {
         config,
         external_id,
-        stored,
+        stored: Box::new(stored),
     }
 }
 
@@ -456,7 +460,7 @@ pub fn handle_departure(
     };
 
     let external_ref = notice.external_ref.clone().or_else(|| {
-        stored
+        (*stored)
             .as_ref()
             .and_then(|refs| refs.slots.get(&notice.slot).cloned())
     });
@@ -554,7 +558,7 @@ pub fn handle_desync(
         .map(|d| DivergedSlotWebhook {
             slot: d.slot.0,
             external_ref: d.external_ref.clone().or_else(|| {
-                stored
+                (*stored)
                     .as_ref()
                     .and_then(|refs| refs.slots.get(&d.slot).cloned())
             }),
@@ -648,7 +652,7 @@ pub fn handle_result(
     };
 
     let external_ref = notice.external_ref.clone().or_else(|| {
-        stored
+        (*stored)
             .as_ref()
             .and_then(|refs| refs.slots.get(&notice.slot).cloned())
     });

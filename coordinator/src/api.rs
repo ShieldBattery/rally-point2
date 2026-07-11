@@ -387,6 +387,20 @@ async fn rehome_session(
 
     let departed = state.lifecycle.departed_slots(&tenant, session);
     let outcome = session::rehome(&state.setup, &tenant, session, dead_relay, departed);
+    // Keep the lifecycle's cached serving-relay set in step with the mutation
+    // `session::rehome` just committed, so a later `SessionClosed` from the
+    // replacement can still satisfy the all-relays-closed condition. Only the
+    // ask that actually performed (or replayed, via `rehome`'s own idempotency
+    // check) the mutation reaches here — the lock-free recorded-rehome fast path
+    // above returns before this point and never calls in, matching that its
+    // first application already applied the swap. `on_rehome` is itself
+    // idempotent (a second call for an already-swapped id is a no-op), so a
+    // repeat here from `rehome`'s internal idempotent branch is harmless.
+    if let RehomeOutcome::NewTarget(ref endpoint) = outcome {
+        state
+            .lifecycle
+            .on_rehome(&tenant, session, dead_relay, endpoint.relay_id);
+    }
     // Let the descriptor push reach R_new's control task before responding, so the
     // relay is likelier to hold the resumed descriptor before a client dials it
     // (the client's reconnect backoff absorbs whatever race remains).

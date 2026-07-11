@@ -226,6 +226,39 @@ impl Lifecycle {
         }
     }
 
+    /// Swaps `dead` for `r_new` in the session's cached serving-relay set, so a
+    /// later `SessionClosed` from the replacement (or from any other surviving
+    /// relay) can still satisfy the all-relays-closed condition — without this, a
+    /// re-home leaves the cached set naming a relay that will never report
+    /// closed, and the session's final `sessionClosed` webhook, state, and drain
+    /// queue task never retire.
+    ///
+    /// A same-id swap (`dead == r_new`, a relay that restarted in place under a
+    /// new cert) is a no-op: the id was never removed from the cached set, so
+    /// there is nothing to swap. Otherwise, if `r_new` is already present, `dead`
+    /// is simply dropped from the set rather than producing a duplicate entry. A
+    /// session with no cached state, or one whose cached set no longer names
+    /// `dead` (an already-applied swap, or an id unrelated to this session), is
+    /// left untouched — the call is idempotent, so a caller need not track
+    /// whether it already applied a given swap.
+    pub fn on_rehome(&self, tenant: &TenantId, session: SessionId, dead: RelayId, r_new: RelayId) {
+        if dead == r_new {
+            return;
+        }
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
+            return;
+        };
+        let Some(pos) = state.serving_relays.iter().position(|&id| id == dead) else {
+            return;
+        };
+        if state.serving_relays.contains(&r_new) {
+            state.serving_relays.remove(pos);
+        } else {
+            state.serving_relays[pos] = r_new;
+        }
+    }
+
     /// Records a slot's departure: accounts the slot (if a player), notes it
     /// departed with its left-vs-dropped classification, and re-evaluates the reap
     /// timers. The `kind` is retained so a coordinator-mediated re-home can seed a
@@ -1295,6 +1328,310 @@ mod tests {
                 .iter()
                 .all(|d| d.session != s),
         );
+    }
+
+    /// A two-relay setup — both enrolled, only relay 1 serving (the session's
+    /// default, unsplit assignment) — with the tenant's notify URL wired to
+    /// `url`, so a test can observe the final `sessionClosed` webhook.
+    fn setup_with_two_relays_and_session(url: String) -> (SessionSetup, SessionId) {
+        use rally_point_proto::control::{PlayerHandoff, RelayHello, SessionRequest};
+        use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
+        use rally_point_proto::version::ProtocolVersion;
+
+        let reg = registry::new_registry();
+        for (id, port) in [(1u64, 14900u16), (2, 14901)] {
+            registry::enroll(
+                &reg,
+                RelayHello::new(
+                    RelayId(id),
+                    std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    ProtocolVersion::CURRENT,
+                    vec![id as u8; 4],
+                ),
+            );
+        }
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("k1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        tenant::set_notify(&tenants, &tid(), Some(NotifyConfig { url }));
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = crate::session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                ],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        (setup, resp.session)
+    }
+
+    #[tokio::test]
+    async fn rehome_then_the_replacements_close_satisfies_all_relays_closed_and_reaps_the_state() {
+        // A rehome must keep the lifecycle's cached serving set in step with the
+        // mutation `session::rehome` applies to the session's real membership --
+        // otherwise the relay it swapped onto is never recognized as needing to
+        // report closed, `all_relays_closed` can never be satisfied, and the
+        // session's state (and its drain queue task) leaks for the process
+        // lifetime instead of being reaped here.
+        use crate::session::{self, RehomeOutcome};
+
+        let (url, mut rx) = spawn_receiver(None).await;
+        let (setup, s) = setup_with_two_relays_and_session(url);
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        assert_eq!(setup.serving_relays(&tid(), s), vec![RelayId(1)]);
+
+        registry::remove(setup.registry(), RelayId(1));
+        let RehomeOutcome::NewTarget(endpoint) =
+            session::rehome(&setup, &tid(), s, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(2));
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+
+        // The replacement's own close satisfies all-relays-closed (the cached set
+        // now names only relay 2) and reaps the state: the final webhook fires, and
+        // the session is no longer alive or tracked at all.
+        lc.on_session_closed(tid(), s, RelayId(2));
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("sessionClosed is delivered once the swapped-in relay closes")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+        assert!(!lc.is_alive(&tid(), s), "a fully-closed session is not alive");
+        assert!(
+            !lc.contains_state(&tid(), s),
+            "the session's lifecycle state and drain queue are reaped, not left immortal",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_close_from_the_swapped_out_dead_relay_is_ignored() {
+        // A dead relay can briefly reconnect after a partition and flush a stale
+        // SessionClosed for a session a rehome already swapped it out of. That
+        // late report must not satisfy all-relays-closed on its own, and must not
+        // disturb the real serving relay's own close finishing the session
+        // normally afterward.
+        use crate::session::{self, RehomeOutcome};
+
+        let (url, mut rx) = spawn_receiver(None).await;
+        let (setup, s) = setup_with_two_relays_and_session(url);
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        registry::remove(setup.registry(), RelayId(1));
+        let RehomeOutcome::NewTarget(endpoint) =
+            session::rehome(&setup, &tid(), s, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(2));
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+
+        lc.on_session_closed(tid(), s, RelayId(1)); // the swapped-out dead relay's late report
+        assert!(
+            lc.is_alive(&tid(), s),
+            "a close from a relay no longer in the cached serving set does not finish the session",
+        );
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "no sessionClosed fires from the stale close alone",
+        );
+
+        lc.on_session_closed(tid(), s, RelayId(2));
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the real serving relay's close still finishes the session")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+    }
+
+    #[tokio::test]
+    async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() {
+        // A split session on relays 1 (home) and 2 (secondary). Relay 2 asks to
+        // drain -- still a serving member, but excluded from the replacement pick
+        // -- so when the home dies the group moves onto the idle relay 3 instead,
+        // leaving BOTH 3 (the replacement) and 2 (the drained-but-still-serving
+        // survivor) in the cached set. Both must report closed before the session
+        // finishes.
+        use crate::session::{self, RehomeOutcome};
+        use rally_point_proto::control::{PlayerHandoff, RelayHello, SessionRequest};
+        use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
+        use rally_point_proto::version::ProtocolVersion;
+
+        let (url, mut rx) = spawn_receiver(None).await;
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![1u8; 4],
+            ),
+        );
+        let gen2 = registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(2),
+                std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                ProtocolVersion::CURRENT,
+                vec![2u8; 4],
+            ),
+        );
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(3),
+                std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14902)),
+                ProtocolVersion::CURRENT,
+                vec![3u8; 4],
+            ),
+        );
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("k1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        tenant::set_notify(&tenants, &tid(), Some(NotifyConfig { url }));
+        let setup = SessionSetup::new(reg, tenants);
+
+        let resp = crate::session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                        observer: false,
+                    },
+                ],
+                external_id: None,
+                dev_relay_split: vec![SlotId(1)],
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        let s = resp.session;
+        assert_eq!(setup.serving_relays(&tid(), s), vec![RelayId(1), RelayId(2)]);
+
+        let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        assert!(registry::mark_draining(setup.registry(), RelayId(2), gen2));
+        registry::remove(setup.registry(), RelayId(1));
+
+        let RehomeOutcome::NewTarget(endpoint) =
+            session::rehome(&setup, &tid(), s, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            endpoint.relay_id,
+            RelayId(3),
+            "the draining relay 2 is skipped for the idle live relay 3",
+        );
+        assert_eq!(
+            setup.serving_relays(&tid(), s),
+            vec![RelayId(3), RelayId(2)],
+        );
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(3));
+
+        lc.on_session_closed(tid(), s, RelayId(3));
+        assert!(lc.is_alive(&tid(), s), "relay 2 hasn't closed yet");
+
+        lc.on_session_closed(tid(), s, RelayId(2));
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("sessionClosed fires once both the replacement and the surviving relay close")
+            .unwrap();
+        assert_eq!(got.event, "sessionClosed");
+    }
+
+    #[tokio::test]
+    async fn on_rehome_is_a_no_op_for_a_same_id_swap() {
+        // A same-id restart's `NewTarget` names the relay's own id as both dead
+        // and replacement. The cached serving set never dropped the id in the
+        // first place, so composing `on_rehome` with it must leave the set
+        // untouched rather than dropping the relay entirely.
+        let setup = bare_setup();
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+
+        lc.on_rehome(&tid(), s, RelayId(1), RelayId(1));
+
+        // Close ONLY relay 2. If the same-id swap had wrongly dropped relay 1 from
+        // the cached set (treating it as removed rather than unchanged), this
+        // alone would satisfy all-relays-closed; it must not.
+        lc.on_session_closed(tid(), s, RelayId(2));
+        assert!(
+            lc.is_alive(&tid(), s),
+            "relay 1 hasn't closed yet -- the same-id swap did not drop it from the set",
+        );
+
+        lc.on_session_closed(tid(), s, RelayId(1));
+        assert!(!lc.is_alive(&tid(), s), "both original members closing finishes it");
     }
 
     #[tokio::test]
