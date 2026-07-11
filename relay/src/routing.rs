@@ -822,9 +822,11 @@ pub async fn run_slot_link(
     // its outbound uni-stream (open_uni completes locally); the client's stream
     // is accepted lazily inside the reader task so a one-way-traffic client that
     // never sends a beacon doesn't block on an accept that never completes. The
-    // reader assembles complete frames off a cancel-safe path and forwards each
-    // `(slot, cursor)` over an mpsc channel — cursors are per-slot, so they
-    // don't subsume each other across slots and can't collapse to one latest.
+    // reader assembles complete frames off a cancel-safe path and folds each
+    // `(slot, cursor)` into a per-slot latest-value cell — a cursor is
+    // cumulative within its slot, so the newest is all this loop needs, and the
+    // final cursor before traffic stops survives however slowly this loop
+    // drains (see `BeaconCursors`).
     let mut beacon_send = match link.connection().open_uni().await {
         Ok(send) => send,
         Err(error) => {

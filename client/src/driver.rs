@@ -743,9 +743,11 @@ impl LinkDriver {
         // (open_uni completes locally, no peer round-trip); the peer's stream is
         // accepted lazily inside the reader task, so a one-way-traffic link that
         // never sends a beacon doesn't block the dial on an accept that never
-        // completes. The reader decodes complete frames and forwards each
-        // `(slot, cursor)` over an mpsc channel — cursors are per-slot, so they
-        // don't subsume each other across slots and can't collapse to one latest.
+        // completes. The reader decodes complete frames and folds each
+        // `(slot, cursor)` into a per-slot latest-value cell — a cursor is
+        // cumulative within its slot, so the newest is all this loop needs,
+        // and the final cursor before traffic stops survives however slowly
+        // this loop drains (see `BeaconCursors`).
         let mut beacon_send = link
             .connection()
             .open_uni()

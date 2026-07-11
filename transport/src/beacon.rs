@@ -11,13 +11,105 @@
 //! See `proto::beacon` for the wire frame these helpers read and write.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use rally_point_proto::beacon;
 use rally_point_proto::ids::SlotId;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
-/// Spawns a dedicated task that reads the peer's beacon uni-stream and forwards
-/// each complete `(slot, delivered-through)` cursor over an `mpsc` channel.
+/// The driver's receive handle for the beacon reader task: a per-slot
+/// latest-value cell, not a queue.
+///
+/// Cursors are cumulative — a slot's newer cursor subsumes every older one — so
+/// whatever a driver misses while it isn't draining collapses to exactly one
+/// pending value per slot: the newest. That coalescing (rather than a bounded
+/// queue that drops on full) is load-bearing, not an optimization: the sender
+/// pushes a cursor only when it *advances*, and the beacon may be the only
+/// retirement path left when the reverse datagram path is lost. The last
+/// cursor before traffic stops therefore has no successor to supersede it — a
+/// queue that dropped it on overflow would leave the peer re-carrying its
+/// already-delivered unacked tail for the rest of the connection, exactly the
+/// stall the beacon exists to rescue.
+pub struct BeaconCursors {
+    inner: Arc<CursorCell>,
+}
+
+/// The shared state between the reader task (folds cursors in) and the driver
+/// (takes them out).
+struct CursorCell {
+    /// Per-slot newest delivered-through cursor not yet taken by the driver.
+    /// Max-merged on every decoded frame; each slot is independent (a slot-0
+    /// advance never subsumes a slot-1 advance), which is why this is a map and
+    /// not a single latest value.
+    pending: Mutex<HashMap<SlotId, u64>>,
+    /// Wakes the driver's [`BeaconCursors::recv`].
+    notify: Notify,
+    /// Set (then notified) when the reader task ends — the peer's beacon stream
+    /// closed or errored, or the connection closed before one was opened.
+    closed: AtomicBool,
+}
+
+impl BeaconCursors {
+    /// The newest pending cursor for some slot, or `None` once the reader task
+    /// has ended and every pending cursor has been taken.
+    ///
+    /// Cancel-safe for a `select!` branch: a returned value is removed and
+    /// yielded within a single poll, and the only await point holds nothing —
+    /// a cancelled `recv` loses no cursor. Like an `mpsc` receiver, `None` is
+    /// terminal, and a caller should disable its branch on it (every later
+    /// poll would return `None` again, spinning the loop).
+    pub async fn recv(&mut self) -> Option<(SlotId, u64)> {
+        loop {
+            if let Some(entry) = self.take_pending() {
+                return Some(entry);
+            }
+            if self.inner.closed.load(Ordering::Acquire) {
+                // A cursor folded in between the take above and this check is
+                // the reader's last word: hand it out before going terminal.
+                return self.take_pending();
+            }
+            // A fold between the empty take above and this await left a stored
+            // permit, so `notified` returns at once — no wakeup is missable.
+            self.inner.notify.notified().await;
+        }
+    }
+
+    /// Removes and returns some slot's pending cursor.
+    fn take_pending(&self) -> Option<(SlotId, u64)> {
+        let mut pending = self.inner.pending.lock().unwrap();
+        let slot = *pending.keys().next()?;
+        let cursor = pending.remove(&slot).expect("key was just read");
+        Some((slot, cursor))
+    }
+}
+
+/// Folds a decoded cursor into the cell (max-merge — a stale or reordered frame
+/// never regresses a newer pending value) and wakes the driver.
+fn fold_cursor(inner: &CursorCell, slot: SlotId, cursor: u64) {
+    {
+        let mut pending = inner.pending.lock().unwrap();
+        let entry = pending.entry(slot).or_insert(cursor);
+        if *entry < cursor {
+            *entry = cursor;
+        }
+    }
+    inner.notify.notify_one();
+}
+
+/// Marks the cell closed and wakes the driver so its `recv` can go terminal.
+/// A no-op if the driver already dropped its handle.
+fn close_cell(cell: &Weak<CursorCell>) {
+    if let Some(inner) = cell.upgrade() {
+        inner.closed.store(true, Ordering::Release);
+        inner.notify.notify_one();
+    }
+}
+
+/// Spawns a dedicated task that reads the peer's beacon uni-stream and folds
+/// each complete `(slot, delivered-through)` cursor into the returned
+/// [`BeaconCursors`] cell (per-slot latest value — see its doc for why the
+/// newest cursor must always survive a slow driver).
 ///
 /// The stream is accepted lazily *inside* the task: `open_uni` completes locally
 /// (no peer round-trip), but the peer's outbound stream isn't visible to
@@ -30,17 +122,17 @@ use tokio::sync::mpsc;
 /// beacon cancel-safe: a `read_exact` dropped mid-frame inside a `select!` branch
 /// would lose the consumed bytes and desync the framing, handing a garbage
 /// `(slot, cursor)` to `retire_through`. This task assembles complete frames and
-/// forwards them; `mpsc::Receiver::recv` in the driver's `select!` is
-/// cancel-safe.
-///
-/// `mpsc` (not `watch`) because each slot carries its own cursor and cursors do
-/// not subsume each other across slots — a slot-0 advance and a slot-1 advance
-/// are independent, so latest-wins would drop one. Within a slot the cursor is
-/// monotonic, so a burst collapses to a prefix the driver drains in order.
-pub fn spawn_beacon_reader(connection: quinn::Connection) -> mpsc::Receiver<(SlotId, u64)> {
-    // Generous depth: cursors are tiny and a healthy link sends one per delivered
-    // turn. A burst under loss is bounded by the number of slots, which is small.
-    let (tx, rx) = mpsc::channel(256);
+/// folds them; [`BeaconCursors::recv`] in the driver's `select!` is cancel-safe.
+pub fn spawn_beacon_reader(connection: quinn::Connection) -> BeaconCursors {
+    let inner = Arc::new(CursorCell {
+        pending: Mutex::new(HashMap::new()),
+        notify: Notify::new(),
+        closed: AtomicBool::new(false),
+    });
+    // The task holds only a weak handle, so a driver that dropped its
+    // `BeaconCursors` doesn't keep the cell alive, and the task can notice the
+    // orphaning (a failed upgrade) and stop.
+    let cell = Arc::downgrade(&inner);
     tokio::spawn(async move {
         // Lazy accept: waits for the peer to open its beacon stream. A link that
         // never sends a beacon (one-way traffic, or the peer has nothing to retire)
@@ -48,10 +140,13 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> mpsc::Receiver<(Slo
         // fires and `retire_through` is simply never called.
         let mut recv = match connection.accept_uni().await {
             Ok(recv) => recv,
-            // The connection closed before the peer opened a beacon stream. Drop the
-            // sender so the driver's `recv()` returns None, surfacing the closed
-            // link.
-            Err(_) => return,
+            // The connection closed before the peer opened a beacon stream.
+            // Close the cell so the driver's `recv()` goes terminal, surfacing
+            // the ended beacon.
+            Err(_) => {
+                close_cell(&cell);
+                return;
+            }
         };
 
         let mut buf = [0u8; beacon::BEACON_FRAME_LEN];
@@ -61,47 +156,32 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> mpsc::Receiver<(Slo
             match recv.read_exact(&mut buf).await {
                 Ok(()) => {
                     match beacon::decode_frame(&buf) {
-                        Ok(frame) => {
-                            // Non-blocking offer: a stuck driver (not draining)
-                            // can't stall the reader. A momentarily full channel
-                            // must not permanently kill reverse-path retirement,
-                            // so a full channel drops just this frame and keeps
-                            // reading; only a dropped receiver ends the task.
-                            match tx.try_send(frame) {
-                                Ok(()) => {}
-                                // The driver fell briefly behind and its channel
-                                // is full. Drop this one cursor and keep reading:
-                                // the cursor is monotonic per slot and
-                                // `flush_beacon` pushes on advance, so the next
-                                // delivery advance re-sends a strictly higher
-                                // cursor for the slot — a dropped intermediate
-                                // loses nothing durable, and the reader stays
-                                // alive to carry that later value once the driver
-                                // drains. Returning here instead would strand the
-                                // link on lost acks for its whole lifetime, right
-                                // when the beacon should be rescuing it from the
-                                // terminal unacked-window cap.
-                                Err(mpsc::error::TrySendError::Full(_)) => {}
-                                // The driver dropped its receiver: the task is
-                                // orphaned with nowhere to forward, so stop.
-                                Err(mpsc::error::TrySendError::Closed(_)) => return,
-                            }
+                        Ok((slot, cursor)) => {
+                            // The driver dropped its handle: the task is
+                            // orphaned with nowhere to fold, so stop.
+                            let Some(inner) = cell.upgrade() else {
+                                return;
+                            };
+                            fold_cursor(&inner, slot, cursor);
                         }
                         // A malformed slot (out of SlotId range). Drop the frame
-                        // rather than forward garbage to retire_through; the stream
+                        // rather than fold garbage into retire_through; the stream
                         // stays framed, so the next read resyncs cleanly.
                         Err(error) => {
                             tracing::debug!(%error, "dropping malformed beacon frame");
                         }
                     }
                 }
-                // Stream ended (peer closed) or errored. Drop the sender so the
+                // Stream ended (peer closed) or errored. Close the cell so the
                 // driver learns the beacon is gone.
-                Err(_) => return,
+                Err(_) => {
+                    close_cell(&cell);
+                    return;
+                }
             }
         }
     });
-    rx
+    BeaconCursors { inner }
 }
 
 /// Pushes the per-slot delivered-through cursor to the peer over the beacon
@@ -189,23 +269,19 @@ mod tests {
         (client_conn, server_conn, client, server)
     }
 
-    /// A driver that briefly stops draining fills the forwarding channel. The
-    /// reader must drop the overflow and stay alive, so that a *later* cursor —
-    /// the one the beacon exists to deliver — still reaches the driver once it
-    /// resumes. The old code returned unconditionally on a full channel, which
-    /// permanently killed reverse-path retirement and stranded the link on a lost
-    /// ack until the unacked-window cap tripped.
+    /// The final cursor before traffic stops must survive an arbitrarily slow
+    /// driver: it has no successor to supersede it, and the sender pushes only
+    /// on advance, so losing it would leave the peer re-carrying its
+    /// already-delivered unacked tail for the rest of the connection. A flood
+    /// far past any queue's depth, drained only afterwards, must still hand
+    /// the driver the newest cursor.
     #[tokio::test]
-    async fn full_channel_drops_frames_but_keeps_reading() {
+    async fn the_final_cursor_survives_a_driver_that_drains_late() {
         let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
-
-        // The reader lazily accepts the peer's beacon uni-stream and forwards
-        // each cursor over the returned channel (depth 256).
         let mut rx = spawn_beacon_reader(reader_conn);
 
-        // Flood one slot with far more cursors than the channel can hold, without
-        // draining `rx`. The reader forwards the prefix, fills the channel, then
-        // must hit `Full` on the remainder.
+        // Flood one slot without draining `rx` at all — every intermediate value
+        // is superseded, but the last one is the durable fact.
         let mut send = writer_conn.open_uni().await.unwrap();
         const FLOOD: u64 = 400;
         for cursor in 0..FLOOD {
@@ -213,41 +289,85 @@ mod tests {
                 .await
                 .unwrap();
         }
-
-        // Give the reader time to drain the stream into the (now full) channel and
-        // drop the overflow. If it had exited, dropping its `connection` would
-        // close the link and fail the writes below.
+        // Let the reader consume the whole stream before the late drain.
         sleep(Duration::from_millis(200)).await;
 
-        // Drain the forwarded prefix so the channel has room again.
-        while rx.try_recv().is_ok() {}
+        let delivered = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a pending cursor must be receivable")
+            .expect("the reader is still alive");
+        assert_eq!(
+            delivered,
+            (SlotId(0), FLOOD - 1),
+            "the newest cursor survives however far the driver fell behind",
+        );
 
-        // A later delivery advance pushes a strictly higher cursor. It must reach
-        // the driver — proof the reader survived the full channel.
+        // And the reader keeps serving later advances after the flood.
         send.write_all(&beacon::encode_frame(SlotId(0), 9999))
             .await
             .unwrap();
+        let later = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a later advance must still arrive")
+            .expect("the reader is still alive");
+        assert_eq!(later, (SlotId(0), 9999));
+    }
 
-        // Look for 9999 under one overall timeout, tolerating stragglers: the
-        // drain above races the reader task, so a pre-drain cursor it was still
-        // forwarding can land in the channel after the drain and arrive first.
-        // That's not the behavior under test, so skip anything that isn't 9999
-        // rather than asserting on the very first frame.
-        let delivered = timeout(Duration::from_secs(5), async {
-            loop {
-                match rx.recv().await {
-                    Some(frame) if frame.1 == 9999 => return Some(frame),
-                    Some(_stale) => continue,
-                    None => return None,
-                }
-            }
-        })
-        .await
-        .expect("the reader must still be forwarding after a full channel");
+    /// Each slot's cursor is independent — a slot-0 advance never subsumes a
+    /// slot-1 advance — so a late drain yields the newest value for *every*
+    /// slot, not one global latest.
+    #[tokio::test]
+    async fn coalescing_is_per_slot_not_global() {
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+        let mut rx = spawn_beacon_reader(reader_conn);
+
+        let mut send = writer_conn.open_uni().await.unwrap();
+        for cursor in 0..100u64 {
+            send.write_all(&beacon::encode_frame(SlotId(0), cursor))
+                .await
+                .unwrap();
+            send.write_all(&beacon::encode_frame(SlotId(1), cursor * 2))
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+
+        let mut newest: HashMap<SlotId, u64> = HashMap::new();
+        for _ in 0..2 {
+            let (slot, cursor) = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("both slots' cursors must be pending")
+                .expect("the reader is still alive");
+            newest.insert(slot, cursor);
+        }
+        assert_eq!(newest.get(&SlotId(0)), Some(&99));
+        assert_eq!(newest.get(&SlotId(1)), Some(&198));
+    }
+
+    /// A closed beacon stream goes terminal — but never before the last folded
+    /// cursor has been handed out.
+    #[tokio::test]
+    async fn recv_goes_terminal_only_after_the_last_cursor_is_taken() {
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+        let mut rx = spawn_beacon_reader(reader_conn);
+
+        let mut send = writer_conn.open_uni().await.unwrap();
+        send.write_all(&beacon::encode_frame(SlotId(3), 42))
+            .await
+            .unwrap();
+        // Finish the stream: the reader ends after folding the frame.
+        send.finish().unwrap();
+
+        let first = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the folded cursor must be receivable");
+        assert_eq!(first, Some((SlotId(3), 42)));
+        let second = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("recv must go terminal, not park");
         assert_eq!(
-            delivered,
-            Some((SlotId(0), 9999)),
-            "a briefly full channel must not permanently kill the beacon reader",
+            second, None,
+            "an ended reader with nothing pending is terminal"
         );
     }
 }
