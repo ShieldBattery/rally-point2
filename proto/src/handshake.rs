@@ -1,21 +1,26 @@
 //! Sans-I/O codec for the post-QUIC authorization handshake.
 //!
 //! Right after the QUIC handshake, a client proves it may submit turns over a
-//! single client-opened bidirectional stream, in a fixed four-step exchange:
+//! single client-opened bidirectional stream, in a fixed five-step exchange:
 //!
 //! ```text
 //!   client → relay   u16-LE length, then that many token bytes
 //!   relay  → client  32 random challenge bytes
 //!   client → relay   64-byte Ed25519 signature over the challenge
+//!   client → relay   u16-LE entry count, then that many (u8 slot, u64-LE cursor)
+//!                    resume-cursor entries — an empty (zero-count) frame on a
+//!                    fresh connect, and never skipped: the relay reads it
+//!                    unconditionally, so omitting it deadlocks the handshake
 //!   relay  → client  one HANDSHAKE_OK byte (only once the slot is routable)
 //! ```
 //!
 //! The two endpoints live in different crates and must agree on this shape to the
 //! byte, so the framing is defined here once and consumed by both. This module is
-//! pure: it frames and unframes the one variable-length message — the
-//! length-prefixed token — and owns the fixed sizes and the acknowledgement
-//! sentinel. The actual stream reads and writes, and the Ed25519 sign/verify,
-//! stay with the caller, so neither async I/O nor a crypto backend leaks in here.
+//! pure: it frames and unframes the two variable-length messages — the
+//! length-prefixed token and the count-prefixed resume cursors — and owns the
+//! fixed sizes and the acknowledgement sentinel. The actual stream reads and
+//! writes, and the Ed25519 sign/verify, stay with the caller, so neither async
+//! I/O nor a crypto backend leaks in here.
 //!
 //! The two fixed-size frames need no codec of their own: the challenge and the
 //! response are carried by [`ConnectionChallenge`](crate::token::ConnectionChallenge)

@@ -31,6 +31,9 @@
 //!   client → relay   u16-LE length, then that many token bytes
 //!   relay  → client  32 random challenge bytes
 //!   client → relay   64-byte Ed25519 signature over the challenge
+//!   client → relay   u16-LE entry count, then that many (u8 slot, u64-LE cursor)
+//!                    resume-cursor entries (zero-count on a fresh connect; read
+//!                    unconditionally, only after the challenge proof passes)
 //!   relay  → client  one HANDSHAKE_OK byte (only after the slot is registered)
 //! ```
 //!
