@@ -910,9 +910,11 @@ pub enum CoordinatorToRelay {
     /// [`RelayToCoordinator::IdentityProof`], a signature over
     /// [`ENROLL_POP_CONTEXT`] `++ nonce` made with that key. Sent once, after
     /// `Hello` and version negotiation succeed and before the coordinator
-    /// enrolls the relay — never on an already-enrolled connection — and only
-    /// when the negotiated version reaches
-    /// [`ProtocolVersion::ENROLL_POP_MIN`](crate::version::ProtocolVersion::ENROLL_POP_MIN).
+    /// enrolls the relay — never on an already-enrolled connection — on every
+    /// accepted connection: negotiation refuses any relay advertising a version
+    /// below
+    /// [`ProtocolVersion::ENROLL_POP_MIN`](crate::version::ProtocolVersion::ENROLL_POP_MIN)
+    /// before the challenge, so no un-challenged enroll path exists.
     /// Closes `Hello.cert_der`'s gap: without this, a bootstrap-secret holder
     /// could copy a victim relay's public certificate into its own `Hello` and
     /// enroll as it, since the certificate alone is payload, not proof of
@@ -1687,12 +1689,10 @@ mod tests {
 
     #[test]
     fn identity_challenge_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
-        // Same forward-compatibility shape as `mesh_peers`: an old relay build
-        // (modeled by `RelayToCoordinator`, which has no such variant) skips an
-        // IdentityChallenge it doesn't understand rather than erroring — which
-        // is exactly the case ENROLL_POP_MIN exists to keep out of reach of an
-        // old relay in the first place, but the wire format stays forward-safe
-        // regardless.
+        // Same forward-compatibility shape as `mesh_peers`: a build that predates
+        // this variant (modeled by `RelayToCoordinator`, which has no such variant)
+        // skips an IdentityChallenge it doesn't understand rather than erroring, so
+        // the wire format stays forward-safe.
         let json = r#"{"type":"identity_challenge","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
         let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, RelayToCoordinator::Unknown);

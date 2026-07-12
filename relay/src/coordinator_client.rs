@@ -292,13 +292,15 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// frame on each connection to enroll into the coordinator's registry.
 ///
 /// `identity_key` is the private key matching `relay_hello.cert_der` — the same
-/// key the relay serves its client and mesh edges with. A coordinator whose
-/// negotiated version reaches [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN)
-/// challenges the relay to prove it holds this key before enrolling it; this
+/// key the relay serves its client and mesh edges with. The coordinator
+/// challenges the relay to prove it holds this key before enrolling it, and this
 /// loop signs that challenge with it (see [`sign_enroll_proof`]) the moment one
-/// arrives. An older coordinator never sends the challenge, so an old-enough
-/// negotiated version makes this key inert without anything having to know that
-/// in advance.
+/// arrives. The challenge is not optional: the relay advertises a window
+/// bottoming out at [`ProtocolVersion::MIN_SUPPORTED`](rally_point_proto::version::ProtocolVersion::MIN_SUPPORTED),
+/// which tracks the current version, so any coordinator it can enroll with
+/// negotiates a version reaching [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN)
+/// and challenges — a coordinator too old to challenge shares no version with
+/// this relay and is refused at negotiation before any enroll.
 ///
 /// `notices` is the drain end of the decision-maker registry's notifier: the
 /// leave sites push a departure and the desync comparator pushes a desync (both

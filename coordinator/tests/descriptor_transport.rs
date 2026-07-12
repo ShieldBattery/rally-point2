@@ -35,6 +35,9 @@ use rustls_pki_types::PrivateKeyDer;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
+mod common;
+use common::{connect_and_send_hello, prove_identity, relay_cert, relay_key};
+
 const TENANT: &str = "sb-test";
 
 /// A generous liveness deadline for tests that don't exercise the timeout — long
@@ -75,30 +78,20 @@ fn session_key(session: SessionId) -> SessionKey {
 /// The relay's enroll `Hello` (id + a loopback address on `port`), the first frame
 /// the subscriber sends on each connection.
 ///
-/// Advertises `MIN_SUPPORTED` (a relay predating enroll proof-of-possession),
-/// not `CURRENT`: these tests exercise descriptor transport, drain, liveness,
-/// and region/version-negotiation mechanics, none of which is about proving
-/// certificate possession, so negotiating below `ENROLL_POP_MIN` keeps the
-/// coordinator from ever challenging them — the placeholder `cert_der` below
-/// is never parsed as a real certificate as a result. The dedicated
-/// proof-of-possession coverage (`enroll_identity.rs`) builds real certs and
-/// negotiates at `CURRENT` on purpose.
+/// Negotiates at `CURRENT` (which `MIN_SUPPORTED` tracks), so the coordinator
+/// challenges the connection for enroll proof-of-possession — every accepted
+/// control connection is challenged now. The certificate is this relay id's
+/// stable self-signed identity ([`common::relay_cert`]); the matching key is
+/// [`common::relay_key`]`(id)`. A `run_descriptor_subscriber_with` relay answers
+/// the challenge with that key automatically; a test driving a raw control socket
+/// answers it with [`common::prove_identity`] before the enrolled path proceeds.
 fn relay_hello(id: u64, port: u16) -> RelayHello {
     RelayHello::new(
         RelayId(id),
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        ProtocolVersion::MIN_SUPPORTED,
-        vec![id as u8; 4],
+        ProtocolVersion::CURRENT,
+        relay_cert(id),
     )
-}
-
-/// A private key for tests whose relay negotiates below `ENROLL_POP_MIN` (see
-/// [`relay_hello`]) and so is never challenged for it — these calls just need
-/// *some* well-formed key to satisfy `run_descriptor_subscriber_with`'s
-/// signature, not one matching any particular certificate.
-fn throwaway_identity_key() -> PrivateKeyDer<'static> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap()
 }
 
 /// Polls the registry until `id` enrolls, up to a couple of seconds. Returns
@@ -263,7 +256,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
-        throwaway_identity_key(),
+        relay_key(1),
         Some(secret.to_owned()),
         control,
         std::sync::Arc::default(),
@@ -295,7 +288,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
-        throwaway_identity_key(),
+        relay_key(1),
         None,
         control,
         std::sync::Arc::default(),
@@ -339,7 +332,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
-        throwaway_identity_key(),
+        relay_key(1),
         Some("wrong-secret".to_owned()),
         control,
         std::sync::Arc::default(),
@@ -378,7 +371,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(5, 15000),
-        throwaway_identity_key(),
+        relay_key(5),
         None,
         control,
         std::sync::Arc::default(),
@@ -507,7 +500,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
     let handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),
-        throwaway_identity_key(),
+        relay_key(7),
         None,
         control,
         std::sync::Arc::default(),
@@ -547,9 +540,11 @@ async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
     let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
-    // Enroll with a Hello, then go silent — never send a heartbeat.
+    // Enroll with a Hello and prove possession, then go silent — never send a
+    // heartbeat.
     let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(7, 15007))).unwrap();
     socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(7)).await;
     assert!(
         wait_for_enrollment(&reg, RelayId(7)).await,
         "the relay enrolls from its Hello",
@@ -676,10 +671,11 @@ async fn a_draining_relay_gets_its_set_then_an_ack_and_is_excluded_from_new_sess
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
     let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
-    // Enroll relay 1 via its Hello, then give it a session so its descriptor set is
-    // non-empty at drain time.
+    // Enroll relay 1 via its Hello (proving possession), then give it a session so
+    // its descriptor set is non-empty at drain time.
     let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
     socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(1)).await;
     assert!(
         wait_for_enrollment(setup.registry(), RelayId(1)).await,
         "the relay enrolls from its Hello",
@@ -734,6 +730,7 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
 
     let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
     socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(1)).await;
     assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
 
     let draining = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
@@ -773,22 +770,6 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
 }
 
 // --- Protocol-version negotiation at the enroll Hello ---
-
-/// Connects to `base_url`'s control endpoint and sends `hello` as the enroll
-/// frame, returning the open socket for the test to read the coordinator's answer.
-async fn connect_and_send_hello(
-    base_url: &str,
-    hello: RelayHello,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    use futures_util::SinkExt;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
-    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-    let frame = serde_json::to_string(&RelayToCoordinator::Hello(hello)).unwrap();
-    socket.send(Message::Text(frame.into())).await.unwrap();
-    socket
-}
 
 /// Reads the coordinator's answer to an incompatible Hello and asserts it is the
 /// version-refusal close — code [`CONTROL_CLOSE_PROTOCOL_MISMATCH`] with a reason
@@ -1033,7 +1014,10 @@ async fn a_region_less_hello_enrolls_even_with_a_region_config() {
     // region-less hello is the dev/loopback and region-blind-fallback path.
     let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
     let mut socket = connect_and_send_hello(&base_url, relay_hello(9, 14909)).await;
-    // The first frame down is the enrolled path's descriptor re-sync, not a close.
+    // Region validation passes (untagged), so the coordinator challenges before
+    // enrolling; answer it, then the first frame down is the enrolled path's
+    // descriptor re-sync, not a close.
+    prove_identity(&mut socket, &relay_key(9)).await;
     let first = timeout(Duration::from_secs(5), {
         use futures_util::StreamExt;
         socket.next()
@@ -1056,6 +1040,9 @@ async fn a_valid_region_enrolls_and_lands_in_the_registry_entry() {
     let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
     let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
     let mut socket = connect_and_send_hello(&base_url, hello).await;
+    // A configured region passes validation, so the coordinator challenges before
+    // enrolling; answer it, then drain the initial descriptor re-sync.
+    prove_identity(&mut socket, &relay_key(9)).await;
     let _ = timeout(Duration::from_secs(5), {
         use futures_util::StreamExt;
         socket.next()
@@ -1115,7 +1102,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     let _handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),
-        throwaway_identity_key(),
+        relay_key(7),
         None,
         control,
         std::sync::Arc::default(),
@@ -1181,10 +1168,11 @@ async fn the_fleet_mesh_peer_set_is_pushed_and_tracks_membership() {
     let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS).await;
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
 
-    // Relay 1 opens its control connection and enrolls.
+    // Relay 1 opens its control connection, proves possession, and enrolls.
     let (mut socket1, _resp) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     let hello1 = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
     socket1.send(Message::Text(hello1.into())).await.unwrap();
+    prove_identity(&mut socket1, &relay_key(1)).await;
     assert!(wait_for_enrollment(&reg, RelayId(1)).await);
 
     // On connect it is pushed the fleet set — just itself so far — carrying the
@@ -1197,6 +1185,7 @@ async fn the_fleet_mesh_peer_set_is_pushed_and_tracks_membership() {
     let (mut socket2, _resp) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     let hello2 = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(2, 14901))).unwrap();
     socket2.send(Message::Text(hello2.into())).await.unwrap();
+    prove_identity(&mut socket2, &relay_key(2)).await;
     assert!(wait_for_enrollment(&reg, RelayId(2)).await);
 
     // The membership change pushes an updated set to BOTH connections, each naming

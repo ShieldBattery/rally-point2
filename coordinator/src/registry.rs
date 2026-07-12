@@ -150,13 +150,14 @@ fn publish_mesh_peers(
 /// Re-registering the same `relay_id` replaces the prior entry (a relay that
 /// restarted, or reconnected, with a new address) and assigns a strictly greater
 /// generation — **unconditionally**, whatever certificate the hello carries.
-/// This is the enrollment for a connection whose identity was never
-/// proof-of-possession-verified (a relay negotiating below the challenge's
-/// protocol version); a verified connection enrolls through [`try_enroll`],
-/// which refuses an id conflict instead. The caller — a control-connection
-/// task — keeps the returned generation and passes it to [`remove_if_current`]
-/// when its connection drops, so a drop only deregisters the relay when no
-/// newer connection has since taken over.
+/// This is the raw replace primitive and performs no identity check, so it must
+/// not be reached for a hello whose certificate possession was not proven: the
+/// live control handler always enrolls through [`try_enroll`] (after proving
+/// possession), which refuses an id conflict instead of displacing. This
+/// unconditional form seeds registry state directly in tests. The caller — a
+/// control-connection task — keeps the returned generation and passes it to
+/// [`remove_if_current`] when its connection drops, so a drop only deregisters
+/// the relay when no newer connection has since taken over.
 pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
     let cert_fingerprint = cert_fingerprint(&hello.cert_der);
     let mut relays = registry.relays.lock();

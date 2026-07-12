@@ -1,14 +1,14 @@
 //! Enroll proof-of-possession + duplicate-id refusal, exercised end to end over
-//! a real WebSocket control connection: the coordinator challenges a relay
-//! whose negotiated version reaches `ENROLL_POP_MIN`, verifies the signed
-//! answer against the certificate the `Hello` presented, and — once proven —
-//! refuses a second relay claiming an already-live id under a different
-//! certificate while accepting the same relay's own reconnect.
+//! a real WebSocket control connection: the coordinator challenges every
+//! accepted relay, verifies the signed answer against the certificate the
+//! `Hello` presented, and — once proven — refuses a second relay claiming an
+//! already-live id under a different certificate while accepting the same
+//! relay's own reconnect.
 //!
-//! `descriptor_transport.rs` covers the surrounding control-connection
-//! mechanics (descriptors, drain, liveness, region/version negotiation) with
-//! relays pinned below `ENROLL_POP_MIN` on purpose, so none of it exercises
-//! this seam. This file is the dedicated coverage for the seam itself.
+//! Negotiation refuses any relay advertising a version below the challenge
+//! threshold, so there is no un-challenged enroll path; a downgrade Hello that
+//! tries to reach one is turned away before it can enroll or displace a live
+//! relay.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -21,39 +21,25 @@ use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::{self, RelayRegistry};
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, tenant};
-use rally_point_proto::control::{CoordinatorToRelay, RelayHello, RelayToCoordinator};
+use rally_point_proto::control::{RelayHello, RelayToCoordinator};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
-    CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN, ProtocolVersion,
+    CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
+    CONTROL_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion,
 };
 use rally_point_relay::coordinator_client;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+use common::{
+    ControlSocket, answer_challenge, connect_and_send_hello, expect_identity_challenge,
+    hello_at_current, self_signed,
+};
 
 /// A generous liveness deadline — these tests don't exercise the timeout.
 const LIVENESS: Duration = Duration::from_secs(30);
-
-/// A self-signed certificate (DER) + its matching PKCS#8 private key, for a
-/// relay that can actually answer an enroll challenge.
-fn self_signed() -> (Vec<u8>, PrivateKeyDer<'static>) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().to_vec();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (cert_der, key)
-}
-
-/// A relay `Hello` negotiating at `CURRENT` (so `ENROLL_POP_MIN` is reached)
-/// carrying `cert_der`.
-fn hello_at_current(id: u64, port: u16, cert_der: Vec<u8>) -> RelayHello {
-    RelayHello::new(
-        RelayId(id),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        ProtocolVersion::CURRENT,
-        cert_der,
-    )
-}
 
 /// Serves a bare coordinator (open auth, no regions, no tenant) on an
 /// ephemeral port. Returns the base URL and a handle to the registry so a test
@@ -82,57 +68,9 @@ async fn serve_bare_coordinator() -> (String, RelayRegistry) {
     (format!("http://{addr}"), reg)
 }
 
-/// Connects to `base_url`'s control endpoint and sends `hello` as the enroll
-/// frame, returning the open socket.
-async fn connect_and_send_hello(
-    base_url: &str,
-    hello: RelayHello,
-) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
-    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-    let frame = serde_json::to_string(&RelayToCoordinator::Hello(hello)).unwrap();
-    socket.send(Message::Text(frame.into())).await.unwrap();
-    socket
-}
-
-/// Reads the coordinator's next frame and asserts it is an `IdentityChallenge`,
-/// returning the nonce.
-async fn expect_identity_challenge(
-    socket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-) -> [u8; 32] {
-    let frame = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator challenges promptly")
-        .expect("a frame arrives")
-        .unwrap();
-    let Message::Text(text) = frame else {
-        panic!("expected an identity challenge, got {frame:?}");
-    };
-    match serde_json::from_str(&text).unwrap() {
-        CoordinatorToRelay::IdentityChallenge { nonce } => nonce,
-        other => panic!("expected an identity_challenge frame, got: {other:?}"),
-    }
-}
-
-/// Signs `nonce` with `key` (via the relay's own signing helper — the same
-/// code path a real relay runs) and sends it as an `IdentityProof`.
-async fn answer_challenge(
-    socket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    key: &PrivateKeyDer<'static>,
-    nonce: &[u8; 32],
-) {
-    let signature =
-        coordinator_client::sign_enroll_proof(key, nonce).expect("a supported key always signs");
-    let frame = serde_json::to_string(&RelayToCoordinator::IdentityProof { signature }).unwrap();
-    socket.send(Message::Text(frame.into())).await.unwrap();
-}
-
 /// Reads the coordinator's next frame and asserts it is a close with
 /// `expected_code`.
-async fn expect_close(
-    socket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    expected_code: u16,
-) {
+async fn expect_close(socket: &mut ControlSocket, expected_code: u16) {
     let frame = timeout(Duration::from_secs(5), socket.next())
         .await
         .expect("the coordinator answers promptly")
@@ -253,35 +191,46 @@ async fn a_signature_from_the_wrong_key_is_refused_with_identity_unproven() {
 }
 
 #[tokio::test]
-async fn an_old_version_relay_is_never_challenged_and_still_enrolls() {
-    // MIN_SUPPORTED (below ENROLL_POP_MIN): the coordinator never sends a
-    // challenge at all, and the placeholder cert bytes (never a real
-    // certificate) are never parsed as a result — additive compat with a relay
-    // that predates proof-of-possession.
+async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_live_entry() {
+    // A bootstrap-secret holder cannot dodge proof-of-possession by advertising
+    // an older protocol version: MIN_SUPPORTED tracks CURRENT, so a Hello whose
+    // window tops out below the current version shares no version with the
+    // coordinator and is refused at negotiation — it never reaches the challenge,
+    // never enrolls, and never displaces a relay that legitimately holds the id.
     let (base_url, reg) = serve_bare_coordinator().await;
+
+    // A legitimate current relay enrolls under id 5, proving possession, and
+    // holds its connection open (a live entry).
+    let (cert_der, key) = self_signed();
+    let mut live = connect_and_send_hello(&base_url, hello_at_current(5, 14904, cert_der)).await;
+    let nonce = expect_identity_challenge(&mut live).await;
+    answer_challenge(&mut live, &key, &nonce).await;
+    assert!(wait_for_enrollment(&reg, RelayId(5)).await);
+    let live_fingerprint = registry::live_cert_fingerprint(&reg, RelayId(5));
+    assert!(live_fingerprint.is_some());
+
+    // The downgrade attempt claims the same id, advertising a version just below
+    // the current one to try to reach the unconditional-replace path enroll PoP
+    // closed. Negotiation refuses it outright.
+    let downgrade = ProtocolVersion(ProtocolVersion::CURRENT.0 - 1);
     let hello = RelayHello::new(
         RelayId(5),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 14904)),
-        ProtocolVersion::MIN_SUPPORTED,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 14999)),
+        downgrade,
         vec![0xAB; 4],
     );
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
+    let mut attacker = connect_and_send_hello(&base_url, hello).await;
+    expect_close(&mut attacker, CONTROL_CLOSE_PROTOCOL_MISMATCH).await;
 
-    // The first (and only) frame down is the descriptor re-sync, not a
-    // challenge — proving no challenge is ever sent.
-    let first = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator answers promptly")
-        .expect("a frame arrives")
-        .unwrap();
-    let Message::Text(text) = first else {
-        panic!("expected the descriptor re-sync, got {first:?}");
-    };
-    assert!(text.contains("\"type\":\"descriptors\""));
-
+    // The live relay's entry is untouched: still present, still its own cert.
     assert!(
-        wait_for_enrollment(&reg, RelayId(5)).await,
-        "an old relay enrolls unchallenged",
+        registry::peer(&reg, RelayId(5)).is_some(),
+        "the live entry survives the refused downgrade",
+    );
+    assert_eq!(
+        registry::live_cert_fingerprint(&reg, RelayId(5)),
+        live_fingerprint,
+        "the downgrade attempt did not displace the live relay's certificate",
     );
 }
 
