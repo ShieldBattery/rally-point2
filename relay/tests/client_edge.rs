@@ -1965,6 +1965,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     let window = Duration::from_millis(150);
     let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
     let provisional: ProvisionalSessions = mesh.provisional.clone();
+    let decision_makers = mesh.decision_makers.clone();
     let (chain, key_der, ca) = self_signed();
     let server_cfg = server_config(chain, key_der).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
@@ -1986,6 +1987,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     tokio::spawn(provisional::run_sweep_with(
         provisional,
         Arc::clone(&sessions),
+        decision_makers,
         armed_rx,
         Duration::from_millis(20),
     ));
@@ -2064,6 +2066,7 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     let window = Duration::from_millis(150);
     let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
     let provisional: ProvisionalSessions = mesh.provisional.clone();
+    let decision_makers = mesh.decision_makers.clone();
     // Points at the same decision-maker registry and provisional map the
     // relay serves this session with, so `apply_descriptor` here is
     // indistinguishable from one the coordinator subscriber would have
@@ -2090,6 +2093,7 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     tokio::spawn(provisional::run_sweep_with(
         provisional,
         Arc::clone(&sessions),
+        decision_makers,
         armed_rx,
         Duration::from_millis(20),
     ));

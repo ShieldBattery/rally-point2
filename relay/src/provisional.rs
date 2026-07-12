@@ -152,21 +152,45 @@ impl ProvisionalSessions {
 /// Runs the provisional-admission sweep at the production cadence. Never
 /// returns; spawned once per relay when a coordinator is configured -- see
 /// the module docs for arming.
+///
+/// `decision_makers` is consulted before each reap so a session a descriptor
+/// named just as its deadline passed is spared -- see [`run_sweep_with`].
 pub async fn run_sweep(
     provisional: ProvisionalSessions,
     sessions: Sessions,
+    decision_makers: Arc<DecisionMakers>,
     armed: watch::Receiver<bool>,
 ) {
-    run_sweep_with(provisional, sessions, armed, SWEEP_INTERVAL).await;
+    run_sweep_with(
+        provisional,
+        sessions,
+        decision_makers,
+        armed,
+        SWEEP_INTERVAL,
+    )
+    .await;
 }
 
 /// [`run_sweep`] with the sweep interval injected, so a test can drive a reap
 /// without waiting a whole production tick. `provisional`'s own configured
 /// window (see [`ProvisionalSessions::new`]) governs how long a mark stands,
 /// including on a rearm's restart.
+///
+/// A descriptor can name a session in the narrow window between the sweep
+/// pulling its mark (`take_expired`) and the reap firing --
+/// [`crate::mesh_control::MeshControl::apply_descriptor`] creates the session's
+/// decision-maker and clears the mark concurrently. So each expired key is
+/// checked against `decision_makers` before it is reaped: a maker now present
+/// means a descriptor claimed the session, and the reap is skipped. The pulled
+/// mark is already consumed, so a spared key needs nothing further. The check
+/// mirrors [`ProvisionalSessions::mark_if_undescribed`]'s own maker check and is
+/// deliberately best-effort -- a maker created strictly between the check and the
+/// reap still reaps, but that residual is self-healing (the client reconnects and
+/// is admitted cleanly), so no lock is held across the reap to close it.
 pub async fn run_sweep_with(
     provisional: ProvisionalSessions,
     sessions: Sessions,
+    decision_makers: Arc<DecisionMakers>,
     armed: watch::Receiver<bool>,
     sweep_interval: Duration,
 ) {
@@ -194,6 +218,12 @@ pub async fn run_sweep_with(
         was_armed = now_armed;
         if now_armed {
             for key in provisional.take_expired(Instant::now()) {
+                // A descriptor may have named the session as its deadline passed:
+                // skip the reap if a decision-maker now exists for it. The mark is
+                // already consumed, so a spared key needs nothing further.
+                if decision_makers.lock().contains_key(&key) {
+                    continue;
+                }
                 tracing::info!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
@@ -319,7 +349,7 @@ mod tests {
     async fn the_sweep_reaps_only_while_armed_and_a_rearm_restarts_the_window() {
         let window = Duration::from_millis(60);
         let provisional = ProvisionalSessions::new(window);
-        let makers = crate::consensus::new_decision_makers();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
         let sessions: Sessions = Arc::default();
         let (armed_tx, armed_rx) = watch::channel(false);
 
@@ -328,6 +358,7 @@ mod tests {
         tokio::spawn(run_sweep_with(
             provisional.clone(),
             sessions,
+            makers.clone(),
             armed_rx,
             Duration::from_millis(10),
         ));
@@ -366,7 +397,7 @@ mod tests {
         // signal fired once the sweep observes its deadline passed while armed,
         // and the mark itself is consumed by the reap.
         let provisional = ProvisionalSessions::new(Duration::from_millis(20));
-        let makers = crate::consensus::new_decision_makers();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
         let sessions: Sessions = Arc::default();
         let (mut guard, inbox) =
             routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
@@ -380,6 +411,7 @@ mod tests {
         tokio::spawn(run_sweep_with(
             provisional.clone(),
             sessions,
+            makers.clone(),
             armed_rx,
             Duration::from_millis(10),
         ));
@@ -390,6 +422,63 @@ mod tests {
         assert!(
             !provisional.is_marked(&key(1)),
             "the mark is consumed by the reap",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_described_session_is_spared_when_its_maker_appears_before_the_reap() {
+        use crate::consensus::sync_maker;
+        use rally_point_proto::control::BufferBounds;
+        use std::collections::HashSet;
+
+        // The race the maker-check closes: a session marked provisional, then named
+        // by a descriptor (its decision-maker created) with the mark not yet
+        // cleared. The sweep's take_expired pulls the still-present mark, but the
+        // maker now exists, so the session must be spared rather than reaped.
+        let window = Duration::from_millis(20);
+        let provisional = ProvisionalSessions::new(window);
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let sessions: Sessions = Arc::default();
+
+        let (mut guard, inbox) =
+            routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+                .expect("slot 0 registers");
+        guard.disarm();
+        let reap_signal = inbox.provisional_reap_handle();
+
+        // Mark first (no maker yet), then create the maker as apply_descriptor's
+        // sync_maker would -- leaving the mark in place to model the race window.
+        assert!(provisional.mark_if_undescribed(&makers, &key(1)));
+        let _ = sync_maker(
+            &makers,
+            &key(1),
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        assert!(
+            provisional.is_marked(&key(1)),
+            "the mark is still present when the sweep runs",
+        );
+
+        let (_armed_tx, armed_rx) = watch::channel(true);
+        tokio::spawn(run_sweep_with(
+            provisional.clone(),
+            sessions,
+            makers.clone(),
+            armed_rx,
+            Duration::from_millis(10),
+        ));
+
+        // Well past the deadline, the slot's reap signal must never fire: the maker
+        // spared it. (take_expired still consumes the mark, so it is gone.)
+        let fired = tokio::time::timeout(window * 4, reap_signal.notified()).await;
+        assert!(
+            fired.is_err(),
+            "a session a descriptor named is not reaped even though its deadline passed",
         );
     }
 }

@@ -489,6 +489,7 @@ async fn main() -> Result<()> {
             tokio::spawn(provisional::run_sweep(
                 mesh_state.provisional.clone(),
                 Arc::clone(&sessions),
+                Arc::clone(&mesh_state.decision_makers),
                 control_connected_rx,
             ));
         }
