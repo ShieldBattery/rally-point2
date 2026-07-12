@@ -56,16 +56,19 @@
 //! public key material only, the same posture as `/session/create` returning
 //! relay certs).
 
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        Path, State,
+        ConnectInfo, FromRequestParts, Path, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
+    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -75,8 +78,8 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
-    self, CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
-    CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    self, CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
+    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -84,6 +87,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::descriptors::SlotClose;
 use crate::identity;
+use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
 use crate::presence;
@@ -91,6 +95,33 @@ use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 use crate::tenant;
+
+/// The connecting relay's transport-level peer address, when the server was
+/// built to record it (`into_make_service_with_connect_info::<SocketAddr>`).
+/// `None` when the serve path supplies none — the router-`oneshot` unit tests,
+/// and any test harness that drives the endpoint without a real socket — in which
+/// case a ledger's expected-address check reads the peer as unknown.
+///
+/// An infallible extractor: it never rejects a request, so wiring it onto the
+/// control handler cannot change the dev / loopback path, which ignores the value
+/// entirely (only a ledger-backed coordinator consults it).
+struct OptionalPeerAddr(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(OptionalPeerAddr(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connect_info| connect_info.0),
+        ))
+    }
+}
 
 /// How the relay control endpoint authenticates a connecting relay.
 ///
@@ -187,6 +218,14 @@ pub struct CoordinatorState {
     /// window in which a client can still (re)connect to its session. Set from
     /// `--player-token-lifetime-secs`.
     pub player_token_lifetime: Duration,
+    /// The provisioned-relay ledger, when the coordinator was started with one
+    /// (`--relay-ledger`). Present ⇒ **ledger mode**: a relay may enroll only
+    /// under an id the ledger minted, presenting its one-time token at first
+    /// enroll and its bound certificate on every reconnect; a token-less or
+    /// otherwise unauthorized enroll is refused. Absent ⇒ the dev / loopback
+    /// posture, where an enroll's id claim is accepted as presented and this whole
+    /// path is untouched. Shared across all relay control connections.
+    pub ledger: Option<Arc<RelayLedger>>,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -712,9 +751,18 @@ async fn regions(State(state): State<CoordinatorState>) -> Json<RegionsConfig> {
 /// whose certificate differs from the newly-proven one is refused as a duplicate
 /// rather than silently evicted (the same certificate replaces it, exactly as a
 /// reconnect always has).
+///
+/// A coordinator started with a provisioned-relay ledger tightens this further:
+/// after the proof-of-possession succeeds, the connection is authorized against
+/// the ledger (see [`crate::ledger`]) — the id must have been minted, must not be
+/// retired, and must present its one-time token (first enroll) or its bound
+/// certificate (reconnect), else the connection is closed with
+/// [`CONTROL_CLOSE_ENROLL_UNAUTHORIZED`] and never reaches the registry. A
+/// coordinator with no ledger skips that step entirely (dev / loopback).
 async fn relay_control(
     State(state): State<CoordinatorState>,
     headers: HeaderMap,
+    OptionalPeerAddr(peer_addr): OptionalPeerAddr,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !control_auth_ok(&headers, &state.control_auth) {
@@ -727,6 +775,8 @@ async fn relay_control(
     let hello_timeout = state.hello_timeout;
     let liveness_timeout = state.liveness_timeout;
     let regions = state.regions.clone();
+    let ledger = state.ledger.clone();
+    let peer_ip = peer_addr.map(|addr| addr.ip());
     ws.on_upgrade(move |socket| {
         serve_relay_control(
             socket,
@@ -736,6 +786,8 @@ async fn relay_control(
             hello_timeout,
             liveness_timeout,
             regions,
+            ledger,
+            peer_ip,
         )
     })
 }
@@ -756,11 +808,25 @@ async fn relay_control(
 /// ends — the relay closes, the socket errors, the relay goes silent past
 /// `liveness_timeout`, or the coordinator's outbox is dropped (shutdown).
 ///
+/// When `ledger` is present, a step runs between the proof-of-possession and the
+/// registry insert: the enroll is authorized against the provisioned-relay ledger
+/// (see [`crate::ledger`]), refused with [`CONTROL_CLOSE_ENROLL_UNAUTHORIZED`] if
+/// the id was not minted, is retired, or presents no valid token / bound
+/// certificate. On a first enroll the ledger consumes the id's token and binds it
+/// to this certificate; when the ledger recorded a coordinator-resolved advertise
+/// set for the id, that set overrides the hello's self-reported addresses before
+/// enrollment (coordinator-sourced addresses win, the hello is the fallback).
+/// `peer_ip` is the connection's transport-level peer address, enforced against
+/// the ledger's expected address for the id when one was recorded. Without a
+/// ledger this step is skipped and the hello enrolls with its self-reported id
+/// and addresses.
+///
 /// When the connection drops, the relay is deregistered — but only if this
 /// connection is still the current one ([`registry::remove_if_current`]): a relay
 /// that already reconnected (a newer connection re-enrolled it) keeps its live
 /// entry, so a stale drop racing a reconnect does not evict a relay that is in fact
 /// connected.
+#[allow(clippy::too_many_arguments)]
 async fn serve_relay_control(
     mut socket: WebSocket,
     setup: SessionSetup,
@@ -769,11 +835,13 @@ async fn serve_relay_control(
     hello_timeout: Duration,
     liveness_timeout: Duration,
     regions: RegionsConfig,
+    ledger: Option<Arc<RelayLedger>>,
+    peer_ip: Option<IpAddr>,
 ) {
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
     // than left to pin a task. A bad/absent first frame likewise just closes.
-    let hello = match tokio::time::timeout(hello_timeout, read_hello(&mut socket)).await {
+    let mut hello = match tokio::time::timeout(hello_timeout, read_hello(&mut socket)).await {
         Ok(Some(hello)) => hello,
         Ok(None) => return,
         Err(_elapsed) => {
@@ -842,6 +910,61 @@ async fn serve_relay_control(
     // there is no un-challenged enroll path to reach.
     if !challenge_and_verify(&mut socket, &hello, hello_timeout).await {
         return;
+    }
+
+    // A ledger-backed coordinator authorizes the enroll against its provisioned
+    // record before touching the registry: the id must be one the ledger minted,
+    // not retired, and either presenting its one-time token (first enroll, binding
+    // this proof-of-possession-verified certificate) or re-presenting the bound
+    // certificate (a reconnect). A refusal closes with a single generic reason so a
+    // caller cannot probe which ids exist or whether a token was near-valid; the
+    // specific class rides only the server-side log. A coordinator with no ledger
+    // skips this entirely — the id claim is accepted as presented (dev / loopback).
+    if let Some(ledger) = &ledger {
+        let cert_fingerprint = registry::cert_fingerprint(&hello.cert_der);
+        match ledger.authorize_enroll(
+            relay_id,
+            cert_fingerprint,
+            hello.enroll_token.as_deref(),
+            peer_ip,
+        ) {
+            Ok(_authorized) => {
+                // Coordinator-sourced addresses win; the hello's self-report is the
+                // fallback. When the ledger recorded an advertise set for this id,
+                // override the hello's addresses with it (first entry is the
+                // primary) before enrolling, so the registry advertises what the
+                // coordinator resolved rather than what the relay claimed. An id
+                // with no recorded set enrolls with its self-reported addresses.
+                match ledger.advertised_addrs(relay_id) {
+                    Ok(Some(addrs)) if !addrs.is_empty() => {
+                        hello.relay_addr = addrs[0];
+                        hello.relay_addrs = addrs;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            relay_id = relay_id.0,
+                            %error,
+                            "reading the ledger advertise set failed; enrolling with the hello's addresses",
+                        );
+                    }
+                }
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    %refusal,
+                    "refusing relay control connection: ledger did not authorize the enroll",
+                );
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
+                        reason: "enrollment not authorized for this relay id".into(),
+                    })))
+                    .await;
+                return;
+            }
+        }
     }
 
     // Enrollment goes through `registry::try_enroll`, whose duplicate-id refusal
@@ -1749,6 +1872,7 @@ mod tests {
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
+            ledger: None,
         }
     }
 
@@ -2149,6 +2273,7 @@ mod tests {
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
+            ledger: None,
         };
         let app = router(state);
 
@@ -2252,6 +2377,7 @@ mod tests {
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
+            ledger: None,
         };
         let app = router(state);
 

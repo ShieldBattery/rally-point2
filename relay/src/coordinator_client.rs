@@ -50,8 +50,8 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
-    CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
-    CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
+    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -111,6 +111,14 @@ enum ControlDisconnect {
     /// transient condition a redial fixes, so this backs off the same
     /// [`VERSION_REFUSED_RECONNECT_DELAY`] as a version or region refusal.
     IdentityUnproven,
+    /// The coordinator refused the connection because its provisioned-relay
+    /// ledger did not authorize this enroll (close code
+    /// [`CONTROL_CLOSE_ENROLL_UNAUTHORIZED`]): the id was not minted, is retired,
+    /// or the presented token/certificate is invalid. Redialing changes nothing —
+    /// the provisioner must reissue an identity or token — so this backs off the
+    /// same [`VERSION_REFUSED_RECONNECT_DELAY`] as a version, region, or identity
+    /// refusal.
+    EnrollUnauthorized,
 }
 
 /// The sessions the last-applied descriptor set named — the subscriber's removal
@@ -447,15 +455,17 @@ pub async fn run_descriptor_subscriber_with(
             }
             // Already logged (with the coordinator's reason) where the close frame
             // was read; only the far longer backoff is decided here. A version
-            // mismatch, an unknown region, and an unproven identity are all
-            // operator-fix-not-redial refusals, so they share the long backoff.
-            // A duplicate-relay-id refusal is deliberately absent from this list —
-            // it resolves on its own as the stale entry ages out, so it takes the
-            // `Ordinary` path's short delay instead.
+            // mismatch, an unknown region, an unproven identity, and a ledger
+            // enrollment refusal are all operator/provisioner-fix-not-redial
+            // refusals, so they share the long backoff. A duplicate-relay-id
+            // refusal is deliberately absent from this list — it resolves on its
+            // own as the stale entry ages out, so it takes the `Ordinary` path's
+            // short delay instead.
             Ok(
                 ControlDisconnect::VersionRefused
                 | ControlDisconnect::RegionRefused
-                | ControlDisconnect::IdentityUnproven,
+                | ControlDisconnect::IdentityUnproven
+                | ControlDisconnect::EnrollUnauthorized,
             ) => version_refused_delay,
             Err(error) => {
                 tracing::warn!(
@@ -818,6 +828,14 @@ fn classify_control_close(frame: Option<CloseFrame>, relay_id: RelayId) -> Contr
                 "coordinator rejected our enroll proof of possession; backing off until the key/cert mismatch is fixed",
             );
             ControlDisconnect::IdentityUnproven
+        }
+        CONTROL_CLOSE_ENROLL_UNAUTHORIZED => {
+            tracing::error!(
+                relay_id = relay_id.0,
+                reason = %frame.reason,
+                "coordinator's ledger did not authorize our enrollment; backing off until the provisioner reissues our identity/token",
+            );
+            ControlDisconnect::EnrollUnauthorized
         }
         CONTROL_CLOSE_DUPLICATE_RELAY_ID => {
             tracing::warn!(

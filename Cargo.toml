@@ -139,8 +139,15 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
   "ring",
   "webpki-roots",
 ] }
-# Standard (padded) base64 for the webhook's `x-rp2-signature` header.
+# Standard (padded) base64 for the webhook's `x-rp2-signature` header, and
+# URL-safe base64 (no padding) for the coordinator's minted enroll tokens.
 base64 = "0.22"
+# The coordinator's provisioned-relay ledger: a small local SQLite store of
+# minted relay identities + one-time enroll tokens. `bundled` compiles SQLite
+# from source so no system libsqlite3 is needed. Coordinator-only — the game
+# DLL's `rally-point-client` must keep building for `i686-pc-windows-msvc`
+# without a C/SQLite dependency, so this stays out of that crate's tree.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # WebSocket client for the relay's persistent control connection to the
 # coordinator. `rustls-tls-webpki-roots` enables wss:// over rustls; the crate
 # brings rustls/tokio-rustls with default-features off, so it rides this

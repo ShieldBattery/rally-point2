@@ -172,6 +172,26 @@ pub const CONTROL_CLOSE_IDENTITY_UNPROVEN: u16 = 4003;
 /// deploy or config fix.
 pub const CONTROL_CLOSE_DUPLICATE_RELAY_ID: u16 = 4004;
 
+/// WebSocket close code the coordinator sends when it runs a provisioned-relay
+/// ledger and refuses a relay's (proof-of-possession verified) `Hello` because
+/// the ledger does not authorize the claimed `relay_id` to enroll: the id is
+/// unknown to the ledger, is retired, presents a certificate that differs from
+/// the one bound to it, connects from an address the ledger does not expect for
+/// it, or presents a missing/expired/already-consumed one-time enroll token. In
+/// the same private-use range (4000–4999) as its sibling enroll-seam refusals.
+///
+/// A cross-component contract: the coordinator sends it *instead of enrolling*,
+/// with a deliberately **generic** reason ("enrollment not authorized for this
+/// relay id") — the same string for every refusal class above — so a caller
+/// cannot probe which ids exist or whether a token was near-valid; the specific
+/// class is recorded only in the coordinator's own logs. One code covers every
+/// ledger refusal class. The relay's coordinator client recognizes it and backs
+/// off far longer than a normal reconnect: a ledger refusal is resolved by the
+/// provisioner reissuing an identity/token, not by redialing, exactly like
+/// [`CONTROL_CLOSE_IDENTITY_UNPROVEN`]. A coordinator with no ledger (dev /
+/// loopback) never sends this code — it accepts the id claim as presented.
+pub const CONTROL_CLOSE_ENROLL_UNAUTHORIZED: u16 = 4005;
+
 /// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
 /// whose advertised protocol version does not [`negotiate`] against its own.
 /// Sent before the link driver is ever spawned, so an incompatible pair never

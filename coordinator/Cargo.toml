@@ -41,6 +41,9 @@ hyper-rustls = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
+# The provisioned-relay enrollment ledger (minted ids + one-time enroll tokens +
+# cert-fingerprint bindings). SQLite bundled from source; coordinator-only.
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 rally-point-relay = { workspace = true }

@@ -143,6 +143,17 @@ struct Cli {
     #[arg(long, env = "RELAY_COORDINATOR_SECRET")]
     coordinator_secret: Option<String>,
 
+    /// One-time enrollment token, presented in the enroll `Hello` so a
+    /// coordinator that runs a provisioned-relay ledger can bind this relay id to
+    /// its certificate at first enroll. The coordinator mints it when it launches
+    /// this relay's task and injects it here (its launch environment). Absent for
+    /// dev/loopback against a coordinator with no ledger. The token rides every
+    /// enroll this process sends — the environment does not change between
+    /// redials — and the coordinator ignores it once the certificate is bound:
+    /// the bound certificate, not the token, authorizes reconnects.
+    #[arg(long, env = "RELAY_ENROLL_TOKEN")]
+    enroll_token: Option<String>,
+
     /// Public address(es) clients and peer relays reach this relay at — sent to
     /// the coordinator in the enroll `Hello`. Repeatable (or comma-separated in
     /// the env var) for a dual-stack relay: one flag per family, the first is the
@@ -449,6 +460,13 @@ async fn main() -> Result<()> {
             .with_relay_addrs(advertise_addrs);
             if let Some(region) = &cli.region {
                 relay_hello = relay_hello.with_region(RegionId(region.clone()));
+            }
+            // Carry the one-time enroll token to a ledger-backed coordinator, which
+            // binds this id to the hello's certificate at first enroll. Absent
+            // against a coordinator with no ledger, and unnecessary once the
+            // certificate is bound (a reconnect authorizes on the certificate).
+            if let Some(token) = &cli.enroll_token {
+                relay_hello = relay_hello.with_enroll_token(token.clone());
             }
             tracing::info!(
                 relay_id = our_id,

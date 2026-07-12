@@ -131,6 +131,15 @@ struct Cli {
     /// `x-rp2-signature`) — no separate secret to configure.
     #[arg(long, env = "COORDINATOR_DEV_NOTIFY_URL", requires = "dev_tenant")]
     dev_notify_url: Option<String>,
+
+    /// Path to the provisioned-relay ledger's SQLite database (created if
+    /// absent). Present ⇒ **ledger mode**: a relay may enroll only under an id
+    /// this coordinator minted, presenting its one-time enroll token at first
+    /// enroll and its bound certificate on every reconnect; a token-less or
+    /// otherwise unauthorized enroll is refused. Absent ⇒ the dev / loopback
+    /// posture, where a relay's id claim in its `Hello` is accepted as presented.
+    #[arg(long, env = "COORDINATOR_RELAY_LEDGER")]
+    relay_ledger: Option<std::path::PathBuf>,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
@@ -204,6 +213,27 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Open the provisioned-relay ledger when one is configured. Fail startup if
+    // it cannot be opened: a coordinator asked to run in ledger mode must not
+    // silently fall back to accepting unprovisioned enrolls.
+    let ledger = match &cli.relay_ledger {
+        Some(path) => {
+            let ledger = rally_point_coordinator::ledger::RelayLedger::open(path)
+                .with_context(|| format!("opening the relay ledger at {}", path.display()))?;
+            tracing::info!(
+                path = %path.display(),
+                "relay ledger opened — only provisioned relay ids may enroll",
+            );
+            Some(std::sync::Arc::new(ledger))
+        }
+        None => {
+            tracing::info!(
+                "no --relay-ledger configured; relay id claims are accepted as presented"
+            );
+            None
+        }
+    };
+
     let lifecycle = Lifecycle::new(setup.clone());
     let notices = notify::new_dedup();
     // Let the lifecycle prune these dedup sets when it removes a session's state,
@@ -218,6 +248,7 @@ async fn main() -> Result<()> {
         liveness_timeout: api::LIVENESS_TIMEOUT,
         regions,
         player_token_lifetime: Duration::from_secs(cli.player_token_lifetime_secs),
+        ledger,
     };
 
     let app = api::router(state);
@@ -227,9 +258,16 @@ async fn main() -> Result<()> {
         .context("binding coordinator listen address")?;
     tracing::info!("coordinator API listening on {}", cli.listen);
 
-    axum::serve(listener, app)
-        .await
-        .context("coordinator API server ended with an error")?;
+    // Serve with connect-info so the relay control handler can read each
+    // connection's transport-level peer address for the ledger's expected-address
+    // check. This presumes the coordinator is directly exposed — a reverse proxy
+    // in front of it would replace the peer address with its own.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("coordinator API server ended with an error")?;
     Ok(())
 }
 

@@ -31,6 +31,11 @@
 //!   signature against the certificate its `Hello` presented, closing the gap
 //!   where the certificate alone is a copyable claim, not proof of holding the
 //!   matching private key.
+//! - **ledger** ([`ledger`]) — the optional provisioned-relay ledger: a local
+//!   SQLite store of minted relay ids, their one-time enroll tokens, and the
+//!   certificate fingerprint each id binds to at first enroll. Present, a
+//!   coordinator refuses any enroll it did not provision; absent, it keeps the
+//!   dev / loopback posture of accepting the id claim as presented.
 //! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
 //!   executes per-turn. The bounds type itself lives in
 //!   [`rally_point_proto::control::BufferBounds`] (it crosses the
@@ -45,6 +50,7 @@
 pub mod api;
 pub mod descriptors;
 pub mod identity;
+pub mod ledger;
 pub mod lifecycle;
 pub mod notify;
 pub mod presence;

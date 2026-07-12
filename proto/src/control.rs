@@ -103,9 +103,16 @@ impl AsRef<str> for RegionId {
 ///
 /// The control connection that carries this is authenticated by a
 /// coordinator-issued bootstrap secret (fail-closed: the coordinator refuses to
-/// serve it unauthenticated without an explicit insecure opt-in). The relay id
-/// here is still an unverified claim — binding the connection to a relay identity
-/// is deferred to the relay-identity / mTLS work.
+/// serve it unauthenticated without an explicit insecure opt-in). How the
+/// claimed `relay_id` is bound to an identity depends on whether the coordinator
+/// runs a provisioning ledger. A ledger-backed coordinator mints each id with a
+/// one-time [`enroll_token`](Self::enroll_token) and binds the id to the
+/// certificate presented here at first enroll — the token is consumed, and every
+/// later reconnect must re-present the same certificate; an id it never minted,
+/// or one it has retired, cannot enroll at all. A coordinator with no ledger
+/// (dev / loopback) accepts the id claim as presented, resting on the enroll
+/// proof-of-possession alone to prove the relay holds the private key behind the
+/// certificate it names.
 ///
 /// `relay_addr` is the public address clients and peer relays connect to. It
 /// serializes as the familiar `"ip:port"` string via serde's built-in
@@ -160,6 +167,18 @@ pub struct RelayHello {
     /// hello stays byte-identical to the pre-region form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionId>,
+    /// A one-time enrollment token, presented on a relay's first enroll against a
+    /// coordinator that runs a provisioning ledger. The coordinator mints it when
+    /// it launches the relay's task and hands it to the relay out of band (its
+    /// launch environment); at first enroll the coordinator consumes it and binds
+    /// this relay id to the certificate the hello carries, after which the bound
+    /// certificate alone authorizes reconnects — a token re-presented on a later
+    /// enroll (the relay's environment keeps supplying it across redials) is
+    /// simply ignored. Absent for a relay enrolling against a coordinator with no
+    /// ledger (dev / loopback), which accepts the id claim as presented.
+    /// Additive, so a tokenless hello stays byte-identical to the pre-token form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_token: Option<String>,
 }
 
 impl RelayHello {
@@ -186,6 +205,7 @@ impl RelayHello {
             min_protocol: None,
             relay_addrs: Vec::new(),
             region: None,
+            enroll_token: None,
         }
     }
 
@@ -211,6 +231,17 @@ impl RelayHello {
     /// region-blind fallback pick.
     pub fn with_region(mut self, region: RegionId) -> Self {
         self.region = Some(region);
+        self
+    }
+
+    /// Attaches the one-time enrollment token the coordinator minted for this
+    /// relay id, presented so a ledger-backed coordinator can bind the id to this
+    /// hello's certificate at first enroll. Left unset (via [`new`](Self::new)),
+    /// the hello carries no token — the form a relay uses against a coordinator
+    /// with no ledger. A relay launched with a token keeps presenting it on every
+    /// enroll; once its certificate is bound the coordinator ignores the token.
+    pub fn with_enroll_token(mut self, token: String) -> Self {
+        self.enroll_token = Some(token);
         self
     }
 }
@@ -1356,12 +1387,51 @@ mod tests {
             min_protocol: None,
             relay_addrs: vec![],
             region: None,
+            enroll_token: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         // An unset window bottom stays off the wire (a one-version window).
         assert!(!json.contains("min_protocol"));
         let back: RelayHello = serde_json::from_str(&json).unwrap();
         assert_eq!(back, hello);
+    }
+
+    #[test]
+    fn relay_hello_with_an_enroll_token_roundtrips_json() {
+        let hello = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        )
+        .with_enroll_token("s3cr3t-token".to_owned());
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"enroll_token\":\"s3cr3t-token\""));
+        let back: RelayHello = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hello);
+        assert_eq!(back.enroll_token.as_deref(), Some("s3cr3t-token"));
+    }
+
+    #[test]
+    fn a_tokenless_hello_serializes_byte_identical_to_the_pre_token_form() {
+        // A hello with no enroll token keeps the field off the wire entirely, so a
+        // relay enrolling against a coordinator with no ledger (and every reconnect
+        // once a certificate is bound) emits exactly the shape a pre-token peer
+        // would — the additive-field byte-identical guarantee.
+        let tokenless = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        );
+        let json = serde_json::to_string(&tokenless).unwrap();
+        assert!(!json.contains("enroll_token"));
+        // The same bytes a tokenless hello has always produced: adding
+        // `with_enroll_token` and then clearing it back to `None` round-trips to
+        // the identical wire form.
+        let back: RelayHello = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tokenless);
+        assert!(back.enroll_token.is_none());
     }
 
     #[test]

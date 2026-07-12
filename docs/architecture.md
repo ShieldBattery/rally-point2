@@ -734,6 +734,24 @@ fingerprint)` pairing the mesh acceptor pins against (see [Mesh trust](#the-mesh
 relay→coordinator heartbeat rides this same channel — it doubles as the keepalive that surfaces a
 connection that died without a close.
 
+**A provisioned-identity ledger (optional) removes the offline-but-claimable state.** Proof of possession
+still lets *any* id be claimed with *any* freshly generated certificate, so a bootstrap-secret holder could
+enroll under an offline relay's id with its own cert. A coordinator started with a **relay ledger** (a small
+local SQLite store, `--relay-ledger`) closes that: it becomes the thing that launches relay tasks, and mints
+each `relay_id` together with a **one-time enroll token** (only the token's SHA-256 is stored — the token
+itself is handed to the launched task and never written down) at launch. At enroll, after the
+proof-of-possession succeeds, an id unknown to the ledger, a retired id, or a missing/expired/already-consumed
+token is refused — all with **one generic close code** (`4005`) and reason, so a probe cannot learn which ids
+exist or whether a token was near-valid; the specific class rides only the coordinator's own logs. A first
+enroll consumes the token and **binds** the id to the certificate the `Hello` presented, in one atomic
+`UPDATE` so two enrolls racing on a token bind at most one cert; every reconnect thereafter must re-present
+that bound certificate (no token), and a retired id is refused forever. An id is therefore only ever
+*launching* (token-guarded), *live* (cert-bound), or *retired* — never offline-but-claimable. Where the
+coordinator recorded a resolved advertise set for a launched id, that set overrides the hello's self-reported
+addresses at enroll (coordinator-sourced addresses win; the hello is the fallback). A coordinator with **no**
+ledger keeps the dev / loopback posture: the id claim in a `Hello` is accepted as presented, and this whole
+authorization step is skipped.
+
 ### Tenant → coordinator requests (the app-server API)
 
 The coordinator's tenant-facing HTTP API — `POST /session/create`, `POST /sessions/alive`, and so on — is
