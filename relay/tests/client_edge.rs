@@ -501,6 +501,76 @@ async fn a_late_slot_receives_session_start_on_register() {
 }
 
 #[tokio::test]
+async fn session_start_carries_the_computed_initial_buffer_depth() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::spawn_control_reader;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(91);
+
+    // Seed the maker as authority over two expected slots, then feed it the
+    // session shape: a large one-way latency hint (400ms) and the multi-relay
+    // flag, so the initial-depth computation is hint-dominated and deterministic.
+    // 400ms is ceil(400000/41666) = 10 turns; a multi-relay session is never
+    // "fully observed" (its per-slot conditions never cross the mesh pre-start),
+    // so the depth is max(observed, 10) + 1 hop cushion = 11 — the localhost
+    // handshake RTT the slots contribute stays far below 10, so it never lifts the
+    // max above the hint.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+    consensus::set_session_shape(&makers, &key, Some(400), false);
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut reader0 = spawn_control_reader(slot0.connection().clone());
+    let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut reader1 = spawn_control_reader(slot1.connection().clone());
+
+    assert_eq!(
+        recv_meaningful(&mut reader0).await.session_start_depth(),
+        Some(Some(11)),
+        "slot 0's session-start carries the computed initial buffer depth",
+    );
+    assert_eq!(
+        recv_meaningful(&mut reader1).await.session_start_depth(),
+        Some(Some(11)),
+        "the slot that completed the set gets the same stamped depth",
+    );
+}
+
+/// Test helper: the initial buffer depth a `SessionStart` control frame carried,
+/// or `None` for any other frame kind. `Some(None)` is a depth-less directive.
+trait SessionStartDepth {
+    fn session_start_depth(&self) -> Option<Option<u32>>;
+}
+
+impl SessionStartDepth for rally_point_transport::control::ControlInbound {
+    fn session_start_depth(&self) -> Option<Option<u32>> {
+        match self {
+            rally_point_transport::control::ControlInbound::SessionStart(depth) => Some(*depth),
+            _ => None,
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_slots_connect_fans_a_connectivity_up_to_the_other_slots() {
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 

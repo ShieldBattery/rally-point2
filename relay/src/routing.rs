@@ -104,6 +104,15 @@ const ISOLATED_CLOSE: u32 = 0x04;
 /// retransmit latency and a one-way sender's backlog low.
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 
+/// How often a slot's serve loop resamples its QUIC link conditions while the
+/// session has not yet started. Lobby traffic rides the reliable control stream,
+/// not datagrams, so the receive-driven sampler above never fires pre-start —
+/// this tick keeps each slot's link stats current through the pre-start window so
+/// the authority sizes the initial buffer depth from live conditions, not just
+/// the handshake's first RTT. It stops the moment the session starts; the
+/// receive-driven sampler covers the game from there.
+const PRE_START_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// The hard ceiling on payloads forwarded to a client but not yet known-delivered.
 /// Mirrors the client's cap: under reverse-path loss (the client received the
 /// turns but the acks riding the datagrams were lost), the beacon side-channel
@@ -243,9 +252,10 @@ pub struct SlotEntry {
     /// decides every expected slot has connected, and by
     /// [`deliver_session_start_to_slot`] for a slot that registers after the
     /// session already started; drained by this slot's link task, which writes a
-    /// `SessionStart` frame to its control stream. Fieldless — a unit per
-    /// directive, carrying nothing but the fact.
-    start_push: mpsc::Sender<()>,
+    /// `SessionStart` frame to its control stream. Carries the session's computed
+    /// initial latency-buffer depth (`None` when the authoring relay sized none),
+    /// which the frame stamps for the game to apply before frame 0.
+    start_push: mpsc::Sender<Option<u32>>,
     /// Slot-connectivity changes to push down THIS client's reliable control
     /// stream. Fed by [`fan_out_connectivity`] when any slot's link dies or
     /// (re)registers; drained by this slot's link task, which writes a
@@ -264,7 +274,7 @@ pub struct SlotInbox {
     leave_push_rx: mpsc::Receiver<LeaveDirective>,
     /// Session-start directives to push down this client's control stream (see
     /// [`SlotEntry::start_push`]).
-    start_push_rx: mpsc::Receiver<()>,
+    start_push_rx: mpsc::Receiver<Option<u32>>,
     /// Slot-connectivity changes to push down this client's control stream (see
     /// [`SlotEntry::conn_push`]).
     conn_push_rx: mpsc::Receiver<(SlotId, bool)>,
@@ -543,8 +553,12 @@ pub(crate) fn fan_out_leave(
 /// and the lock dropped before delivery, as in [`fan_out`]. A slot whose start
 /// queue is full is unexpected (starts are rare and the queue is drained
 /// promptly); it is logged rather than dropped silently.
-pub(crate) fn fan_out_session_start(sessions: &Sessions, key: &SessionKey) {
-    let targets: Vec<(SlotId, mpsc::Sender<()>)> = {
+pub(crate) fn fan_out_session_start(
+    sessions: &Sessions,
+    key: &SessionKey,
+    initial_buffer_turns: Option<u32>,
+) {
+    let targets: Vec<(SlotId, mpsc::Sender<Option<u32>>)> = {
         let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => slots
@@ -555,7 +569,7 @@ pub(crate) fn fan_out_session_start(sessions: &Sessions, key: &SessionKey) {
         }
     };
     for (slot, tx) in targets {
-        match tx.try_send(()) {
+        match tx.try_send(initial_buffer_turns) {
             Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
@@ -627,9 +641,16 @@ pub(crate) fn broadcast_connectivity(
 }
 
 /// Pushes the session-start directive down a single slot's control stream — the
-/// re-push a slot gets when it registers after the session already started. A
-/// slot absent from the roster (already gone) is skipped.
-pub(crate) fn deliver_session_start_to_slot(sessions: &Sessions, key: &SessionKey, slot: SlotId) {
+/// re-push a slot gets when it registers after the session already started —
+/// stamping the session's stored initial buffer depth (`None` when the authoring
+/// relay sized none, e.g. a resumed re-home). A slot absent from the roster
+/// (already gone) is skipped.
+pub(crate) fn deliver_session_start_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    initial_buffer_turns: Option<u32>,
+) {
     let sender = {
         let roster = sessions.lock();
         roster
@@ -638,7 +659,7 @@ pub(crate) fn deliver_session_start_to_slot(sessions: &Sessions, key: &SessionKe
             .map(|entry| entry.start_push.clone())
     };
     if let Some(tx) = sender {
-        let _ = tx.try_send(());
+        let _ = tx.try_send(initial_buffer_turns);
     }
 }
 
@@ -646,14 +667,18 @@ pub(crate) fn deliver_session_start_to_slot(sessions: &Sessions, key: &SessionKe
 /// slot ([`fan_out_session_start`]) and broadcasts it across the mesh so every
 /// peer relay fans it to its own local slots ([`crate::mesh::fan_out_session_start`]).
 /// The one call the authority makes when full slot presence is reached, and the
-/// same one an authority-churn re-evaluation makes.
+/// same one an authority-churn re-evaluation makes. Both legs carry the maker's
+/// stored initial buffer depth (the authority sized it at the coverage latch),
+/// so every local slot and every peer relay learns the same stamped depth.
 pub(crate) fn deliver_session_start(
     sessions: &Sessions,
+    decision_makers: &consensus::DecisionMakers,
     mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
 ) {
-    fan_out_session_start(sessions, key);
-    crate::mesh::fan_out_session_start(mesh_links, key);
+    let initial_buffer_turns = consensus::session_initial_buffer_turns(decision_makers, key);
+    fan_out_session_start(sessions, key, initial_buffer_turns);
+    crate::mesh::fan_out_session_start(mesh_links, key, initial_buffer_turns);
 }
 
 /// Re-evaluates a session's start condition after an authority change and, if the
@@ -668,7 +693,7 @@ pub fn maybe_start_session(
     key: &SessionKey,
 ) {
     if consensus::reevaluate_session_start(decision_makers, key) {
-        deliver_session_start(sessions, mesh_links, key);
+        deliver_session_start(sessions, decision_makers, mesh_links, key);
     }
 }
 
@@ -696,9 +721,10 @@ pub fn announce_slot_present(
     // directive session-wide; otherwise, if the session already started, this
     // late slot still needs the directive pushed to it directly.
     if consensus::note_slot_present(decision_makers, key, slot) {
-        deliver_session_start(sessions, mesh_links, key);
+        deliver_session_start(sessions, decision_makers, mesh_links, key);
     } else if consensus::session_started(decision_makers, key) {
-        deliver_session_start_to_slot(sessions, key, slot);
+        let initial_buffer_turns = consensus::session_initial_buffer_turns(decision_makers, key);
+        deliver_session_start_to_slot(sessions, key, slot, initial_buffer_turns);
     }
 }
 
@@ -800,6 +826,23 @@ pub async fn run_slot_link(
     // report it and re-derive. The peers learn the new count from the mesh
     // drivers' presence reconcile, off the same roster.
     report_own_presence(&sessions, &mesh_for_teardown, &key);
+
+    // Feed an immediate conditions sample from the completed QUIC handshake into
+    // the session's decision-maker BEFORE announcing presence, so when this slot
+    // completes the expected set and the authority sizes the initial buffer depth,
+    // this slot's measured path RTT is already accounted for. A pre-start `ingest`
+    // can emit no directive — `decide` bails until a framed turn gives it a
+    // consensus coordinate — so this only accumulates state. Publishing it also
+    // seeds the mesh sidecar for this slot.
+    let handshake_sample = sample_slot_conditions(link.connection(), slot);
+    crate::mesh::publish_conditions(&conditions, &key, slot, handshake_sample);
+    let _ = consensus::ingest_local_conditions(
+        &decision_makers,
+        &key,
+        &LinkConditions {
+            slots: vec![handshake_sample],
+        },
+    );
 
     // Announce this slot's presence to the mesh and record it into the session's
     // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -923,6 +966,12 @@ pub async fn run_slot_link(
     // to fire when a forward carries no redundancy or the link is idle, so a turn the
     // fresh packets can't re-carry is still retransmitted.
     let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
+    // Whether to keep resampling this slot's link conditions on the pre-start tick.
+    // Armed only while the session has not started (a late slot joining an already
+    // started session leaves it to the receive-driven sampler); disarmed the tick
+    // it observes the session started, so post-start sampling is never doubled.
+    let mut pre_start_sampling = !consensus::session_started(&decision_makers, &key);
+    let mut pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
 
     // Anchor this connection's own-slot receive window. A re-homing client presents
     // a cursor for *its own* slot (peers present per-peer cursors; a slot never
@@ -1141,11 +1190,11 @@ pub async fn run_slot_link(
             // the stream is dead regardless of which frame kind hit it.
             pushed = start_push_rx.recv(), if start_push_alive => {
                 match pushed {
-                    Some(()) => {
+                    Some(initial_buffer_turns) => {
                         if let Err(error) =
                             rally_point_transport::control::send_control_session_start(
                                 &mut control_send,
-                                None,
+                                initial_buffer_turns,
                             )
                             .await
                         {
@@ -1684,6 +1733,29 @@ pub async fn run_slot_link(
                     acks_owed = false;
                 }
                 flush_deadline = Instant::now() + FLUSH_INTERVAL;
+            }
+            _ = sleep_until(pre_start_deadline), if pre_start_sampling => {
+                // Pre-start conditions sampler. Lobby traffic rides the reliable
+                // control stream, so no datagram arrives to drive the receive-path
+                // sampler until the game starts — this keeps each slot's link stats
+                // current so the authority's initial-depth computation at coverage
+                // reflects live conditions. It stops once the session starts; the
+                // receive-driven sampler covers the running game, so nothing is
+                // double-sampled.
+                if consensus::session_started(&decision_makers, &key) {
+                    pre_start_sampling = false;
+                } else {
+                    let sample = sample_slot_conditions(link.connection(), slot);
+                    crate::mesh::publish_conditions(&conditions, &key, slot, sample);
+                    let _ = consensus::ingest_local_conditions(
+                        &decision_makers,
+                        &key,
+                        &LinkConditions {
+                            slots: vec![sample],
+                        },
+                    );
+                    pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
+                }
             }
             _ = shutdown.notified() => {
                 // The relay is isolating this slot: it fell hopelessly behind and was

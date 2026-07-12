@@ -1295,3 +1295,71 @@ async fn bind_dials_an_ipv6_relay() {
         "dual-stack bind failed to dial IPv6 relay: {outcome:?}"
     );
 }
+
+/// The relay-computed initial buffer depth stamped onto SessionStart reaches the
+/// game through the client driver's `session_start` channel — the end-to-end
+/// surface the DLL reads to seed the game's turn buffer before frame 0.
+#[tokio::test]
+async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_channel() {
+    use std::collections::HashSet;
+
+    use rally_point_client::LinkDriver;
+    use rally_point_proto::control::BufferBounds;
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(71);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Seed the authority over the two expected slots, then feed it a large one-way
+    // latency hint (400ms) and the multi-relay flag, so the initial-depth
+    // computation is hint-dominated and deterministic: 400ms is 10 turns, a
+    // multi-relay session is never fully observed, so the depth is
+    // max(observed, 10) + 1 hop cushion = 11 (the localhost handshake RTT stays
+    // far below the hint).
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let _ = consensus::sync_maker(
+        &mesh.decision_makers,
+        &key,
+        BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+        HashSet::new(),
+        HashSet::new(),
+    );
+    consensus::set_session_shape(&mesh.decision_makers, &key, Some(400), false);
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let (driver0, mut chan0) = LinkDriver::new(link0);
+    let task0 = tokio::spawn(driver0.run());
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let (driver1, _chan1) = LinkDriver::new(link1);
+    let task1 = tokio::spawn(driver1.run());
+
+    // Both connected: session-start fires, and the driver surfaces the stamped
+    // depth on the channel the game reads before frame 0.
+    let depth = tokio::time::timeout(Duration::from_secs(5), chan0.session_start.recv())
+        .await
+        .expect("session start never fired")
+        .expect("slot 0's session-start channel closed");
+    assert_eq!(
+        depth,
+        Some(11),
+        "the driver surfaces the relay-computed initial buffer depth",
+    );
+
+    drop(chan0);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task0).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), task1).await;
+}

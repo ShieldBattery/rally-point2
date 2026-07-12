@@ -135,8 +135,13 @@ pub enum FlightEvent {
     /// rate-cap-passed) against a held slot.
     DropRequested { requester: u8, target: u8 },
     /// The session-start directive fired on this relay (it was the authority
-    /// observing full expected-slot coverage).
-    SessionStart,
+    /// observing full expected-slot coverage). `initial_buffer_turns` is the
+    /// latency-buffer depth the authority sized and stamped onto the directive,
+    /// or absent when it sized none (nothing observed and no hint).
+    SessionStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_buffer_turns: Option<u32>,
+    },
     /// A resumed (re-home) descriptor was applied — this relay took over an
     /// already-running session, seeded with the given number of
     /// already-decided departures.
@@ -888,7 +893,12 @@ mod tests {
         recorder.set_identity(RelayId(7));
         recorder.set_sink(Arc::new(FileSink::new(dir.clone())));
         let k = key(42);
-        recorder.record(&k, FlightEvent::SessionStart);
+        recorder.record(
+            &k,
+            FlightEvent::SessionStart {
+                initial_buffer_turns: None,
+            },
+        );
 
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
 
@@ -921,7 +931,12 @@ mod tests {
     async fn without_a_sink_recording_continues_and_a_flush_is_a_logged_discard() {
         let recorder = FlightRecorder::default();
         let k = key(1);
-        recorder.record(&k, FlightEvent::SessionStart);
+        recorder.record(
+            &k,
+            FlightEvent::SessionStart {
+                initial_buffer_turns: None,
+            },
+        );
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::NoSink);
         assert!(recorder.recorded_sessions().is_empty());
 
@@ -934,8 +949,18 @@ mod tests {
     async fn the_drain_flush_respects_its_deadline_against_a_slow_sink() {
         let recorder = FlightRecorder::default();
         recorder.set_sink(Arc::new(SlowSink));
-        recorder.record(&key(1), FlightEvent::SessionStart);
-        recorder.record(&key(2), FlightEvent::SessionStart);
+        recorder.record(
+            &key(1),
+            FlightEvent::SessionStart {
+                initial_buffer_turns: None,
+            },
+        );
+        recorder.record(
+            &key(2),
+            FlightEvent::SessionStart {
+                initial_buffer_turns: None,
+            },
+        );
 
         let started = std::time::Instant::now();
         recorder.flush_all(Duration::from_millis(100)).await;

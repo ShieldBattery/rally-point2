@@ -332,6 +332,17 @@ impl MeshControl {
         // run on every descriptor push, not just creation, since `sync_maker`
         // itself re-syncs an existing maker the same way.
         consensus::set_own_relay_id(&self.decision_makers, &key, self.our_id);
+        // Feed the descriptor-derived inputs to the initial-depth computation: the
+        // tenant's latency hint, and whether this is a single-relay session (no
+        // mesh peers) — the latter decides both the fully-observed rule and the
+        // multi-relay hop cushion. Set on create and every re-sync, like the
+        // observer/expected/homed sets above.
+        consensus::set_session_shape(
+            &self.decision_makers,
+            &key,
+            descriptor.latency_estimate_ms,
+            new_peers.is_empty(),
+        );
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
         // A rehome descriptor (coordinator-mediated failover) resumes an
         // already-running session onto this relay. Seed the departures the

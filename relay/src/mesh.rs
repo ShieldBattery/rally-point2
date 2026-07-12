@@ -947,12 +947,21 @@ pub(crate) fn fan_out_slot_present(links: &MeshLinks, key: &SessionKey, slot: Sl
 }
 
 /// Broadcasts the session-start directive the authority decided to every peer
-/// relay serving `key`, so each fans it down its own local slots. A relay that
-/// receives this latches the session started and fans it locally but does not
-/// re-broadcast it — the authority already sent it to every relay — so there is
-/// no echo.
-pub(crate) fn fan_out_session_start(links: &MeshLinks, key: &SessionKey) {
-    fan_out_control(links, key, session_start_frame(key.session));
+/// relay serving `key`, so each fans it down its own local slots — carrying the
+/// authority's computed initial buffer depth (`None` when it sized none) so each
+/// peer adopts the same depth. A relay that receives this latches the session
+/// started and fans it locally but does not re-broadcast it — the authority
+/// already sent it to every relay — so there is no echo.
+pub(crate) fn fan_out_session_start(
+    links: &MeshLinks,
+    key: &SessionKey,
+    initial_buffer_turns: Option<u32>,
+) {
+    fan_out_control(
+        links,
+        key,
+        session_start_frame(key.session, initial_buffer_turns),
+    );
 }
 
 /// Broadcasts a slot-connectivity change to every peer relay serving `key`, so
@@ -1018,12 +1027,13 @@ fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
     }
 }
 
-/// Builds a `SessionStart` mesh control frame for `session`.
-fn session_start_frame(session: SessionId) -> MeshControlFrame {
+/// Builds a `SessionStart` mesh control frame for `session`, stamping the
+/// computed initial buffer depth (`None` when the authoring relay sized none).
+fn session_start_frame(session: SessionId, initial_buffer_turns: Option<u32>) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {
-            initial_buffer_turns: None,
+            initial_buffer_turns,
         })),
     }
 }
@@ -2294,18 +2304,34 @@ fn dispatch_mesh_control(
             // fans to its own locals, but the frame is idempotent). A non-authority
             // relay just records it, for a later promotion.
             if crate::consensus::note_slot_present(&mesh.decision_makers, &key, slot) {
-                routing::fan_out_session_start(sessions, &key);
-                fan_out_session_start(&mesh.links, &key);
+                // Coverage fired here (this relay is the authority): the maker
+                // sized and stored the initial buffer depth as the latch fired, so
+                // both fan-out legs carry it.
+                let initial_buffer_turns =
+                    crate::consensus::session_initial_buffer_turns(&mesh.decision_makers, &key);
+                routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
+                fan_out_session_start(&mesh.links, &key, initial_buffer_turns);
             }
         }
-        Some(mesh_control_frame::Kind::SessionStart(_)) => {
-            // The authority's session-start directive. Latch the session started —
-            // so this relay's own late-registering local slots still get a re-push
-            // — and fan it down every current local slot. Deliberately NOT
-            // re-broadcast across the mesh: the authority already sent a copy to
-            // every link serving the session, so re-flooding would only echo.
-            crate::consensus::mark_session_started(&mesh.decision_makers, &key);
-            routing::fan_out_session_start(sessions, &key);
+        Some(mesh_control_frame::Kind::SessionStart(start)) => {
+            // The authority's session-start directive. Adopt the carried initial
+            // buffer depth into this relay's maker — its buffer and its stored
+            // depth — so a later promotion reasons from the right base and this
+            // relay's own re-pushes stamp the same depth; a depth-less directive (an
+            // old authority, or a resumed re-home re-push) leaves the buffer
+            // untouched. Latching started keeps this relay's own late-registering
+            // local slots getting a re-push. Then fan it down every current local
+            // slot. Deliberately NOT re-broadcast across the mesh: the authority
+            // already sent a copy to every link serving the session, so re-flooding
+            // would only echo.
+            crate::consensus::adopt_session_start(
+                &mesh.decision_makers,
+                &key,
+                start.initial_buffer_turns,
+            );
+            let initial_buffer_turns =
+                crate::consensus::session_initial_buffer_turns(&mesh.decision_makers, &key);
+            routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
         }
         Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
             let Ok(slot) = u8::try_from(change.slot).map(SlotId) else {
@@ -2463,8 +2489,13 @@ fn reconcile_leaves_on_join(
     // too: a peer relay that dialed in (or redialed) after the authority fired
     // would otherwise never hear it, stranding its local slots. Idempotent — a
     // relay that already started latches it again and re-fans to its own locals.
+    // Carries this relay's stored initial buffer depth, which is `None` on a
+    // resumed relay (it never sized one), so a re-push into a running game never
+    // resizes a live buffer.
     if crate::consensus::session_started(decision_makers, key) {
-        let _ = control_tx.send(session_start_frame(key.session));
+        let initial_buffer_turns =
+            crate::consensus::session_initial_buffer_turns(decision_makers, key);
+        let _ = control_tx.send(session_start_frame(key.session, initial_buffer_turns));
     }
 }
 

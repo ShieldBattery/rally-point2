@@ -626,6 +626,29 @@ pub struct DecisionMaker {
     /// (`MeshControl`) sets it once, right after creating or syncing the
     /// maker, from the id it already carries.
     own_relay_id: Option<RelayId>,
+    /// The tenant's worst-pairwise one-way path-latency estimate (milliseconds)
+    /// for the session, from the descriptor — a fallback the initial-depth
+    /// computation folds in for the pre-start window the relay's own link
+    /// measurements cannot see. `None` when the descriptor carried none.
+    /// Descriptor-driven (set via [`set_session_shape`](Self::set_session_shape)),
+    /// so it survives authority changes like `expected_slots`.
+    latency_hint_ms: Option<u32>,
+    /// Whether the session spans exactly one relay (no mesh peers). The
+    /// initial-depth computation treats the pre-start conditions as *fully
+    /// observed* only for a single-relay session — a multi-relay session's
+    /// per-slot conditions never cross the mesh before the game starts — and adds
+    /// a one-turn hop cushion for a multi-relay session. Defaults `true` (a
+    /// standalone/dev maker with no descriptor is single-relay);
+    /// descriptor-driven via [`set_session_shape`](Self::set_session_shape).
+    single_relay: bool,
+    /// The computed initial latency-buffer depth this authority sized at the
+    /// coverage latch (see [`maybe_start`](Self::maybe_start)), stored so every
+    /// `SessionStart` this relay emits — the session-wide fan-out and each late
+    /// re-push — stamps the same value. `None` until the latch fires, on a relay
+    /// that never became the deciding authority, and on a resumed relay (which
+    /// latches started without sizing a depth). A peer relay adopts the
+    /// authority's value here via [`adopt_session_start`](Self::adopt_session_start).
+    initial_buffer_turns: Option<u32>,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -1712,6 +1735,9 @@ impl DecisionMaker {
             started: false,
             close_reported: false,
             own_relay_id: None,
+            latency_hint_ms: None,
+            single_relay: true,
+            initial_buffer_turns: None,
         }
     }
 
@@ -3015,6 +3041,43 @@ impl DecisionMaker {
         self.own_relay_id = Some(id);
     }
 
+    /// Records the descriptor-derived inputs to the initial-depth computation:
+    /// the tenant's `latency_hint_ms` estimate and whether the session is
+    /// `single_relay` (no mesh peers). Descriptor-driven like
+    /// [`set_expected_slots`](Self::set_expected_slots): set on create and on
+    /// every re-sync, so a rehome-rebuilt descriptor keeps them current (harmless
+    /// on a resumed relay, which never sizes a depth). Idempotent on a repeat.
+    pub fn set_session_shape(&mut self, latency_hint_ms: Option<u32>, single_relay: bool) {
+        self.latency_hint_ms = latency_hint_ms;
+        self.single_relay = single_relay;
+    }
+
+    /// The computed initial latency-buffer depth this relay stamps onto the
+    /// `SessionStart` directive — `Some` once the authority sized it at the
+    /// coverage latch (or a peer adopted the authority's value), `None`
+    /// otherwise. Read for every fan-out and late re-push.
+    pub fn initial_buffer_turns(&self) -> Option<u32> {
+        self.initial_buffer_turns
+    }
+
+    /// Adopts the authority's `SessionStart` on a peer relay: latches the session
+    /// started (so this relay's own late-registering local slots still get a
+    /// re-push) and, when the directive carried a depth, adopts it as this relay's
+    /// current buffer and stores it for this relay's own re-pushes — so a later
+    /// promotion reasons from the right base and this relay stamps the same depth.
+    /// A depth-less directive (an authority that predates the field, or a resumed
+    /// re-home re-push into a running game) leaves the buffer untouched: a stale
+    /// initial depth must never resize a live game. The depth is bounds-clamped
+    /// defensively, though the authority already clamped it before stamping.
+    pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
+        self.started = true;
+        if let Some(depth) = initial_buffer_turns {
+            let clamped = self.bounds.clamp(depth);
+            self.buffer = BufferSize(clamped);
+            self.initial_buffer_turns = Some(clamped);
+        }
+    }
+
     /// Whether `slot` is admissible on this relay: the homed set is empty
     /// (unenforced — see the field's doc) or contains `slot`. Read by
     /// [`slot_homed`] at client admission.
@@ -3068,6 +3131,14 @@ impl DecisionMaker {
     /// exactly when this relay is the authority, the expected set is non-empty,
     /// and the accumulated live slots cover it. Every other case returns `false`
     /// and changes nothing.
+    ///
+    /// The coverage latch is also where the authority sizes the session's initial
+    /// latency-buffer depth — exactly once, from the conditions accumulated during
+    /// the pre-start window (see [`compute_initial_depth`](Self::compute_initial_depth)).
+    /// It adopts the depth as its current `buffer` (so the one-shot first-frame
+    /// re-affirm in [`decide`](Self::decide) broadcasts the stamped depth rather
+    /// than clobbering it back to the minimum) and stores it for every
+    /// `SessionStart` it stamps.
     fn maybe_start(&mut self) -> bool {
         if self.started || self.authority != Authority::SelfRelay || self.expected_slots.is_empty()
         {
@@ -3075,9 +3146,82 @@ impl DecisionMaker {
         }
         if self.expected_slots.is_subset(&self.live_slots) {
             self.started = true;
+            let depth = self.compute_initial_depth();
+            self.buffer = BufferSize(depth);
+            self.initial_buffer_turns = Some(depth);
             return true;
         }
         false
+    }
+
+    /// Sizes the session's initial latency-buffer depth at the coverage latch,
+    /// from the pre-start conditions the authority has accumulated. The result is
+    /// clamped to [`BufferBounds`].
+    ///
+    /// `observed` is the control law's [`target`](Self::target) over those
+    /// conditions (the pairwise path of the two highest effective-RTT slots plus a
+    /// loss-risk term); `hint_turns` converts the descriptor's one-way
+    /// `latency_hint_ms` into turns. The session is **fully observed** only when it
+    /// is single-relay *and* every expected, still-present slot has an RTT
+    /// sample — a multi-relay session's per-slot conditions never cross the mesh
+    /// before the game starts, and a local slot may not have measured yet. A fully
+    /// observed session uses `observed` alone (the hint is a fallback for what the
+    /// window couldn't see, not a floor over reality). Otherwise it takes
+    /// `max(observed, hint)` and adds a one-turn hop cushion for a multi-relay
+    /// session (mirroring the in-game per-hop delivery cushion: pairwise max is two
+    /// hops, so +1). With neither observed nor hint, it falls back to `bounds.min`.
+    fn compute_initial_depth(&self) -> u32 {
+        let observed = self.target();
+        let hint_turns = self.latency_hint_turns();
+
+        let depth = if self.single_relay && self.all_expected_slots_have_rtt() {
+            // Fully observed: the pre-start window saw every expected slot's link,
+            // so the observed target is the truth; the hint is deliberately ignored
+            // (a stale estimate must not distort a fully-observed session). With
+            // every slot sampled, `observed` is `Some`, but fall back defensively.
+            observed.unwrap_or(self.bounds.min)
+        } else if observed.is_none() && hint_turns.is_none() {
+            // Nothing to size from — the pre-start window saw no RTT and no hint was
+            // supplied. Today's behavior: start at the tenant minimum.
+            self.bounds.min
+        } else {
+            let base = observed.unwrap_or(0).max(hint_turns.unwrap_or(0));
+            // One turn of hop cushion when the session spans more than one relay.
+            let cushion = u32::from(!self.single_relay);
+            base.saturating_add(cushion)
+        };
+
+        self.bounds.clamp(depth)
+    }
+
+    /// The descriptor's one-way `latency_hint_ms` converted to whole turns:
+    /// `ceil(ms * 1000 / turn_duration_us)`. The hint is the same one-way
+    /// pairwise-path quantity as the control law's path term, so the ms→turns
+    /// conversion lives here, in one place. `None` when no hint was supplied (or,
+    /// defensively, when the turn duration is zero).
+    fn latency_hint_turns(&self) -> Option<u32> {
+        let turn_us = u64::from(self.law.turn_duration_us);
+        if turn_us == 0 {
+            return None;
+        }
+        self.latency_hint_ms.map(|ms| {
+            let us = u64::from(ms).saturating_mul(1000);
+            // Whole turns, rounded up: a fractional turn of latency still needs a
+            // full turn of cushion. Bounded by `bounds.clamp` at the call site.
+            us.div_ceil(turn_us).min(u64::from(u32::MAX)) as u32
+        })
+    }
+
+    /// Whether every expected, still-present slot has at least one RTT sample —
+    /// the "fully observed" precondition. A departed slot is not still-present, so
+    /// it is exempt (at the latch, coverage means no expected slot has departed, so
+    /// this is defensive). A slot with no tracked conditions, or one QUIC has not
+    /// measured yet (RTT `0`), is not sampled, so the session is not fully observed
+    /// and the hint fallback applies.
+    fn all_expected_slots_have_rtt(&self) -> bool {
+        self.expected_slots.iter().all(|slot| {
+            self.departures.contains_key(slot) || self.slots.get(slot).is_some_and(|s| s.rtt() > 0)
+        })
     }
 
     /// Feeds one turn's commands into the desync comparator, returning a
@@ -3612,16 +3756,26 @@ pub fn sync_maker(
 /// exists (a session this relay does not serve, or one run without descriptors).
 #[must_use]
 pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
-    let fired = registry
-        .lock()
-        .get_mut(key)
-        .is_some_and(|maker| maker.note_slot_present(slot));
-    if fired {
-        registry
-            .flight
-            .record(key, crate::flight_recorder::FlightEvent::SessionStart);
+    // Capture the sized depth under the same lock the latch fires under, so the
+    // flight-recorder event names exactly what this fan-out will stamp.
+    let fired = {
+        let mut makers = registry.lock();
+        match makers.get_mut(key) {
+            Some(maker) => maker
+                .note_slot_present(slot)
+                .then(|| maker.initial_buffer_turns()),
+            None => None,
+        }
+    };
+    if let Some(initial_buffer_turns) = fired {
+        registry.flight.record(
+            key,
+            crate::flight_recorder::FlightEvent::SessionStart {
+                initial_buffer_turns,
+            },
+        );
     }
-    fired
+    fired.is_some()
 }
 
 /// Re-evaluates `key`'s session-start condition after an authority change,
@@ -3631,16 +3785,24 @@ pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: Slot
 /// exists.
 #[must_use]
 pub fn reevaluate_session_start(registry: &DecisionMakers, key: &SessionKey) -> bool {
-    let fired = registry
-        .lock()
-        .get_mut(key)
-        .is_some_and(|maker| maker.reevaluate_start());
-    if fired {
-        registry
-            .flight
-            .record(key, crate::flight_recorder::FlightEvent::SessionStart);
+    let fired = {
+        let mut makers = registry.lock();
+        match makers.get_mut(key) {
+            Some(maker) => maker
+                .reevaluate_start()
+                .then(|| maker.initial_buffer_turns()),
+            None => None,
+        }
+    };
+    if let Some(initial_buffer_turns) = fired {
+        registry.flight.record(
+            key,
+            crate::flight_recorder::FlightEvent::SessionStart {
+                initial_buffer_turns,
+            },
+        );
     }
-    fired
+    fired.is_some()
 }
 
 /// Whether `key`'s session-start directive has already been emitted — the guard
@@ -3659,6 +3821,45 @@ pub fn session_started(registry: &DecisionMakers, key: &SessionKey) -> bool {
 pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.mark_started();
+    }
+}
+
+/// Records the descriptor-derived initial-depth inputs (`latency_hint_ms` and
+/// whether the session is `single_relay`) onto `key`'s maker (see
+/// [`DecisionMaker::set_session_shape`]). A no-op when no maker exists.
+pub fn set_session_shape(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    latency_hint_ms: Option<u32>,
+    single_relay: bool,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.set_session_shape(latency_hint_ms, single_relay);
+    }
+}
+
+/// The computed initial latency-buffer depth `key`'s maker stamps onto every
+/// `SessionStart` it emits — `Some` once the authority sized it (or a peer
+/// adopted the authority's), `None` otherwise (including when no maker exists).
+/// See [`DecisionMaker::initial_buffer_turns`].
+pub fn session_initial_buffer_turns(registry: &DecisionMakers, key: &SessionKey) -> Option<u32> {
+    registry
+        .lock()
+        .get(key)
+        .and_then(DecisionMaker::initial_buffer_turns)
+}
+
+/// Adopts an authority's mesh `SessionStart` onto a peer relay's maker: latches
+/// started and, when the directive carried a depth, adopts it as the buffer and
+/// stores it for this relay's re-pushes (see
+/// [`DecisionMaker::adopt_session_start`]). A no-op when no maker exists.
+pub fn adopt_session_start(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    initial_buffer_turns: Option<u32>,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.adopt_session_start(initial_buffer_turns);
     }
 }
 
@@ -8021,6 +8222,219 @@ mod tests {
         // Even a later promotion never re-fires: the latch is already set.
         let _ = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
         assert!(!reevaluate_session_start(&registry, &k));
+    }
+
+    // -- Initial buffer depth sized at the coverage latch --
+
+    /// Builds an authority maker with the given bounds, expected slots, and
+    /// session shape, ready to drive to the coverage latch.
+    fn initial_depth_maker(
+        min: u32,
+        max: u32,
+        expected: &[u8],
+        latency_hint_ms: Option<u32>,
+        single_relay: bool,
+    ) -> DecisionMaker {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(min, max),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.set_expected_slots(expected.iter().map(|&s| SlotId(s)).collect());
+        maker.set_session_shape(latency_hint_ms, single_relay);
+        maker
+    }
+
+    /// Reports each of `present` as registered, returning whether the last one
+    /// fired the coverage latch (and, with it, the initial-depth computation).
+    fn drive_to_coverage(maker: &mut DecisionMaker, present: &[u8]) -> bool {
+        let mut fired = false;
+        for &s in present {
+            fired = maker.note_slot_present(SlotId(s));
+        }
+        fired
+    }
+
+    #[test]
+    fn initial_depth_fully_observed_single_relay_uses_observed_and_ignores_the_hint() {
+        // Single-relay with every expected slot sampled is "fully observed": the
+        // observed target is the truth, and a (higher) stale hint is ignored.
+        let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(200), true);
+        // Both slots at 150ms: target = ceil(150000/41666) = 4. Hint 200ms = 5.
+        maker.ingest_local(&multi_conditions(&[
+            (0, 150_000, 0, 100),
+            (1, 150_000, 0, 100),
+        ]));
+        assert!(drive_to_coverage(&mut maker, &[0, 1]), "coverage fires");
+        assert_eq!(maker.target(), Some(4), "the observed target");
+        assert_eq!(
+            maker.initial_buffer_turns(),
+            Some(4),
+            "fully observed uses the observed target, not the higher hint",
+        );
+        assert_eq!(maker.buffer(), BufferSize(4), "and adopts it as the buffer");
+    }
+
+    #[test]
+    fn initial_depth_multi_relay_uses_max_of_observed_and_hint_plus_a_hop_cushion() {
+        // A multi-relay session's per-slot conditions never cross the mesh before
+        // the game starts, so it is never fully observed: it takes
+        // max(observed, hint) and adds a one-turn hop cushion.
+        let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(200), false);
+        // Observed target 4 (both at 150ms); hint 200ms = 5; max = 5; +1 = 6.
+        maker.ingest_local(&multi_conditions(&[
+            (0, 150_000, 0, 100),
+            (1, 150_000, 0, 100),
+        ]));
+        assert!(drive_to_coverage(&mut maker, &[0, 1]));
+        assert_eq!(maker.target(), Some(4));
+        assert_eq!(
+            maker.initial_buffer_turns(),
+            Some(6),
+            "max(observed 4, hint 5) + a one-turn multi-relay hop cushion",
+        );
+        assert_eq!(maker.buffer(), BufferSize(6));
+    }
+
+    #[test]
+    fn initial_depth_single_relay_unobserved_slot_uses_the_hint_without_a_cushion() {
+        // Single-relay but one expected slot never produced an RTT sample: not
+        // fully observed, so the hint is the fallback — and no hop cushion, since
+        // the session spans one relay.
+        let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(300), true);
+        // Only slot 0 is sampled (150ms → observed 4). Slot 1 is present but never
+        // measured. Hint 300ms = ceil(300000/41666) = 8; max(4, 8) = 8, no cushion.
+        maker.ingest_local(&conditions(0, 150_000, 0, 100));
+        assert!(drive_to_coverage(&mut maker, &[0, 1]));
+        assert_eq!(
+            maker.initial_buffer_turns(),
+            Some(8),
+            "the hint covers the unobserved slot, with no multi-relay cushion",
+        );
+    }
+
+    #[test]
+    fn initial_depth_falls_back_to_bounds_min_with_no_conditions_and_no_hint() {
+        // Nothing observed and no hint: start at the tenant minimum (today's
+        // behavior).
+        let mut maker = initial_depth_maker(3, 20, &[0, 1], None, true);
+        assert!(drive_to_coverage(&mut maker, &[0, 1]));
+        assert_eq!(maker.target(), None, "no RTT observed");
+        assert_eq!(
+            maker.initial_buffer_turns(),
+            Some(3),
+            "falls back to the tenant minimum",
+        );
+        assert_eq!(maker.buffer(), BufferSize(3));
+    }
+
+    #[test]
+    fn initial_depth_clamps_to_both_bounds() {
+        // Above the ceiling: a huge observed target clamps down to max.
+        let mut hi = initial_depth_maker(1, 5, &[0, 1], None, true);
+        hi.ingest_local(&multi_conditions(&[
+            (0, 2_000_000, 0, 100),
+            (1, 2_000_000, 0, 100),
+        ]));
+        assert!(drive_to_coverage(&mut hi, &[0, 1]));
+        assert_eq!(hi.initial_buffer_turns(), Some(5), "clamped to the ceiling");
+        assert_eq!(hi.buffer(), BufferSize(5));
+
+        // Below the floor: a tiny observed target clamps up to min.
+        let mut lo = initial_depth_maker(6, 20, &[0, 1], None, true);
+        lo.ingest_local(&multi_conditions(&[
+            (0, 10_000, 0, 100),
+            (1, 10_000, 0, 100),
+        ]));
+        assert!(drive_to_coverage(&mut lo, &[0, 1]));
+        assert_eq!(
+            lo.initial_buffer_turns(),
+            Some(6),
+            "clamped up to the floor"
+        );
+        assert_eq!(lo.buffer(), BufferSize(6));
+    }
+
+    #[test]
+    fn the_adopted_depth_is_what_the_first_frame_re_affirm_broadcasts() {
+        // The adoption into `buffer` is load-bearing: the one-shot first-frame
+        // re-affirm broadcasts the current buffer, so it must name the stamped
+        // depth rather than clobbering it back to the minimum.
+        let mut maker = initial_depth_maker(0, 20, &[0, 1], None, true);
+        let conds = multi_conditions(&[(0, 150_000, 0, 100), (1, 150_000, 0, 100)]);
+        maker.ingest_local(&conds);
+        assert!(drive_to_coverage(&mut maker, &[0, 1]));
+        assert_eq!(maker.initial_buffer_turns(), Some(4));
+        assert_eq!(maker.buffer(), BufferSize(4));
+
+        // The first framed turn: the control law holds (target == buffer), so the
+        // one-shot initial re-affirm fires — re-affirming 4 (the adopted depth),
+        // not bounds.min.
+        let decision = ingest_at(&mut maker, &conds, 10).expect("the re-affirm fires once");
+        assert_eq!(
+            decision.buffer,
+            BufferSize(4),
+            "the re-affirm broadcasts the stamped depth, not bounds.min",
+        );
+        // And it is a one-shot: a later framed turn at the same target re-affirms
+        // nothing.
+        assert!(ingest_at(&mut maker, &conds, 11).is_none());
+    }
+
+    #[test]
+    fn a_relay_that_only_marks_started_sizes_no_depth() {
+        // A resumed (re-home) relay latches started via `mark_started` without ever
+        // running the coverage computation, so it stamps no depth — a stale initial
+        // depth must never resize a running game.
+        let mut maker = initial_depth_maker(1, 20, &[0, 1], Some(200), true);
+        maker.ingest_local(&multi_conditions(&[
+            (0, 150_000, 0, 100),
+            (1, 150_000, 0, 100),
+        ]));
+        maker.mark_started();
+        assert!(maker.is_started());
+        assert_eq!(maker.initial_buffer_turns(), None, "no depth synthesized");
+        assert_eq!(
+            maker.buffer(),
+            BufferSize(1),
+            "the buffer stays at the seed"
+        );
+    }
+
+    #[test]
+    fn a_peer_adopts_the_authoritys_stamped_depth() {
+        // A peer adopts the authority's carried depth into its buffer and stores it
+        // for its own re-pushes; the value is bounds-clamped defensively.
+        let mut peer =
+            DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+        peer.adopt_session_start(Some(4));
+        assert!(peer.is_started());
+        assert_eq!(peer.initial_buffer_turns(), Some(4));
+        assert_eq!(peer.buffer(), BufferSize(4));
+
+        let mut clamped =
+            DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+        clamped.adopt_session_start(Some(99));
+        assert_eq!(
+            clamped.buffer(),
+            BufferSize(5),
+            "an over-ceiling depth clamps"
+        );
+
+        // A depth-less directive (an old authority, or a resumed re-push into a
+        // running game) latches started but leaves the seed buffer untouched.
+        let mut peerless =
+            DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+        peerless.adopt_session_start(None);
+        assert!(peerless.is_started());
+        assert_eq!(peerless.initial_buffer_turns(), None);
+        assert_eq!(
+            peerless.buffer(),
+            BufferSize(1),
+            "the seed buffer is untouched"
+        );
     }
 
     #[test]
