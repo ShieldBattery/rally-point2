@@ -59,6 +59,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 use crate::consensus::RelayNotice;
 use crate::mesh_control::MeshControl;
@@ -276,6 +277,14 @@ pub enum ControlError {
     /// The `Authorization` header value could not be built from the secret.
     #[error("building the control request authorization failed: {0}")]
     Authorization(#[from] tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue),
+    /// The loaded identity private key is not an algorithm the enroll
+    /// proof-of-possession signer supports, so the coordinator's identity
+    /// challenge cannot be answered. A configuration/build fault — a key this
+    /// relay's own certificate loading could never have produced — not a
+    /// transient condition, so it ends the connection rather than leaving the
+    /// challenge silently unanswered.
+    #[error("the loaded identity key cannot sign the enroll proof-of-possession challenge")]
+    UnsupportedIdentityKey,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
@@ -514,6 +523,52 @@ async fn connect_and_stream(
     // is about to land, rather than waiting on it.
     let _ = control_connected.send(true);
 
+    // Complete the enroll proof-of-possession handshake before sending any
+    // application frame. The coordinator sends an `IdentityChallenge` as the
+    // first frame after the Hello and reads exactly one frame back expecting the
+    // `IdentityProof`; if a pending notice or a drain re-assert reached the wire
+    // first, the coordinator would read that instead and refuse the enroll — and
+    // a pending notice persists across reconnects, locking the relay out of
+    // re-enrolling indefinitely. Read frames until the challenge is answered.
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                match serde_json::from_str::<CoordinatorToRelay>(text.as_str())? {
+                    CoordinatorToRelay::IdentityChallenge { nonce } => {
+                        answer_identity_challenge(&mut socket, identity_key, &nonce, relay_id)
+                            .await?;
+                        break;
+                    }
+                    // The coordinator always challenges first, so any other frame
+                    // here is a protocol violation. End the connection rather than
+                    // proceed un-enrolled; the caller redials.
+                    _ => {
+                        tracing::warn!(
+                            relay_id = relay_id.0,
+                            "coordinator sent a control frame before the enroll challenge; \
+                             disconnecting",
+                        );
+                        return Ok(ControlDisconnect::Ordinary);
+                    }
+                }
+            }
+            // A refusal that arrives before the challenge: the coordinator
+            // validates version and region before challenging and closes on
+            // failure. Classify it with the same helper the steady-state loop uses.
+            Some(Ok(Message::Close(frame))) => {
+                return Ok(classify_control_close(frame, relay_id));
+            }
+            // Ping/pong (and any other non-text frame) carry no enrollment content;
+            // keep reading for the challenge.
+            Some(Ok(_)) => continue,
+            // A read error ends the connection with that error.
+            Some(Err(error)) => return Err(error.into()),
+            // The stream ended before the challenge; let the caller redial.
+            None => return Ok(ControlDisconnect::Ordinary),
+        }
+    }
+
+    // The enroll handshake is complete, so application frames may now go out.
     // Flush a notice held over from a prior connection first: one decided while
     // the coordinator was down (or one a failed send left pending) must go out on
     // this fresh connection before anything else, so it is not lost to the
@@ -525,9 +580,10 @@ async fn connect_and_stream(
 
     // Re-assert a drain that is already in progress. A re-enroll clears the
     // coordinator-side draining flag, so if we are mid-drain this fresh connection
-    // must re-send `Draining` right after the Hello or the coordinator would treat
-    // us as available again. `borrow_and_update` also marks the current value seen,
-    // so the loop's `drain.changed()` below fires only on a *new* transition.
+    // must re-send `Draining` (right after enrolling, ahead of the steady-state
+    // loop) or the coordinator would treat us as available again.
+    // `borrow_and_update` also marks the current value seen, so the loop's
+    // `drain.changed()` below fires only on a *new* transition.
     if *drain.borrow_and_update() {
         send_draining(&mut socket).await?;
     }
@@ -579,94 +635,28 @@ async fn connect_and_stream(
                                 fleet.store(peers);
                             }
                             CoordinatorToRelay::IdentityChallenge { nonce } => {
-                                // Stateless: sign and reply immediately, wherever this
-                                // arrives in the stream. The coordinator alone decides
-                                // when to challenge and how long to wait for the
-                                // answer, so there is no handshake-phase state of our
-                                // own to track.
-                                match sign_enroll_proof(identity_key, &nonce) {
-                                    Some(signature) => {
-                                        let frame = serde_json::to_string(
-                                            &RelayToCoordinator::IdentityProof { signature },
-                                        )
-                                        .expect("an identity-proof frame always serializes");
-                                        socket.send(Message::Text(frame.into())).await?;
-                                    }
-                                    None => tracing::error!(
-                                        relay_id = relay_id.0,
-                                        "cannot answer the coordinator's enroll proof-of-\
-                                         possession challenge: the loaded private key is \
-                                         not a supported algorithm",
-                                    ),
-                                }
+                                // The enroll handshake above already answered the
+                                // coordinator's challenge before this loop began, and
+                                // the coordinator does not re-challenge. This arm
+                                // answers one anyway, wherever it might arrive, so the
+                                // match stays exhaustive and the "answer wherever it
+                                // lands" robustness is preserved.
+                                answer_identity_challenge(
+                                    &mut socket,
+                                    identity_key,
+                                    &nonce,
+                                    relay_id,
+                                )
+                                .await?;
                             }
                             other => apply_message(control, other, applied),
                         }
                     }
                     Message::Close(frame) => {
-                        // A protocol-version refusal is a distinct disconnect: the
-                        // coordinator found no common version and will keep refusing
-                        // until a deploy fixes the skew, so the caller backs off far
-                        // longer than a normal reconnect. The reason names both
-                        // windows — surface it at error, since no amount of retrying
-                        // resolves this.
-                        if let Some(frame) = &frame
-                            && u16::from(frame.code) == CONTROL_CLOSE_PROTOCOL_MISMATCH
-                        {
-                            tracing::error!(
-                                relay_id = relay_id.0,
-                                reason = %frame.reason,
-                                "coordinator refused our protocol version; backing off until a deploy resolves the skew",
-                            );
-                            return Ok(ControlDisconnect::VersionRefused);
-                        }
-                        // An unknown-region refusal is the sibling of the version
-                        // mismatch: the coordinator will keep refusing until its
-                        // region config (or this relay's `--region`) is corrected, so
-                        // back off long rather than hot-redialing the same refusal.
-                        if let Some(frame) = &frame
-                            && u16::from(frame.code) == CONTROL_CLOSE_UNKNOWN_REGION
-                        {
-                            tracing::error!(
-                                relay_id = relay_id.0,
-                                reason = %frame.reason,
-                                "coordinator refused our region; backing off until the region config is fixed",
-                            );
-                            return Ok(ControlDisconnect::RegionRefused);
-                        }
-                        // An identity-unproven refusal means our signed answer to the
-                        // enroll challenge didn't verify (or we never sent one) — a
-                        // config/implementation fault (wrong key, broken signer), not
-                        // a transient condition, so back off long like the version and
-                        // region refusals rather than hot-redialing the same failure.
-                        if let Some(frame) = &frame
-                            && u16::from(frame.code) == CONTROL_CLOSE_IDENTITY_UNPROVEN
-                        {
-                            tracing::error!(
-                                relay_id = relay_id.0,
-                                reason = %frame.reason,
-                                "coordinator rejected our enroll proof of possession; backing off until the key/cert mismatch is fixed",
-                            );
-                            return Ok(ControlDisconnect::IdentityUnproven);
-                        }
-                        // A duplicate-relay-id refusal means the registry already
-                        // holds a live entry for our id under a different certificate
-                        // — most often a crashed predecessor that hasn't aged out via
-                        // the coordinator's liveness deadline yet. That resolves on
-                        // its own, so this is logged distinctly but backs off on the
-                        // *ordinary* (short) delay like any other close: retrying is
-                        // exactly what lets the enroll converge once the stale entry
-                        // expires.
-                        if let Some(frame) = &frame
-                            && u16::from(frame.code) == CONTROL_CLOSE_DUPLICATE_RELAY_ID
-                        {
-                            tracing::warn!(
-                                relay_id = relay_id.0,
-                                reason = %frame.reason,
-                                "coordinator refused our relay id as already enrolled under a different certificate; retrying",
-                            );
-                        }
-                        break;
+                        // Classify the refusal (and log its stated reason) with the
+                        // same helper the enroll handshake uses, so a close is read
+                        // identically wherever it arrives.
+                        return Ok(classify_control_close(frame, relay_id));
                     }
                     // The coordinator sends no pings today and the relay reads only
                     // descriptor text frames; any other frame is ignored.
@@ -751,6 +741,94 @@ async fn send_notice(
     let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
     socket.send(Message::Text(text.into())).await?;
     Ok(())
+}
+
+/// Answers the coordinator's enroll proof-of-possession challenge: signs
+/// `ENROLL_POP_CONTEXT ++ nonce` with the relay's identity key (see
+/// [`sign_enroll_proof`]) and sends the [`RelayToCoordinator::IdentityProof`] up
+/// the connection, so the coordinator's verification against the certificate the
+/// `Hello` presented succeeds.
+///
+/// A key this relay's own certificate loading could never have produced cannot
+/// sign the challenge; that surfaces as [`ControlError::UnsupportedIdentityKey`],
+/// ending the connection rather than proceeding un-enrolled. Both the enroll
+/// handshake and the steady-state loop's defensive re-answer route through here,
+/// so a challenge is answered identically wherever it arrives.
+async fn answer_identity_challenge(
+    socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    identity_key: &PrivateKeyDer<'static>,
+    nonce: &[u8; 32],
+    relay_id: RelayId,
+) -> Result<(), ControlError> {
+    match sign_enroll_proof(identity_key, nonce) {
+        Some(signature) => {
+            let frame = serde_json::to_string(&RelayToCoordinator::IdentityProof { signature })
+                .expect("an identity-proof frame always serializes");
+            socket.send(Message::Text(frame.into())).await?;
+            Ok(())
+        }
+        None => {
+            tracing::error!(
+                relay_id = relay_id.0,
+                "cannot answer the coordinator's enroll proof-of-possession challenge: \
+                 the loaded private key is not a supported algorithm",
+            );
+            Err(ControlError::UnsupportedIdentityKey)
+        }
+    }
+}
+
+/// Classifies a coordinator control-connection close into the
+/// [`ControlDisconnect`] the reconnect loop backs its next-dial delay on, logging
+/// the coordinator's stated reason at the level each code warrants. Shared by the
+/// enroll handshake and the steady-state loop so a close is read identically
+/// whether it lands before or after the identity challenge.
+///
+/// A version mismatch, an unknown region, and an unproven identity are
+/// operator-fix-not-redial refusals — each maps to its own long-backoff variant.
+/// A duplicate-relay-id refusal (a stale predecessor entry that ages out on its
+/// own) is logged distinctly but takes the ordinary short delay, as does every
+/// other close, so retrying is exactly what lets the enroll converge once the
+/// stale entry expires.
+fn classify_control_close(frame: Option<CloseFrame>, relay_id: RelayId) -> ControlDisconnect {
+    let Some(frame) = frame else {
+        return ControlDisconnect::Ordinary;
+    };
+    match u16::from(frame.code) {
+        CONTROL_CLOSE_PROTOCOL_MISMATCH => {
+            tracing::error!(
+                relay_id = relay_id.0,
+                reason = %frame.reason,
+                "coordinator refused our protocol version; backing off until a deploy resolves the skew",
+            );
+            ControlDisconnect::VersionRefused
+        }
+        CONTROL_CLOSE_UNKNOWN_REGION => {
+            tracing::error!(
+                relay_id = relay_id.0,
+                reason = %frame.reason,
+                "coordinator refused our region; backing off until the region config is fixed",
+            );
+            ControlDisconnect::RegionRefused
+        }
+        CONTROL_CLOSE_IDENTITY_UNPROVEN => {
+            tracing::error!(
+                relay_id = relay_id.0,
+                reason = %frame.reason,
+                "coordinator rejected our enroll proof of possession; backing off until the key/cert mismatch is fixed",
+            );
+            ControlDisconnect::IdentityUnproven
+        }
+        CONTROL_CLOSE_DUPLICATE_RELAY_ID => {
+            tracing::warn!(
+                relay_id = relay_id.0,
+                reason = %frame.reason,
+                "coordinator refused our relay id as already enrolled under a different certificate; retrying",
+            );
+            ControlDisconnect::Ordinary
+        }
+        _ => ControlDisconnect::Ordinary,
+    }
 }
 
 /// Signs `nonce` for the enroll proof-of-possession exchange: the exact bytes
@@ -1255,11 +1333,12 @@ mod tests {
             let (first, _) = listener.accept().await.unwrap();
             drop(first);
 
-            // Second connection: complete the WebSocket handshake, read the enroll
-            // Hello, then the flushed notice.
+            // Second connection: complete the WebSocket handshake and the enroll
+            // proof exchange, then read the flushed notice — which the relay sends
+            // only after the proof.
             let (second, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(second).await.unwrap();
-            let hello = ws.next().await.unwrap().unwrap();
+            let hello = accept_enroll(&mut ws).await;
             let Message::Text(hello) = hello else {
                 panic!("first frame is the Hello");
             };
@@ -1416,12 +1495,48 @@ mod tests {
         )
     }
 
-    /// A private key for tests that need *some* value for `identity_key` but
-    /// never actually get challenged — these drive a hand-scripted stand-in
-    /// coordinator, not `serve_relay_control`, so nothing ever reads it.
+    /// A private key for the `identity_key` these stand-in-coordinator tests
+    /// pass. `rcgen`'s default is an ECDSA P-256 key, which [`sign_enroll_proof`]
+    /// can sign, so [`accept_enroll`]'s challenge is answered with a valid
+    /// `IdentityProof`. The stand-in coordinators don't *verify* the signature —
+    /// they only assert the proof frame arrives in the right order — so any
+    /// signable key suffices.
     fn throwaway_identity_key() -> PrivateKeyDer<'static> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap()
+    }
+
+    /// Drives the coordinator side of the enroll proof-of-possession handshake on
+    /// `ws`: reads the relay's Hello, sends an `IdentityChallenge`, and reads and
+    /// asserts the relay's `IdentityProof` answer — leaving `ws` positioned to
+    /// read the relay's first post-enroll application frame. Returns the Hello
+    /// frame for the caller's own assertions.
+    ///
+    /// Every stand-in coordinator that reads past the Hello must run this first:
+    /// the relay completes the enroll handshake before it sends any application
+    /// frame (notice, drain, heartbeat), so a coordinator that skipped the
+    /// challenge would leave the relay blocked waiting for one.
+    async fn accept_enroll<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Message
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let hello = ws.next().await.unwrap().unwrap();
+        let challenge =
+            serde_json::to_string(&CoordinatorToRelay::IdentityChallenge { nonce: [0u8; 32] })
+                .expect("an identity-challenge frame serializes");
+        ws.send(Message::Text(challenge.into())).await.unwrap();
+        let proof = ws.next().await.unwrap().unwrap();
+        let Message::Text(proof) = proof else {
+            panic!("the relay answers the challenge with a text IdentityProof frame");
+        };
+        assert!(
+            matches!(
+                serde_json::from_str::<RelayToCoordinator>(&proof).unwrap(),
+                RelayToCoordinator::IdentityProof { .. },
+            ),
+            "the relay's first post-Hello frame is the IdentityProof",
+        );
+        hello
     }
 
     #[tokio::test]
@@ -1432,12 +1547,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
 
-        // Stand-in coordinator: accept, read the enroll Hello, then the frame that
-        // follows once the relay is told to drain.
+        // Stand-in coordinator: accept, complete the enroll handshake, then read
+        // the frame that follows once the relay is told to drain.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let hello = ws.next().await.unwrap().unwrap();
+            let hello = accept_enroll(&mut ws).await;
             let next = ws.next().await.unwrap().unwrap();
             let _ = frames_tx.send((hello, next));
         });
@@ -1494,12 +1609,12 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Stand-in coordinator: accept, read the Hello, then send a DrainAck and
-        // hold the connection open.
+        // Stand-in coordinator: accept, complete the enroll handshake, then send a
+        // DrainAck and hold the connection open.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _hello = ws.next().await.unwrap().unwrap();
+            let _hello = accept_enroll(&mut ws).await;
             let ack = serde_json::to_string(&CoordinatorToRelay::DrainAck).unwrap();
             ws.send(Message::Text(ack.into())).await.unwrap();
             // Keep the connection open so the relay doesn't reconnect mid-assert.
@@ -1547,14 +1662,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
-        // Stand-in coordinator: the FIRST connection reads Hello then Draining and
-        // drops; the SECOND (reconnect) must again read Hello then Draining — proving
-        // a relay that reconnects mid-drain re-asserts it right after the Hello.
+        // Stand-in coordinator: the FIRST connection enrolls then reads Draining and
+        // drops; the SECOND (reconnect) must again enroll then read Draining —
+        // proving a relay that reconnects mid-drain re-asserts it right after the
+        // enroll handshake completes.
         tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let hello = ws.next().await.unwrap().unwrap();
+                let hello = accept_enroll(&mut ws).await;
                 let Message::Text(hello) = hello else {
                     panic!("first frame is the Hello");
                 };
@@ -1608,6 +1724,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_enroll_proof_precedes_a_pending_notice_and_a_drain() {
+        use tokio::net::TcpListener;
+
+        // The coordinator sends the IdentityChallenge as the first post-Hello
+        // frame and reads exactly one frame back expecting the IdentityProof. A
+        // relay that reconnects with a queued notice AND mid-drain would, without
+        // an enroll handshake that completes first, send that notice (or the
+        // Draining) ahead of the proof and be refused. This asserts the proof is
+        // the first frame after the challenge, with the notice and Draining
+        // strictly behind it.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Read the Hello, then challenge and read the very next frame — the
+            // proof must be it, ahead of the queued notice and the drain re-assert.
+            let hello = ws.next().await.unwrap().unwrap();
+            let Message::Text(hello) = hello else {
+                panic!("first frame is the Hello");
+            };
+            assert!(hello.contains("\"type\":\"hello\""));
+            let challenge =
+                serde_json::to_string(&CoordinatorToRelay::IdentityChallenge { nonce: [7u8; 32] })
+                    .unwrap();
+            ws.send(Message::Text(challenge.into())).await.unwrap();
+
+            // Capture the next three frames in wire order: proof, then the notice
+            // and the Draining (in whichever order the relay flushes them).
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            let third = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((first, second, third));
+        });
+
+        // Queue a notice AND set the relay mid-drain before it starts, so both
+        // would race the proof if enrollment did not complete first.
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        notices_tx
+            .send(RelayNotice::Departure(dropped_notice()))
+            .unwrap();
+        let (_drain_tx, drain_rx) = watch::channel(true);
+        let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            throwaway_identity_key(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            FleetMeshPeers::default(),
+            notices_rx,
+            drain_rx,
+            drain_acked_tx,
+            no_connected(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600), // no heartbeat during the test
+        ));
+
+        let (first, second, third) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("the relay sends the proof then the queued frames")
+            .unwrap();
+
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+
+        assert!(
+            matches!(decode(first), RelayToCoordinator::IdentityProof { .. }),
+            "the identity proof must be the first frame after the challenge",
+        );
+        let rest = [decode(second), decode(third)];
+        assert!(
+            rest.contains(&RelayToCoordinator::Departure(dropped_notice())),
+            "the queued notice goes out only after the proof",
+        );
+        assert!(
+            rest.contains(&RelayToCoordinator::Draining),
+            "the drain re-assert goes out only after the proof",
+        );
+    }
+
+    #[tokio::test]
     async fn a_heartbeat_carries_the_live_roster_as_presence() {
         use tokio::net::TcpListener;
 
@@ -1615,11 +1828,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
 
-        // Stand-in coordinator: read the Hello, then the first heartbeat.
+        // Stand-in coordinator: complete the enroll handshake, then read the first
+        // heartbeat.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let hello = ws.next().await.unwrap().unwrap();
+            let hello = accept_enroll(&mut ws).await;
             let Message::Text(hello) = hello else {
                 panic!("first frame is the Hello");
             };
@@ -1944,12 +2158,13 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Stand-in coordinator: accept, read the Hello, push a MeshPeers set, then
-        // hold the connection open so the relay does not reconnect mid-assert.
+        // Stand-in coordinator: accept, complete the enroll handshake, push a
+        // MeshPeers set, then hold the connection open so the relay does not
+        // reconnect mid-assert.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _hello = ws.next().await.unwrap().unwrap();
+            let _hello = accept_enroll(&mut ws).await;
             let frame = serde_json::to_string(&CoordinatorToRelay::MeshPeers {
                 peers: vec![
                     MeshPeerIdentity {
