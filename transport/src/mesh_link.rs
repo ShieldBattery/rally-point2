@@ -4,11 +4,15 @@
 //! A [`MeshLink`] owns one `quinn::Connection` and a registry of [`SessionLink`]
 //! instances — one per game active on that relay-pair. Every datagram on the
 //! connection is a [`MeshPacket`]: a
-//! session id plus the per-link [`Packet`]
-//! for that session. The link demultiplexes by session: each session's
-//! [`AckManager`] and `Dedup` instance only ever sees its own session's
-//! packets, so the origin `(slot, seq)` identity is unambiguous within an
-//! instance — the session never enters the dedup/ack/retirement key.
+//! session id (plus an optional tenant) and the per-link [`Packet`] for that
+//! session. The link demultiplexes by [`MeshSessionKey`] — the session id
+//! alone when a datagram carries no tenant, or the full `(session, tenant)`
+//! pair when it does, so two sessions that happen to share a numeric id under
+//! different tenants get independent transport state instead of colliding.
+//! Each key's own [`AckManager`] and `Dedup` instance only ever sees its own
+//! session's packets, so the origin `(slot, seq)` identity is unambiguous
+//! within an instance — neither the session nor the tenant ever enters the
+//! dedup/ack/retirement key itself.
 //!
 //! This is the faithful reading of "one QUIC connection per relay-pair"
 //! (architecture.md §"The mesh"): a relay-pair shares one connection, so the
@@ -40,18 +44,20 @@ use crate::ack_manager::{AckError, AckManager, PacketSeqExhausted};
 use crate::link::{Dedup, Delivery, LinkError, Received};
 
 /// Worst-case byte overhead a `MeshPacket` adds around the inner `Packet` when
-/// the wrapper carries no conditions sidecar: the session field tag (1) + its
-/// varint (≤10 for a u64, but a real session id fits in ≤5), plus the inner
-/// `Packet` field tag (1) + its length prefix (≤3 for any packet under ~16MB).
-/// 16 covers the worst case with margin.
+/// the wrapper carries no conditions sidecar and no tenant: the session field
+/// tag (1) + its varint (≤10 for a u64, but a real session id fits in ≤5),
+/// plus the inner `Packet` field tag (1) + its length prefix (≤3 for any
+/// packet under ~16MB). 16 covers the worst case with margin.
 ///
-/// When conditions are attached, [`MeshLink::send`] measures their exact wire
-/// cost with a prost `encoded_len` probe rather than reserving a fixed worst
-/// case, so the redundancy budget that defends lockstep latency is never stolen
-/// by a reservation for conditions that may be small or absent (ack-only
-/// flushes carry none at all). The inner `Packet` field's own tag + length
-/// prefix is the one part that can't be probed without the packet itself, so it
-/// stays in this const — it is bounded and small.
+/// When conditions or a tenant are attached, [`MeshLink::send`] measures each
+/// one's exact wire cost with a prost `encoded_len` probe (conditions) or a
+/// direct length computation (the tenant string) rather than reserving a fixed
+/// worst case, so the redundancy budget that defends lockstep latency is never
+/// stolen by a reservation for a field that may be small or absent (ack-only
+/// flushes carry no conditions; a tenant-less send carries no tenant). The
+/// inner `Packet` field's own tag + length prefix is the one part that can't
+/// be probed without the packet itself, so it stays in this const — it is
+/// bounded and small.
 const MESH_PACKET_OVERHEAD: usize = 16;
 
 /// The exact wire cost of embedding `conditions` as the `MeshPacket.conditions`
@@ -67,6 +73,67 @@ const MESH_PACKET_OVERHEAD: usize = 16;
 fn conditions_element_len(conditions: &LinkConditions) -> usize {
     let body_len = conditions.encoded_len();
     1 + prost::encoding::encoded_len_varint(body_len as u64) + body_len
+}
+
+/// The exact wire cost of embedding `tenant` as the `MeshPacket.tenant` field:
+/// the field's own tag (1 byte — field number 4 fits a 1-byte tag), its
+/// length-delimiter varint, and the string's raw byte length. Mirrors
+/// [`conditions_element_len`] for the same reason: a tenant id can run up to
+/// 255 bytes (`token::MAX_STRING_LEN`), far past [`MESH_PACKET_OVERHEAD`]'s
+/// fixed margin, so its wire cost is measured exactly rather than guessed at.
+fn tenant_element_len(tenant: &str) -> usize {
+    let body_len = tenant.len();
+    1 + prost::encoding::encoded_len_varint(body_len as u64) + body_len
+}
+
+/// A mesh link's per-session key: the bare session id a `MeshPacket` always
+/// carries, plus the tenant it optionally stamps.
+///
+/// `MeshPacket.tenant` is additive on the wire (a sender that predates it, or
+/// one with nothing to scope by, sends none), so this key mirrors that shape:
+/// `None` groups with every other tenant-less registration under the same
+/// bare id — the legacy path every pre-tenant caller keeps working through —
+/// while `Some(tenant)` scopes a session to exactly that tenant, so two
+/// sessions that happen to share a numeric id under different tenants get
+/// wholly independent per-link transport state (their own [`AckManager`] +
+/// `Dedup`) instead of colliding.
+///
+/// `MeshLink` never interprets the tenant string itself: validation,
+/// uniqueness, and the tenant type's own invariants are
+/// `rally_point_proto::control::TenantId`'s job, one layer up — this crate
+/// doesn't depend on that control-plane type, so a plain `String` (not the
+/// newtype) is what keeps this key transport-local. It only needs something
+/// `Eq + Hash` to key its per-session map.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeshSessionKey {
+    /// The session id.
+    pub session: SessionId,
+    /// The tenant the key is scoped to, or `None` for the legacy (tenant-less)
+    /// path.
+    pub tenant: Option<String>,
+}
+
+impl MeshSessionKey {
+    /// A tenant-scoped session key.
+    pub fn new(session: SessionId, tenant: impl Into<String>) -> Self {
+        Self {
+            session,
+            tenant: Some(tenant.into()),
+        }
+    }
+}
+
+impl From<SessionId> for MeshSessionKey {
+    /// The legacy, tenant-less key. Lets a caller that predates tenant
+    /// scoping (or genuinely has none to offer, like most of this module's
+    /// own tests) keep calling `MeshLink`'s per-session methods with a bare
+    /// `SessionId`, since they all accept `impl Into<MeshSessionKey>`.
+    fn from(session: SessionId) -> Self {
+        Self {
+            session,
+            tenant: None,
+        }
+    }
 }
 
 /// Whether this relay should be the one to dial `peer_id` on the mesh, given
@@ -101,7 +168,7 @@ pub fn should_dial_mesh(our_id: RelayId, peer_id: RelayId) -> bool {
 /// peer-relay counterpart for that session goes away.
 pub struct MeshLink {
     connection: quinn::Connection,
-    sessions: HashMap<SessionId, SessionLink>,
+    sessions: HashMap<MeshSessionKey, SessionLink>,
 }
 
 /// One session's per-link transport state on a mesh link: its own
@@ -201,6 +268,12 @@ impl From<LinkError> for MeshLinkError {
 pub struct MeshReceived {
     /// The session this datagram belonged to.
     pub session: SessionId,
+    /// The tenant the sender stamped on this datagram, or `None` when it
+    /// carried none — exactly what decided which session's transport state
+    /// this datagram demultiplexed to (see [`MeshSessionKey`]), so a caller
+    /// that needs the full identity back (rather than re-deriving it) can read
+    /// it straight off here instead of the bare `session`.
+    pub tenant: Option<String>,
     /// What the inner `Packet` delivered (new payloads, deduped) plus whether
     /// it carried payloads at all.
     pub delivery: Received,
@@ -228,21 +301,27 @@ impl MeshLink {
     }
 
     /// Opens a new session's transport state on this link. Idempotent: opening
-    /// an already-open session is a no-op (a relay may re-offer a session its
-    /// peer already announced). Returns a borrow so the caller can drive the
-    /// session without a separate lookup.
-    pub fn open_session(&mut self, session: SessionId) -> &mut SessionLink {
-        self.sessions.entry(session).or_insert_with(|| SessionLink {
-            acks: AckManager::new(),
-            dedup: Dedup::new(),
-        })
+    /// an already-open session (the same key) is a no-op (a relay may re-offer
+    /// a session its peer already announced). Returns a borrow so the caller
+    /// can drive the session without a separate lookup.
+    ///
+    /// `key` accepts a bare `SessionId` (the legacy, tenant-less path) or an
+    /// explicit [`MeshSessionKey`] (tenant-scoped) — see that type's doc for
+    /// what distinguishes them.
+    pub fn open_session(&mut self, key: impl Into<MeshSessionKey>) -> &mut SessionLink {
+        self.sessions
+            .entry(key.into())
+            .or_insert_with(|| SessionLink {
+                acks: AckManager::new(),
+                dedup: Dedup::new(),
+            })
     }
 
     /// Drops a session's transport state. Called when the game ends or the
     /// peer-relay side for that session is gone. Idempotent: closing an absent
-    /// session is a no-op.
-    pub fn close_session(&mut self, session: SessionId) {
-        self.sessions.remove(&session);
+    /// session (or key) is a no-op.
+    pub fn close_session(&mut self, key: impl Into<MeshSessionKey>) {
+        self.sessions.remove(&key.into());
     }
 
     /// Builds the next `MeshPacket` for `session` — `payload` plus redundant
@@ -259,34 +338,43 @@ impl MeshLink {
     /// controller paces every session's datagrams, which is the point of the
     /// shared connection.
     ///
+    /// `key` accepts a bare `SessionId` (the legacy, tenant-less path) or an
+    /// explicit [`MeshSessionKey`] (tenant-scoped) — see that type's doc. When
+    /// `key` carries a tenant, it is stamped onto the outgoing `MeshPacket` so
+    /// the peer can demultiplex it against the right session even if another
+    /// tenant happens to share the same numeric session id.
+    ///
     /// `conditions` carries the sender relay's home-client link stats for the
     /// latency-buffer decision-maker. When present, its exact wire cost is
     /// measured with a prost `encoded_len` probe and subtracted from the packet
     /// budget — so the redundancy budget that defends lockstep latency is never
     /// stolen by a fixed worst-case reservation, and ack-only flushes (which
-    /// carry no conditions) keep their full budget. The inner `Packet` is then
-    /// built to the budget *minus* `MESH_PACKET_OVERHEAD` (the inner-Packet
-    /// field tag + length prefix that can't be probed without the packet
-    /// itself), so the `MeshPacket` wrapper fits the datagram even when
+    /// carry no conditions) keep their full budget. A tenant-scoped `key` gets
+    /// the same exact-cost treatment (a tag + length-prefix + body probe),
+    /// since a tenant id can run far past a fixed margin. The inner `Packet` is then
+    /// built to what's left of the budget *minus* `MESH_PACKET_OVERHEAD` (the
+    /// inner-Packet field tag + length prefix that can't be probed without the
+    /// packet itself), so the `MeshPacket` wrapper fits the datagram even when
     /// redundancy fills the inner packet — the client-edge [`Link::send`](crate::Link::send)
     /// needs no such reservation because its datagram *is* the `Packet`.
     pub fn send(
         &mut self,
-        session: SessionId,
+        key: impl Into<MeshSessionKey>,
         payload: Option<Payload>,
         conditions: Option<LinkConditions>,
     ) -> Result<usize, MeshLinkError> {
+        let key = key.into();
         let datagram_budget = self
             .connection
             .max_datagram_size()
             .ok_or(MeshLinkError::DatagramsUnsupported)?;
         let had_fresh = payload.is_some();
 
-        let Some(session_link) = self.sessions.get_mut(&session) else {
+        let Some(session_link) = self.sessions.get_mut(&key) else {
             // Sending for a session that isn't open is a driver bug: the relay
             // opened it before routing turns to this link. Surface rather than
             // silently drop.
-            return Err(MeshLinkError::UnknownSession(session));
+            return Err(MeshLinkError::UnknownSession(key.session));
         };
         // Measure the conditions sidecar's exact wire cost so the redundancy
         // budget that defends lockstep latency is never stolen by a fixed
@@ -295,11 +383,15 @@ impl MeshLink {
         // `conditions_element_len` for why this is the field's tag + length
         // prefix + body, not `encoded_len` alone.
         let conditions_overhead = conditions.as_ref().map(conditions_element_len).unwrap_or(0);
+        // Same exact-cost treatment for the tenant this key carries, if any —
+        // see `tenant_element_len`.
+        let tenant_overhead = key.tenant.as_deref().map(tenant_element_len).unwrap_or(0);
         // The inner Packet's own field tag + varint length prefix can't be
         // probed without the packet itself, so MESH_PACKET_OVERHEAD covers it —
         // bounded (≤3 bytes for any packet under ~16MB) and small.
         let packet_budget = datagram_budget
             .saturating_sub(conditions_overhead)
+            .saturating_sub(tenant_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
         // A payload that can never ride any datagram is refused *before* it is
         // registered as unacked (mirroring `Link::send`): registered, every
@@ -330,9 +422,10 @@ impl MeshLink {
         let redundant = packet.payloads.len() - usize::from(had_fresh);
 
         let mesh_packet = MeshPacket {
-            session: session.0,
+            session: key.session.0,
             packet: Some(packet),
             conditions,
+            tenant: key.tenant,
         };
         let encoded = mesh_packet.encode_to_vec();
         let datagram_len = encoded.len();
@@ -349,35 +442,40 @@ impl MeshLink {
     /// Whether `payload` can ever ride a mesh datagram on this connection's
     /// current path, sized against the same budget [`send`](Self::send) applies:
     /// the live `max_datagram_size()` minus the exact wire cost of the
-    /// `conditions` sidecar that would accompany it and the `MeshPacket`
-    /// wrapper's own overhead. The caller's pre-check for the divert path — a
-    /// payload this returns `false` for must go over the mesh control stream,
-    /// never into `send` (which would refuse it anyway, but by then the caller
-    /// has lost the payload to the move). Mirrors
+    /// `conditions` sidecar and the `tenant` string that would accompany it,
+    /// and the `MeshPacket` wrapper's own overhead. The caller's pre-check for
+    /// the divert path — a payload this returns `false` for must go over the
+    /// mesh control stream, never into `send` (which would refuse it anyway,
+    /// but by then the caller has lost the payload to the move). Mirrors
     /// [`Link::payload_fits`](crate::Link::payload_fits) on the client edge;
-    /// takes the conditions because the mesh budget, unlike the client edge's,
-    /// varies with the sidecar attached to each send.
+    /// takes the conditions and tenant because the mesh budget, unlike the
+    /// client edge's, varies with what's attached to each send.
     pub fn payload_fits(
         &self,
         payload: &Payload,
         conditions: Option<&LinkConditions>,
+        tenant: Option<&str>,
     ) -> Result<bool, MeshLinkError> {
         let datagram_budget = self
             .connection
             .max_datagram_size()
             .ok_or(MeshLinkError::DatagramsUnsupported)?;
         let conditions_overhead = conditions.map(conditions_element_len).unwrap_or(0);
+        let tenant_overhead = tenant.map(tenant_element_len).unwrap_or(0);
         let packet_budget = datagram_budget
             .saturating_sub(conditions_overhead)
+            .saturating_sub(tenant_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
         Ok(crate::ack_manager::lone_packet_len(payload) <= packet_budget)
     }
 
-    /// Awaits the next datagram, demultiplexes it by session, folds its acks
-    /// into that session's manager, and returns what it delivered: the session,
-    /// the payloads not seen before (redundant copies dropped, in ascending seq
-    /// order within each slot), whether the packet carried any payloads at all,
-    /// and the per-client conditions the peer relay attached (if any).
+    /// Awaits the next datagram, demultiplexes it by session (and, when
+    /// present, tenant — see [`MeshSessionKey`]), folds its acks into that
+    /// session's manager, and returns what it delivered: the session, the
+    /// tenant the sender stamped (if any), the payloads not seen before
+    /// (redundant copies dropped, in ascending seq order within each slot),
+    /// whether the packet carried any payloads at all, and the per-client
+    /// conditions the peer relay attached (if any).
     ///
     /// One driver task calls this in a loop — never multiple tasks, since
     /// `read_datagram` is a single-consumer API and racing on it would
@@ -401,36 +499,45 @@ impl MeshLink {
             ));
         };
 
-        let Some(session_link) = self.sessions.get_mut(&session) else {
+        // The wire's own tenant (or its absence) decides the lookup key: a
+        // tenant-stamped packet demuxes only against the matching tenant-scoped
+        // session; a tenant-less one demuxes against the legacy bare-session
+        // entry. This is never a fuzzy or fallback match — see `MeshSessionKey`.
+        let key = MeshSessionKey {
+            session,
+            tenant: mesh_packet.tenant.clone(),
+        };
+        let Some(session_link) = self.sessions.get_mut(&key) else {
             return Err(MeshLinkError::UnknownSession(session));
         };
 
         let delivery = session_link.process_incoming(packet)?;
         Ok(MeshReceived {
             session,
+            tenant: mesh_packet.tenant,
             delivery,
             conditions: mesh_packet.conditions,
         })
     }
 
-    /// Payloads sent for `session` but not yet known-delivered — the in-flight
+    /// Payloads sent for `key` but not yet known-delivered — the in-flight
     /// depth, and the overflow signal the driver watches under sustained loss.
-    /// Returns `0` for a session that isn't open (nothing in flight).
-    pub fn payloads_in_flight(&self, session: SessionId) -> usize {
+    /// Returns `0` for a session (or key) that isn't open (nothing in flight).
+    pub fn payloads_in_flight(&self, key: impl Into<MeshSessionKey>) -> usize {
         self.sessions
-            .get(&session)
+            .get(&key.into())
             .map(|s| s.acks.payloads_in_flight())
             .unwrap_or(0)
     }
 
     /// The top of the contiguous run of payloads this link has delivered to its
-    /// consumer for `(session, slot)`, or `None` before the session's first
-    /// payload for that slot arrives. This is the per-slot cursor the beacon
+    /// consumer for `(key, slot)`, or `None` before the session's first payload
+    /// for that slot arrives. This is the per-slot cursor the beacon
     /// side-channel pushes to the peer so it can force-advance its unacked
     /// window past turns it now knows were received.
-    pub fn delivered_through(&self, session: SessionId, slot: SlotId) -> Option<u64> {
+    pub fn delivered_through(&self, key: impl Into<MeshSessionKey>, slot: SlotId) -> Option<u64> {
         self.sessions
-            .get(&session)
+            .get(&key.into())
             .and_then(|s| s.dedup.delivered_through(slot))
     }
 
@@ -440,23 +547,28 @@ impl MeshLink {
     /// ack-cursor push reads: the driver has no independent list of which
     /// remote slots a session carries, so it reads back exactly what this
     /// link's own receive state has actually seen.
-    pub fn delivered_through_all(&self, session: SessionId) -> Vec<(SlotId, u64)> {
+    pub fn delivered_through_all(&self, key: impl Into<MeshSessionKey>) -> Vec<(SlotId, u64)> {
         self.sessions
-            .get(&session)
+            .get(&key.into())
             .map(|s| s.dedup.delivered_through_all())
             .unwrap_or_default()
     }
 
-    /// Force-retires every unacked payload in `(session, slot)` up to
+    /// Force-retires every unacked payload in `(key, slot)` up to
     /// `through_seq`, returning how many were dropped, *unless* `through_seq`
     /// is not strictly greater than the last cursor applied for that slot. A
     /// monotonic guard: the beacon stream is reliable-ordered, so cursors arrive
     /// in order, but a stream framing desync could produce a garbage `u64` —
     /// retiring turns the peer never confirmed would desync lockstep silently.
     /// Rejecting anything not strictly advancing turns such a desync into a
-    /// harmless no-op. Returns `0` for a session that isn't open.
-    pub fn retire_through(&mut self, session: SessionId, slot: SlotId, through_seq: u64) -> usize {
-        let Some(session_link) = self.sessions.get_mut(&session) else {
+    /// harmless no-op. Returns `0` for a session (or key) that isn't open.
+    pub fn retire_through(
+        &mut self,
+        key: impl Into<MeshSessionKey>,
+        slot: SlotId,
+        through_seq: u64,
+    ) -> usize {
+        let Some(session_link) = self.sessions.get_mut(&key.into()) else {
             return 0;
         };
         if session_link
@@ -658,6 +770,106 @@ mod tests {
         );
     }
 
+    /// The headline proof for tenant-scoped mesh sessions: two tenants happen
+    /// to use the *same* numeric session id on one `MeshLink`, plus a third,
+    /// tenant-less session also sharing that id (the legacy path an old peer,
+    /// or a caller with nothing to scope by, still uses) — all three coexist
+    /// with fully independent transport state and no cross-delivery. Mirrors
+    /// `two_sessions_on_one_link_do_not_cross_dedup_ack_or_retire`'s design
+    /// (identical `(slot, seq)` on every one of them), but demuxing by
+    /// `MeshSessionKey` instead of by distinct session ids — proving the
+    /// tenant (or its absence) is what disambiguates, not merely the numeric
+    /// id.
+    #[tokio::test]
+    async fn two_tenants_sharing_a_session_id_exchange_turns_without_cross_delivery() {
+        let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(1);
+        let key_bare = MeshSessionKey::from(session);
+        let key_prod = MeshSessionKey::new(session, "sb-prod");
+        let key_staging = MeshSessionKey::new(session, "sb-staging");
+
+        for key in [&key_bare, &key_prod, &key_staging] {
+            sender.open_session(key.clone());
+            receiver.open_session(key.clone());
+        }
+
+        // All three send the identical (slot=0, seq=0) identity. A shared-demux
+        // bug would make the second and third arrivals duplicates.
+        sender
+            .send(key_bare.clone(), Some(turn(0, 0, 0xB0)), None)
+            .unwrap();
+        sender
+            .send(key_prod.clone(), Some(turn(0, 0, 0xA0)), None)
+            .unwrap();
+        sender
+            .send(key_staging.clone(), Some(turn(0, 0, 0xC0)), None)
+            .unwrap();
+
+        let mut by_tenant: HashMap<Option<String>, u8> = HashMap::new();
+        for _ in 0..3 {
+            let received = receiver.recv().await.unwrap();
+            assert_eq!(
+                received.session, session,
+                "all three share the same numeric id"
+            );
+            assert_eq!(
+                received.delivery.fresh.len(),
+                1,
+                "each arrival is new, not a duplicate of another tenant's identical (slot, seq)",
+            );
+            by_tenant.insert(
+                received.tenant.clone(),
+                received.delivery.fresh[0].commands[0],
+            );
+        }
+        assert_eq!(
+            by_tenant.get(&None),
+            Some(&0xB0),
+            "the tenant-less send delivered its own byte"
+        );
+        assert_eq!(by_tenant.get(&Some("sb-prod".to_owned())), Some(&0xA0));
+        assert_eq!(by_tenant.get(&Some("sb-staging".to_owned())), Some(&0xC0));
+
+        // Independent in-flight/retire accounting too, exactly like the
+        // bare-id sibling test proves for distinct session ids.
+        assert_eq!(sender.payloads_in_flight(key_bare.clone()), 1);
+        assert_eq!(sender.payloads_in_flight(key_prod.clone()), 1);
+        assert_eq!(sender.payloads_in_flight(key_staging.clone()), 1);
+
+        let retired = sender.retire_through(key_prod.clone(), SlotId(0), 0);
+        assert_eq!(retired, 1, "sb-prod's payload should retire");
+        assert_eq!(sender.payloads_in_flight(key_prod), 0);
+        assert_eq!(
+            sender.payloads_in_flight(key_bare),
+            1,
+            "the tenant-less session's payload must survive sb-prod's retire"
+        );
+        assert_eq!(
+            sender.payloads_in_flight(key_staging),
+            1,
+            "sb-staging's payload must survive sb-prod's retire"
+        );
+    }
+
+    /// `MeshPacket.tenant` round-trips through `send`/`recv`: a tenant-scoped
+    /// send is observed with that same tenant on the receive side.
+    #[tokio::test]
+    async fn mesh_packet_tenant_round_trips_through_send_and_recv() {
+        let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(7);
+        let scoped = MeshSessionKey::new(session, "sb-test");
+        sender.open_session(scoped.clone());
+        receiver.open_session(scoped.clone());
+
+        sender.send(scoped, Some(turn(0, 0, 0xAA)), None).unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.session, session);
+        assert_eq!(received.tenant.as_deref(), Some("sb-test"));
+        assert_eq!(received.delivery.fresh.len(), 1);
+    }
+
     /// The ack-beacon cursor delivered_through is per-session: a delivery on
     /// session A does not advance session B's cursor for the same slot.
     #[tokio::test]
@@ -746,6 +958,7 @@ mod tests {
                 payloads: vec![turn(0, 0, 0xA0)],
             }),
             conditions: None,
+            tenant: None,
         };
         sender
             .connection()
@@ -787,6 +1000,7 @@ mod tests {
                 ],
             }),
             conditions: None,
+            tenant: None,
         };
         sender
             .connection()
@@ -816,6 +1030,7 @@ mod tests {
                 payloads: vec![turn(0, 0, 0xAA)],
             }),
             conditions: None,
+            tenant: None,
         };
         sender
             .connection()
@@ -1098,7 +1313,7 @@ mod tests {
         sender.open_session(session);
 
         let small = turn(0, 0, 0xA0);
-        assert!(sender.payload_fits(&small, None).unwrap());
+        assert!(sender.payload_fits(&small, None, None).unwrap());
 
         // A full 8-slot conditions sidecar shrinks the budget but not enough to
         // evict a routine turn.
@@ -1112,7 +1327,20 @@ mod tests {
                 })
                 .collect(),
         };
-        assert!(sender.payload_fits(&small, Some(&conditions)).unwrap());
+        assert!(
+            sender
+                .payload_fits(&small, Some(&conditions), None)
+                .unwrap()
+        );
+
+        // A tenant string shrinks the budget the same way -- not enough to
+        // evict a routine turn either, even at the maximum tenant-id length.
+        let max_tenant = "t".repeat(255);
+        assert!(
+            sender
+                .payload_fits(&small, None, Some(&max_tenant))
+                .unwrap()
+        );
 
         // A turn far past any datagram budget must be diverted, and `send`
         // agrees: it refuses the same payload the pre-check rejected.
@@ -1122,7 +1350,7 @@ mod tests {
             commands: vec![0xAB; 5000].into(),
             ..Default::default()
         };
-        assert!(!sender.payload_fits(&oversize, None).unwrap());
+        assert!(!sender.payload_fits(&oversize, None, None).unwrap());
         assert!(matches!(
             sender.send(session, Some(oversize), None),
             Err(MeshLinkError::PayloadTooLarge { .. })

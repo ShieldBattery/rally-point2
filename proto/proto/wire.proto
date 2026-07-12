@@ -58,13 +58,15 @@ message Packet {
 // optional field is wire-compatible with a `1` peer that does not know it, so
 // the mesh ALPN does not bump for this addition.
 message MeshPacket {
-  // The game this datagram belongs to, scoped within the tenant the mesh link
-  // authenticated for. A `0` is malformed and rejected by the reader (sessions
-  // are 1-indexed), so the field is effectively required despite proto3 having
-  // no `required` keyword. Carried as a `uint64` to match `SessionId` in the
-  // domain types (which the token also carries as a u64); varint encoding keeps
-  // a small session id the same width as a `uint32`, so there is no per-datagram
-  // cost in practice.
+  // The game this datagram belongs to. Combined with `tenant`, names the
+  // session uniquely: session ids are assigned per tenant, not globally, so
+  // two different tenants' sessions can share the same numeric id here. A `0`
+  // session is malformed and rejected by the reader (sessions are 1-indexed),
+  // so the field is effectively required despite proto3 having no `required`
+  // keyword. Carried as a `uint64` to match `SessionId` in the domain types
+  // (which the token also carries as a u64); varint encoding keeps a small
+  // session id the same width as a `uint32`, so there is no per-datagram cost
+  // in practice.
   uint64 session = 1;
 
   // The per-link transport packet for this session, unchanged from the
@@ -76,6 +78,19 @@ message MeshPacket {
   // when the sender has nothing to report (an ack-only flush, or no local
   // clients). See `LinkConditions`.
   optional LinkConditions conditions = 3;
+
+  // The tenant `session` belongs to, so a session id that two different
+  // tenants both happen to use resolves to two independent sessions instead
+  // of colliding: the receiver demultiplexes by the full `(tenant, session)`
+  // pair when this is present. The sender always stamps its own session's
+  // tenant; absent only when the sender predates this field (mesh peers
+  // exchange this cert-authenticated relay-to-relay, so that means a rolling
+  // deploy in progress, not an untrusted source) — the receiver then falls
+  // back to demultiplexing by the bare session id alone, exactly as before
+  // this field existed. Additive: a peer that does not know this field
+  // ignores it on the wire and keeps working off the bare session id, so no
+  // mesh ALPN bump is needed for it.
+  optional string tenant = 4;
 }
 
 // Per-client network conditions a relay gathered from its own home-client QUIC

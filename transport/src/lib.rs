@@ -49,7 +49,9 @@ pub mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager};
 pub use link::{Link, LinkError, Received};
-pub use mesh_link::{MeshLink, MeshLinkError, SessionLink, should_dial_mesh};
+pub use mesh_link::{
+    MeshLink, MeshLinkError, MeshReceived, MeshSessionKey, SessionLink, should_dial_mesh,
+};
 
 pub mod beacon;
 pub mod control;

@@ -34,9 +34,20 @@ use rally_point_proto::messages::{
     GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, RequestDrop,
     SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
+use rally_point_transport::MeshSessionKey;
 use tokio::sync::{Notify, mpsc};
 
 use crate::routing::{self, SessionKey};
+
+/// Converts a relay-local [`SessionKey`] into the transport layer's
+/// [`MeshSessionKey`] — the lightweight `(session, tenant)` pair `MeshLink`
+/// keys its per-session transport state by. The relay always knows its own
+/// session's tenant, so every mesh-link call this relay originates is
+/// tenant-scoped; `MeshLink`'s own tenant-less path only ever arises from a
+/// peer's wire packet that didn't stamp one (see `MeshSessionKey`'s own doc).
+fn mesh_session_key(key: &SessionKey) -> MeshSessionKey {
+    MeshSessionKey::new(key.session, key.tenant.as_ref())
+}
 
 /// Session-level topological dedup: records which `(slot, seq)` turns have
 /// already been forwarded to this session's local clients, so a turn arriving
@@ -834,7 +845,18 @@ fn ack_cursors_frame(session: SessionId, cursors: Vec<(SlotId, u64)>) -> MeshCon
 /// [`dispatch_mesh_control`] -- like [`resume_replay_for_frame`], it needs
 /// direct access to this link's transport state, which that function does
 /// not have.
-fn apply_ack_cursors(link: &mut rally_point_transport::MeshLink, frame: &MeshControlFrame) {
+///
+/// `joined` supplies the session's tenant (this relay always knows it for a
+/// session it has joined), so the retire targets the same tenant-scoped
+/// [`MeshSessionKey`] the datagram path opened. A frame naming a session this
+/// relay hasn't joined (predating a Leave, or a stale peer echo) is harmless:
+/// there is no key to build, so it falls through as a no-op exactly like an
+/// unopened session already does.
+fn apply_ack_cursors(
+    link: &mut rally_point_transport::MeshLink,
+    frame: &MeshControlFrame,
+    joined: &HashMap<SessionId, SessionState>,
+) {
     if frame.session == 0 {
         return;
     }
@@ -842,11 +864,15 @@ fn apply_ack_cursors(link: &mut rally_point_transport::MeshLink, frame: &MeshCon
         return;
     };
     let session = SessionId(frame.session);
+    let Some(state) = joined.get(&session) else {
+        return;
+    };
+    let key = mesh_session_key(&state.key);
     for cursor in &cursors.cursors {
         let Ok(slot) = u8::try_from(cursor.slot).map(SlotId) else {
             continue;
         };
-        link.retire_through(session, slot, cursor.delivered_through);
+        link.retire_through(key.clone(), slot, cursor.delivered_through);
     }
 }
 
@@ -864,9 +890,10 @@ fn reconcile_ack_cursors(
     ack_cursors_sent: &mut HashMap<(SessionId, SlotId), u64>,
     joined: &HashMap<SessionId, SessionState>,
 ) {
-    for &session_id in joined.keys() {
+    for state in joined.values() {
+        let session_id = state.key.session;
         let advanced: Vec<(SlotId, u64)> = link
-            .delivered_through_all(session_id)
+            .delivered_through_all(mesh_session_key(&state.key))
             .into_iter()
             .filter(|&(slot, cursor)| {
                 !matches!(
@@ -1372,7 +1399,7 @@ async fn send_turn_over_link(
     context: &'static str,
 ) -> bool {
     let session_id = key.session;
-    let fits = match link.payload_fits(&payload, conditions.as_ref()) {
+    let fits = match link.payload_fits(&payload, conditions.as_ref(), Some(key.tenant.as_ref())) {
         Ok(fits) => fits,
         Err(error) => {
             tracing::info!(%error, context, "mesh send failed; closing link");
@@ -1403,7 +1430,7 @@ async fn send_turn_over_link(
         }
         return true;
     }
-    match link.send(session_id, Some(payload), conditions) {
+    match link.send(mesh_session_key(key), Some(payload), conditions) {
         Ok(_) => true,
         // The pre-check above diverts anything that can never ride a
         // datagram, so this arm is reachable only if the path budget moved
@@ -1761,7 +1788,7 @@ pub async fn run_mesh_link(
                         // before anything else touches the frame. Needs direct
                         // link access `dispatch_mesh_control` doesn't have, so
                         // it's handled here, like the resume-cursor reply below.
-                        apply_ack_cursors(&mut link, &frame);
+                        apply_ack_cursors(&mut link, &frame, &joined);
                         if let Some((key, payloads)) =
                             resume_replay_for_frame(&frame, &joined, &mesh_for_dispatch)
                             && !send_resume_replay(
@@ -1841,21 +1868,22 @@ pub async fn run_mesh_link(
                 let now = tokio::time::Instant::now();
                 let mut failed = None;
                 let mut window_exhausted = false;
-                for (&session_id, state) in joined.iter_mut() {
+                for state in joined.values_mut() {
+                    let key = mesh_session_key(&state.key);
                     // Checked every tick, independent of this session's own
                     // flush deadline: a stuck window is a safety-net condition
                     // the driver must not sit on for up to a whole flush cycle
                     // longer than necessary. See `MESH_UNACKED_WINDOW_CAP` for
                     // why this reads per session, not summed across the link.
-                    if mesh_window_exhausted(link.payloads_in_flight(session_id)) {
+                    if mesh_window_exhausted(link.payloads_in_flight(key.clone())) {
                         window_exhausted = true;
                         break;
                     }
                     if state.flush_deadline > now {
                         continue;
                     }
-                    if link.payloads_in_flight(session_id) > 0
-                        && let Err(error) = link.send(session_id, None, None)
+                    if link.payloads_in_flight(key.clone()) > 0
+                        && let Err(error) = link.send(key, None, None)
                     {
                         failed = Some(error);
                         break;
@@ -1984,7 +2012,7 @@ pub async fn run_mesh_link(
                         if joined.contains_key(&session_id) {
                             continue;
                         }
-                        link.open_session(session_id);
+                        link.open_session(mesh_session_key(&key));
                         let registration = register_mesh_link(
                             &mesh_links,
                             key.clone(),
@@ -2047,7 +2075,7 @@ pub async fn run_mesh_link(
                             // Dropping the removed `SessionState` deregisters this
                             // session's mesh forward channel (its RAII guard).
                             joined.remove(&session_id);
-                            link.close_session(session_id);
+                            link.close_session(mesh_session_key(&key));
                             presence_sent.remove(&session_id);
                             // Arm the idle timer when the last session leaves,
                             // so the driver tears the link down after
@@ -4460,8 +4488,11 @@ mod tests {
     #[tokio::test]
     async fn apply_ack_cursors_retires_the_named_slots_unacked_window() {
         let (mut link, _client_ep, _server_ep) = connected_mesh_link().await;
-        let session = SessionId(1);
-        link.open_session(session);
+        let key = control_key();
+        let session = key.session;
+        link.open_session(mesh_session_key(&key));
+        let mut joined = HashMap::new();
+        joined.insert(session, bare_session_state(key.clone()));
 
         for slot in [0u8, 1] {
             for seq in 0..3u64 {
@@ -4471,22 +4502,23 @@ mod tests {
                     commands: vec![0xAA].into(),
                     ..Default::default()
                 };
-                link.send(session, Some(payload), None).unwrap();
+                link.send(mesh_session_key(&key), Some(payload), None)
+                    .unwrap();
             }
         }
-        assert_eq!(link.payloads_in_flight(session), 6);
+        assert_eq!(link.payloads_in_flight(mesh_session_key(&key)), 6);
 
-        // A frame for a different session is a no-op.
+        // A frame for a different (unjoined) session is a no-op.
         let other_session_frame = ack_cursors_frame(SessionId(2), vec![(SlotId(0), 2)]);
-        apply_ack_cursors(&mut link, &other_session_frame);
-        assert_eq!(link.payloads_in_flight(session), 6);
+        apply_ack_cursors(&mut link, &other_session_frame, &joined);
+        assert_eq!(link.payloads_in_flight(mesh_session_key(&key)), 6);
 
         // Retire only slot 0 through seq 1 (seq 2 stays in flight); slot 1 is
         // untouched.
         let frame = ack_cursors_frame(session, vec![(SlotId(0), 1)]);
-        apply_ack_cursors(&mut link, &frame);
+        apply_ack_cursors(&mut link, &frame, &joined);
         assert_eq!(
-            link.payloads_in_flight(session),
+            link.payloads_in_flight(mesh_session_key(&key)),
             4,
             "slot 0's seqs 0 and 1 retired; its seq 2 and all of slot 1 remain",
         );
@@ -4510,9 +4542,9 @@ mod tests {
                 },
             )),
         };
-        apply_ack_cursors(&mut link, &mixed);
+        apply_ack_cursors(&mut link, &mixed, &joined);
         assert_eq!(
-            link.payloads_in_flight(session),
+            link.payloads_in_flight(mesh_session_key(&key)),
             1,
             "slot 1 fully retired despite the malformed entry alongside it; \
              only slot 0's seq 2 remains",
@@ -4533,10 +4565,10 @@ mod tests {
         // sender-to-receiver round trip (mirroring the transport-level
         // tests), not just one side of a connection.
         let (mut sender, mut receiver, _e1, _e2) = connected_mesh_link_pair().await;
-        receiver.open_session(session);
-        sender.open_session(session);
+        receiver.open_session(mesh_session_key(&key));
+        sender.open_session(mesh_session_key(&key));
         sender
-            .send(session, Some(turn_payload(0, 0)), None)
+            .send(mesh_session_key(&key), Some(turn_payload(0, 0)), None)
             .unwrap();
         receiver.recv().await.unwrap();
 
@@ -4566,7 +4598,7 @@ mod tests {
 
         // A genuine advance (seq 1) is pushed again.
         sender
-            .send(session, Some(turn_payload(0, 1)), None)
+            .send(mesh_session_key(&key), Some(turn_payload(0, 1)), None)
             .unwrap();
         receiver.recv().await.unwrap();
         reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
