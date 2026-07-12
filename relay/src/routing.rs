@@ -1145,6 +1145,7 @@ pub async fn run_slot_link(
                         if let Err(error) =
                             rally_point_transport::control::send_control_session_start(
                                 &mut control_send,
+                                None,
                             )
                             .await
                         {
@@ -1348,7 +1349,7 @@ pub async fn run_slot_link(
                     // Likewise the session-start directive is relay → client only;
                     // a client never sends one up. Ignore a stray one, mirroring the
                     // leave case above.
-                    Some(ControlInbound::SessionStart) => {
+                    Some(ControlInbound::SessionStart(_)) => {
                         tracing::warn!(
                             tenant = key.tenant.as_ref(),
                             session = key.session.0,

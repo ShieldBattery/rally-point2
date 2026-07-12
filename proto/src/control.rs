@@ -576,6 +576,20 @@ pub struct SessionRequest {
     /// matter of giving the slots different regions rather than setting this.
     #[serde(default)]
     pub dev_relay_split: Vec<SlotId>,
+    /// The tenant's estimate of the worst pairwise **one-way** path latency (in
+    /// milliseconds) across the session's players, computed app-side from each
+    /// player's region and measured RTT against the region backbone table. The
+    /// coordinator forwards it verbatim on every serving relay's
+    /// [`SessionDescriptor::latency_estimate_ms`], where the session's authority
+    /// relay folds it into the initial latency-buffer depth it stamps onto
+    /// [`crate::messages::SessionStart`] — a fallback for the pre-start window the
+    /// relay's own link measurements cannot see (a client that has only just
+    /// dialed contributes little more than its handshake RTT). Absent when the
+    /// tenant supplied none; the relay then sizes the depth from its own
+    /// observations alone. Additive, so a request that predates the field still
+    /// interops (the control protos don't `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_estimate_ms: Option<u32>,
 }
 
 /// One player's completed handoff: the token the coordinator minted and the
@@ -771,6 +785,17 @@ pub struct SessionDescriptor {
     /// (or a coordinator that predates the field).
     #[serde(default)]
     pub departed_slots: Vec<DepartedSlot>,
+    /// The tenant's worst-pairwise one-way path-latency estimate (milliseconds)
+    /// for the session, forwarded verbatim from the [`SessionRequest`] that
+    /// created it. The session's authority relay folds it into the initial
+    /// latency-buffer depth it stamps onto [`crate::messages::SessionStart`] — a
+    /// fallback for the pre-start conditions its own link measurements cannot see.
+    /// Carried on every serving relay's descriptor, including a rehome-rebuilt one
+    /// (harmless there: a resumed relay never re-stamps an initial depth). Absent
+    /// when the request carried none, or the descriptor is from a coordinator that
+    /// predates the field. Additive, so an old descriptor still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_estimate_ms: Option<u32>,
 }
 
 /// One slot the coordinator has recorded as departed, carried in a rehome-rebuilt
@@ -1455,6 +1480,7 @@ mod tests {
                 homed_slots: vec![],
                 resumed: false,
                 departed_slots: vec![],
+                latency_estimate_ms: Some(45),
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -1463,6 +1489,59 @@ mod tests {
         assert!(json.contains("\"type\":\"descriptors\""));
         let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
+        // A request that predates the field parses with the estimate absent — the
+        // control protos don't `deny_unknown_fields`, and the field defaults.
+        let old = r#"{
+            "tenant":"sb-staging",
+            "players":[]
+        }"#;
+        let back: SessionRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(back.latency_estimate_ms, None);
+
+        // An absent estimate stays off the wire (byte-identical to the pre-field
+        // form), while a present one round-trips.
+        let request = SessionRequest {
+            tenant: TenantId("sb-staging".to_owned()),
+            players: vec![],
+            external_id: None,
+            dev_relay_split: vec![],
+            latency_estimate_ms: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("latency_estimate_ms"));
+        assert_eq!(
+            serde_json::from_str::<SessionRequest>(&json).unwrap(),
+            request
+        );
+
+        let with_estimate = SessionRequest {
+            latency_estimate_ms: Some(72),
+            ..request
+        };
+        let json = serde_json::to_string(&with_estimate).unwrap();
+        assert!(json.contains("\"latency_estimate_ms\":72"));
+        assert_eq!(
+            serde_json::from_str::<SessionRequest>(&json).unwrap(),
+            with_estimate
+        );
+    }
+
+    #[test]
+    fn session_descriptor_latency_estimate_defaults_absent() {
+        // A descriptor from a coordinator that predates the field parses with the
+        // estimate absent, exactly like `observer_slots`/`expected_slots` do.
+        let old = r#"{
+            "tenant":"sb-staging",
+            "session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6}
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(old).unwrap();
+        assert_eq!(back.latency_estimate_ms, None);
     }
 
     #[test]
@@ -1668,6 +1747,7 @@ mod tests {
                 slot: SlotId(2),
                 kind: DepartureKind::Dropped,
             }],
+            latency_estimate_ms: Some(30),
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
@@ -1740,9 +1820,11 @@ mod tests {
             homed_slots: vec![],
             resumed: false,
             departed_slots: vec![],
+            latency_estimate_ms: None,
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("external_id"));
+        assert!(!json.contains("latency_estimate_ms"));
         assert!(json.contains("\"slot_refs\":[]"));
         assert!(json.contains("\"observer_slots\":[]"));
         assert!(json.contains("\"expected_slots\":[]"));
@@ -1920,10 +2002,12 @@ mod tests {
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("external_id"));
         assert!(!json.contains("external_ref"));
+        assert!(!json.contains("latency_estimate_ms"));
         // `observer` is a plain `#[serde(default)]` bool with no
         // `skip_serializing_if`, so a competitor still serializes as
         // `"observer":false` — an old decoder just ignores it.

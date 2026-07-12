@@ -1022,7 +1022,9 @@ fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
 fn session_start_frame(session: SessionId) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
-        kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {})),
+        kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {
+            initial_buffer_turns: None,
+        })),
     }
 }
 

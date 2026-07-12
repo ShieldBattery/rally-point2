@@ -1568,6 +1568,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
         let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
@@ -1591,6 +1592,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
 
@@ -1634,6 +1636,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&original).unwrap();
         let resp = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
@@ -1669,6 +1672,7 @@ mod tests {
             ],
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&conflicting).unwrap();
         let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
@@ -1692,6 +1696,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         // No signature headers at all — fails closed.
         let resp = app
@@ -1719,6 +1724,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
         // Signed with a key whose public half is not the tenant's enrolled one.
@@ -1737,6 +1743,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
 
@@ -1943,6 +1950,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
         let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
@@ -1963,6 +1971,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
         // Even a signature made by *some* valid key can't help: the tenant named
@@ -2168,6 +2177,7 @@ mod tests {
                 }],
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             rally_point_proto::token::ExpiresAt(u64::MAX),
         )
@@ -2324,6 +2334,7 @@ mod tests {
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         crate::session::create_session(&state.setup, req, ExpiresAt(u64::MAX))
             .unwrap()
@@ -2578,6 +2589,7 @@ mod tests {
                 }],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )

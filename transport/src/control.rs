@@ -77,8 +77,12 @@ pub enum ControlInbound {
     /// The relay-driven session-start directive (relay → client only): every
     /// expected slot has connected, so the game may begin. A relay never receives
     /// this from a client, so the relay edge ignores a stray one just as it does a
-    /// `Leave`. Fieldless — its whole meaning is that it arrived.
-    SessionStart,
+    /// `Leave`. Carries the session's computed initial latency-buffer depth when
+    /// the authoring relay sized one (`Some(turns)`) — the game applies it to its
+    /// turn buffer before the first frame — or `None` when it sized none (an
+    /// authority that predates the field, or a resumed re-home re-push), in which
+    /// case the game keeps whatever depth it already seeded.
+    SessionStart(Option<u32>),
     /// A relay-pushed slot-connectivity change (relay → client only): a member's
     /// link died (`connected` false) or (re)registered (`connected` true). A relay
     /// never receives this from a client, so the relay edge ignores a stray one
@@ -197,8 +201,11 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                     kind: Some(control_frame::Kind::GameChat(chat)),
                 } => ControlInbound::Chat(chat),
                 ControlFrame {
-                    kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
-                } => ControlInbound::SessionStart,
+                    kind:
+                        Some(control_frame::Kind::SessionStart(SessionStart {
+                            initial_buffer_turns,
+                        })),
+                } => ControlInbound::SessionStart(initial_buffer_turns),
                 ControlFrame {
                     kind: Some(control_frame::Kind::SlotConnectivity(connectivity)),
                 } => ControlInbound::Connectivity(connectivity),
@@ -333,16 +340,23 @@ pub async fn send_control_chat(
     Ok(())
 }
 
-/// Pushes the session-start directive down the control stream (relay → client).
-/// Reliable and un-redundant like a leave: an error means the stream is gone,
-/// which the caller treats as that client having left. The relay may send it
-/// more than once (a re-push on a late slot, an authority handoff); the client
+/// Pushes the session-start directive down the control stream (relay → client),
+/// carrying the session's computed initial latency-buffer depth in
+/// `initial_buffer_turns` (`Some(turns)`), or `None` when the authoring relay
+/// sized none (an authority that predates the field, or a resumed re-home
+/// re-push into a running game — where a stale depth must never resize the live
+/// buffer). Reliable and un-redundant like a leave: an error means the stream is
+/// gone, which the caller treats as that client having left. The relay may send
+/// it more than once (a re-push on a late slot, an authority handoff); the client
 /// dedups, so a repeat costs only a frame.
 pub async fn send_control_session_start(
     control_send: &mut quinn::SendStream,
+    initial_buffer_turns: Option<u32>,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
-        kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
+        kind: Some(control_frame::Kind::SessionStart(SessionStart {
+            initial_buffer_turns,
+        })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

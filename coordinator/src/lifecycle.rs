@@ -1876,6 +1876,7 @@ mod tests {
                 ],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2034,6 +2035,7 @@ mod tests {
                 ],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2218,6 +2220,7 @@ mod tests {
                 ],
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )

@@ -678,6 +678,7 @@ mod tests {
             homed_slots: vec![],
             resumed: false,
             departed_slots: vec![],
+            latency_estimate_ms: None,
         }
     }
 

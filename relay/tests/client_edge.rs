@@ -431,14 +431,14 @@ async fn fires_session_start_when_every_expected_slot_connects() {
     assert!(
         matches!(
             recv_meaningful(&mut reader0).await,
-            ControlInbound::SessionStart
+            ControlInbound::SessionStart(_)
         ),
         "slot 0 receives the session-start directive once slot 1 completes the set",
     );
     assert!(
         matches!(
             recv_meaningful(&mut reader1).await,
-            ControlInbound::SessionStart
+            ControlInbound::SessionStart(_)
         ),
         "the slot that completed the set receives the directive too",
     );
@@ -482,7 +482,7 @@ async fn a_late_slot_receives_session_start_on_register() {
     assert!(
         matches!(
             recv_meaningful(&mut reader0).await,
-            ControlInbound::SessionStart
+            ControlInbound::SessionStart(_)
         ),
         "the sole expected slot starts the session on connect",
     );
@@ -494,7 +494,7 @@ async fn a_late_slot_receives_session_start_on_register() {
     assert!(
         matches!(
             recv_meaningful(&mut reader1).await,
-            ControlInbound::SessionStart
+            ControlInbound::SessionStart(_)
         ),
         "a slot that registers after start still receives the directive",
     );

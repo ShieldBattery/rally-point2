@@ -1179,6 +1179,7 @@ pub fn build_descriptor(
             .collect(),
         resumed,
         departed_slots,
+        latency_estimate_ms: None,
     })
 }
 
@@ -1577,6 +1578,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
 
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
@@ -1614,6 +1616,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -1659,6 +1662,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -1689,6 +1693,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -1718,6 +1723,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(0), SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -1761,6 +1767,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
             .unwrap()
@@ -1793,6 +1800,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1811,6 +1819,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1830,6 +1839,7 @@ mod tests {
                 players: vec![],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1856,6 +1866,7 @@ mod tests {
                 players: (0..=11).map(player).collect(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -1870,6 +1881,7 @@ mod tests {
                 players: vec![player(12)],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1894,6 +1906,7 @@ mod tests {
                 players: vec![player(0), player(1), player(0)],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1910,6 +1923,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1923,6 +1937,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN)),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1954,6 +1969,7 @@ mod tests {
                 ],
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1977,6 +1993,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: oversized_split,
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         );
@@ -1998,6 +2015,7 @@ mod tests {
                 // Split slot 1 onto the secondary relay so both relays serve and
                 // mesh — the only way a session spans two relays.
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2079,6 +2097,7 @@ mod tests {
                 ],
                 external_id: Some("game-99".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2121,6 +2140,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2168,6 +2188,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2226,6 +2247,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2256,6 +2278,7 @@ mod tests {
                 external_id: None,
                 // Split so slot 1 homes on the secondary, giving both relays a slot.
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2301,6 +2324,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2319,6 +2343,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2349,6 +2374,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2379,6 +2405,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2394,6 +2421,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2415,6 +2443,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2444,6 +2473,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2456,6 +2486,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("game-2".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2486,6 +2517,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("shared-id".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2498,6 +2530,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("shared-id".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2514,6 +2547,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2550,6 +2584,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2566,6 +2601,7 @@ mod tests {
             players: two_players(),
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
             .unwrap()
@@ -2587,6 +2623,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
         assert!(
@@ -2621,6 +2658,7 @@ mod tests {
                 players,
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2632,6 +2670,7 @@ mod tests {
                 players: reversed,
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2651,6 +2690,7 @@ mod tests {
             players: two_players(),
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let first = create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
 
@@ -2679,6 +2719,7 @@ mod tests {
             ],
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         let err = create_session(&setup, conflicting, ExpiresAt(u64::MAX)).unwrap_err();
         assert_eq!(err, SessionSetupError::IdempotentCreateMismatch);
@@ -2719,6 +2760,7 @@ mod tests {
                 players,
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2730,6 +2772,7 @@ mod tests {
                 players: with_observer,
                 external_id: Some("game-1".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -2821,6 +2864,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3011,6 +3055,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3124,6 +3169,7 @@ mod tests {
                 players: two_players(),
                 external_id: Some("game-42".to_owned()),
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3178,6 +3224,7 @@ mod tests {
                 // a descriptor staged).
                 dev_relay_split: vec![SlotId(1)],
                 external_id: None,
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3362,6 +3409,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3486,6 +3534,7 @@ mod tests {
                 players: two_players(),
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3545,6 +3594,7 @@ mod tests {
                     players: two_players(),
                     external_id: None,
                     dev_relay_split: Vec::new(),
+                    latency_estimate_ms: None,
                 },
                 ExpiresAt(u64::MAX),
                 || {
@@ -3604,6 +3654,7 @@ mod tests {
                             players: two_players(),
                             external_id: None,
                             dev_relay_split: Vec::new(),
+                            latency_estimate_ms: None,
                         },
                         ExpiresAt(u64::MAX),
                     ) {
@@ -3700,6 +3751,7 @@ mod tests {
                 players,
                 external_id: None,
                 dev_relay_split: Vec::new(),
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3806,6 +3858,7 @@ mod tests {
                 ],
                 external_id: None,
                 dev_relay_split: vec![SlotId(1)],
+                latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
         )
@@ -3858,6 +3911,7 @@ mod tests {
             ],
             external_id: Some("game-1".to_owned()),
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         };
         create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
 

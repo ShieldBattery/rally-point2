@@ -267,12 +267,17 @@ pub struct TurnChannels {
     /// the live stream.
     pub request_drop: mpsc::Sender<SlotId>,
     /// The relay-driven session-start directive, delivered once every expected
-    /// slot has connected somewhere in the session's mesh. The driver forwards a
-    /// unit here each time the relay pushes a `SessionStart` down the reliable
-    /// control stream; the game begins on the first and treats any repeat as a
-    /// no-op (the relay may re-deliver on a late slot's register or an authority
-    /// handoff). Fieldless — the whole signal is that it arrived.
-    pub session_start: mpsc::Receiver<()>,
+    /// slot has connected somewhere in the session's mesh. The driver forwards the
+    /// directive's payload here each time the relay pushes a `SessionStart` down
+    /// the reliable control stream; the game begins on the first and treats any
+    /// repeat as a no-op (the relay may re-deliver on a late slot's register or an
+    /// authority handoff). The payload is the session's computed initial
+    /// latency-buffer depth: `Some(turns)` when the authoring relay sized one (the
+    /// game applies it before the first frame), `None` when it sized none (an
+    /// authority that predates the field, or a resumed re-home re-push), where the
+    /// game keeps the depth it already seeded. The game applies a depth only from
+    /// its single pre-start receive, so a re-delivery never resizes a running game.
+    pub session_start: mpsc::Receiver<Option<u32>>,
     /// Slot-connectivity changes, each carrying `(slot, connected)`: a member's
     /// link died (`false`) or (re)registered (`true`). Best-effort and
     /// informational — the game uses it to drive a "player X disconnected" display,
@@ -334,8 +339,10 @@ pub struct LinkDriver {
     /// `RequestDrop` frames.
     request_drop: mpsc::Receiver<SlotId>,
     /// The relay-driven session-start directive, to hand to the game thread when
-    /// the relay pushes a `SessionStart` down the control stream.
-    session_start: mpsc::Sender<()>,
+    /// the relay pushes a `SessionStart` down the control stream. Carries the
+    /// session's computed initial latency-buffer depth (`None` when the authoring
+    /// relay sized none).
+    session_start: mpsc::Sender<Option<u32>>,
     /// Slot-connectivity changes, to hand to the game thread when the relay
     /// pushes a `SlotConnectivity` down the control stream.
     connectivity: mpsc::Sender<(SlotId, bool)>,
@@ -1060,12 +1067,12 @@ impl LinkDriver {
                         // authority handoff) is idempotent for the game.
                         // Correctness-critical: a game waiting on a start it never
                         // hears waits forever, so a full buffer here is a stall.
-                        Some(ControlInbound::SessionStart) => {
+                        Some(ControlInbound::SessionStart(initial_buffer_turns)) => {
                             // The game has started: from here a dead home relay may
                             // escalate to coordinator-mediated failover. Latched, and
                             // kept across reconnects via the persistent state.
                             *game_started = true;
-                            match push_to_game(session_start, ()) {
+                            match push_to_game(session_start, initial_buffer_turns) {
                                 GamePush::Sent => {}
                                 GamePush::Full => {
                                     tracing::warn!(
@@ -1644,7 +1651,7 @@ struct GameSeam {
     chat_out: mpsc::Receiver<ChatOut>,
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
     request_drop: mpsc::Receiver<SlotId>,
-    session_start: mpsc::Sender<()>,
+    session_start: mpsc::Sender<Option<u32>>,
     connectivity: mpsc::Sender<(SlotId, bool)>,
 }
 
@@ -2878,7 +2885,7 @@ mod tests {
         // The peer plays the relay far enough to start the game (escalation is
         // gated on `SessionStart`), then its connection dies — a link failure.
         let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
-        send_control_session_start(&mut peer_control_send)
+        send_control_session_start(&mut peer_control_send, None)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;

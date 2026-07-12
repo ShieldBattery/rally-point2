@@ -177,6 +177,7 @@ async fn coordinator_with_session(
             // Home slot 1 on the secondary relay so both relays serve and mesh —
             // the topology these transport tests exercise.
             dev_relay_split: vec![SlotId(1)],
+            latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
     )
@@ -582,6 +583,7 @@ fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
     )
@@ -668,6 +670,7 @@ async fn a_draining_relay_gets_its_set_then_an_ack_and_is_excluded_from_new_sess
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
     )
@@ -714,6 +717,7 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
             }],
             external_id: None,
             dev_relay_split: Vec::new(),
+            latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
     )

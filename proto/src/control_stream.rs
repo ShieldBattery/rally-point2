@@ -335,9 +335,11 @@ mod tests {
         use crate::messages::SessionStart;
 
         // The relay-driven session-start directive rides the client-edge control
-        // frame — fieldless, its whole meaning is the frame kind.
+        // frame, carrying the computed initial buffer depth.
         let frame = ControlFrame {
-            kind: Some(control_frame::Kind::SessionStart(SessionStart {})),
+            kind: Some(control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: Some(6),
+            })),
         };
         let encoded = encode_frame(&frame).unwrap();
         let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
@@ -347,11 +349,51 @@ mod tests {
         // cross-relay broadcast.
         let mesh = MeshControlFrame {
             session: 7,
-            kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {})),
+            kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: Some(6),
+            })),
         };
         let encoded = encode_frame(&mesh).unwrap();
         let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
         assert_eq!(decoded, mesh);
+    }
+
+    #[test]
+    fn a_session_start_without_a_depth_round_trips_and_matches_old_fieldless_bytes() {
+        use crate::messages::SessionStart;
+
+        // A directive whose authority sized no depth carries an absent
+        // `initial_buffer_turns` — distinct from a present `Some(0)`.
+        let absent = ControlFrame {
+            kind: Some(control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: None,
+            })),
+        };
+        let encoded = encode_frame(&absent).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, absent);
+
+        // The depth-less directive encodes to exactly the pre-field fieldless
+        // form: an empty `SessionStart` body, so the whole frame is just the
+        // oneof tag (field 7, wire type 2) with a zero-length body. A build that
+        // predates the field wrote precisely these bytes, and one that predates it
+        // reads a `Some(depth)` frame by skipping the unknown field 1 — the
+        // additive contract the field relies on.
+        let old_fieldless_body: &[u8] = &[0x3A, 0x00]; // field 7, len-delimited, empty
+        let decoded_old: ControlFrame = decode_frame(old_fieldless_body).unwrap();
+        assert_eq!(decoded_old, absent);
+        assert_eq!(&encoded[CONTROL_LEN_PREFIX..], old_fieldless_body);
+
+        // A present depth (even 0) is distinguishable from absence on the wire.
+        let zero = ControlFrame {
+            kind: Some(control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: Some(0),
+            })),
+        };
+        let encoded_zero = encode_frame(&zero).unwrap();
+        let decoded_zero: ControlFrame = decode_frame(&encoded_zero[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded_zero, zero);
+        assert_ne!(decoded_zero, absent);
     }
 
     #[test]

@@ -936,11 +936,32 @@ message SlotDeparted {
 // to every client over the reliable control stream, replacing the tenant app
 // server's out-of-band start signal.
 //
-// Fieldless: the whole signal is "start". Identity is the connection (on the
-// client edge) or the framed session id (on the mesh). Delivered at least once —
-// a late or reconnecting slot is re-pushed on register, and an authority handoff
-// can re-fire — so the client dedups (applying it a second time is a no-op).
-message SessionStart {}
+// It also carries the session's computed initial latency-buffer depth in
+// `initial_buffer_turns` when the authoring authority sized one: that relay
+// accumulates its home clients' pre-start link stats, runs the buffer control
+// law's target over them (folded with a session-create latency hint and a
+// mesh-hop cushion), clamps to the session bounds, and stamps the result here so
+// the game starts at the right depth from frame 0 instead of the tenant minimum.
+// The field is absent when the authoring relay sized no depth — an authority
+// that predates the field, or a resumed (re-home) relay re-pushing into an
+// already-running game, where a stale initial depth must never resize the live
+// buffer — and the receiver then keeps whatever buffer it already seeded.
+//
+// Identity is the connection (on the client edge) or the framed session id (on
+// the mesh). Delivered at least once — a late or reconnecting slot is re-pushed
+// on register, and an authority handoff can re-fire — so the client dedups
+// (applying it a second time is a no-op) and applies the depth only in its
+// single pre-start step, so a redundant re-delivery never resizes a running game.
+message SessionStart {
+  // The computed initial latency-buffer depth, in whole turns, or absent when
+  // the authoring relay sized none (an authority that predates the field, or a
+  // resumed re-home re-push into a running game). `optional` (not a `0` default)
+  // so "no depth, keep the seeded buffer" stays distinct from a genuine 0-turn
+  // depth — the same absence-vs-zero distinction `Payload.game_frame_count`
+  // draws. Old peers skip this unknown field, exactly as they do
+  // `BufferDirective.authority_relay_id`.
+  optional uint32 initial_buffer_turns = 1;
+}
 
 // A relay's announcement to its mesh peers that one of its home clients has
 // registered for the session — its authenticated connection joined the relay's
