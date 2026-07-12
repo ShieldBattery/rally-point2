@@ -462,6 +462,36 @@ link stats to what it forwards across the mesh, and the decision-maker combines 
 picture (loss rate, latency, …) it decides on. The same conditions flow down to the clients, where they
 can drive an in-game netgraph or other debugging output.
 
+**The initial depth.** Left to the control law alone, a game *starts* at the tenant-minimum buffer and only
+gets its first correction once framed turns are flowing — roughly ten seconds in, past the opening worker
+split — because the law needs a consensus frame to schedule a directive against and there is none until the
+game begins. So the buffer's opening move is jarring exactly when the game is most sensitive to it. The
+**authority relay sizes an initial depth** instead, once, at the moment it fires the session-start directive
+(when every expected slot has connected), and **stamps it onto that directive** — a new optional field on
+`SessionStart`, not a `buffer_directive` (the decision seq stays untouched; this is a seed, not a decision).
+The game applies it to its turn buffer before the first frame, so it opens at (or near) the right depth. The
+inputs are the pre-start conditions the relay has already gathered for the law: it runs the same target
+formula over them, and — because a client that has only just dialed contributes little more than its
+handshake RTT, and the pre-start window can miss a slow-connecting slot entirely — folds in a
+**session-create latency hint** the tenant supplies (a worst-pairwise *one-way* path estimate in
+milliseconds, computed app-side from each player's region and measured RTT), converting it to turns here in
+the one place that quantity lives. A session that is genuinely **fully observed** — single-relay, with every
+expected slot having produced an RTT sample — trusts what it measured and ignores the hint, since a stale
+estimate must not distort a picture the window actually saw; otherwise it takes the larger of the observed
+target and the hint, plus **one turn of cushion per extra relay hop** (a multi-relay session's per-slot
+conditions never cross the mesh before the game starts, so its observed half is always partial). The result
+is clamped to the same `BufferBounds` as any decision. The authority **adopts** the stamped depth as its own
+current buffer, which matters because the law's one-shot re-affirm at the first framed turn broadcasts
+whatever the buffer *is* — so without the adoption that re-affirm would immediately clobber the seed back to
+the minimum. Peer relays adopt the depth off the mesh copy of the directive (so a later authority promotion
+reasons from the right base); a **resumed** relay taking over an already-running game stamps the field
+**absent** — the running buffer is whatever directives made it, and a stale initial depth must never resize a
+live game — and the client, which applies the depth only in its single pre-start step, ignores a redundant
+re-delivery for the same reason. The honest limitation: loss is essentially unobservable pre-start (there is
+almost no traffic to lose yet) and the last slot to connect is seen only through its handshake, so the seed
+is a *good opening guess*, not the law's steady-state truth — the in-game law's fast-raise still closes any
+remaining gap within the first turns, just from a much better starting point than the tenant minimum.
+
 ### Relay-side desync detection
 
 SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the command
