@@ -429,10 +429,13 @@ async fn serve_connection(
 }
 
 /// Current Unix time in seconds, used to check token expiry. A clock before the
-/// epoch yields 0, which simply expires every token rather than misbehaving.
+/// epoch (a misconfigured host) yields `u64::MAX`, which fails closed — every
+/// token reads as expired and every client is refused — rather than failing
+/// open: a `0` here would make every real expiry compare as still-in-the-future
+/// and admit expired tokens.
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(u64::MAX)
 }
