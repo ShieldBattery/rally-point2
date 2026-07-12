@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{
@@ -37,6 +38,7 @@ use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
 
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::presence::PresenceStore;
+use crate::provision::WarmTargets;
 use crate::registry::{self, RelayRegistry, SessionSetupError, cert_fingerprint};
 use crate::rehome::RehomeLimiter;
 use crate::tenant::{self, TenantStore};
@@ -227,6 +229,114 @@ pub struct CreatedSession {
 
 use std::sync::Arc;
 
+/// The default warm-demand TTL a coordinator with no provisioning loop stamps on
+/// its (unread) warm store. Nothing consumes that store, so the exact value is
+/// immaterial — it only has to be positive; a provisioning-enabled coordinator
+/// overrides it from its configured warm TTL.
+const DEFAULT_WARM_TTL: Duration = Duration::from_secs(600);
+
+/// The floor on how long an abandoned pending-create anchor is kept before a
+/// consult prunes it, used when ten hold caps would be shorter. Ten minutes is
+/// far longer than any live create's retry span, so a create that polls within
+/// the cap is never pruned out from under itself.
+const PENDING_PRUNE_MIN_SLACK: Duration = Duration::from_secs(600);
+
+/// The provisioning knobs and the shared warm-demand store the coordinator
+/// consults when a session names a region with no live relay.
+///
+/// The `warm` store is written by `POST /regions/warm` and by a hold-until-ready
+/// create, and read by the reconcile loop, which holds a clone of the same map.
+/// `create_hold` is `Some` only on a coordinator whose provisioning loop is
+/// running — that presence is what turns on hold-until-ready create. A
+/// coordinator with no loop holds a **dormant** gate: an orphan warm store the
+/// warm endpoint still writes but nothing reads, and `create_hold: None`, so
+/// every create falls back to region-blind placement immediately.
+#[derive(Clone)]
+pub struct ProvisionGate {
+    /// Per-region warm demand, shared with the reconcile loop.
+    warm: WarmTargets,
+    /// How long each warm keeps a region warm.
+    warm_ttl: Duration,
+    /// The per-create hold cap: how long a create naming an unlit region is held
+    /// — warmed and answered [`CreateOutcome::Provisioning`] — before it falls
+    /// back to region-blind placement. `None` on a coordinator with no
+    /// provisioning loop, which never holds a create.
+    create_hold: Option<Duration>,
+}
+
+impl ProvisionGate {
+    /// The gate for a coordinator with a running provisioning loop. `warm` is the
+    /// store the loop reconciles against, `warm_ttl` is how long each warm lasts,
+    /// and `create_hold` bounds how long a create naming an unlit region holds
+    /// before falling back.
+    pub fn provisioning(warm: WarmTargets, warm_ttl: Duration, create_hold: Duration) -> Self {
+        Self {
+            warm,
+            warm_ttl,
+            create_hold: Some(create_hold),
+        }
+    }
+
+    /// The dormant gate for a coordinator with no provisioning loop: a warm store
+    /// the endpoint writes but nothing reads, and no create hold.
+    fn dormant() -> Self {
+        Self {
+            warm: WarmTargets::new(),
+            warm_ttl: DEFAULT_WARM_TTL,
+            create_hold: None,
+        }
+    }
+
+    /// The shared warm-demand store — what `POST /regions/warm` writes and the
+    /// reconcile loop reads.
+    pub fn warm(&self) -> &WarmTargets {
+        &self.warm
+    }
+
+    /// How long each warm keeps a region warm.
+    pub fn warm_ttl(&self) -> Duration {
+        self.warm_ttl
+    }
+}
+
+/// The outcome of a hold-until-ready create: either a session to hand back, or a
+/// signal that a requested region has no relay yet and the create is being held.
+///
+/// A [`Provisioning`](Self::Provisioning) outcome mints nothing — no session, no
+/// idempotency entry, no descriptors, no lifecycle state. It means the
+/// coordinator has warmed the listed regions and is holding the create; the
+/// caller re-sends the byte-identical signed request until the region's relay
+/// enrolls (the retry then places in-region and returns
+/// [`Created`](Self::Created)) or the coordinator's hold cap elapses (the retry
+/// then falls back to region-blind placement and also returns `Created`). The
+/// held request never changes, so its idempotency fingerprint is undisturbed
+/// across the retries.
+pub enum CreateOutcome {
+    /// A minted or replayed session — the app-server response plus whether it was
+    /// an idempotent replay (see [`CreatedSession`]).
+    Created(CreatedSession),
+    /// The listed regions have no available relay; the coordinator warmed them and
+    /// is holding the create. No session was minted.
+    Provisioning {
+        /// The still-unlit requested regions being warmed.
+        regions: Vec<RegionId>,
+    },
+}
+
+/// Whether a create consults the provisioning gate.
+enum CreatePolicy {
+    /// Place immediately, falling back to region-blind placement for an unlit
+    /// region — never warming or holding. This is the behavior of
+    /// [`create_session`].
+    Immediate,
+    /// Consult the provisioning gate: a request naming an unlit region on a
+    /// provisioning-enabled coordinator warms it and holds (returns
+    /// [`CreateOutcome::Provisioning`]) until the region's relay enrolls or the
+    /// hold cap — measured against `now`, Unix seconds — elapses. A `now` of
+    /// `u64::MAX` marks an unusable clock, on which a create never holds.
+    HoldUntilReady { now: u64 },
+}
+
 /// The inputs to session setup: the registries the coordinator holds.
 #[derive(Clone)]
 pub struct SessionSetup {
@@ -309,6 +419,19 @@ pub struct SessionSetup {
     /// never recorded here and is therefore never idempotent — see
     /// [`SessionRequest::external_id`]'s own doc.
     create_idempotency: Arc<Mutex<HashMap<(TenantId, String), CachedCreate>>>,
+    /// The provisioning gate: the shared warm-demand store, its TTL, and (when a
+    /// provisioning loop is running) the per-create hold cap. Consulted by
+    /// hold-until-ready create and by `POST /regions/warm`. Dormant — an orphan
+    /// warm store and no hold — on a coordinator with no provisioning loop, which
+    /// keeps every hold-until-ready behavior off.
+    provision: ProvisionGate,
+    /// First-hold timestamps (Unix seconds) for creates currently held for a cold
+    /// region, keyed `(tenant, external_id)`. Stamped when a create is first held
+    /// and consulted on every retry to enforce the hold cap; dropped when the
+    /// create finally places (in-region or via fallback), when the cap elapses, or
+    /// by a lazy prune of abandoned anchors. Empty and unused on a coordinator with
+    /// no provisioning loop.
+    pending_creates: Arc<Mutex<HashMap<(TenantId, String), u64>>>,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -341,7 +464,25 @@ impl SessionSetup {
             rehome_limiter,
             assignment_lock: Arc::new(Mutex::new(())),
             create_idempotency: Arc::new(Mutex::new(HashMap::new())),
+            provision: ProvisionGate::dormant(),
+            pending_creates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Installs the provisioning gate, enabling hold-until-ready create and giving
+    /// `POST /regions/warm` the warm store the reconcile loop shares. Called once
+    /// at construction on a coordinator whose provisioning loop is running; a
+    /// coordinator with no loop keeps the dormant gate and every hold-until-ready
+    /// behavior stays off.
+    pub fn with_provision_gate(mut self, gate: ProvisionGate) -> Self {
+        self.provision = gate;
+        self
+    }
+
+    /// The provisioning gate — the warm store, warm TTL, and create-hold cap the
+    /// warm endpoint and hold-until-ready create consult.
+    pub fn provision(&self) -> &ProvisionGate {
+        &self.provision
     }
 
     /// Exposes the relay registry (the coordinator's API needs it to build
@@ -898,6 +1039,47 @@ pub fn create_session(
     create_session_inner(setup, request, expires_at, || {})
 }
 
+/// Hold-until-ready create: like [`create_session`], but on a provisioning-enabled
+/// coordinator (one whose gate carries a create-hold cap) a request naming a region
+/// with **no available relay** warms that region and returns
+/// [`CreateOutcome::Provisioning`] instead of falling straight back to a
+/// region-blind relay. The caller re-sends the byte-identical signed request until
+/// the region's relay enrolls (the retry then places in-region) or the coordinator's
+/// hold cap elapses (the retry then falls back exactly as [`create_session`] would),
+/// at which point a session is minted and [`CreateOutcome::Created`] returned.
+///
+/// The hold is anchored across retries by the request's `external_id`: a create with
+/// none has nothing to key the cap on, so it never holds and falls back immediately.
+/// A held create mints nothing — no session, idempotency entry, descriptor, or
+/// lifecycle state — so nothing needs undoing when it is finally placed, and the
+/// idempotency fingerprint is undisturbed across the retries.
+pub fn create_or_provision_session(
+    setup: &SessionSetup,
+    request: SessionRequest,
+    expires_at: ExpiresAt,
+) -> Result<CreateOutcome, SessionSetupError> {
+    create_or_provision_session_at(setup, request, expires_at, now_unix_secs_fail_closed())
+}
+
+/// [`create_or_provision_session`] with the hold-cap clock supplied, so a test can
+/// drive the cap deterministically. `now` is Unix seconds; `u64::MAX` marks an
+/// unusable clock, on which a create never holds (it falls back immediately) so a
+/// broken clock cannot wedge session creation.
+pub fn create_or_provision_session_at(
+    setup: &SessionSetup,
+    request: SessionRequest,
+    expires_at: ExpiresAt,
+    now: u64,
+) -> Result<CreateOutcome, SessionSetupError> {
+    create_body(
+        setup,
+        request,
+        expires_at,
+        CreatePolicy::HoldUntilReady { now },
+        || {},
+    )
+}
+
 /// [`create_session`]'s body, with a test seam `before_commit` invoked after the
 /// relays are picked but before any membership is recorded or descriptor staged —
 /// the exact window in which a racing drain mark must be linearized out. Production
@@ -909,6 +1091,33 @@ fn create_session_inner(
     expires_at: ExpiresAt,
     before_commit: impl FnOnce(),
 ) -> Result<CreatedSession, SessionSetupError> {
+    match create_body(
+        setup,
+        request,
+        expires_at,
+        CreatePolicy::Immediate,
+        before_commit,
+    )? {
+        CreateOutcome::Created(created) => Ok(created),
+        // Immediate placement never consults the warm gate, so it cannot warm or
+        // hold — it only ever yields a created session.
+        CreateOutcome::Provisioning { .. } => {
+            unreachable!("immediate placement never returns a provisioning hold")
+        }
+    }
+}
+
+/// The shared body of every create path. `policy` selects immediate placement
+/// (the behavior of [`create_session`]) or hold-until-ready (the behavior of
+/// [`create_or_provision_session`], which may return [`CreateOutcome::Provisioning`]).
+/// `before_commit` is the drain-race test seam (see [`create_session_inner`]).
+fn create_body(
+    setup: &SessionSetup,
+    request: SessionRequest,
+    expires_at: ExpiresAt,
+    policy: CreatePolicy,
+    before_commit: impl FnOnce(),
+) -> Result<CreateOutcome, SessionSetupError> {
     // Hold the outermost assignment lock across this entire (await-free) body, so
     // the registry read below and the commit that follows cannot interleave with a
     // relay's drain mark. See `SessionSetup::assignment_lock`.
@@ -944,16 +1153,47 @@ fn create_session_inner(
                 .is_empty()
         {
             if cached.fingerprint == CreateFingerprint::from_request(&request) {
-                return Ok(CreatedSession {
+                return Ok(CreateOutcome::Created(CreatedSession {
                     response: cached.response,
                     replayed: true,
-                });
+                }));
             }
             return Err(SessionSetupError::IdempotentCreateMismatch);
         }
     }
 
     validate_request(&request)?;
+
+    // Hold-until-ready: on a provisioning-enabled coordinator, a request naming a
+    // region with no available relay warms that region and holds — returning a
+    // provisioning signal rather than falling straight back to a region-blind
+    // relay — until the region's relay enrolls or a per-create hold cap elapses.
+    // The hold is anchored across retries by `external_id`; a request with none has
+    // nothing to key the cap on and falls straight through to region-blind
+    // placement. A held create commits nothing (no placement runs), so a retry that
+    // finally places does not double-place.
+    if let CreatePolicy::HoldUntilReady { now } = policy
+        && let Some(create_hold) = setup.provision.create_hold
+        && let Some(external_id) = &request.external_id
+    {
+        let unlit = unlit_requested_regions(&setup.registry, &request);
+        if !unlit.is_empty() {
+            for region in &unlit {
+                setup
+                    .provision
+                    .warm
+                    .warm(region.clone(), setup.provision.warm_ttl);
+            }
+            let key = (request.tenant.clone(), external_id.clone());
+            if hold_pending_create(&setup.pending_creates, &key, now, create_hold) {
+                return Ok(CreateOutcome::Provisioning { regions: unlit });
+            }
+            // The cap elapsed (or the clock is unusable): the anchor was dropped and
+            // the create falls through to placement below, whose region-blind
+            // fallback fills the still-unlit slots — a game is never refused because
+            // a region stayed cold.
+        }
+    }
 
     // Placement: each slot homes on a relay in the region it requested when one
     // is live, else the region-blind fallback (the lowest-id available relay). A
@@ -1062,18 +1302,23 @@ fn create_session_inner(
     // above for why that matters. A request with no `external_id` is never
     // recorded (nothing to key a replay on).
     if let Some(external_id) = &request.external_id {
+        let key = (request.tenant.clone(), external_id.clone());
+        // The create committed: drop any hold anchored on this `external_id`. The
+        // relay enrolled and the slot placed in-region, or the cap elapsed and it
+        // placed via fallback — either way the hold is over.
+        setup.pending_creates.lock().remove(&key);
         setup.create_idempotency.lock().insert(
-            (request.tenant.clone(), external_id.clone()),
+            key,
             CachedCreate {
                 fingerprint: CreateFingerprint::from_request(&request),
                 response: response.clone(),
             },
         );
     }
-    Ok(CreatedSession {
+    Ok(CreateOutcome::Created(CreatedSession {
         response,
         replayed: false,
-    })
+    }))
 }
 
 /// Builds the [`SessionDescriptor`] the coordinator pushes to a relay serving
@@ -1251,6 +1496,81 @@ struct Placement {
     /// Each serving relay's region at pick time, so a re-home can prefer the dead
     /// relay's region for the replacement.
     relay_regions: std::collections::BTreeMap<RelayId, Option<RegionId>>,
+}
+
+/// The requested slot regions with no available relay to home them — the regions
+/// [`place_by_region`] would fall back to the region-blind pick for. Reads the same
+/// available-relay snapshot placement does and applies the same region-match rule,
+/// so the hold decision and the eventual placement agree on which regions are lit.
+/// Order-preserving and de-duplicated: each unlit region appears once, in
+/// first-requested order. A request naming no regions yields an empty set.
+fn unlit_requested_regions(registry: &RelayRegistry, request: &SessionRequest) -> Vec<RegionId> {
+    let entries = registry::available_entries(registry);
+    let mut unlit: Vec<RegionId> = Vec::new();
+    for player in &request.players {
+        if let Some(region) = &player.region
+            && !unlit.contains(region)
+            && !entries.iter().any(|e| e.region.as_ref() == Some(region))
+        {
+            unlit.push(region.clone());
+        }
+    }
+    unlit
+}
+
+/// Consults (and updates) the pending-create anchor for `key`, returning whether
+/// the create should be held (answered [`CreateOutcome::Provisioning`]) rather than
+/// placed now.
+///
+/// The first hold for a key stamps `now`; a retry within `create_hold` of that
+/// stamp keeps holding; once `create_hold` has elapsed the anchor is dropped and the
+/// create is released to placement. An unusable clock (`now == u64::MAX`) never holds
+/// and clears any anchor it finds, so a broken clock releases the create to fallback
+/// rather than wedging it. Every consult also prunes anchors older than the cap plus
+/// generous slack, so a create that is started and never retried cannot leave its
+/// anchor in the map for the process lifetime; a live create polling within the cap
+/// is released by the cap before it could ever reach the prune horizon, so pruning
+/// never drops the current key from under it.
+fn hold_pending_create(
+    pending: &Mutex<HashMap<(TenantId, String), u64>>,
+    key: &(TenantId, String),
+    now: u64,
+    create_hold: Duration,
+) -> bool {
+    // An unusable clock cannot measure the cap: do not hold, and drop any stale
+    // anchor so a recovered clock starts a fresh, bounded hold.
+    if now == u64::MAX {
+        pending.lock().remove(key);
+        return false;
+    }
+    let cap = create_hold.as_secs();
+    let prune_horizon = cap
+        .saturating_mul(10)
+        .max(PENDING_PRUNE_MIN_SLACK.as_secs());
+    let mut map = pending.lock();
+    map.retain(|_, &mut first| now.saturating_sub(first) <= prune_horizon);
+    match map.get(key).copied() {
+        None => {
+            map.insert(key.clone(), now);
+            true
+        }
+        Some(first) if now.saturating_sub(first) < cap => true,
+        Some(_) => {
+            map.remove(key);
+            false
+        }
+    }
+}
+
+/// The current Unix time in seconds, **failing closed**: a pre-epoch or errored
+/// clock yields `u64::MAX`, which the hold logic treats as an unusable clock and
+/// declines to hold on, so a broken clock releases a create to fallback instead of
+/// wedging it.
+fn now_unix_secs_fail_closed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
 }
 
 /// Region-aware placement: home each slot on a live relay in the region it
@@ -2342,6 +2662,253 @@ mod tests {
         assert!(
             new.session.0 >= old.session.0,
             "a fresh coordinator's ids never start below the old one's",
+        );
+    }
+
+    // --- Hold-until-ready create (provisioning gate) ---
+
+    /// A tenant-enrolled setup whose provisioning gate is on: relay 1 is untagged
+    /// (the region-blind fallback target) and `region-a` starts cold. The create
+    /// hold cap is `create_hold`; warms last a fixed 600s. Returns the setup and a
+    /// clone of its warm store so a test can assert on the demand a hold raised.
+    fn provisioning_setup(create_hold: Duration) -> (SessionSetup, WarmTargets) {
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 1, 14900);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let warm = WarmTargets::new();
+        let gate = ProvisionGate::provisioning(warm.clone(), Duration::from_secs(600), create_hold);
+        (
+            SessionSetup::new(reg, tenants).with_provision_gate(gate),
+            warm,
+        )
+    }
+
+    fn region_a() -> RegionId {
+        RegionId("region-a".to_owned())
+    }
+
+    /// A create request whose single player names `region-a`, anchored on
+    /// `external_id` when one is given (so the hold cap has a key to track it by).
+    fn region_a_request(external_id: Option<&str>) -> SessionRequest {
+        SessionRequest {
+            tenant: tid(),
+            players: vec![player_in_region(0, Some("region-a"))],
+            external_id: external_id.map(|s| s.to_owned()),
+            latency_estimate_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_cold_region_create_warms_and_holds_without_minting() {
+        let (setup, warm) = provisioning_setup(Duration::from_secs(60));
+        let outcome = create_or_provision_session_at(
+            &setup,
+            region_a_request(Some("g1")),
+            ExpiresAt(u64::MAX),
+            1_000,
+        )
+        .unwrap();
+        match outcome {
+            CreateOutcome::Provisioning { regions } => {
+                assert_eq!(regions, vec![region_a()], "the unlit region is reported");
+            }
+            CreateOutcome::Created(_) => panic!("a cold requested region must hold, not place"),
+        }
+        // A held create mints nothing: no session membership, no idempotency entry.
+        assert!(
+            setup.session_relays.lock().is_empty(),
+            "no session membership recorded while pending",
+        );
+        assert!(
+            setup.create_idempotency.lock().is_empty(),
+            "no idempotency entry cached while pending",
+        );
+        // The hold is anchored, and warm demand for the region was raised.
+        assert_eq!(
+            setup.pending_creates.lock().len(),
+            1,
+            "the hold is anchored"
+        );
+        assert_eq!(
+            warm.target_at(&region_a(), 0),
+            1,
+            "the cold region was warmed so the loop provisions a relay there",
+        );
+    }
+
+    #[test]
+    fn a_retry_within_the_cap_keeps_holding() {
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        let req = region_a_request(Some("g1"));
+        assert!(matches!(
+            create_or_provision_session_at(&setup, req.clone(), ExpiresAt(u64::MAX), 1_000)
+                .unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        // A retry at t=1_030, still inside the 60s cap, holds again on one anchor.
+        assert!(matches!(
+            create_or_provision_session_at(&setup, req, ExpiresAt(u64::MAX), 1_030).unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        assert_eq!(
+            setup.pending_creates.lock().len(),
+            1,
+            "one anchor tracks the hold across retries",
+        );
+    }
+
+    #[test]
+    fn the_cap_elapsing_falls_back_to_placement_and_clears_the_hold() {
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        let req = region_a_request(Some("g1"));
+        assert!(matches!(
+            create_or_provision_session_at(&setup, req.clone(), ExpiresAt(u64::MAX), 1_000)
+                .unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        // At t=1_060 the cap has elapsed: the create falls through to region-blind
+        // placement (relay 1), exactly as an unlit-region create does with no gate.
+        let resp = match create_or_provision_session_at(&setup, req, ExpiresAt(u64::MAX), 1_060)
+            .unwrap()
+        {
+            CreateOutcome::Created(created) => created.response,
+            CreateOutcome::Provisioning { .. } => panic!("the cap elapsed; placement must proceed"),
+        };
+        assert_eq!(
+            resp.home_relay.relay_id,
+            RelayId(1),
+            "the cold region fell back to the region-blind relay",
+        );
+        assert!(
+            setup.pending_creates.lock().is_empty(),
+            "the hold anchor is cleared once the create places",
+        );
+    }
+
+    #[test]
+    fn a_relay_enrolling_while_pending_places_in_region_and_clears_the_hold() {
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        let req = region_a_request(Some("g1"));
+        assert!(matches!(
+            create_or_provision_session_at(&setup, req.clone(), ExpiresAt(u64::MAX), 1_000)
+                .unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        // A relay for region-a enrolls while the create is held.
+        enroll_relay_in_region(setup.registry(), 2, 14901, Some("region-a"));
+        // The next identical retry, still inside the cap, places in-region on relay 2
+        // rather than falling back to the region-blind relay 1.
+        let resp = match create_or_provision_session_at(&setup, req, ExpiresAt(u64::MAX), 1_005)
+            .unwrap()
+        {
+            CreateOutcome::Created(created) => created.response,
+            CreateOutcome::Provisioning { .. } => {
+                panic!("the region's relay enrolled; placement must proceed")
+            }
+        };
+        assert_eq!(
+            resp.home_relay.relay_id,
+            RelayId(2),
+            "the slot placed on the region's relay, not the fallback",
+        );
+        assert!(
+            setup.pending_creates.lock().is_empty(),
+            "the hold anchor is cleared once the create places",
+        );
+    }
+
+    #[test]
+    fn a_create_without_an_external_id_never_holds() {
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        // The same cold region, but no external_id to anchor a hold: it places at
+        // once via region-blind fallback rather than holding.
+        let outcome = create_or_provision_session_at(
+            &setup,
+            region_a_request(None),
+            ExpiresAt(u64::MAX),
+            1_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, CreateOutcome::Created(_)),
+            "a create with no external_id falls back immediately",
+        );
+        assert!(
+            setup.pending_creates.lock().is_empty(),
+            "nothing is anchored for a create that cannot be held",
+        );
+    }
+
+    #[test]
+    fn an_unusable_clock_never_holds() {
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        // `u64::MAX` marks an unusable clock: the create must fall back rather than
+        // wedge, even though the region is cold.
+        let outcome = create_or_provision_session_at(
+            &setup,
+            region_a_request(Some("g1")),
+            ExpiresAt(u64::MAX),
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, CreateOutcome::Created(_)),
+            "a broken clock releases the create to fallback",
+        );
+        assert!(
+            setup.pending_creates.lock().is_empty(),
+            "no hold is anchored on a broken clock",
+        );
+    }
+
+    #[test]
+    fn provisioning_off_never_holds() {
+        // A setup with the dormant gate (no provisioning loop): a cold-region create
+        // with an external_id still falls back immediately — no hold path exists.
+        let setup = setup_with_two_relays_and_tenant();
+        let outcome = create_or_provision_session_at(
+            &setup,
+            region_a_request(Some("g1")),
+            ExpiresAt(u64::MAX),
+            1_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, CreateOutcome::Created(_)),
+            "with no provisioning loop, create never holds",
+        );
+        assert!(setup.pending_creates.lock().is_empty());
+    }
+
+    #[test]
+    fn a_pending_sibling_roster_under_one_external_id_does_not_panic() {
+        // Two different rosters share one external_id while the region is cold. The
+        // pending map is keyed by external_id, so the second roster shares the first's
+        // anchor and also holds — no session or cache exists yet, so nothing conflicts
+        // and nothing panics.
+        let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
+        let roster_a = region_a_request(Some("g1"));
+        let mut roster_b = region_a_request(Some("g1"));
+        roster_b.players[0].client_pubkey = ClientPublicKey([0x99; 32]);
+        assert!(matches!(
+            create_or_provision_session_at(&setup, roster_a, ExpiresAt(u64::MAX), 1_000).unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        assert!(matches!(
+            create_or_provision_session_at(&setup, roster_b, ExpiresAt(u64::MAX), 1_010).unwrap(),
+            CreateOutcome::Provisioning { .. }
+        ));
+        assert_eq!(
+            setup.pending_creates.lock().len(),
+            1,
+            "both rosters share one external_id-keyed anchor",
         );
     }
 

@@ -235,6 +235,7 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/session/rehome", post(rehome_session))
         .route("/sessions/alive", post(sessions_alive))
         .route("/presence/query", post(presence_query))
+        .route("/regions/warm", post(warm_regions))
         .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
         .route("/regions", get(regions))
         .route("/relay/control", get(relay_control))
@@ -257,13 +258,22 @@ pub fn router(state: CoordinatorState) -> Router {
 /// (see `lifecycle::never_started_grace`): a freshly created session is held at
 /// least until its tokens can no longer be used to dial in, so the reaper never
 /// retires a session a straggler could still legitimately connect to.
+///
+/// On a provisioning-enabled coordinator, a request naming a region with no
+/// available relay does not immediately fall back: the coordinator warms that
+/// region and answers `202 Accepted` with a [`ProvisioningResponse`]
+/// (`{"status":"provisioning", ...}`) without minting anything. The caller
+/// re-sends the byte-identical signed request; once the region's relay enrolls the
+/// retry places in-region and returns `200`, and if the region stays cold past the
+/// coordinator's hold cap the retry falls back to region-blind placement and also
+/// returns `200`. The held request never changes, so idempotency is undisturbed.
 async fn create_session(
     State(state): State<CoordinatorState>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<SessionResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let request: SessionRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     verify_tenant_request(
@@ -298,22 +308,43 @@ async fn create_session(
     let expires_at = rally_point_proto::token::ExpiresAt(
         now_unix.saturating_add(state.player_token_lifetime.as_secs()),
     );
-    let session::CreatedSession {
-        response: resp,
-        replayed,
-    } = session::create_session(&state.setup, request, expires_at).map_err(|e| {
-        tracing::warn!(error = %e, "session setup failed");
-        match e {
-            registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
-            registry::SessionSetupError::IdempotentCreateMismatch => StatusCode::CONFLICT,
-            registry::SessionSetupError::TenantNotFound(_)
-            | registry::SessionSetupError::SlotOutOfRange(_)
-            | registry::SessionSetupError::NoPlayers
-            | registry::SessionSetupError::DuplicateSlot(_)
-            | registry::SessionSetupError::ExternalIdTooLong
-            | registry::SessionSetupError::ExternalRefTooLong(_) => StatusCode::BAD_REQUEST,
+    let created = match session::create_or_provision_session(&state.setup, request, expires_at) {
+        Ok(session::CreateOutcome::Created(created)) => created,
+        Ok(session::CreateOutcome::Provisioning { regions }) => {
+            // No session minted: a requested region has no relay yet. The
+            // coordinator warmed it and is holding the create; the caller re-sends
+            // the identical signed request until a relay enrolls or the hold cap
+            // elapses. Not a failure, so this does not log like one.
+            tracing::info!(
+                regions = regions.len(),
+                "session create held for a region with no relay yet",
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(ProvisioningResponse {
+                    status: "provisioning",
+                    regions,
+                    retry_after_ms: PROVISIONING_RETRY_AFTER_MS,
+                }),
+            )
+                .into_response());
         }
-    })?;
+        Err(e) => {
+            tracing::warn!(error = %e, "session setup failed");
+            return Err(match e {
+                registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
+                registry::SessionSetupError::IdempotentCreateMismatch => StatusCode::CONFLICT,
+                registry::SessionSetupError::TenantNotFound(_)
+                | registry::SessionSetupError::SlotOutOfRange(_)
+                | registry::SessionSetupError::NoPlayers
+                | registry::SessionSetupError::DuplicateSlot(_)
+                | registry::SessionSetupError::ExternalIdTooLong
+                | registry::SessionSetupError::ExternalRefTooLong(_) => StatusCode::BAD_REQUEST,
+            });
+        }
+    };
+    let resp: SessionResponse = created.response;
+    let replayed = created.replayed;
 
     // Arm the session's lifecycle only on a fresh mint: its serving relay set
     // (the distinct home relays of its slots) and its player/observer slots
@@ -343,7 +374,30 @@ async fn create_session(
         players = resp.tokens.len(),
         "session created"
     );
-    Ok(Json(resp))
+    Ok((StatusCode::OK, Json(resp)).into_response())
+}
+
+/// How long (milliseconds) a `202 provisioning` response tells the caller to wait
+/// before re-sending the identical create. Short enough that a relay enrolling
+/// mid-hold is noticed promptly, long enough that a stream of retries does not
+/// hammer the coordinator while a region warms.
+const PROVISIONING_RETRY_AFTER_MS: u64 = 2000;
+
+/// The `202 Accepted` body a hold-until-ready create returns while a requested
+/// region is being warmed: `{"status":"provisioning","regions":[...],
+/// "retryAfterMs":2000}`. camelCase (tenant-facing surface). `regions` are the
+/// still-unlit requested regions the coordinator warmed; the caller re-sends the
+/// byte-identical signed create after `retryAfterMs`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvisioningResponse {
+    /// Always `"provisioning"` — the discriminator that tells this body apart from
+    /// a `200` [`SessionResponse`].
+    status: &'static str,
+    /// The still-unlit requested regions the coordinator is warming.
+    regions: Vec<rally_point_proto::control::RegionId>,
+    /// How long to wait before re-sending the identical create.
+    retry_after_ms: u64,
 }
 
 /// Request body for `POST /session/rehome` (tenant-authenticated, snake_case —
@@ -682,6 +736,85 @@ async fn presence_query(
         })
         .collect();
     Ok(Json(PresenceQueryResponse { users }))
+}
+
+/// Request body for `POST /regions/warm`: a tenant and the regions it wants kept
+/// warm. Tenant-authenticated (snake_case control-plane surface, like
+/// [`SessionRequest`]); `tenant` must match the tenant the request signature
+/// verifies under.
+#[derive(Debug, Deserialize)]
+struct WarmRequest {
+    /// The tenant the app server is acting for — must match the request signature.
+    tenant: TenantId,
+    /// The regions to keep warm.
+    regions: Vec<rally_point_proto::control::RegionId>,
+}
+
+/// Response body for `POST /regions/warm`: which requested regions were warmed and
+/// which were not recognized. A region the coordinator does not configure lands in
+/// `unknown` rather than failing the request, so a stale region list on the tenant
+/// still warms the valid remainder.
+#[derive(Debug, Serialize)]
+struct WarmResponse {
+    /// The requested regions the coordinator configures — warmed (their demand
+    /// raised and TTL extended) when a provisioning loop is running.
+    warmed: Vec<rally_point_proto::control::RegionId>,
+    /// The requested regions the coordinator does not configure. Reported, not an
+    /// error.
+    unknown: Vec<rally_point_proto::control::RegionId>,
+}
+
+/// Keeps the named regions warm: raises each configured region's warm demand and
+/// pushes its TTL out, so the reconcile loop provisions (or holds) a relay there
+/// ahead of a create that needs it. Idempotent — the app server re-sends this on an
+/// interval to hold a region warm, and stops simply by going quiet (the demand
+/// lapses at its TTL).
+///
+/// Same tenant request-signature auth as `POST /session/create` (see the module
+/// docs); the `tenant` in the body must match the tenant the signature verifies
+/// under. A region the coordinator does not configure is reported in `unknown`
+/// (and logged at debug) rather than failing the whole request, so a stale region
+/// list still warms its valid regions. No rate limit: the only callers are
+/// tenant-signed app servers.
+///
+/// On a coordinator with **no provisioning loop**, the gate is dormant: known
+/// regions are still acknowledged in `warmed` and unknown ones still reported, but
+/// nothing consumes warm demand, so no relay is actually held warm. The response
+/// shape is the same, so a caller sees the known/unknown split either way.
+async fn warm_regions(
+    State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<WarmResponse>, StatusCode> {
+    let request: WarmRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    )?;
+
+    let gate = state.setup.provision();
+    let mut warmed = Vec::new();
+    let mut unknown = Vec::new();
+    for region in request.regions {
+        if state.regions.contains(&region) {
+            gate.warm().warm(region.clone(), gate.warm_ttl());
+            warmed.push(region);
+        } else {
+            tracing::debug!(
+                region = region.as_ref(),
+                "warm request named a region the coordinator does not configure",
+            );
+            unknown.push(region);
+        }
+    }
+    Ok(Json(WarmResponse { warmed, unknown }))
 }
 
 /// Response body for `GET /tenant/:tenant/pubkey`.
@@ -3113,5 +3246,217 @@ mod tests {
                 .unwrap();
         let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // --- Warm endpoint + hold-until-ready create ---
+
+    /// A region config listing each of `ids` (with placeholder display/ping fields
+    /// the endpoint does not exercise).
+    fn regions_config(ids: &[&str]) -> RegionsConfig {
+        let entries: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                format!(r#"{{"id":"{id}","display_name":"{id}","beacon":"h:1","fallback":"h:2"}}"#)
+            })
+            .collect();
+        RegionsConfig::from_json(&format!(r#"{{"regions":[{}]}}"#, entries.join(","))).unwrap()
+    }
+
+    /// A coordinator state with `region_ids` configured and relay 1 enrolled
+    /// untagged (the region-blind fallback). `provisioning` installs the gate so
+    /// the warm endpoint holds demand and a cold-region create returns `202`; the
+    /// dormant case still answers the warm endpoint but holds nothing.
+    fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorState {
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            ),
+        );
+        let tenants = crate::tenant::new_store();
+        crate::tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
+        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
+        let mut setup = crate::session::SessionSetup::new(reg, tenants);
+        if provisioning {
+            setup = setup.with_provision_gate(crate::session::ProvisionGate::provisioning(
+                crate::provision::WarmTargets::new(),
+                Duration::from_secs(600),
+                Duration::from_secs(75),
+            ));
+        }
+        let lifecycle = Lifecycle::new(setup.clone());
+        CoordinatorState {
+            setup,
+            notices: notify::new_dedup(),
+            lifecycle,
+            control_auth: ControlAuth::Open,
+            hello_timeout: HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS_TIMEOUT,
+            regions: regions_config(region_ids),
+            player_token_lifetime: TEST_TOKEN_LIFETIME,
+            ledger: None,
+        }
+    }
+
+    /// A single-player create request naming `region` for its slot, anchored on
+    /// `external_id`.
+    fn region_create_body(region: &str, external_id: &str) -> Vec<u8> {
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: vec![PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0xAA; 32]),
+                external_ref: None,
+                observer: false,
+                region: Some(rally_point_proto::control::RegionId(region.to_owned())),
+            }],
+            external_id: Some(external_id.to_owned()),
+            latency_estimate_ms: None,
+        };
+        serde_json::to_vec(&req).unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<axum::body::Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn warm_endpoint_warms_known_regions_and_reports_unknown() {
+        let state = provisioning_state(&["region-a", "region-b"], true);
+        let warm = state.setup.provision().warm().clone();
+        let app = router(state);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tenant": "sb-test",
+            "regions": ["region-a", "region-b", "atlantis"],
+        }))
+        .unwrap();
+        let resp = signed_post(app, "/regions/warm", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["warmed"],
+            serde_json::json!(["region-a", "region-b"]),
+            "the configured regions are warmed",
+        );
+        assert_eq!(
+            v["unknown"],
+            serde_json::json!(["atlantis"]),
+            "an unconfigured region is reported, not an error",
+        );
+        // The loop reads target 1 for each warmed region, and never for the unknown.
+        assert_eq!(warm.target_at(&region("region-a"), 0), 1);
+        assert_eq!(warm.target_at(&region("region-b"), 0), 1);
+        assert_eq!(warm.target_at(&region("atlantis"), 0), 0);
+    }
+
+    #[tokio::test]
+    async fn warm_endpoint_requires_a_valid_signature() {
+        let state = provisioning_state(&["region-a"], true);
+        let app = router(state);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tenant": "sb-test",
+            "regions": ["region-a"],
+        }))
+        .unwrap();
+
+        // Signed with a key whose public half is not the tenant's enrolled one.
+        let resp = signed_post(app.clone(), "/regions/warm", &body, &[0x22; 32]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // No signature headers at all — fails closed.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/regions/warm")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn warm_endpoint_with_no_provisioning_loop_still_reports_known_regions() {
+        // A dormant gate: the endpoint acknowledges known regions and reports
+        // unknown ones the same way, though nothing consumes the demand.
+        let state = provisioning_state(&["region-a"], false);
+        let app = router(state);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tenant": "sb-test",
+            "regions": ["region-a", "atlantis"],
+        }))
+        .unwrap();
+        let resp = signed_post(app, "/regions/warm", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["warmed"], serde_json::json!(["region-a"]));
+        assert_eq!(v["unknown"], serde_json::json!(["atlantis"]));
+    }
+
+    #[tokio::test]
+    async fn cold_region_create_returns_202_then_200_once_a_relay_enrolls() {
+        let state = provisioning_state(&["region-a"], true);
+        let app = router(state.clone());
+        let body = region_create_body("region-a", "g1");
+
+        // region-a has no relay: the create is held with a 202 provisioning body and
+        // nothing is minted.
+        let resp = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "provisioning");
+        assert_eq!(v["regions"], serde_json::json!(["region-a"]));
+        assert_eq!(v["retryAfterMs"], 2000);
+        assert!(
+            state.setup.descriptors().current_for(RelayId(1)).is_empty(),
+            "a held create stages no descriptor and mints no session",
+        );
+
+        // A relay for region-a enrolls; the identical retry now places in-region.
+        registry::enroll(
+            state.setup.registry(),
+            RelayHello::new(
+                RelayId(2),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                ProtocolVersion::CURRENT,
+                vec![0xC2; 4],
+            )
+            .with_region(rally_point_proto::control::RegionId("region-a".to_owned())),
+        );
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let session: SessionResponse = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            session.home_relay.relay_id,
+            RelayId(2),
+            "the retry placed on the region's freshly enrolled relay",
+        );
+    }
+
+    fn region(name: &str) -> rally_point_proto::control::RegionId {
+        rally_point_proto::control::RegionId(name.to_owned())
     }
 }

@@ -181,6 +181,27 @@ struct Cli {
     /// count against warm demand. Default 5.
     #[arg(long, env = "COORDINATOR_PROVISION_TICK_SECS", default_value_t = 5)]
     provision_tick_secs: u64,
+
+    /// TTL, in seconds, of warm demand raised via `POST /regions/warm` or a
+    /// hold-until-ready create. A region stays warm this long after each warm; the
+    /// app server re-warms before it lapses to hold a region, and stops simply by
+    /// going quiet. Comfortably larger than the create-hold cap so a region a
+    /// pending create warmed stays warm through the launch. Default 600.
+    #[arg(long, env = "COORDINATOR_WARM_TTL_SECS", default_value_t = 600)]
+    warm_ttl_secs: u64,
+
+    /// How long, in seconds, `POST /session/create` holds a create naming a region
+    /// with no live relay — warming the region and answering `202 provisioning` —
+    /// before falling back to region-blind placement. Bounds the wait so a game is
+    /// never refused because a region stayed cold. Only meaningful with
+    /// `--provision-relay-bin`; with no provisioning loop, create never holds.
+    /// Default 75.
+    #[arg(
+        long,
+        env = "COORDINATOR_PROVISION_CREATE_HOLD_SECS",
+        default_value_t = 75
+    )]
+    provision_create_hold_secs: u64,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
@@ -234,7 +255,27 @@ async fn main() -> Result<()> {
     if cli.dev_tenant {
         enroll_dev_tenant(&tenants, &cli)?;
     }
-    let setup = session::SessionSetup::new(registry::new_registry(), tenants);
+
+    // The shared warm-demand store: written by `POST /regions/warm` and by a
+    // hold-until-ready create, read by the reconcile loop. Built once here and
+    // handed (as clones sharing one map) to both the loop and the session setup's
+    // provisioning gate, so demand raised on the API side is the demand the loop
+    // reconciles. Only meaningful when the loop runs; a coordinator with no loop
+    // leaves the store unread.
+    let warm = WarmTargets::new();
+
+    // Install the provisioning gate on the setup only when the loop will run (a
+    // relay binary is configured). Present ⇒ hold-until-ready create is on and the
+    // warm endpoint's demand is shared with the loop. Absent ⇒ the setup keeps its
+    // dormant gate and every hold-until-ready behavior is off.
+    let mut setup = session::SessionSetup::new(registry::new_registry(), tenants);
+    if cli.provision_relay_bin.is_some() {
+        setup = setup.with_provision_gate(session::ProvisionGate::provisioning(
+            warm.clone(),
+            Duration::from_secs(cli.warm_ttl_secs),
+            Duration::from_secs(cli.provision_create_hold_secs),
+        ));
+    }
 
     // A launched relay presents the same bootstrap secret to open its control
     // connection, so keep a copy before the auth resolution consumes the original.
@@ -307,10 +348,9 @@ async fn main() -> Result<()> {
     let app = api::router(state);
 
     // Start the provisioning loop when a relay binary is configured. It keeps each
-    // region's relay count matched to warm demand; with no warm demand (the default
-    // until the warm endpoint lands) it idles, so starting it with none configured
-    // is valid and does nothing. Provisioning requires the ledger, so refuse to
-    // start without one.
+    // region's relay count matched to warm demand; a region with no warm demand
+    // idles, so a fleet that nothing has warmed yet is valid and does nothing.
+    // Provisioning requires the ledger, so refuse to start without one.
     if let Some(relay_bin) = cli.provision_relay_bin {
         let Some(provision_ledger) = provision_ledger else {
             return Err(eyre!(
@@ -344,7 +384,7 @@ async fn main() -> Result<()> {
             provision_setup.registry().clone(),
             provision_setup,
             provision_ledger,
-            WarmTargets::new(),
+            warm.clone(),
             provisioner,
         );
         tokio::spawn(provision_loop.run());
