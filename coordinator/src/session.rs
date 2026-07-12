@@ -111,6 +111,15 @@ pub struct SessionRefs {
     /// falling back to a region-blind pick. A `BTreeMap` for the same
     /// deterministic-order reason as `homes`.
     pub relay_regions: std::collections::BTreeMap<RelayId, Option<RegionId>>,
+    /// The tenant's worst-pairwise one-way path-latency estimate (milliseconds)
+    /// for the session, from the [`SessionRequest`]. Carried into every serving
+    /// relay's `SessionDescriptor::latency_estimate_ms` so the authority relay
+    /// folds it into the initial buffer depth it sizes.
+    /// Recorded here, alongside the other correlation state, so it survives the
+    /// same restart/persistence paths and is carried by a rehome-rebuilt descriptor
+    /// too (harmless there: a resumed relay never re-stamps a depth). `None` when
+    /// the request carried no estimate.
+    pub latency_estimate_ms: Option<u32>,
 }
 
 /// A create request reduced to the fields that shape the session it mints,
@@ -1018,6 +1027,7 @@ fn create_session_inner(
         homes,
         relay_certs,
         relay_regions,
+        latency_estimate_ms: request.latency_estimate_ms,
     };
     setup
         .session_refs
@@ -1179,7 +1189,10 @@ pub fn build_descriptor(
             .collect(),
         resumed,
         departed_slots,
-        latency_estimate_ms: None,
+        // The tenant's latency hint, carried down so the authority relay folds it
+        // into the initial buffer depth. Present on a rehome-rebuilt descriptor too
+        // (harmless: a resumed relay never re-stamps a depth).
+        latency_estimate_ms: refs.latency_estimate_ms,
     })
 }
 
@@ -2129,6 +2142,55 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_for_carries_the_latency_estimate_hint() {
+        // The tenant's one-way latency estimate rides in the descriptor built for
+        // the session, so the authority relay can fold it into the initial buffer
+        // depth it sizes at session start.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: None,
+                        observer: false,
+                        region: None,
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                        observer: false,
+                        region: None,
+                    },
+                ],
+                external_id: None,
+                dev_relay_split: Vec::new(),
+                latency_estimate_ms: Some(72),
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response;
+
+        let desc = descriptor_for(
+            &setup,
+            &TenantId("sb-test".to_owned()),
+            resp.session,
+            RelayId(1),
+        )
+        .unwrap();
+        assert_eq!(
+            desc.latency_estimate_ms,
+            Some(72),
+            "the tenant's latency hint is carried into the descriptor",
+        );
+    }
+
+    #[test]
     fn descriptor_for_without_stored_refs_has_none_and_empty() {
         // A session created with no correlation ids at all still builds a
         // descriptor — just with the fields empty, not an error.
@@ -2156,6 +2218,10 @@ mod tests {
         .unwrap();
         assert!(desc.external_id.is_none());
         assert!(desc.slot_refs.is_empty());
+        assert!(
+            desc.latency_estimate_ms.is_none(),
+            "a request with no latency estimate carries none in the descriptor",
+        );
         assert!(
             desc.observer_slots.is_empty(),
             "no observer-flagged players -> empty observer_slots",
