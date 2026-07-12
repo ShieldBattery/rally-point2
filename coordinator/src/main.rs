@@ -6,6 +6,7 @@
 //! where it's testable, mirroring the relay binary.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
@@ -51,6 +52,25 @@ struct Cli {
         default_value_t = false
     )]
     allow_insecure_control: bool,
+
+    /// Lifetime, in seconds, of the per-player authorization tokens minted for
+    /// each session. A client presents its token to a relay at every
+    /// (re)connection — the initial connect, a same-relay reconnect after a
+    /// network blip, and a re-home onto a replacement relay — and the relay
+    /// rejects one whose expiry has passed at handshake. So the lifetime must
+    /// cover the whole span in which a client might still need to (re)connect:
+    /// the create→first-connect lead time, plus the longest plausible game, plus
+    /// any mid-game reconnect or re-home. Expiry while a connection is already up
+    /// is harmless — the token is checked only at handshake, never per-turn — so
+    /// an overly generous value costs only how long an abandoned, never-started
+    /// session lingers before the never-started reaper retires it. Default 6
+    /// hours.
+    #[arg(
+        long,
+        env = "COORDINATOR_PLAYER_TOKEN_LIFETIME_SECS",
+        default_value_t = 21600
+    )]
+    player_token_lifetime_secs: u64,
 
     /// Enroll a single tenant at startup so `POST /session/create` can mint
     /// tokens without any provisioning flow. Dev/loopback only: the signing key
@@ -197,6 +217,7 @@ async fn main() -> Result<()> {
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
         regions,
+        player_token_lifetime: Duration::from_secs(cli.player_token_lifetime_secs),
     };
 
     let app = api::router(state);
@@ -307,4 +328,16 @@ fn init_tracing() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn player_token_lifetime_defaults_to_six_hours() {
+        // With no flag and no env var, the mint lifetime falls back to 6 hours.
+        let cli = Cli::parse_from(["rally-point-coordinator"]);
+        assert_eq!(cli.player_token_lifetime_secs, 21600);
+    }
 }

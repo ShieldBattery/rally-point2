@@ -122,6 +122,7 @@ async fn serve_bare_coordinator(
         hello_timeout,
         liveness_timeout,
         regions: RegionsConfig::default(),
+        player_token_lifetime: Duration::from_secs(3600),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -201,6 +202,7 @@ async fn coordinator_with_session(
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
         regions: RegionsConfig::default(),
+        player_token_lifetime: Duration::from_secs(3600),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -559,6 +561,7 @@ async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (Strin
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
         regions: RegionsConfig::default(),
+        player_token_lifetime: Duration::from_secs(3600),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -905,6 +908,7 @@ async fn serve_coordinator_with_regions(regions: RegionsConfig) -> (String, Sess
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
         regions,
+        player_token_lifetime: Duration::from_secs(3600),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

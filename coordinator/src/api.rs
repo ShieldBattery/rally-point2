@@ -178,6 +178,12 @@ pub struct CoordinatorState {
     /// refuse a relay tagged with a region not listed here. Empty (the default,
     /// when no `--regions` file is given) leaves every region behavior dormant.
     pub regions: RegionsConfig,
+    /// How long each minted player token stays valid, measured from the mint
+    /// instant. A client presents its token to a relay at every (re)connection,
+    /// and the relay rejects an expired one at handshake, so this bounds the
+    /// window in which a client can still (re)connect to its session. Set from
+    /// `--player-token-lifetime-secs`.
+    pub player_token_lifetime: Duration,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -201,13 +207,14 @@ pub fn router(state: CoordinatorState) -> Router {
 /// Reads the raw body (rather than a `Json` extractor) so the signature covers
 /// exactly the bytes on the wire.
 ///
-/// Token expiry is set to `u64::MAX` for now (dev/loopback). Production must
-/// set it to the game session lifetime plus margin -- this is no longer just a
-/// token concern: the never-started reaper's grace window (see
-/// `lifecycle::never_started_grace`) reads `u64::MAX` as "no real expiry was
-/// set" and falls back to a fixed floor, so a real expiry here is also what
-/// lets that reaper size its window from the session's actual lifetime
-/// instead of the floor alone.
+/// Each player token is stamped with an expiry of the current Unix time plus
+/// [`CoordinatorState::player_token_lifetime`] (saturating). A relay rejects an
+/// expired token at handshake, so the lifetime must outlast every (re)connection
+/// a client makes over a session's life — initial connect, same-relay reconnect,
+/// re-home. That same expiry also sizes the never-started reaper's grace window
+/// (see `lifecycle::never_started_grace`): a freshly created session is held at
+/// least until its tokens can no longer be used to dial in, so the reaper never
+/// retires a session a straggler could still legitimately connect to.
 async fn create_session(
     State(state): State<CoordinatorState>,
     method: Method,
@@ -242,7 +249,13 @@ async fn create_session(
         .map(|p| p.slot)
         .collect();
 
-    let expires_at = rally_point_proto::token::ExpiresAt(u64::MAX);
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = rally_point_proto::token::ExpiresAt(
+        now_unix.saturating_add(state.player_token_lifetime.as_secs()),
+    );
     let session::CreatedSession {
         response: resp,
         replayed,
@@ -1460,6 +1473,10 @@ mod tests {
     /// signs with it so a request verifies. Not a real secret — a test fixture.
     const TEST_CLIENT_SEED: [u8; 32] = [0x11; 32];
 
+    /// The player-token lifetime the test coordinator states mint with. A plain
+    /// finite span so a minted expiry is `now + this`, observable without waiting.
+    const TEST_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+
     /// Produces the `(x-rp2-timestamp, x-rp2-signature)` header pair a tenant
     /// sends, signing the canonical request message with `seed` at the current
     /// time. Mirrors the app server's `signCoordinatorRequest`.
@@ -1535,6 +1552,7 @@ mod tests {
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
+            player_token_lifetime: TEST_TOKEN_LIFETIME,
         }
     }
 
@@ -1934,6 +1952,7 @@ mod tests {
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
+            player_token_lifetime: TEST_TOKEN_LIFETIME,
         };
         let app = router(state);
 
@@ -1947,6 +1966,50 @@ mod tests {
         let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn create_session_stamps_expiry_at_now_plus_configured_lifetime() {
+        // The handler mints each token's expiry as (now + the configured
+        // lifetime); decode a token out of the response and confirm it lands in
+        // the window bracketing the call, offset by the lifetime.
+        let state = state_with_relay_and_tenant();
+        let lifetime_secs = state.player_token_lifetime.as_secs();
+        let app = router(state);
+
+        let req = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: None,
+            latency_estimate_ms: None,
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session_resp: SessionResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!session_resp.tokens.is_empty(), "a session mints tokens");
+        for player_token in &session_resp.tokens {
+            let token = rally_point_proto::token::SignedToken::decode(&player_token.token).unwrap();
+            let expires = token.claims.expires_at.0;
+            assert!(
+                expires >= before.saturating_add(lifetime_secs)
+                    && expires <= after.saturating_add(lifetime_secs),
+                "expiry {expires} should be now + {lifetime_secs}s (call window {before}..={after})",
+            );
+        }
     }
 
     #[tokio::test]
@@ -1992,6 +2055,7 @@ mod tests {
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
             regions: RegionsConfig::default(),
+            player_token_lifetime: TEST_TOKEN_LIFETIME,
         };
         let app = router(state);
 

@@ -79,11 +79,10 @@ pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 /// LATER of this and the session's own token expiry (plus
 /// [`NEVER_STARTED_EXPIRY_MARGIN`]), so a session whose tokens are still
 /// legitimately usable is never reaped out from under a client that could
-/// still dial in. Today's only production caller mints tokens with no real
-/// expiry (`ExpiresAt(u64::MAX)`), which reads as "no signal" rather than "584
-/// billion years from now" — see `never_started_grace`'s own doc — so in
-/// practice this floor is what governs every session until a tenant-facing
-/// finite expiry exists.
+/// still dial in. A caller that wants tokens with no real expiry mints
+/// `ExpiresAt(u64::MAX)`, which `never_started_grace` reads as "no signal"
+/// rather than "584 billion years from now" — see its own doc — and falls back
+/// to this floor, so a no-expiry session is still bounded by it.
 pub const NEVER_STARTED_REAP_FLOOR: Duration = Duration::from_secs(15 * 60);
 
 /// Extra margin held past a session's token expiry (when it has a real one)
@@ -101,12 +100,11 @@ pub const NEVER_STARTED_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// production window.
 ///
 /// `u64::MAX` — the sentinel a caller mints when it wants tokens that
-/// effectively never expire (today's only production caller always does) —
-/// is treated as "no real expiry was set", not as a literal ~584-billion-year
-/// deadline: computing a duration from it and taking the max against the
-/// floor would make the floor irrelevant and the reaper never fire, exactly
-/// backwards from the point of having one. Only a genuinely finite
-/// `expires_at` can push the window out past the floor.
+/// effectively never expire — is treated as "no real expiry was set", not as a
+/// literal ~584-billion-year deadline: computing a duration from it and taking
+/// the max against the floor would make the floor irrelevant and the reaper
+/// never fire, exactly backwards from the point of having one. Only a genuinely
+/// finite `expires_at` can push the window out past the floor.
 fn never_started_grace(
     expires_at: ExpiresAt,
     floor: Duration,
