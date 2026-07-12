@@ -38,15 +38,17 @@
 //! have not dialed yet holds no local slot, so the applied set is the only signal
 //! that the relay is still spoken for (see [`drained_idle`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
+    CoordinatorToRelay, MeshPeerIdentity, RelayHello, RelayToCoordinator, SessionDescriptor,
+    SessionPresence,
 };
+use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
@@ -139,6 +141,93 @@ impl AppliedSessions {
     }
 }
 
+/// The fleet's currently-enrolled mesh peers as the coordinator last pushed them:
+/// each relay id mapped to the SHA-256 fingerprint of the TLS leaf certificate it
+/// enrolled with. The mesh acceptor pins a dialing peer's TLS client certificate
+/// against this map, so only a relay the coordinator has enrolled — presenting the
+/// exact certificate it enrolled with — is admitted as a mesh peer, with no
+/// certificate authority and no out-of-band distribution.
+///
+/// The coordinator sends the whole set on every control-connection start and again
+/// whenever fleet membership changes; the relay replaces its stored map wholesale
+/// on each push (declarative current state, like the descriptor set). The map is
+/// empty until the first push lands — a coordinator that never sends the set (one
+/// predating it) leaves it empty, and the accept-path pin treats an empty map as
+/// "pin nothing".
+///
+/// `watch`-backed so the map is observable: the writer is held by the coordinator
+/// client, and [`reader`](Self::reader) hands out cheap, cloneable read handles for
+/// the mesh acceptor to consult.
+#[derive(Clone)]
+pub struct FleetMeshPeers {
+    peers: Arc<watch::Sender<HashMap<RelayId, [u8; 32]>>>,
+}
+
+impl Default for FleetMeshPeers {
+    fn default() -> Self {
+        Self {
+            peers: Arc::new(watch::channel(HashMap::new()).0),
+        }
+    }
+}
+
+impl FleetMeshPeers {
+    /// Creates an empty fleet mesh-peer map (a relay that has received no push).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A cheap, cloneable read handle onto the map, for the mesh acceptor to pin a
+    /// dialing peer's certificate against.
+    pub fn reader(&self) -> FleetMeshPeersReader {
+        FleetMeshPeersReader {
+            peers: self.peers.subscribe(),
+        }
+    }
+
+    /// Replaces the stored map with the coordinator's latest full set, waking
+    /// observers only when it actually changed. The pushed set is declarative
+    /// current state, so a wholesale replace — not a merge — is correct.
+    fn store(&self, peers: Vec<MeshPeerIdentity>) {
+        let next: HashMap<RelayId, [u8; 32]> = peers
+            .into_iter()
+            .map(|p| (p.relay_id, p.cert_sha256))
+            .collect();
+        self.peers.send_if_modified(|current| {
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        });
+    }
+}
+
+/// A read handle onto the fleet mesh-peer map the coordinator client maintains
+/// ([`FleetMeshPeers`]). Cheap to clone; every clone observes the same watch-backed
+/// map. The mesh acceptor holds one to pin a dialing peer's TLS client certificate
+/// against the coordinator's enrolled-fleet truth.
+#[derive(Clone)]
+pub struct FleetMeshPeersReader {
+    peers: watch::Receiver<HashMap<RelayId, [u8; 32]>>,
+}
+
+impl FleetMeshPeersReader {
+    /// The fingerprint the coordinator last published for `relay_id`, or `None`
+    /// when the fleet map names no such relay — including before the first push,
+    /// when the map is empty.
+    pub fn fingerprint(&self, relay_id: RelayId) -> Option<[u8; 32]> {
+        self.peers.borrow().get(&relay_id).copied()
+    }
+
+    /// Whether the fleet map is currently empty — no push has landed yet (or a
+    /// coordinator that never sends one).
+    pub fn is_empty(&self) -> bool {
+        self.peers.borrow().is_empty()
+    }
+}
+
 /// Whether the relay is drained-idle — safe to exit without abandoning anyone: it
 /// holds **no local slot** ([`crate::routing::holds_any_slots`]) *and* its
 /// last-applied descriptor set is **empty**.
@@ -204,6 +293,10 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// through [`drained_idle`] to tell an assigned-but-not-yet-dialed session from a
 /// provably unassigned relay.
 ///
+/// `fleet` is the fleet mesh-peer map ([`FleetMeshPeers`]): this loop replaces it
+/// wholesale on every [`CoordinatorToRelay::MeshPeers`] push, and the mesh acceptor
+/// reads it through a [`FleetMeshPeersReader`] to pin a dialing peer's certificate.
+///
 /// `drain` and `drain_acked` are the coordinated-drain seam: when the relay
 /// receives its shutdown signal, the drain sequence flips `drain` to `true`, and
 /// this loop sends a [`RelayToCoordinator::Draining`] up the connection asking the
@@ -222,6 +315,7 @@ pub async fn run_descriptor_subscriber(
     control: MeshControl,
     sessions: Sessions,
     applied: AppliedSessions,
+    fleet: FleetMeshPeers,
     notices: UnboundedReceiver<RelayNotice>,
     drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -233,6 +327,7 @@ pub async fn run_descriptor_subscriber(
         control,
         sessions,
         applied,
+        fleet,
         notices,
         drain,
         drain_acked,
@@ -258,6 +353,9 @@ pub async fn run_descriptor_subscriber_with(
     // disconnected is left when the next connection's full-set re-sync arrives
     // without it.
     applied: AppliedSessions,
+    // Held across connections so the mesh acceptor's read handle keeps observing
+    // the same map: each connection re-syncs the full set on connect, replacing it.
+    fleet: FleetMeshPeers,
     mut notices: UnboundedReceiver<RelayNotice>,
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -280,6 +378,7 @@ pub async fn run_descriptor_subscriber_with(
             &control,
             &sessions,
             &applied,
+            &fleet,
             &mut notices,
             &mut pending,
             &mut drain,
@@ -334,6 +433,7 @@ async fn connect_and_stream(
     control: &MeshControl,
     sessions: &Sessions,
     applied: &AppliedSessions,
+    fleet: &FleetMeshPeers,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
     drain: &mut watch::Receiver<bool>,
@@ -403,13 +503,22 @@ async fn connect_and_stream(
                 match message? {
                     Message::Text(text) => {
                         let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
-                        if matches!(message, CoordinatorToRelay::DrainAck) {
-                            // The coordinator has marked us ineligible and pushed our
-                            // current descriptor set just before this ack; signal the
-                            // drain sequence it may proceed (empty set ⇒ unassigned).
-                            let _ = drain_acked.send(true);
-                        } else {
-                            apply_message(control, message, applied);
+                        match message {
+                            CoordinatorToRelay::DrainAck => {
+                                // The coordinator has marked us ineligible and pushed
+                                // our current descriptor set just before this ack;
+                                // signal the drain sequence it may proceed (empty set
+                                // ⇒ unassigned).
+                                let _ = drain_acked.send(true);
+                            }
+                            CoordinatorToRelay::MeshPeers { peers } => {
+                                // The fleet's currently-enrolled mesh peers: store the
+                                // whole set, replacing the prior one. Declarative
+                                // current state — a reconnect re-syncs the full set —
+                                // so a wholesale replace is correct.
+                                fleet.store(peers);
+                            }
+                            other => apply_message(control, other, applied),
                         }
                     }
                     Message::Close(frame) => {
@@ -556,6 +665,11 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
         // delegating here, so this arm is only a defensive no-op for a stray one.
         CoordinatorToRelay::DrainAck => {
             tracing::debug!("ignoring a DrainAck received outside a drain exchange");
+        }
+        // The connection loop intercepts MeshPeers (it stores the set into the fleet
+        // map) before delegating here, so this arm is only a defensive no-op.
+        CoordinatorToRelay::MeshPeers { .. } => {
+            tracing::debug!("ignoring a MeshPeers frame received outside the fleet-map store");
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -1011,6 +1125,7 @@ mod tests {
             control,
             Arc::default(),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             notices_rx,
             drain_rx,
             drain_acked,
@@ -1159,6 +1274,7 @@ mod tests {
             control,
             Arc::default(),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1220,6 +1336,7 @@ mod tests {
             control,
             Arc::default(),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1287,6 +1404,7 @@ mod tests {
             control,
             Arc::default(),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1344,6 +1462,7 @@ mod tests {
             control,
             Arc::clone(&sessions),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -1428,6 +1547,7 @@ mod tests {
             control,
             Arc::default(),
             AppliedSessions::default(),
+            FleetMeshPeers::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -1519,5 +1639,124 @@ mod tests {
             .await
             .expect("an ordinary close redials at the normal delay, not the refusal backoff")
             .unwrap();
+    }
+
+    // --- Fleet mesh-peer map ---
+
+    #[test]
+    fn store_replaces_the_fleet_map_wholesale_and_the_reader_reflects_it() {
+        let fleet = FleetMeshPeers::new();
+        let reader = fleet.reader();
+        assert!(reader.is_empty(), "a fresh map is empty");
+
+        fleet.store(vec![
+            MeshPeerIdentity {
+                relay_id: RelayId(1),
+                cert_sha256: [0x11; 32],
+            },
+            MeshPeerIdentity {
+                relay_id: RelayId(2),
+                cert_sha256: [0x22; 32],
+            },
+        ]);
+        assert_eq!(reader.fingerprint(RelayId(1)), Some([0x11; 32]));
+        assert_eq!(reader.fingerprint(RelayId(2)), Some([0x22; 32]));
+        assert!(!reader.is_empty());
+
+        // A later push is declarative current state: relay 1 drops out and relay
+        // 2's cert rotates, replacing the map wholesale rather than merging.
+        fleet.store(vec![MeshPeerIdentity {
+            relay_id: RelayId(2),
+            cert_sha256: [0xEE; 32],
+        }]);
+        assert_eq!(
+            reader.fingerprint(RelayId(1)),
+            None,
+            "a wholesale replace drops the absent relay",
+        );
+        assert_eq!(
+            reader.fingerprint(RelayId(2)),
+            Some([0xEE; 32]),
+            "the rotated cert is reflected",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mesh_peers_push_updates_the_fleet_map_the_reader_exposes() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Stand-in coordinator: accept, read the Hello, push a MeshPeers set, then
+        // hold the connection open so the relay does not reconnect mid-assert.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = ws.next().await.unwrap().unwrap();
+            let frame = serde_json::to_string(&CoordinatorToRelay::MeshPeers {
+                peers: vec![
+                    MeshPeerIdentity {
+                        relay_id: RelayId(2),
+                        cert_sha256: [0x22; 32],
+                    },
+                    MeshPeerIdentity {
+                        relay_id: RelayId(3),
+                        cert_sha256: [0x33; 32],
+                    },
+                ],
+            })
+            .unwrap();
+            ws.send(Message::Text(frame.into())).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        // The reader is taken before the writer moves into the subscriber, so it
+        // observes exactly the map the received push stores.
+        let fleet = FleetMeshPeers::new();
+        let reader = fleet.reader();
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            fleet,
+            mpsc::unbounded_channel().1,
+            drain_rx,
+            drain_acked,
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        ));
+
+        // The pushed set lands in the shared map the reader observes.
+        let landed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if reader.fingerprint(RelayId(2)) == Some([0x22; 32])
+                    && reader.fingerprint(RelayId(3)) == Some([0x33; 32])
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            landed.is_ok(),
+            "the reader exposes the coordinator's pushed fleet map",
+        );
+        assert_eq!(
+            reader.fingerprint(RelayId(9)),
+            None,
+            "a relay absent from the pushed set has no fingerprint",
+        );
     }
 }

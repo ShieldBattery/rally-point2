@@ -37,7 +37,7 @@ use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
 
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::presence::PresenceStore;
-use crate::registry::{self, RelayRegistry, SessionSetupError};
+use crate::registry::{self, RelayRegistry, SessionSetupError, cert_fingerprint};
 use crate::rehome::RehomeLimiter;
 use crate::tenant::{self, TenantStore};
 
@@ -223,16 +223,6 @@ pub struct CreatedSession {
     /// create for an `external_id` already bound to a live session) rather than
     /// freshly minted.
     pub replayed: bool,
-}
-
-/// The SHA-256 fingerprint of a relay's DER-encoded certificate — the compact
-/// form a session records to remember which cert its clients pinned to a
-/// relay, rather than carrying the full DER bytes through every session's
-/// state for a plain byte comparison.
-fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
-    out
 }
 
 use std::sync::Arc;

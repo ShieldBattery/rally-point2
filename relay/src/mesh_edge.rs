@@ -69,6 +69,7 @@ use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::coordinator_client::FleetMeshPeersReader;
 use crate::mesh::{self, MeshState};
 use crate::presence;
 use crate::routing::Sessions;
@@ -217,11 +218,17 @@ pub struct MeshDial {
 ///
 /// Ends when `mesh_accept` closes (the client-edge accept loop ended — the
 /// relay is shutting down).
+///
+/// `_fleet_peers` is the coordinator's enrolled-fleet mesh-peer fingerprint map
+/// (see [`FleetMeshPeersReader`]), threaded in for the accept-path pin that checks
+/// a dialing peer's TLS client certificate against the fingerprint the coordinator
+/// recorded for its claimed relay id. It is held but not consulted here.
 pub async fn run_mesh_accept(
     mut mesh_accept: mpsc::Receiver<quinn::Connection>,
     sessions: Sessions,
     mesh: MeshState,
     links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    _fleet_peers: FleetMeshPeersReader,
 ) {
     while let Some(connection) = mesh_accept.recv().await {
         let sessions = Arc::clone(&sessions);
@@ -821,6 +828,7 @@ mod tests {
             Sessions::default(),
             mesh::new_mesh_state(),
             links_tx,
+            crate::coordinator_client::FleetMeshPeers::new().reader(),
         ));
 
         let (silent_conn, _client_conn, _client_ep, _server_ep) = silent_mesh_connection().await;

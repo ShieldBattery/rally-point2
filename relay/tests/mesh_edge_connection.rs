@@ -30,6 +30,7 @@ use rally_point_proto::token::{
     TokenClaims,
 };
 use rally_point_relay::auth::HANDSHAKE_OK;
+use rally_point_relay::coordinator_client::{FleetMeshPeers, FleetMeshPeersReader};
 use rally_point_relay::mesh;
 use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_dialer;
@@ -48,6 +49,13 @@ const KID: &str = "staging-key-1";
 const TENANT: &str = "sb-staging";
 
 type AnyError = Box<dyn Error + Send + Sync>;
+
+/// An empty fleet mesh-peer read handle for the accept side: these tests exercise
+/// the connection half, not the coordinator's peer-auth push, so the acceptor's
+/// fleet map is empty (its writer is dropped immediately, leaving only the handle).
+fn empty_fleet_peers() -> FleetMeshPeersReader {
+    FleetMeshPeers::new().reader()
+}
 
 /// What an established mesh link surfaces on the `links` channel: the peer's id and
 /// the command sender that drives `Join`/`Leave` on that link.
@@ -262,6 +270,7 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     // A dials B. The dial establishes the connection and spawns a
@@ -367,6 +376,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     let (links_a_tx, mut links_a_rx) =
@@ -510,6 +520,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
     let (links_a_tx, mut links_a_rx) =
         mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
@@ -1008,6 +1019,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     let (links_a_tx, mut links_a_rx) =
@@ -1178,6 +1190,7 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     // A's on-demand dialer, fed desired peers over a watch. Its configured
@@ -1417,6 +1430,7 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     // A stand-in dialer speaking only v1 (below MIN_SUPPORTED): connect on the
@@ -1571,6 +1585,7 @@ async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(),
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
 
     let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
@@ -1653,6 +1668,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
         Arc::clone(&relay_b.sessions),
         relay_b.mesh.clone(),
         links_b_tx,
+        empty_fleet_peers(),
     ));
     let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();

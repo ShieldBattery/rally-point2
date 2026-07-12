@@ -280,6 +280,14 @@ async fn main() -> Result<()> {
             tokio::sync::mpsc::UnboundedSender<mesh::MeshCommand>,
         )>(8);
 
+        // The fleet mesh-peer map: the coordinator pushes the currently-enrolled
+        // fleet's cert fingerprints down the control connection, the subscriber
+        // stores them here, and the mesh acceptor reads them to pin a dialing
+        // peer's certificate. Created here so both the accept task (a read handle)
+        // and the coordinator subscriber (the writer) share one map; without a
+        // coordinator URL it stays empty (dev/static `--mesh-peer`).
+        let fleet_peers = coordinator_client::FleetMeshPeers::new();
+
         // Clone `links_tx` for the accept task; the original stays for the dial
         // tasks below (each clones again per peer).
         tokio::spawn(mesh_edge::run_mesh_accept(
@@ -287,6 +295,7 @@ async fn main() -> Result<()> {
             Arc::clone(&sessions),
             mesh_state.clone(),
             links_tx.clone(),
+            fleet_peers.reader(),
         ));
 
         // Roots to trust peer certs against — needed by the static `--mesh-peer`
@@ -423,6 +432,7 @@ async fn main() -> Result<()> {
                 mesh_control.clone(),
                 Arc::clone(&sessions),
                 applied.clone(),
+                fleet_peers,
                 notices_rx,
                 drain_rx.clone(),
                 drain_acked_tx.clone(),

@@ -70,8 +70,8 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
-    SessionRequest, SessionResponse, TenantId,
+    CoordinatorToRelay, MeshPeerIdentity, RelayEndpoint, RelayHello, RelayToCoordinator,
+    SessionDescriptor, SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -878,6 +878,10 @@ async fn push_and_watch(
     // directives here, and this loop forwards each down the connection. A fresh
     // subscribe replaces any prior sender, so a reconnect owns the live receiver.
     let mut reaps = setup.reaps().subscribe(relay_id);
+    // The fleet mesh-peer set: shared across every relay's connection, re-synced
+    // in full on connect and pushed again whenever fleet membership changes. The
+    // relay pins a dialing peer's cert against it at mesh-accept time.
+    let mut mesh_peers_rx = registry::subscribe_mesh_peers(setup.registry());
 
     // A relay silent past this deadline — or one whose send stalls past it — is
     // treated as dead. Every inbound frame pushes it forward; a heartbeat lands
@@ -891,6 +895,13 @@ async fn push_and_watch(
     if !send_before_deadline(socket, &initial, relay_id, deadline).await {
         return;
     }
+    // The fleet mesh-peer set rides the same connect-time re-sync, alongside the
+    // descriptor set: the relay learns every enrolled peer's cert fingerprint the
+    // moment it connects.
+    let initial_peers = mesh_peers_rx.borrow_and_update().clone();
+    if !send_mesh_peers_before_deadline(socket, &initial_peers, relay_id, deadline).await {
+        return;
+    }
 
     loop {
         tokio::select! {
@@ -900,6 +911,15 @@ async fn push_and_watch(
                 }
                 let set = rx.borrow_and_update().clone();
                 if !send_before_deadline(socket, &set, relay_id, deadline).await {
+                    break;
+                }
+            }
+            changed = mesh_peers_rx.changed() => {
+                if changed.is_err() {
+                    break; // the registry's mesh-peer channel was dropped: shutting down
+                }
+                let peers = mesh_peers_rx.borrow_and_update().clone();
+                if !send_mesh_peers_before_deadline(socket, &peers, relay_id, deadline).await {
                     break;
                 }
             }
@@ -1011,6 +1031,40 @@ async fn send_before_deadline(
             tracing::info!(
                 relay_id = relay_id.0,
                 "descriptor push stalled past the liveness deadline; dropping",
+            );
+            false
+        }
+    }
+}
+
+/// Sends the fleet mesh-peer set down the connection, racing the same liveness
+/// deadline as a descriptor push (a relay that stopped reading must not hold its
+/// registry entry open while wedged). Returns whether the connection should keep
+/// running: `false` on a send error or a stall past the deadline.
+async fn send_mesh_peers_before_deadline(
+    socket: &mut WebSocket,
+    peers: &[MeshPeerIdentity],
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let message = CoordinatorToRelay::MeshPeers {
+        peers: peers.to_vec(),
+    };
+    let json = serde_json::to_string(&message).expect("a mesh-peers frame always serializes");
+    tokio::select! {
+        result = socket.send(Message::Text(json.into())) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "mesh-peers push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "mesh-peers push stalled past the liveness deadline; dropping",
             );
             false
         }

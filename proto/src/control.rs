@@ -793,6 +793,29 @@ pub struct DepartedSlot {
 // Persistent control connection (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
 
+/// One relay's mesh-peer identity as the coordinator distributes it to the whole
+/// fleet: the relay's id paired with the SHA-256 fingerprint of the TLS leaf
+/// certificate it enrolled with.
+///
+/// A relay serves its client edge and its mesh edge with a single self-signed
+/// certificate, so that certificate's fingerprint *is* the relay's identity. The
+/// mesh acceptor pins a dialing peer's TLS client certificate against the
+/// fingerprint carried here: a peer claiming a relay id present in the fleet set
+/// must present the certificate whose fingerprint the set records for it. This
+/// makes independently self-signed relay certs trust each other with no
+/// certificate authority and no out-of-band distribution — the same fingerprint
+/// clients pin from a session response and dialers pin from a descriptor, here
+/// pinned by the *accepting* relay instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshPeerIdentity {
+    /// The peer relay's coordinator-assigned id.
+    pub relay_id: RelayId,
+    /// The SHA-256 digest of the DER-encoded TLS leaf certificate the relay
+    /// enrolled with — the same certificate clients pin from a session response
+    /// and peers pin from a [`RelayPeer`] in a descriptor.
+    pub cert_sha256: [u8; 32],
+}
+
 /// A message the coordinator sends down the persistent control connection a
 /// relay holds open to it.
 ///
@@ -853,6 +876,24 @@ pub enum CoordinatorToRelay {
     /// generation; a stale connection's Draining draws no ack (its live successor
     /// runs its own drain exchange).
     DrainAck,
+    /// The fleet's currently-enrolled mesh peers — every relay the coordinator
+    /// holds enrolled, each with the SHA-256 fingerprint of the certificate it
+    /// enrolled with. The relay consumes this at mesh-accept time to pin a
+    /// dialing peer's TLS client certificate: a peer claiming a relay id in this
+    /// set must present the certificate whose fingerprint the set records for it.
+    ///
+    /// The coordinator sends the whole set on the control connection's start and
+    /// again whenever fleet membership changes, and the relay replaces its stored
+    /// set wholesale on each push — declarative complete state, exactly like
+    /// [`Descriptors`](Self::Descriptors). Re-sending an unchanged set is a
+    /// harmless no-op, and a relay that reconnects re-syncs the full current set,
+    /// so the channel never has to guarantee exactly-once delivery. A draining
+    /// relay stays in the set: it still serves live sessions and holds mesh links,
+    /// and the set governs only which peers may open a *new* mesh link.
+    MeshPeers {
+        /// The complete set of currently-enrolled fleet peers.
+        peers: Vec<MeshPeerIdentity>,
+    },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -1550,6 +1591,44 @@ mod tests {
         // up-direction `RelayToCoordinator` (which has no such variant) folds
         // into `Unknown` rather than erroring — an older relay build's path.
         let json = r#"{"type":"close_slot","tenant":"sb-staging","session":42,"slots":[1]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
+    fn coordinator_to_relay_mesh_peers_roundtrips_json() {
+        let message = CoordinatorToRelay::MeshPeers {
+            peers: vec![
+                MeshPeerIdentity {
+                    relay_id: RelayId(1),
+                    cert_sha256: [0x11; 32],
+                },
+                MeshPeerIdentity {
+                    relay_id: RelayId(2),
+                    cert_sha256: [0x22; 32],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"mesh_peers\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+        // The fingerprint survives the round trip intact — the acceptor pins on it.
+        let CoordinatorToRelay::MeshPeers { peers } = back else {
+            panic!("expected a mesh_peers frame");
+        };
+        assert_eq!(peers[0].cert_sha256, [0x11; 32]);
+        assert_eq!(peers[1].relay_id, RelayId(2));
+    }
+
+    #[test]
+    fn mesh_peers_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `MeshPeers` down-frame decoded by a build whose
+        // `CoordinatorToRelay` predates the variant (modeled by the up-direction
+        // `RelayToCoordinator`, which has no such variant) folds into `Unknown`
+        // rather than erroring — a coordinator that pushes the set to an older relay
+        // is skipped, not fatal.
+        let json = r#"{"type":"mesh_peers","peers":[]}"#;
         let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, RelayToCoordinator::Unknown);
     }

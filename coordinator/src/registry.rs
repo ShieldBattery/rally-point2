@@ -33,8 +33,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{RelayEntry, RelayHello, RelayPeer};
+use rally_point_proto::control::{MeshPeerIdentity, RelayEntry, RelayHello, RelayPeer};
 use rally_point_proto::ids::RelayId;
+use tokio::sync::watch;
 
 /// A registered relay, paired with the generation of the control connection that
 /// last enrolled it.
@@ -64,13 +65,71 @@ struct Registered {
 /// await point — mirroring `routing::Sessions` and `mesh::MeshLinks` on the
 /// relay. Clone the registry cheaply (each clone shares the same `Arc`) to
 /// hand a copy to a session-setup task.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RelayRegistry {
     relays: Arc<Mutex<HashMap<RelayId, Registered>>>,
     /// Hands out a fresh, strictly-increasing generation per enroll. Monotonic
     /// for the coordinator's lifetime, so two connections (even for the same
     /// relay id) never share one.
     next_generation: Arc<AtomicU64>,
+    /// Broadcast of the fleet's current mesh-peer set — every enrolled relay's id
+    /// paired with the SHA-256 fingerprint of the certificate it enrolled with
+    /// ([`MeshPeerIdentity`]). Rebuilt and published under the registry lock on
+    /// every membership change (enroll, remove), so a relay's control connection
+    /// re-syncs the whole set on connect and receives each change. Every enrolled
+    /// relay is included, draining ones too: the set governs new mesh-link
+    /// admission, not liveness, and a draining relay still serves live links.
+    mesh_peers: Arc<watch::Sender<Vec<MeshPeerIdentity>>>,
+}
+
+impl Default for RelayRegistry {
+    fn default() -> Self {
+        Self {
+            relays: Arc::default(),
+            next_generation: Arc::default(),
+            mesh_peers: Arc::new(watch::channel(Vec::new()).0),
+        }
+    }
+}
+
+/// The SHA-256 fingerprint of a relay's DER-encoded certificate — the compact
+/// form used to record which certificate a relay enrolled with (and which a
+/// session's clients pinned to it), rather than carrying the full DER bytes
+/// through every comparison. Shared so the registry and session setup hash the
+/// certificate one way.
+pub(crate) fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
+    out
+}
+
+/// Rebuilds the fleet mesh-peer set from the current relay map and publishes it
+/// on the broadcast channel, waking every subscribed control connection only when
+/// the set actually changed. Called under the registry lock, so the published set
+/// is a consistent snapshot of the mutation that produced it. Every enrolled relay
+/// is included — draining ones too — since the set governs new mesh-link admission,
+/// not liveness. Sorted by relay id for a stable wire order and a cheap equality
+/// check against the last-published set.
+fn publish_mesh_peers(
+    relays: &HashMap<RelayId, Registered>,
+    mesh_peers: &watch::Sender<Vec<MeshPeerIdentity>>,
+) {
+    let mut peers: Vec<MeshPeerIdentity> = relays
+        .values()
+        .map(|r| MeshPeerIdentity {
+            relay_id: r.entry.relay_id,
+            cert_sha256: cert_fingerprint(&r.entry.cert_der),
+        })
+        .collect();
+    peers.sort_by_key(|p| p.relay_id.0);
+    mesh_peers.send_if_modified(|current| {
+        if *current == peers {
+            false
+        } else {
+            *current = peers.clone();
+            true
+        }
+    });
 }
 
 /// Registers a relay that has enrolled (sent its `Hello` on its control
@@ -92,7 +151,8 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
         region: hello.region,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
-    registry.relays.lock().insert(
+    let mut relays = registry.relays.lock();
+    relays.insert(
         entry.relay_id,
         Registered {
             entry,
@@ -102,6 +162,9 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
             draining: false,
         },
     );
+    // A new (or re-enrolled) relay changes the fleet mesh-peer set; publish it to
+    // every connected relay under the same lock, so the snapshot is consistent.
+    publish_mesh_peers(&relays, &registry.mesh_peers);
     generation
 }
 
@@ -205,7 +268,11 @@ pub fn is_empty(registry: &RelayRegistry) -> bool {
 /// which is safe against a relay that reconnected while this connection was
 /// dropping.
 pub fn remove(registry: &RelayRegistry, id: RelayId) {
-    registry.relays.lock().remove(&id);
+    let mut relays = registry.relays.lock();
+    if relays.remove(&id).is_some() {
+        // The relay left the fleet: re-publish the shrunk mesh-peer set.
+        publish_mesh_peers(&relays, &registry.mesh_peers);
+    }
 }
 
 /// Deregisters a relay when its control connection drops, but **only if that
@@ -222,10 +289,29 @@ pub fn remove_if_current(registry: &RelayRegistry, id: RelayId, generation: u64)
     match relays.get(&id) {
         Some(registered) if registered.generation == generation => {
             relays.remove(&id);
+            // The relay left the fleet: re-publish the shrunk mesh-peer set.
+            publish_mesh_peers(&relays, &registry.mesh_peers);
             true
         }
         _ => false,
     }
+}
+
+/// Subscribes a control connection to the fleet mesh-peer set. The returned
+/// receiver's current value is the whole set as it stands now — so a freshly
+/// connected relay re-syncs the complete set before it waits for changes — and it
+/// wakes on every fleet-membership change ([`enroll`], [`remove`],
+/// [`remove_if_current`]). The relay applies each set wholesale, so re-delivery of
+/// an unchanged set is a harmless no-op.
+pub fn subscribe_mesh_peers(registry: &RelayRegistry) -> watch::Receiver<Vec<MeshPeerIdentity>> {
+    registry.mesh_peers.subscribe()
+}
+
+/// The current fleet mesh-peer set — every enrolled relay's id and cert
+/// fingerprint, sorted by relay id. Non-consuming; a one-shot read for tests and
+/// callers that do not need to observe changes.
+pub fn mesh_peers(registry: &RelayRegistry) -> Vec<MeshPeerIdentity> {
+    registry.mesh_peers.borrow().clone()
 }
 
 /// Creates an empty relay registry for a coordinator with no relays phoned
@@ -484,5 +570,68 @@ mod tests {
             2,
             "the draining relay stays enrolled"
         );
+    }
+
+    #[test]
+    fn enroll_publishes_a_fingerprinted_mesh_peer_set() {
+        let reg = new_registry();
+        assert!(mesh_peers(&reg).is_empty(), "no relays enrolled, no peers");
+
+        enroll(&reg, hello(2, 14902));
+        enroll(&reg, hello(1, 14901));
+
+        // Sorted by relay id, each peer carrying the SHA-256 of the cert it
+        // enrolled with (`hello` enrolls with `vec![id; 4]`).
+        let peers = mesh_peers(&reg);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].relay_id, RelayId(1));
+        assert_eq!(peers[0].cert_sha256, cert_fingerprint(&[1u8; 4]));
+        assert_eq!(peers[1].relay_id, RelayId(2));
+        assert_eq!(peers[1].cert_sha256, cert_fingerprint(&[2u8; 4]));
+    }
+
+    #[test]
+    fn a_subscriber_re_syncs_the_current_set_and_wakes_on_membership_change() {
+        let reg = new_registry();
+        enroll(&reg, hello(1, 14901));
+
+        // A fresh subscriber re-syncs the current set as its initial value.
+        let mut rx = subscribe_mesh_peers(&reg);
+        let initial = rx.borrow_and_update().clone();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].relay_id, RelayId(1));
+
+        // A later enroll wakes the subscriber and grows the set.
+        enroll(&reg, hello(2, 14902));
+        assert!(rx.has_changed().unwrap());
+        let grown = rx.borrow_and_update().clone();
+        assert_eq!(grown.len(), 2);
+
+        // Re-enrolling the same relay with the same cert (only its address
+        // differs) leaves the mesh-peer set unchanged, so it must not wake the
+        // subscriber — the set keys on id + cert fingerprint, nothing else.
+        enroll(&reg, hello(2, 14999));
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged mesh-peer set must not wake a subscriber",
+        );
+    }
+
+    #[test]
+    fn deregistration_shrinks_the_mesh_peer_set() {
+        let reg = new_registry();
+        let g1 = enroll(&reg, hello(1, 14901));
+        enroll(&reg, hello(2, 14902));
+        assert_eq!(mesh_peers(&reg).len(), 2);
+
+        // A generation-fenced deregister drops the relay and shrinks the set.
+        assert!(remove_if_current(&reg, RelayId(1), g1));
+        let peers = mesh_peers(&reg);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].relay_id, RelayId(2));
+
+        // An unconditional remove shrinks it too.
+        remove(&reg, RelayId(2));
+        assert!(mesh_peers(&reg).is_empty());
     }
 }

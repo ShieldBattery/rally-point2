@@ -18,8 +18,8 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, CoordinatorToRelay, PlayerHandoff, RegionId, RelayHello, RelayToCoordinator,
-    ResultNotice, SessionDescriptor, SessionRequest, TenantId,
+    BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionId, RelayHello,
+    RelayToCoordinator, ResultNotice, SessionDescriptor, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -242,6 +242,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -271,6 +272,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -312,6 +314,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -348,6 +351,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -474,6 +478,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -1051,6 +1056,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         control,
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
+        coordinator_client::FleetMeshPeers::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -1069,4 +1075,86 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         registry::peer(&reg, RelayId(7)).is_some(),
         "a heartbeating relay must not be deregistered",
     );
+}
+
+// --- Fleet mesh-peer distribution ---
+
+/// Reads down-frames from `socket` until a [`CoordinatorToRelay::MeshPeers`] frame
+/// carrying exactly `want` peers arrives, returning its peer set. The coordinator
+/// interleaves descriptor and mesh-peer pushes down the one connection, so this
+/// skips every frame that is not a mesh-peer set of the wanted size.
+async fn read_mesh_peers_until(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    want: usize,
+) -> Vec<MeshPeerIdentity> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message
+                && let CoordinatorToRelay::MeshPeers { peers } =
+                    serde_json::from_str::<CoordinatorToRelay>(&text).unwrap()
+                && peers.len() == want
+            {
+                return peers;
+            }
+        }
+        panic!("the connection closed before a MeshPeers set of the wanted size arrived");
+    })
+    .await
+    .expect("a MeshPeers set of the wanted size should arrive")
+}
+
+#[tokio::test]
+async fn the_fleet_mesh_peer_set_is_pushed_and_tracks_membership() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+
+    // Relay 1 opens its control connection and enrolls.
+    let (mut socket1, _resp) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let hello1 = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket1.send(Message::Text(hello1.into())).await.unwrap();
+    assert!(wait_for_enrollment(&reg, RelayId(1)).await);
+
+    // On connect it is pushed the fleet set — just itself so far — carrying the
+    // fingerprint the coordinator recorded for it at enroll.
+    let solo = read_mesh_peers_until(&mut socket1, 1).await;
+    assert_eq!(solo, registry::mesh_peers(&reg));
+    assert_eq!(solo[0].relay_id, RelayId(1));
+
+    // Relay 2 enrolls over its own connection.
+    let (mut socket2, _resp) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let hello2 = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(2, 14901))).unwrap();
+    socket2.send(Message::Text(hello2.into())).await.unwrap();
+    assert!(wait_for_enrollment(&reg, RelayId(2)).await);
+
+    // The membership change pushes an updated set to BOTH connections, each naming
+    // both relays with the coordinator's recorded fingerprints.
+    let expected = registry::mesh_peers(&reg);
+    assert_eq!(expected.len(), 2);
+    let on_one = read_mesh_peers_until(&mut socket1, 2).await;
+    assert_eq!(
+        on_one, expected,
+        "the earlier relay is pushed the grown set"
+    );
+    let on_two = read_mesh_peers_until(&mut socket2, 2).await;
+    assert_eq!(
+        on_two, expected,
+        "the newly-connected relay receives the full set on connect",
+    );
+    // The two relays carry distinct fingerprints — they enrolled distinct certs.
+    assert_ne!(on_one[0].cert_sha256, on_one[1].cert_sha256);
+
+    // Relay 2 goes away: its deregistration shrinks the set pushed to relay 1.
+    drop(socket2);
+    assert!(wait_for_deregistration(&reg, RelayId(2)).await);
+    let shrunk = read_mesh_peers_until(&mut socket1, 1).await;
+    assert_eq!(shrunk, registry::mesh_peers(&reg));
+    assert_eq!(shrunk[0].relay_id, RelayId(1));
 }
