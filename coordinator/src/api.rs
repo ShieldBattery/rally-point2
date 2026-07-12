@@ -256,8 +256,7 @@ async fn create_session(
             | registry::SessionSetupError::NoPlayers
             | registry::SessionSetupError::DuplicateSlot(_)
             | registry::SessionSetupError::ExternalIdTooLong
-            | registry::SessionSetupError::ExternalRefTooLong(_)
-            | registry::SessionSetupError::DevRelaySplitTooLong(_) => StatusCode::BAD_REQUEST,
+            | registry::SessionSetupError::ExternalRefTooLong(_) => StatusCode::BAD_REQUEST,
         }
     })?;
 
@@ -1567,7 +1566,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -1591,7 +1589,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -1635,7 +1632,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&original).unwrap();
@@ -1671,7 +1667,6 @@ mod tests {
                 },
             ],
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&conflicting).unwrap();
@@ -1695,7 +1690,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         // No signature headers at all — fails closed.
@@ -1723,7 +1717,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -1742,7 +1735,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -1949,7 +1941,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -1970,7 +1961,6 @@ mod tests {
             tenant: TenantId("not-enrolled".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -2176,7 +2166,6 @@ mod tests {
                     region: None,
                 }],
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             rally_point_proto::token::ExpiresAt(u64::MAX),
@@ -2333,7 +2322,6 @@ mod tests {
                 region: None,
             }],
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         crate::session::create_session(&state.setup, req, ExpiresAt(u64::MAX))
@@ -2588,7 +2576,6 @@ mod tests {
                     region: None,
                 }],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),

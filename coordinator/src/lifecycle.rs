@@ -1875,7 +1875,6 @@ mod tests {
                     },
                 ],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2034,7 +2033,6 @@ mod tests {
                     },
                 ],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2147,14 +2145,14 @@ mod tests {
 
     #[tokio::test]
     async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() {
-        // A split session on relays 1 (home) and 2 (secondary). Relay 2 asks to
-        // drain -- still a serving member, but excluded from the replacement pick
-        // -- so when the home dies the group moves onto the idle relay 3 instead,
-        // leaving BOTH 3 (the replacement) and 2 (the drained-but-still-serving
-        // survivor) in the cached set. Both must report closed before the session
-        // finishes.
+        // A cross-region session on relays 1 (home, region-a) and 2 (region-b).
+        // Relay 2 asks to drain -- still a serving member, but excluded from the
+        // replacement pick -- so when the home dies the group moves onto the idle
+        // relay 3 instead, leaving BOTH 3 (the replacement) and 2 (the
+        // drained-but-still-serving survivor) in the cached set. Both must report
+        // closed before the session finishes.
         use crate::session::{self, RehomeOutcome};
-        use rally_point_proto::control::{PlayerHandoff, RelayHello, SessionRequest};
+        use rally_point_proto::control::{PlayerHandoff, RegionId, RelayHello, SessionRequest};
         use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
         use rally_point_proto::version::ProtocolVersion;
 
@@ -2167,7 +2165,8 @@ mod tests {
                 std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
                 ProtocolVersion::CURRENT,
                 vec![1u8; 4],
-            ),
+            )
+            .with_region(RegionId("region-a".to_owned())),
         );
         let gen2 = registry::enroll(
             &reg,
@@ -2176,7 +2175,8 @@ mod tests {
                 std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
                 ProtocolVersion::CURRENT,
                 vec![2u8; 4],
-            ),
+            )
+            .with_region(RegionId("region-b".to_owned())),
         );
         registry::enroll(
             &reg,
@@ -2208,18 +2208,17 @@ mod tests {
                         client_pubkey: ClientPublicKey([0xAA; 32]),
                         external_ref: None,
                         observer: false,
-                        region: None,
+                        region: Some(RegionId("region-a".to_owned())),
                     },
                     PlayerHandoff {
                         slot: SlotId(1),
                         client_pubkey: ClientPublicKey([0xBB; 32]),
                         external_ref: None,
                         observer: false,
-                        region: None,
+                        region: Some(RegionId("region-b".to_owned())),
                     },
                 ],
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),

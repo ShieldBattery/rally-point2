@@ -140,9 +140,11 @@ async fn coordinator_with_session(
     bootstrap_secret: Option<&str>,
 ) -> (String, SessionId, SessionSetup) {
     let reg = registry::new_registry();
-    for (id, port) in [(1u64, 14900u16), (2, 14901)] {
-        registry::enroll(&reg, relay_hello(id, port));
-    }
+    registry::enroll(&reg, relay_hello(1, 14900));
+    registry::enroll(
+        &reg,
+        relay_hello(2, 14901).with_region(RegionId("region-b".to_owned())),
+    );
     let tenants = tenant::new_store();
     tenant::enroll(
         &tenants,
@@ -170,13 +172,13 @@ async fn coordinator_with_session(
                     client_pubkey: ClientPublicKey([0xBB; 32]),
                     external_ref: None,
                     observer: false,
-                    region: None,
+                    // Homes slot 1 on relay 2 (the only relay enrolled in
+                    // region-b) so both relays serve and mesh — the topology
+                    // these transport tests exercise.
+                    region: Some(RegionId("region-b".to_owned())),
                 },
             ],
             external_id: None,
-            // Home slot 1 on the secondary relay so both relays serve and mesh —
-            // the topology these transport tests exercise.
-            dev_relay_split: vec![SlotId(1)],
             latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
@@ -582,7 +584,6 @@ fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
                 region: None,
             }],
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
@@ -669,7 +670,6 @@ async fn a_draining_relay_gets_its_set_then_an_ack_and_is_excluded_from_new_sess
                 region: None,
             }],
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),
@@ -716,7 +716,6 @@ async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
                 region: None,
             }],
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         },
         ExpiresAt(u64::MAX),

@@ -94,8 +94,8 @@ pub struct SessionRefs {
     pub homes: std::collections::BTreeMap<SlotId, RelayId>,
     /// The SHA-256 fingerprint of the DER certificate each serving relay's
     /// clients currently pin, keyed by relay id. Recorded at session creation
-    /// for the primary home and any dev-split secondary, and updated for the
-    /// replacement relay on every re-home (including a same-id restart, where
+    /// for every serving relay, and updated for the replacement relay on every
+    /// re-home (including a same-id restart, where
     /// it captures the relay's fresh cert under its unchanged id). A relay
     /// restart mints a new cert under the same id, so this — not the relay's
     /// enroll generation, which also bumps on a benign reconnect of an
@@ -148,8 +148,6 @@ pub struct SessionRefs {
 /// - each player's `region` — selects the slot's home relay, so the same
 ///   `external_id` retried with different per-slot regions reads as a genuine
 ///   roster mismatch (a `409`), not a replay.
-/// - `dev_relay_split` — decides which slots home on the secondary relay,
-///   shaping the response's `slot_homes` and the session's serving-relay set.
 ///
 /// Equality is plain struct equality ([`PartialEq`]), never a hash: a hash
 /// collision must not be able to bind two genuinely different rosters to one
@@ -160,9 +158,6 @@ struct CreateFingerprint {
     /// A request cannot name a slot twice (`validate_request` rejects a
     /// duplicate), so the slot totally orders this list.
     players: Vec<FingerprintPlayer>,
-    /// The dev cross-relay split, sorted so the same set in a different order
-    /// still matches.
-    dev_relay_split: Vec<SlotId>,
 }
 
 /// One player's contribution to a [`CreateFingerprint`]: the fields of a
@@ -180,8 +175,8 @@ struct FingerprintPlayer {
 
 impl CreateFingerprint {
     /// Reduces a request to its canonical fingerprint, sorting the players by
-    /// slot and the dev split so two semantically identical requests that
-    /// differ only in ordering still compare equal.
+    /// slot so two semantically identical requests that differ only in
+    /// ordering still compare equal.
     fn from_request(request: &SessionRequest) -> Self {
         let mut players: Vec<FingerprintPlayer> = request
             .players
@@ -195,12 +190,7 @@ impl CreateFingerprint {
             })
             .collect();
         players.sort_by_key(|p| p.slot);
-        let mut dev_relay_split = request.dev_relay_split.clone();
-        dev_relay_split.sort_unstable();
-        Self {
-            players,
-            dev_relay_split,
-        }
+        Self { players }
     }
 }
 
@@ -868,13 +858,10 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// Each slot homes on a live relay in the region it requested
 /// ([`PlayerHandoff::region`](rally_point_proto::control::PlayerHandoff::region)),
 /// falling back to the lowest-id available relay when it named no region or its
-/// region has no live relay. A request that carries no region at all instead runs
-/// the region-blind dev path, where every slot homes on the lowest-id relay
-/// except those the dev-only
-/// [`dev_relay_split`](SessionRequest::dev_relay_split) moves onto the secondary
-/// to force a cross-relay meshed session in testing. Each player gets a token
-/// signed by its tenant's key, binding the client pubkey to the slot and session.
-/// The bounds come from the tenant's enrolled policy.
+/// region has no live relay. A request with no per-slot regions at all falls back
+/// for every slot, so it homes as a single-relay session on the lowest-id relay.
+/// Each player gets a token signed by its tenant's key, binding the client pubkey
+/// to the slot and session. The bounds come from the tenant's enrolled policy.
 ///
 /// Records the session's relay membership — the distinct home relays of its
 /// slots — so [`descriptor_for`] can list only the relays actually serving this
@@ -965,17 +952,9 @@ fn create_session_inner(
 
     // Placement: each slot homes on a relay in the region it requested when one
     // is live, else the region-blind fallback (the lowest-id available relay). A
-    // request that carries any per-slot region is placed by region and ignores
-    // `dev_relay_split` — regions are the production placement mechanism, the
-    // split a region-less dev escape hatch — while a request with no region at all
-    // runs the dev-split path unchanged, so today's behavior is byte-for-byte
-    // preserved.
-    let any_region = request.players.iter().any(|p| p.region.is_some());
-    let placement = if any_region {
-        place_by_region(&setup.registry, &request)?
-    } else {
-        place_dev_split(&setup.registry, &request)?
-    };
+    // request with no per-slot regions at all falls back for every slot, landing
+    // everyone on that single relay.
+    let placement = place_by_region(&setup.registry, &request)?;
 
     if !tenant::is_enrolled(&setup.tenants, &request.tenant) {
         return Err(SessionSetupError::TenantNotFound(request.tenant));
@@ -1219,12 +1198,6 @@ pub fn session_refs(
 /// legitimate use.
 const MAX_EXTERNAL_STRING_LEN: usize = 256;
 
-/// The largest `dev_relay_split` the coordinator accepts: no more entries than a
-/// session can possibly have slots for ([`MAX_SLOT`] + 1). A dev-only field
-/// (production requests always send it empty), but the tenant-authenticated cheap
-/// defense applies here too — nothing legitimate ever needs more.
-const MAX_DEV_RELAY_SPLIT_LEN: usize = MAX_SLOT as usize + 1;
-
 /// Validates a session request before any work is done.
 fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     if request.players.is_empty() {
@@ -1249,54 +1222,12 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     {
         return Err(SessionSetupError::ExternalIdTooLong);
     }
-    if request.dev_relay_split.len() > MAX_DEV_RELAY_SPLIT_LEN {
-        return Err(SessionSetupError::DevRelaySplitTooLong(
-            request.dev_relay_split.len(),
-        ));
-    }
     Ok(())
 }
 
-/// Picks the session's home relays from the registry, as the client-facing
-/// endpoints (address + pinned cert) the session response carries: the primary
-/// home every slot dials by default, and the secondary a dev cross-relay split
-/// can move individual slots onto.
-///
-/// The primary is the lowest-id registered relay (deterministic for a given
-/// fleet state); the secondary is the next one, or `None` when only one relay is
-/// enrolled (a single-relay session, where the split silently collapses).
-///
-/// Only *available* relays are candidates — a relay that has asked to drain is
-/// excluded from new assignments (it keeps serving its existing sessions). If every
-/// relay is draining (or none is enrolled), there is nothing to assign and this is
-/// [`NoRelaysAvailable`](SessionSetupError::NoRelaysAvailable).
-fn assign_relays(
-    registry: &RelayRegistry,
-) -> Result<(RelayEndpoint, Option<RelayEndpoint>), SessionSetupError> {
-    let mut entries = registry::available_entries(registry);
-    if entries.is_empty() {
-        return Err(SessionSetupError::NoRelaysAvailable);
-    }
-
-    // NOTE(version-aware placement): each entry carries the relay's advertised
-    // `protocol` (negotiated against at enroll — an incompatible relay never gets
-    // this far), so a placement policy that keeps one session's relays on a single
-    // protocol version — needed once a wire bump rolls through a mixed fleet —
-    // would filter the candidates here. Nothing consumes it yet; assignment stays
-    // version-blind.
-
-    // Sort by relay_id for deterministic assignment.
-    entries.sort_by_key(|e| e.relay_id);
-
-    let home = RelayEndpoint::from(&entries[0]);
-    let secondary = entries.get(1).map(RelayEndpoint::from);
-    Ok((home, secondary))
-}
-
 /// A session's relay placement, distilled into the response shape and the
-/// coordinator-side records the descriptors and a later re-home read. Both the
-/// region-aware and the dev-split paths produce one, so the rest of
-/// [`create_session`] is placement-agnostic.
+/// coordinator-side records the descriptors and a later re-home read, built by
+/// [`place_by_region`].
 struct Placement {
     /// The session's primary home relay — the response's `home_relay`, where the
     /// most slots home (ties broken by lowest relay id).
@@ -1336,6 +1267,14 @@ fn place_by_region(
     if entries.is_empty() {
         return Err(SessionSetupError::NoRelaysAvailable);
     }
+
+    // NOTE(version-aware placement): each entry carries the relay's advertised
+    // `protocol` (negotiated against at enroll — an incompatible relay never gets
+    // this far), so a placement policy that keeps one session's relays on a single
+    // protocol version — needed once a wire bump rolls through a mixed fleet —
+    // would filter the candidates here. Nothing consumes it yet; assignment stays
+    // version-blind.
+
     // Ascending id, so "first in a region" and "first overall" are both the
     // deterministic lowest-id pick.
     entries.sort_by_key(|e| e.relay_id);
@@ -1401,99 +1340,6 @@ fn place_by_region(
     let relay_regions = relay_ids
         .iter()
         .map(|&id| (id, entry_for(id).region.clone()))
-        .collect();
-
-    Ok(Placement {
-        home,
-        slot_homes,
-        relay_ids,
-        homes,
-        relay_certs,
-        relay_regions,
-    })
-}
-
-/// The region-blind (dev / loopback) placement: every slot homes on the primary
-/// relay (lowest-id available), except those the request's
-/// [`dev_relay_split`](SessionRequest::dev_relay_split) moves onto the secondary
-/// (next-lowest) to force a cross-relay meshed session in testing. This is the
-/// pre-region behavior verbatim, run only when no player named a region.
-fn place_dev_split(
-    registry: &RelayRegistry,
-    request: &SessionRequest,
-) -> Result<Placement, SessionSetupError> {
-    let (home, secondary) = assign_relays(registry)?;
-
-    // Slots the split flagged home on the secondary — honored only when a second
-    // relay is enrolled; otherwise the split collapses and every slot homes on
-    // the primary.
-    let slot_homes: Vec<SlotHome> = match &secondary {
-        Some(secondary) => request
-            .players
-            .iter()
-            .filter(|p| request.dev_relay_split.contains(&p.slot))
-            .map(|p| SlotHome {
-                slot: p.slot,
-                relay: secondary.clone(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    // The distinct home relays: the primary (serving unless the split moved every
-    // slot off it), plus the secondary when at least one slot homes there. A
-    // serving relay always homes at least one slot.
-    let relay_ids: Vec<RelayId> = {
-        let mut ids = Vec::new();
-        if slot_homes.len() < request.players.len() {
-            ids.push(home.relay_id);
-        }
-        if let Some(secondary) = &secondary
-            && !slot_homes.is_empty()
-            && secondary.relay_id != home.relay_id
-        {
-            ids.push(secondary.relay_id);
-        }
-        ids
-    };
-
-    // Every slot not in `slot_homes` homes on the primary; reusing that set keeps
-    // `homes` in lockstep with the overrides by construction.
-    let homes = request
-        .players
-        .iter()
-        .map(|p| {
-            let relay_id = slot_homes
-                .iter()
-                .find(|split| split.slot == p.slot)
-                .map_or(home.relay_id, |split| split.relay.relay_id);
-            (p.slot, relay_id)
-        })
-        .collect();
-
-    // Each serving relay's cert, looked up from the `home`/`secondary` endpoints
-    // rather than the registry again, so it reflects exactly the cert the tokens
-    // just minted (and the response about to be returned) commit the clients to.
-    let relay_certs = relay_ids
-        .iter()
-        .filter_map(|&id| {
-            if id == home.relay_id {
-                Some((id, cert_fingerprint(&home.cert_der)))
-            } else {
-                secondary
-                    .as_ref()
-                    .filter(|s| s.relay_id == id)
-                    .map(|s| (id, cert_fingerprint(&s.cert_der)))
-            }
-        })
-        .collect();
-
-    // Each serving relay's region, from its current registry entry — the endpoints
-    // above don't carry it (region is coordinator-side placement state, never sent
-    // to clients or peers), so it is read back here at pick time.
-    let relay_regions = relay_ids
-        .iter()
-        .map(|&id| (id, registry::entry(registry, id).and_then(|e| e.region)))
         .collect();
 
     Ok(Placement {
@@ -1583,6 +1429,48 @@ mod tests {
         ]
     }
 
+    /// Like `setup_with_two_relays_and_tenant`, but relay 2 is tagged `region-b`
+    /// so a player naming that region places there through the production region
+    /// path, producing a two-relay meshed session.
+    fn setup_with_two_relays_region_b_and_tenant() -> SessionSetup {
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 1, 14900);
+        enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
+
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+
+        SessionSetup::new(reg, tenants)
+    }
+
+    /// Like `two_players()`, but slot 1 requests `region-b` — landing it on relay
+    /// 2 in a `setup_with_two_relays_region_b_and_tenant` fleet while slot 0
+    /// falls back to relay 1, so both relays serve one meshed session.
+    fn two_players_slot_1_in_region_b() -> Vec<PlayerHandoff> {
+        vec![
+            PlayerHandoff {
+                slot: SlotId(0),
+                client_pubkey: ClientPublicKey([0xAA; 32]),
+                external_ref: None,
+                observer: false,
+                region: None,
+            },
+            PlayerHandoff {
+                slot: SlotId(1),
+                client_pubkey: ClientPublicKey([0xBB; 32]),
+                external_ref: None,
+                observer: false,
+                region: Some(RegionId("region-b".to_owned())),
+            },
+        ]
+    }
+
     #[test]
     fn create_session_assigns_relays_and_mints_tokens() {
         let setup = setup_with_two_relays_and_tenant();
@@ -1590,7 +1478,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
 
@@ -1599,13 +1486,14 @@ mod tests {
             .response;
 
         // Home is the lowest-id relay, carrying the cert it reported at enrollment
-        // so clients can pin it. Without a dev split every slot homes there, so the
-        // response carries no per-slot overrides even with a second relay enrolled.
+        // so clients can pin it. With no player naming a region every slot falls
+        // back there, so the response carries no per-slot overrides even with a
+        // second relay enrolled.
         assert_eq!(resp.home_relay.relay_id, RelayId(1));
         assert_eq!(resp.home_relay.cert_der, fake_cert(1));
         assert!(
             resp.slot_homes.is_empty(),
-            "a session with no dev split homes every slot on the primary",
+            "a session with no per-slot regions homes every slot on the primary",
         );
 
         // One token per player.
@@ -1618,17 +1506,16 @@ mod tests {
     }
 
     #[test]
-    fn dev_split_homes_listed_slots_on_the_secondary_relay() {
-        // The dev cross-relay knob: the listed slot homes on the secondary relay,
-        // the others on the primary, so both relays serve one meshed session.
-        let setup = setup_with_two_relays_and_tenant();
+    fn region_override_homes_a_slot_on_the_secondary_relay() {
+        // The slot naming region-b homes on the relay tagged for it, the others
+        // fall back to the primary, so both relays serve one meshed session.
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1648,7 +1535,7 @@ mod tests {
                     relay_addrs: vec![],
                 },
             }],
-            "only the split slot homes on the secondary relay, with its pinned cert",
+            "only the region-b slot homes on the secondary relay, with its pinned cert",
         );
 
         // The session serves exactly the distinct home relays of its slots.
@@ -1663,10 +1550,10 @@ mod tests {
     }
 
     #[test]
-    fn serving_relays_are_the_distinct_homes_and_a_lone_relay_needs_no_split() {
-        // With no split (and even with a second relay enrolled) the session serves
-        // only the primary home — a serving relay always homes at least one slot,
-        // so an unused relay is never in the set.
+    fn serving_relays_are_the_distinct_homes_not_every_enrolled_relay() {
+        // With no player naming a region (and even with a second relay enrolled)
+        // the session serves only the primary home — a serving relay always homes
+        // at least one slot, so an unused relay is never in the set.
         let setup = setup_with_two_relays_and_tenant();
         let resp = create_session(
             &setup,
@@ -1674,7 +1561,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1685,57 +1571,36 @@ mod tests {
             setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
             vec![RelayId(1)],
         );
-
-        // A split naming slots on a single-relay fleet collapses: no secondary
-        // exists, so every slot still homes on the primary and no override rides.
-        let reg = registry::new_registry();
-        enroll_relay(&reg, 5, 14900);
-        let tenants = tenant::new_store();
-        tenant::enroll(
-            &tenants,
-            KeyId("test-key-1".to_owned()),
-            TenantId("sb-test".to_owned()),
-            BufferBounds::new(1, 6).unwrap(),
-        )
-        .unwrap();
-        let lone = SessionSetup::new(reg, tenants);
-        let resp = create_session(
-            &lone,
-            SessionRequest {
-                tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
-                external_id: None,
-                dev_relay_split: vec![SlotId(1)],
-                latency_estimate_ms: None,
-            },
-            ExpiresAt(u64::MAX),
-        )
-        .unwrap()
-        .response;
-        assert!(
-            resp.slot_homes.is_empty(),
-            "a split with no second relay collapses to a single-relay session",
-        );
-        assert_eq!(
-            lone.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
-            vec![RelayId(5)],
-        );
     }
 
     #[test]
-    fn dev_split_covering_every_slot_does_not_serve_the_slotless_home() {
-        // A degenerate dev split naming every player slot moves them all onto the
-        // secondary relay; the primary then homes no slot. It must not be recorded
-        // as serving — a slotless serving relay would never register a slot, never
-        // report `SessionClosed`, and the session's lifecycle would never close.
-        let setup = setup_with_two_relays_and_tenant();
+    fn a_relay_with_no_assigned_slots_is_not_recorded_as_serving() {
+        // Both slots name region-b, so relay 1 (untagged) wins none of them. It
+        // must not be recorded as serving — a slotless serving relay would never
+        // register a slot, never report `SessionClosed`, and the session's
+        // lifecycle would never close.
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
+                players: vec![
+                    PlayerHandoff {
+                        slot: SlotId(0),
+                        client_pubkey: ClientPublicKey([0xAA; 32]),
+                        external_ref: None,
+                        observer: false,
+                        region: Some(RegionId("region-b".to_owned())),
+                    },
+                    PlayerHandoff {
+                        slot: SlotId(1),
+                        client_pubkey: ClientPublicKey([0xBB; 32]),
+                        external_ref: None,
+                        observer: false,
+                        region: Some(RegionId("region-b".to_owned())),
+                    },
+                ],
                 external_id: None,
-                dev_relay_split: vec![SlotId(0), SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1743,21 +1608,18 @@ mod tests {
         .unwrap()
         .response;
 
-        // Every slot moved to the secondary (relay 2); only it serves.
+        // Both slots land on relay 2, so it is the home outright and no override
+        // rides (every slot already homes on the home relay).
+        assert_eq!(resp.home_relay.relay_id, RelayId(2));
+        assert!(resp.slot_homes.is_empty());
         assert_eq!(
             setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
             vec![RelayId(2)],
-            "the slotless primary is not recorded as serving",
-        );
-        assert_eq!(resp.slot_homes.len(), 2, "both slots home on the secondary");
-        assert!(
-            resp.slot_homes
-                .iter()
-                .all(|h| h.relay.relay_id == RelayId(2)),
+            "the slotless relay 1 is not recorded as serving",
         );
 
         // The descriptor built for the sole serving relay ranks only itself in the
-        // authority order — the empty home never appears.
+        // authority order — the unused relay never appears.
         let desc = descriptor_for(
             &setup,
             &TenantId("sb-test".to_owned()),
@@ -1766,10 +1628,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.authority_order, vec![RelayId(2)]);
-        assert!(
-            desc.peers.is_empty(),
-            "the slotless home is not a mesh peer"
-        );
+        assert!(desc.peers.is_empty(), "the unused relay is not a mesh peer");
     }
 
     #[test]
@@ -1779,7 +1638,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
@@ -1812,7 +1670,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1831,7 +1688,6 @@ mod tests {
                 tenant: TenantId("not-enrolled".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1851,7 +1707,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1878,7 +1733,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: (0..=11).map(player).collect(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1893,7 +1747,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![player(12)],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1918,7 +1771,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: vec![player(0), player(1), player(0)],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1935,7 +1787,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1949,7 +1800,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN)),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1981,7 +1831,6 @@ mod tests {
                     },
                 ],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -1993,41 +1842,17 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_dev_relay_split_is_rejected() {
-        let setup = setup_with_two_relays_and_tenant();
-        // More entries than any session could have slots for.
-        let oversized_split: Vec<SlotId> = (0..(MAX_DEV_RELAY_SPLIT_LEN + 1) as u8)
-            .map(SlotId)
-            .collect();
-        let result = create_session(
-            &setup,
-            SessionRequest {
-                tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
-                external_id: None,
-                dev_relay_split: oversized_split,
-                latency_estimate_ms: None,
-            },
-            ExpiresAt(u64::MAX),
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            SessionSetupError::DevRelaySplitTooLong(MAX_DEV_RELAY_SPLIT_LEN + 1),
-        );
-    }
-
-    #[test]
     fn descriptor_for_lists_other_session_relays_as_peers() {
-        let setup = setup_with_two_relays_and_tenant();
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
+                // Slot 1 names region-b so it homes on the secondary relay,
+                // giving both relays a slot to serve and mesh — the only way a
+                // session spans two relays.
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                // Split slot 1 onto the secondary relay so both relays serve and
-                // mesh — the only way a session spans two relays.
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2109,7 +1934,6 @@ mod tests {
                     },
                 ],
                 external_id: Some("game-99".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2168,7 +1992,6 @@ mod tests {
                     },
                 ],
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: Some(72),
             },
             ExpiresAt(u64::MAX),
@@ -2201,7 +2024,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2253,7 +2075,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2288,12 +2109,12 @@ mod tests {
 
     #[test]
     fn descriptor_for_excludes_relays_not_in_session() {
-        // Three relays registered, but a session only uses two (the dev split
-        // homes slot 1 on the secondary). The third relay must NOT appear in the
+        // Three relays registered, but a session only uses two (region-b resolves
+        // slot 1 onto relay 2). The third relay must NOT appear in the
         // descriptor's peer list.
         let reg = registry::new_registry();
         enroll_relay(&reg, 1, 14900);
-        enroll_relay(&reg, 2, 14901);
+        enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
         enroll_relay(&reg, 3, 14902); // not in the session
 
         let tenants = tenant::new_store();
@@ -2310,9 +2131,8 @@ mod tests {
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2335,15 +2155,14 @@ mod tests {
 
     #[test]
     fn create_session_stages_descriptors_for_each_relay() {
-        let setup = setup_with_two_relays_and_tenant();
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
+                // Slot 1 names region-b, giving both relays a slot.
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                // Split so slot 1 homes on the secondary, giving both relays a slot.
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2351,7 +2170,7 @@ mod tests {
         .unwrap()
         .response;
 
-        // The split's secondary home is the relay slot 1 was moved onto.
+        // The region override's home is the relay slot 1 was placed onto.
         let secondary_relay = resp.slot_homes[0].relay.relay_id;
 
         // Both relays serving the session have a descriptor staged in the outbox,
@@ -2389,7 +2208,6 @@ mod tests {
                 tenant: TenantId("sb-test".to_owned()),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2408,7 +2226,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX))
@@ -2439,7 +2256,6 @@ mod tests {
             tenant: TenantId("sb-test".to_owned()),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX))
@@ -2470,7 +2286,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2486,7 +2301,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
@@ -2508,7 +2322,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
@@ -2538,7 +2351,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2551,7 +2363,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: Some("game-2".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2582,7 +2393,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: Some("shared-id".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2595,7 +2405,6 @@ mod tests {
                 tenant: other_tenant,
                 players: two_players(),
                 external_id: Some("shared-id".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2612,7 +2421,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
@@ -2649,7 +2457,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2666,7 +2473,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
@@ -2688,7 +2494,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
@@ -2723,7 +2528,6 @@ mod tests {
                 tenant: tid(),
                 players,
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2735,7 +2539,6 @@ mod tests {
                 tenant: tid(),
                 players: reversed,
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2755,7 +2558,6 @@ mod tests {
             tenant: tid(),
             players: two_players(),
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let first = create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
@@ -2784,7 +2586,6 @@ mod tests {
                 },
             ],
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let err = create_session(&setup, conflicting, ExpiresAt(u64::MAX)).unwrap_err();
@@ -2825,7 +2626,6 @@ mod tests {
                 tenant: tid(),
                 players,
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2837,7 +2637,6 @@ mod tests {
                 tenant: tid(),
                 players: with_observer,
                 external_id: Some("game-1".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -2906,13 +2705,13 @@ mod tests {
 
     #[test]
     fn rehome_prefers_a_relay_already_serving_the_session() {
-        // Relays 1 (home), 2 (dev-split secondary), and 3 (live but idle). The home
-        // dies; the replacement must be relay 2 — already serving the session — not
-        // the idle relay 3, even though 3 is a lower id than any non-serving pick
-        // would otherwise use.
+        // Relays 1 (home), 2 (region-b, already serving), and 3 (live but idle).
+        // The home dies; the replacement must be relay 2 — already serving the
+        // session — not the idle relay 3, even though 3 is a lower id than any
+        // non-serving pick would otherwise use.
         let reg = registry::new_registry();
         enroll_relay(&reg, 1, 14900);
-        enroll_relay(&reg, 2, 14901);
+        enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
         enroll_relay(&reg, 3, 14902);
         let tenants = tenant::new_store();
         tenant::enroll(
@@ -2927,9 +2726,8 @@ mod tests {
             &setup,
             SessionRequest {
                 tenant: tid(),
-                players: two_players(),
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3112,15 +2910,14 @@ mod tests {
     }
 
     #[test]
-    fn create_session_records_each_serving_relays_cert_for_a_split_session() {
-        let setup = setup_with_two_relays_and_tenant();
+    fn create_session_records_each_serving_relays_cert_for_a_cross_relay_session() {
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: tid(),
-                players: two_players(),
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3137,7 +2934,7 @@ mod tests {
         assert_eq!(
             refs.relay_certs.get(&RelayId(2)),
             Some(&cert_fingerprint(&fake_cert(2))),
-            "the split secondary's cert is recorded too",
+            "the region-b relay's cert is recorded too",
         );
     }
 
@@ -3234,7 +3031,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: Some("game-42".to_owned()),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3280,15 +3076,14 @@ mod tests {
         // When the group moves off a dead relay, that relay's descriptor outbox entry
         // for the session must be removed — else a re-enrolling dead relay would be
         // re-synced a descriptor for a session it no longer serves and rejoin it.
-        let setup = setup_with_two_relays_and_tenant();
+        let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: tid(),
-                players: two_players(),
-                // Split slot 1 onto the secondary so both relays serve (and each has
-                // a descriptor staged).
-                dev_relay_split: vec![SlotId(1)],
+                // Slot 1 names region-b so both relays serve (and each has a
+                // descriptor staged).
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
                 latency_estimate_ms: None,
             },
@@ -3454,7 +3249,8 @@ mod tests {
         registry::enroll(
             &reg,
             RelayHello::new(RelayId(2), v4_2, ProtocolVersion::CURRENT, fake_cert(2))
-                .with_relay_addrs(vec![v4_2, v6_2]),
+                .with_relay_addrs(vec![v4_2, v6_2])
+                .with_region(RegionId("region-b".to_owned())),
         );
         let tenants = tenant::new_store();
         tenant::enroll(
@@ -3467,14 +3263,13 @@ mod tests {
         let setup = SessionSetup::new(reg, tenants);
 
         // A cross-relay session so both relays serve (and each descriptor names
-        // the other as a peer).
+        // the other as a peer): slot 1 names region-b, homing it on relay 2.
         let resp = create_session(
             &setup,
             SessionRequest {
                 tenant: tid(),
-                players: two_players(),
+                players: two_players_slot_1_in_region_b(),
                 external_id: None,
-                dev_relay_split: vec![SlotId(1)],
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3599,7 +3394,6 @@ mod tests {
                 tenant: tid(),
                 players: two_players(),
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3659,7 +3453,6 @@ mod tests {
                     tenant: tid(),
                     players: two_players(),
                     external_id: None,
-                    dev_relay_split: Vec::new(),
                     latency_estimate_ms: None,
                 },
                 ExpiresAt(u64::MAX),
@@ -3719,7 +3512,6 @@ mod tests {
                             tenant: tid(),
                             players: two_players(),
                             external_id: None,
-                            dev_relay_split: Vec::new(),
                             latency_estimate_ms: None,
                         },
                         ExpiresAt(u64::MAX),
@@ -3816,7 +3608,6 @@ mod tests {
                 tenant: tid(),
                 players,
                 external_id: None,
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
@@ -3908,38 +3699,6 @@ mod tests {
     }
 
     #[test]
-    fn dev_relay_split_is_ignored_when_any_player_names_a_region() {
-        // Slot 0 asks for region-a; slot 1 names no region but is in dev_relay_split.
-        // Because a region is present anywhere in the request, the split is ignored
-        // entirely: slot 1 falls back to the global pick (relay 1), not relay 2.
-        let setup =
-            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
-        let resp = create_session(
-            &setup,
-            SessionRequest {
-                tenant: tid(),
-                players: vec![
-                    player_in_region(0, Some("region-a")),
-                    player_in_region(1, None),
-                ],
-                external_id: None,
-                dev_relay_split: vec![SlotId(1)],
-                latency_estimate_ms: None,
-            },
-            ExpiresAt(u64::MAX),
-        )
-        .unwrap()
-        .response;
-
-        assert_eq!(resp.home_relay.relay_id, RelayId(1));
-        assert!(
-            resp.slot_homes.is_empty(),
-            "the dev split is ignored, so slot 1 stays on the global pick (relay 1)",
-        );
-        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
-    }
-
-    #[test]
     fn placement_records_each_serving_relays_region() {
         // The serving relays' regions are recorded so a later re-home can prefer the
         // dead relay's region.
@@ -3976,7 +3735,6 @@ mod tests {
                 player_in_region(1, Some("region-a")),
             ],
             external_id: Some("game-1".to_owned()),
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();

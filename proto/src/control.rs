@@ -523,10 +523,6 @@ pub struct PlayerHandoff {
     /// means no preference (the fallback pick outright). Additive: a handoff that
     /// predates the field carries no region, and the control protos don't
     /// `deny_unknown_fields`.
-    ///
-    /// Regions are the production placement mechanism, so a request in which *any*
-    /// player carries a region is placed by region and ignores the dev-only
-    /// [`SessionRequest::dev_relay_split`] entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionId>,
 }
@@ -561,21 +557,6 @@ pub struct SessionRequest {
     /// mints a fresh session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
-    /// Dev/testing only: slots that should home on a *secondary* relay instead of
-    /// the session's primary home, to force a genuine cross-relay (meshed) session
-    /// without a real network split between players. The coordinator honors it only
-    /// when a second relay is enrolled; otherwise the split collapses to the single
-    /// available home. Empty on every production request. Optional so a peer that
-    /// predates the field still interops.
-    ///
-    /// This is the region-blind escape hatch: per-slot
-    /// [`region`](PlayerHandoff::region)s are the production placement mechanism,
-    /// so a request that carries **any**
-    /// player region ignores `dev_relay_split` entirely and places by region
-    /// instead. Forcing a cross-relay session through the production path is then a
-    /// matter of giving the slots different regions rather than setting this.
-    #[serde(default)]
-    pub dev_relay_split: Vec<SlotId>,
     /// The tenant's estimate of the worst pairwise **one-way** path latency (in
     /// milliseconds) across the session's players, computed app-side from each
     /// player's region and measured RTT against the region backbone table. The
@@ -614,11 +595,10 @@ pub struct PlayerToken {
 /// a relay other than the session's primary [`SessionResponse::home_relay`].
 ///
 /// A single-region (or single-relay) session produces none — every slot homes on
-/// the primary. These appear for a genuine cross-region session (each player's
-/// home relay is in their own region) or the dev-forced cross-relay split
-/// ([`SessionRequest::dev_relay_split`]). Multi-relay redundancy is per-player
-/// home relays plus the mesh: a relay named here always homes at least one slot,
-/// so it is never assigned to a session it serves no player in.
+/// the primary. These appear for a genuine cross-region session, where each
+/// player's home relay is in their own region. Multi-relay redundancy is
+/// per-player home relays plus the mesh: a relay named here always homes at
+/// least one slot, so it is never assigned to a session it serves no player in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotHome {
     /// The slot this override applies to.
@@ -632,13 +612,12 @@ pub struct SlotHome {
 ///
 /// The home relay is the one clients connect to. A same-region session is
 /// single-relay (every slot homes on `home_relay`); `slot_homes` overrides the
-/// home for individual slots — a cross-region session's per-player home relays,
-/// or the dev-forced cross-relay split. Multi-relay redundancy is per-player home
-/// relays plus the mesh: a relay that serves a session always homes at least one
-/// of its slots. The relay topology drives the
-/// mesh edge — each serving relay receives a [`SessionDescriptor`] naming its
-/// peers, and the lower-id side of each pair dials. The policy bounds are pushed
-/// to each relay's decision-maker.
+/// home for individual slots — a cross-region session's per-player home relays.
+/// Multi-relay redundancy is per-player home relays plus the mesh: a relay that
+/// serves a session always homes at least one of its slots. The relay topology
+/// drives the mesh edge — each serving relay receives a [`SessionDescriptor`]
+/// naming its peers, and the lower-id side of each pair dials. The policy
+/// bounds are pushed to each relay's decision-maker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResponse {
     /// The coordinator-assigned session id (unique within the tenant).
@@ -648,8 +627,7 @@ pub struct SessionResponse {
     pub home_relay: RelayEndpoint,
     /// Per-slot home overrides: slots that home on a relay other than
     /// `home_relay`. Empty for a same-region (single-relay) session; populated for
-    /// a cross-region session (each slot's home in its own region) or a dev-forced
-    /// cross-relay split ([`SessionRequest::dev_relay_split`]).
+    /// a cross-region session (each slot's home in its own region).
     #[serde(default)]
     pub slot_homes: Vec<SlotHome>,
     /// One token per player, matching the slots in the request.
@@ -1508,7 +1486,6 @@ mod tests {
             tenant: TenantId("sb-staging".to_owned()),
             players: vec![],
             external_id: None,
-            dev_relay_split: vec![],
             latency_estimate_ms: None,
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -1981,10 +1958,6 @@ mod tests {
             !back.players[0].observer,
             "a player handoff without the observer field decodes to a competitor",
         );
-        assert!(
-            back.dev_relay_split.is_empty(),
-            "a request without the dev split field decodes to no split",
-        );
     }
 
     #[test]
@@ -2001,7 +1974,6 @@ mod tests {
                 region: None,
             }],
             external_id: None,
-            dev_relay_split: Vec::new(),
             latency_estimate_ms: None,
         };
         let json = serde_json::to_string(&req).unwrap();

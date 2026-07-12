@@ -260,16 +260,13 @@ pub enum SessionSetupError {
     /// A player's `external_ref` exceeds the coordinator's length cap.
     #[error("external_ref for slot {0} exceeds the maximum length")]
     ExternalRefTooLong(u16),
-    /// `dev_relay_split` names more slots than a session could ever have.
-    #[error("dev_relay_split names {0} slots, more than any session can have")]
-    DevRelaySplitTooLong(usize),
     /// The request's `external_id` is already bound to a still-live session, but
-    /// the roster it names (slots, pubkeys, observer flags, correlation refs, or
-    /// dev relay split) differs from the one that created that session. The
-    /// coordinator neither hands back the original roster's tokens nor overwrites
-    /// the live session's accounting, so the conflicting create is refused: the
-    /// tenant must close the existing session, or use a distinct `external_id`,
-    /// before binding this id to a new roster.
+    /// the roster it names (slots, pubkeys, observer flags, or correlation refs)
+    /// differs from the one that created that session. The coordinator neither
+    /// hands back the original roster's tokens nor overwrites the live session's
+    /// accounting, so the conflicting create is refused: the tenant must close
+    /// the existing session, or use a distinct `external_id`, before binding this
+    /// id to a new roster.
     #[error("external_id is already bound to a live session with a different roster")]
     IdempotentCreateMismatch,
 }

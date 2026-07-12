@@ -1111,7 +1111,6 @@ mod tests {
                     region: None,
                 }],
                 external_id: external_id.map(str::to_owned),
-                dev_relay_split: Vec::new(),
                 latency_estimate_ms: None,
             },
             ExpiresAt(u64::MAX),
