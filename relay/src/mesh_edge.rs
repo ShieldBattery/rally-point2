@@ -1002,4 +1002,32 @@ mod tests {
         drop(mesh_accept_tx);
         let _ = accept_task.await;
     }
+
+    #[tokio::test]
+    async fn an_empty_fleet_map_is_enforced_only_when_peer_auth_is_required() {
+        // The seam a coordinator-driven relay turns on: with the fleet map still
+        // empty (no push has landed yet), `require_peer_auth` decides whether a
+        // dialing peer is admitted. A coordinator-driven relay passes `true` here
+        // (see `main::mesh_peer_auth_required`), so it fails closed from boot; a
+        // dev/static `--mesh-peer` relay passes `false` and stays open.
+        let (server_conn, _client_conn, _client_ep, _server_ep) = silent_mesh_connection().await;
+        let empty = crate::coordinator_client::FleetMeshPeers::new().reader();
+        assert!(empty.is_empty(), "no fleet-peer push has landed");
+
+        // Peer auth off (dev/static, no coordinator): the empty map is unenforced,
+        // so the dial is admitted even though nothing could be pinned against it.
+        assert!(
+            verify_mesh_peer_identity(&server_conn, RelayId(1), &empty, false).is_ok(),
+            "an empty fleet map with peer auth off admits the dial",
+        );
+
+        // Peer auth required (a coordinator-driven relay, or `--require-mesh-peer-auth`):
+        // the claimed id is absent from the empty set, so the dial is refused as an
+        // unknown peer before the first push ever lands.
+        assert_eq!(
+            verify_mesh_peer_identity(&server_conn, RelayId(1), &empty, true),
+            Err(MeshPeerAuthRefusal::UnknownPeer),
+            "an empty fleet map with peer auth required refuses every dial",
+        );
+    }
 }

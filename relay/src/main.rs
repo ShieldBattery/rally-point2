@@ -115,12 +115,15 @@ struct Cli {
 
     /// Fail closed on the mesh accept path: refuse every dialing peer's
     /// connection until the coordinator's fleet-peer set has arrived, rather
-    /// than treating an empty set as not-yet-enforced. Off by default, so the
-    /// dev/loopback static `--mesh-peer` path (no coordinator, no fleet push
-    /// ever arrives) keeps meshing with no peer-identity checks at all.
-    /// Production sets this: a coordinator-driven relay should never serve an
-    /// unauthenticated mesh accept, not even during the brief startup window
-    /// before its first fleet-peer push lands.
+    /// than treating an empty set as not-yet-enforced. This flag only matters
+    /// for the dev/static `--mesh-peer` path (no coordinator, so no fleet push
+    /// ever arrives): off by default there, that path keeps meshing with no
+    /// peer-identity checks at all; set it to fail closed instead. A
+    /// coordinator-driven relay (a relay id plus a coordinator URL) always fails
+    /// closed regardless of this flag — it will receive a fleet-peer push and
+    /// must never serve an unauthenticated mesh accept, not even during the
+    /// startup window before its first push lands (genuine peers' dial
+    /// supervisors redial through that brief window).
     #[arg(long, env = "RELAY_REQUIRE_MESH_PEER_AUTH", default_value_t = false)]
     require_mesh_peer_auth: bool,
 
@@ -320,7 +323,7 @@ async fn main() -> Result<()> {
             mesh_state.clone(),
             links_tx.clone(),
             fleet_peers.reader(),
-            cli.require_mesh_peer_auth,
+            mesh_peer_auth_required(cli.require_mesh_peer_auth, has_coordinator),
         ));
 
         // Roots to trust peer certs against — needed by the static `--mesh-peer`
@@ -429,11 +432,13 @@ async fn main() -> Result<()> {
                 config::resolve_advertise_addrs(&cli.advertise_addr, cli.listen);
             // The hello carries our client-edge leaf cert so the coordinator
             // can hand it to clients in session responses — they pin exactly
-            // this cert to connect — the full `[MIN_SUPPORTED, CURRENT]`
-            // protocol window, so a newer relay downgrades to an older
-            // coordinator's version instead of being refused, and the complete
-            // advertised address set (empty for a single-address relay), so a
-            // dual-stack relay's consumers can pick a family.
+            // this cert to connect — the `[MIN_SUPPORTED, CURRENT]` protocol
+            // window the coordinator negotiates against before enrolling
+            // (MIN_SUPPORTED tracks CURRENT because enroll proof-of-possession
+            // admits no lower form, so the window is a single version today),
+            // and the complete advertised address set (empty for a
+            // single-address relay), so a dual-stack relay's consumers can pick
+            // a family.
             let mut relay_hello = RelayHello::new(
                 RelayId(our_id),
                 advertise_addr,
@@ -639,4 +644,36 @@ fn init_tracing() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).init();
+}
+
+/// Whether the mesh accept path must fail closed on peer identity. Always true
+/// for a coordinator-driven relay: it will receive a fleet-peer push and must
+/// never serve an unauthenticated mesh accept, not even during the startup gap
+/// before the first push lands. Otherwise it is on only when the operator passed
+/// `--require-mesh-peer-auth` — the dev/static `--mesh-peer` path, which has no
+/// coordinator to ever populate a fleet set, stays default-off.
+fn mesh_peer_auth_required(require_flag: bool, has_coordinator: bool) -> bool {
+    require_flag || has_coordinator
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_coordinator_driven_relay_always_requires_mesh_peer_auth() {
+        // A relay with both a relay id and a coordinator URL (has_coordinator) will
+        // receive fleet-peer pushes, so it fails closed whether or not the operator
+        // set the flag — closing the boot-to-first-push window an unset flag left open.
+        assert!(mesh_peer_auth_required(false, true));
+        assert!(mesh_peer_auth_required(true, true));
+    }
+
+    #[test]
+    fn a_dev_static_relay_follows_the_flag() {
+        // No coordinator: the empty fleet map stays unenforced unless the operator
+        // opts in with --require-mesh-peer-auth.
+        assert!(!mesh_peer_auth_required(false, false));
+        assert!(mesh_peer_auth_required(true, false));
+    }
 }
