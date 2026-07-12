@@ -52,8 +52,7 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 >   replacement with its existing token + resume cursors, and re-injects a retained ring of its own sent turns
 >   so the new relay's empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
 >
-> Still designed but not built: **per-relay identity binding** on the control connection, production mesh
-> **mTLS / an internal CA**, coordinator **HA / persistence** (a restart still forgets the registry,
+> Still designed but not built: coordinator **HA / persistence** (a restart still forgets the registry,
 > tenant keys, and session accounting), and **ECS-metadata address discovery** (dual-stack advertise is
 > built — explicit flags carry the address set; deriving it from the cloud substrate is what remains).
 
@@ -299,22 +298,37 @@ from a dropped connection: it redials a failed connection (after a short delay, 
 link so the Join source re-syncs its sessions onto it) and leaves an idle teardown or a
 relay-initiated shutdown alone.
 
-**Mesh trust today vs. production.** Today the dial **pins the peer's cert from the session descriptor**:
-the coordinator carries each relay's leaf cert in the descriptor, and the dialer trusts exactly that cert
-for the connection — the same way a game client pins `RelayEndpoint::cert_der` for its own relay dial. A
-descriptor that predates carrying peer certs (or a pin rustls can't parse) falls back to the configured
-mesh roots, logged — reproducing the earlier dev/loopback behavior where a self-signed pair just works
-(each relay trusting its own leaf). Pinning removes the pre-distribution problem — with scale-to-zero
-relays churn constantly, so shipping every relay's cert to every potential peer ahead of time is
-infeasible — but it still trusts *whatever cert the coordinator vouches for*. The longer-term production
-approach is an **internal CA** (AWS Private CA, or a simple CA the coordinator runs): one CA root signs
-every relay cert on startup, each relay trusts the CA root, and any two relays mesh without the
-coordinator brokering each cert. The current `mesh_client_config` does server-auth only
-(`with_no_client_auth`); production mTLS — both sides present certs — is a transport-level change that
-lands with the internal-CA work, alongside the open `S===S` inter-relay auth question (mutual certs vs. a
-coordinator-issued shared secret). Client → relay trust is the same descriptor-pinning story: it's 1:1
-(one relay per client), cert pinned from the session descriptor, with an internal CA as the scale
-alternative; direct IPs (D3) rule out public CA.
+**Mesh trust.** A relay's identity is the **SHA-256 fingerprint of the self-signed certificate it already
+serves both clients and peers with** — there is no certificate authority, and none is needed. Every relay
+mints its own leaf cert; the coordinator's job is only to tell the fleet *which* fingerprint currently
+belongs to *which* `relay_id`, not to vouch for a broader chain of trust. Pinning by fingerprint (rather
+than pre-distributing every relay's cert to every potential peer) is what makes this workable at all under
+scale-to-zero, where relays churn constantly and the peer set isn't knowable ahead of time.
+
+Fingerprint pinning runs in **both mesh directions**. Dialing: the coordinator carries each relay's leaf
+cert in the session descriptor, and the dialer trusts exactly that cert for the connection — the same way
+a game client pins `RelayEndpoint::cert_der` for its own relay dial. Accepting: `mesh_client_config` now
+presents a client certificate too (mutual TLS), and the acceptor pins it against the
+coordinator-distributed **fleet set** — every enrolled relay's `(relay_id, cert fingerprint)` pair, pushed
+down each relay's control connection and replaced wholesale on every fleet change — refusing a peer whose
+presented cert doesn't match its claimed id's enrolled fingerprint. A descriptor that predates carrying
+peer certs, or a peer the fleet set hasn't named yet, falls back to the configured mesh roots (the
+dev/loopback default) or is refused outright under `--require-mesh-peer-auth`.
+
+What makes a pinned fingerprint trustworthy in the first place is **enrollment** (see
+[Auth](#the-control-connection-coordinator--relay)): the coordinator only ever distributes a fingerprint
+for a relay that proved, at enroll time, it holds the private key behind the certificate it presented —
+not just a copy of the cert's public bytes — and only one live connection may claim a given `relay_id` at
+once. Mesh datagrams also carry an additive **tenant tag** on the wire, so two tenants independently
+assigned the same numeric session id can share a mesh link between the same relay pair without ever
+cross-delivering.
+
+Client → relay trust is the same fingerprint-pinning story: 1:1 (one relay per client), cert pinned from
+the session response, no CA there either. A client's own admission is additionally **bounded**: a session
+with no applied descriptor yet is still admitted on the strength of a valid token alone (tolerating the
+create-response-to-dial race beating the coordinator's descriptor push), but that admission is now
+**provisional** — if no descriptor names the session within a bounded window, the relay's sweep tears it
+down, so a stale or misrouted token can no longer hold a session open on a relay indefinitely.
 
 ### Failover and reconnect
 
@@ -704,15 +718,21 @@ open mode exists only for trusted dev/loopback that has consciously asked for it
 relay *to* the coordinator; the reverse direction (the relay trusting it reached the real coordinator) is
 TLS's job: the connection runs over `wss://` (rustls on this workspace's ring provider, validating against
 the public web PKI), so a publicly-trusted coordinator cert works today, while trusting an internal-CA or
-self-signed cert (a custom root store) rides the still-open internal-CA / cert story alongside the `S===S`
-inter-relay auth — until then a `wss://` coordinator needs a public cert or the secret-bearing channel
-runs on trusted transport as `ws://`. **The secret today authenticates "a relay," not a specific relay
-id** — a secret-holder can subscribe as any `relay_id` and read that relay's descriptor set, and the
-requested id is not checked against the registry. Binding the connection to a relay identity (per-relay
-credentials or a signed bootstrap token carrying the id, plus rejecting unregistered ids) lands with that
-same cert work; until then the connection is for trusted (internal / loopback) deployment only. The
-relay→coordinator heartbeat now rides this channel — it doubles as the keepalive that surfaces a connection
-that died without a close — so per-relay identity binding is the channel's main remaining hardening.
+self-signed *coordinator* cert (a custom root store) is still open — until then a `wss://` coordinator
+needs a public cert or the secret-bearing channel runs on trusted transport as `ws://`.
+
+**Enrollment binds identity, not just possession of the secret.** The bootstrap secret alone only proves
+*fleet membership* — every relay in the fleet holds the same one — so the `Hello`'s enroll additionally
+proves two things the secret can't. A **proof-of-possession nonce** challenge, answered by signing
+`ENROLL_POP_CONTEXT ++ nonce` with the private key backing the certificate the `Hello` presented, binds
+this connection to a certificate it demonstrably holds the key for, not just bytes it copied. An **atomic
+duplicate-id refusal** — checked and inserted under one registry lock — refuses a second connection
+enrolling under a `relay_id` another live connection already holds, closing the race a naive
+check-then-insert would leave for two concurrent enrolls to both pass. Together with the fleet-membership
+secret, this is what a relay's enrolled identity now rests on — the same enrolled `(relay_id, cert
+fingerprint)` pairing the mesh acceptor pins against (see [Mesh trust](#the-mesh-relay--relay)). The
+relay→coordinator heartbeat rides this same channel — it doubles as the keepalive that surfaces a
+connection that died without a close.
 
 ### Tenant → coordinator requests (the app-server API)
 
