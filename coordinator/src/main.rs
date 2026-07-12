@@ -12,9 +12,12 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::lifecycle::Lifecycle;
+use rally_point_coordinator::provision::{
+    ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop, WarmTargets,
+};
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{notify, regions, registry, session, tenant};
-use rally_point_proto::control::{BufferBounds, TenantId};
+use rally_point_proto::control::{BufferBounds, RegionId, TenantId};
 use rally_point_proto::token::KeyId;
 
 /// Multi-tenant netcode v2 coordinator.
@@ -140,6 +143,44 @@ struct Cli {
     /// posture, where a relay's id claim in its `Hello` is accepted as presented.
     #[arg(long, env = "COORDINATOR_RELAY_LEDGER")]
     relay_ledger: Option<std::path::PathBuf>,
+
+    /// Path to the relay binary the provisioning loop launches. Present ⇒ the loop
+    /// runs, minting ids and spawning local relay processes to match each region's
+    /// warm demand. Requires `--relay-ledger`: a provisioned relay's identity is
+    /// only sound when it is minted and bound through the ledger, so the
+    /// coordinator refuses to start a provisioning loop without one. Absent ⇒ the
+    /// loop is off (relays are enrolled and managed out of band).
+    #[arg(long, env = "COORDINATOR_PROVISION_RELAY_BIN")]
+    provision_relay_bin: Option<std::path::PathBuf>,
+
+    /// Base URL a provisioned relay dials to reach this coordinator, injected into
+    /// each launched relay's environment. Defaults to `http://127.0.0.1:<port>` of
+    /// the listen address — correct for local process provisioning, where relays
+    /// run on the same host. Set it when the coordinator is reachable at another
+    /// address.
+    #[arg(long, env = "COORDINATOR_PROVISION_COORDINATOR_URL")]
+    provision_coordinator_url: Option<String>,
+
+    /// How long, in seconds, a provisioned relay has to enroll before its launch is
+    /// abandoned: the lifetime of the one-time enroll token minted for it. A launch
+    /// that has not enrolled by then is swept — its task stopped, its id retired —
+    /// and a fresh one minted. Default 300.
+    #[arg(
+        long,
+        env = "COORDINATOR_PROVISION_LAUNCH_DEADLINE_SECS",
+        default_value_t = 300
+    )]
+    provision_launch_deadline_secs: u64,
+
+    /// How long, in seconds, an enrolled relay must be continuously session-free
+    /// before the provisioning loop may drain it in a scale-down. Default 600.
+    #[arg(long, env = "COORDINATOR_RELAY_IDLE_SECS", default_value_t = 600)]
+    relay_idle_secs: u64,
+
+    /// How often, in seconds, the provisioning loop reconciles each region's relay
+    /// count against warm demand. Default 5.
+    #[arg(long, env = "COORDINATOR_PROVISION_TICK_SECS", default_value_t = 5)]
+    provision_tick_secs: u64,
 }
 
 /// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
@@ -195,6 +236,10 @@ async fn main() -> Result<()> {
     }
     let setup = session::SessionSetup::new(registry::new_registry(), tenants);
 
+    // A launched relay presents the same bootstrap secret to open its control
+    // connection, so keep a copy before the auth resolution consumes the original.
+    let provision_bootstrap_secret = cli.bootstrap_secret.clone();
+
     // Fail closed: a coordinator with no bootstrap secret would serve the relay
     // control endpoint to anyone, leaking mesh topology. Require an explicit
     // insecure opt-in rather than defaulting to open.
@@ -239,6 +284,14 @@ async fn main() -> Result<()> {
     // Let the lifecycle prune these dedup sets when it removes a session's state,
     // so they don't grow for the process lifetime.
     lifecycle.attach_dedup(notices.clone());
+
+    // Capture the handles the provisioning loop reconciles over before they move
+    // into the served state: it shares the same setup, ledger, and region list the
+    // API does.
+    let provision_setup = setup.clone();
+    let provision_ledger = ledger.clone();
+    let provision_regions: Vec<RegionId> = regions.regions().iter().map(|r| r.id.clone()).collect();
+
     let state = CoordinatorState {
         setup,
         notices,
@@ -252,6 +305,52 @@ async fn main() -> Result<()> {
     };
 
     let app = api::router(state);
+
+    // Start the provisioning loop when a relay binary is configured. It keeps each
+    // region's relay count matched to warm demand; with no warm demand (the default
+    // until the warm endpoint lands) it idles, so starting it with none configured
+    // is valid and does nothing. Provisioning requires the ledger, so refuse to
+    // start without one.
+    if let Some(relay_bin) = cli.provision_relay_bin {
+        let Some(provision_ledger) = provision_ledger else {
+            return Err(eyre!(
+                "refusing to start: --provision-relay-bin requires --relay-ledger \
+                 (COORDINATOR_RELAY_LEDGER); a provisioned relay identity is only sound \
+                 when it is minted and bound through the ledger",
+            ));
+        };
+        let coordinator_url = cli
+            .provision_coordinator_url
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", cli.listen.port()));
+        let provisioner = std::sync::Arc::new(ProcessProvisioner::new(ProcessConfig {
+            relay_bin,
+            coordinator_url,
+            bootstrap_secret: provision_bootstrap_secret,
+        }));
+        tracing::info!(
+            regions = provision_regions.len(),
+            tick_secs = cli.provision_tick_secs,
+            launch_deadline_secs = cli.provision_launch_deadline_secs,
+            relay_idle_secs = cli.relay_idle_secs,
+            "starting the relay provisioning loop",
+        );
+        let provision_loop = ProvisionLoop::new(
+            ProvisionConfig {
+                regions: provision_regions,
+                tick_interval: Duration::from_secs(cli.provision_tick_secs),
+                launch_deadline: Duration::from_secs(cli.provision_launch_deadline_secs),
+                idle_grace: Duration::from_secs(cli.relay_idle_secs),
+            },
+            provision_setup.registry().clone(),
+            provision_setup,
+            provision_ledger,
+            WarmTargets::new(),
+            provisioner,
+        );
+        tokio::spawn(provision_loop.run());
+    } else {
+        tracing::info!("no --provision-relay-bin configured; the provisioning loop is off");
+    }
 
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await

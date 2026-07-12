@@ -1373,11 +1373,13 @@ dependencies = [
 name = "rally-point-relay"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "color-eyre",
  "futures-util",
  "hex",
  "parking_lot",
+ "rally-point-coordinator",
  "rally-point-proto",
  "rally-point-transport",
  "rcgen",

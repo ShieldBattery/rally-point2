@@ -390,6 +390,21 @@ impl SessionSetup {
             .unwrap_or_default()
     }
 
+    /// The number of live sessions `relay` currently serves — how many recorded
+    /// serving sets, across every tenant, name it. Zero means the relay homes no
+    /// session's slots right now: a reconcile scale-down reads this to find a relay
+    /// safe to drain, and re-reads it after marking the relay draining to catch a
+    /// session that landed in the placement race. Counts a session once even if the
+    /// relay were to appear in its set more than once (it never is — a serving set
+    /// is the session's distinct home relays).
+    pub fn session_count_for_relay(&self, relay: RelayId) -> usize {
+        self.session_relays
+            .lock()
+            .values()
+            .filter(|relays| relays.contains(&relay))
+            .count()
+    }
+
     /// Forgets any recorded rehome decisions for `session` — called when the
     /// session's lifecycle state is removed, so the idempotency record stays
     /// bounded by the coordinator's live sessions (the sibling of
@@ -1493,6 +1508,74 @@ mod tests {
 
         // Bounds come from the tenant's policy.
         assert_eq!(resp.bounds, BufferBounds::new(1, 6).unwrap());
+    }
+
+    #[test]
+    fn session_count_for_relay_counts_serving_memberships() {
+        let setup = setup_with_two_relays_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+
+        // No sessions yet: every relay serves zero.
+        assert_eq!(setup.session_count_for_relay(RelayId(1)), 0);
+        assert_eq!(setup.session_count_for_relay(RelayId(2)), 0);
+
+        // Two single-relay sessions both home on relay 1 (the primary); relay 2
+        // serves neither.
+        let first = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tenant.clone(),
+                players: two_players(),
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response;
+        let second = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tenant.clone(),
+                players: two_players(),
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response;
+        assert_eq!(
+            setup.session_count_for_relay(RelayId(1)),
+            2,
+            "relay 1 homes both sessions",
+        );
+        assert_eq!(setup.session_count_for_relay(RelayId(2)), 0);
+
+        // Closing one session's membership drops relay 1's count.
+        setup.take_session_membership(&tenant, first.session);
+        assert_eq!(setup.session_count_for_relay(RelayId(1)), 1);
+        setup.take_session_membership(&tenant, second.session);
+        assert_eq!(setup.session_count_for_relay(RelayId(1)), 0);
+    }
+
+    #[test]
+    fn session_count_for_relay_counts_a_cross_relay_session_for_each_home() {
+        // A session served by two relays counts once against each.
+        let setup = setup_with_two_relays_region_b_and_tenant();
+        create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId("sb-test".to_owned()),
+                players: two_players_slot_1_in_region_b(),
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(setup.session_count_for_relay(RelayId(1)), 1);
+        assert_eq!(setup.session_count_for_relay(RelayId(2)), 1);
     }
 
     #[test]

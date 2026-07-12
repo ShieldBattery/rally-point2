@@ -115,6 +115,18 @@ pub struct Minted {
     pub token: String,
 }
 
+/// A ledger row's relay id paired with the provisioner task recorded for it (if
+/// any). The reconcile sweeps read these: an expired launching id, a bound id
+/// whose relay is gone, or an id whose task must be stopped as it is retired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionedTask {
+    /// The relay id the row minted.
+    pub relay_id: RelayId,
+    /// The provisioner task recorded for the id, or `None` if no task was ever
+    /// recorded (an id that enrolled on its self-reported addresses).
+    pub task_arn: Option<String>,
+}
+
 /// The ledger authorized an enroll — how it did so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authorized {
@@ -213,7 +225,7 @@ impl RelayLedger {
     /// [`unix_now`] yields pre-epoch or on error) would store an expiry that
     /// reads back as "never expires" — a token minted from a clock that cannot
     /// be trusted must not outlive every deadline, so it is not minted at all.
-    fn mint_at(
+    pub(crate) fn mint_at(
         &self,
         now: u64,
         region: Option<&RegionId>,
@@ -267,9 +279,9 @@ impl RelayLedger {
     }
 
     /// [`authorize_enroll`](Self::authorize_enroll) with the current time
-    /// supplied, so a test can pin token expiry and exercise the fail-closed
+    /// supplied, so a caller can pin token expiry and exercise the fail-closed
     /// broken-clock path deterministically.
-    fn authorize_enroll_at(
+    pub(crate) fn authorize_enroll_at(
         &self,
         now: u64,
         relay_id: RelayId,
@@ -436,6 +448,103 @@ impl RelayLedger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(addrs))
     }
+
+    /// The number of ids in `region` that are still launching at `now`: minted,
+    /// not retired, not yet bound to a certificate, and whose token has not
+    /// expired. This is the count of in-flight launches a reconcile pass credits
+    /// against a region's target so it does not double-launch while a task is
+    /// still coming up. `region` of `None` counts the untagged ids. A token
+    /// already past its expiry is excluded — it can no longer bind, so it is not
+    /// a live launch — and is instead the launch-deadline sweep's concern
+    /// ([`expired_launching`](Self::expired_launching)).
+    pub(crate) fn count_launching(
+        &self,
+        region: Option<&RegionId>,
+        now: u64,
+    ) -> Result<usize, LedgerError> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provisioned_relays
+              WHERE retired_at IS NULL AND cert_fingerprint IS NULL
+                AND token_expires_at >= ?1 AND region IS ?2",
+            params![as_i64(now), region.map(|r| r.as_ref())],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Every id still launching at `now` whose token has expired: minted, not
+    /// retired, never bound to a certificate, and past its token expiry. The
+    /// relay never enrolled and its token can no longer bind, so the id is dead —
+    /// the launch-deadline sweep stops the recorded task (if any) and retires it.
+    pub(crate) fn expired_launching(&self, now: u64) -> Result<Vec<ProvisionedTask>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relay_id, task_arn FROM provisioned_relays
+              WHERE retired_at IS NULL AND cert_fingerprint IS NULL
+                AND token_expires_at < ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![as_i64(now)], row_to_provisioned_task)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every id that is bound to a certificate and not retired, paired with the
+    /// task recorded for it. The vanished-task sweep reads these to find a bound
+    /// id whose relay is no longer enrolled and whose task has stopped — a relay
+    /// that died — so the id can be retired and never claimed again.
+    pub(crate) fn bound_unretired(&self) -> Result<Vec<ProvisionedTask>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relay_id, task_arn FROM provisioned_relays
+              WHERE retired_at IS NULL AND cert_fingerprint IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_provisioned_task)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The set of task identifiers recorded on ids that are not retired. The
+    /// orphan sweep subtracts this from the tasks the provisioner still lists: a
+    /// running task no live id references is a launch the ledger lost track of and
+    /// must be stopped so it does not run unaccounted.
+    pub(crate) fn referenced_task_arns(&self) -> Result<Vec<String>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT task_arn FROM provisioned_relays
+              WHERE retired_at IS NULL AND task_arn IS NOT NULL",
+        )?;
+        let arns = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(arns)
+    }
+
+    /// The provisioner task recorded for `relay_id`, or `None` when the id is
+    /// unknown or never had a task recorded. A scale-down reads this to find the
+    /// task it must stop as it retires the id.
+    pub(crate) fn task_arn(&self, relay_id: RelayId) -> Result<Option<String>, LedgerError> {
+        let conn = self.conn.lock();
+        let arn: Option<Option<String>> = conn
+            .query_row(
+                "SELECT task_arn FROM provisioned_relays WHERE relay_id = ?1",
+                params![as_i64(relay_id.0)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(arn.flatten())
+    }
+}
+
+/// Maps a `(relay_id, task_arn)` row to a [`ProvisionedTask`], shared by the
+/// sweeps' queries so the id-reinterpretation and column order live in one place.
+fn row_to_provisioned_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProvisionedTask> {
+    Ok(ProvisionedTask {
+        relay_id: RelayId(as_u64(row.get(0)?)),
+        task_arn: row.get(1)?,
+    })
 }
 
 /// The columns [`RelayLedger::authorize_enroll_at`] reads for its decision.
@@ -852,5 +961,156 @@ mod tests {
         let b = ledger.mint_at(1_000, None, DAY).unwrap();
         assert_ne!(a.token, b.token, "each mint draws a fresh random token");
         assert_ne!(a.relay_id, b.relay_id);
+    }
+
+    /// A region id for the launching-count tests.
+    fn region(name: &str) -> RegionId {
+        RegionId(name.to_owned())
+    }
+
+    #[test]
+    fn count_launching_counts_only_unretired_unbound_unexpired_in_region() {
+        let ledger = ledger();
+        let east = region("us-east");
+        let west = region("us-west");
+
+        // Two launching ids in us-east, one in us-west, one untagged.
+        let a = ledger.mint_at(1_000, Some(&east), DAY).unwrap();
+        let _b = ledger.mint_at(1_000, Some(&east), DAY).unwrap();
+        let _c = ledger.mint_at(1_000, Some(&west), DAY).unwrap();
+        let _d = ledger.mint_at(1_000, None, DAY).unwrap();
+
+        assert_eq!(ledger.count_launching(Some(&east), 1_100).unwrap(), 2);
+        assert_eq!(ledger.count_launching(Some(&west), 1_100).unwrap(), 1);
+        assert_eq!(ledger.count_launching(None, 1_100).unwrap(), 1);
+
+        // Binding `a` (a first enroll) drops it from the launching count.
+        ledger
+            .authorize_enroll_at(1_050, a.relay_id, fingerprint(0x01), Some(&a.token), None)
+            .unwrap();
+        assert_eq!(
+            ledger.count_launching(Some(&east), 1_100).unwrap(),
+            1,
+            "a bound id no longer counts as launching",
+        );
+
+        // Retiring one of the remaining launching ids drops it too.
+        ledger.retire(_b.relay_id).unwrap();
+        assert_eq!(
+            ledger.count_launching(Some(&east), 1_100).unwrap(),
+            0,
+            "a retired id no longer counts as launching",
+        );
+    }
+
+    #[test]
+    fn count_launching_excludes_an_expired_token() {
+        let ledger = ledger();
+        let east = region("us-east");
+        // A 10-second token minted at t=1000 expires at 1010.
+        ledger
+            .mint_at(1_000, Some(&east), Duration::from_secs(10))
+            .unwrap();
+        // Still counted while unexpired…
+        assert_eq!(ledger.count_launching(Some(&east), 1_005).unwrap(), 1);
+        // …and excluded once its token has expired (the launch-deadline sweep's
+        // concern instead).
+        assert_eq!(ledger.count_launching(Some(&east), 2_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_launching_returns_only_past_deadline_unbound_ids_with_tasks() {
+        let ledger = ledger();
+        // Two short tokens (expire at 1010) and one long token (a day).
+        let a = ledger
+            .mint_at(1_000, None, Duration::from_secs(10))
+            .unwrap();
+        let b = ledger
+            .mint_at(1_000, None, Duration::from_secs(10))
+            .unwrap();
+        let _c = ledger.mint_at(1_000, None, DAY).unwrap();
+        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+
+        // At t=2000 both short tokens have expired; the long one has not.
+        let mut expired = ledger.expired_launching(2_000).unwrap();
+        expired.sort_by_key(|t| t.relay_id.0);
+        assert_eq!(expired.len(), 2);
+        assert_eq!(expired[0].relay_id, a.relay_id);
+        assert_eq!(expired[0].task_arn.as_deref(), Some("task/a"));
+        assert_eq!(expired[1].relay_id, b.relay_id);
+        assert_eq!(expired[1].task_arn, None, "b never had a task recorded");
+
+        // A bound id, even past the token expiry, is never "launching".
+        ledger
+            .authorize_enroll_at(1_005, a.relay_id, fingerprint(0x01), Some(&a.token), None)
+            .unwrap();
+        let after_bind = ledger.expired_launching(2_000).unwrap();
+        assert_eq!(
+            after_bind
+                .iter()
+                .filter(|t| t.relay_id == a.relay_id)
+                .count(),
+            0,
+            "binding `a` removes it from the expired-launching set",
+        );
+    }
+
+    #[test]
+    fn bound_unretired_lists_bound_ids_and_omits_retired_and_launching() {
+        let ledger = ledger();
+        let a = ledger.mint_at(1_000, None, DAY).unwrap();
+        let b = ledger.mint_at(1_000, None, DAY).unwrap();
+        let _launching = ledger.mint_at(1_000, None, DAY).unwrap();
+
+        // Bind both a and b; record a task for a; retire b.
+        ledger
+            .authorize_enroll_at(1_010, a.relay_id, fingerprint(0xA1), Some(&a.token), None)
+            .unwrap();
+        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        ledger
+            .authorize_enroll_at(1_010, b.relay_id, fingerprint(0xB1), Some(&b.token), None)
+            .unwrap();
+        ledger.retire(b.relay_id).unwrap();
+
+        let bound = ledger.bound_unretired().unwrap();
+        assert_eq!(bound.len(), 1, "only the bound, unretired id is listed");
+        assert_eq!(bound[0].relay_id, a.relay_id);
+        assert_eq!(bound[0].task_arn.as_deref(), Some("task/a"));
+    }
+
+    #[test]
+    fn referenced_task_arns_lists_unretired_recorded_tasks_only() {
+        let ledger = ledger();
+        let a = ledger.mint_at(1_000, None, DAY).unwrap();
+        let b = ledger.mint_at(1_000, None, DAY).unwrap();
+        let _no_task = ledger.mint_at(1_000, None, DAY).unwrap();
+        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        ledger.record_task(b.relay_id, "task/b", None, &[]).unwrap();
+        ledger.retire(b.relay_id).unwrap();
+
+        let mut arns = ledger.referenced_task_arns().unwrap();
+        arns.sort();
+        assert_eq!(
+            arns,
+            vec!["task/a".to_owned()],
+            "a retired id's task is no longer referenced; an id with no task contributes none",
+        );
+    }
+
+    #[test]
+    fn task_arn_returns_the_recorded_task_or_none() {
+        let ledger = ledger();
+        let a = ledger.mint_at(1_000, None, DAY).unwrap();
+        assert_eq!(ledger.task_arn(a.relay_id).unwrap(), None);
+        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        assert_eq!(
+            ledger.task_arn(a.relay_id).unwrap(),
+            Some("task/a".to_owned())
+        );
+        assert_eq!(
+            ledger.task_arn(RelayId(9999)).unwrap(),
+            None,
+            "an unknown id has no recorded task",
+        );
     }
 }

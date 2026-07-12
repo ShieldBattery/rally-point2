@@ -255,11 +255,82 @@ pub fn mark_draining(registry: &RelayRegistry, id: RelayId, generation: u64) -> 
     }
 }
 
+/// Clears the draining mark on `id` — it may be assigned new sessions again —
+/// **only if the entry's generation matches** `generation`. Returns whether the
+/// clear applied.
+///
+/// The inverse of [`mark_draining`], under the same generation fence: a caller
+/// that marked an entry draining and then decides to spare it (a scale-down that
+/// found the relay picked up a session after the mark) re-admits exactly the
+/// entry it marked, never a newer connection a reconnect installed. A mismatched
+/// generation, or an unknown relay, is a no-op returning `false`. Idempotent —
+/// clearing an entry that is not draining still reports applied (`true`) under a
+/// matching generation.
+pub fn clear_draining(registry: &RelayRegistry, id: RelayId, generation: u64) -> bool {
+    let mut relays = registry.relays.lock();
+    match relays.get_mut(&id) {
+        Some(registered) if registered.generation == generation => {
+            registered.draining = false;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Whether `id` is enrolled and available for a *new* session assignment — present
 /// in the registry and not draining. A draining relay reads as unavailable here
 /// even though it stays enrolled and keeps serving its existing sessions.
 pub fn is_available(registry: &RelayRegistry, id: RelayId) -> bool {
     registry.relays.lock().get(&id).is_some_and(|r| !r.draining)
+}
+
+/// Whether `id` is currently enrolled at all — draining or not. Distinct from
+/// [`is_available`], which excludes a draining relay: the reconcile sweeps ask
+/// only whether a relay is present (a bound ledger id whose relay is still
+/// enrolled has not vanished), so a draining-but-present relay must read as
+/// enrolled here.
+pub fn is_enrolled(registry: &RelayRegistry, id: RelayId) -> bool {
+    registry.relays.lock().contains_key(&id)
+}
+
+/// A snapshot of one enrolled relay for the reconcile loop: its id, the region
+/// it enrolled with, the generation of its current control connection (the fence
+/// token a drain mark must present), and whether it is already draining.
+///
+/// Carries only what per-region reconcile needs, so a tick reads the whole fleet
+/// once — a live count per region, and the drain candidates with the generation
+/// each mark must match — without cloning every relay's certificate and address
+/// set the way [`all_entries`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrolledRelay {
+    /// The enrolled relay's id.
+    pub relay_id: RelayId,
+    /// The region the relay enrolled with, or `None` for an untagged relay.
+    pub region: Option<rally_point_proto::control::RegionId>,
+    /// The generation of the relay's current control connection — what a
+    /// [`mark_draining`] / [`clear_draining`] for this relay must present.
+    pub generation: u64,
+    /// Whether the relay has already been marked draining.
+    pub draining: bool,
+}
+
+/// A snapshot of every enrolled relay, in an unspecified order. One lock
+/// acquisition yields the reconcile loop its whole per-region view: live counts
+/// (all enrolled relays, draining included) and drain candidates (the
+/// non-draining ones), each carrying the generation a drain mark must fence
+/// against.
+pub fn enrolled_relays(registry: &RelayRegistry) -> Vec<EnrolledRelay> {
+    registry
+        .relays
+        .lock()
+        .values()
+        .map(|r| EnrolledRelay {
+            relay_id: r.entry.relay_id,
+            region: r.entry.region.clone(),
+            generation: r.generation,
+            draining: r.draining,
+        })
+        .collect()
 }
 
 /// Whether `generation` is still the generation enrolled for `id` — i.e. the
@@ -621,6 +692,91 @@ mod tests {
             is_available(&reg, RelayId(1)),
             "a re-enroll clears draining — the relay is fresh again",
         );
+    }
+
+    #[test]
+    fn clear_draining_re_admits_under_the_current_generation() {
+        let reg = new_registry();
+        let generation = enroll(&reg, hello(1, 14900));
+        assert!(mark_draining(&reg, RelayId(1), generation));
+        assert!(!is_available(&reg, RelayId(1)));
+
+        // Clearing under the same generation re-admits the relay.
+        assert!(clear_draining(&reg, RelayId(1), generation));
+        assert!(
+            is_available(&reg, RelayId(1)),
+            "a cleared relay is available for new assignments again",
+        );
+        // Idempotent: clearing an already-cleared entry still reports applied.
+        assert!(clear_draining(&reg, RelayId(1), generation));
+        assert!(is_available(&reg, RelayId(1)));
+    }
+
+    #[test]
+    fn clear_draining_ignores_a_stale_generation() {
+        // A stale connection's clear must not re-admit an entry a newer connection
+        // re-enrolled — the same fence mark_draining honors, in the other direction.
+        let reg = new_registry();
+        let stale = enroll(&reg, hello(1, 14900));
+        let current = enroll(&reg, hello(1, 14999));
+        assert!(mark_draining(&reg, RelayId(1), current));
+        assert!(!is_available(&reg, RelayId(1)));
+
+        assert!(
+            !clear_draining(&reg, RelayId(1), stale),
+            "a stale generation must not clear the reconnected relay's mark",
+        );
+        assert!(
+            !is_available(&reg, RelayId(1)),
+            "the relay stays draining under the stale clear",
+        );
+        // The live generation's own clear applies.
+        assert!(clear_draining(&reg, RelayId(1), current));
+        assert!(is_available(&reg, RelayId(1)));
+    }
+
+    #[test]
+    fn clear_draining_on_an_unknown_relay_is_a_no_op() {
+        let reg = new_registry();
+        assert!(!clear_draining(&reg, RelayId(7), 0));
+    }
+
+    #[test]
+    fn is_enrolled_tracks_presence_including_draining() {
+        let reg = new_registry();
+        assert!(!is_enrolled(&reg, RelayId(1)));
+        let generation = enroll(&reg, hello(1, 14900));
+        assert!(is_enrolled(&reg, RelayId(1)));
+
+        // A draining relay is still enrolled (present), even though unavailable.
+        mark_draining(&reg, RelayId(1), generation);
+        assert!(is_enrolled(&reg, RelayId(1)));
+        assert!(!is_available(&reg, RelayId(1)));
+
+        remove(&reg, RelayId(1));
+        assert!(!is_enrolled(&reg, RelayId(1)));
+    }
+
+    #[test]
+    fn enrolled_relays_snapshots_id_region_generation_and_draining() {
+        let reg = new_registry();
+        let region = rally_point_proto::control::RegionId("us-east".to_owned());
+        let g1 = enroll(&reg, hello(1, 14900).with_region(region.clone()));
+        enroll(&reg, hello(2, 14901)); // untagged
+        mark_draining(&reg, RelayId(1), g1);
+
+        let mut snapshot = enrolled_relays(&reg);
+        snapshot.sort_by_key(|r| r.relay_id.0);
+        assert_eq!(snapshot.len(), 2);
+
+        assert_eq!(snapshot[0].relay_id, RelayId(1));
+        assert_eq!(snapshot[0].region.as_ref(), Some(&region));
+        assert_eq!(snapshot[0].generation, g1);
+        assert!(snapshot[0].draining, "relay 1 was marked draining");
+
+        assert_eq!(snapshot[1].relay_id, RelayId(2));
+        assert_eq!(snapshot[1].region, None, "relay 2 enrolled untagged");
+        assert!(!snapshot[1].draining);
     }
 
     #[test]

@@ -36,6 +36,13 @@
 //!   certificate fingerprint each id binds to at first enroll. Present, a
 //!   coordinator refuses any enroll it did not provision; absent, it keeps the
 //!   dev / loopback posture of accepting the id claim as presented.
+//! - **provision** ([`provision`]) — the reconcile loop that keeps each region's
+//!   relay count matched to TTL'd warm demand: it mints identities through the
+//!   ledger, launches relay tasks through a [`provision::Provisioner`], records
+//!   their addresses, drains idle relays, and sweeps launches that never
+//!   enrolled or tasks the ledger lost track of. A local
+//!   [`provision::ProcessProvisioner`] spawns real relay binaries, so the whole
+//!   lifecycle runs without a cloud substrate.
 //! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
 //!   executes per-turn. The bounds type itself lives in
 //!   [`rally_point_proto::control::BufferBounds`] (it crosses the
@@ -54,6 +61,7 @@ pub mod ledger;
 pub mod lifecycle;
 pub mod notify;
 pub mod presence;
+pub mod provision;
 pub mod regions;
 pub mod registry;
 pub mod rehome;

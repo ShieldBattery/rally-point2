@@ -23,7 +23,9 @@ ring = { workspace = true }
 rustls-webpki = { workspace = true }
 rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `process` (on top of the workspace features) for the local `ProcessProvisioner`,
+# which spawns relay binaries as child processes and reaps them with kill-on-drop.
+tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
