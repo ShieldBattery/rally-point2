@@ -45,11 +45,15 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RelayHello, RelayToCoordinator, SessionDescriptor,
-    SessionPresence,
+    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RelayHello, RelayToCoordinator,
+    SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::ids::RelayId;
-use rally_point_proto::version::{CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION};
+use rally_point_proto::version::{
+    CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
+    CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+};
+use rally_point_transport::rustls::pki_types::PrivateKeyDer;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
@@ -99,6 +103,13 @@ enum ControlDisconnect {
     /// changes nothing — the fix is a config/deploy correction — so it backs off
     /// the same [`VERSION_REFUSED_RECONNECT_DELAY`] rather than the ordinary delay.
     RegionRefused,
+    /// The coordinator refused the connection because this relay's enroll
+    /// proof-of-possession failed (close code
+    /// [`CONTROL_CLOSE_IDENTITY_UNPROVEN`]). A bad signature (or none at all) is
+    /// a config/implementation fault — a mismatched key, a broken signer — not a
+    /// transient condition a redial fixes, so this backs off the same
+    /// [`VERSION_REFUSED_RECONNECT_DELAY`] as a version or region refusal.
+    IdentityUnproven,
 }
 
 /// The sessions the last-applied descriptor set named — the subscriber's removal
@@ -280,6 +291,15 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// `relay_hello` is the relay's identity + reachable address, sent as the first
 /// frame on each connection to enroll into the coordinator's registry.
 ///
+/// `identity_key` is the private key matching `relay_hello.cert_der` — the same
+/// key the relay serves its client and mesh edges with. A coordinator whose
+/// negotiated version reaches [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN)
+/// challenges the relay to prove it holds this key before enrolling it; this
+/// loop signs that challenge with it (see [`sign_enroll_proof`]) the moment one
+/// arrives. An older coordinator never sends the challenge, so an old-enough
+/// negotiated version makes this key inert without anything having to know that
+/// in advance.
+///
 /// `notices` is the drain end of the decision-maker registry's notifier: the
 /// leave sites push a departure and the desync comparator pushes a desync (both
 /// as [`RelayNotice`]) onto it, and this loop forwards each up the control
@@ -315,6 +335,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 pub async fn run_descriptor_subscriber(
     coordinator_url: String,
     relay_hello: RelayHello,
+    identity_key: PrivateKeyDer<'static>,
     bootstrap_secret: Option<String>,
     control: MeshControl,
     sessions: Sessions,
@@ -327,6 +348,7 @@ pub async fn run_descriptor_subscriber(
     run_descriptor_subscriber_with(
         coordinator_url,
         relay_hello,
+        identity_key,
         bootstrap_secret,
         control,
         sessions,
@@ -349,6 +371,7 @@ pub async fn run_descriptor_subscriber(
 pub async fn run_descriptor_subscriber_with(
     coordinator_url: String,
     relay_hello: RelayHello,
+    identity_key: PrivateKeyDer<'static>,
     bootstrap_secret: Option<String>,
     control: MeshControl,
     sessions: Sessions,
@@ -378,6 +401,7 @@ pub async fn run_descriptor_subscriber_with(
         let delay = match connect_and_stream(
             &coordinator_url,
             &relay_hello,
+            &identity_key,
             bootstrap_secret.as_deref(),
             &control,
             &sessions,
@@ -400,11 +424,16 @@ pub async fn run_descriptor_subscriber_with(
             }
             // Already logged (with the coordinator's reason) where the close frame
             // was read; only the far longer backoff is decided here. A version
-            // mismatch and an unknown region are both operator-fix-not-redial
-            // refusals, so they share the long backoff.
-            Ok(ControlDisconnect::VersionRefused | ControlDisconnect::RegionRefused) => {
-                version_refused_delay
-            }
+            // mismatch, an unknown region, and an unproven identity are all
+            // operator-fix-not-redial refusals, so they share the long backoff.
+            // A duplicate-relay-id refusal is deliberately absent from this list —
+            // it resolves on its own as the stale entry ages out, so it takes the
+            // `Ordinary` path's short delay instead.
+            Ok(
+                ControlDisconnect::VersionRefused
+                | ControlDisconnect::RegionRefused
+                | ControlDisconnect::IdentityUnproven,
+            ) => version_refused_delay,
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -433,6 +462,7 @@ pub async fn run_descriptor_subscriber_with(
 async fn connect_and_stream(
     coordinator_url: &str,
     relay_hello: &RelayHello,
+    identity_key: &PrivateKeyDer<'static>,
     secret: Option<&str>,
     control: &MeshControl,
     sessions: &Sessions,
@@ -522,6 +552,28 @@ async fn connect_and_stream(
                                 // so a wholesale replace is correct.
                                 fleet.store(peers);
                             }
+                            CoordinatorToRelay::IdentityChallenge { nonce } => {
+                                // Stateless: sign and reply immediately, wherever this
+                                // arrives in the stream. The coordinator alone decides
+                                // when to challenge and how long to wait for the
+                                // answer, so there is no handshake-phase state of our
+                                // own to track.
+                                match sign_enroll_proof(identity_key, &nonce) {
+                                    Some(signature) => {
+                                        let frame = serde_json::to_string(
+                                            &RelayToCoordinator::IdentityProof { signature },
+                                        )
+                                        .expect("an identity-proof frame always serializes");
+                                        socket.send(Message::Text(frame.into())).await?;
+                                    }
+                                    None => tracing::error!(
+                                        relay_id = relay_id.0,
+                                        "cannot answer the coordinator's enroll proof-of-\
+                                         possession challenge: the loaded private key is \
+                                         not a supported algorithm",
+                                    ),
+                                }
+                            }
                             other => apply_message(control, other, applied),
                         }
                     }
@@ -555,6 +607,38 @@ async fn connect_and_stream(
                                 "coordinator refused our region; backing off until the region config is fixed",
                             );
                             return Ok(ControlDisconnect::RegionRefused);
+                        }
+                        // An identity-unproven refusal means our signed answer to the
+                        // enroll challenge didn't verify (or we never sent one) — a
+                        // config/implementation fault (wrong key, broken signer), not
+                        // a transient condition, so back off long like the version and
+                        // region refusals rather than hot-redialing the same failure.
+                        if let Some(frame) = &frame
+                            && u16::from(frame.code) == CONTROL_CLOSE_IDENTITY_UNPROVEN
+                        {
+                            tracing::error!(
+                                relay_id = relay_id.0,
+                                reason = %frame.reason,
+                                "coordinator rejected our enroll proof of possession; backing off until the key/cert mismatch is fixed",
+                            );
+                            return Ok(ControlDisconnect::IdentityUnproven);
+                        }
+                        // A duplicate-relay-id refusal means the registry already
+                        // holds a live entry for our id under a different certificate
+                        // — most often a crashed predecessor that hasn't aged out via
+                        // the coordinator's liveness deadline yet. That resolves on
+                        // its own, so this is logged distinctly but backs off on the
+                        // *ordinary* (short) delay like any other close: retrying is
+                        // exactly what lets the enroll converge once the stale entry
+                        // expires.
+                        if let Some(frame) = &frame
+                            && u16::from(frame.code) == CONTROL_CLOSE_DUPLICATE_RELAY_ID
+                        {
+                            tracing::warn!(
+                                relay_id = relay_id.0,
+                                reason = %frame.reason,
+                                "coordinator refused our relay id as already enrolled under a different certificate; retrying",
+                            );
                         }
                         break;
                     }
@@ -643,6 +727,50 @@ async fn send_notice(
     Ok(())
 }
 
+/// Signs `nonce` for the enroll proof-of-possession exchange: the exact bytes
+/// `ENROLL_POP_CONTEXT ++ nonce`, using the relay's TLS private key — the same
+/// key backing the certificate its `Hello` presented, so the coordinator's
+/// verification against that certificate's public key succeeds. `pub` so the
+/// coordinator's own tests can cross-verify this signer against its verifier
+/// without reimplementing signing there.
+///
+/// The key is always PKCS#8 in this codebase — `config::self_signed_cert`'s
+/// `rcgen` key and `config::load_cert`'s PEM parser both only ever produce
+/// [`PrivateKeyDer::Pkcs8`] — and its algorithm is either ECDSA P-256 (the
+/// `rcgen` self-signed default) or Ed25519 (a PEM-supplied key), the same two
+/// algorithms the coordinator's verifier accepts. A PKCS#8 blob doesn't
+/// self-announce which one it encodes, so this tries ECDSA first, then
+/// Ed25519. Returns `None` for a key this relay's own cert loading could never
+/// have produced (not PKCS#8, or PKCS#8 bytes neither loader accepts) — there
+/// is no proof to offer, so the caller leaves the challenge unanswered and the
+/// coordinator's own timeout refuses the connection.
+pub fn sign_enroll_proof(
+    identity_key: &PrivateKeyDer<'static>,
+    nonce: &[u8; 32],
+) -> Option<Vec<u8>> {
+    let PrivateKeyDer::Pkcs8(pkcs8) = identity_key else {
+        return None;
+    };
+    let mut message = ENROLL_POP_CONTEXT.to_vec();
+    message.extend_from_slice(nonce);
+
+    let rng = ring::rand::SystemRandom::new();
+    if let Ok(pair) = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        pkcs8.secret_pkcs8_der(),
+        &rng,
+    ) {
+        return pair
+            .sign(&rng, &message)
+            .ok()
+            .map(|signature| signature.as_ref().to_vec());
+    }
+    if let Ok(pair) = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.secret_pkcs8_der()) {
+        return Some(pair.sign(&message).as_ref().to_vec());
+    }
+    None
+}
+
 /// Applies one decoded control message to the Join source.
 ///
 /// A descriptor set reconciles membership; an unrecognized message kind (one a
@@ -674,6 +802,14 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
         // map) before delegating here, so this arm is only a defensive no-op.
         CoordinatorToRelay::MeshPeers { .. } => {
             tracing::debug!("ignoring a MeshPeers frame received outside the fleet-map store");
+        }
+        // The connection loop intercepts IdentityChallenge (it signs and replies
+        // immediately) before delegating here, so this arm is only a defensive
+        // no-op for a stray one.
+        CoordinatorToRelay::IdentityChallenge { .. } => {
+            tracing::debug!(
+                "ignoring an IdentityChallenge received outside the enroll proof exchange"
+            );
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -1125,6 +1261,7 @@ mod tests {
                 rally_point_proto::version::ProtocolVersion::CURRENT,
                 vec![0xAB; 4],
             ),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),
@@ -1246,6 +1383,14 @@ mod tests {
         )
     }
 
+    /// A private key for tests that need *some* value for `identity_key` but
+    /// never actually get challenged — these drive a hand-scripted stand-in
+    /// coordinator, not `serve_relay_control`, so nothing ever reads it.
+    fn throwaway_identity_key() -> PrivateKeyDer<'static> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap()
+    }
+
     #[tokio::test]
     async fn a_drain_trigger_sends_a_draining_frame_after_the_hello() {
         use tokio::net::TcpListener;
@@ -1274,6 +1419,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),
@@ -1336,6 +1482,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),
@@ -1404,6 +1551,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),
@@ -1462,6 +1610,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::clone(&sessions),
@@ -1547,6 +1696,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),
@@ -1625,6 +1775,70 @@ mod tests {
             "an unknown-region refusal must wait the refusal backoff, not the ordinary \
              reconnect delay (observed gap: {gap:?})",
         );
+    }
+
+    #[tokio::test]
+    async fn an_identity_unproven_close_waits_the_refusal_backoff_before_redialing() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        // The coordinator refuses every connection with the identity-unproven
+        // close — a bad signature or key mismatch is a config/implementation
+        // fault, not something a redial fixes, so it takes the long backoff like
+        // a version or region refusal.
+        let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
+            code: CloseCode::from(CONTROL_CLOSE_IDENTITY_UNPROVEN),
+            reason: "enroll proof-of-possession failed".into(),
+        }))
+        .await;
+
+        spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
+
+        let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the first dial arrives")
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the relay eventually redials")
+            .unwrap();
+        let gap = second.duration_since(first);
+        assert!(
+            gap >= Duration::from_millis(400),
+            "an identity-unproven refusal must wait the refusal backoff, not the \
+             ordinary reconnect delay (observed gap: {gap:?})",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_relay_id_close_redials_at_the_normal_delay() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        // Unlike identity-unproven, a duplicate-relay-id refusal resolves on its
+        // own (the stale entry ages out via the coordinator's liveness deadline),
+        // so it must take the ordinary short delay, not the long refusal backoff
+        // — proven the same way the plain-close test proves it: the refusal
+        // backoff is set absurdly long, so a prompt redial proves the ordinary
+        // path was taken.
+        let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
+            code: CloseCode::from(CONTROL_CLOSE_DUPLICATE_RELAY_ID),
+            reason: "relay id already enrolled under a different certificate".into(),
+        }))
+        .await;
+        spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_secs(3600));
+
+        tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+            .await
+            .expect("the first dial arrives")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), times_rx.recv())
+            .await
+            .expect(
+                "a duplicate-relay-id refusal redials at the normal delay, \
+                 not the long refusal backoff",
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1728,6 +1942,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             format!("http://{addr}"),
             drain_hello(),
+            throwaway_identity_key(),
             None,
             control,
             Arc::default(),

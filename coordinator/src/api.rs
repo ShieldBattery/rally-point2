@@ -75,12 +75,15 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
-    self, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    self, CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
+    CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
 };
+use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::descriptors::SlotClose;
+use crate::identity;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
 use crate::presence;
@@ -694,14 +697,22 @@ async fn regions(State(state): State<CoordinatorState>) -> Json<RegionsConfig> {
 /// relay gets a `401` rather than an open socket — then upgrades and serves the
 /// connection, which enrolls the relay (from its `Hello`) and pushes descriptors.
 ///
-/// **Known limitation (deferred):** the bootstrap secret authenticates "a relay,"
-/// not a specific relay id. A holder of the shared secret can connect, enroll as
-/// any relay id, and receive that relay's descriptor set; the id in the `Hello`
-/// is an unverified claim. Binding the connection to a relay identity — per-relay
-/// credentials or a signed bootstrap token carrying the id — lands with the
-/// relay-identity / mTLS work, the same effort that brings coordinator→relay
-/// trust. Until then this endpoint is for trusted (loopback / internal)
-/// deployment only.
+/// **The claimed relay id is bound to proof of holding its certificate's private
+/// key**, not merely trusted from the shared bootstrap secret. Once the `Hello`
+/// negotiates a version reaching
+/// [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN),
+/// [`serve_relay_control`] challenges the connection with a random nonce and
+/// verifies a signature over it made with the private key matching
+/// `Hello.cert_der`, before enrolling — closing the gap where a bootstrap-secret
+/// holder could otherwise copy a victim relay's public certificate into its own
+/// `Hello` and enroll as it (see [`crate::identity`]). Proof of possession alone
+/// still permits *any* id claim, though: a live registry entry under the claimed
+/// id whose certificate differs from the newly-proven one is refused as a
+/// duplicate rather than silently evicted (the same certificate replaces it,
+/// exactly as an unchallenged reconnect always has). A relay negotiating below
+/// `ENROLL_POP_MIN` — one that predates this exchange — enrolls unconditionally,
+/// today's behavior, since there is no proven identity to check a duplicate
+/// against.
 async fn relay_control(
     State(state): State<CoordinatorState>,
     headers: HeaderMap,
@@ -735,11 +746,15 @@ async fn relay_control(
 /// drops.
 ///
 /// The relay's first frame must be its [`RelayToCoordinator::Hello`], sent within
-/// `hello_timeout`; it enrolls the relay into the registry and yields the
-/// connection's generation. The connection then serves descriptors and watches
-/// liveness ([`push_and_watch`]) until it ends — the relay closes, the socket
-/// errors, the relay goes silent past `liveness_timeout`, or the coordinator's
-/// outbox is dropped (shutdown).
+/// `hello_timeout`. After version negotiation and region validation succeed, a
+/// relay negotiating at or above
+/// [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN)
+/// must also prove possession of its certificate's private key (see
+/// [`crate::identity`]) and clear the duplicate-id check before
+/// [`registry::enroll`] runs and yields the connection's generation. The
+/// connection then serves descriptors and watches liveness ([`push_and_watch`])
+/// until it ends — the relay closes, the socket errors, the relay goes silent
+/// past `liveness_timeout`, or the coordinator's outbox is dropped (shutdown).
 ///
 /// When the connection drops, the relay is deregistered — but only if this
 /// connection is still the current one ([`registry::remove_if_current`]): a relay
@@ -817,7 +832,91 @@ async fn serve_relay_control(
 
     let relay_id = hello.relay_id;
     let registry = setup.registry();
-    let generation = registry::enroll(registry, hello);
+
+    // Enroll proof-of-possession, only once the negotiated version reaches
+    // ENROLL_POP_MIN: `hello.cert_der` alone is a claim the relay presented,
+    // not proof it holds the matching private key — a bootstrap-secret holder
+    // could otherwise copy a victim relay's public certificate into its own
+    // Hello and enroll as it. A relay negotiating below the threshold predates
+    // the challenge entirely; half-enforcing a check against an identity
+    // nobody proved would be worse than not checking at all.
+    if negotiated >= ProtocolVersion::ENROLL_POP_MIN {
+        let mut nonce = [0u8; 32];
+        if let Err(error) = SystemRandom::new().fill(&mut nonce) {
+            tracing::error!(
+                relay_id = relay_id.0,
+                %error,
+                "generating the enroll challenge nonce failed; closing",
+            );
+            return;
+        }
+        let challenge_json =
+            serde_json::to_string(&CoordinatorToRelay::IdentityChallenge { nonce })
+                .expect("an identity-challenge frame always serializes");
+        if socket
+            .send(Message::Text(challenge_json.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        // Bounded by the same hello_timeout pattern as the initial enroll
+        // frame: a relay silent past it, or one that answers with anything
+        // other than an IdentityProof, is exactly as unwelcome here as one
+        // that never sent a Hello.
+        let proof = tokio::time::timeout(hello_timeout, read_identity_proof(&mut socket))
+            .await
+            .ok()
+            .flatten();
+        let proven = proof.is_some_and(|signature| {
+            identity::verify_enroll_proof(&hello.cert_der, &nonce, &signature)
+        });
+        if !proven {
+            tracing::warn!(
+                relay_id = relay_id.0,
+                "refusing relay control connection: enroll proof-of-possession failed",
+            );
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CONTROL_CLOSE_IDENTITY_UNPROVEN,
+                    reason: "enroll proof-of-possession failed".into(),
+                })))
+                .await;
+            return;
+        }
+    }
+
+    // Enrollment. A proof-of-possession-verified connection enrolls through
+    // `registry::try_enroll`, whose duplicate-id refusal is atomic with the
+    // insert: a live entry under this id bound to a *different* certificate is
+    // a second relay process colliding on the id and is refused, while the
+    // same fingerprint is this relay's own control connection redialing (its
+    // cert is stable across restarts of one instance) and replaces the entry
+    // exactly as it always has. A relay negotiating below ENROLL_POP_MIN
+    // keeps the unconditional replace: nobody proved its identity either way,
+    // and refusing on an unproven claim would let a copied public certificate
+    // squat an id.
+    let generation = if negotiated >= ProtocolVersion::ENROLL_POP_MIN {
+        match registry::try_enroll(registry, hello) {
+            Ok(generation) => generation,
+            Err(registry::EnrollConflict) => {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    "refusing relay control connection: relay id already enrolled under a different certificate",
+                );
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CONTROL_CLOSE_DUPLICATE_RELAY_ID,
+                        reason: "relay id already enrolled under a different certificate".into(),
+                    })))
+                    .await;
+                return;
+            }
+        }
+    } else {
+        registry::enroll(registry, hello)
+    };
     tracing::info!(
         relay_id = relay_id.0,
         negotiated = %negotiated,
@@ -1333,9 +1432,9 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat, a departure, a desync, a result, or any future
-                    // up-frame before the enroll Hello is a protocol violation:
-                    // enrollment comes first.
+                    // A heartbeat, a departure, a desync, a result, an identity
+                    // proof, or any future up-frame before the enroll Hello is a
+                    // protocol violation: enrollment comes first.
                     Ok(
                         RelayToCoordinator::Heartbeat { .. }
                         | RelayToCoordinator::Draining
@@ -1343,6 +1442,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)
                         | RelayToCoordinator::SessionClosed { .. }
+                        | RelayToCoordinator::IdentityProof { .. }
                         | RelayToCoordinator::Unknown,
                     ) => {
                         tracing::warn!("first control frame was not a Hello; closing");
@@ -1362,6 +1462,33 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(_)) | None => return None,
             Some(Err(error)) => {
                 tracing::debug!(%error, "control connection error before hello");
+                return None;
+            }
+        }
+    }
+}
+
+/// Reads the relay's answer to an [`CoordinatorToRelay::IdentityChallenge`],
+/// returning the raw signature bytes from a
+/// [`RelayToCoordinator::IdentityProof`]. Any other outcome — a different
+/// frame kind, an undecodable frame, a close, a stream end, or a read error —
+/// is `None`: the caller treats all of them as an unanswered challenge
+/// uniformly, since none proves possession of the claimed key. Ping/pong
+/// control frames are skipped, exactly like [`read_hello`]; the caller's own
+/// timeout bounds how long a silent connection may sit before answering.
+async fn read_identity_proof(socket: &mut WebSocket) -> Option<Vec<u8>> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                return match serde_json::from_str::<RelayToCoordinator>(&text) {
+                    Ok(RelayToCoordinator::IdentityProof { signature }) => Some(signature),
+                    _ => None,
+                };
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(_)) | None => return None,
+            Some(Err(error)) => {
+                tracing::debug!(%error, "control connection error awaiting identity proof");
                 return None;
             }
         }

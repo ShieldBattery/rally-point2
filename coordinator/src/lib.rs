@@ -27,6 +27,10 @@
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
+//! - **identity** ([`identity`]) — verifies a relay's enroll proof-of-possession
+//!   signature against the certificate its `Hello` presented, closing the gap
+//!   where the certificate alone is a copyable claim, not proof of holding the
+//!   matching private key.
 //! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
 //!   executes per-turn. The bounds type itself lives in
 //!   [`rally_point_proto::control::BufferBounds`] (it crosses the
@@ -40,6 +44,7 @@
 
 pub mod api;
 pub mod descriptors;
+pub mod identity;
 pub mod lifecycle;
 pub mod notify;
 pub mod presence;

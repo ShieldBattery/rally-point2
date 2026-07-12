@@ -34,17 +34,42 @@ pub struct ProtocolVersion(pub u16);
 impl ProtocolVersion {
     /// The version implemented by this build.
     ///
+    /// `3` adds proof-of-possession to relay enrollment: after the enroll
+    /// `Hello` and version negotiation, the coordinator challenges the relay
+    /// with a random nonce
+    /// ([`CoordinatorToRelay::IdentityChallenge`](crate::control::CoordinatorToRelay::IdentityChallenge))
+    /// and the relay must answer with a signature made by the TLS private key
+    /// matching `Hello.cert_der`
+    /// ([`RelayToCoordinator::IdentityProof`](crate::control::RelayToCoordinator::IdentityProof)),
+    /// proving it actually holds that key rather than having copied a cert it
+    /// observed elsewhere. See [`Self::ENROLL_POP_MIN`] for exactly when the
+    /// coordinator challenges.
+    ///
     /// `2` folds a TLS channel binding into the connection-binding challenge
     /// proof, which a v1 peer can neither produce nor verify.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(2);
+    pub const CURRENT: ProtocolVersion = ProtocolVersion(3);
 
     /// The oldest version this build can still interoperate with.
     ///
-    /// Held equal to [`Self::CURRENT`]: v2's proof change is a security fix —
-    /// v1's challenge proof was replayable — so v1 is intentionally not
-    /// interoperable. This drops below `CURRENT` only once we ship a wire version
-    /// we *do* commit to interoperating with.
+    /// Stays at `2`, *below* [`Self::CURRENT`] — unlike the `1`→`2` bump (a
+    /// security fix with no backward-compatible form, so `MIN_SUPPORTED`
+    /// tracked `CURRENT` up to drop `1`), enroll proof-of-possession is
+    /// enforceable additively: the coordinator only challenges a relay whose
+    /// *negotiated* version reaches [`Self::ENROLL_POP_MIN`], so a relay
+    /// advertising only `2` still enrolls exactly as it did before `3`
+    /// existed. There is no reason to force an upgrade for a check that a
+    /// relay predating it simply never receives.
     pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(2);
+
+    /// The lowest *negotiated* version at which the coordinator runs the
+    /// enroll proof-of-possession exchange (see [`Self::CURRENT`]'s `3` entry).
+    /// A relay whose advertised window caps the negotiated result below this —
+    /// an old relay, or a new relay against an old coordinator that has never
+    /// heard of `3` — enrolls unchallenged, today's behavior. Named
+    /// separately from [`Self::CURRENT`] so a later bump for an unrelated
+    /// reason (say `4`) does not silently change when this specific check
+    /// applies.
+    pub const ENROLL_POP_MIN: ProtocolVersion = ProtocolVersion(3);
 }
 
 impl std::fmt::Display for ProtocolVersion {
@@ -100,6 +125,44 @@ pub const CONTROL_CLOSE_PROTOCOL_MISMATCH: u16 = 4001;
 /// client recognizes it and backs off far longer than a normal reconnect — like a
 /// version mismatch, the fix is a config/deploy change, not a redial.
 pub const CONTROL_CLOSE_UNKNOWN_REGION: u16 = 4002;
+
+/// WebSocket close code the coordinator sends when it refuses a relay's control
+/// connection because the relay's enroll proof-of-possession failed: it never
+/// answered [`CoordinatorToRelay::IdentityChallenge`](crate::control::CoordinatorToRelay::IdentityChallenge)
+/// within the hello-timeout window, answered with something other than
+/// [`RelayToCoordinator::IdentityProof`](crate::control::RelayToCoordinator::IdentityProof),
+/// or answered with a signature that does not verify against `Hello.cert_der`.
+/// Only sent when the negotiated version reaches
+/// [`ProtocolVersion::ENROLL_POP_MIN`] — see that constant for when the
+/// exchange runs at all.
+///
+/// A cross-component contract: the coordinator sends it *instead of enrolling*,
+/// and the relay's coordinator client recognizes it and backs off far longer
+/// than a normal reconnect — an unproven identity is a config/implementation
+/// fault (a mismatched key, a broken signer), not a transient condition a redial
+/// fixes, exactly like [`CONTROL_CLOSE_PROTOCOL_MISMATCH`].
+pub const CONTROL_CLOSE_IDENTITY_UNPROVEN: u16 = 4003;
+
+/// WebSocket close code the coordinator sends when a relay's (proof-of-possession
+/// verified) `Hello` claims a `relay_id` the registry already holds a *live*
+/// entry for, under a *different* certificate fingerprint. Two distinct relay
+/// processes cannot legitimately share one id — this refuses the second one
+/// rather than silently evicting the first, which the shared bootstrap secret's
+/// per-relay-id ambiguity would otherwise allow. A `Hello` proving possession of
+/// the *same* certificate as the live entry is the same relay reconnecting
+/// (its control connection dropped and redialed) and replaces the entry as
+/// always. Only checked when the negotiated version reaches
+/// [`ProtocolVersion::ENROLL_POP_MIN`] — an unproven identity has nothing
+/// trustworthy to compare a fingerprint against, so an older relay keeps
+/// today's unconditional-replace behavior.
+///
+/// A cross-component contract: the coordinator sends it *instead of enrolling*.
+/// Unlike [`CONTROL_CLOSE_IDENTITY_UNPROVEN`], the relay backs off on its
+/// *ordinary* (short) reconnect delay — a crashed predecessor's stale registry
+/// entry ages out on its own once the coordinator's liveness deadline lapses,
+/// so simply retrying converges to a successful enroll rather than needing a
+/// deploy or config fix.
+pub const CONTROL_CLOSE_DUPLICATE_RELAY_ID: u16 = 4004;
 
 /// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
 /// whose advertised protocol version does not [`negotiate`] against its own.
@@ -169,5 +232,41 @@ mod tests {
     fn rejects_disjoint_windows() {
         // Peer only speaks future versions this build doesn't support yet.
         assert!(negotiate(ProtocolVersion(7), ProtocolVersion(9)).is_err());
+    }
+
+    #[test]
+    fn an_old_relays_window_negotiates_below_the_pop_threshold() {
+        // A relay that predates proof-of-possession advertises a window topping
+        // out at MIN_SUPPORTED (2) — this build's CURRENT (3) never enters the
+        // negotiation, so the result stays below ENROLL_POP_MIN and the
+        // coordinator must not challenge it.
+        let negotiated = negotiate(
+            ProtocolVersion::MIN_SUPPORTED,
+            ProtocolVersion::MIN_SUPPORTED,
+        )
+        .expect("an old relay's window still overlaps MIN_SUPPORTED");
+        assert!(
+            negotiated < ProtocolVersion::ENROLL_POP_MIN,
+            "an old relay's negotiated version must stay below the PoP threshold",
+        );
+    }
+
+    #[test]
+    fn a_current_relays_window_negotiates_at_the_pop_threshold() {
+        // A relay advertising this build's own window negotiates exactly at
+        // CURRENT, which is also ENROLL_POP_MIN — the coordinator challenges it.
+        let negotiated = negotiate(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT)
+            .expect("a current relay's window overlaps");
+        assert_eq!(negotiated, ProtocolVersion::CURRENT);
+        assert!(negotiated >= ProtocolVersion::ENROLL_POP_MIN);
+    }
+
+    #[test]
+    fn min_supported_stays_below_current_for_additive_pop_compat() {
+        // Unlike the 1->2 bump (MIN_SUPPORTED tracked CURRENT up), the 2->3 bump
+        // widens the window: proof-of-possession is enforceable additively, so
+        // an old (2-only) relay must remain interoperable.
+        assert!(ProtocolVersion::MIN_SUPPORTED < ProtocolVersion::CURRENT);
+        assert_eq!(ProtocolVersion::CURRENT, ProtocolVersion::ENROLL_POP_MIN);
     }
 }

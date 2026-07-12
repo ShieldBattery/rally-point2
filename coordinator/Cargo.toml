@@ -17,6 +17,11 @@ axum = { workspace = true }
 rally-point-proto = { workspace = true }
 parking_lot = { workspace = true }
 ring = { workspace = true }
+# Verifies a relay's enroll proof-of-possession signature against its
+# presented certificate (`EndEntityCert::verify_signature`), without hand-
+# parsing the certificate's SPKI.
+rustls-webpki = { workspace = true }
+rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -44,3 +49,8 @@ tower = { workspace = true }
 # never sends its enroll Hello), which the relay's own client can't express.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+# Self-signed certs for the enroll proof-of-possession tests (`identity`'s unit
+# tests and the control-connection integration tests) — real certificates a
+# relay could actually present, not the fixed placeholder bytes descriptor
+# transport's older tests use.
+rcgen = { workspace = true }

@@ -31,6 +31,7 @@ use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::mesh_control::MeshControl;
 use rally_point_relay::routing::SessionKey;
+use rustls_pki_types::PrivateKeyDer;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
@@ -67,13 +68,31 @@ fn session_key(session: SessionId) -> SessionKey {
 
 /// The relay's enroll `Hello` (id + a loopback address on `port`), the first frame
 /// the subscriber sends on each connection.
+///
+/// Advertises `MIN_SUPPORTED` (a relay predating enroll proof-of-possession),
+/// not `CURRENT`: these tests exercise descriptor transport, drain, liveness,
+/// and region/version-negotiation mechanics, none of which is about proving
+/// certificate possession, so negotiating below `ENROLL_POP_MIN` keeps the
+/// coordinator from ever challenging them — the placeholder `cert_der` below
+/// is never parsed as a real certificate as a result. The dedicated
+/// proof-of-possession coverage (`enroll_identity.rs`) builds real certs and
+/// negotiates at `CURRENT` on purpose.
 fn relay_hello(id: u64, port: u16) -> RelayHello {
     RelayHello::new(
         RelayId(id),
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        ProtocolVersion::CURRENT,
+        ProtocolVersion::MIN_SUPPORTED,
         vec![id as u8; 4],
     )
+}
+
+/// A private key for tests whose relay negotiates below `ENROLL_POP_MIN` (see
+/// [`relay_hello`]) and so is never challenged for it — these calls just need
+/// *some* well-formed key to satisfy `run_descriptor_subscriber_with`'s
+/// signature, not one matching any particular certificate.
+fn throwaway_identity_key() -> PrivateKeyDer<'static> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap()
 }
 
 /// Polls the registry until `id` enrolls, up to a couple of seconds. Returns
@@ -238,6 +257,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
+        throwaway_identity_key(),
         Some(secret.to_owned()),
         control,
         std::sync::Arc::default(),
@@ -268,6 +288,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
+        throwaway_identity_key(),
         None,
         control,
         std::sync::Arc::default(),
@@ -310,6 +331,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(1, 14900),
+        throwaway_identity_key(),
         Some("wrong-secret".to_owned()),
         control,
         std::sync::Arc::default(),
@@ -347,6 +369,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(5, 15000),
+        throwaway_identity_key(),
         None,
         control,
         std::sync::Arc::default(),
@@ -474,6 +497,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
     let handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),
+        throwaway_identity_key(),
         None,
         control,
         std::sync::Arc::default(),
@@ -850,20 +874,48 @@ async fn a_newer_relay_with_an_overlapping_window_downgrades_and_enrolls() {
     // The downgrade rule: a relay one version ahead that still speaks CURRENT
     // (min_protocol = CURRENT) overlaps this coordinator's window, so it enrolls —
     // negotiated at CURRENT — receives its descriptor re-sync, and can be assigned
-    // sessions.
+    // sessions. Negotiating at CURRENT means ENROLL_POP_MIN is reached, so unlike
+    // most of this file's hellos (pinned below that threshold — see
+    // `relay_hello`), this one needs a real certificate and must answer the
+    // coordinator's proof-of-possession challenge before enrollment proceeds.
     let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_der = cert.cert.der().to_vec();
+    let identity_key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
 
     let hello = RelayHello::new(
         RelayId(9),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 14909)),
         ProtocolVersion(ProtocolVersion::CURRENT.0 + 1),
-        vec![0xC9; 4],
+        cert_der,
     )
     .with_min_protocol(ProtocolVersion::CURRENT);
     let mut socket = connect_and_send_hello(&base_url, hello).await;
 
-    // The first frame down is the enrolled path's initial descriptor re-sync —
-    // not a refusal close.
+    // The challenge arrives before enrollment; answer it with a real signature.
+    let challenge = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator challenges promptly")
+        .expect("a frame arrives")
+        .unwrap();
+    let Message::Text(text) = challenge else {
+        panic!("expected an identity challenge, got {challenge:?}");
+    };
+    let CoordinatorToRelay::IdentityChallenge { nonce } = serde_json::from_str(&text).unwrap()
+    else {
+        panic!("expected an identity_challenge frame, got: {text}");
+    };
+    let signature = coordinator_client::sign_enroll_proof(&identity_key, &nonce)
+        .expect("an ECDSA P-256 key always signs");
+    let proof = serde_json::to_string(&RelayToCoordinator::IdentityProof { signature }).unwrap();
+    {
+        use futures_util::SinkExt;
+        socket.send(Message::Text(proof.into())).await.unwrap();
+    }
+
+    // The first frame down after that is the enrolled path's initial descriptor
+    // re-sync — not a refusal close.
     let first = timeout(Duration::from_secs(5), socket.next())
         .await
         .expect("the coordinator answers")
@@ -1052,6 +1104,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     let _handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
         base_url,
         relay_hello(7, 15007),
+        throwaway_identity_key(),
         None,
         control,
         std::sync::Arc::default(),

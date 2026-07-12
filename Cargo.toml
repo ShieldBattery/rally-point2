@@ -48,6 +48,18 @@ socket2 = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # PEM cert/key file reading for the relay binary (loads --cert/--key files).
 rustls-pemfile = "2"
+# X.509 signature verification, ring-backed, already resolved transitively via
+# rustls: the coordinator uses `webpki::EndEntityCert` to verify a relay's
+# enroll proof-of-possession signature against its presented certificate,
+# without pulling in a second X.509 stack.
+rustls-webpki = { version = "0.103", default-features = false, features = [
+  "ring",
+  "std",
+] }
+# The `CertificateDer` type `rustls-webpki`'s `EndEntityCert` is built from —
+# depended on directly (not only via `rustls::pki_types`) so the coordinator,
+# which has no other rustls dependency, can wrap a relay's raw cert bytes.
+rustls-pki-types = "1"
 # Self-signed certs for transport loopback tests (dev-only). Uses ring, not the
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 # Hex encode/decode for the relay/coordinator binaries' tenant-key CLI flags.

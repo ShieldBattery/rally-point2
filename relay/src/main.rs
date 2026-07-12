@@ -216,6 +216,10 @@ async fn main() -> Result<()> {
     // originals.
     let mesh_cert_chain = cert_chain.clone();
     let mesh_private_key = private_key.clone_key();
+    // The same key again, threaded to the coordinator client: it signs the
+    // coordinator's enroll proof-of-possession challenge, proving this relay
+    // holds the key matching the certificate its Hello presents.
+    let identity_key = private_key.clone_key();
 
     let server_config = rally_point_transport::quic::server_config(cert_chain, private_key)
         .context("building QUIC server config")?;
@@ -452,6 +456,7 @@ async fn main() -> Result<()> {
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
                 coordinator_url,
                 relay_hello,
+                identity_key,
                 cli.coordinator_secret.clone(),
                 mesh_control.clone(),
                 Arc::clone(&sessions),

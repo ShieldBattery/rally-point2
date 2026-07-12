@@ -816,6 +816,16 @@ pub struct MeshPeerIdentity {
     pub cert_sha256: [u8; 32],
 }
 
+/// The fixed prefix signed (and verified) in the enroll proof-of-possession
+/// exchange: the relay signs `ENROLL_POP_CONTEXT ++ nonce` — never the bare
+/// nonce — so a signature produced for this purpose can never be replayed as
+/// a valid signature for some unrelated protocol that also happens to sign
+/// 32-byte messages. Versioned in the literal (`v1`) the same way the
+/// connection-binding challenge's own signed contexts are, so a future change
+/// to what gets signed is a new, distinguishable prefix rather than a silent
+/// reinterpretation of old signatures.
+pub const ENROLL_POP_CONTEXT: &[u8] = b"rp2-enroll-pop-v1:";
+
 /// A message the coordinator sends down the persistent control connection a
 /// relay holds open to it.
 ///
@@ -894,6 +904,23 @@ pub enum CoordinatorToRelay {
         /// The complete set of currently-enrolled fleet peers.
         peers: Vec<MeshPeerIdentity>,
     },
+    /// A random challenge proving the relay holds the private key matching the
+    /// certificate its `Hello` presented (enroll proof-of-possession): the
+    /// relay must answer with
+    /// [`RelayToCoordinator::IdentityProof`], a signature over
+    /// [`ENROLL_POP_CONTEXT`] `++ nonce` made with that key. Sent once, after
+    /// `Hello` and version negotiation succeed and before the coordinator
+    /// enrolls the relay — never on an already-enrolled connection — and only
+    /// when the negotiated version reaches
+    /// [`ProtocolVersion::ENROLL_POP_MIN`](crate::version::ProtocolVersion::ENROLL_POP_MIN).
+    /// Closes `Hello.cert_der`'s gap: without this, a bootstrap-secret holder
+    /// could copy a victim relay's public certificate into its own `Hello` and
+    /// enroll as it, since the certificate alone is payload, not proof of
+    /// holding the matching key.
+    IdentityChallenge {
+        /// A fresh random value, unique per connection attempt.
+        nonce: [u8; 32],
+    },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -924,6 +951,22 @@ pub enum RelayToCoordinator {
     /// The relay's identity and reachable address, sent as the first frame to
     /// enroll into the coordinator's registry.
     Hello(RelayHello),
+    /// The answer to a [`CoordinatorToRelay::IdentityChallenge`]: a signature
+    /// over [`ENROLL_POP_CONTEXT`] `++` the challenge's nonce, made with the
+    /// private key matching the certificate this connection's `Hello`
+    /// presented — proof-of-possession of that key, not just knowledge of the
+    /// certificate's public bytes. Sent statelessly the moment a challenge
+    /// arrives; the relay tracks no handshake-phase state of its own, since the
+    /// coordinator alone decides when to challenge and when to give up waiting.
+    IdentityProof {
+        /// The signature, in the format the key's algorithm produces (an
+        /// ECDSA P-256 signature is ASN.1 DER; an Ed25519 signature is the raw
+        /// 64 bytes) — the coordinator tries each algorithm it supports against
+        /// `Hello.cert_der`'s public key, so the wire form doesn't need to name
+        /// which one this is.
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+    },
     /// A periodic presence ping proving the control connection is still alive,
     /// carrying the relay's live roster.
     ///
@@ -1634,6 +1677,28 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_to_relay_identity_challenge_roundtrips_json() {
+        let message = CoordinatorToRelay::IdentityChallenge { nonce: [0x7A; 32] };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"identity_challenge\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn identity_challenge_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Same forward-compatibility shape as `mesh_peers`: an old relay build
+        // (modeled by `RelayToCoordinator`, which has no such variant) skips an
+        // IdentityChallenge it doesn't understand rather than erroring — which
+        // is exactly the case ENROLL_POP_MIN exists to keep out of reach of an
+        // old relay in the first place, but the wire format stays forward-safe
+        // regardless.
+        let json = r#"{"type":"identity_challenge","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
     fn relay_to_coordinator_hello_roundtrips_json() {
         let message = RelayToCoordinator::Hello(RelayHello::new(
             RelayId(3),
@@ -1647,6 +1712,27 @@ mod tests {
         assert!(json.contains("\"relay_id\""));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn relay_to_coordinator_identity_proof_roundtrips_json() {
+        let message = RelayToCoordinator::IdentityProof {
+            signature: vec![0x30, 0x45, 0x02, 0x21, 0x00],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"identity_proof\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn identity_proof_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility, mirroring the down-direction IdentityChallenge
+        // test: decoded by `CoordinatorToRelay` (no such variant), an
+        // IdentityProof folds into `Unknown` rather than erroring.
+        let json = r#"{"type":"identity_proof","signature":[1,2,3]}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }
 
     #[test]

@@ -7,9 +7,11 @@
 //! (the [`RelayPeer`] list in a session descriptor).
 //!
 //! The control connection that carries enrollment is authenticated by a
-//! coordinator-issued bootstrap secret (fail-closed). Binding the connection to a
-//! specific relay *identity* (so a secret-holder cannot enroll as an arbitrary id)
-//! is deferred to the relay-identity / mTLS work.
+//! coordinator-issued bootstrap secret (fail-closed), which proves fleet
+//! membership, not identity. Identity is bound at enroll time: the connection
+//! handler challenges the relay to prove possession of the private key behind
+//! its `Hello`'s certificate (see [`crate::identity`]), and [`try_enroll`]
+//! refuses to re-enroll a live id under a different certificate.
 //!
 //! The registry is a plain `parking_lot::Mutex<HashMap<...>>` — every critical
 //! section is a short, await-free insert or lookup, mirroring the relay's
@@ -48,6 +50,10 @@ use tokio::sync::watch;
 struct Registered {
     entry: RelayEntry,
     generation: u64,
+    /// The SHA-256 fingerprint of `entry.cert_der`, computed once at enroll and
+    /// kept alongside it — the duplicate-id check and the fleet-set publish
+    /// both need it, and neither has to re-hash the certificate to get it.
+    cert_fingerprint: [u8; 32],
     /// Whether this relay has asked to drain — it received its shutdown signal and
     /// requested that the coordinator stop assigning it new sessions (see
     /// [`mark_draining`]). A draining relay stays enrolled and keeps serving its
@@ -123,7 +129,7 @@ fn publish_mesh_peers(
         .values()
         .map(|r| MeshPeerIdentity {
             relay_id: r.entry.relay_id,
-            cert_sha256: cert_fingerprint(&r.entry.cert_der),
+            cert_sha256: r.cert_fingerprint,
         })
         .collect();
     peers.sort_by_key(|p| p.relay_id.0);
@@ -143,10 +149,66 @@ fn publish_mesh_peers(
 ///
 /// Re-registering the same `relay_id` replaces the prior entry (a relay that
 /// restarted, or reconnected, with a new address) and assigns a strictly greater
-/// generation. The caller — a control-connection task — keeps the returned
-/// generation and passes it to [`remove_if_current`] when its connection drops, so
-/// a drop only deregisters the relay when no newer connection has since taken over.
+/// generation — **unconditionally**, whatever certificate the hello carries.
+/// This is the enrollment for a connection whose identity was never
+/// proof-of-possession-verified (a relay negotiating below the challenge's
+/// protocol version); a verified connection enrolls through [`try_enroll`],
+/// which refuses an id conflict instead. The caller — a control-connection
+/// task — keeps the returned generation and passes it to [`remove_if_current`]
+/// when its connection drops, so a drop only deregisters the relay when no
+/// newer connection has since taken over.
 pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
+    let cert_fingerprint = cert_fingerprint(&hello.cert_der);
+    let mut relays = registry.relays.lock();
+    insert_locked(registry, &mut relays, hello, cert_fingerprint)
+}
+
+/// Refusal from [`try_enroll`]: the id is already enrolled by a live control
+/// connection bound to a different certificate — a second relay process
+/// colliding on the id, not the same relay reconnecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrollConflict;
+
+/// Registers a relay like [`enroll`], but refuses — instead of replacing —
+/// when a live entry already holds the id under a **different** certificate
+/// fingerprint. The same fingerprint still replaces: that is this relay's own
+/// control connection redialing (its certificate is stable across reconnects
+/// of one instance).
+///
+/// The conflict check and the insert are one atomic step under the registry
+/// lock, deliberately: as two separate steps, two concurrent enrolls for the
+/// same id could each pass the check and the later insert would silently
+/// displace the earlier winner — the exact takeover the refusal exists to
+/// block. Callers must have proof-of-possession-verified the hello's
+/// certificate first; refusing on an unproven claim would let anyone squat an
+/// id with a copied public certificate.
+pub fn try_enroll(registry: &RelayRegistry, hello: RelayHello) -> Result<u64, EnrollConflict> {
+    let cert_fingerprint = cert_fingerprint(&hello.cert_der);
+    let mut relays = registry.relays.lock();
+    if let Some(existing) = relays.get(&hello.relay_id)
+        && existing.cert_fingerprint != cert_fingerprint
+    {
+        return Err(EnrollConflict);
+    }
+    Ok(insert_locked(
+        registry,
+        &mut relays,
+        hello,
+        cert_fingerprint,
+    ))
+}
+
+/// The shared insert both enrollment paths end in: builds the [`Registered`]
+/// entry, assigns a fresh generation, and publishes the updated fleet
+/// mesh-peer set — all under the registry lock the caller already holds, so
+/// the published snapshot is consistent with the mutation and a concurrent
+/// enroll can neither interleave nor publish a stale set.
+fn insert_locked(
+    registry: &RelayRegistry,
+    relays: &mut HashMap<RelayId, Registered>,
+    hello: RelayHello,
+    cert_fingerprint: [u8; 32],
+) -> u64 {
     let entry = RelayEntry {
         relay_id: hello.relay_id,
         relay_addr: hello.relay_addr,
@@ -156,20 +218,18 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
         region: hello.region,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);
-    let mut relays = registry.relays.lock();
     relays.insert(
         entry.relay_id,
         Registered {
             entry,
             generation,
+            cert_fingerprint,
             // A fresh enroll is never draining: a relay that reconnects mid-drain
             // re-sends its `Draining` frame to re-mark itself.
             draining: false,
         },
     );
-    // A new (or re-enrolled) relay changes the fleet mesh-peer set; publish it to
-    // every connected relay under the same lock, so the snapshot is consistent.
-    publish_mesh_peers(&relays, &registry.mesh_peers);
+    publish_mesh_peers(relays, &registry.mesh_peers);
     generation
 }
 
@@ -228,6 +288,15 @@ pub fn peer(registry: &RelayRegistry, id: RelayId) -> Option<RelayPeer> {
 /// Looks up a relay's full entry by id.
 pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
     registry.relays.lock().get(&id).map(|r| r.entry.clone())
+}
+
+/// The certificate fingerprint of the *live* entry for `id`, if the registry
+/// holds one — the enroll-time duplicate-id check's comparison point. `None`
+/// when no relay is currently registered under `id` (a fresh id, or one whose
+/// prior entry already aged out), which the caller treats as nothing to
+/// compare against: any (proof-of-possession-verified) `Hello` may enroll.
+pub fn live_cert_fingerprint(registry: &RelayRegistry, id: RelayId) -> Option<[u8; 32]> {
+    registry.relays.lock().get(&id).map(|r| r.cert_fingerprint)
 }
 
 /// All registered relays' full entries, in an unspecified order — draining ones
@@ -620,6 +689,74 @@ mod tests {
             !rx.has_changed().unwrap(),
             "an unchanged mesh-peer set must not wake a subscriber",
         );
+    }
+
+    #[test]
+    fn live_cert_fingerprint_tracks_the_current_entry() {
+        let reg = new_registry();
+        assert_eq!(
+            live_cert_fingerprint(&reg, RelayId(1)),
+            None,
+            "an unenrolled id has nothing to compare against",
+        );
+
+        enroll(&reg, hello(1, 14900));
+        assert_eq!(
+            live_cert_fingerprint(&reg, RelayId(1)),
+            Some(cert_fingerprint(&[1u8; 4])),
+        );
+
+        // Deregistering clears it.
+        remove(&reg, RelayId(1));
+        assert_eq!(live_cert_fingerprint(&reg, RelayId(1)), None);
+    }
+
+    /// Builds a hello like [`hello`] but with an explicit certificate, for
+    /// exercising same-id/different-cert enrollment conflicts.
+    fn hello_with_cert(id: u64, port: u16, cert_der: Vec<u8>) -> RelayHello {
+        RelayHello::new(
+            RelayId(id),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            ProtocolVersion::CURRENT,
+            cert_der,
+        )
+    }
+
+    #[test]
+    fn try_enroll_refuses_a_live_id_bound_to_a_different_certificate() {
+        let reg = new_registry();
+        enroll(&reg, hello(1, 14900)); // cert [1u8; 4]
+
+        // A different certificate claiming the live id is refused, and the
+        // refusal leaves everything untouched: the entry, its fingerprint, and
+        // the published mesh-peer set.
+        let before_peers = mesh_peers(&reg);
+        let refused = try_enroll(&reg, hello_with_cert(1, 15000, vec![0xAA; 4]));
+        assert_eq!(refused, Err(EnrollConflict));
+        assert_eq!(
+            live_cert_fingerprint(&reg, RelayId(1)),
+            Some(cert_fingerprint(&[1u8; 4])),
+            "the refused enroll must not displace the live entry",
+        );
+        assert_eq!(
+            entry(&reg, RelayId(1)).unwrap().relay_addr.port(),
+            14900,
+            "the refused enroll must not touch the live entry's address",
+        );
+        assert_eq!(mesh_peers(&reg), before_peers);
+    }
+
+    #[test]
+    fn try_enroll_replaces_on_the_same_certificate_and_enrolls_fresh_ids() {
+        let reg = new_registry();
+        let g1 = try_enroll(&reg, hello(1, 14900)).expect("a fresh id enrolls");
+
+        // The same certificate re-enrolling is this relay's own reconnect: it
+        // replaces the entry (new address) under a strictly greater generation.
+        let g2 = try_enroll(&reg, hello_with_cert(1, 15000, vec![1u8; 4]))
+            .expect("the same certificate reconnecting replaces");
+        assert!(g2 > g1);
+        assert_eq!(entry(&reg, RelayId(1)).unwrap().relay_addr.port(), 15000);
     }
 
     #[test]
