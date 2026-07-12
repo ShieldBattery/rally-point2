@@ -393,6 +393,16 @@ async fn serve_connection(
     // resumed one whose hold and record another path already cleared) —
     // proceed exactly as a first-time dial would.
 
+    // Bound the admit-first race this connection just rode (`slot_homed`
+    // above, admitted because no descriptor names this session yet): if the
+    // coordinator's descriptor push never arrives, the provisional-admission
+    // sweep tears this session down rather than trusting it indefinitely. A
+    // session already covered by a descriptor — even one with an empty
+    // (unenforced) homed set — is left alone; see
+    // `crate::provisional::ProvisionalSessions::mark_if_undescribed`.
+    mesh.provisional
+        .mark_if_undescribed(&mesh.decision_makers, &key);
+
     registration.disarm();
 
     tracing::info!(

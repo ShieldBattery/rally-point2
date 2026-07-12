@@ -331,6 +331,14 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// `drain_acked` to `true`, unblocking the drain sequence — and because the
 /// coordinator pushes the descriptor set *before* the ack on the same socket, this
 /// sequential loop has already reconciled `applied` to the post-mark truth by then.
+///
+/// `control_connected` reports whether the control connection is *currently*
+/// established: `true` from a successful enroll until the connection drops,
+/// `false` otherwise (including every reconnect gap). The provisional-admission
+/// sweep ([`crate::provisional::run_sweep`]) arms only while this is `true` —
+/// while the connection is down the coordinator cannot push a descriptor to
+/// clear a provisional mark, so reaping then would punish an outage rather than
+/// an actually-undescribed session.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_descriptor_subscriber(
     coordinator_url: String,
@@ -344,6 +352,7 @@ pub async fn run_descriptor_subscriber(
     notices: UnboundedReceiver<RelayNotice>,
     drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
+    control_connected: watch::Sender<bool>,
 ) {
     run_descriptor_subscriber_with(
         coordinator_url,
@@ -357,6 +366,7 @@ pub async fn run_descriptor_subscriber(
         notices,
         drain,
         drain_acked,
+        control_connected,
         RECONNECT_DELAY,
         VERSION_REFUSED_RECONNECT_DELAY,
         HEARTBEAT_INTERVAL,
@@ -386,6 +396,7 @@ pub async fn run_descriptor_subscriber_with(
     mut notices: UnboundedReceiver<RelayNotice>,
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
+    control_connected: watch::Sender<bool>,
     reconnect_delay: Duration,
     version_refused_delay: Duration,
     heartbeat_interval: Duration,
@@ -411,6 +422,7 @@ pub async fn run_descriptor_subscriber_with(
             &mut pending,
             &mut drain,
             &drain_acked,
+            &control_connected,
             heartbeat_interval,
         )
         .await
@@ -443,6 +455,11 @@ pub async fn run_descriptor_subscriber_with(
                 reconnect_delay
             }
         };
+        // The connection just ended, however it ended -- report it down
+        // uniformly here rather than at each of `connect_and_stream`'s several
+        // exit points, so the provisional-admission sweep never observes a
+        // stale "connected" reading across a reconnect gap.
+        let _ = control_connected.send(false);
         tokio::time::sleep(delay).await;
     }
 }
@@ -472,6 +489,7 @@ async fn connect_and_stream(
     pending: &mut Option<RelayNotice>,
     drain: &mut watch::Receiver<bool>,
     drain_acked: &watch::Sender<bool>,
+    control_connected: &watch::Sender<bool>,
     heartbeat_interval: Duration,
 ) -> Result<ControlDisconnect, ControlError> {
     let relay_id = relay_hello.relay_id;
@@ -487,6 +505,12 @@ async fn connect_and_stream(
         relay_id = relay_id.0,
         "coordinator control connection established",
     );
+    // Reported established the instant the Hello is on the wire, matching
+    // this connection's own "on connect, the full descriptor set resyncs
+    // immediately" contract: the provisional-admission sweep arming here is
+    // exactly what lets it restart every mark's window right as that resync
+    // is about to land, rather than waiting on it.
+    let _ = control_connected.send(true);
 
     // Flush a notice held over from a prior connection first: one decided while
     // the coordinator was down (or one a failed send left pending) must go out on
@@ -1270,6 +1294,7 @@ mod tests {
             notices_rx,
             drain_rx,
             drain_acked,
+            no_connected(),
             Duration::from_millis(20), // redial fast after the failed first dial
             Duration::from_secs(60),
             Duration::from_secs(3600), // no heartbeat during the test
@@ -1313,6 +1338,12 @@ mod tests {
     /// harmless no-op.
     fn no_drain() -> (watch::Receiver<bool>, watch::Sender<bool>) {
         (watch::channel(false).1, watch::channel(false).0)
+    }
+
+    /// A throwaway `control_connected` sender for a test that doesn't assert
+    /// on the connection-state signal itself.
+    fn no_connected() -> watch::Sender<bool> {
+        watch::channel(false).0
     }
 
     #[test]
@@ -1428,6 +1459,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
+            no_connected(),
             Duration::from_millis(20),
             Duration::from_secs(60),
             Duration::from_secs(3600),
@@ -1491,6 +1523,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
+            no_connected(),
             Duration::from_millis(20),
             Duration::from_secs(60),
             Duration::from_secs(3600),
@@ -1560,6 +1593,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
+            no_connected(),
             Duration::from_millis(20),
             Duration::from_secs(60),
             Duration::from_secs(3600),
@@ -1619,6 +1653,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
+            no_connected(),
             Duration::from_millis(20),
             Duration::from_secs(60),
             Duration::from_millis(50), // beat quickly so the test observes one
@@ -1705,6 +1740,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
+            no_connected(),
             reconnect_delay,
             version_refused_delay,
             Duration::from_secs(3600),
@@ -1951,6 +1987,7 @@ mod tests {
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
+            no_connected(),
             Duration::from_millis(20),
             Duration::from_secs(60),
             Duration::from_secs(3600),

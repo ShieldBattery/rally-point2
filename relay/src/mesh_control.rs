@@ -101,6 +101,13 @@ pub struct MeshControl {
     /// immediately decidable, exactly like the behavior this replaces. Wired to
     /// the real per-relay registry with [`with_drop_holds`](Self::with_drop_holds).
     drop_holds: DropHolds,
+    /// The relay's provisional-admission registry, cleared here whenever a
+    /// descriptor names a session -- a fresh, never-shared registry by
+    /// default (a control plane with no turn path — tests, a standalone
+    /// descriptor driver), where clearing is a harmless no-op against state
+    /// nothing else ever marks. Wired to the real per-relay registry with
+    /// [`with_provisional`](Self::with_provisional).
+    provisional: crate::provisional::ProvisionalSessions,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -170,6 +177,9 @@ impl MeshControl {
                 crate::drop_hold::DROP_UNLOCK,
                 crate::drop_hold::ABANDONED_SESSION_TIMEOUT,
             ),
+            provisional: crate::provisional::ProvisionalSessions::new(
+                crate::provisional::PROVISIONAL_WINDOW,
+            ),
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 desired: HashMap::new(),
@@ -201,6 +211,20 @@ impl MeshControl {
     /// harmless placeholder from [`new`](Self::new).
     pub fn with_drop_holds(mut self, drop_holds: DropHolds) -> Self {
         self.drop_holds = drop_holds;
+        self
+    }
+
+    /// Wires the real per-relay provisional-admission registry, so
+    /// `apply_descriptor` clears a session's provisional mark the moment a
+    /// descriptor names it. The production relay calls this with the same
+    /// [`crate::provisional::ProvisionalSessions`] the turn path holds (via
+    /// `MeshState`); a control plane with no turn path leaves the harmless
+    /// placeholder from [`new`](Self::new).
+    pub fn with_provisional(
+        mut self,
+        provisional: crate::provisional::ProvisionalSessions,
+    ) -> Self {
+        self.provisional = provisional;
         self
     }
 
@@ -326,6 +350,12 @@ impl MeshControl {
             descriptor.homed_slots.iter().copied().collect(),
             held_slots,
         );
+        // A descriptor now names this session, so any provisional-admission
+        // mark it carried is moot -- the bounded-admission sweep would
+        // otherwise still reap it on the original deadline. A session that
+        // was never provisional (a mesh Join, or a descriptor that beat every
+        // client dial) has nothing here to clear.
+        self.provisional.clear(&key);
         // Stamps this relay's own id onto the maker so a buffer directive it
         // queues as authority carries the deterministic decision_seq
         // tie-break (see `BufferDirective.authority_relay_id`). Idempotent;

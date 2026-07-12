@@ -412,6 +412,12 @@ pub struct MeshState {
     /// threaded through the same per-session tasks (the turn forward path records
     /// into it; a re-register reads from it). See [`crate::turn_ring`].
     pub turn_ring: crate::turn_ring::TurnRing,
+    /// Provisional-admission deadlines: a session a client admitted with no
+    /// applied descriptor yet is marked here, and the relay's periodic sweep
+    /// tears it down if no descriptor claims it in time. Local and ephemeral
+    /// like `drop_holds`, and threaded through the same admission and
+    /// descriptor-apply paths. See [`crate::provisional`].
+    pub provisional: crate::provisional::ProvisionalSessions,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -429,6 +435,17 @@ pub fn new_mesh_state() -> MeshState {
 /// value.
 pub fn new_mesh_state_with_drop_unlock(unlock: std::time::Duration) -> MeshState {
     new_mesh_state_with_timings(unlock, crate::drop_hold::ABANDONED_SESSION_TIMEOUT)
+}
+
+/// [`new_mesh_state`] with an explicit provisional-admission window, so a test
+/// can drive a client-admitted, undescribed session to its deadline without
+/// waiting out the production 10-second window. Every other timing keeps its
+/// production value.
+pub fn new_mesh_state_with_provisional_window(window: std::time::Duration) -> MeshState {
+    MeshState {
+        provisional: crate::provisional::ProvisionalSessions::new(window),
+        ..new_mesh_state()
+    }
 }
 
 /// [`new_mesh_state`] with both drop-decision windows injected — the manual-drop
@@ -449,6 +466,9 @@ pub fn new_mesh_state_with_timings(
         chat: crate::chat::new_chat_registry(),
         drop_holds: crate::drop_hold::DropHolds::new(unlock, abandon_timeout),
         turn_ring: crate::turn_ring::TurnRing::new(),
+        provisional: crate::provisional::ProvisionalSessions::new(
+            crate::provisional::PROVISIONAL_WINDOW,
+        ),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -3046,6 +3066,9 @@ mod tests {
                 crate::drop_hold::ABANDONED_SESSION_TIMEOUT,
             ),
             turn_ring: crate::turn_ring::TurnRing::new(),
+            provisional: crate::provisional::ProvisionalSessions::new(
+                crate::provisional::PROVISIONAL_WINDOW,
+            ),
         }
     }
 

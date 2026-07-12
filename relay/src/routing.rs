@@ -181,6 +181,15 @@ const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
 /// resume-time value) so it's diagnosable in logs.
 const RESUME_ANCHOR_INVALID_CLOSE: u32 = 0x09;
 
+/// QUIC application close code for a connection closed because its session was
+/// admitted provisionally -- a client dial with no descriptor yet naming the
+/// session -- and no descriptor claimed it within the provisional window (see
+/// [`crate::provisional`]). Distinct from every other close so a client that
+/// hits it can tell "the descriptor was simply slow" from a terminal refusal:
+/// a fresh dial re-admits with its own new provisional window, so this only
+/// ever delays a legitimate session, never bricks it.
+pub const PROVISIONAL_EXPIRED_CLOSE: u32 = 0x0A;
+
 /// Whether a client's `GameResult` control frame should be forwarded to
 /// `consensus::record_result`, or dropped at ingress before it ever reaches the
 /// decision-maker. A zero-length payload is the wire sentinel a `SlotDeparted`
@@ -264,6 +273,12 @@ pub struct SlotEntry {
     /// very disconnect being reported. Carries `(slot, connected)`.
     conn_push: mpsc::Sender<(SlotId, bool)>,
     shutdown: Arc<Notify>,
+    /// Fired by the provisional-admission sweep when this slot's session was
+    /// admitted with no applied descriptor and its deadline passed with none
+    /// arriving (see [`crate::provisional`]). Separate from `shutdown` so the
+    /// closed connection carries [`PROVISIONAL_EXPIRED_CLOSE`] specifically,
+    /// distinguishable from the generic reap/isolation close `shutdown` signals.
+    provisional_reap: Arc<Notify>,
 }
 
 /// The receiving end of a registered slot, handed to its link task: the queue of
@@ -279,6 +294,8 @@ pub struct SlotInbox {
     /// [`SlotEntry::conn_push`]).
     conn_push_rx: mpsc::Receiver<(SlotId, bool)>,
     shutdown: Arc<Notify>,
+    /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
+    provisional_reap: Arc<Notify>,
 }
 
 impl SlotInbox {
@@ -287,6 +304,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn shutdown_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// The slot's provisional-reap signal, for a test that drives the
+    /// bounded-admission sweep's close path directly without waiting out a
+    /// real deadline.
+    #[cfg(test)]
+    pub(crate) fn provisional_reap_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.provisional_reap)
     }
 
     /// Non-blockingly pulls the next slot-connectivity change pushed to this slot,
@@ -378,6 +403,7 @@ pub fn register(
     // game); the same small channel suits them.
     let (conn_tx, conn_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
+    let provisional_reap = Arc::new(Notify::new());
     {
         let mut roster = sessions.lock();
         let slots = roster.entry(key.clone()).or_default();
@@ -392,6 +418,7 @@ pub fn register(
                 start_push: start_tx,
                 conn_push: conn_tx,
                 shutdown: Arc::clone(&shutdown),
+                provisional_reap: Arc::clone(&provisional_reap),
             },
         );
     }
@@ -407,6 +434,7 @@ pub fn register(
         start_push_rx: start_rx,
         conn_push_rx: conn_rx,
         shutdown,
+        provisional_reap,
     };
     Some((registration, inbox))
 }
@@ -757,6 +785,25 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
     }
 }
 
+/// Fires the provisional-reap signal for each of `key`'s currently-registered
+/// slots, closing every connection with [`PROVISIONAL_EXPIRED_CLOSE`] -- the
+/// bounded-admission sweep's teardown when no descriptor named a provisionally
+/// admitted session before its deadline (see [`crate::provisional`]). A
+/// session absent from the roster (already gone) is simply a no-op.
+///
+/// Signals rather than yanking the roster entry, exactly like [`close_slots`]:
+/// each slot's own link task closes its connection and deregisters itself, so
+/// no replacement can register a second sender in the interim.
+pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
+    let roster = sessions.lock();
+    let Some(group) = roster.get(key) else {
+        return;
+    };
+    for entry in group.values() {
+        entry.provisional_reap.notify_one();
+    }
+}
+
 /// Drives one authorized client's link until it closes.
 ///
 /// Owns `link` outright and alternates between receiving its client's turns
@@ -782,6 +829,7 @@ pub async fn run_slot_link(
         mut start_push_rx,
         mut conn_push_rx,
         shutdown,
+        provisional_reap,
     } = inbox;
     // Cloned (cheap — every field is an `Arc`) before the destructure below
     // pulls `mesh` apart, so every exit path can hand the whole bundle to
@@ -1769,6 +1817,24 @@ pub async fn run_slot_link(
                 );
                 break 'serve;
             }
+            _ = provisional_reap.notified() => {
+                // This session was admitted with no applied descriptor and its
+                // provisional deadline passed with none arriving. Close with a
+                // distinct code so a redialing client can tell this apart from a
+                // terminal refusal -- a fresh dial re-admits with its own new
+                // provisional window.
+                tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "provisional admission expired with no applied descriptor; closing connection",
+                );
+                link.connection().close(
+                    VarInt::from_u32(PROVISIONAL_EXPIRED_CLOSE),
+                    b"provisional admission expired",
+                );
+                break 'serve;
+            }
         }
     }
 
@@ -1961,6 +2027,10 @@ pub(crate) fn maybe_close_emptied_session(
     // has decided yet. See `crate::drop_hold` module docs.
     let decided = consensus::decided_slots(&mesh.decision_makers, key);
     mesh.drop_holds.end_session(key, &decided);
+    // Nothing local remains for a provisional mark to protect -- a later dial
+    // for the same session id (a genuinely fresh admission) gets its own new
+    // mark rather than inheriting whatever deadline this one had left.
+    mesh.provisional.clear(key);
 }
 
 /// Announces a home client's departure from the game: records it, tells the peer

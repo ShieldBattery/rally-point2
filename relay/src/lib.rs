@@ -81,6 +81,7 @@ pub mod mesh_control;
 pub mod mesh_dialer;
 pub mod mesh_edge;
 pub mod presence;
+pub mod provisional;
 pub mod routing;
 pub mod server;
 pub mod turn_ring;

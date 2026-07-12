@@ -36,6 +36,7 @@ use rally_point_relay::mesh;
 use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_dialer;
 use rally_point_relay::mesh_edge;
+use rally_point_relay::provisional;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::{DEFAULT_PORT, server};
 use rally_point_transport::quinn;
@@ -389,7 +390,12 @@ async fn main() -> Result<()> {
         // promotion already does — without this, a descriptor re-push racing a
         // reconnect would decide (and broadcast) a leave for a slot a client is
         // actively returning to.
-        .with_drop_holds(mesh_state.drop_holds.clone());
+        .with_drop_holds(mesh_state.drop_holds.clone())
+        // Wire the real provisional-admission registry so a descriptor
+        // applying here clears the provisional mark client admission may have
+        // left on the session (`server.rs`), rather than leaving it to expire
+        // on a relay the descriptor already covers.
+        .with_provisional(mesh_state.provisional.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it
@@ -453,6 +459,14 @@ async fn main() -> Result<()> {
             let (notices_tx, notices_rx) = tokio::sync::mpsc::unbounded_channel();
             mesh_state.decision_makers.set_notice_notifier(notices_tx);
 
+            // The provisional-admission sweep's arming signal: `true` only
+            // while the control connection below is actually established (see
+            // `coordinator_client::run_descriptor_subscriber`'s doc on
+            // `control_connected`). Local to this block, so dev/static mode
+            // (no coordinator URL) never constructs it and never spawns the
+            // sweep task at all — the simplest possible "never arms".
+            let (control_connected_tx, control_connected_rx) = tokio::sync::watch::channel(false);
+
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
                 coordinator_url,
                 relay_hello,
@@ -465,6 +479,12 @@ async fn main() -> Result<()> {
                 notices_rx,
                 drain_rx.clone(),
                 drain_acked_tx.clone(),
+                control_connected_tx,
+            ));
+            tokio::spawn(provisional::run_sweep(
+                mesh_state.provisional.clone(),
+                Arc::clone(&sessions),
+                control_connected_rx,
             ));
         }
 

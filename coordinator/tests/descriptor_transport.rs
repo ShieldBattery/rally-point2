@@ -59,6 +59,12 @@ fn no_drain_ack() -> watch::Sender<bool> {
     watch::channel(false).0
 }
 
+/// A throwaway control-connected sender for subscribers that don't assert on
+/// the connection-state signal itself.
+fn no_control_connected() -> watch::Sender<bool> {
+    watch::channel(false).0
+}
+
 fn session_key(session: SessionId) -> SessionKey {
     SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -266,6 +272,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_secs(3600),
@@ -297,6 +304,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_secs(3600),
@@ -340,6 +348,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_secs(3600),
@@ -378,6 +387,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_secs(3600),
@@ -506,6 +516,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_secs(3600), // effectively no heartbeat during the test
@@ -1113,6 +1124,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
+        no_control_connected(),
         Duration::from_millis(50),
         Duration::from_secs(60),
         Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
