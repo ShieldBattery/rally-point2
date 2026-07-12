@@ -21,7 +21,10 @@
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 /// ALPN protocol id negotiated on every client ↔ relay QUIC connection. The
 /// trailing number is bumped on any change an older peer can't interoperate
@@ -111,7 +114,18 @@ pub const ALPN: &[u8] = b"rp2/5";
 /// version rejects the mismatch cleanly at TLS negotiation instead, exactly as
 /// `2` and `3` did for their new streams. (Both relays of a deployment update
 /// together, so no long-lived mixed pair is expected.)
-pub const MESH_ALPN: &[u8] = b"rp2-mesh/4";
+///
+/// `5`: the dialer now presents a TLS client certificate on the mesh connection
+/// — the same self-signed certificate it serves with — and the acceptor pins it
+/// against the coordinator-distributed fleet set (relay id → cert fingerprint)
+/// before the link driver ever spawns. `MeshPacket` also gains the session's
+/// tenant alongside the bare session id (an additive field an older decoder
+/// would ignore, staying tenant-blind). A `4` peer presents no client
+/// certificate at all, so against an enforcing acceptor a mixed pair would
+/// complete the TLS handshake and then be refused post-handshake — bumping the
+/// ALPN rejects the pair cleanly at TLS negotiation instead, and gives both
+/// changes a single fleet-upgrade boundary.
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/5";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -181,19 +195,142 @@ fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// The SHA-256 fingerprint of a DER-encoded TLS certificate — the compact form
+/// the mesh-accept path pins a dialing peer's presented client certificate
+/// against, and the coordinator records to remember which certificate a relay
+/// enrolled with. A relay's identity *is* this fingerprint: there is no shared
+/// certificate authority, so two independently self-signed relay certs have
+/// nothing else in common to check.
+///
+/// The fingerprints the coordinator distributes in the fleet-peer set are
+/// computed by its own equivalent of this digest (SHA-256 over the raw DER
+/// bytes), and the accept-path pin compares the two byte-for-byte — any change
+/// to this digest must land on both sides at once.
+pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
+    out
+}
+
+/// Requests but does not require a TLS client certificate from a peer dialing
+/// the relay's single listening endpoint ([`server_config`]), and accepts
+/// whatever certificate is presented without validating it against any
+/// certificate chain, trust anchor, or expiry.
+///
+/// The client edge and the mesh edge share one TLS listener, and their two
+/// kinds of dialer need opposite defaults: a game client presents no
+/// certificate at all (client authorization is a separate app-level step, see
+/// the module docs) and must keep connecting exactly as before; a peer relay
+/// dialing the mesh edge now presents its own self-signed leaf certificate as
+/// its TLS client identity ([`mesh_client_config`]). `client_auth_mandatory`
+/// returning `false` is what keeps the client edge unaffected — a connection
+/// presenting no certificate is accepted here exactly as `with_no_client_auth`
+/// always accepted it.
+///
+/// **This verifier makes no trust decision.** `verify_client_cert` accepts any
+/// certificate unconditionally — there is no root store to check it against,
+/// because relay certs are independently self-signed with no shared CA. The
+/// actual trust decision is made one layer up, at the application level: the
+/// mesh acceptor SHA-256s the presented leaf ([`cert_fingerprint`]) and pins it
+/// against the fingerprint the coordinator recorded for the claimed relay id at
+/// that relay's enroll, refusing the connection post-handshake on a mismatch. A
+/// certificate this verifier "accepted" only proves the dialer holds the
+/// matching private key — which certificate is trustworthy is a fact this
+/// verifier does not have.
+///
+/// Signature verification still runs for real: `verify_tls12_signature` and
+/// `verify_tls13_signature` delegate to the ring provider's default webpki-based
+/// checks, which parse the certificate to extract its public key. So "no chain
+/// validation" means no root/issuer/expiry check, not no check at all — a
+/// certificate that isn't valid X.509, or a handshake signature that doesn't
+/// actually match the presented certificate's public key, still fails here.
+#[derive(Debug)]
+struct RequestClientCert {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ClientCertVerifier for RequestClientCert {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // No trust anchors to hint at: this verifier trusts no CA, so there is
+        // nothing to name here. An empty list asks a client to present whatever
+        // it has rather than steering it toward a specific issuer.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        // No chain validation — see the type doc. A malformed certificate still
+        // fails the handshake below, where signature verification must parse it
+        // to extract a public key.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Builds the relay-side QUIC server config from its certificate chain and
 /// private key. The relay presents this chain; clients verify it against their
 /// trusted roots (see [`client_config`]). The server advertises both the
 /// client-edge [`ALPN`] and the mesh [`MESH_ALPN`], so a single listening
 /// endpoint accepts both connection kinds; the negotiated ALPN tells the accept
 /// loop which wire type (`Packet` or `MeshPacket`) the connection will carry.
+///
+/// Requests (does not require) a TLS client certificate from every dialer —
+/// see `RequestClientCert`, this module's client-cert verifier. A client-edge
+/// dialer presents none and connects
+/// unaffected; a mesh-edge dialer presents its own leaf cert, which the mesh
+/// acceptor pins against the coordinator's fleet set at the application layer.
 pub fn server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, TlsError> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(ring_provider())
+    let provider = ring_provider();
+    let client_verifier = Arc::new(RequestClientCert {
+        provider: Arc::clone(&provider),
+    });
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, key)?;
     tls.alpn_protocols = vec![ALPN.to_vec(), MESH_ALPN.to_vec()];
 
@@ -221,15 +358,29 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig
 }
 
 /// Builds the mesh-edge QUIC config a relay uses to dial a peer relay,
-/// trusting the given root certificates to authenticate it. Negotiates the mesh
+/// trusting the given root certificates to authenticate it and presenting
+/// `cert_chain`/`key` as this relay's own TLS client identity — the same
+/// certificate it serves with (see [`server_config`]'s `RequestClientCert`,
+/// which the peer's acceptor applies to us in turn). Negotiates the mesh
 /// [`MESH_ALPN`], so the connection carries `MeshPacket` datagrams — never
 /// client-edge `Packet`. A mesh link is a relay ↔ relay connection distinct from
 /// the client ↔ relay edge; the ALPN keeps the two wire types from crossing.
-pub fn mesh_client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig, TlsError> {
+///
+/// Presenting a client certificate is unconditional here — every mesh dial
+/// announces itself — because the *enforcement* decision (whether an acceptor
+/// actually checks it) lives entirely on the accept side, keyed off whether the
+/// coordinator has pushed a fleet-peer set. An acceptor with no fleet set yet
+/// (or one that predates this leg) simply never looks at the certificate this
+/// presents, so dialing with one is always safe.
+pub fn mesh_client_config(
+    roots: rustls::RootCertStore,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<quinn::ClientConfig, TlsError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_client_auth_cert(cert_chain, key)?;
     tls.alpn_protocols = vec![MESH_ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
@@ -259,7 +410,10 @@ mod tests {
 
     /// Proves the pinned quinn + rustls + ring stack actually completes a
     /// handshake and carries a datagram over loopback — the foundation every
-    /// link is built on.
+    /// link is built on. `client_config` presents no TLS client certificate (a
+    /// game client never does), so this also proves `RequestClientCert`'s
+    /// `client_auth_mandatory: false` keeps a certificate-less dialer connecting
+    /// exactly as `with_no_client_auth` always did.
     #[tokio::test]
     async fn loopback_connects_and_exchanges_a_datagram() {
         let (chain, key, ca) = self_signed();
@@ -291,6 +445,53 @@ mod tests {
 
         let received = server_task.await.unwrap();
         assert_eq!(&received[..], b"hello");
+    }
+
+    /// A mesh dial presents its own certificate as its TLS client identity, and
+    /// the accepting side observes exactly that certificate via
+    /// `Connection::peer_identity` — the raw material the mesh-accept path's
+    /// fingerprint pin (built one layer up, in `relay::mesh_edge`) checks
+    /// against the coordinator's fleet set. This only proves the TLS plumbing
+    /// carries the certificate through; the pin comparison itself is relay-side.
+    #[tokio::test]
+    async fn mesh_dial_presents_its_client_certificate_to_the_acceptor() {
+        let (server_chain, server_key, server_ca) = self_signed();
+        let server_cfg = server_config(server_chain, server_key).unwrap();
+
+        let (dial_chain, dial_key, _dial_ca) = self_signed();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_ca).unwrap();
+        let client_cfg = mesh_client_config(roots, dial_chain.clone(), dial_key).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            incoming.await.unwrap()
+        });
+
+        let _client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = server_task.await.unwrap();
+
+        let peer_certs = server_conn
+            .peer_identity()
+            .expect("the mesh dial presented a client certificate")
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .expect("the rustls backend's peer identity is a cert chain");
+        assert_eq!(
+            peer_certs.first(),
+            dial_chain.first(),
+            "the acceptor observes exactly the leaf the dialer presented",
+        );
     }
 
     /// A peer on an older protocol — here, advertising the previous ALPN — is

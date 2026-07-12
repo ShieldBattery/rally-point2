@@ -23,6 +23,11 @@ thiserror = { workspace = true }
 # 32-bit game DLL without a C/NASM toolchain.
 quinn = { workspace = true }
 rustls = { workspace = true }
+# Only for `quic::cert_fingerprint` (the SHA-256 the mesh-accept path pins a
+# dialing peer's certificate against). Already compiled into this crate
+# transitively as rustls's pinned crypto provider (see the provider note
+# below); this just gives our own code an explicit edge to call it.
+ring = { workspace = true }
 # The beacon side-channel's read-loop task and channel. Needed by the shared
 # `beacon` module used by both the client and relay drivers.
 tokio = { workspace = true }

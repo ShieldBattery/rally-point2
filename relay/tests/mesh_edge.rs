@@ -287,7 +287,8 @@ async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoi
     let server_cfg = server_config(chain, key).unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca).unwrap();
-    let client_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
@@ -413,7 +414,8 @@ async fn mesh_two_relays(
 ) {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
@@ -810,7 +812,8 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
@@ -921,7 +924,8 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
     // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
@@ -1033,7 +1037,8 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
@@ -1162,7 +1167,8 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
@@ -1298,7 +1304,8 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     // A dials B on the mesh ALPN. B's accept loop dispatches to mesh_rx.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
-    let mesh_cfg = mesh_client_config(roots).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut mesh_ep = quinn::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);

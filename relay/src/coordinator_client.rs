@@ -188,7 +188,11 @@ impl FleetMeshPeers {
     /// Replaces the stored map with the coordinator's latest full set, waking
     /// observers only when it actually changed. The pushed set is declarative
     /// current state, so a wholesale replace — not a merge — is correct.
-    fn store(&self, peers: Vec<MeshPeerIdentity>) {
+    ///
+    /// `pub` so a test can seed the map directly — standing in for the
+    /// coordinator's control-connection push — without driving a real WebSocket
+    /// transport just to get a fingerprint into the map.
+    pub fn store(&self, peers: Vec<MeshPeerIdentity>) {
         let next: HashMap<RelayId, [u8; 32]> = peers
             .into_iter()
             .map(|p| (p.relay_id, p.cert_sha256))

@@ -49,14 +49,23 @@
 //! would contradict the coordinator-targeted source, so the connection half
 //! stays out of session membership entirely.
 //!
-//! # Auth today
+//! # Peer identity
 //!
-//! Real relay-to-relay authentication and tenant binding land with the
-//! coordinator (Phase 3, open — see the build plan's open questions). Today the
-//! dial trusts the peer's certificate against the same roots a client would,
-//! so a dev/loopback pair with self-signed certs just works and a production
-//! pair needs its relay certs in each other's trust store until the
-//! coordinator issues a mesh-specific secret.
+//! Each side of a mesh connection presents its own self-signed certificate as
+//! its TLS identity — a relay's client edge and mesh edge share one cert, so
+//! the same certificate a game client pins from a session response is what a
+//! peer relay presents when it dials the mesh edge. The **dial** side trusts
+//! the peer it is dialing by pinning the exact certificate the coordinator's
+//! descriptor carried for it (`mesh_dialer::dial_roots`; the static
+//! dev/loopback `--mesh-peer` path pins the configured mesh roots instead, no
+//! coordinator involved). The **accept** side cannot pin a descriptor-carried
+//! cert before the connection exists, so it instead checks the dialer's
+//! identity hello and presented certificate against the coordinator's
+//! fleet-peer set — every enrolled relay's id and certificate fingerprint,
+//! pushed down the control connection — right after hello and version
+//! negotiation in [`run_mesh_accept`]. No shared certificate authority exists
+//! or is needed: fingerprint pinning in both directions is the whole trust
+//! model.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,9 +73,14 @@ use std::time::Duration;
 
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::mesh::{MESH_HELLO_LEN, MeshHello};
-use rally_point_proto::version::{self, MESH_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
+use rally_point_proto::version::{
+    self, MESH_CLOSE_CERT_MISMATCH, MESH_CLOSE_NO_CLIENT_CERT, MESH_CLOSE_PROTOCOL_MISMATCH,
+    MESH_CLOSE_UNKNOWN_PEER, ProtocolVersion,
+};
+use rally_point_transport::quic::cert_fingerprint;
 use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
+use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::coordinator_client::FleetMeshPeersReader;
@@ -94,8 +108,12 @@ const MESH_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// other relays, not thousands of players -- so a small dedicated bound is
 /// the right shape here: 8 is comfortably above any real fleet's concurrent
 /// (re)connect burst while still bounding how many QUIC connections an
-/// attacker speaking `MESH_ALPN` (no mesh auth exists yet, see the module
-/// docs) can hold open in a stalled, pre-link handshake state at once.
+/// attacker speaking `MESH_ALPN` can hold open in a stalled, pre-link
+/// handshake state at once. The fleet-peer identity check (see the module
+/// docs) only runs *after* a connection sends its hello — a peer that never
+/// does is by definition unidentified, no matter what this permit gates — so
+/// this cap is still what bounds how many such silent connections can sit here
+/// concurrently.
 ///
 /// Held only across the handshake window this const is named for -- acquired
 /// before [`recv_mesh_hello`], dropped once the connection is ready to become
@@ -192,6 +210,106 @@ pub struct MeshDial {
     /// pinned (see `mesh_dialer::dial_roots`); the static dev/loopback dial
     /// passes the configured mesh roots.
     pub roots: RootCertStore,
+    /// This relay's own certificate chain, presented as the TLS client
+    /// identity on the mesh dial — the same chain it serves with. The peer's
+    /// acceptor pins it against the coordinator's fleet-peer set.
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    /// The private key matching `cert_chain`.
+    pub key: PrivateKeyDer<'static>,
+}
+
+/// Why the mesh acceptor refused a dialing peer's identity, once hello and
+/// version negotiation already succeeded. Each variant closes the connection
+/// with its own code (see `rally_point_proto::version`) so a trace tells the
+/// three failure shapes apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshPeerAuthRefusal {
+    /// The dialer completed the TLS handshake without presenting a client
+    /// certificate, so there is nothing to pin against the fleet map.
+    NoClientCert,
+    /// The claimed relay id names no relay in the coordinator's currently
+    /// enrolled fleet set — including every claim when peer-identity
+    /// enforcement is forced on ([`run_mesh_accept`]'s `require_peer_auth`)
+    /// while the coordinator has not yet pushed its first fleet-peer set.
+    UnknownPeer,
+    /// A certificate was presented and the claimed id is enrolled, but its
+    /// SHA-256 fingerprint does not match the one the coordinator recorded for
+    /// that relay id at its enroll.
+    CertMismatch,
+}
+
+impl MeshPeerAuthRefusal {
+    /// The QUIC application close code naming this refusal.
+    fn close_code(self) -> u32 {
+        match self {
+            Self::NoClientCert => MESH_CLOSE_NO_CLIENT_CERT,
+            Self::UnknownPeer => MESH_CLOSE_UNKNOWN_PEER,
+            Self::CertMismatch => MESH_CLOSE_CERT_MISMATCH,
+        }
+    }
+
+    /// The close frame's reason bytes.
+    fn reason_bytes(self) -> &'static [u8] {
+        match self {
+            Self::NoClientCert => b"no mesh client certificate presented",
+            Self::UnknownPeer => b"claimed relay id not enrolled in the fleet",
+            Self::CertMismatch => b"client certificate fingerprint mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for MeshPeerAuthRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoClientCert => "no client certificate presented",
+            Self::UnknownPeer => "claimed relay id not in the fleet-peer set",
+            Self::CertMismatch => "certificate fingerprint does not match the fleet-peer set",
+        })
+    }
+}
+
+/// Pins a dialing peer's TLS client certificate against the coordinator's
+/// fleet-peer set, once hello + version negotiation have already succeeded.
+///
+/// Enforced whenever `fleet_peers` is non-empty (the coordinator has pushed at
+/// least one relay's identity) **or** `require_peer_auth` is set. The latter
+/// fails closed even before the coordinator's first push, so a relay started
+/// with `--require-mesh-peer-auth` never serves an unauthenticated mesh accept
+/// during its brief startup window — every claimed id trivially fails the
+/// "enrolled in the fleet" check against an empty map, which is exactly the
+/// refusal this function already produces for an unrecognized id, so no
+/// separate case is needed for "map empty and required".
+///
+/// With neither condition true, this is a no-op — the dev/loopback static-mesh
+/// path (`--mesh-peer`, no coordinator) never receives a fleet push and stays
+/// exactly as unauthenticated as it was before peer-identity pinning existed.
+fn verify_mesh_peer_identity(
+    connection: &quinn::Connection,
+    peer_id: RelayId,
+    fleet_peers: &FleetMeshPeersReader,
+    require_peer_auth: bool,
+) -> Result<(), MeshPeerAuthRefusal> {
+    if fleet_peers.is_empty() && !require_peer_auth {
+        return Ok(());
+    }
+
+    let leaf = connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|certs| certs.into_iter().next());
+    let Some(leaf) = leaf else {
+        return Err(MeshPeerAuthRefusal::NoClientCert);
+    };
+
+    let Some(expected) = fleet_peers.fingerprint(peer_id) else {
+        return Err(MeshPeerAuthRefusal::UnknownPeer);
+    };
+
+    if cert_fingerprint(&leaf) != expected {
+        return Err(MeshPeerAuthRefusal::CertMismatch);
+    }
+
+    Ok(())
 }
 
 /// Drives the accept side of the mesh edge.
@@ -219,21 +337,28 @@ pub struct MeshDial {
 /// Ends when `mesh_accept` closes (the client-edge accept loop ended — the
 /// relay is shutting down).
 ///
-/// `_fleet_peers` is the coordinator's enrolled-fleet mesh-peer fingerprint map
-/// (see [`FleetMeshPeersReader`]), threaded in for the accept-path pin that checks
-/// a dialing peer's TLS client certificate against the fingerprint the coordinator
-/// recorded for its claimed relay id. It is held but not consulted here.
+/// `fleet_peers` is the coordinator's enrolled-fleet mesh-peer fingerprint map
+/// (see [`FleetMeshPeersReader`]): right after hello + version negotiation, this
+/// pins the dialer's presented TLS client certificate against the fingerprint
+/// the coordinator recorded for its claimed relay id. `require_peer_auth` (the relay's
+/// `--require-mesh-peer-auth` flag) forces that check to run even while
+/// `fleet_peers` is still empty — refusing every dial until the coordinator's
+/// first push lands — rather than treating an empty map as unenforced, which is
+/// the default (and how the dev/loopback static `--mesh-peer` path, which never
+/// receives a fleet push, keeps working with no peer-identity checks at all).
 pub async fn run_mesh_accept(
     mut mesh_accept: mpsc::Receiver<quinn::Connection>,
     sessions: Sessions,
     mesh: MeshState,
     links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
-    _fleet_peers: FleetMeshPeersReader,
+    fleet_peers: FleetMeshPeersReader,
+    require_peer_auth: bool,
 ) {
     while let Some(connection) = mesh_accept.recv().await {
         let sessions = Arc::clone(&sessions);
         let mesh = mesh.clone();
         let links = links.clone();
+        let fleet_peers = fleet_peers.clone();
         tokio::spawn(async move {
             // Gate the handshake window behind the dedicated mesh-accept cap
             // before any handshake work begins -- queues rather than refusing
@@ -276,6 +401,22 @@ pub async fn run_mesh_accept(
                     return;
                 }
             };
+
+            if let Err(refusal) =
+                verify_mesh_peer_identity(&connection, peer_id, &fleet_peers, require_peer_auth)
+            {
+                tracing::warn!(
+                    peer_id = peer_id.0,
+                    remote = %connection.remote_address(),
+                    reason = %refusal,
+                    "refusing mesh peer: identity check failed",
+                );
+                connection.close(
+                    quinn::VarInt::from_u32(refusal.close_code()),
+                    refusal.reason_bytes(),
+                );
+                return;
+            }
 
             tracing::info!(
                 peer_id = peer_id.0,
@@ -415,6 +556,8 @@ pub async fn run_mesh_dial_with(
         peer_addrs,
         server_name,
         roots,
+        cert_chain,
+        key,
     } = dial;
 
     // Pre-connect local decision: don't dial if we're the higher id. The peer
@@ -435,7 +578,7 @@ pub async fn run_mesh_dial_with(
     // outlives every connection dialed from it (a quinn `Endpoint` closes its
     // connections when dropped), so keeping it on this task's stack for the whole
     // supervisor loop keeps each attempt's connection alive while its driver runs.
-    let mesh_cfg = match rally_point_transport::quic::mesh_client_config(roots) {
+    let mesh_cfg = match rally_point_transport::quic::mesh_client_config(roots, cert_chain, key) {
         Ok(cfg) => cfg,
         Err(error) => {
             tracing::error!(%error, "building mesh client config; not dialing peer");
@@ -744,7 +887,8 @@ mod tests {
         let server_cfg = server_config(chain, key).unwrap();
         let mut roots = rally_point_transport::rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
-        let client_cfg = mesh_client_config(roots).unwrap();
+        let (dial_chain, dial_key, _) = self_signed();
+        let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
@@ -829,6 +973,7 @@ mod tests {
             mesh::new_mesh_state(),
             links_tx,
             crate::coordinator_client::FleetMeshPeers::new().reader(),
+            false,
         ));
 
         let (silent_conn, _client_conn, _client_ep, _server_ep) = silent_mesh_connection().await;

@@ -97,6 +97,11 @@ impl Default for RelayRegistry {
 /// session's clients pinned to it), rather than carrying the full DER bytes
 /// through every comparison. Shared so the registry and session setup hash the
 /// certificate one way.
+///
+/// A relay's mesh acceptor computes the same digest (SHA-256 over the raw DER
+/// bytes) over a dialing peer's presented certificate and compares it
+/// byte-for-byte against the fingerprints distributed from here in the
+/// fleet-peer set — any change to this digest must land on both sides at once.
 pub(crate) fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());

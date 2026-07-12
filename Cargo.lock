@@ -1358,6 +1358,7 @@ dependencies = [
  "quinn",
  "rally-point-proto",
  "rcgen",
+ "ring",
  "rustls",
  "thiserror",
  "tokio",

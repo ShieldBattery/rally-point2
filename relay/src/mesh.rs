@@ -4409,7 +4409,8 @@ mod tests {
         let server_cfg = server_config(chain, key).unwrap();
         let mut roots = rally_point_transport::rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
-        let client_cfg = mesh_client_config(roots).unwrap();
+        let (dial_chain, dial_key, _) = self_signed();
+        let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
@@ -4596,7 +4597,8 @@ mod tests {
         let server_cfg = server_config(chain, key).unwrap();
         let mut roots = rally_point_transport::rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
-        let client_cfg = mesh_client_config(roots).unwrap();
+        let (dial_chain, dial_key, _) = self_signed();
+        let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();

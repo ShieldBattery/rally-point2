@@ -113,6 +113,30 @@ pub const CONTROL_CLOSE_UNKNOWN_REGION: u16 = 4002;
 /// pair stops being asked to connect once the fleet converges.
 pub const MESH_CLOSE_PROTOCOL_MISMATCH: u32 = 0x10;
 
+/// QUIC application close code a mesh acceptor uses to refuse a dialing peer
+/// that completed the TLS handshake without presenting a client certificate,
+/// while peer-identity enforcement is active (the coordinator's fleet-peer set
+/// is non-empty, or the relay was started with `--require-mesh-peer-auth`).
+/// Sent after hello + version negotiation, before the link driver ever spawns.
+pub const MESH_CLOSE_NO_CLIENT_CERT: u32 = 0x11;
+
+/// QUIC application close code a mesh acceptor uses to refuse a dialing peer
+/// whose identity hello claims a relay id absent from the coordinator's
+/// fleet-peer set, while peer-identity enforcement is active. Also the code an
+/// acceptor started with `--require-mesh-peer-auth` sends for *every* dial
+/// while the fleet set is still empty (nothing it could claim would be
+/// present), so a peer-auth-required relay never serves an unauthenticated
+/// mesh accept even during its brief startup window before the coordinator's
+/// first push lands.
+pub const MESH_CLOSE_UNKNOWN_PEER: u32 = 0x12;
+
+/// QUIC application close code a mesh acceptor uses to refuse a dialing peer
+/// whose claimed relay id is enrolled and whose certificate was presented, but
+/// whose certificate's SHA-256 fingerprint does not match the one the
+/// coordinator recorded for that relay id at enroll — the fleet-set pin
+/// mismatched. Sent while peer-identity enforcement is active.
+pub const MESH_CLOSE_CERT_MISMATCH: u32 = 0x13;
+
 /// The local and peer protocol-version support windows have no version in common.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(

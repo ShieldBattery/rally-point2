@@ -64,7 +64,7 @@ use std::time::Duration;
 use rally_point_proto::control::RelayPeer;
 use rally_point_proto::ids::RelayId;
 use rally_point_transport::rustls::RootCertStore;
-use rally_point_transport::rustls::pki_types::CertificateDer;
+use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
@@ -85,6 +85,15 @@ pub struct DialerConfig {
     /// peer's descriptor carried no pinned cert (see `dial_roots`). A
     /// descriptor-carried pin wins over these.
     pub roots: RootCertStore,
+    /// This relay's own certificate chain — the same one it serves with —
+    /// presented as the TLS client identity on every dial this config spawns.
+    /// Cloned into each supervisor this config spawns; a peer's acceptor pins
+    /// it against the coordinator's fleet-peer set.
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    /// The private key matching `cert_chain`. `PrivateKeyDer` isn't `Clone`, so
+    /// each supervisor gets its own copy via
+    /// [`clone_key`](PrivateKeyDer::clone_key).
+    pub key: PrivateKeyDer<'static>,
     /// The relay's session routing state, shared into each link driver.
     pub sessions: Sessions,
     /// The relay's mesh state, shared into each link driver.
@@ -251,6 +260,8 @@ fn spawn_dial(
         peer_addrs: target.addrs.clone(),
         server_name: config.server_name.clone(),
         roots: dial_roots(peer_id, &target.cert_der, &config.roots),
+        cert_chain: config.cert_chain.clone(),
+        key: config.key.clone_key(),
     };
     let sessions = Arc::clone(&config.sessions);
     let mesh = config.mesh.clone();

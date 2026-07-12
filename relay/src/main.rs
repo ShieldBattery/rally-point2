@@ -112,6 +112,17 @@ struct Cli {
     #[arg(long, env = "RELAY_MESH_SERVER_NAME", default_value = "localhost")]
     mesh_server_name: String,
 
+    /// Fail closed on the mesh accept path: refuse every dialing peer's
+    /// connection until the coordinator's fleet-peer set has arrived, rather
+    /// than treating an empty set as not-yet-enforced. Off by default, so the
+    /// dev/loopback static `--mesh-peer` path (no coordinator, no fleet push
+    /// ever arrives) keeps meshing with no peer-identity checks at all.
+    /// Production sets this: a coordinator-driven relay should never serve an
+    /// unauthenticated mesh accept, not even during the brief startup window
+    /// before its first fleet-peer push lands.
+    #[arg(long, env = "RELAY_REQUIRE_MESH_PEER_AUTH", default_value_t = false)]
+    require_mesh_peer_auth: bool,
+
     /// Base URL of the coordinator's control-plane API (e.g.
     /// `http://coordinator.internal:14910`). When set together with `--relay-id`,
     /// the relay holds a control connection open to the coordinator and applies
@@ -197,6 +208,14 @@ async fn main() -> Result<()> {
         // clap's `requires = "cert"` makes the (Some, None) case unreachable.
         _ => unreachable!(),
     };
+
+    // Kept alongside the server identity: a mesh dial presents this same
+    // certificate as its TLS client identity (`mesh_client_config`), so a peer
+    // relay's acceptor pins exactly what a client would pin from this relay's
+    // session responses. Cloned before `server_config` below moves the
+    // originals.
+    let mesh_cert_chain = cert_chain.clone();
+    let mesh_private_key = private_key.clone_key();
 
     let server_config = rally_point_transport::quic::server_config(cert_chain, private_key)
         .context("building QUIC server config")?;
@@ -296,6 +315,7 @@ async fn main() -> Result<()> {
             mesh_state.clone(),
             links_tx.clone(),
             fleet_peers.reader(),
+            cli.require_mesh_peer_auth,
         ));
 
         // Roots to trust peer certs against — needed by the static `--mesh-peer`
@@ -335,6 +355,8 @@ async fn main() -> Result<()> {
                     peer_addrs: vec![peer.addr],
                     server_name: cli.mesh_server_name.clone(),
                     roots: mesh_roots.clone(),
+                    cert_chain: mesh_cert_chain.clone(),
+                    key: mesh_private_key.clone_key(),
                 };
                 tokio::spawn(mesh_edge::run_mesh_dial(dial, sessions, mesh, links_tx));
             }
@@ -381,6 +403,8 @@ async fn main() -> Result<()> {
                 our_id: RelayId(our_id),
                 server_name: cli.mesh_server_name.clone(),
                 roots: mesh_roots.clone(),
+                cert_chain: mesh_cert_chain,
+                key: mesh_private_key,
                 sessions: Arc::clone(&sessions),
                 mesh: mesh_state.clone(),
                 links: links_tx.clone(),
