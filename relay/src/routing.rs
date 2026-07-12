@@ -53,6 +53,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
@@ -75,6 +76,28 @@ use crate::validation::validate_turn;
 /// so this is deliberately generous rather than tuned. Shared by the client-edge
 /// slot link and the mesh-link task (same turn-magnitude, same drain cadence).
 pub(crate) const FORWARD_CAPACITY: usize = 1024;
+
+/// The aggregate resident-byte ceiling on one slot's forward queue, a second
+/// bound sitting alongside the payload-*count* bound [`FORWARD_CAPACITY`].
+///
+/// The count bound alone lets a queue hold [`FORWARD_CAPACITY`] payloads of *any*
+/// size up to the per-turn oversize cap ([`MAX_OVERSIZE_TURN_COMMANDS_LEN`]), so a
+/// client spraying max-size oversize turns could pin
+/// `MAX_OVERSIZE_TURN_COMMANDS_LEN * FORWARD_CAPACITY` (~8 MiB) of buffered turns
+/// in one slot's queue, replicated across every receiving slot — memory no single
+/// rejectable turn accounts for. This bounds the aggregate: whichever bound a slot
+/// crosses first — too many payloads or too many resident bytes — isolates it, via
+/// the same lagging-peer signal a count-full queue already uses (see [`fan_out`]).
+///
+/// Set to a quarter of that worst case (~2 MiB). A queue of normal turns never
+/// approaches it: a legitimate turn is a few hundred command bytes, so a full
+/// count-bounded queue of them is only a few hundred KiB, and the count bound is
+/// what governs that honest-but-lagging case. A queue of max-oversize turns, by
+/// contrast, trips this at a quarter of the count bound (256 turns), capping the
+/// memory an oversize-spraying client can pin at ~2 MiB rather than ~8 MiB. The
+/// byte bound thus never fires on honest traffic; it only caps the
+/// oversize-amplification residual the count bound leaves open.
+const FORWARD_BYTE_BUDGET: usize = MAX_OVERSIZE_TURN_COMMANDS_LEN * FORWARD_CAPACITY / 4;
 
 /// Depth of a slot's leave-push channel. Leaves are rare (at most one per other
 /// player, and only on a departure), so a small buffer is ample.
@@ -239,6 +262,113 @@ const MAX_OVERSIZE_TURN_COMMANDS_LEN: usize = 8192;
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
 
+/// The bytes a queued payload counts against a slot's resident forward budget.
+/// Only the command stream varies in size; the envelope's fixed fields are
+/// negligible and constant, so — like the per-turn oversize cap — the measure is
+/// the command length. The enqueue reservation and the drain release share this
+/// one definition so they can never disagree on a payload's cost.
+fn forward_bytes(payload: &Payload) -> usize {
+    payload.commands.len()
+}
+
+/// The outcome of offering a payload to a slot's [`ForwardSink`].
+enum ForwardOutcome {
+    /// Enqueued; its bytes are counted resident until the link task drains it.
+    Delivered,
+    /// The slot's queue is at the payload-count bound ([`FORWARD_CAPACITY`]).
+    QueueFull,
+    /// Accepting the payload would push the slot's resident forward bytes over
+    /// [`FORWARD_BYTE_BUDGET`]; the payload was not enqueued.
+    OverBudget,
+    /// The slot's link task already exited and dropped its receiver.
+    Gone,
+}
+
+/// One slot's forward channel paired with a live count of the payload bytes
+/// resident in it. The channel bounds how many payloads may queue
+/// ([`FORWARD_CAPACITY`]); the count bounds their aggregate size
+/// ([`FORWARD_BYTE_BUDGET`]), because one oversize turn costs far more than a
+/// normal one and a queue full of them pins far more memory than the count bound
+/// alone implies.
+///
+/// Cloneable and shared: [`fan_out`] holds a producer clone per send, the link
+/// task's [`SlotInbox`] holds the matching [`ForwardRx`] over the same counter,
+/// and every producer's reservation and the consumer's release act on that one
+/// shared count. The queue is many-producer (a turn from any local sibling slot
+/// and a turn arriving over any mesh link both fan out to it), so the count is an
+/// atomic and the reservation is taken before the payload is enqueued.
+#[derive(Clone)]
+struct ForwardSink {
+    tx: ForwardTx,
+    resident_bytes: Arc<AtomicUsize>,
+}
+
+impl ForwardSink {
+    /// Offers `payload` to the slot without blocking, reporting whether it landed
+    /// or the slot is too far behind to take it (its count bound or its byte
+    /// budget).
+    ///
+    /// The byte reservation is taken *before* the payload is enqueued, so it is
+    /// visible to the draining [`ForwardRx`] before the payload is: the drain's
+    /// matching release can then never observe an un-reserved payload and underflow
+    /// the count, which keeps the count sound even under the many producers that
+    /// concurrently fan out to one slot. A reservation that would breach the budget,
+    /// or a send that finds the queue full or the receiver gone, is backed out so
+    /// only genuinely resident bytes stay counted.
+    fn offer(&self, payload: &Payload) -> ForwardOutcome {
+        let bytes = forward_bytes(payload);
+        let resident = self.resident_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if resident > FORWARD_BYTE_BUDGET {
+            self.resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            return ForwardOutcome::OverBudget;
+        }
+        match self.tx.try_send(payload.clone()) {
+            Ok(()) => ForwardOutcome::Delivered,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                ForwardOutcome::QueueFull
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.resident_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                ForwardOutcome::Gone
+            }
+        }
+    }
+}
+
+/// The receiving half of a slot's forward channel, paired with the same resident-
+/// byte count [`ForwardSink`] reserves against. Draining a payload releases its
+/// bytes from the count, so the count tracks only what is still buffered.
+struct ForwardRx {
+    rx: mpsc::Receiver<Payload>,
+    resident_bytes: Arc<AtomicUsize>,
+}
+
+impl ForwardRx {
+    /// Waits for the next forwarded payload, releasing its reserved bytes from the
+    /// resident count as it hands it over. `None` once every sender is dropped.
+    ///
+    /// Cancel-safe for `tokio::select!`: the only await is the inner `recv`, itself
+    /// cancel-safe, and the release runs synchronously once a payload is in hand, so
+    /// a cancelled poll neither takes a payload nor releases bytes.
+    async fn recv(&mut self) -> Option<Payload> {
+        let payload = self.rx.recv().await?;
+        self.resident_bytes
+            .fetch_sub(forward_bytes(&payload), Ordering::Relaxed);
+        Some(payload)
+    }
+
+    /// Non-blockingly pulls the next forwarded payload, releasing its reserved
+    /// bytes as [`recv`](Self::recv) does. `None` when the queue is empty.
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Option<Payload> {
+        let payload = self.rx.try_recv().ok()?;
+        self.resident_bytes
+            .fetch_sub(forward_bytes(&payload), Ordering::Relaxed);
+        Some(payload)
+    }
+}
+
 /// What the roster holds for one connected slot: the channel that reaches its link
 /// task, and a signal the relay fires to make that task close its connection and
 /// leave. Removing the slot from the roster is *not* how a link is stopped — that
@@ -249,7 +379,7 @@ type ForwardTx = mpsc::Sender<Payload>;
 /// Public only because it appears in the [`Sessions`] alias; its fields are
 /// private, so the roster is built and read solely through this module.
 pub struct SlotEntry {
-    forward: ForwardTx,
+    forward: ForwardSink,
     /// Synced player-leaves to push down THIS client's reliable control stream.
     /// Fed by [`fan_out_leave`] when a *different* slot leaves; drained by this
     /// slot's link task, which writes each to its control stream. Separate from
@@ -284,7 +414,7 @@ pub struct SlotEntry {
 /// The receiving end of a registered slot, handed to its link task: the queue of
 /// turns to deliver to the client, and the signal to shut the link down.
 pub struct SlotInbox {
-    forward_rx: mpsc::Receiver<Payload>,
+    forward_rx: ForwardRx,
     /// Leaves to push down this client's control stream (see [`SlotEntry::leave_push`]).
     leave_push_rx: mpsc::Receiver<LeaveDirective>,
     /// Session-start directives to push down this client's control stream (see
@@ -394,6 +524,11 @@ pub fn register(
     slot: SlotId,
 ) -> Option<(SlotRegistration, SlotInbox)> {
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
+    // The forward queue's aggregate resident bytes, shared between the fan-out
+    // producers (via the `ForwardSink` below) and the draining link task (via the
+    // `ForwardRx` in the inbox), so the byte budget can bound it alongside the
+    // channel's count bound.
+    let forward_resident = Arc::new(AtomicUsize::new(0));
     // Leaves are rare (one per departing peer), so a small channel is ample.
     let (leave_tx, leave_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     // Session-start directives are rarer still (the fire, plus any re-push on a
@@ -413,7 +548,10 @@ pub fn register(
         slots.insert(
             slot,
             SlotEntry {
-                forward: tx,
+                forward: ForwardSink {
+                    tx,
+                    resident_bytes: Arc::clone(&forward_resident),
+                },
                 leave_push: leave_tx,
                 start_push: start_tx,
                 conn_push: conn_tx,
@@ -429,7 +567,10 @@ pub fn register(
         armed: true,
     };
     let inbox = SlotInbox {
-        forward_rx: rx,
+        forward_rx: ForwardRx {
+            rx,
+            resident_bytes: forward_resident,
+        },
         leave_push_rx: leave_rx,
         start_push_rx: start_rx,
         conn_push_rx: conn_rx,
@@ -494,19 +635,21 @@ pub fn live_slots(sessions: &Sessions) -> Vec<(SessionKey, Vec<SlotId>)> {
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
 /// without ever blocking on a slow peer.
 ///
-/// Senders and shutdown signals are cloned out under the lock and the lock dropped
-/// before any delivery, then each peer is offered the payload with a non-blocking
-/// `try_send`, so one client can never park the source's link task (nor deadlock
-/// two saturated peers against each other). A peer whose queue is full is
-/// hopelessly behind — a live link drains its queue every turn, and in lockstep the
-/// game is already stalled waiting on a peer this far back — so it is *signaled to
+/// Sinks and shutdown signals are cloned out under the lock and the lock dropped
+/// before any delivery, then each peer is offered the payload without blocking, so
+/// one client can never park the source's link task (nor deadlock two saturated
+/// peers against each other). A peer that cannot take the payload — its queue is at
+/// the payload-count bound ([`FORWARD_CAPACITY`]), or accepting it would push the
+/// peer's resident forward bytes over [`FORWARD_BYTE_BUDGET`] — is hopelessly
+/// behind: a live link drains its queue every turn, and in lockstep the game is
+/// already stalled waiting on a peer this far back, so it is *signaled to
 /// disconnect* rather than allowed to back-pressure healthy peers. Crucially it is
 /// **not** removed from the roster here: its slot stays occupied until its own link
 /// task acts on the signal and exits, so no replacement can register a second
 /// sender for it in the meantime. A send to an already-departed peer is ignored. A
 /// turn is therefore never silently dropped for a keeping-up peer.
 pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, payload: Payload) {
-    let targets: Vec<(SlotId, ForwardTx, Arc<Notify>)> = {
+    let targets: Vec<(SlotId, ForwardSink, Arc<Notify>)> = {
         let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => slots
@@ -517,10 +660,10 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
             None => Vec::new(),
         }
     };
-    for (slot, tx, shutdown) in targets {
-        match tx.try_send(payload.clone()) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+    for (slot, sink, shutdown) in targets {
+        match sink.offer(&payload) {
+            ForwardOutcome::Delivered => {}
+            ForwardOutcome::QueueFull => {
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
@@ -529,8 +672,17 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
                 );
                 shutdown.notify_one();
             }
+            ForwardOutcome::OverBudget => {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "forward byte budget exceeded; signaling lagging slot to disconnect",
+                );
+                shutdown.notify_one();
+            }
             // The peer's task already ended; it deregisters itself.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            ForwardOutcome::Gone => {}
         }
     }
 }
@@ -2575,6 +2727,17 @@ mod tests {
         }
     }
 
+    /// A payload carrying `len` command bytes, for exercising the forward queue's
+    /// resident-byte budget (the only field the budget measures).
+    fn payload_of(len: usize) -> Payload {
+        Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; len].into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn an_occupied_slot_is_refused() {
         let sessions: Sessions = Arc::default();
@@ -2895,7 +3058,7 @@ mod tests {
         let mut delivered_to_1 = 0;
         for _ in 0..(FORWARD_CAPACITY + 8) {
             fan_out(&sessions, &k, SlotId(0), payload());
-            if inbox1.forward_rx.try_recv().is_ok() {
+            if inbox1.forward_rx.try_recv().is_some() {
                 delivered_to_1 += 1;
             }
         }
@@ -2915,6 +3078,134 @@ mod tests {
         let slots = roster.get(&k).expect("group present");
         assert!(slots.contains_key(&SlotId(1)));
         assert!(slots.contains_key(&SlotId(2)));
+    }
+
+    #[tokio::test]
+    async fn normal_payloads_fill_the_count_bound_without_tripping_the_byte_budget() {
+        // A queue filled to the payload-count bound with normal-size turns must not
+        // be byte-isolated: the count bound is what governs honest lagging traffic.
+        let sessions: Sessions = Arc::default();
+        let k = key();
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g1, inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        g0.disarm();
+        g1.disarm();
+
+        // A few hundred command bytes is a generous normal turn; a full
+        // count-bounded queue of them is only ~FORWARD_CAPACITY * 512 bytes, far
+        // under the byte budget.
+        const { assert!(FORWARD_CAPACITY * 512 < FORWARD_BYTE_BUDGET) };
+        for _ in 0..FORWARD_CAPACITY {
+            fan_out(&sessions, &k, SlotId(0), payload_of(512));
+        }
+
+        // The queue holds exactly the count bound and never crossed the byte
+        // budget, so the slot was not signaled to disconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
+                .await
+                .is_err(),
+            "a count-full queue of normal turns must not trip the byte budget",
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_payloads_trip_the_byte_budget_before_the_count_bound() {
+        // Max-oversize turns pin far more per payload, so a queue of them must be
+        // byte-isolated well before it reaches the payload-count bound.
+        let sessions: Sessions = Arc::default();
+        let k = key();
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        g0.disarm();
+        g1.disarm();
+
+        // Never drain slot 1: fan out max-oversize turns until the budget trips.
+        // The byte budget admits exactly FORWARD_BYTE_BUDGET / oversize-len turns,
+        // which is a quarter of the count bound.
+        let admitted = FORWARD_BYTE_BUDGET / MAX_OVERSIZE_TURN_COMMANDS_LEN;
+        assert!(
+            admitted < FORWARD_CAPACITY,
+            "the budget trips before the count bound"
+        );
+        for _ in 0..FORWARD_CAPACITY {
+            fan_out(
+                &sessions,
+                &k,
+                SlotId(0),
+                payload_of(MAX_OVERSIZE_TURN_COMMANDS_LEN),
+            );
+        }
+
+        // The slot was signaled to disconnect (the byte budget, not the count
+        // bound)...
+        tokio::time::timeout(Duration::from_millis(100), inbox1.shutdown.notified())
+            .await
+            .expect("the oversize spray trips the byte budget");
+
+        // ...and only the under-budget turns were ever enqueued — far fewer than
+        // the count bound would have allowed.
+        let mut resident = 0;
+        while inbox1.forward_rx.try_recv().is_some() {
+            resident += 1;
+        }
+        assert_eq!(resident, admitted);
+    }
+
+    #[tokio::test]
+    async fn draining_the_forward_queue_frees_the_byte_budget() {
+        // The budget is resident bytes, not a cumulative total: a queue filled to
+        // the budget accepts again once its turns are drained.
+        let sessions: Sessions = Arc::default();
+        let k = key();
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        g0.disarm();
+        g1.disarm();
+
+        let admitted = FORWARD_BYTE_BUDGET / MAX_OVERSIZE_TURN_COMMANDS_LEN;
+        // Fill the queue right up to the budget — every turn lands, none isolates.
+        for _ in 0..admitted {
+            fan_out(
+                &sessions,
+                &k,
+                SlotId(0),
+                payload_of(MAX_OVERSIZE_TURN_COMMANDS_LEN),
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
+                .await
+                .is_err(),
+            "a queue filled exactly to the budget must not isolate",
+        );
+
+        // Drain every turn; each drain releases its bytes from the resident count.
+        for _ in 0..admitted {
+            assert!(inbox1.forward_rx.recv().await.is_some());
+        }
+
+        // The freed budget accepts a fresh full batch, again without isolating —
+        // proving the count tracks resident bytes, not a running total.
+        for _ in 0..admitted {
+            fan_out(
+                &sessions,
+                &k,
+                SlotId(0),
+                payload_of(MAX_OVERSIZE_TURN_COMMANDS_LEN),
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
+                .await
+                .is_err(),
+            "a drained queue must accept a fresh batch up to the budget",
+        );
+        let mut resident = 0;
+        while inbox1.forward_rx.try_recv().is_some() {
+            resident += 1;
+        }
+        assert_eq!(resident, admitted);
     }
 
     #[tokio::test]
@@ -3030,7 +3321,7 @@ mod tests {
             crate::turn_ring::TurnOrigin::Mesh,
         );
         assert!(
-            inbox.forward_rx.try_recv().is_err(),
+            inbox.forward_rx.try_recv().is_none(),
             "the topological duplicate is dropped",
         );
     }
