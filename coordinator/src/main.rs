@@ -6,15 +6,19 @@
 //! where it's testable, mirroring the relay binary.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::ledger::RelayLedger;
 use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::provision::{
-    ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop, WarmTargets,
+    EcsConfig, EcsProvisioner, ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop,
+    Provisioner, WarmTargets,
 };
+use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{notify, regions, registry, session, tenant};
 use rally_point_proto::control::{BufferBounds, RegionId, TenantId};
@@ -153,6 +157,20 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_PROVISION_RELAY_BIN")]
     provision_relay_bin: Option<std::path::PathBuf>,
 
+    /// Path to the ECS/Fargate provisioner config JSON (`started_by` plus one entry
+    /// per region mapping it to its AWS region, cluster, task definition, and
+    /// `awsvpc` networking). Present ⇒ the provisioning loop launches relays as
+    /// Fargate tasks via ECS and resolves each task's public addresses from its
+    /// network interface. Mutually exclusive with `--provision-relay-bin` — exactly
+    /// one substrate may be configured — and requires `--relay-ledger` for the same
+    /// reason the process substrate does. Absent ⇒ the ECS substrate is off.
+    #[arg(
+        long,
+        env = "COORDINATOR_PROVISION_ECS_CONFIG",
+        conflicts_with = "provision_relay_bin"
+    )]
+    provision_ecs_config: Option<std::path::PathBuf>,
+
     /// Base URL a provisioned relay dials to reach this coordinator, injected into
     /// each launched relay's environment. Defaults to `http://127.0.0.1:<port>` of
     /// the listen address — correct for local process provisioning, where relays
@@ -193,9 +211,9 @@ struct Cli {
     /// How long, in seconds, `POST /session/create` holds a create naming a region
     /// with no live relay — warming the region and answering `202 provisioning` —
     /// before falling back to region-blind placement. Bounds the wait so a game is
-    /// never refused because a region stayed cold. Only meaningful with
-    /// `--provision-relay-bin`; with no provisioning loop, create never holds.
-    /// Default 75.
+    /// never refused because a region stayed cold. Only meaningful when a
+    /// provisioning substrate is configured; with no provisioning loop, create
+    /// never holds. Default 75.
     #[arg(
         long,
         env = "COORDINATOR_PROVISION_CREATE_HOLD_SECS",
@@ -234,6 +252,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing::info!(listen = %cli.listen, "rally-point coordinator starting");
 
+    // Exactly one launch substrate may be configured. Clap already refuses both
+    // (`--provision-ecs-config` conflicts with `--provision-relay-bin`); this is
+    // the single flag that turns the provisioning loop — and its create-hold gate —
+    // on, whichever substrate backs it.
+    let provisioning_enabled =
+        cli.provision_relay_bin.is_some() || cli.provision_ecs_config.is_some();
+
     // Load the region config if one was given. Fail startup on an invalid file:
     // a coordinator that cannot trust its region list would mis-place or wrongly
     // refuse relays. No `--regions` = an empty config, region behavior dormant.
@@ -265,11 +290,11 @@ async fn main() -> Result<()> {
     let warm = WarmTargets::new();
 
     // Install the provisioning gate on the setup only when the loop will run (a
-    // relay binary is configured). Present ⇒ hold-until-ready create is on and the
+    // substrate is configured). Present ⇒ hold-until-ready create is on and the
     // warm endpoint's demand is shared with the loop. Absent ⇒ the setup keeps its
     // dormant gate and every hold-until-ready behavior is off.
     let mut setup = session::SessionSetup::new(registry::new_registry(), tenants);
-    if cli.provision_relay_bin.is_some() {
+    if provisioning_enabled {
         setup = setup.with_provision_gate(session::ProvisionGate::provisioning(
             warm.clone(),
             Duration::from_secs(cli.warm_ttl_secs),
@@ -347,49 +372,72 @@ async fn main() -> Result<()> {
 
     let app = api::router(state);
 
-    // Start the provisioning loop when a relay binary is configured. It keeps each
+    // Start the provisioning loop when a substrate is configured. It keeps each
     // region's relay count matched to warm demand; a region with no warm demand
     // idles, so a fleet that nothing has warmed yet is valid and does nothing.
-    // Provisioning requires the ledger, so refuse to start without one.
-    if let Some(relay_bin) = cli.provision_relay_bin {
+    // Provisioning requires the ledger, so refuse to start without one. The loop is
+    // identical whichever substrate backs it — only the provisioner differs.
+    if provisioning_enabled {
         let Some(provision_ledger) = provision_ledger else {
             return Err(eyre!(
-                "refusing to start: --provision-relay-bin requires --relay-ledger \
+                "refusing to start: relay provisioning requires --relay-ledger \
                  (COORDINATOR_RELAY_LEDGER); a provisioned relay identity is only sound \
                  when it is minted and bound through the ledger",
             ));
         };
-        let coordinator_url = cli
-            .provision_coordinator_url
-            .unwrap_or_else(|| format!("http://127.0.0.1:{}", cli.listen.port()));
-        let provisioner = std::sync::Arc::new(ProcessProvisioner::new(ProcessConfig {
-            relay_bin,
-            coordinator_url,
-            bootstrap_secret: provision_bootstrap_secret,
-        }));
+        let config = ProvisionConfig {
+            regions: provision_regions,
+            tick_interval: Duration::from_secs(cli.provision_tick_secs),
+            launch_deadline: Duration::from_secs(cli.provision_launch_deadline_secs),
+            idle_grace: Duration::from_secs(cli.relay_idle_secs),
+        };
         tracing::info!(
-            regions = provision_regions.len(),
+            regions = config.regions.len(),
             tick_secs = cli.provision_tick_secs,
             launch_deadline_secs = cli.provision_launch_deadline_secs,
             relay_idle_secs = cli.relay_idle_secs,
             "starting the relay provisioning loop",
         );
-        let provision_loop = ProvisionLoop::new(
-            ProvisionConfig {
-                regions: provision_regions,
-                tick_interval: Duration::from_secs(cli.provision_tick_secs),
-                launch_deadline: Duration::from_secs(cli.provision_launch_deadline_secs),
-                idle_grace: Duration::from_secs(cli.relay_idle_secs),
-            },
-            provision_setup.registry().clone(),
-            provision_setup,
-            provision_ledger,
-            warm.clone(),
-            provisioner,
-        );
-        tokio::spawn(provision_loop.run());
+        if let Some(relay_bin) = cli.provision_relay_bin {
+            let coordinator_url = cli
+                .provision_coordinator_url
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", cli.listen.port()));
+            tracing::info!("provisioning substrate: local relay processes");
+            let provisioner = ProcessProvisioner::new(ProcessConfig {
+                relay_bin,
+                coordinator_url,
+                bootstrap_secret: provision_bootstrap_secret,
+            });
+            spawn_provision_loop(
+                config,
+                provision_setup,
+                provision_ledger,
+                warm.clone(),
+                provisioner,
+            );
+        } else if let Some(ecs_config_path) = cli.provision_ecs_config {
+            let ecs_config = EcsConfig::load(&ecs_config_path).with_context(|| {
+                format!(
+                    "loading ECS provisioner config {}",
+                    ecs_config_path.display()
+                )
+            })?;
+            tracing::info!(
+                started_by = %ecs_config.started_by,
+                aws_regions = ecs_config.regions.len(),
+                "provisioning substrate: AWS Fargate (ECS)",
+            );
+            let provisioner = EcsProvisioner::new(ecs_config).await;
+            spawn_provision_loop(
+                config,
+                provision_setup,
+                provision_ledger,
+                warm.clone(),
+                provisioner,
+            );
+        }
     } else {
-        tracing::info!("no --provision-relay-bin configured; the provisioning loop is off");
+        tracing::info!("no provisioning substrate configured; the provisioning loop is off");
     }
 
     let listener = tokio::net::TcpListener::bind(cli.listen)
@@ -408,6 +456,22 @@ async fn main() -> Result<()> {
     .await
     .context("coordinator API server ended with an error")?;
     Ok(())
+}
+
+/// Builds the reconcile loop over the shared coordinator handles and the chosen
+/// provisioner, then spawns it. The loop is generic over the substrate, so this is
+/// the single construction point both the process and the ECS substrate funnel
+/// through — only the provisioner value differs.
+fn spawn_provision_loop<P: Provisioner + 'static>(
+    config: ProvisionConfig,
+    setup: SessionSetup,
+    ledger: Arc<RelayLedger>,
+    warm: WarmTargets,
+    provisioner: P,
+) {
+    let registry = setup.registry().clone();
+    let provision_loop = ProvisionLoop::new(config, registry, setup, ledger, warm, provisioner);
+    tokio::spawn(provision_loop.run());
 }
 
 /// Enrolls the `--dev-tenant` tenant into `tenants`, logging the public

@@ -136,7 +136,7 @@ impl Provisioner for ProcessProvisioner {
             Ok(None) => {
                 let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, running.port));
                 Ok(TaskState::Running {
-                    expected_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    expected_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
                     addrs: vec![addr],
                 })
             }

@@ -338,11 +338,14 @@ impl<P: Provisioner> ProvisionLoop<P> {
         let mut still = Vec::with_capacity(pending.len());
         for launch in pending {
             match self.provisioner.state(&launch.task).await {
-                Ok(TaskState::Running { expected_ip, addrs }) => {
+                Ok(TaskState::Running {
+                    expected_ips,
+                    addrs,
+                }) => {
                     if let Err(error) = self.ledger.record_task(
                         launch.relay_id,
                         &launch.task.0,
-                        expected_ip,
+                        &expected_ips,
                         &addrs,
                     ) {
                         tracing::warn!(
@@ -552,7 +555,7 @@ mod tests {
     /// "the launch came up" outcome.
     fn running() -> TaskState {
         TaskState::Running {
-            expected_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            expected_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 15_000))],
         }
     }
@@ -766,7 +769,7 @@ mod tests {
                 .record_task(
                     minted.relay_id,
                     &format!("task-live-{}", minted.relay_id.0),
-                    None,
+                    &[],
                     &[],
                 )
                 .unwrap();
@@ -1053,7 +1056,7 @@ mod tests {
             )
             .unwrap();
         h.ledger
-            .record_task(minted.relay_id, "task-vanished", None, &[])
+            .record_task(minted.relay_id, "task-vanished", &[], &[])
             .unwrap();
         h.fake.set_task_state("task-vanished", TaskState::Stopped);
 

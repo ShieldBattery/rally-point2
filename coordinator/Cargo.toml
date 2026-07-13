@@ -46,6 +46,14 @@ base64 = { workspace = true }
 # The provisioned-relay enrollment ledger (minted ids + one-time enroll tokens +
 # cert-fingerprint bindings). SQLite bundled from source; coordinator-only.
 rusqlite = { workspace = true }
+# The AWS Fargate substrate: launch relay tasks on ECS and resolve their public
+# addresses from the attached EC2 network interface. Coordinator-only, ring-only
+# TLS (see the workspace manifest). `aws-smithy-http-client` supplies the ring
+# HTTPS connector the SDK clients are built with.
+aws-config = { workspace = true }
+aws-sdk-ecs = { workspace = true }
+aws-sdk-ec2 = { workspace = true }
+aws-smithy-http-client = { workspace = true }
 
 [dev-dependencies]
 rally-point-relay = { workspace = true }

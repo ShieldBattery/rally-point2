@@ -169,6 +169,37 @@ futures-util = { version = "0.3", default-features = false, features = [
   "sink",
 ] }
 
+# --- AWS SDK (coordinator-only Fargate substrate) ---
+# The ECS/EC2 clients the coordinator launches and inspects relay tasks with.
+# `default-features = false` drops the SDK's bundled default HTTPS client, which
+# selects the aws-lc-rs crypto provider — aws-lc-rs needs a C/NASM toolchain that
+# the 32-bit Windows client build (and this workspace's ring-only pin) deliberately
+# avoids. The HTTPS connector is supplied explicitly from `aws-smithy-http-client`
+# below on the ring provider instead, so the tree grows no aws-lc-rs / openssl /
+# native-tls path. `behavior-version-latest` lets the config pin the newest client
+# behavior without naming a dated version; `rt-tokio` supplies the Tokio timers the
+# SDK's retry/timeout machinery needs. Coordinator-only: kept out of every other
+# crate's tree (the game DLL's `rally-point-client` must keep building for
+# `i686-pc-windows-msvc` without this graph), the same isolation `rusqlite` holds.
+aws-config = { version = "1.8", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-ecs = { version = "1.111", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+aws-sdk-ec2 = { version = "1.208", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
+# The explicit HTTPS connector for the SDK clients, pinned to the rustls **ring**
+# provider so the AWS graph reuses the workspace's single crypto backend instead
+# of pulling aws-lc-rs.
+aws-smithy-http-client = { version = "1.1", default-features = false, features = [
+  "rustls-ring",
+] }
+
 [workspace.lints.rust]
 # The hot-path FFI / cross-thread handoff lives in `shieldbattery/game/`, not
 # here — these crates stay `unsafe`-free. A crate that genuinely needs FFI can

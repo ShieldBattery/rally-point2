@@ -22,10 +22,12 @@ use std::net::{IpAddr, SocketAddr};
 use rally_point_proto::control::RegionId;
 use rally_point_proto::ids::RelayId;
 
+mod ecs;
 mod process;
 mod reconcile;
 mod warm;
 
+pub use ecs::{EcsConfig, EcsConfigError, EcsProvisioner};
 pub use process::{ProcessConfig, ProcessProvisioner};
 pub use reconcile::{ProvisionConfig, ProvisionLoop};
 pub use warm::WarmTargets;
@@ -65,14 +67,15 @@ pub enum TaskState {
     /// The substrate accepted the launch but the task has no reachable address
     /// yet. The loop keeps polling until it reports [`Running`](Self::Running).
     Starting,
-    /// The task is up with a known address set. `expected_ip` is the peer address
-    /// the coordinator should see it enroll from (when the substrate resolves
-    /// one); `addrs` is the advertise set clients and peers reach it at, first
-    /// entry primary.
+    /// The task is up with a known address set. `expected_ips` are the peer
+    /// addresses the coordinator may see it enroll from (a dual-stack task can
+    /// connect from either family); `addrs` is the advertise set clients and peers
+    /// reach it at, first entry primary. An empty `expected_ips` means the
+    /// substrate resolved no peer address to gate on.
     Running {
-        /// The peer address the coordinator should see the relay enroll from, or
-        /// `None` when the substrate cannot resolve one.
-        expected_ip: Option<IpAddr>,
+        /// The peer addresses the coordinator may see the relay enroll from —
+        /// any one matches. Empty when the substrate cannot resolve one.
+        expected_ips: Vec<IpAddr>,
         /// The advertise-address set, in preference order (first is primary).
         addrs: Vec<SocketAddr>,
     },

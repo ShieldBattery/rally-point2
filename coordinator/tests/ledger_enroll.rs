@@ -151,7 +151,7 @@ async fn a_recorded_advertise_set_overrides_the_hello_addresses() {
     let v4: SocketAddr = "203.0.113.5:15000".parse().unwrap();
     let v6: SocketAddr = "[2001:db8::5]:15000".parse().unwrap();
     ledger
-        .record_task(minted.relay_id, "arn:aws:ecs:task/abc", None, &[v4, v6])
+        .record_task(minted.relay_id, "arn:aws:ecs:task/abc", &[], &[v4, v6])
         .expect("record the task's advertise set");
 
     // The hello self-reports a different (loopback) address.

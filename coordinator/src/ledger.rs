@@ -70,7 +70,11 @@ CREATE TABLE IF NOT EXISTS provisioned_relays (
   token_consumed_at INTEGER,
   cert_fingerprint  BLOB,
   task_arn          TEXT,
-  expected_ip       TEXT,
+  -- JSON array of canonical IP strings the relay may enroll from; an empty or
+  -- absent set gates nothing. A dual-stack task advertises a public IPv4 and an
+  -- IPv6 and may open its control connection from either family, so the gate
+  -- accepts any address in the set.
+  expected_ips      TEXT,
   addrs             TEXT,
   launched_at       INTEGER NOT NULL,
   enrolled_at       INTEGER,
@@ -293,7 +297,7 @@ impl RelayLedger {
         let row = conn
             .query_row(
                 "SELECT retired_at, cert_fingerprint, token_hash, token_expires_at,
-                        token_consumed_at, expected_ip
+                        token_consumed_at, expected_ips
                  FROM provisioned_relays WHERE relay_id = ?1",
                 params![as_i64(relay_id.0)],
                 |row| {
@@ -302,7 +306,7 @@ impl RelayLedger {
                         cert_fingerprint: row.get(1)?,
                         token_hash: row.get(2)?,
                         token_expires_at: row.get(3)?,
-                        expected_ip: row.get(5)?,
+                        expected_ips: row.get(5)?,
                     })
                 },
             )
@@ -315,11 +319,15 @@ impl RelayLedger {
             return Err(EnrollRefusal::Retired);
         }
         // The expected-address gate applies to a first enroll AND every
-        // reconnect, so it precedes the bound/unbound split. It presumes the
-        // coordinator is directly exposed (the connection's transport-level peer
-        // address is the relay's real one, not a reverse proxy's).
-        if let Some(expected) = &row.expected_ip {
-            let matches = peer_ip.is_some_and(|ip| ip.to_string() == *expected);
+        // reconnect, so it precedes the bound/unbound split. A relay may enroll
+        // from any address in the recorded set; an empty or absent set gates
+        // nothing, and a non-empty set still refuses a connection whose peer
+        // address the server could not record. It presumes the coordinator is
+        // directly exposed (the connection's transport-level peer address is the
+        // relay's real one, not a reverse proxy's).
+        let expected = parse_expected_ips(row.expected_ips.as_deref())?;
+        if !expected.is_empty() {
+            let matches = peer_ip.is_some_and(|ip| expected.contains(&ip));
             if !matches {
                 return Err(EnrollRefusal::IpMismatch);
             }
@@ -392,30 +400,33 @@ impl RelayLedger {
     }
 
     /// Records the launch-provisioner details for `relay_id`: the ECS task ARN it
-    /// runs as, the peer address the coordinator should see it enroll from (when
-    /// known), and the coordinator-resolved advertise-address set clients and
-    /// peers reach it at. The advertise set is stored as a JSON array of
-    /// `"ip:port"` strings and later overrides a hello's self-reported addresses
-    /// at enroll ([`advertised_addrs`](Self::advertised_addrs)).
+    /// runs as, the set of peer addresses the coordinator should accept it
+    /// enrolling from (any one of which matches), and the coordinator-resolved
+    /// advertise-address set clients and peers reach it at. Both sets are stored
+    /// as a JSON array of strings — canonical IPs for the expected set, `"ip:port"`
+    /// for the advertise set. The advertise set later overrides a hello's
+    /// self-reported addresses at enroll ([`advertised_addrs`](Self::advertised_addrs)),
+    /// and the expected set gates every enroll ([`authorize_enroll`](Self::authorize_enroll)).
     pub fn record_task(
         &self,
         relay_id: RelayId,
         task_arn: &str,
-        expected_ip: Option<IpAddr>,
+        expected_ips: &[IpAddr],
         addrs: &[SocketAddr],
     ) -> Result<(), LedgerError> {
+        let expected_json = serde_json::to_string(
+            &expected_ips
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>(),
+        )?;
         let addrs_json =
             serde_json::to_string(&addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>())?;
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE provisioned_relays SET task_arn = ?1, expected_ip = ?2, addrs = ?3
+            "UPDATE provisioned_relays SET task_arn = ?1, expected_ips = ?2, addrs = ?3
               WHERE relay_id = ?4",
-            params![
-                task_arn,
-                expected_ip.map(|ip| ip.to_string()),
-                addrs_json,
-                as_i64(relay_id.0),
-            ],
+            params![task_arn, expected_json, addrs_json, as_i64(relay_id.0)],
         )?;
         Ok(())
     }
@@ -553,7 +564,22 @@ struct LedgerRow {
     cert_fingerprint: Option<Vec<u8>>,
     token_hash: Vec<u8>,
     token_expires_at: i64,
-    expected_ip: Option<String>,
+    expected_ips: Option<String>,
+}
+
+/// Parses the stored expected-peer-IP set — a JSON array of canonical IP strings,
+/// or an absent column — into the addresses a relay may enroll from. Both an
+/// absent column and an empty array yield an empty set, which gates nothing.
+fn parse_expected_ips(stored: Option<&str>) -> Result<Vec<IpAddr>, LedgerError> {
+    let Some(json) = stored else {
+        return Ok(Vec::new());
+    };
+    let strings: Vec<String> = serde_json::from_str(json)?;
+    let ips = strings
+        .iter()
+        .map(|s| s.parse::<IpAddr>())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ips)
 }
 
 /// The current Unix time in seconds, **failing closed**: a pre-epoch or errored
@@ -855,7 +881,7 @@ mod tests {
         let expected: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
         let other: IpAddr = Ipv4Addr::new(198, 51, 100, 9).into();
         ledger
-            .record_task(minted.relay_id, "arn:aws:ecs:task/abc", Some(expected), &[])
+            .record_task(minted.relay_id, "arn:aws:ecs:task/abc", &[expected], &[])
             .unwrap();
 
         // A mismatched peer is refused before the token is even consulted.
@@ -912,6 +938,70 @@ mod tests {
     }
 
     #[test]
+    fn enroll_matches_any_ip_in_the_expected_set() {
+        // A dual-stack task records both its public IPv4 and its IPv6; a connection
+        // from either address enrolls, and one from neither is refused.
+        let ledger = ledger();
+        let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+        let v4: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+        let other: IpAddr = Ipv4Addr::new(198, 51, 100, 9).into();
+        ledger
+            .record_task(minted.relay_id, "arn:aws:ecs:task/dual", &[v4, v6], &[])
+            .unwrap();
+
+        // Enroll over IPv6 (binds the cert).
+        let over_v6 = ledger
+            .authorize_enroll_at(
+                1_010,
+                minted.relay_id,
+                fingerprint(0x20),
+                Some(&minted.token),
+                Some(v6),
+            )
+            .unwrap();
+        assert_eq!(over_v6, Authorized::FirstEnroll);
+
+        // Reconnect over the other family in the set is accepted too.
+        let over_v4 = ledger
+            .authorize_enroll_at(1_020, minted.relay_id, fingerprint(0x20), None, Some(v4))
+            .unwrap();
+        assert_eq!(over_v4, Authorized::Reenroll);
+
+        // An address outside the set is refused.
+        let outside = ledger.authorize_enroll_at(
+            1_030,
+            minted.relay_id,
+            fingerprint(0x20),
+            None,
+            Some(other),
+        );
+        assert!(matches!(outside, Err(EnrollRefusal::IpMismatch)));
+    }
+
+    #[test]
+    fn an_empty_expected_set_gates_nothing() {
+        // Recording an empty expected set leaves the gate open: any peer, or none,
+        // enrolls — the posture for a substrate that resolves no address.
+        let ledger = ledger();
+        let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+        ledger
+            .record_task(minted.relay_id, "arn:aws:ecs:task/none", &[], &[])
+            .unwrap();
+        let any_peer: IpAddr = Ipv4Addr::new(198, 51, 100, 3).into();
+        let ok = ledger
+            .authorize_enroll_at(
+                1_010,
+                minted.relay_id,
+                fingerprint(0x21),
+                Some(&minted.token),
+                Some(any_peer),
+            )
+            .unwrap();
+        assert_eq!(ok, Authorized::FirstEnroll);
+    }
+
+    #[test]
     fn mint_after_retire_yields_a_fresh_id() {
         // AUTOINCREMENT: a retired id's number is never handed out again, so a
         // tombstone can never be shadowed by a reused id.
@@ -935,7 +1025,7 @@ mod tests {
         let v4: SocketAddr = "203.0.113.7:14900".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::7]:14900".parse().unwrap();
         ledger
-            .record_task(minted.relay_id, "arn:aws:ecs:task/xyz", None, &[v4, v6])
+            .record_task(minted.relay_id, "arn:aws:ecs:task/xyz", &[], &[v4, v6])
             .unwrap();
         assert_eq!(
             ledger.advertised_addrs(minted.relay_id).unwrap(),
@@ -1029,7 +1119,7 @@ mod tests {
             .mint_at(1_000, None, Duration::from_secs(10))
             .unwrap();
         let _c = ledger.mint_at(1_000, None, DAY).unwrap();
-        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
 
         // At t=2000 both short tokens have expired; the long one has not.
         let mut expired = ledger.expired_launching(2_000).unwrap();
@@ -1066,7 +1156,7 @@ mod tests {
         ledger
             .authorize_enroll_at(1_010, a.relay_id, fingerprint(0xA1), Some(&a.token), None)
             .unwrap();
-        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
         ledger
             .authorize_enroll_at(1_010, b.relay_id, fingerprint(0xB1), Some(&b.token), None)
             .unwrap();
@@ -1084,8 +1174,8 @@ mod tests {
         let a = ledger.mint_at(1_000, None, DAY).unwrap();
         let b = ledger.mint_at(1_000, None, DAY).unwrap();
         let _no_task = ledger.mint_at(1_000, None, DAY).unwrap();
-        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
-        ledger.record_task(b.relay_id, "task/b", None, &[]).unwrap();
+        ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
+        ledger.record_task(b.relay_id, "task/b", &[], &[]).unwrap();
         ledger.retire(b.relay_id).unwrap();
 
         let mut arns = ledger.referenced_task_arns().unwrap();
@@ -1102,7 +1192,7 @@ mod tests {
         let ledger = ledger();
         let a = ledger.mint_at(1_000, None, DAY).unwrap();
         assert_eq!(ledger.task_arn(a.relay_id).unwrap(), None);
-        ledger.record_task(a.relay_id, "task/a", None, &[]).unwrap();
+        ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
         assert_eq!(
             ledger.task_arn(a.relay_id).unwrap(),
             Some("task/a".to_owned())
