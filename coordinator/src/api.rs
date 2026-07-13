@@ -41,8 +41,10 @@
 //! requires an Ed25519 request signature from the tenant's
 //! own client key, the mirror image of the coordinator→tenant webhook
 //! signature. The app server signs each request with its client key
-//! (`SB_RP2_CLIENT_KEY`); the coordinator verifies against the public half it
-//! holds (`client_pubkey`, set at enrollment). Headers: `x-rp2-timestamp`
+//! (`SB_RP2_CLIENT_KEY`); the coordinator verifies against one of the public
+//! halves it holds for the tenant (its `client_pubkeys`, set at enrollment —
+//! more than one only while a request key is being rotated, when a signature
+//! from either is accepted). Headers: `x-rp2-timestamp`
 //! (unix *seconds*) + `x-rp2-signature` (hex) over `rp2-request-v1:<ts>:<METHOD
 //! uppercased>:<path as sent>:<raw body>`. Binding method + path stops a
 //! signed body being replayed against a different endpoint. Verification is
@@ -52,9 +54,17 @@
 //! nonce** — a request captured inside the window can be replayed, but at worst
 //! that mints a garbage session that is reaped, and the transport is HTTPS in
 //! prod / loopback in dev, so a captured-in-window replay is not a meaningful
-//! threat. `GET /tenant/:tenant/pubkey` stays unsigned (bootstrap: it hands out
+//! threat.
+//!
+//! Once a signature verifies, the tenant's operational state gates the endpoint:
+//! a suspended tenant is refused `403` on the new-game operations (session
+//! create, region warming) while its running games' endpoints keep working, and
+//! a revoked tenant is refused `403` everywhere. The state check runs only after
+//! the signature, so a tenant's state is disclosed to that authenticated tenant
+//! alone, never to an unauthenticated caller (who always gets the same `401`).
+//! `GET /tenant/:tenant/pubkey` stays unsigned (bootstrap: it hands out
 //! public key material only, the same posture as `/session/create` returning
-//! relay certs).
+//! relay certs), but a revoked tenant's key reads as absent there — a `404`.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -246,9 +256,11 @@ pub fn router(state: CoordinatorState) -> Router {
 ///
 /// Authenticated by the tenant's request signature (see the module docs): the
 /// body is deserialized to learn the tenant, then the signature is verified
-/// against that tenant's enrolled `client_pubkey` before any work is done.
+/// against that tenant's enrolled `client_pubkeys` before any work is done.
 /// Reads the raw body (rather than a `Json` extractor) so the signature covers
-/// exactly the bytes on the wire.
+/// exactly the bytes on the wire. A suspended or revoked tenant is refused `403`
+/// after its signature verifies: creating a new game is exactly the operation
+/// suspension halts.
 ///
 /// Each player token is stamped with an expiry of the current Unix time plus
 /// [`CoordinatorState::player_token_lifetime`] (saturating). A relay rejects an
@@ -283,6 +295,7 @@ async fn create_session(
         &uri,
         &headers,
         &body,
+        TenantAccess::NewGame,
     )?;
 
     // Capture the tenant and the player/observer slot split before the request is
@@ -471,7 +484,8 @@ impl From<RehomeOutcome> for RehomeResponse {
 /// about one of its own sessions. A missing/invalid signature, a stale timestamp,
 /// or an unenrolled tenant all map to `401` without revealing which failed. A
 /// lenient per-`(tenant, session)` rate limit returns `429` when the caller
-/// re-asks too fast.
+/// re-asks too fast. As live-game machinery this is refused (`403`) only for a
+/// revoked tenant, not a suspended one — failover must not strand a running game.
 ///
 /// The session lookup [`session::rehome`] performs is tenant-keyed, so a caller
 /// can only ever affect a session it actually owns: a `session` that belongs to
@@ -497,6 +511,7 @@ async fn rehome_session(
         &uri,
         &headers,
         &body,
+        TenantAccess::LiveGame,
     )?;
 
     let tenant = request.tenant;
@@ -575,8 +590,9 @@ struct SessionsAliveResponse {
 ///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs): the body is deserialized to learn the tenant, then verified against
-/// that tenant's enrolled `client_pubkey` before the probe. Rejects an over-cap
-/// list rather than scan it.
+/// that tenant's enrolled `client_pubkeys` before the probe. A running game's
+/// liveness must survive suspension, so this is refused only for a revoked
+/// tenant, not a suspended one. Rejects an over-cap list rather than scan it.
 async fn sessions_alive(
     State(state): State<CoordinatorState>,
     method: Method,
@@ -593,6 +609,7 @@ async fn sessions_alive(
         &uri,
         &headers,
         &body,
+        TenantAccess::LiveGame,
     )?;
 
     if request.sessions.len() > MAX_LIVENESS_SESSIONS {
@@ -651,7 +668,9 @@ struct UserPresence {
 ///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs); the `tenant` in the body must match the tenant the signature verifies
-/// under. Rejects an over-cap user list rather than resolve it.
+/// under. As live-game machinery this is refused (`403`) only for a revoked
+/// tenant, not a suspended one. Rejects an over-cap user list rather than resolve
+/// it.
 ///
 /// **Fail-open, by design.** Absence of evidence answers `in_game: false`. The
 /// presence store is in-memory truth fed by relay heartbeats: a coordinator
@@ -687,6 +706,7 @@ async fn presence_query(
         &uri,
         &headers,
         &body,
+        TenantAccess::LiveGame,
     )?;
 
     if request.users.len() > MAX_PRESENCE_USERS {
@@ -797,6 +817,7 @@ async fn warm_regions(
         &uri,
         &headers,
         &body,
+        TenantAccess::NewGame,
     )?;
 
     let gate = state.setup.provision();
@@ -838,13 +859,22 @@ struct TenantPubkeyResponse {
 ///
 /// No auth: this hands out public key material only, the same trust posture
 /// as `/session/create` handing out relay certs. 404s for a tenant that isn't
-/// enrolled (never provisioned, or removed).
+/// enrolled (never provisioned, or removed). A revoked tenant is treated as
+/// absent — a `404` — since a revoked tenant delivers no webhooks, so there is
+/// no signature for a consumer to validate against its key.
 async fn tenant_pubkey(
     State(state): State<CoordinatorState>,
     Path(tenant): Path<String>,
 ) -> Result<Json<TenantPubkeyResponse>, StatusCode> {
-    let (kid, public_key) = tenant::verifying_key(state.setup.tenants(), &TenantId(tenant))
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let tenant = TenantId(tenant);
+    if matches!(
+        tenant::tenant_state(state.setup.tenants(), &tenant),
+        Some(tenant::TenantState::Revoked)
+    ) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let (kid, public_key) =
+        tenant::verifying_key(state.setup.tenants(), &tenant).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(TenantPubkeyResponse {
         kid: kid.0,
         public_key: hex::encode(public_key),
@@ -1854,12 +1884,44 @@ fn build_request_message(timestamp: &str, method: &Method, path: &str, body: &[u
     message
 }
 
-/// Verifies a tenant-scoped mutating request's signature, failing closed with
-/// `401` on any problem — a missing/unparseable timestamp, a stale timestamp
-/// (outside [`REQUEST_TIMESTAMP_WINDOW_SECS`]), a missing/non-hex signature, a
-/// tenant with no enrolled `client_pubkey`, or a signature that does not verify.
-/// Every failure maps to the same `UNAUTHORIZED` so the response never reveals
-/// which check failed. `ring`'s `verify` is itself constant-time.
+/// The least tenant state a tenant-authenticated endpoint accepts, passed to
+/// [`verify_tenant_request`] as a required argument. Making it required is the
+/// point: a tenant-authenticated endpoint cannot be wired up without calling
+/// [`verify_tenant_request`], and it cannot call that without choosing which
+/// tenant states may reach it — so the suspended/revoked gate can never be
+/// silently omitted for a future endpoint.
+#[derive(Clone, Copy, Debug)]
+enum TenantAccess {
+    /// New-game machinery — only an active tenant. A suspended or revoked tenant
+    /// is refused with `403`. For the operations that begin or prepare a
+    /// brand-new game (session create, region warming), which suspension halts.
+    NewGame,
+    /// Live-game machinery — any tenant that is not revoked (active or
+    /// suspended). Only a revoked tenant is refused with `403`. For the
+    /// operations a game already in progress relies on (failover re-home, the
+    /// liveness probe, the presence query), which suspension must not strand.
+    LiveGame,
+}
+
+/// Verifies a tenant-scoped request's signature and then enforces the tenant's
+/// state against `access`, so signature verification and the state gate are one
+/// inseparable step every tenant-authenticated endpoint performs.
+///
+/// A signature problem fails closed with `401` — a missing/unparseable
+/// timestamp, a stale timestamp (outside [`REQUEST_TIMESTAMP_WINDOW_SECS`]), a
+/// missing/non-hex signature, a tenant with no enrolled verification key, or a
+/// signature that verifies against none of the tenant's keys. Every one maps to
+/// the same `UNAUTHORIZED` so the response never reveals which check failed;
+/// `ring`'s `verify` is itself constant-time. A tenant may list more than one
+/// verification key (for zero-downtime request-key rotation); a signature is
+/// accepted if it verifies against ANY of them.
+///
+/// The state gate runs only *after* a good signature, and a state refusal is a
+/// distinct `403`: the tenant is proven before its state can shape the outcome,
+/// so an unauthenticated caller learns nothing about the tenant's state. A
+/// revoked tenant is refused by every `access`; a suspended tenant is refused
+/// only [`TenantAccess::NewGame`]. The refusal names only its class in the
+/// server log and carries no detail on the wire beyond the status code.
 ///
 /// The signed message binds the request method and the path as sent (see
 /// [`build_request_message`]); `path` uses the full path-and-query so a future
@@ -1872,6 +1934,7 @@ fn verify_tenant_request(
     uri: &Uri,
     headers: &HeaderMap,
     body: &[u8],
+    access: TenantAccess,
 ) -> Result<(), StatusCode> {
     let timestamp = headers
         .get(REQUEST_TIMESTAMP_HEADER)
@@ -1892,8 +1955,10 @@ fn verify_tenant_request(
         .and_then(|hex_str| hex::decode(hex_str).ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let client_pubkey =
-        tenant::client_pubkey(setup.tenants(), tenant).ok_or(StatusCode::UNAUTHORIZED)?;
+    let client_pubkeys = tenant::client_pubkeys(setup.tenants(), tenant);
+    if client_pubkeys.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
     let path = uri
         .path_and_query()
@@ -1901,9 +1966,45 @@ fn verify_tenant_request(
         .unwrap_or_else(|| uri.path());
     let message = build_request_message(timestamp, method, path, body);
 
-    UnparsedPublicKey::new(&ED25519, client_pubkey.as_ref())
-        .verify(&message, &signature)
-        .map_err(|_| StatusCode::UNAUTHORIZED)
+    let verified = client_pubkeys.iter().any(|key| {
+        UnparsedPublicKey::new(&ED25519, key.as_ref())
+            .verify(&message, &signature)
+            .is_ok()
+    });
+    if !verified {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    enforce_tenant_state(setup, tenant, access)
+}
+
+/// Enforces an authenticated tenant's state against what `access` requires,
+/// mapping a refusal to `403` and logging its class. Called only from
+/// [`verify_tenant_request`], after the signature is proven — a revoked tenant is
+/// refused by every endpoint, a suspended tenant by the new-game ones. A tenant
+/// that vanished between the signature check and here reads as `None` and is
+/// refused as unauthorized.
+fn enforce_tenant_state(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    access: TenantAccess,
+) -> Result<(), StatusCode> {
+    let state = tenant::tenant_state(setup.tenants(), tenant).ok_or(StatusCode::UNAUTHORIZED)?;
+    let permitted = match access {
+        TenantAccess::NewGame => matches!(state, tenant::TenantState::Active),
+        TenantAccess::LiveGame => !matches!(state, tenant::TenantState::Revoked),
+    };
+    if permitted {
+        Ok(())
+    } else {
+        tracing::warn!(
+            tenant = tenant.as_ref(),
+            state = ?state,
+            access = ?access,
+            "tenant request refused: the tenant's state does not permit this endpoint",
+        );
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 #[cfg(test)]
@@ -1993,7 +2094,11 @@ mod tests {
         // Enroll the tenant's inbound-request verifying key so signed requests
         // authenticate.
         let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
-        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
+        crate::tenant::set_client_pubkeys(
+            &tenants,
+            &TenantId("sb-test".to_owned()),
+            vec![client_pubkey],
+        );
         let setup = crate::session::SessionSetup::new(reg, tenants);
         let lifecycle = Lifecycle::new(setup.clone());
         CoordinatorState {
@@ -2394,7 +2499,11 @@ mod tests {
         )
         .unwrap();
         let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
-        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
+        crate::tenant::set_client_pubkeys(
+            &tenants,
+            &TenantId("sb-test".to_owned()),
+            vec![client_pubkey],
+        );
         let setup = crate::session::SessionSetup::new(registry::new_registry(), tenants);
         let lifecycle = Lifecycle::new(setup.clone());
         let state = CoordinatorState {
@@ -2861,10 +2970,10 @@ mod tests {
         )
         .unwrap();
         let client_pubkey = crate::tenant::client_pubkey_from_seed(&OTHER_CLIENT_SEED).unwrap();
-        crate::tenant::set_client_pubkey(
+        crate::tenant::set_client_pubkeys(
             state.setup.tenants(),
             &TenantId("sb-other".to_owned()),
-            client_pubkey,
+            vec![client_pubkey],
         );
     }
 
@@ -3286,7 +3395,11 @@ mod tests {
         )
         .unwrap();
         let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
-        crate::tenant::set_client_pubkey(&tenants, &TenantId("sb-test".to_owned()), client_pubkey);
+        crate::tenant::set_client_pubkeys(
+            &tenants,
+            &TenantId("sb-test".to_owned()),
+            vec![client_pubkey],
+        );
         let mut setup = crate::session::SessionSetup::new(reg, tenants);
         if provisioning {
             setup = setup.with_provision_gate(crate::session::ProvisionGate::provisioning(
@@ -3458,5 +3571,240 @@ mod tests {
 
     fn region(name: &str) -> rally_point_proto::control::RegionId {
         rally_point_proto::control::RegionId(name.to_owned())
+    }
+
+    // --- Multi-key inbound verification + per-state enforcement ---
+
+    /// The retired half of a request-key rotation: still listed, so a signature
+    /// from it must keep verifying until it is dropped.
+    const ROTATION_SEED_OLD: [u8; 32] = [0x55; 32];
+    /// The incoming half of a request-key rotation: listed alongside the old key,
+    /// so a signature from it verifies too.
+    const ROTATION_SEED_NEW: [u8; 32] = [0x66; 32];
+    /// A key that is not among the tenant's listed verification keys — its
+    /// signatures must be refused.
+    const UNLISTED_SEED: [u8; 32] = [0x77; 32];
+
+    /// A single-player create body anchored on `external_id`, so two otherwise
+    /// identical creates are independent sessions rather than an idempotent
+    /// replay.
+    fn create_body(external_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: Some(external_id.to_owned()),
+            latency_estimate_ms: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_any_listed_client_key_and_refuses_an_unlisted_one() {
+        // A request-key rotation in flight: the tenant lists both the old and the
+        // new key at once. A signature from either verifies; one from an unlisted
+        // key does not. This is what makes app-server key rotation zero-downtime.
+        let state = state_with_relay_and_tenant();
+        let old = crate::tenant::client_pubkey_from_seed(&ROTATION_SEED_OLD).unwrap();
+        let new = crate::tenant::client_pubkey_from_seed(&ROTATION_SEED_NEW).unwrap();
+        crate::tenant::set_client_pubkeys(
+            state.setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            vec![old, new],
+        );
+        let app = router(state);
+
+        // The first (retiring) key verifies.
+        let resp = signed_post(
+            app.clone(),
+            "/session/create",
+            &create_body("rot-old"),
+            &ROTATION_SEED_OLD,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The second (incoming) key verifies.
+        let resp = signed_post(
+            app.clone(),
+            "/session/create",
+            &create_body("rot-new"),
+            &ROTATION_SEED_NEW,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A key absent from the list is refused, indistinguishably from any other
+        // auth failure.
+        let resp = signed_post(
+            app,
+            "/session/create",
+            &create_body("rot-bad"),
+            &UNLISTED_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Sends a `GET /tenant/sb-test/pubkey` and returns the status.
+    async fn get_pubkey_status(app: Router) -> StatusCode {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/tenant/sb-test/pubkey")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
+        let state = state_with_relay_and_tenant();
+        // Live-game state the suspended tenant must keep serving: a session to
+        // re-home (homed on the still-live relay 1), a liveness-probe target, and
+        // a presence session.
+        let rehome = create_rehome_session(&state);
+        state.lifecycle.register_session(
+            TenantId("sb-test".to_owned()),
+            SessionId(9001),
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            std::collections::HashSet::new(),
+            rally_point_proto::token::ExpiresAt(u64::MAX),
+        );
+        let presence_session = create_session_with_user(&state, "sb-user-7");
+        presence::apply_heartbeat(
+            state.setup.presence(),
+            RelayId(1),
+            1,
+            &slot0_roster(presence_session),
+            std::time::Instant::now(),
+        );
+
+        crate::tenant::set_state(
+            state.setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            crate::tenant::TenantState::Suspended,
+        );
+        let app = router(state);
+
+        // Create is refused — but with 403 (state), a distinct status from the 401
+        // an auth failure yields: the signature verified, the state did not permit.
+        let resp = signed_post(
+            app.clone(),
+            "/session/create",
+            &create_body("suspended-create"),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Re-home still works (relay 1 is alive, so the decision is "stay").
+        let resp = signed_post(
+            app.clone(),
+            "/session/rehome",
+            &rehome_body("sb-test", rehome, 1),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["decision"], "stay");
+
+        // The liveness probe still works.
+        let resp = signed_post(
+            app.clone(),
+            "/sessions/alive",
+            &serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "sessions": [9001]}))
+                .unwrap(),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["alive"], serde_json::json!([9001]));
+
+        // The presence query still works.
+        let resp = signed_post(
+            app.clone(),
+            "/presence/query",
+            &presence_body("sb-test", &["sb-user-7"]),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["users"][0]["in_game"], true);
+
+        // The verifying-key fetch still works (a suspended tenant's live games
+        // keep signing webhooks the consumer validates against this key).
+        assert_eq!(get_pubkey_status(app).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_tenant_is_refused_everywhere_and_its_pubkey_404s() {
+        let state = state_with_relay_and_tenant();
+        let rehome = create_rehome_session(&state);
+        state.lifecycle.register_session(
+            TenantId("sb-test".to_owned()),
+            SessionId(9001),
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            std::collections::HashSet::new(),
+            rally_point_proto::token::ExpiresAt(u64::MAX),
+        );
+        let _presence_session = create_session_with_user(&state, "sb-user-7");
+
+        crate::tenant::set_state(
+            state.setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            crate::tenant::TenantState::Revoked,
+        );
+        let app = router(state);
+
+        // Every tenant-authenticated endpoint refuses with 403 — the signature
+        // still verifies (the key is unchanged), the state permits nothing.
+        for (path, body) in [
+            ("/session/create", create_body("revoked-create")),
+            ("/session/rehome", rehome_body("sb-test", rehome, 1)),
+            (
+                "/sessions/alive",
+                serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "sessions": [9001]}))
+                    .unwrap(),
+            ),
+            ("/presence/query", presence_body("sb-test", &["sb-user-7"])),
+        ] {
+            let resp = signed_post(app.clone(), path, &body, &TEST_CLIENT_SEED).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{path} must be refused with 403 for a revoked tenant",
+            );
+        }
+
+        // The pubkey endpoint reports the revoked tenant as absent.
+        assert_eq!(get_pubkey_status(app).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_active_tenant_is_unaffected() {
+        // Setting the state to Active is the same as the default: create mints and
+        // the pubkey endpoint serves, exactly as with no state enforcement.
+        let state = state_with_relay_and_tenant();
+        crate::tenant::set_state(
+            state.setup.tenants(),
+            &TenantId("sb-test".to_owned()),
+            crate::tenant::TenantState::Active,
+        );
+        let app = router(state);
+
+        let resp = signed_post(
+            app.clone(),
+            "/session/create",
+            &create_body("active-create"),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(get_pubkey_status(app).await, StatusCode::OK);
     }
 }

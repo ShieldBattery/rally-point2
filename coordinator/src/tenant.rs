@@ -47,6 +47,50 @@ pub struct NotifyConfig {
     pub url: String,
 }
 
+/// A tenant's operational state — an operator lever over whether it may start
+/// new games, only keep serving the ones already running, or neither.
+///
+/// Only tenants loaded from the registry file carry a state; a dev tenant has
+/// none of its own and is always treated as [`TenantState::Active`]. Nothing in
+/// the netcode protocol conveys this state to the tenant: a suspended tenant's
+/// create requests simply begin failing through the ordinary error surface, with
+/// no distinct signal that the tenant was suspended rather than misconfigured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantState {
+    /// Full service: new games and running games alike.
+    Active,
+    /// New games are refused, but everything a running game relies on keeps
+    /// working — failover re-home, the liveness probe, the presence query, the
+    /// verifying-key fetch, and webhook delivery. Stops new games without
+    /// stranding the ones already in progress.
+    Suspended,
+    /// No service at all: every tenant-authenticated request is refused, the
+    /// verifying-key fetch reports the tenant as absent, and no webhook is
+    /// delivered for it.
+    Revoked,
+}
+
+/// The latency-buffer bounds a tenant's sessions use when its configuration
+/// names none: a 1-turn floor up to a 12-turn worst case.
+///
+/// **Why 12.** Under netcode v2 the client's turn pipe depth *is* `buffer_turns`
+/// exactly — the seam's pipe replacement bypasses the game's own built-in 2-turn
+/// base and user-latency setting entirely, so total one-way tolerance is
+/// `buffer_turns * ~42ms` at the 24 turns/sec rate. The parity target is BW's old
+/// TR8 "Extra High" ceiling (~480ms one-way), which needs a depth of 12
+/// (~504ms).
+///
+/// **BW-side ceiling.** The game's own sync bookkeeping (the `0x37` command's
+/// ring nibble; see the relay's `consensus::SYNC_RING_MODULUS`) is a 16-entry
+/// ring, and under v2 in-flight turns equal `buffer_turns` exactly (no native +2
+/// on top of it, per the pipe-replacement note above) — so 12 leaves 4 ring
+/// entries of headroom. Bounds beyond ~14 should get a hard look before shipping:
+/// past that point they start crowding the game's own wraparound, not just the
+/// relay's own tuning.
+pub fn default_bounds() -> BufferBounds {
+    BufferBounds::new(1, 12).expect("1..=12 is a valid bounds range")
+}
+
 /// The coordinator's view of one tenant's signing key + policy.
 #[derive(Clone)]
 struct TenantSigningKey {
@@ -67,15 +111,22 @@ struct TenantSigningKey {
     /// configured. Set out of band via [`set_notify`] (enrollment leaves it
     /// `None`); absent = departure notifications off for the tenant.
     notify: Option<NotifyConfig>,
-    /// The tenant's inbound-request verifying key: the public half of the
-    /// Ed25519 keypair the app server signs its coordinator-bound requests with
-    /// (`x-rp2-signature`). Distinct from `pair` (this coordinator's own
-    /// token/webhook signing key) — that signs coordinator→tenant; this
-    /// verifies tenant→coordinator, and the coordinator holds only its public
-    /// half. Set out of band via [`set_client_pubkey`] (enrollment leaves it
-    /// `None`); a tenant without one cannot make an authenticated request, so
-    /// inbound verification fails closed.
-    client_pubkey: Option<[u8; PUBLIC_KEY_LEN]>,
+    /// The tenant's inbound-request verifying keys: the public halves of the
+    /// Ed25519 keypairs the app server may sign its coordinator-bound requests
+    /// with (`x-rp2-signature`). Distinct from `pair` (this coordinator's own
+    /// token/webhook signing key) — that signs coordinator→tenant; these verify
+    /// tenant→coordinator, and the coordinator holds only their public halves.
+    /// Verification accepts a signature from ANY key in the list, so an app
+    /// server rotates its request-signing key with no downtime: add the next
+    /// key, roll the app servers onto it, then drop the old one. Set out of band
+    /// via [`set_client_pubkeys`] (enrollment leaves it empty); an empty list
+    /// authenticates no request, so inbound verification fails closed.
+    client_pubkeys: Vec<[u8; PUBLIC_KEY_LEN]>,
+    /// This tenant's operational state — whether it may create new games, only
+    /// keep serving running ones, or neither. Enrollment defaults it to
+    /// [`TenantState::Active`]; the registry loader overrides it per the config
+    /// file, and a dev tenant stays `Active`.
+    state: TenantState,
 }
 
 impl std::fmt::Debug for TenantSigningKey {
@@ -84,6 +135,7 @@ impl std::fmt::Debug for TenantSigningKey {
             .field("kid", &self.kid)
             .field("tenant", &self.tenant)
             .field("bounds", &self.bounds)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -164,7 +216,8 @@ pub fn enroll_from_pkcs8(
             pair: Arc::new(pair),
             bounds,
             notify: None,
-            client_pubkey: None,
+            client_pubkeys: Vec::new(),
+            state: TenantState::Active,
         },
     );
     Ok(pubkey)
@@ -185,45 +238,74 @@ pub fn set_notify(store: &TenantStore, tenant: &TenantId, notify: Option<NotifyC
 }
 
 /// Looks up a tenant's departure-notify config, or `None` when the tenant is
-/// unknown or has no config (notifications off).
+/// unknown, has no config (notifications off), or is [`TenantState::Revoked`].
+/// A revoked tenant reports no notify config so no webhook is delivered for it —
+/// every webhook path resolves this config before enqueuing anything, so gating
+/// it here turns delivery off for a revoked tenant at a single point.
 pub fn notify_config(store: &TenantStore, tenant: &TenantId) -> Option<NotifyConfig> {
     store
         .tenants
         .lock()
         .get(tenant)
+        .filter(|t| t.state != TenantState::Revoked)
         .and_then(|t| t.notify.clone())
 }
 
-/// Sets a tenant's inbound-request verifying key (the public half of the app
-/// server's request-signing keypair), if the tenant is enrolled. Kept separate
+/// Sets a tenant's inbound-request verifying keys (the public halves of the app
+/// server's request-signing keypairs), if the tenant is enrolled. Kept separate
 /// from enrollment — like [`set_notify`] — so the many `enroll*` call sites are
 /// unaffected: the dev flow enrolls the signing key first, then sets this from
-/// its CLI flag. Returns whether the tenant existed (a no-op on an unknown
-/// tenant).
-pub fn set_client_pubkey(
+/// its CLI flag. One or two keys let an app server rotate its request key with
+/// no downtime; an empty list leaves the tenant unable to authenticate. Returns
+/// whether the tenant existed (a no-op on an unknown tenant).
+pub fn set_client_pubkeys(
     store: &TenantStore,
     tenant: &TenantId,
-    client_pubkey: [u8; PUBLIC_KEY_LEN],
+    client_pubkeys: Vec<[u8; PUBLIC_KEY_LEN]>,
 ) -> bool {
     match store.tenants.lock().get_mut(tenant) {
         Some(entry) => {
-            entry.client_pubkey = Some(client_pubkey);
+            entry.client_pubkeys = client_pubkeys;
             true
         }
         None => false,
     }
 }
 
-/// Looks up a tenant's inbound-request verifying key, or `None` when the tenant
-/// is unknown or has no client key set. `None` fails inbound request auth
-/// closed — an unenrolled or client-key-less tenant cannot make an
-/// authenticated request.
-pub fn client_pubkey(store: &TenantStore, tenant: &TenantId) -> Option<[u8; PUBLIC_KEY_LEN]> {
+/// Looks up a tenant's inbound-request verifying keys, or an empty list when the
+/// tenant is unknown or has none set. An empty list fails inbound request auth
+/// closed — an unenrolled or client-key-less tenant cannot make an authenticated
+/// request. When more than one key is present, verification accepts a signature
+/// from any of them, which is what makes app-server request-key rotation
+/// zero-downtime.
+pub fn client_pubkeys(store: &TenantStore, tenant: &TenantId) -> Vec<[u8; PUBLIC_KEY_LEN]> {
     store
         .tenants
         .lock()
         .get(tenant)
-        .and_then(|t| t.client_pubkey)
+        .map(|t| t.client_pubkeys.clone())
+        .unwrap_or_default()
+}
+
+/// Sets a tenant's operational state, if the tenant is enrolled. Kept separate
+/// from enrollment — like [`set_notify`] and [`set_client_pubkeys`] — so the
+/// registry loader can enroll a tenant's signing key first and then stamp its
+/// configured state. Returns whether the tenant existed (a no-op on an unknown
+/// tenant).
+pub fn set_state(store: &TenantStore, tenant: &TenantId, state: TenantState) -> bool {
+    match store.tenants.lock().get_mut(tenant) {
+        Some(entry) => {
+            entry.state = state;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Looks up a tenant's operational state, or `None` when the tenant is not
+/// enrolled.
+pub fn tenant_state(store: &TenantStore, tenant: &TenantId) -> Option<TenantState> {
+    store.tenants.lock().get(tenant).map(|t| t.state)
 }
 
 /// Derives the Ed25519 verifying (public) key from a raw 32-byte private seed.
@@ -337,6 +419,10 @@ pub fn mint_token(
 /// building a `SignedToken`: the webhook signs its own domain-separated
 /// message (a timestamp + the exact request body), which has nothing to do
 /// with the token wire format.
+///
+/// A [`TenantState::Revoked`] tenant signs nothing (`None`), so a revoked
+/// tenant's key can never mint a webhook signature even if a caller reaches this
+/// primitive without first consulting [`notify_config`].
 pub fn sign_webhook(
     store: &TenantStore,
     tenant: &TenantId,
@@ -344,6 +430,9 @@ pub fn sign_webhook(
 ) -> Option<[u8; rally_point_proto::token::SIGNATURE_LEN]> {
     let guard = store.tenants.lock();
     let key = guard.get(tenant)?;
+    if key.state == TenantState::Revoked {
+        return None;
+    }
     let sig = key.pair.sign(message);
     Some(
         sig.as_ref()
@@ -593,23 +682,96 @@ mod tests {
     }
 
     #[test]
-    fn set_and_get_client_pubkey_roundtrips() {
+    fn set_and_get_client_pubkeys_roundtrips() {
         let (store, _, tenant) = store_with_tenant();
 
-        // Absent until set.
-        assert!(client_pubkey(&store, &tenant).is_none());
+        // Empty until set.
+        assert!(client_pubkeys(&store, &tenant).is_empty());
 
         let pubkey = client_pubkey_from_seed(&RFC8032_SEED).unwrap();
-        assert!(set_client_pubkey(&store, &tenant, pubkey));
-        assert_eq!(client_pubkey(&store, &tenant), Some(pubkey));
+        assert!(set_client_pubkeys(&store, &tenant, vec![pubkey]));
+        assert_eq!(client_pubkeys(&store, &tenant), vec![pubkey]);
 
         // A no-op (and no panic) on an unknown tenant.
-        assert!(!set_client_pubkey(
+        assert!(!set_client_pubkeys(
             &store,
             &TenantId("nope".to_owned()),
-            pubkey
+            vec![pubkey]
         ));
-        assert!(client_pubkey(&store, &TenantId("nope".to_owned())).is_none());
+        assert!(client_pubkeys(&store, &TenantId("nope".to_owned())).is_empty());
+    }
+
+    #[test]
+    fn set_client_pubkeys_holds_two_keys_in_order() {
+        // Rotation posture: a tenant can carry two request-verifying keys at once
+        // (old + new), both retrievable in the order they were set.
+        let (store, _, tenant) = store_with_tenant();
+        let first = client_pubkey_from_seed(&[0x11; 32]).unwrap();
+        let second = client_pubkey_from_seed(&[0x22; 32]).unwrap();
+        assert!(set_client_pubkeys(&store, &tenant, vec![first, second]));
+        assert_eq!(client_pubkeys(&store, &tenant), vec![first, second]);
+    }
+
+    #[test]
+    fn a_freshly_enrolled_tenant_is_active() {
+        let (store, _, tenant) = store_with_tenant();
+        assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Active));
+        // An unknown tenant has no state.
+        assert_eq!(tenant_state(&store, &TenantId("nope".to_owned())), None);
+    }
+
+    #[test]
+    fn set_and_get_state_roundtrips() {
+        let (store, _, tenant) = store_with_tenant();
+        assert!(set_state(&store, &tenant, TenantState::Suspended));
+        assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Suspended));
+        assert!(set_state(&store, &tenant, TenantState::Revoked));
+        assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Revoked));
+
+        // A no-op on an unknown tenant.
+        assert!(!set_state(
+            &store,
+            &TenantId("nope".to_owned()),
+            TenantState::Active
+        ));
+    }
+
+    #[test]
+    fn notify_config_is_withheld_from_a_revoked_tenant() {
+        let (store, _, tenant) = store_with_tenant();
+        set_notify(
+            &store,
+            &tenant,
+            Some(NotifyConfig {
+                url: "http://localhost/hook".to_owned(),
+            }),
+        );
+
+        // Active and suspended both report the config (a suspended tenant's live
+        // games keep delivering webhooks); revoked withholds it entirely.
+        assert!(notify_config(&store, &tenant).is_some());
+        set_state(&store, &tenant, TenantState::Suspended);
+        assert!(notify_config(&store, &tenant).is_some());
+        set_state(&store, &tenant, TenantState::Revoked);
+        assert!(notify_config(&store, &tenant).is_none());
+    }
+
+    #[test]
+    fn sign_webhook_refuses_a_revoked_tenant() {
+        let (store, _, tenant) = store_with_tenant();
+        assert!(sign_webhook(&store, &tenant, b"anything").is_some());
+        set_state(&store, &tenant, TenantState::Suspended);
+        assert!(
+            sign_webhook(&store, &tenant, b"anything").is_some(),
+            "a suspended tenant's key still signs its live games' webhooks",
+        );
+        set_state(&store, &tenant, TenantState::Revoked);
+        assert!(sign_webhook(&store, &tenant, b"anything").is_none());
+    }
+
+    #[test]
+    fn default_bounds_is_one_to_twelve() {
+        assert_eq!(default_bounds(), BufferBounds::new(1, 12).unwrap());
     }
 
     #[test]

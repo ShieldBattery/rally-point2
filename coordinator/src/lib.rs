@@ -73,6 +73,7 @@ pub mod registry;
 pub mod rehome;
 pub mod session;
 pub mod tenant;
+pub mod tenant_config;
 
 /// Default port the coordinator serves its app-server + relay control API on.
 pub const DEFAULT_PORT: u16 = 14_910;

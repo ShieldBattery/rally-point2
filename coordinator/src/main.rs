@@ -20,8 +20,8 @@ use rally_point_coordinator::provision::{
 };
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
-use rally_point_coordinator::{acme, notify, regions, registry, session, tenant};
-use rally_point_proto::control::{BufferBounds, RegionId, TenantId};
+use rally_point_coordinator::{acme, notify, regions, registry, session, tenant, tenant_config};
+use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
 
 /// Multi-tenant netcode v2 coordinator.
@@ -117,6 +117,22 @@ struct Cli {
         default_value_t = 21600
     )]
     player_token_lifetime_secs: u64,
+
+    /// Path to a JSON tenant registry (`{"tenants": [...]}`) — the production
+    /// tenant source. Each entry carries a tenant's id, operational state
+    /// (active / suspended / revoked), signing-key `kid`, the NAME of the
+    /// environment variable holding its base64 PKCS#8 signing key (so the secret
+    /// stays in the deployment's environment, not the file), its inbound-request
+    /// verification public keys (one or two, so an app server rotates its
+    /// request key with no downtime), an optional webhook URL, and optional
+    /// buffer bounds. Loaded and validated at startup; an invalid file — a
+    /// malformed field, a duplicate id or kid, an unset signing-key variable —
+    /// fails the coordinator to start. Mutually exclusive with the
+    /// `--dev-tenant` flags, which enroll one tenant from the command line
+    /// instead. Absent, and with no dev tenant, no tenants are configured: every
+    /// tenant request is refused — the dev / loopback posture.
+    #[arg(long, env = "COORDINATOR_TENANTS", conflicts_with = "dev_tenant")]
+    tenants: Option<std::path::PathBuf>,
 
     /// Enroll a single tenant at startup so `POST /session/create` can mint
     /// tokens without any provisioning flow. Dev/loopback only: the signing key
@@ -261,28 +277,6 @@ struct Cli {
     provision_create_hold_secs: u64,
 }
 
-/// Latency-buffer bounds the dev tenant's sessions use: a 1-turn floor up to a
-/// 12-turn worst case. Production tenants will get per-tenant policy at
-/// provisioning time; this is a sane default for loopback games.
-///
-/// **Why 12.** Under netcode v2 the client's turn pipe depth *is*
-/// `buffer_turns` exactly — the seam's pipe replacement bypasses the game's
-/// own built-in 2-turn base and user-latency setting entirely, so total
-/// one-way tolerance is `buffer_turns * ~42ms` at the 24 turns/sec rate. The
-/// parity target is BW's old TR8 "Extra High" ceiling (~480ms one-way), which
-/// needs a depth of 12 (~504ms).
-///
-/// **BW-side ceiling.** The game's own sync bookkeeping (the `0x37` command's
-/// ring nibble; see the relay's `consensus::SYNC_RING_MODULUS`) is a 16-entry
-/// ring, and under v2 in-flight turns equal `buffer_turns` exactly (no native
-/// +2 on top of it, per the pipe-replacement note above) — so 12 leaves 4
-/// ring entries of headroom. Bounds beyond ~14 should get a hard look before
-/// shipping: past that point they start crowding the game's own wraparound,
-/// not just the relay's own tuning.
-fn dev_tenant_bounds() -> BufferBounds {
-    BufferBounds::new(1, 12).expect("1..=12 is a valid bounds range")
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -315,9 +309,22 @@ async fn main() -> Result<()> {
         None => regions::RegionsConfig::default(),
     };
 
+    // Tenant sources are mutually exclusive (clap enforces `--tenants` conflicts
+    // with `--dev-tenant`). With neither, no tenants are enrolled and every
+    // tenant request is refused — a valid, if inert, coordinator.
     let tenants = tenant::new_store();
     if cli.dev_tenant {
         enroll_dev_tenant(&tenants, &cli)?;
+    } else if let Some(path) = &cli.tenants {
+        let config = tenant_config::load(path)
+            .with_context(|| format!("loading tenant registry {}", path.display()))?;
+        tenant_config::enroll_all(&tenants, &config, |name| std::env::var(name).ok())
+            .context("enrolling tenants from the registry")?;
+        tracing::info!(
+            path = %path.display(),
+            count = config.len(),
+            "loaded tenant registry",
+        );
     }
 
     // The shared warm-demand store: written by `POST /regions/warm` and by a
@@ -559,12 +566,18 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
     let verifying_key = match &cli.tenant_key {
         Some(input) => {
             let pkcs8 = read_hex_input(input, "tenant key")?;
-            tenant::enroll_from_pkcs8(tenants, kid, tenant_id.clone(), dev_tenant_bounds(), &pkcs8)
-                .context("enrolling dev tenant from --tenant-key")?
+            tenant::enroll_from_pkcs8(
+                tenants,
+                kid,
+                tenant_id.clone(),
+                tenant::default_bounds(),
+                &pkcs8,
+            )
+            .context("enrolling dev tenant from --tenant-key")?
         }
         None => {
             let generated =
-                tenant::enroll_generated(tenants, kid, tenant_id.clone(), dev_tenant_bounds())
+                tenant::enroll_generated(tenants, kid, tenant_id.clone(), tenant::default_bounds())
                     .context("enrolling dev tenant")?;
             tracing::warn!(
                 pkcs8_hex = %hex::encode(&generated.pkcs8),
@@ -600,7 +613,7 @@ fn enroll_dev_tenant(tenants: &tenant::TenantStore, cli: &Cli) -> Result<()> {
             pubkey
         }
     };
-    tenant::set_client_pubkey(tenants, &tenant_id, client_pubkey);
+    tenant::set_client_pubkeys(tenants, &tenant_id, vec![client_pubkey]);
 
     // Wire the dev tenant's departure webhook, if configured. `--dev-notify-url`
     // requires `--dev-tenant` (clap), so this only runs for the enrolled tenant.
@@ -685,6 +698,32 @@ mod tests {
                 "ops@example.com",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn tenants_file_and_dev_tenant_are_mutually_exclusive() {
+        // The production registry and the dev single-tenant flags are two ways to
+        // configure the same thing, so clap refuses both at once.
+        assert!(
+            Cli::try_parse_from([
+                "rally-point-coordinator",
+                "--tenants",
+                "tenants.json",
+                "--dev-tenant",
+            ])
+            .is_err(),
+            "a registry file and --dev-tenant together must be rejected",
+        );
+
+        // Either source alone parses.
+        assert!(
+            Cli::try_parse_from(["rally-point-coordinator", "--tenants", "tenants.json"]).is_ok(),
+            "a registry file alone is valid",
+        );
+        assert!(
+            Cli::try_parse_from(["rally-point-coordinator", "--dev-tenant"]).is_ok(),
+            "the dev tenant alone is valid",
         );
     }
 
