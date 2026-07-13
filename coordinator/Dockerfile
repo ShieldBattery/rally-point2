@@ -17,8 +17,12 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p rally-point-coordinator
+RUN cargo build --release -p rally-point-coordinator && mkdir /data-skel
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# /data exists in the image owned by the runtime user (nonroot, 65532) so a
+# fresh named volume mounted there inherits that ownership — without this,
+# Docker creates the volume root-owned and the ledger/ACME cache can't write.
+COPY --from=build --chown=65532:65532 /data-skel /data
 COPY --from=build /src/target/release/rally-point-coordinator /usr/local/bin/rally-point-coordinator
 ENTRYPOINT ["/usr/local/bin/rally-point-coordinator"]
