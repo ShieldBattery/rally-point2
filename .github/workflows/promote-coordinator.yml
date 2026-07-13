@@ -1,0 +1,36 @@
+name: Promote coordinator image to stable
+
+# Retags an already-published ghcr.io/shieldbattery/rp2-coordinator image as
+# `stable` — the tag deployed boxes track, so an upgrade there is just
+# `docker-compose pull && up -d`. This RETAGS rather than rebuilds: the digest
+# stays identical, so the image that was tested is bit-for-bit the image
+# promoted. Run it manually with the full commit SHA whose image should become
+# stable.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA of the image to promote (its per-commit tag must exist)
+        required: true
+        type: string
+
+jobs:
+  promote:
+    name: retag as stable
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retag
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/shieldbattery/rp2-coordinator:stable \
+            ghcr.io/shieldbattery/rp2-coordinator:${{ inputs.sha }}
+      - name: Show promoted digest
+        run: docker buildx imagetools inspect ghcr.io/shieldbattery/rp2-coordinator:stable
