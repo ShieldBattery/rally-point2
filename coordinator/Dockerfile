@@ -11,7 +11,10 @@
 # dependency. Runs as nonroot; mount a writable volume for the ledger and point
 # COORDINATOR_RELAY_LEDGER at it.
 
-FROM rust:1.88-bookworm AS build
+# Latest stable Rust, but the OS half of the tag stays bookworm on purpose: the
+# runtime stage below is distroless cc-debian12 (= bookworm), and the builder's
+# glibc must never be newer than the runtime's or the binary fails to start.
+FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p rally-point-coordinator
