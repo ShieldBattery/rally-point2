@@ -20,7 +20,7 @@ use rally_point_coordinator::provision::{
 };
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
-use rally_point_coordinator::{notify, regions, registry, session, tenant};
+use rally_point_coordinator::{acme, notify, regions, registry, session, tenant};
 use rally_point_proto::control::{BufferBounds, RegionId, TenantId};
 use rally_point_proto::token::KeyId;
 
@@ -28,9 +28,48 @@ use rally_point_proto::token::KeyId;
 #[derive(Debug, Parser)]
 #[command(name = "rally-point-coordinator", version, about)]
 struct Cli {
-    /// Address to serve the app-server + relay control API on.
+    /// Address to serve the app-server + relay control API on. With
+    /// `--acme-domain` set the coordinator terminates TLS here and answers the
+    /// ACME TLS-ALPN-01 challenge on this same port, so the host must be publicly
+    /// reachable on it (443 in production) at the ACME domain; no port 80 is used.
     #[arg(long, env = "COORDINATOR_LISTEN", default_value_t = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), rally_point_coordinator::DEFAULT_PORT))]
     listen: SocketAddr,
+
+    /// Public hostname the coordinator obtains a Let's Encrypt certificate for and
+    /// terminates TLS under. Present ⇒ TLS mode: the coordinator serves HTTPS on
+    /// `--listen`, obtaining and renewing its certificate in-process over the ACME
+    /// TLS-ALPN-01 challenge. Absent ⇒ plain HTTP, the dev / loopback posture. TLS
+    /// terminates in the coordinator by design — relay enrollment checks a control
+    /// connection's transport peer address, and a TLS-terminating proxy in front
+    /// would replace it.
+    #[arg(
+        long,
+        env = "COORDINATOR_ACME_DOMAIN",
+        requires = "acme_contact",
+        requires = "acme_cache"
+    )]
+    acme_domain: Option<String>,
+
+    /// Contact email for the ACME account (a bare address gains a `mailto:` prefix
+    /// in code); the CA uses it for expiry and policy notices. Required with
+    /// `--acme-domain`.
+    #[arg(long, env = "COORDINATOR_ACME_CONTACT")]
+    acme_contact: Option<String>,
+
+    /// Directory the ACME account key and issued certificates are persisted to,
+    /// created if absent. Required with `--acme-domain`, and a startup failure if
+    /// it cannot be created and written: a coordinator that cannot persist its
+    /// certificate would re-request one on every start and quickly exhaust the CA's
+    /// issuance rate limit.
+    #[arg(long, env = "COORDINATOR_ACME_CACHE")]
+    acme_cache: Option<std::path::PathBuf>,
+
+    /// Draw certificates from Let's Encrypt's staging directory instead of
+    /// production. Staging issues browser-untrusted certificates under far higher
+    /// rate limits — for standing a host up without spending production issuance
+    /// budget. Only meaningful with `--acme-domain`.
+    #[arg(long, env = "COORDINATOR_ACME_STAGING", default_value_t = false)]
+    acme_staging: bool,
 
     /// Shared bootstrap secret a relay must present (`Authorization: Bearer
     /// <secret>`) to open its control connection. Production injects one so a
@@ -440,21 +479,56 @@ async fn main() -> Result<()> {
         tracing::info!("no provisioning substrate configured; the provisioning loop is off");
     }
 
-    let listener = tokio::net::TcpListener::bind(cli.listen)
-        .await
-        .context("binding coordinator listen address")?;
-    tracing::info!("coordinator API listening on {}", cli.listen);
-
     // Serve with connect-info so the relay control handler can read each
     // connection's transport-level peer address for the ledger's expected-address
     // check. This presumes the coordinator is directly exposed — a reverse proxy
     // in front of it would replace the peer address with its own.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("coordinator API server ended with an error")?;
+    //
+    // With an ACME domain configured the coordinator terminates TLS itself and
+    // obtains/renews its Let's Encrypt certificate in-process; the same router and
+    // the same connect-info wiring ride behind the TLS acceptor, which runs the
+    // handshake only after the real peer address has been recorded. Absent a
+    // domain, it serves plain HTTP — the dev / loopback path.
+    if let Some(domain) = cli.acme_domain.clone() {
+        let settings = acme::AcmeSettings {
+            domain,
+            contact: cli
+                .acme_contact
+                .clone()
+                .expect("--acme-contact is required with --acme-domain (clap `requires`)"),
+            cache_dir: cli
+                .acme_cache
+                .clone()
+                .expect("--acme-cache is required with --acme-domain (clap `requires`)"),
+            staging: cli.acme_staging,
+        };
+        tracing::info!(
+            domain = %settings.domain,
+            cache = %settings.cache_dir.display(),
+            staging = settings.staging,
+            "coordinator TLS enabled; obtaining a Let's Encrypt certificate via ACME TLS-ALPN-01",
+        );
+        let state = acme::build_state(&settings).context("preparing the ACME certificate cache")?;
+        let acceptor = state.axum_acceptor(state.default_rustls_config());
+        tokio::spawn(acme::log_certificate_events(state));
+        tracing::info!("coordinator API listening on {} (HTTPS)", cli.listen);
+        axum_server::bind(cli.listen)
+            .acceptor(acceptor)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("coordinator API server ended with an error")?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(cli.listen)
+            .await
+            .context("binding coordinator listen address")?;
+        tracing::info!("coordinator API listening on {}", cli.listen);
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .context("coordinator API server ended with an error")?;
+    }
     Ok(())
 }
 
@@ -580,5 +654,54 @@ mod tests {
         // With no flag and no env var, the mint lifetime falls back to 6 hours.
         let cli = Cli::parse_from(["rally-point-coordinator"]);
         assert_eq!(cli.player_token_lifetime_secs, 21600);
+    }
+
+    #[test]
+    fn no_acme_flags_leaves_tls_off() {
+        // The default posture is plain HTTP: no domain, so no TLS configuration.
+        let cli = Cli::try_parse_from(["rally-point-coordinator"]).expect("no acme flags is valid");
+        assert!(cli.acme_domain.is_none());
+        assert!(!cli.acme_staging);
+    }
+
+    #[test]
+    fn acme_domain_requires_contact_and_cache() {
+        // A domain names TLS mode but cannot stand alone: the account contact and
+        // the certificate cache are both mandatory, enforced by clap `requires`.
+        assert!(
+            Cli::try_parse_from([
+                "rally-point-coordinator",
+                "--acme-domain",
+                "coord.example.com",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rally-point-coordinator",
+                "--acme-domain",
+                "coord.example.com",
+                "--acme-contact",
+                "ops@example.com",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn acme_domain_with_contact_and_cache_parses() {
+        let cli = Cli::try_parse_from([
+            "rally-point-coordinator",
+            "--acme-domain",
+            "coord.example.com",
+            "--acme-contact",
+            "ops@example.com",
+            "--acme-cache",
+            "/var/lib/rp2-acme",
+        ])
+        .expect("a domain with a contact and a cache is a valid TLS configuration");
+        assert_eq!(cli.acme_domain.as_deref(), Some("coord.example.com"));
+        assert_eq!(cli.acme_contact.as_deref(), Some("ops@example.com"));
+        assert!(!cli.acme_staging);
     }
 }

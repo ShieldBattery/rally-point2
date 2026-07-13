@@ -112,6 +112,32 @@ axum = { version = "0.8", default-features = false, features = [
   # descriptors down and (later) the relay reports liveness up the one channel.
   "ws",
 ] }
+# In-process automatic TLS for the coordinator's control-plane listener: when a
+# public domain is configured, the coordinator obtains and renews its Let's
+# Encrypt certificate itself over the TLS-ALPN-01 challenge answered on the same
+# listening port — no separate challenge port, no external agent, no reverse
+# proxy. Terminating TLS in the coordinator is required, not a convenience: relay
+# enrollment authorizes a control connection against the transport peer address
+# recorded when the relay was provisioned, and a TLS-terminating proxy in front
+# would replace every peer address with its own. `default-features = false` drops
+# the crate's default aws-lc-rs crypto backend; `ring` selects this workspace's
+# single crypto provider instead, keeping the tree free of aws-lc-rs and the
+# C/NASM toolchain the 32-bit client build avoids. `axum` pulls the axum-server
+# integration whose acceptor runs the ACME TLS handshake under the existing
+# router; `webpki-roots` supplies the public CA roots the ACME client validates
+# the Let's Encrypt API against. Coordinator-only.
+rustls-acme = { version = "0.15", default-features = false, features = [
+  "ring",
+  "axum",
+  "webpki-roots",
+] }
+# The HTTP server the rustls-acme acceptor plugs into (`bind(addr).acceptor(..)`),
+# and the piece that carries each connection's real transport peer address into
+# `ConnectInfo<SocketAddr>` before the TLS handshake runs, so the enrollment gate
+# still sees real peers under TLS. `default-features = false` leaves its crypto
+# provider unselected — rustls-acme enables its `tls-rustls-no-provider` feature,
+# which never pulls aws-lc-rs. Coordinator-only.
+axum-server = { version = "0.8", default-features = false }
 # tower's `ServiceExt::oneshot` drives the coordinator's HTTP router in tests
 # without binding a socket.
 tower = { version = "0.5", default-features = false }

@@ -14,6 +14,15 @@ workspace = true
 
 [dependencies]
 axum = { workspace = true }
+# In-process automatic TLS: obtains and renews the coordinator's Let's Encrypt
+# certificate over TLS-ALPN-01 on the listening port. `axum-server` hosts the
+# router behind rustls-acme's acceptor and carries the real transport peer address
+# into connect-info before the TLS handshake, so the enrollment gate still reads
+# real peers under TLS. Both are ring-only (see the workspace manifest).
+rustls-acme = { workspace = true }
+axum-server = { workspace = true }
+# `StreamExt::next` drives the ACME certificate-lifecycle event stream.
+futures-util = { workspace = true }
 rally-point-proto = { workspace = true }
 parking_lot = { workspace = true }
 ring = { workspace = true }

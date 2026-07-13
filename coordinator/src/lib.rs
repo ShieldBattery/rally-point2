@@ -27,6 +27,11 @@
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
+//! - **acme** ([`acme`]) — optional in-process TLS: when a public domain is
+//!   configured, obtain and renew the coordinator's Let's Encrypt certificate
+//!   over TLS-ALPN-01 on the listening port, so TLS terminates in the process
+//!   that reads each control connection's peer address. Absent a domain, the
+//!   coordinator serves plain HTTP (the dev / loopback posture).
 //! - **identity** ([`identity`]) — verifies a relay's enroll proof-of-possession
 //!   signature against the certificate its `Hello` presented, closing the gap
 //!   where the certificate alone is a copyable claim, not proof of holding the
@@ -54,6 +59,7 @@
 //! registries. The `api` module wraps them in an HTTP router; the binary half
 //! ([`main`](../main.rs)) binds the listener and serves it.
 
+pub mod acme;
 pub mod api;
 pub mod descriptors;
 pub mod identity;
