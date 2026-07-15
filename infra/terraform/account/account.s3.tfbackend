@@ -1,6 +1,6 @@
-# Sample backend config for the account stack. Copy the bucket in and pass at
-# init: terraform init -backend-config=environments/account.s3.tfbackend
-bucket       = "CHANGEME-rp2-tfstate"
+# Backend config for the account stack. Pass at init:
+#   terraform init -backend-config=account.s3.tfbackend
+bucket       = "shieldbattery-rp2-tfstate"
 key          = "rp2/account.tfstate"
 region       = "us-east-1"
 encrypt      = true
