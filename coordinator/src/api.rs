@@ -1691,7 +1691,10 @@ fn note_inbound(
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
-        Ok(RelayToCoordinator::Heartbeat { sessions }) => {
+        Ok(RelayToCoordinator::Heartbeat {
+            sessions,
+            region_rtts: _,
+        }) => {
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat");
             // The beat's roster feeds active-player presence — but only from the
             // relay's CURRENT connection. A stale connection's late beat (a

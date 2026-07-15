@@ -36,6 +36,11 @@
 //!   session-descriptor set (on connect and again on every change, no polling).
 //!   Each set is fed to the `mesh_control` Join source, reconciling membership
 //!   as sessions come and go.
+//! - **region_ping** ([`region_ping`]) — relay-measured backbone round-trips:
+//!   ping each region's always-up UDP echo beacon (the target set the coordinator
+//!   pushes down the control connection), keep the latest measured medians, and let
+//!   the heartbeat carry them back up so the coordinator can serve a measured
+//!   region-pair backbone table instead of static config.
 //! - **consensus** ([`consensus`]) — the latency-buffer decision-maker: the
 //!   relay-side core that turns game-wide network conditions into a buffer-size
 //!   change, scheduled at an agreed future turn. Authority is an injected input,
@@ -82,6 +87,7 @@ pub mod mesh_dialer;
 pub mod mesh_edge;
 pub mod presence;
 pub mod provisional;
+pub mod region_ping;
 pub mod routing;
 pub mod server;
 pub mod turn_ring;

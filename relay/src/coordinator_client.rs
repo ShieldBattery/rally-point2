@@ -45,8 +45,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RelayHello, RelayToCoordinator,
-    SessionDescriptor, SessionPresence,
+    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport, RelayHello,
+    RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
@@ -64,6 +64,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use crate::auth::SharedRegistry;
 use crate::consensus::RelayNotice;
 use crate::mesh_control::MeshControl;
+use crate::region_ping::{RegionPingTargets, RegionRttCache};
 use crate::routing::{SessionKey, Sessions};
 
 /// How long to wait before redialing after the control connection drops. The
@@ -347,6 +348,15 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// authorization tokens. The coordinator sends the set before the first descriptor,
 /// so a session's clients can always be verified by the time its descriptor lands.
 ///
+/// `region_targets` is the region ping-beacon target set ([`RegionPingTargets`]):
+/// this loop stores each [`CoordinatorToRelay::RegionBeacons`] push into it wholesale,
+/// and the [`crate::region_ping::run_region_ping`] loop measures a backbone
+/// round-trip to each named beacon.
+///
+/// `region_rtt_cache` is the measured-round-trip cache ([`RegionRttCache`]) the ping
+/// loop writes: every heartbeat snapshots it into the beat's `region_rtts`, so the
+/// coordinator can aggregate a measured region-pair backbone table.
+///
 /// `drain` and `drain_acked` are the coordinated-drain seam: when the relay
 /// receives its shutdown signal, the drain sequence flips `drain` to `true`, and
 /// this loop sends a [`RelayToCoordinator::Draining`] up the connection asking the
@@ -376,6 +386,8 @@ pub async fn run_descriptor_subscriber(
     applied: AppliedSessions,
     fleet: FleetMeshPeers,
     verifying_keys: SharedRegistry,
+    region_targets: RegionPingTargets,
+    region_rtt_cache: RegionRttCache,
     notices: UnboundedReceiver<RelayNotice>,
     drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -391,6 +403,8 @@ pub async fn run_descriptor_subscriber(
         applied,
         fleet,
         verifying_keys,
+        region_targets,
+        region_rtt_cache,
         notices,
         drain,
         drain_acked,
@@ -425,6 +439,13 @@ pub async fn run_descriptor_subscriber_with(
     // the same registry: each connection re-syncs the full tenant-key set on connect,
     // replacing it wholesale.
     verifying_keys: SharedRegistry,
+    // Held across connections so the region-ping loop keeps observing the same
+    // target set: each connection re-syncs the full beacon set on connect, and an
+    // unchanged re-push wakes no sweep.
+    region_targets: RegionPingTargets,
+    // Held across connections so the heartbeat builder reads the same measured
+    // round-trips the region-ping loop writes, independent of any reconnect.
+    region_rtt_cache: RegionRttCache,
     mut notices: UnboundedReceiver<RelayNotice>,
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -451,6 +472,8 @@ pub async fn run_descriptor_subscriber_with(
             &applied,
             &fleet,
             &verifying_keys,
+            &region_targets,
+            &region_rtt_cache,
             &mut notices,
             &mut pending,
             &mut drain,
@@ -521,6 +544,8 @@ async fn connect_and_stream(
     applied: &AppliedSessions,
     fleet: &FleetMeshPeers,
     verifying_keys: &SharedRegistry,
+    region_targets: &RegionPingTargets,
+    region_rtt_cache: &RegionRttCache,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
     drain: &mut watch::Receiver<bool>,
@@ -635,6 +660,7 @@ async fn connect_and_stream(
                 // scale option, not needed at these payload sizes.
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
                     sessions: heartbeat_presence(sessions),
+                    region_rtts: heartbeat_region_rtts(region_rtt_cache),
                 })
                 .expect("a heartbeat always serializes");
                 socket.send(Message::Text(frame.into())).await?;
@@ -667,6 +693,14 @@ async fn connect_and_stream(
                                 // the relay can always verify a session's clients by
                                 // the time its descriptor arrives.
                                 verifying_keys.apply(keys);
+                            }
+                            CoordinatorToRelay::RegionBeacons { beacons } => {
+                                // The region ping-beacon targets: store the whole set,
+                                // replacing the prior one. Declarative current state —
+                                // a reconnect re-syncs the full set — so a wholesale
+                                // replace is correct, and an unchanged re-push wakes no
+                                // sweep.
+                                region_targets.store(beacons);
                             }
                             CoordinatorToRelay::IdentityChallenge { nonce } => {
                                 // The enroll handshake above already answered the
@@ -744,6 +778,20 @@ fn heartbeat_presence(sessions: &Sessions) -> Vec<SessionPresence> {
             slots,
         })
         .collect()
+}
+
+/// Snapshots the region-ping cache into the [`RegionRttReport`] entries a heartbeat
+/// carries — one per region the relay currently has a measured median for, sorted
+/// by region id so the beat's wire output is deterministic. Empty until the relay
+/// has measured anything, and empty entries are omitted from the wire.
+fn heartbeat_region_rtts(cache: &RegionRttCache) -> Vec<RegionRttReport> {
+    let mut reports: Vec<RegionRttReport> = cache
+        .snapshot()
+        .into_iter()
+        .map(|(region, rtt_ms)| RegionRttReport { region, rtt_ms })
+        .collect();
+    reports.sort_by(|a, b| a.region.0.cmp(&b.region.0));
+    reports
 }
 
 /// Sends a [`RelayToCoordinator::Draining`] up the control connection, asking the
@@ -962,12 +1010,13 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
                 "ignoring an IdentityChallenge received outside the enroll proof exchange"
             );
         }
-        // A RegionBeacons push names the beacons a relay could measure backbone
-        // round-trips against. This build performs no such measurement, so it
-        // ignores the targets — a no-op that keeps the match exhaustive without
-        // carrying any relay state.
+        // The connection loop intercepts RegionBeacons (it stores the set into the
+        // region-ping targets) before delegating here, so this arm is only a
+        // defensive no-op.
         CoordinatorToRelay::RegionBeacons { .. } => {
-            tracing::debug!("ignoring a RegionBeacons frame; this relay measures no backbone RTTs");
+            tracing::debug!(
+                "ignoring a RegionBeacons frame received outside the region-ping store"
+            );
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -1054,7 +1103,8 @@ mod tests {
     use super::*;
     use crate::mesh::MeshCommand;
     use rally_point_proto::control::{
-        BufferBounds, DepartureNotice, DesyncNotice, DivergedSlot, RelayPeer, TenantId,
+        BufferBounds, DepartureNotice, DesyncNotice, DivergedSlot, RegionBeaconTarget, RegionId,
+        RelayPeer, TenantId,
     };
     use rally_point_proto::ids::{RelayId, SessionId};
     use tokio::sync::mpsc;
@@ -1427,6 +1477,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             notices_rx,
             drain_rx,
             drain_acked,
@@ -1629,6 +1681,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1694,6 +1748,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1766,6 +1822,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1843,6 +1901,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             notices_rx,
             drain_rx,
             drain_acked_tx,
@@ -1926,6 +1986,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -1951,6 +2013,7 @@ mod tests {
                     session: SessionId(7),
                     slots: vec![rally_point_proto::ids::SlotId(3)],
                 }],
+                region_rtts: vec![],
             },
             "the beat names the registered (tenant, session, slot)",
         );
@@ -2014,6 +2077,8 @@ mod tests {
             AppliedSessions::default(),
             FleetMeshPeers::default(),
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -2263,6 +2328,8 @@ mod tests {
             AppliedSessions::default(),
             fleet,
             SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -2292,6 +2359,81 @@ mod tests {
             reader.fingerprint(RelayId(9)),
             None,
             "a relay absent from the pushed set has no fingerprint",
+        );
+    }
+
+    // --- Region ping targets + heartbeat RTT report ---
+
+    fn beacon(region: &str, host_port: &str) -> RegionBeaconTarget {
+        RegionBeaconTarget {
+            region: RegionId(region.to_owned()),
+            beacon: host_port.to_owned(),
+        }
+    }
+
+    #[test]
+    fn heartbeat_region_rtts_snapshots_the_cache_sorted_by_region() {
+        let cache = RegionRttCache::new();
+        // An empty cache reports no RTTs — the beat's field stays off the wire.
+        assert!(heartbeat_region_rtts(&cache).is_empty());
+
+        // Insert out of region order; the snapshot is sorted by region id, so the
+        // beat's wire output is deterministic regardless of map iteration order.
+        cache.record(RegionId("us-east".to_owned()), 87);
+        cache.record(RegionId("ap-southeast".to_owned()), 210);
+        cache.record(RegionId("eu-central".to_owned()), 42);
+        assert_eq!(
+            heartbeat_region_rtts(&cache),
+            vec![
+                RegionRttReport {
+                    region: RegionId("ap-southeast".to_owned()),
+                    rtt_ms: 210,
+                },
+                RegionRttReport {
+                    region: RegionId("eu-central".to_owned()),
+                    rtt_ms: 42,
+                },
+                RegionRttReport {
+                    region: RegionId("us-east".to_owned()),
+                    rtt_ms: 87,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_region_beacons_push_lands_in_the_store_and_an_unchanged_repush_signals_nothing() {
+        let targets = RegionPingTargets::new();
+        let mut watch = targets.subscribe();
+
+        let set = vec![
+            beacon("eu-central", "eu.example:20000"),
+            beacon("us-east", "us.example:20000"),
+        ];
+        targets.store(set.clone());
+        assert!(
+            watch.has_changed().unwrap(),
+            "the first push signals the ping loop",
+        );
+        assert_eq!(
+            *watch.borrow_and_update(),
+            set,
+            "the pushed set lands in the store"
+        );
+
+        // A reconnect re-push of the identical set is declarative current state:
+        // `send_if_modified` sees no change, so it wakes no sweep.
+        targets.store(set.clone());
+        assert!(
+            !watch.has_changed().unwrap(),
+            "an unchanged re-push does not re-signal the watch",
+        );
+
+        // A genuinely different set does signal again.
+        targets.store(vec![beacon("eu-central", "eu.example:20000")]);
+        assert!(
+            watch.has_changed().unwrap(),
+            "a changed set signals the ping loop",
         );
     }
 }

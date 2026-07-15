@@ -31,6 +31,7 @@ use rally_point_relay::consensus::RelayNotice;
 use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::mesh_control::MeshControl;
+use rally_point_relay::region_ping;
 use rally_point_relay::routing::SessionKey;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::sync::{mpsc, watch};
@@ -270,6 +271,8 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -303,6 +306,8 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -348,6 +353,8 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -388,6 +395,8 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -518,6 +527,8 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -1105,6 +1116,8 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
         SharedRegistry::default(),
+        region_ping::RegionPingTargets::default(),
+        region_ping::RegionRttCache::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),

@@ -895,6 +895,26 @@ pub struct RegionBeaconTarget {
     pub beacon: String,
 }
 
+/// One region's measured backbone round-trip, as a relay reports it up its
+/// control connection: the region id paired with the relay's latest measured
+/// median round-trip to that region's ping beacon, in milliseconds.
+///
+/// Carried in [`RelayToCoordinator::Heartbeat`]'s `region_rtts`. Declarative like
+/// the beat's session roster — the relay repeats its whole current set of
+/// measured medians on every beat, so a lost or reordered beat is corrected by
+/// the next one. A region the relay has not yet measured (or one whose last sweep
+/// found no reachable beacon) is simply absent from the set, never reported as a
+/// zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionRttReport {
+    /// The region this measurement is for — the wire name matching the
+    /// [`RegionBeaconTarget::region`] the coordinator pushed the relay.
+    pub region: RegionId,
+    /// The relay's latest measured median round-trip to that region's beacon,
+    /// in milliseconds.
+    pub rtt_ms: u32,
+}
+
 /// The fixed prefix signed (and verified) in the enroll proof-of-possession
 /// exchange: the relay signs `ENROLL_POP_CONTEXT ++ nonce` — never the bare
 /// nonce — so a signature produced for this purpose can never be replayed as
@@ -1109,6 +1129,15 @@ pub enum RelayToCoordinator {
         /// connected slot for. Empty (and omitted from the wire) on an idle relay.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sessions: Vec<SessionPresence>,
+        /// The relay's latest measured backbone round-trips: one entry per region
+        /// it has a median for, declarative like `sessions` — the relay repeats
+        /// its whole current set of measured medians on every beat, so a lost or
+        /// reordered beat is corrected by the next one. Empty (and omitted from the
+        /// wire) until the relay has measured anything, which is also exactly what a
+        /// relay build that predates the measurement sends, so an older coordinator
+        /// reads the beat unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        region_rtts: Vec<RegionRttReport>,
     },
     /// The relay has received its shutdown signal and asks the coordinator to
     /// **stop assigning it new sessions**. The control connection itself identifies
@@ -1932,11 +1961,15 @@ mod tests {
 
     #[test]
     fn relay_to_coordinator_heartbeat_roundtrips_json() {
-        let message = RelayToCoordinator::Heartbeat { sessions: vec![] };
+        let message = RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts: vec![],
+        };
         let json = serde_json::to_string(&message).unwrap();
-        // An idle relay's beat is byte-identical to the historical payload-free
-        // ping: just the tag, the empty roster omitted from the wire — so an older
-        // coordinator reads it unchanged.
+        // An idle, un-measured relay's beat is byte-identical to the historical
+        // payload-free ping: just the tag, both the empty roster and the empty
+        // RTT set omitted from the wire — so an older coordinator reads it
+        // unchanged.
         assert_eq!(json, r#"{"type":"heartbeat"}"#);
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
@@ -1944,11 +1977,18 @@ mod tests {
 
     #[test]
     fn a_bare_heartbeat_decodes_with_an_empty_roster() {
-        // A beat from a relay that predates the presence roster carries no
-        // `sessions` field; it must decode with an empty roster, not error.
+        // A beat from a relay that predates the presence roster (or the backbone
+        // RTT set) carries neither field; it must decode with both empty, not
+        // error.
         let json = r#"{"type":"heartbeat"}"#;
         let back: RelayToCoordinator = serde_json::from_str(json).unwrap();
-        assert_eq!(back, RelayToCoordinator::Heartbeat { sessions: vec![] });
+        assert_eq!(
+            back,
+            RelayToCoordinator::Heartbeat {
+                sessions: vec![],
+                region_rtts: vec![],
+            },
+        );
     }
 
     #[test]
@@ -1959,12 +1999,78 @@ mod tests {
                 session: SessionId(42),
                 slots: vec![SlotId(0), SlotId(3)],
             }],
+            region_rtts: vec![],
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"heartbeat\""));
         assert!(json.contains("\"sessions\""));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn an_rtt_bearing_heartbeat_roundtrips_and_omits_an_empty_set() {
+        // A beat carrying measured backbone RTTs serializes the field; the same
+        // beat with an empty set omits it entirely (byte-identical to a beat that
+        // never measured anything), so an older coordinator reads either unchanged.
+        let with_rtts = RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts: vec![
+                RegionRttReport {
+                    region: RegionId("eu-central".to_owned()),
+                    rtt_ms: 87,
+                },
+                RegionRttReport {
+                    region: RegionId("us-east".to_owned()),
+                    rtt_ms: 42,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&with_rtts).unwrap();
+        assert!(json.contains("\"region_rtts\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_rtts);
+
+        let empty = RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts: vec![],
+        };
+        let empty_json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !empty_json.contains("region_rtts"),
+            "an empty RTT set stays off the wire",
+        );
+    }
+
+    #[test]
+    fn an_rtt_bearing_heartbeat_decodes_on_a_pre_rtt_decoder() {
+        // A coordinator whose Heartbeat variant predates `region_rtts` ignores the
+        // unrecognized field rather than erroring, so a newer relay's measured beat
+        // still reads as a liveness signal + its roster.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreRttRelayToCoordinator {
+            Heartbeat {
+                #[serde(default)]
+                sessions: Vec<SessionPresence>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+
+        let json = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts: vec![RegionRttReport {
+                region: RegionId("us-west".to_owned()),
+                rtt_ms: 13,
+            }],
+        })
+        .unwrap();
+        let decoded: PreRttRelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded,
+            PreRttRelayToCoordinator::Heartbeat { sessions: vec![] },
+        );
     }
 
     #[test]

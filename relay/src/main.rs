@@ -38,6 +38,7 @@ use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_dialer;
 use rally_point_relay::mesh_edge;
 use rally_point_relay::provisional;
+use rally_point_relay::region_ping;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::{DEFAULT_PORT, server};
 use rally_point_transport::quinn;
@@ -347,6 +348,16 @@ async fn main() -> Result<()> {
         // coordinator URL it stays empty (dev/static `--mesh-peer`).
         let fleet_peers = coordinator_client::FleetMeshPeers::new();
 
+        // The region ping-beacon targets + measured-round-trip cache. The
+        // coordinator pushes the region beacons down the control connection, the
+        // subscriber stores them into `region_targets`, and `run_region_ping`
+        // measures a backbone round-trip to each — folding the medians into
+        // `region_rtt_cache`, which the heartbeat reports back up. Both stay empty
+        // for a relay with no coordinator URL: no targets ever arrive, and the ping
+        // loop below is spawned only inside the coordinator-driven block.
+        let region_targets = region_ping::RegionPingTargets::new();
+        let region_rtt_cache = region_ping::RegionRttCache::new();
+
         // Clone `links_tx` for the accept task; the original stays for the dial
         // tasks below (each clones again per peer).
         tokio::spawn(mesh_edge::run_mesh_accept(
@@ -523,6 +534,8 @@ async fn main() -> Result<()> {
                 shared_registry
                     .clone()
                     .expect("coordinator mode constructs a shared tenant-key registry"),
+                region_targets.clone(),
+                region_rtt_cache.clone(),
                 notices_rx,
                 drain_rx.clone(),
                 drain_acked_tx.clone(),
@@ -533,6 +546,15 @@ async fn main() -> Result<()> {
                 Arc::clone(&sessions),
                 Arc::clone(&mesh_state.decision_makers),
                 control_connected_rx,
+            ));
+            // Measure backbone round-trips to the coordinator's region beacons and
+            // report the medians up the heartbeat. Spawned only here, inside the
+            // coordinator-driven block, so a static/dev relay (no coordinator, no
+            // beacon targets) never pings. The relay's own region is skipped.
+            tokio::spawn(region_ping::run_region_ping(
+                region_targets,
+                region_rtt_cache,
+                cli.region.clone().map(RegionId),
             ));
         }
 
