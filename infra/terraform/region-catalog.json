@@ -1,0 +1,11 @@
+{
+  "regions": {
+    "us-east": { "aws_region": "us-east-1", "display_name": "US East" },
+    "us-west": { "aws_region": "us-west-2", "display_name": "US West" },
+    "eu-central": { "aws_region": "eu-central-1", "display_name": "EU Central" }
+  },
+  "environments": {
+    "staging": { "us-east": "10.80.0.0/22", "us-west": "10.81.0.0/22", "eu-central": "10.82.0.0/22" },
+    "prod": { "us-east": "10.84.0.0/22", "us-west": "10.85.0.0/22", "eu-central": "10.86.0.0/22" }
+  }
+}

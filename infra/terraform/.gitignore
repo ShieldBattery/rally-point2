@@ -1,0 +1,6 @@
+# Local init artifacts: provider binaries and module copies. The dependency
+# lock files (.terraform.lock.hcl) ARE tracked — they pin provider versions and
+# hashes the way Cargo.lock pins crates.
+**/.terraform/
+*.tfstate
+*.tfstate.*

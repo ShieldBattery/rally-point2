@@ -1,0 +1,7 @@
+# Sample backend config for the staging fleet stack. Copy the bucket in and pass
+# at init: terraform init -backend-config=environments/staging.s3.tfbackend
+bucket       = "CHANGEME-rp2-tfstate"
+key          = "rp2/fleet-staging.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
