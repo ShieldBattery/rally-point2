@@ -35,7 +35,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod common;
 use common::{
     ControlSocket, answer_challenge, connect_and_send_hello, expect_identity_challenge,
-    hello_at_current, self_signed,
+    hello_at_current, read_to_descriptors, self_signed,
 };
 
 /// A generous liveness deadline — these tests don't exercise the timeout.
@@ -304,17 +304,10 @@ async fn a_reconnect_under_the_same_certificate_replaces_the_entry() {
     let nonce = expect_identity_challenge(&mut socket).await;
     answer_challenge(&mut socket, &key, &nonce).await;
 
-    // The reconnect is accepted (not refused as a duplicate): the descriptor
-    // re-sync arrives, not a close.
-    let first = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator answers promptly")
-        .expect("a frame arrives")
-        .unwrap();
-    assert!(
-        matches!(&first, Message::Text(t) if t.contains("\"type\":\"descriptors\"")),
-        "a same-certificate reconnect enrolls rather than being refused, got {first:?}",
-    );
+    // The reconnect is accepted (not refused as a duplicate): the enrolled path
+    // proceeds — the tenant-key lead then the descriptor re-sync arrive, not a
+    // close.
+    let _ = read_to_descriptors(&mut socket).await;
     assert!(registry::peer(&reg, RelayId(1)).is_some());
 }
 

@@ -51,18 +51,20 @@
 //! nothing here can panic on a hostile token.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use rally_point_proto::control::TenantId;
+use rally_point_proto::control::{TenantId, TenantVerifyingKey};
 use rally_point_proto::handshake::{self, HandshakeError};
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ChallengeResponse,
-    ClientPublicKey, ConnectionChallenge, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, SignedToken,
-    TokenError,
+    ClientPublicKey, ConnectionChallenge, KeyId, MAX_STRING_LEN, PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    SignedToken, TokenError,
 };
 use rally_point_transport::quinn;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
+use tokio::sync::watch;
 
 /// The byte the relay writes to acknowledge an authorized, routable connection.
 /// Re-exported from the shared handshake codec so callers reading the relay's
@@ -112,6 +114,145 @@ impl Registry {
     /// rejects every client, which is worth surfacing at startup.
     pub fn is_empty(&self) -> bool {
         self.by_kid.is_empty()
+    }
+
+    /// How many signing keys are registered — the size a coordinator push logs
+    /// after replacing the set.
+    pub fn len(&self) -> usize {
+        self.by_kid.len()
+    }
+}
+
+/// A tenant-key registry the coordinator can replace wholesale while the relay
+/// keeps serving, with an in-flight token verification always reading a stable
+/// snapshot rather than a half-updated map.
+///
+/// The relay's token-verification registry starts empty when a coordinator drives
+/// it and is replaced on every [`CoordinatorToRelay::TenantKeys`](rally_point_proto::control::CoordinatorToRelay::TenantKeys)
+/// push. `watch`-backed, like the relay's fleet mesh-peer map: the writer is held
+/// by the coordinator client (which [`apply`](Self::apply)s each push) and
+/// [`reader`](Self::reader) hands the client edge cheap snapshot handles. A relay
+/// with no coordinator never constructs one — it serves a fixed registry through
+/// [`RegistryReader::fixed`].
+///
+/// The stored value is an `Arc<Registry>` swapped atomically: a reader that has
+/// already taken a snapshot holds an immutable `Registry` unaffected by a later
+/// replacement, so a verification in flight can never observe a torn set.
+#[derive(Clone)]
+pub struct SharedRegistry {
+    registry: Arc<watch::Sender<Arc<Registry>>>,
+}
+
+impl SharedRegistry {
+    /// Wraps `registry` as the initial shared set. A coordinator-driven relay
+    /// seeds this empty and lets the first push fill it.
+    pub fn new(registry: Registry) -> Self {
+        Self {
+            registry: Arc::new(watch::channel(Arc::new(registry)).0),
+        }
+    }
+
+    /// A cheap, cloneable snapshot handle onto the current set, for the client edge
+    /// to verify tokens against.
+    pub fn reader(&self) -> RegistryReader {
+        RegistryReader {
+            registry: self.registry.subscribe(),
+        }
+    }
+
+    /// Replaces the whole set with the tenant keys of a coordinator `TenantKeys`
+    /// push, dropping any entry that cannot be a usable signing key — a verifying
+    /// key that is not exactly [`PUBLIC_KEY_LEN`] bytes, or a `kid`/tenant longer
+    /// than the token wire format's [`MAX_STRING_LEN`] — with an error naming the
+    /// `kid`, while every other entry still applies. Logs the applied size.
+    ///
+    /// The pushed set is declarative current state, so this is a wholesale replace,
+    /// not a merge: a `kid` gone from the set stops verifying, and an in-flight
+    /// verification keeps the snapshot it started with.
+    pub fn apply(&self, keys: Vec<TenantVerifyingKey>) {
+        let mut registry = Registry::new();
+        for entry in keys {
+            let TenantVerifyingKey {
+                kid,
+                tenant,
+                verifying_key,
+            } = entry;
+            let key_bytes: [u8; PUBLIC_KEY_LEN] = match verifying_key.as_slice().try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    tracing::error!(
+                        kid = kid.as_ref(),
+                        len = verifying_key.len(),
+                        "skipping a pushed tenant key: verifying key is not the expected length",
+                    );
+                    continue;
+                }
+            };
+            if kid.as_ref().len() > MAX_STRING_LEN {
+                tracing::error!(
+                    kid = kid.as_ref(),
+                    "skipping a pushed tenant key: kid exceeds the token wire length limit",
+                );
+                continue;
+            }
+            if tenant.as_ref().len() > MAX_STRING_LEN {
+                tracing::error!(
+                    kid = kid.as_ref(),
+                    tenant = tenant.as_ref(),
+                    "skipping a pushed tenant key: tenant exceeds the token wire length limit",
+                );
+                continue;
+            }
+            registry.insert(kid, tenant, key_bytes);
+        }
+        let applied = registry.len();
+        // `send_replace` stores the new set regardless of whether any reader is
+        // currently subscribed, so a replacement is never silently dropped.
+        self.registry.send_replace(Arc::new(registry));
+        tracing::info!(keys = applied, "applied a coordinator tenant-key set");
+    }
+}
+
+impl Default for SharedRegistry {
+    /// An empty shared registry — a coordinator-driven relay's starting point (it
+    /// verifies nothing until the first push), and the seed a test replaces.
+    fn default() -> Self {
+        Self::new(Registry::new())
+    }
+}
+
+/// A snapshot handle onto the relay's tenant-key registry, whether coordinator-fed
+/// ([`SharedRegistry::reader`]) or fixed ([`RegistryReader::fixed`]). The client
+/// edge reads the current set through it per connection, so a mid-connection
+/// replacement never tears a verification in flight.
+#[derive(Clone)]
+pub struct RegistryReader {
+    registry: watch::Receiver<Arc<Registry>>,
+}
+
+impl RegistryReader {
+    /// A registry that never changes: the sole set is seeded here and read for the
+    /// process lifetime. Dev/static relays (no coordinator) use this; a
+    /// coordinator-driven relay uses [`SharedRegistry::reader`] instead, whose set
+    /// the coordinator replaces on each push.
+    pub fn fixed(registry: Arc<Registry>) -> Self {
+        // The sender is dropped immediately: no replacement ever lands, and a watch
+        // receiver keeps returning the seeded value whether or not a sender lives.
+        Self {
+            registry: watch::channel(registry).1,
+        }
+    }
+
+    /// The current set — a cheap `Arc` clone, stable for the caller even if a
+    /// replacement lands mid-use.
+    pub fn current(&self) -> Arc<Registry> {
+        self.registry.borrow().clone()
+    }
+
+    /// Whether the current set registers no signing keys — a relay that would
+    /// reject every client, worth surfacing at startup.
+    pub fn is_empty(&self) -> bool {
+        self.registry.borrow().is_empty()
     }
 }
 
@@ -390,6 +531,114 @@ mod tests {
             key.public,
         );
         registry
+    }
+
+    /// One `TenantVerifyingKey` entry, as a coordinator `TenantKeys` push carries it.
+    fn pushed(kid: &str, tenant: &str, verifying_key: Vec<u8>) -> TenantVerifyingKey {
+        TenantVerifyingKey {
+            kid: KeyId(kid.to_owned()),
+            tenant: TenantId(tenant.to_owned()),
+            verifying_key,
+        }
+    }
+
+    #[test]
+    fn a_pushed_set_replaces_the_registry_and_a_pushed_key_verifies_a_token() {
+        let tenant_key = test_key();
+        let client = test_key();
+        let shared = SharedRegistry::default();
+        let reader = shared.reader();
+        // Empty until the first push: a coordinator-driven relay verifies nothing.
+        assert!(reader.is_empty());
+
+        shared.apply(vec![pushed(KID, TENANT, tenant_key.public.to_vec())]);
+
+        let registry = reader.current();
+        assert_eq!(registry.len(), 1);
+        // A token signed by the pushed key verifies against the replaced set.
+        let token = mint(&tenant_key, KID, TENANT, SlotId(3), NOW + 60, client.public);
+        let authorized = verify_token(&registry, &token, NOW).unwrap();
+        assert_eq!(authorized.tenant.as_ref(), TENANT);
+        assert_eq!(authorized.slot, SlotId(3));
+    }
+
+    #[test]
+    fn a_pushed_set_skips_invalid_entries_and_applies_the_rest() {
+        let good = test_key();
+        let client = test_key();
+        let shared = SharedRegistry::default();
+        let reader = shared.reader();
+
+        shared.apply(vec![
+            // Wrong-length verifying key: skipped.
+            pushed("short-key", TENANT, vec![0u8; PUBLIC_KEY_LEN - 1]),
+            // Over-long kid: skipped.
+            pushed(
+                &"k".repeat(MAX_STRING_LEN + 1),
+                TENANT,
+                good.public.to_vec(),
+            ),
+            // Well-formed: applied.
+            pushed(KID, TENANT, good.public.to_vec()),
+        ]);
+
+        let registry = reader.current();
+        assert_eq!(registry.len(), 1, "only the well-formed entry applies");
+        let token = mint(&good, KID, TENANT, SlotId(0), NOW + 60, client.public);
+        assert!(verify_token(&registry, &token, NOW).is_ok());
+    }
+
+    #[test]
+    fn a_later_push_replaces_the_set_wholesale() {
+        let first_key = test_key();
+        let second_key = test_key();
+        let client = test_key();
+        let shared = SharedRegistry::default();
+        let reader = shared.reader();
+
+        shared.apply(vec![pushed("kid-1", TENANT, first_key.public.to_vec())]);
+        let with_first = reader.current();
+        let first_token = mint(
+            &first_key,
+            "kid-1",
+            TENANT,
+            SlotId(0),
+            NOW + 60,
+            client.public,
+        );
+        assert!(verify_token(&with_first, &first_token, NOW).is_ok());
+
+        // A later push carrying only kid-2 replaces the set: kid-1 no longer verifies.
+        shared.apply(vec![pushed("kid-2", TENANT, second_key.public.to_vec())]);
+        let with_second = reader.current();
+        assert_eq!(with_second.len(), 1);
+        assert!(matches!(
+            verify_token(&with_second, &first_token, NOW),
+            Err(AuthError::UnknownKey),
+        ));
+        let second_token = mint(
+            &second_key,
+            "kid-2",
+            TENANT,
+            SlotId(0),
+            NOW + 60,
+            client.public,
+        );
+        assert!(verify_token(&with_second, &second_token, NOW).is_ok());
+
+        // The snapshot taken before the replacement still verifies kid-1 — an
+        // in-flight verification never observes a torn set.
+        assert!(verify_token(&with_first, &first_token, NOW).is_ok());
+    }
+
+    #[test]
+    fn a_fixed_reader_serves_its_seeded_set() {
+        let tenant_key = test_key();
+        let client = test_key();
+        let reader = RegistryReader::fixed(Arc::new(registry_with(KID, TENANT, &tenant_key)));
+        assert!(!reader.is_empty());
+        let token = mint(&tenant_key, KID, TENANT, SlotId(1), NOW + 60, client.public);
+        assert!(verify_token(&reader.current(), &token, NOW).is_ok());
     }
 
     #[test]

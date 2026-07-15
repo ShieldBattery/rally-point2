@@ -20,7 +20,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use rally_point_proto::control::{CoordinatorToRelay, RelayHello, RelayToCoordinator};
+use rally_point_proto::control::{
+    CoordinatorToRelay, RelayHello, RelayToCoordinator, TenantVerifyingKey,
+};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::ProtocolVersion;
 use rally_point_relay::coordinator_client;
@@ -140,4 +142,50 @@ pub async fn answer_challenge(
 pub async fn prove_identity(socket: &mut ControlSocket, key: &PrivateKeyDer<'static>) {
     let nonce = expect_identity_challenge(socket).await;
     answer_challenge(socket, key, &nonce).await;
+}
+
+/// Reads the coordinator's next frame, asserts it is the `TenantKeys` push, and
+/// returns its entries. A freshly enrolled connection is led by this frame — the
+/// tenant verifying keys the relay checks client tokens against — before any
+/// session descriptor.
+pub async fn expect_tenant_keys(socket: &mut ControlSocket) -> Vec<TenantVerifyingKey> {
+    let frame = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator pushes tenant keys promptly")
+        .expect("a frame arrives")
+        .unwrap();
+    let Message::Text(text) = frame else {
+        panic!("expected a tenant_keys frame, got {frame:?}");
+    };
+    match serde_json::from_str(&text).unwrap() {
+        CoordinatorToRelay::TenantKeys { keys } => keys,
+        other => panic!("expected a tenant_keys frame, got: {other:?}"),
+    }
+}
+
+/// Reads down-frames until the enrolled path's initial `descriptors` re-sync
+/// arrives, returning that frame's text. A freshly enrolled connection is led by a
+/// `tenant_keys` push (the relay must be able to verify a session's client tokens
+/// before any descriptor for it lands), so a test that only needs to confirm the
+/// enrolled path proceeds reads past it here. Panics on a close (a refusal) or if
+/// the stream ends before a descriptor arrives.
+pub async fn read_to_descriptors(socket: &mut ControlSocket) -> String {
+    loop {
+        let frame = timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("the coordinator answers promptly")
+            .expect("a frame arrives before the stream ends")
+            .unwrap();
+        match frame {
+            Message::Text(text) if text.contains("\"type\":\"descriptors\"") => {
+                return text.to_string();
+            }
+            // Skip the tenant_keys lead (and any other non-descriptor push).
+            Message::Text(_) => continue,
+            Message::Close(frame) => {
+                panic!("expected the descriptor re-sync, got a close: {frame:?}")
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
 }

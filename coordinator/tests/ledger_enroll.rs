@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 mod common;
 use common::{
     ControlSocket, answer_challenge, connect_and_send_hello, expect_identity_challenge,
-    hello_at_current, self_signed,
+    hello_at_current, read_to_descriptors, self_signed,
 };
 
 /// A generous liveness deadline — these tests don't exercise the timeout.
@@ -90,19 +90,11 @@ async fn expect_close(socket: &mut ControlSocket, expected_code: u16) {
     );
 }
 
-/// Reads the coordinator's next frame and asserts it is the descriptor re-sync
-/// every accepted enroll begins with — proof the connection enrolled rather than
-/// being closed.
+/// Reads down-frames until the descriptor re-sync every accepted enroll includes —
+/// proof the connection enrolled rather than being closed. The enrolled path leads
+/// with the tenant-key push before the first descriptor, so this reads past it.
 async fn expect_enrolled(socket: &mut ControlSocket) {
-    let frame = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator answers promptly")
-        .expect("a frame arrives")
-        .unwrap();
-    assert!(
-        matches!(&frame, Message::Text(text) if text.contains("\"type\":\"descriptors\"")),
-        "expected a descriptors re-sync (enroll accepted), got {frame:?}",
-    );
+    let _ = read_to_descriptors(socket).await;
 }
 
 /// Polls the registry until `id` enrolls, up to a couple of seconds.

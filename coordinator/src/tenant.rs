@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{BufferBounds, TenantId};
+use rally_point_proto::control::{BufferBounds, TenantId, TenantVerifyingKey};
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
     ClientPublicKey, ExpiresAt, KeyId, PUBLIC_KEY_LEN, Signature, SignedToken, TokenClaims,
@@ -344,6 +344,27 @@ pub fn verifying_key(
     })
 }
 
+/// Every enrolled tenant's verifying key, as the entries a
+/// [`CoordinatorToRelay::TenantKeys`](rally_point_proto::control::CoordinatorToRelay::TenantKeys)
+/// push carries: the `kid`, the owning tenant, and the Ed25519 public key the
+/// relay verifies that tenant's client tokens against.
+///
+/// The coordinator distributes this whole set to a relay right after it enrolls,
+/// so the relay can verify any tenant's clients before a session descriptor for
+/// that tenant reaches it. The private signing halves never leave the store.
+pub fn all_verifying_keys(store: &TenantStore) -> Vec<TenantVerifyingKey> {
+    store
+        .tenants
+        .lock()
+        .values()
+        .map(|t| TenantVerifyingKey {
+            kid: t.kid.clone(),
+            tenant: t.tenant.clone(),
+            verifying_key: t.pair.public_key().as_ref().to_vec(),
+        })
+        .collect()
+}
+
 /// Looks up a tenant's buffer bounds.
 pub fn bounds(store: &TenantStore, tenant: &TenantId) -> Option<BufferBounds> {
     store.tenants.lock().get(tenant).map(|t| t.bounds)
@@ -552,6 +573,40 @@ mod tests {
         // A new key replaces the old one.
         assert_ne!(pubkey1, pubkey2);
         assert_eq!(len(&store), 1);
+    }
+
+    #[test]
+    fn all_verifying_keys_returns_every_enrolled_tenant() {
+        let store = new_store();
+        let bounds = BufferBounds::new(1, 6).unwrap();
+        let pk_a = enroll(
+            &store,
+            KeyId("kid-a".to_owned()),
+            TenantId("tenant-a".to_owned()),
+            bounds,
+        )
+        .unwrap();
+        let pk_b = enroll(
+            &store,
+            KeyId("kid-b".to_owned()),
+            TenantId("tenant-b".to_owned()),
+            bounds,
+        )
+        .unwrap();
+
+        let mut keys = all_verifying_keys(&store);
+        keys.sort_by(|l, r| l.kid.as_ref().cmp(r.kid.as_ref()));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].kid, KeyId("kid-a".to_owned()));
+        assert_eq!(keys[0].tenant, TenantId("tenant-a".to_owned()));
+        assert_eq!(keys[0].verifying_key, pk_a.to_vec());
+        assert_eq!(keys[1].kid, KeyId("kid-b".to_owned()));
+        assert_eq!(keys[1].verifying_key, pk_b.to_vec());
+    }
+
+    #[test]
+    fn all_verifying_keys_is_empty_for_a_store_with_no_tenants() {
+        assert!(all_verifying_keys(&new_store()).is_empty());
     }
 
     #[test]

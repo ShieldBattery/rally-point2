@@ -61,6 +61,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
+use crate::auth::SharedRegistry;
 use crate::consensus::RelayNotice;
 use crate::mesh_control::MeshControl;
 use crate::routing::{SessionKey, Sessions};
@@ -340,6 +341,12 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// wholesale on every [`CoordinatorToRelay::MeshPeers`] push, and the mesh acceptor
 /// reads it through a [`FleetMeshPeersReader`] to pin a dialing peer's certificate.
 ///
+/// `verifying_keys` is the client edge's tenant-key registry ([`SharedRegistry`]):
+/// this loop replaces it wholesale on every [`CoordinatorToRelay::TenantKeys`] push,
+/// and the client edge reads it through a snapshot handle to verify client
+/// authorization tokens. The coordinator sends the set before the first descriptor,
+/// so a session's clients can always be verified by the time its descriptor lands.
+///
 /// `drain` and `drain_acked` are the coordinated-drain seam: when the relay
 /// receives its shutdown signal, the drain sequence flips `drain` to `true`, and
 /// this loop sends a [`RelayToCoordinator::Draining`] up the connection asking the
@@ -368,6 +375,7 @@ pub async fn run_descriptor_subscriber(
     sessions: Sessions,
     applied: AppliedSessions,
     fleet: FleetMeshPeers,
+    verifying_keys: SharedRegistry,
     notices: UnboundedReceiver<RelayNotice>,
     drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -382,6 +390,7 @@ pub async fn run_descriptor_subscriber(
         sessions,
         applied,
         fleet,
+        verifying_keys,
         notices,
         drain,
         drain_acked,
@@ -412,6 +421,10 @@ pub async fn run_descriptor_subscriber_with(
     // Held across connections so the mesh acceptor's read handle keeps observing
     // the same map: each connection re-syncs the full set on connect, replacing it.
     fleet: FleetMeshPeers,
+    // Held across connections so the client edge's snapshot handle keeps observing
+    // the same registry: each connection re-syncs the full tenant-key set on connect,
+    // replacing it wholesale.
+    verifying_keys: SharedRegistry,
     mut notices: UnboundedReceiver<RelayNotice>,
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
@@ -437,6 +450,7 @@ pub async fn run_descriptor_subscriber_with(
             &sessions,
             &applied,
             &fleet,
+            &verifying_keys,
             &mut notices,
             &mut pending,
             &mut drain,
@@ -506,6 +520,7 @@ async fn connect_and_stream(
     sessions: &Sessions,
     applied: &AppliedSessions,
     fleet: &FleetMeshPeers,
+    verifying_keys: &SharedRegistry,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
     drain: &mut watch::Receiver<bool>,
@@ -643,6 +658,15 @@ async fn connect_and_stream(
                                 // current state — a reconnect re-syncs the full set —
                                 // so a wholesale replace is correct.
                                 fleet.store(peers);
+                            }
+                            CoordinatorToRelay::TenantKeys { keys } => {
+                                // The tenant verifying keys the client edge checks
+                                // authorization tokens against: replace the whole
+                                // registry, skipping any malformed entry. Declarative
+                                // current state, sent before the first descriptor, so
+                                // the relay can always verify a session's clients by
+                                // the time its descriptor arrives.
+                                verifying_keys.apply(keys);
                             }
                             CoordinatorToRelay::IdentityChallenge { nonce } => {
                                 // The enroll handshake above already answered the
@@ -924,6 +948,11 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
         // map) before delegating here, so this arm is only a defensive no-op.
         CoordinatorToRelay::MeshPeers { .. } => {
             tracing::debug!("ignoring a MeshPeers frame received outside the fleet-map store");
+        }
+        // The connection loop intercepts TenantKeys (it replaces the tenant-key
+        // registry) before delegating here, so this arm is only a defensive no-op.
+        CoordinatorToRelay::TenantKeys { .. } => {
+            tracing::debug!("ignoring a TenantKeys frame received outside the registry replace");
         }
         // The connection loop intercepts IdentityChallenge (it signs and replies
         // immediately) before delegating here, so this arm is only a defensive
@@ -1390,6 +1419,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             notices_rx,
             drain_rx,
             drain_acked,
@@ -1591,6 +1621,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1655,6 +1686,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1726,6 +1758,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked_tx,
@@ -1802,6 +1835,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             notices_rx,
             drain_rx,
             drain_acked_tx,
@@ -1884,6 +1918,7 @@ mod tests {
             Arc::clone(&sessions),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -1971,6 +2006,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             FleetMeshPeers::default(),
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,
@@ -2219,6 +2255,7 @@ mod tests {
             Arc::default(),
             AppliedSessions::default(),
             fleet,
+            SharedRegistry::default(),
             mpsc::unbounded_channel().1,
             drain_rx,
             drain_acked,

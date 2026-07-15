@@ -84,7 +84,7 @@ use axum::{
 };
 use rally_point_proto::control::{
     CoordinatorToRelay, MeshPeerIdentity, RelayEndpoint, RelayHello, RelayToCoordinator,
-    SessionDescriptor, SessionRequest, SessionResponse, TenantId,
+    SessionDescriptor, SessionRequest, SessionResponse, TenantId, TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -1289,6 +1289,16 @@ async fn push_and_watch(
     // progress (a crash, a half-open connection, or a peer that stopped reading).
     let mut deadline = tokio::time::Instant::now() + liveness_timeout;
 
+    // The tenant verifying keys, pushed once on connect and strictly ahead of the
+    // first descriptor: a descriptor must never reach a relay that cannot yet
+    // verify its clients' tokens. Tenant config is immutable per process, so this
+    // is a one-time connect-time push — a relay that reconnects re-receives it, and
+    // a future dynamic registry would re-push from a watch arm in the loop below.
+    let tenant_keys = tenant::all_verifying_keys(setup.tenants());
+    if !send_tenant_keys_before_deadline(socket, &tenant_keys, relay_id, deadline).await {
+        return;
+    }
+
     // Initial re-sync, bounded by the deadline. Clone the set out of the watch
     // borrow before awaiting — a watch borrow must never be held across an await.
     let initial = rx.borrow_and_update().clone();
@@ -1431,6 +1441,43 @@ async fn send_before_deadline(
             tracing::info!(
                 relay_id = relay_id.0,
                 "descriptor push stalled past the liveness deadline; dropping",
+            );
+            false
+        }
+    }
+}
+
+/// Sends the tenant verifying-key set down the connection, racing the same liveness
+/// deadline as a descriptor push (a relay that stopped reading must not hold its
+/// registry entry open while wedged). Returns whether the connection should keep
+/// running: `false` on a send error or a stall past the deadline.
+///
+/// Pushed once on connect, ahead of the first descriptor, so the relay can verify a
+/// session's client tokens by the time that session's descriptor arrives.
+async fn send_tenant_keys_before_deadline(
+    socket: &mut WebSocket,
+    keys: &[TenantVerifyingKey],
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let message = CoordinatorToRelay::TenantKeys {
+        keys: keys.to_vec(),
+    };
+    let json = serde_json::to_string(&message).expect("a tenant-keys frame always serializes");
+    tokio::select! {
+        result = socket.send(Message::Text(json.into())) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "tenant-keys push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "tenant-keys push stalled past the liveness deadline; dropping",
             );
             false
         }

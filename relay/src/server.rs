@@ -18,7 +18,7 @@ use rally_point_transport::Link;
 use rally_point_transport::quinn::{self, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry};
+use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry, RegistryReader};
 use crate::consensus;
 use crate::routing::{self, SessionKey, Sessions};
 
@@ -116,18 +116,29 @@ pub enum ServerError {
 
 /// Binds a QUIC server endpoint on `listen` and serves the client edge on it.
 ///
-/// Runs until the endpoint stops yielding connections. `registry` is the set of
-/// tenant signing keys clients authorize against.
+/// Runs until the endpoint stops yielding connections. `registry` is the snapshot
+/// handle onto the tenant signing keys clients authorize against — fixed for a
+/// dev/static relay, or fed by the coordinator's `TenantKeys` pushes, which this
+/// server reads afresh per connection so a mid-connection replacement never tears
+/// a verification in flight.
 pub async fn run(
     listen: SocketAddr,
     server_config: quinn::ServerConfig,
-    registry: Arc<Registry>,
+    registry: RegistryReader,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) -> Result<(), ServerError> {
     let endpoint = quinn::Endpoint::server(server_config, listen)?;
-    serve(endpoint, registry, sessions, mesh, mesh_accept).await;
+    serve_reader(
+        endpoint,
+        registry,
+        sessions,
+        mesh,
+        mesh_accept,
+        MAX_PENDING_HANDSHAKES,
+    )
+    .await;
     Ok(())
 }
 
@@ -178,6 +189,31 @@ pub async fn serve_with_max_pending(
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
     max_pending_handshakes: usize,
 ) {
+    serve_reader(
+        endpoint,
+        RegistryReader::fixed(registry),
+        sessions,
+        mesh,
+        mesh_accept,
+        max_pending_handshakes,
+    )
+    .await;
+}
+
+/// Serves the client edge reading the tenant-key registry through a
+/// [`RegistryReader`], so a coordinator-fed relay picks up a `TenantKeys`
+/// replacement without a restart. Each accepted connection snapshots the current
+/// set once, before its handshake, and verifies against that stable snapshot for
+/// the connection's lifetime — a replacement landing mid-handshake never tears an
+/// in-flight verification.
+async fn serve_reader(
+    endpoint: quinn::Endpoint,
+    registry: RegistryReader,
+    sessions: Sessions,
+    mesh: crate::mesh::MeshState,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
+    max_pending_handshakes: usize,
+) {
     if let Ok(addr) = endpoint.local_addr() {
         tracing::info!(%addr, "relay client edge listening");
     }
@@ -193,7 +229,9 @@ pub async fn serve_with_max_pending(
             incoming.refuse();
             continue;
         };
-        let registry = Arc::clone(&registry);
+        // Snapshot the current set for this connection: it stays fixed for the
+        // whole handshake even if the coordinator replaces the registry meanwhile.
+        let registry = registry.current();
         let sessions = Arc::clone(&sessions);
         let mesh = mesh.clone();
         let mesh_accept = mesh_accept.clone();

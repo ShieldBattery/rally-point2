@@ -36,7 +36,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 mod common;
-use common::{connect_and_send_hello, prove_identity, relay_cert, relay_key};
+use common::{
+    connect_and_send_hello, expect_tenant_keys, prove_identity, read_to_descriptors, relay_cert,
+    relay_key,
+};
+use rally_point_relay::auth::SharedRegistry;
 
 const TENANT: &str = "sb-test";
 
@@ -264,6 +268,7 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -296,6 +301,7 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -340,6 +346,7 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -379,6 +386,7 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -508,6 +516,7 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -909,17 +918,9 @@ async fn a_newer_relay_with_an_overlapping_window_downgrades_and_enrolls() {
         socket.send(Message::Text(proof.into())).await.unwrap();
     }
 
-    // The first frame down after that is the enrolled path's initial descriptor
-    // re-sync — not a refusal close.
-    let first = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator answers")
-        .expect("a frame arrives")
-        .unwrap();
-    let Message::Text(text) = first else {
-        panic!("expected the initial descriptor re-sync, got {first:?}");
-    };
-    assert!(text.contains("\"type\":\"descriptors\""));
+    // The enrolled path proceeds (not a refusal close): the tenant-key lead is
+    // followed by the initial descriptor re-sync.
+    let _ = read_to_descriptors(&mut socket).await;
 
     assert!(
         wait_for_enrollment(setup.registry(), RelayId(9)).await,
@@ -1019,20 +1020,10 @@ async fn a_region_less_hello_enrolls_even_with_a_region_config() {
     let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
     let mut socket = connect_and_send_hello(&base_url, relay_hello(9, 14909)).await;
     // Region validation passes (untagged), so the coordinator challenges before
-    // enrolling; answer it, then the first frame down is the enrolled path's
-    // descriptor re-sync, not a close.
+    // enrolling; answer it, then the enrolled path proceeds — the tenant-key lead
+    // followed by the descriptor re-sync, not a close.
     prove_identity(&mut socket, &relay_key(9)).await;
-    let first = timeout(Duration::from_secs(5), {
-        use futures_util::StreamExt;
-        socket.next()
-    })
-    .await
-    .expect("the coordinator answers")
-    .expect("a frame arrives")
-    .unwrap();
-    assert!(
-        matches!(first, tokio_tungstenite::tungstenite::Message::Text(t) if t.contains("\"type\":\"descriptors\""))
-    );
+    let _ = read_to_descriptors(&mut socket).await;
     assert!(
         wait_for_enrollment(setup.registry(), RelayId(9)).await,
         "an untagged relay enrolls",
@@ -1112,6 +1103,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         std::sync::Arc::default(),
         coordinator_client::AppliedSessions::default(),
         coordinator_client::FleetMeshPeers::default(),
+        SharedRegistry::default(),
         no_notices(),
         no_drain_rx(),
         no_drain_ack(),
@@ -1215,4 +1207,53 @@ async fn the_fleet_mesh_peer_set_is_pushed_and_tracks_membership() {
     let shrunk = read_mesh_peers_until(&mut socket1, 1).await;
     assert_eq!(shrunk, registry::mesh_peers(&reg));
     assert_eq!(shrunk[0].relay_id, RelayId(1));
+}
+
+// --- Tenant verifying-key distribution ---
+
+#[tokio::test]
+async fn the_tenant_key_set_is_pushed_before_the_first_descriptor() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A coordinator with one enrolled tenant (sb-test / test-key-1) and a session
+    // relay 1 serves. Relay 1 enrolls over a raw control socket so the test can
+    // read the exact post-enroll frame order.
+    let (base_url, _session, setup) = coordinator_with_session(None).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    // The first frame after enrollment is the tenant-key set — before any
+    // descriptor — carrying every configured tenant, each with the verifying key
+    // the coordinator holds for it.
+    let pushed = expect_tenant_keys(&mut socket).await;
+    let expected = tenant::all_verifying_keys(setup.tenants());
+    assert_eq!(pushed.len(), expected.len());
+    assert_eq!(
+        pushed.len(),
+        1,
+        "the coordinator has exactly one tenant enrolled"
+    );
+
+    let (kid, verifying_key) = tenant::verifying_key(setup.tenants(), &TenantId(TENANT.to_owned()))
+        .expect("the tenant is enrolled");
+    assert_eq!(kid, KeyId("test-key-1".to_owned()));
+    let entry = pushed
+        .iter()
+        .find(|k| k.kid == kid)
+        .expect("the pushed set names the configured tenant");
+    assert_eq!(entry.tenant, TenantId(TENANT.to_owned()));
+    assert_eq!(
+        entry.verifying_key,
+        verifying_key.to_vec(),
+        "the pushed verifying key matches the coordinator's signing key's public half",
+    );
+
+    // The descriptor re-sync follows the tenant-key lead on the same connection.
+    let descriptors = read_to_descriptors(&mut socket).await;
+    assert!(descriptors.contains("\"type\":\"descriptors\""));
 }

@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{RelayId, SessionId, SlotId};
-use crate::token::ClientPublicKey;
+use crate::token::{ClientPublicKey, KeyId};
 use crate::version::ProtocolVersion;
 
 // ---------------------------------------------------------------------------
@@ -847,6 +847,34 @@ pub struct MeshPeerIdentity {
     pub cert_sha256: [u8; 32],
 }
 
+/// One tenant's token-verifying key, as the coordinator distributes it to relays:
+/// the `kid` that names the signing key, the tenant that owns it, and the
+/// [`PUBLIC_KEY_LEN`](crate::token::PUBLIC_KEY_LEN)-byte Ed25519 public key that
+/// verifies tokens signed with it.
+///
+/// The private signing half never leaves the coordinator; the relay holds only
+/// this public half and verifies against it, so the `kid → tenant` binding here is
+/// the authority a forged tenant claim in a token is checked against (mirroring the
+/// relay's own registry — a valid signature proves only that `kid` signed the
+/// claims, never that the claimed tenant owns that key). Carried in a
+/// [`CoordinatorToRelay::TenantKeys`] push.
+///
+/// `verifying_key` is a byte string, the same encoding the neighboring relay frames
+/// give their certificate DER; the relay checks its length before trusting it, so a
+/// wrong-length key is skipped rather than misread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantVerifyingKey {
+    /// The key id (`kid`) a token carries so the relay knows which key verifies it.
+    pub kid: KeyId,
+    /// The tenant that owns the signing key — authoritative, cross-checked against
+    /// the token's own tenant claim.
+    pub tenant: TenantId,
+    /// The Ed25519 public (verifying) key,
+    /// [`PUBLIC_KEY_LEN`](crate::token::PUBLIC_KEY_LEN) bytes when well-formed.
+    #[serde(with = "serde_bytes")]
+    pub verifying_key: Vec<u8>,
+}
+
 /// The fixed prefix signed (and verified) in the enroll proof-of-possession
 /// exchange: the relay signs `ENROLL_POP_CONTEXT ++ nonce` — never the bare
 /// nonce — so a signature produced for this purpose can never be replayed as
@@ -934,6 +962,23 @@ pub enum CoordinatorToRelay {
     MeshPeers {
         /// The complete set of currently-enrolled fleet peers.
         peers: Vec<MeshPeerIdentity>,
+    },
+    /// The tenant token-verifying keys the relay checks client authorization
+    /// tokens against — the full current set as a declarative replacement, one
+    /// entry per tenant signing key.
+    ///
+    /// The coordinator holds every tenant's signing key and pushes the public
+    /// (verifying) halves here, so a relay verifies client tokens with no tenant
+    /// key material in its own environment. The set is sent once when the control
+    /// connection starts, ahead of the first session descriptor — a descriptor
+    /// must never reach a relay that cannot yet verify its clients' tokens — and
+    /// the relay replaces its stored set wholesale on the push (declarative
+    /// complete state, exactly like [`MeshPeers`](Self::MeshPeers) and
+    /// [`Descriptors`](Self::Descriptors)). A relay that reconnects re-syncs the
+    /// full set, so the channel never has to guarantee exactly-once delivery.
+    TenantKeys {
+        /// The complete set of tenant verifying keys.
+        keys: Vec<TenantVerifyingKey>,
     },
     /// A random challenge proving the relay holds the private key matching the
     /// certificate its `Hello` presented (enroll proof-of-possession): the
@@ -1324,7 +1369,7 @@ mod tests {
 
     use super::*;
     use crate::ids::{RelayId, SessionId, SlotId};
-    use crate::token::ClientPublicKey;
+    use crate::token::{ClientPublicKey, PUBLIC_KEY_LEN};
 
     #[test]
     fn buffer_bounds_new_rejects_inverted() {
@@ -1744,6 +1789,47 @@ mod tests {
         // rather than erroring — a coordinator that pushes the set to an older relay
         // is skipped, not fatal.
         let json = r#"{"type":"mesh_peers","peers":[]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
+    fn coordinator_to_relay_tenant_keys_roundtrips_json() {
+        let message = CoordinatorToRelay::TenantKeys {
+            keys: vec![
+                TenantVerifyingKey {
+                    kid: KeyId("staging-key-1".to_owned()),
+                    tenant: TenantId("sb-staging".to_owned()),
+                    verifying_key: vec![0x11; PUBLIC_KEY_LEN],
+                },
+                TenantVerifyingKey {
+                    kid: KeyId("dev-key-1".to_owned()),
+                    tenant: TenantId("sb-dev".to_owned()),
+                    verifying_key: vec![0x22; PUBLIC_KEY_LEN],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"tenant_keys\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+        // The verifying key survives the round trip intact — the relay verifies
+        // client tokens against exactly these bytes.
+        let CoordinatorToRelay::TenantKeys { keys } = back else {
+            panic!("expected a tenant_keys frame");
+        };
+        assert_eq!(keys[0].verifying_key, vec![0x11; PUBLIC_KEY_LEN]);
+        assert_eq!(keys[1].tenant, TenantId("sb-dev".to_owned()));
+    }
+
+    #[test]
+    fn tenant_keys_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility, mirroring `mesh_peers`: a `TenantKeys` down-frame
+        // decoded by a build whose `CoordinatorToRelay` predates the variant
+        // (modeled by the up-direction `RelayToCoordinator`, which has no such
+        // variant) folds into `Unknown` rather than erroring — a coordinator that
+        // pushes the set to an older relay is skipped, not fatal.
+        let json = r#"{"type":"tenant_keys","keys":[]}"#;
         let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, RelayToCoordinator::Unknown);
     }

@@ -28,6 +28,7 @@ use color_eyre::eyre::Context;
 use rally_point_proto::control::{RegionId, RelayHello};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::ProtocolVersion;
+use rally_point_relay::auth::{Registry, RegistryReader, SharedRegistry};
 use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
@@ -239,27 +240,48 @@ async fn main() -> Result<()> {
     let server_config = rally_point_transport::quic::server_config(cert_chain, private_key)
         .context("building QUIC server config")?;
 
-    let tenant_key = match &cli.tenant_pubkey {
-        Some(pubkey_hex) => {
-            tenant_key_from_pubkey(cli.kid.clone(), cli.tenant.clone(), pubkey_hex)?
-        }
-        None => {
-            let key = generate_dev_tenant_key(cli.kid.clone(), cli.tenant.clone())?;
-            if let Some(pkcs8) = &key.generated_pkcs8 {
-                tracing::warn!(
-                    kid = %cli.kid,
-                    tenant = %cli.tenant,
-                    pkcs8_hex = %hex::encode(pkcs8),
-                    public_key_hex = %hex::encode(key.verifying_key),
-                    "generated a dev tenant keypair — use --tenant-pubkey <pub_hex> to pin the public; \
-                     use the pkcs8_hex with a client to mint matching tokens",
-                );
+    let has_coordinator = cli.relay_id.is_some() && cli.coordinator_url.is_some();
+
+    // The tenant-key registry the client edge verifies tokens against. A
+    // coordinator-driven relay starts EMPTY and lets the coordinator's `TenantKeys`
+    // push (which lands before the first session descriptor) fill it, so no tenant
+    // key material lives in the relay's environment; `--tenant-pubkey` is ignored
+    // there, and no dev keypair is generated. A dev/static relay (no coordinator)
+    // keeps a fixed registry seeded from `--tenant-pubkey`, or a generated dev
+    // keypair whose halves are logged for loopback token minting.
+    if tenant_pubkey_ignored(has_coordinator, cli.tenant_pubkey.is_some()) {
+        tracing::warn!(
+            "ignoring --tenant-pubkey / RELAY_TENANT_PUBKEY in coordinator mode: the \
+             coordinator pushes tenant verifying keys over the control connection",
+        );
+    }
+    let (registry_reader, shared_registry) = if has_coordinator {
+        let shared = SharedRegistry::new(Registry::new());
+        (shared.reader(), Some(shared))
+    } else {
+        let tenant_key = match &cli.tenant_pubkey {
+            Some(pubkey_hex) => {
+                tenant_key_from_pubkey(cli.kid.clone(), cli.tenant.clone(), pubkey_hex)?
             }
-            key
-        }
+            None => {
+                let key = generate_dev_tenant_key(cli.kid.clone(), cli.tenant.clone())?;
+                if let Some(pkcs8) = &key.generated_pkcs8 {
+                    tracing::warn!(
+                        kid = %cli.kid,
+                        tenant = %cli.tenant,
+                        pkcs8_hex = %hex::encode(pkcs8),
+                        public_key_hex = %hex::encode(key.verifying_key),
+                        "generated a dev tenant keypair — use --tenant-pubkey <pub_hex> to pin the public; \
+                         use the pkcs8_hex with a client to mint matching tokens",
+                    );
+                }
+                key
+            }
+        };
+        let reader = RegistryReader::fixed(Arc::new(config::registry_from_tenant_key(&tenant_key)));
+        (reader, None)
     };
 
-    let registry = Arc::new(config::registry_from_tenant_key(&tenant_key));
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::new_mesh_state();
 
@@ -269,7 +291,6 @@ async fn main() -> Result<()> {
     // drain sequence waits on (bounded). Both are wired into the coordinator client
     // only when a coordinator URL is configured; without one the drain sequence skips
     // the handshake and waits on local idleness alone.
-    let has_coordinator = cli.relay_id.is_some() && cli.coordinator_url.is_some();
     let drain_timeout = Duration::from_secs(cli.drain_timeout_secs);
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let (drain_acked_tx, mut drain_acked_rx) = tokio::sync::watch::channel(false);
@@ -499,6 +520,9 @@ async fn main() -> Result<()> {
                 Arc::clone(&sessions),
                 applied.clone(),
                 fleet_peers,
+                shared_registry
+                    .clone()
+                    .expect("coordinator mode constructs a shared tenant-key registry"),
                 notices_rx,
                 drain_rx.clone(),
                 drain_acked_tx.clone(),
@@ -531,7 +555,7 @@ async fn main() -> Result<()> {
     let mut server = tokio::spawn(server::run(
         cli.listen,
         server_config,
-        registry,
+        registry_reader,
         sessions,
         mesh_state,
         mesh_accept,
@@ -675,6 +699,15 @@ fn mesh_peer_auth_required(require_flag: bool, has_coordinator: bool) -> bool {
     require_flag || has_coordinator
 }
 
+/// Whether a supplied `--tenant-pubkey` is ignored. In coordinator mode the tenant
+/// verifying keys arrive over the control connection, so a statically pinned pubkey
+/// has no role and is ignored (with a warning); a dev/static relay (no coordinator)
+/// uses it. `true` only when the coordinator drives the relay *and* a pubkey was
+/// supplied — the case that warrants the warning.
+fn tenant_pubkey_ignored(has_coordinator: bool, tenant_pubkey_supplied: bool) -> bool {
+    has_coordinator && tenant_pubkey_supplied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +727,23 @@ mod tests {
         // opts in with --require-mesh-peer-auth.
         assert!(!mesh_peer_auth_required(false, false));
         assert!(mesh_peer_auth_required(true, false));
+    }
+
+    #[test]
+    fn coordinator_mode_ignores_a_supplied_tenant_pubkey() {
+        // A coordinator-driven relay receives its tenant verifying keys over the
+        // control connection, so a pinned --tenant-pubkey is ignored (and warned
+        // about) rather than seeding a static registry.
+        assert!(tenant_pubkey_ignored(true, true));
+        // No pubkey supplied: nothing to ignore, so no warning.
+        assert!(!tenant_pubkey_ignored(true, false));
+    }
+
+    #[test]
+    fn dev_static_mode_uses_a_supplied_tenant_pubkey() {
+        // With no coordinator, --tenant-pubkey seeds the fixed registry — it is not
+        // ignored, whether or not one is supplied.
+        assert!(!tenant_pubkey_ignored(false, true));
+        assert!(!tenant_pubkey_ignored(false, false));
     }
 }
