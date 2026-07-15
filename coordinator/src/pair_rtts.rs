@@ -26,7 +26,7 @@
 //! held across I/O. The handle clones cheaply (an `Arc`), so the HTTP state and every
 //! relay control connection share one table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -145,6 +145,14 @@ impl PairRttStore {
         entries
     }
 
+    /// The set of region pairs that currently hold a value, as canonical keys
+    /// (`a <= b`). The reconcile loop's coverage bootstrap diffs this against the
+    /// configured region pairs to find backbone links still lacking a measurement;
+    /// taking it in one locked pass keeps that check to a set lookup per pair.
+    pub fn covered_pairs(&self) -> HashSet<PairKey> {
+        self.pairs.lock().keys().cloned().collect()
+    }
+
     /// Loads `entries` into the table, canonicalizing each pair — the startup load from
     /// the ledger, so last-known values survive a coordinator restart or a
     /// scale-to-zero. A later entry for a pair overwrites an earlier one.
@@ -224,6 +232,23 @@ mod tests {
         assert_eq!(
             snap[0].measured_at, 30,
             "even an unchanged re-report refreshes the age"
+        );
+    }
+
+    #[test]
+    fn covered_pairs_reports_stored_keys_canonically() {
+        let store = new_store();
+        assert!(
+            store.covered_pairs().is_empty(),
+            "an empty store covers no pairs",
+        );
+        // Either direction of a link registers the one canonical key.
+        store.record(&region("us-east"), &region("eu-west"), 87, 100);
+        let covered = store.covered_pairs();
+        assert_eq!(covered.len(), 1);
+        assert!(
+            covered.contains(&(region("eu-west"), region("us-east"))),
+            "the canonical (a <= b) key is present",
         );
     }
 

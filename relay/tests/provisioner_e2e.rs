@@ -30,7 +30,7 @@ use rally_point_coordinator::provision::{
 use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::{self, EnrolledRelay, RelayRegistry};
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{notify, tenant};
+use rally_point_coordinator::{notify, pair_rtts, tenant};
 use rally_point_proto::control::RegionId;
 
 /// The single region the coordinator is configured for; the relay enrolls tagged
@@ -143,6 +143,7 @@ async fn provisioning_lifecycle_launches_enrolls_drains_and_re_mints_a_fresh_id(
         setup,
         ledger.clone(),
         warm.clone(),
+        pair_rtts::new_store(),
         provisioner.clone(),
     );
 

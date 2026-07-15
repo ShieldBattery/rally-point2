@@ -428,6 +428,9 @@ async fn main() -> Result<()> {
     let provision_setup = setup.clone();
     let provision_ledger = ledger.clone();
     let provision_regions: Vec<RegionId> = regions.regions().iter().map(|r| r.id.clone()).collect();
+    // The provisioning loop reads the same pair table the API serves, so it can spot
+    // configured pairs still lacking a measurement and bootstrap relays to fill them.
+    let provision_pair_rtts = pair_rtts.clone();
 
     let state = CoordinatorState {
         setup,
@@ -485,6 +488,7 @@ async fn main() -> Result<()> {
                 provision_setup,
                 provision_ledger,
                 warm.clone(),
+                provision_pair_rtts.clone(),
                 provisioner,
             );
         } else if let Some(ecs_config_path) = cli.provision_ecs_config {
@@ -505,6 +509,7 @@ async fn main() -> Result<()> {
                 provision_setup,
                 provision_ledger,
                 warm.clone(),
+                provision_pair_rtts.clone(),
                 provisioner,
             );
         }
@@ -574,10 +579,19 @@ fn spawn_provision_loop<P: Provisioner + 'static>(
     setup: SessionSetup,
     ledger: Arc<RelayLedger>,
     warm: WarmTargets,
+    pair_rtts: pair_rtts::PairRttStore,
     provisioner: P,
 ) {
     let registry = setup.registry().clone();
-    let provision_loop = ProvisionLoop::new(config, registry, setup, ledger, warm, provisioner);
+    let provision_loop = ProvisionLoop::new(
+        config,
+        registry,
+        setup,
+        ledger,
+        warm,
+        pair_rtts,
+        provisioner,
+    );
     tokio::spawn(provision_loop.run());
 }
 
