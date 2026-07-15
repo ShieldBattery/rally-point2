@@ -13,9 +13,11 @@
 //! A pair is unordered: `(a, b)` and `(b, a)` are the same backbone link, and either
 //! region's relay may measure it. Keys are canonicalized to `a <= b` by id string
 //! ([`canonical_pair`]), so both directions collapse to one entry. Aggregation is
-//! last-write-wins — the latest report for a pair replaces the stored value, with no
-//! smoothing across the two directions, since measured medians are stable and a fresh
-//! value is the more current one. A same-region report (`a == b`) is rejected: the
+//! last-write-wins beyond a small dead-band ([`RTT_DEADBAND_MS`]) — the latest report
+//! for a pair replaces the stored value, except that a report within noise of the
+//! stored value keeps it, so the two ends' independently-measured medians (which
+//! agree only to within a few milliseconds) do not thrash the stored value — or the
+//! ledger — as their heartbeats alternate. A same-region report (`a == b`) is rejected: the
 //! round-trip to a region's own beacon is zero by definition, and relays skip their
 //! own region already, so the guard is defensive.
 //!
@@ -32,6 +34,15 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rally_point_proto::control::RegionId;
 use serde::Serialize;
+
+/// How far, in milliseconds, a reported round-trip may sit from the stored value and
+/// still count as the same measurement. Both ends of a pair measure it independently
+/// and repeat their medians on every heartbeat; two medians of one backbone path
+/// agree only to within measurement noise (single-digit milliseconds), while a real
+/// backbone shift — a re-route — moves a path by tens of milliseconds. The band
+/// absorbs the noise so alternating heartbeats cannot thrash the stored value or the
+/// ledger, and passes real shifts through unchanged.
+const RTT_DEADBAND_MS: u32 = 5;
 
 /// One region pair's measured backbone round-trip and when it was recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,13 +96,22 @@ impl PairRttStore {
     /// Folds one relay's measured round-trip for a pair into the table, stamping it
     /// `now_unix`. The pair `(relay_region, reported_region)` is canonicalized, so the
     /// direction the relay measured from does not matter; the value is
-    /// last-write-wins.
+    /// last-write-wins beyond a small dead-band.
+    ///
+    /// The dead-band exists because both ends of a pair measure it independently and
+    /// repeat their own median on every heartbeat: two medians of the same backbone
+    /// path agree only to within measurement noise, so without it the stored value
+    /// would flip between the two ends' readings on every alternating beat — and each
+    /// flip would count as a change and cost a ledger write. A report within
+    /// [`RTT_DEADBAND_MS`] of the stored value therefore refreshes `measured_at` but
+    /// keeps the stored round-trip; a real backbone shift (a re-route moves a path by
+    /// tens of milliseconds) lands unchanged.
     ///
     /// Returns whether the stored `rtt_ms` *changed* — `true` for a new pair or a
-    /// different value, `false` for a re-report of the same value (whose `measured_at`
-    /// is still refreshed) — so the caller writes through to the ledger only when
-    /// something actually changed, and a steady-state re-report every heartbeat costs
-    /// no persistence. A same-region report (`relay_region == reported_region`) is
+    /// value beyond the dead-band, `false` otherwise (with `measured_at` still
+    /// refreshed) — so the caller writes through to the ledger only when something
+    /// actually changed, and steady-state re-reports every heartbeat cost no
+    /// persistence. A same-region report (`relay_region == reported_region`) is
     /// rejected: nothing is stored and `false` is returned.
     pub fn record(
         &self,
@@ -108,10 +128,14 @@ impl PairRttStore {
         let mut pairs = self.pairs.lock();
         match pairs.get_mut(&key) {
             Some(existing) => {
-                let changed = existing.rtt_ms != rtt_ms;
-                existing.rtt_ms = rtt_ms;
-                existing.measured_at = now_unix;
-                changed
+                if existing.rtt_ms.abs_diff(rtt_ms) <= RTT_DEADBAND_MS {
+                    existing.measured_at = now_unix;
+                    false
+                } else {
+                    existing.rtt_ms = rtt_ms;
+                    existing.measured_at = now_unix;
+                    true
+                }
             }
             None => {
                 pairs.insert(
@@ -233,6 +257,29 @@ mod tests {
             snap[0].measured_at, 30,
             "even an unchanged re-report refreshes the age"
         );
+    }
+
+    #[test]
+    fn a_report_within_the_dead_band_keeps_the_stored_value() {
+        // The two ends of a pair report independently-measured medians that differ by
+        // noise; the alternating beats must not thrash the value or signal changes.
+        let store = new_store();
+        assert!(store.record(&region("a"), &region("b"), 87, 10));
+        assert!(
+            !store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MS, 20),
+            "a report inside the dead-band is not a change",
+        );
+
+        let snap = store.snapshot();
+        assert_eq!(snap[0].rtt_ms, 87, "the stored value is kept, not nudged");
+        assert_eq!(
+            snap[0].measured_at, 20,
+            "an in-band re-report still refreshes the age"
+        );
+
+        // One past the band is a real shift: it lands and signals.
+        assert!(store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MS + 1, 30));
+        assert_eq!(store.snapshot()[0].rtt_ms, 87 + RTT_DEADBAND_MS + 1);
     }
 
     #[test]
