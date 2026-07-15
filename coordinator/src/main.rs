@@ -20,7 +20,9 @@ use rally_point_coordinator::provision::{
 };
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
-use rally_point_coordinator::{acme, notify, regions, registry, session, tenant, tenant_config};
+use rally_point_coordinator::{
+    acme, notify, pair_rtts, regions, registry, session, tenant, tenant_config,
+};
 use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
 
@@ -391,6 +393,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The backbone-RTT pair table: relays report measured region-pair round-trips on
+    // their heartbeats, the coordinator aggregates them here, and `GET /regions` serves
+    // them. Seeded from the ledger at startup so last-known values survive a restart or
+    // a scale-to-zero; memory-only (still functional within a process lifetime) when no
+    // ledger is configured. A read failure is logged and left empty rather than failing
+    // startup — the table is informational telemetry, not a serving prerequisite.
+    let pair_rtts = pair_rtts::new_store();
+    if let Some(ledger) = &ledger {
+        match ledger.pair_rtts() {
+            Ok(rows) => {
+                let count = rows.len();
+                pair_rtts.seed(rows);
+                tracing::info!(count, "seeded the backbone-RTT table from the ledger");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "loading backbone RTTs from the ledger failed; starting with an empty table",
+                );
+            }
+        }
+    }
+
     let lifecycle = Lifecycle::new(setup.clone());
     let notices = notify::new_dedup();
     // Let the lifecycle prune these dedup sets when it removes a session's state,
@@ -414,6 +439,7 @@ async fn main() -> Result<()> {
         regions,
         player_token_lifetime: Duration::from_secs(cli.player_token_lifetime_secs),
         ledger,
+        pair_rtts,
     };
 
     let app = api::router(state);

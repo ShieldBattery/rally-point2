@@ -46,6 +46,8 @@ use rally_point_proto::ids::RelayId;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::pair_rtts::PairRttEntry;
+
 /// How long a blocked writer waits for the database lock before erroring, rather
 /// than failing instantly on transient contention.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,13 +57,15 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// collision risk.
 const TOKEN_BYTES: usize = 32;
 
-/// The initial schema, applied once to a fresh database (one whose
-/// `user_version` is still 0) and stamping it `user_version = 1`. A later build
-/// that adds a migration bumps that number and keys its migration off the value
-/// [`RelayLedger::open`] reads. `AUTOINCREMENT` on the primary key guarantees a
-/// retired id is never handed out again, so a tombstone can never be shadowed by
-/// a freshly minted relay reusing the number.
-const SCHEMA: &str = "\
+/// The v1 schema, applied to a fresh database (one whose `user_version` is still 0)
+/// and stamping it `user_version = 1`. Each later schema version is a separate
+/// migration [`RelayLedger::open`] applies in order, keyed off the version it reads:
+/// a fresh file runs every step up to the latest, while an existing file runs only
+/// the steps past its recorded version, so its rows survive the upgrade.
+/// `AUTOINCREMENT` on the primary key guarantees a retired id is never handed out
+/// again, so a tombstone can never be shadowed by a freshly minted relay reusing the
+/// number.
+const SCHEMA_V1: &str = "\
 CREATE TABLE IF NOT EXISTS provisioned_relays (
   relay_id          INTEGER PRIMARY KEY AUTOINCREMENT,
   region            TEXT,
@@ -81,6 +85,21 @@ CREATE TABLE IF NOT EXISTS provisioned_relays (
   retired_at        INTEGER
 );
 PRAGMA user_version = 1;";
+
+/// The v2 migration: the backbone-RTT table the coordinator persists so last-known
+/// region-pair round-trips survive a restart or a scale-to-zero. One row per
+/// canonical region pair (`region_a <= region_b`), upserted on report and stamped
+/// with the Unix second it was recorded. Additive — it leaves every v1 table and its
+/// rows untouched — and stamps `user_version = 2`.
+const SCHEMA_V2: &str = "\
+CREATE TABLE IF NOT EXISTS region_pair_rtts (
+  region_a    TEXT NOT NULL,
+  region_b    TEXT NOT NULL,
+  rtt_ms      INTEGER NOT NULL,
+  measured_at INTEGER NOT NULL,
+  PRIMARY KEY (region_a, region_b)
+);
+PRAGMA user_version = 2;";
 
 /// A failure operating the ledger's storage — distinct from an
 /// [`EnrollRefusal`], which is a *decision* the ledger reached, not a fault.
@@ -192,18 +211,27 @@ pub struct RelayLedger {
 }
 
 impl RelayLedger {
-    /// Opens (creating if absent) the ledger database at `path`, applying the
-    /// schema to a fresh file and leaving an already-initialized one untouched.
-    /// Runs in WAL journal mode with a bounded busy timeout, so a reader never
-    /// blocks the single writer and transient lock contention waits rather than
+    /// Opens (creating if absent) the ledger database at `path`, migrating it forward
+    /// to the current schema and leaving an already-current one untouched. Each schema
+    /// step past the file's recorded `user_version` is applied in order, so a fresh
+    /// file gets every table while an existing one gets only the additions and keeps
+    /// its rows. Runs in WAL journal mode with a bounded busy timeout, so a reader
+    /// never blocks the single writer and transient lock contention waits rather than
     /// erroring.
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Apply each schema step whose version this file has not reached yet, in
+        // order. Every step stamps its own `user_version`, so a fresh file (version 0)
+        // runs both and ends at 2, while a v1 file runs only the v2 migration —
+        // preserving its provisioned-relay rows.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            conn.execute_batch(SCHEMA)?;
+        if version < 1 {
+            conn.execute_batch(SCHEMA_V1)?;
+        }
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -546,6 +574,54 @@ impl RelayLedger {
             )
             .optional()?;
         Ok(arn.flatten())
+    }
+
+    /// Records `rtt_ms` for the canonical region pair `(region_a, region_b)` — the
+    /// caller orders them `region_a <= region_b` — stamped `measured_at` in Unix
+    /// seconds. Upserts on the pair's primary key, so a later report overwrites the
+    /// stored value. The coordinator calls this only when the in-memory value actually
+    /// changed, so a steady-state re-report every heartbeat costs no write.
+    pub fn record_pair_rtt(
+        &self,
+        region_a: &RegionId,
+        region_b: &RegionId,
+        rtt_ms: u32,
+        measured_at: u64,
+    ) -> Result<(), LedgerError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO region_pair_rtts (region_a, region_b, rtt_ms, measured_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(region_a, region_b)
+             DO UPDATE SET rtt_ms = excluded.rtt_ms, measured_at = excluded.measured_at",
+            params![
+                region_a.as_ref(),
+                region_b.as_ref(),
+                as_i64(u64::from(rtt_ms)),
+                as_i64(measured_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored region-pair round-trip, as canonical rows — the startup load the
+    /// coordinator seeds its in-memory table from so last-known values survive a
+    /// restart. Unordered; the caller sorts if it needs a deterministic order.
+    pub fn pair_rtts(&self) -> Result<Vec<PairRttEntry>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT region_a, region_b, rtt_ms, measured_at FROM region_pair_rtts")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PairRttEntry {
+                    a: RegionId(row.get::<_, String>(0)?),
+                    b: RegionId(row.get::<_, String>(1)?),
+                    rtt_ms: as_u64(row.get::<_, i64>(2)?) as u32,
+                    measured_at: as_u64(row.get::<_, i64>(3)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 
@@ -1202,5 +1278,139 @@ mod tests {
             None,
             "an unknown id has no recorded task",
         );
+    }
+
+    #[test]
+    fn record_pair_rtt_round_trips() {
+        let ledger = ledger();
+        ledger
+            .record_pair_rtt(&region("eu-west"), &region("us-east"), 87, 1_752_555_555)
+            .unwrap();
+
+        let rows = ledger.pair_rtts().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].a, region("eu-west"));
+        assert_eq!(rows[0].b, region("us-east"));
+        assert_eq!(rows[0].rtt_ms, 87);
+        assert_eq!(rows[0].measured_at, 1_752_555_555);
+    }
+
+    #[test]
+    fn record_pair_rtt_upserts_on_the_pair() {
+        // A second report for the same pair overwrites the stored value rather than
+        // inserting a duplicate — the change-only write-through relies on one row per
+        // pair.
+        let ledger = ledger();
+        ledger
+            .record_pair_rtt(&region("a"), &region("b"), 50, 10)
+            .unwrap();
+        ledger
+            .record_pair_rtt(&region("a"), &region("b"), 75, 20)
+            .unwrap();
+
+        let rows = ledger.pair_rtts().unwrap();
+        assert_eq!(rows.len(), 1, "the pair has a single row");
+        assert_eq!(rows[0].rtt_ms, 75, "the later report wins");
+        assert_eq!(rows[0].measured_at, 20);
+    }
+
+    #[test]
+    fn a_fresh_ledger_stamps_the_current_schema_version() {
+        let ledger = ledger();
+        let version: i64 = ledger
+            .conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 2,
+            "a fresh file is created at the latest schema version"
+        );
+        // Both versions' tables exist on a fresh file.
+        ledger
+            .record_pair_rtt(&region("a"), &region("b"), 1, 1)
+            .unwrap();
+        assert_eq!(ledger.pair_rtts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_v1_file_upgrades_to_v2_and_keeps_its_provisioned_relays() {
+        // A database created at schema v1 (before the backbone-RTT table existed) is
+        // opened by this build: the v2 migration adds the new table while every v1
+        // provisioned-relay row survives untouched.
+        let path = temp_db_path();
+
+        // Stand up a v1-only file: the v1 schema plus one provisioned-relay row, with
+        // no v2 table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO provisioned_relays (token_hash, token_expires_at, launched_at)
+                 VALUES (?1, ?2, ?3)",
+                params![[0u8; 32].as_slice(), 9_999_i64, 1_000_i64],
+            )
+            .unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "the hand-built file is at v1");
+        }
+
+        // Open through the ledger: it migrates the file forward to v2.
+        let ledger = RelayLedger::open(&path).unwrap();
+        let version: i64 = ledger
+            .conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the file is migrated to v2");
+
+        // The v1 provisioned-relay row survived the upgrade.
+        let relays: i64 = ledger
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM provisioned_relays", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            relays, 1,
+            "the v1 provisioned-relay row survives the migration"
+        );
+
+        // The new backbone-RTT table exists and is usable.
+        ledger
+            .record_pair_rtt(&region("a"), &region("b"), 42, 7)
+            .unwrap();
+        assert_eq!(ledger.pair_rtts().unwrap().len(), 1);
+
+        // Drop the connection before removing the file: Windows refuses to delete a
+        // file an open handle still holds.
+        drop(ledger);
+        cleanup_db(&path);
+    }
+
+    /// A unique temp-file path for the migration test, which needs a real file that
+    /// survives a close and reopen (an in-memory database cannot, since each open is a
+    /// fresh database).
+    fn temp_db_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rp2-ledger-migration-{}-{nanos}.sqlite",
+            std::process::id()
+        ));
+        path
+    }
+
+    /// Best-effort removal of a temp database and its WAL sidecars.
+    fn cleanup_db(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 }

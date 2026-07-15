@@ -60,6 +60,7 @@ async fn serve_ledger_coordinator() -> (String, RelayRegistry, Arc<RelayLedger>)
         regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
         ledger: Some(ledger.clone()),
+        pair_rtts: rally_point_coordinator::pair_rtts::new_store(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

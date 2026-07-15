@@ -24,6 +24,10 @@
 //!   relays piggyback on their heartbeats, aggregated so a tenant's app server
 //!   can ask "is user U in a live game" and block an in-game player from
 //!   re-queueing.
+//! - **pair_rtts** ([`pair_rtts`]) — the backbone-RTT pair table: the aggregate of
+//!   the region-to-region round-trips relays measure and report on their
+//!   heartbeats, served on `GET /regions` and persisted through the ledger so
+//!   last-known values survive a restart.
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
@@ -66,6 +70,7 @@ pub mod identity;
 pub mod ledger;
 pub mod lifecycle;
 pub mod notify;
+pub mod pair_rtts;
 pub mod presence;
 pub mod provision;
 pub mod regions;

@@ -83,9 +83,9 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RelayEndpoint, RelayHello,
-    RelayToCoordinator, SessionDescriptor, SessionRequest, SessionResponse, TenantId,
-    TenantVerifyingKey,
+    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RegionId, RegionRttReport,
+    RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
+    SessionResponse, TenantId, TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -101,8 +101,9 @@ use crate::identity;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
 use crate::notify::{self, NoticeDedup};
+use crate::pair_rtts::{self, PairRttEntry, PairRttStore};
 use crate::presence;
-use crate::regions::RegionsConfig;
+use crate::regions::{Region, RegionsConfig};
 use crate::registry;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 use crate::tenant;
@@ -237,6 +238,13 @@ pub struct CoordinatorState {
     /// posture, where an enroll's id claim is accepted as presented and this whole
     /// path is untouched. Shared across all relay control connections.
     pub ledger: Option<Arc<RelayLedger>>,
+    /// The backbone-RTT pair table: the aggregate of the region-to-region round-trips
+    /// relays measure and report on their heartbeats. Written from each relay control
+    /// connection's heartbeat ingest and read by `GET /regions` to serve the pair
+    /// list. Seeded from the ledger at startup when one is present, so last-known
+    /// values survive a restart; memory-only otherwise. Shared (an `Arc`) across all
+    /// relay control connections and the HTTP state.
+    pub pair_rtts: PairRttStore,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -882,16 +890,41 @@ async fn tenant_pubkey(
     }))
 }
 
-/// Serves the coordinator's configured region list as `{"regions": [...]}` (ids,
-/// display names, and ping targets), in the file's display order.
+/// The `GET /regions` response body: the coordinator's configured region list plus
+/// the live backbone-RTT table it has aggregated from relay heartbeats.
+///
+/// A superset of the bare `{"regions": [...]}` the config alone serves: `backbone_rtts`
+/// is a sibling list of measured region-pair round-trips, canonical (`a <= b`) and
+/// sorted, and is **omitted entirely** when no pair has been measured — so a
+/// coordinator serving no measurements returns byte-for-byte the shape it always has.
+/// Built at response time from the config's region list and a store snapshot, leaving
+/// [`RegionsConfig`]'s own serialization untouched.
+#[derive(Serialize)]
+struct RegionsResponse {
+    /// The configured regions, in file (display) order — the same shape and order
+    /// [`RegionsConfig`] serves on its own.
+    regions: Vec<Region>,
+    /// The measured backbone round-trips, canonical and sorted; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    backbone_rtts: Vec<PairRttEntry>,
+}
+
+/// Serves the coordinator's configured region list plus the measured backbone-RTT
+/// table as `{"regions": [...], "backbone_rtts": [...]}` — the region list in file
+/// (display) order, the pair list canonical (`a <= b`) and sorted. `backbone_rtts` is
+/// omitted entirely when no pair has been measured, leaving the exact `{"regions":
+/// [...]}` shape.
 ///
 /// **Unauthenticated GET**, following the `GET /tenant/:tenant/pubkey`
 /// precedent: the request-signature scheme covers body-carrying mutations, and
 /// this list is client-public by design — the SB server forwards it verbatim to
 /// every game client. An empty body (`{"regions": []}`) is the honest answer for
 /// a coordinator with no `--regions` config.
-async fn regions(State(state): State<CoordinatorState>) -> Json<RegionsConfig> {
-    Json(state.regions.clone())
+async fn regions(State(state): State<CoordinatorState>) -> Json<RegionsResponse> {
+    Json(RegionsResponse {
+        regions: state.regions.regions().to_vec(),
+        backbone_rtts: state.pair_rtts.snapshot(),
+    })
 }
 
 /// Accepts a relay's persistent control connection (a WebSocket).
@@ -940,6 +973,7 @@ async fn relay_control(
     let liveness_timeout = state.liveness_timeout;
     let regions = state.regions.clone();
     let ledger = state.ledger.clone();
+    let pair_rtts = state.pair_rtts.clone();
     let peer_ip = peer_addr.map(|addr| addr.ip());
     ws.on_upgrade(move |socket| {
         serve_relay_control(
@@ -952,6 +986,7 @@ async fn relay_control(
             regions,
             ledger,
             peer_ip,
+            pair_rtts,
         )
     })
 }
@@ -1001,6 +1036,7 @@ async fn serve_relay_control(
     regions: RegionsConfig,
     ledger: Option<Arc<RelayLedger>>,
     peer_ip: Option<IpAddr>,
+    pair_rtts: PairRttStore,
 ) {
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
@@ -1063,6 +1099,10 @@ async fn serve_relay_control(
     }
 
     let relay_id = hello.relay_id;
+    // The relay's own region — the near end of every backbone pair it measures.
+    // Captured before the hello is consumed by enrollment; validated against the
+    // config above, so a heartbeat's reports fold against a known region.
+    let relay_region = hello.region.clone();
     let registry = setup.registry();
 
     // Every accepted control connection proves possession of its certificate's
@@ -1160,6 +1200,12 @@ async fn serve_relay_control(
         "relay enrolled over control connection"
     );
 
+    let rtt_ingest = RegionRttIngest {
+        relay_region: relay_region.as_ref(),
+        regions: &regions,
+        store: &pair_rtts,
+        ledger: ledger.as_deref(),
+    };
     push_and_watch(
         &mut socket,
         &setup,
@@ -1169,6 +1215,7 @@ async fn serve_relay_control(
         relay_id,
         generation,
         liveness_timeout,
+        &rtt_ingest,
     )
     .await;
 
@@ -1276,6 +1323,7 @@ async fn push_and_watch(
     relay_id: RelayId,
     generation: u64,
     liveness_timeout: Duration,
+    rtt: &RegionRttIngest<'_>,
 ) {
     let mut rx = setup.descriptors().subscribe(relay_id);
     // The reap outbox for this relay: the reap policies push `CloseSlot`
@@ -1363,8 +1411,9 @@ async fn push_and_watch(
                 match inbound {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        let action =
-                            note_inbound(setup, notices, lifecycle, relay_id, generation, &message);
+                        let action = note_inbound(
+                            setup, notices, lifecycle, relay_id, generation, &message, rtt,
+                        );
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                         // A Draining frame additionally runs the drain exchange: mark
@@ -1649,6 +1698,73 @@ async fn send_drain_ack_before_deadline(
     }
 }
 
+/// The inputs a relay control connection threads from enroll down to
+/// [`note_inbound`], where each heartbeat's `region_rtts` fold into the coordinator's
+/// backbone-RTT table.
+///
+/// `relay_region` is the reporting relay's own region — the near end of every pair it
+/// measures — validated at enroll; a region-less relay reports nothing. `regions` is
+/// the coordinator's configured set, so a report naming a region it does not list (a
+/// stale target after a config change) is dropped. `store` is the shared pair table,
+/// and `ledger` is the optional persistence a *changed* pair value is written through
+/// to.
+struct RegionRttIngest<'a> {
+    relay_region: Option<&'a RegionId>,
+    regions: &'a RegionsConfig,
+    store: &'a PairRttStore,
+    ledger: Option<&'a RelayLedger>,
+}
+
+/// Folds a heartbeat's `region_rtts` into the backbone-RTT table: each report pairs
+/// the reporting relay's own region with the region it measured, recorded
+/// last-write-wins. A report naming a region the coordinator does not configure is
+/// dropped (a stale target list after a config change); a relay with no region
+/// contributes nothing. When a value actually changed and a ledger is present, the
+/// change is persisted so last-known round-trips survive a restart — a steady-state
+/// re-report (the same value every heartbeat) changes nothing and writes nothing.
+///
+/// `measured_at` is stamped with a plain Unix-seconds now, `0` on a pre-epoch clock
+/// rather than failing: the value is informational (it exposes a pair's age), not
+/// security-bearing like the ledger's token expiry.
+fn ingest_region_rtts(rtt: &RegionRttIngest<'_>, relay_id: RelayId, reports: &[RegionRttReport]) {
+    let Some(relay_region) = rtt.relay_region else {
+        if !reports.is_empty() {
+            tracing::debug!(
+                relay_id = relay_id.0,
+                "ignoring backbone RTT reports from a relay with no configured region",
+            );
+        }
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for report in reports {
+        if !rtt.regions.contains(&report.region) {
+            tracing::debug!(
+                relay_id = relay_id.0,
+                region = report.region.as_ref(),
+                "dropping a backbone RTT report for a region not in the coordinator's config",
+            );
+            continue;
+        }
+        let changed = rtt
+            .store
+            .record(relay_region, &report.region, report.rtt_ms, now);
+        if changed && let Some(ledger) = rtt.ledger {
+            let (a, b) = pair_rtts::canonical_pair(relay_region, &report.region);
+            if let Err(error) = ledger.record_pair_rtt(a, b, report.rtt_ms, now) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    %error,
+                    "persisting a backbone RTT to the ledger failed; keeping the in-memory value",
+                );
+            }
+        }
+    }
+}
+
 /// What an inbound relay frame asks the connection loop to do beyond the liveness
 /// refresh every frame already triggers. Most frames drive their webhook/lifecycle
 /// side effects inside [`note_inbound`] and ask nothing further ([`None`](Self::None));
@@ -1686,6 +1802,7 @@ fn note_inbound(
     relay_id: RelayId,
     generation: u64,
     message: &Message,
+    rtt: &RegionRttIngest<'_>,
 ) -> InboundAction {
     let Message::Text(text) = message else {
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
@@ -1693,7 +1810,7 @@ fn note_inbound(
     match serde_json::from_str::<RelayToCoordinator>(text) {
         Ok(RelayToCoordinator::Heartbeat {
             sessions,
-            region_rtts: _,
+            region_rtts,
         }) => {
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat");
             // The beat's roster feeds active-player presence — but only from the
@@ -1718,6 +1835,10 @@ fn note_inbound(
                         lifecycle.on_presence_seen(session.tenant.clone(), session.session);
                     }
                 }
+                // Backbone RTTs fold in under the same generation fence as presence: a
+                // stale connection's beat describes a superseded view, so its measured
+                // pairs must not overwrite what the live connection reports.
+                ingest_region_rtts(rtt, relay_id, &region_rtts);
             } else {
                 tracing::debug!(
                     relay_id = relay_id.0,
@@ -2216,6 +2337,7 @@ mod tests {
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
+            pair_rtts: pair_rtts::new_store(),
         }
     }
 
@@ -2621,6 +2743,7 @@ mod tests {
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
+            pair_rtts: pair_rtts::new_store(),
         };
         let app = router(state);
 
@@ -2725,6 +2848,7 @@ mod tests {
             regions: RegionsConfig::default(),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
+            pair_rtts: pair_rtts::new_store(),
         };
         let app = router(state);
 
@@ -2817,6 +2941,10 @@ mod tests {
         assert_eq!(regions[0]["beacon"], "e:20000");
         assert_eq!(regions[0]["fallback"], "e:443");
         assert_eq!(regions[1]["id"], "eu-west");
+        assert!(
+            json.get("backbone_rtts").is_none(),
+            "an empty pair table omits the backbone_rtts field entirely",
+        );
     }
 
     #[tokio::test]
@@ -2824,6 +2952,46 @@ mod tests {
         // No config = an empty list, not an error — the region-blind posture.
         let json = get_regions(router(state_with_relay_and_tenant())).await;
         assert_eq!(json["regions"].as_array().unwrap().len(), 0);
+        assert!(
+            json.get("backbone_rtts").is_none(),
+            "with no measurements the response is the bare {{\"regions\": [...]}} shape",
+        );
+    }
+
+    #[tokio::test]
+    async fn regions_endpoint_serves_recorded_backbone_rtts() {
+        // With pairs recorded, the endpoint serves them under backbone_rtts, canonical
+        // (a <= b) and sorted, alongside the region list.
+        let mut state = state_with_relay_and_tenant();
+        state.regions = regions_config(&["us-east", "eu-west", "ap-south"]);
+        let now = 1_752_555_555;
+        // Recorded from either direction and in a non-sorted order — the serve path
+        // canonicalizes and sorts.
+        state.pair_rtts.record(
+            &RegionId("us-east".to_owned()),
+            &RegionId("eu-west".to_owned()),
+            87,
+            now,
+        );
+        state.pair_rtts.record(
+            &RegionId("ap-south".to_owned()),
+            &RegionId("us-east".to_owned()),
+            142,
+            now,
+        );
+
+        let json = get_regions(router(state)).await;
+        assert_eq!(json["regions"].as_array().unwrap().len(), 3);
+        let rtts = json["backbone_rtts"].as_array().unwrap();
+        assert_eq!(rtts.len(), 2);
+        // Sorted by (a, b): ap-south|us-east precedes eu-west|us-east.
+        assert_eq!(rtts[0]["a"], "ap-south");
+        assert_eq!(rtts[0]["b"], "us-east");
+        assert_eq!(rtts[0]["rtt_ms"].as_u64().unwrap(), 142);
+        assert_eq!(rtts[0]["measured_at"].as_u64().unwrap(), now);
+        assert_eq!(rtts[1]["a"], "eu-west");
+        assert_eq!(rtts[1]["b"], "us-east");
+        assert_eq!(rtts[1]["rtt_ms"].as_u64().unwrap(), 87);
     }
 
     // -- Notice reporter authorization (cross-tenant forgery guard) --
@@ -2927,6 +3095,120 @@ mod tests {
         Message::Text(json.into())
     }
 
+    /// A no-op backbone-RTT ingest for the notice tests, whose inbound messages are
+    /// never heartbeats — its store stays empty and untouched. Borrows caller-owned
+    /// temporaries so the returned view lives as long as they do.
+    fn idle_rtt_ingest<'a>(
+        regions: &'a RegionsConfig,
+        store: &'a PairRttStore,
+    ) -> RegionRttIngest<'a> {
+        RegionRttIngest {
+            relay_region: None,
+            regions,
+            store,
+            ledger: None,
+        }
+    }
+
+    /// A `Heartbeat` framed as an inbound control message, carrying the given
+    /// `(region, rtt_ms)` backbone measurements and an empty session roster.
+    fn heartbeat_with_rtts(rtts: &[(&str, u32)]) -> Message {
+        let region_rtts = rtts
+            .iter()
+            .map(|(region, rtt_ms)| RegionRttReport {
+                region: RegionId((*region).to_owned()),
+                rtt_ms: *rtt_ms,
+            })
+            .collect();
+        let heartbeat = RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts,
+        };
+        Message::Text(serde_json::to_string(&heartbeat).unwrap().into())
+    }
+
+    #[test]
+    fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
+        // A relay enrolled in region-a reports a round-trip to region-b. The reports
+        // fold into the pair store — but only from the relay's CURRENT connection: a
+        // superseded (stale-generation) beat is dropped whole, the same fence presence
+        // is under.
+        let reg = registry::new_registry();
+        let hello = RelayHello::new(
+            RelayId(1),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xC1; 4],
+        )
+        .with_region(RegionId("region-a".to_owned()));
+        // Enroll twice: the second connection supersedes the first, so the first
+        // generation is no longer current.
+        let stale_generation = registry::enroll(&reg, hello.clone());
+        let current_generation = registry::enroll(&reg, hello);
+        let setup = crate::session::SessionSetup::new(reg, crate::tenant::new_store());
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+        let regions = regions_config(&["region-a", "region-b"]);
+        let relay_region = RegionId("region-a".to_owned());
+        let store = pair_rtts::new_store();
+        let rtt = RegionRttIngest {
+            relay_region: Some(&relay_region),
+            regions: &regions,
+            store: &store,
+            ledger: None,
+        };
+        let beat = heartbeat_with_rtts(&[("region-b", 87)]);
+
+        // The stale connection's beat writes nothing.
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            stale_generation,
+            &beat,
+            &rtt,
+        );
+        assert!(
+            store.snapshot().is_empty(),
+            "a superseded connection's heartbeat writes no backbone RTTs",
+        );
+
+        // The current connection's beat folds the pair in.
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            current_generation,
+            &beat,
+            &rtt,
+        );
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].a, RegionId("region-a".to_owned()));
+        assert_eq!(snap[0].b, RegionId("region-b".to_owned()));
+        assert_eq!(snap[0].rtt_ms, 87);
+
+        // A report for a region the coordinator does not configure is dropped, leaving
+        // the known pair untouched.
+        let unknown = heartbeat_with_rtts(&[("region-z", 42)]);
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            current_generation,
+            &unknown,
+            &rtt,
+        );
+        assert_eq!(
+            store.snapshot().len(),
+            1,
+            "a report for an unconfigured region is dropped",
+        );
+    }
+
     #[test]
     fn relay_serves_session_enforces_membership_only_when_a_serving_set_exists() {
         let (setup, _notices, _lifecycle, session) =
@@ -2964,6 +3246,7 @@ mod tests {
             RelayId(2),
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
+            &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
         );
 
         assert!(
@@ -2986,6 +3269,7 @@ mod tests {
             RelayId(1),
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
+            &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -3011,6 +3295,7 @@ mod tests {
             RelayId(2),
             0, // no live connection generation in this direct-call test
             &result_message(SessionId(4242), 0),
+            &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -3524,6 +3809,7 @@ mod tests {
             regions: regions_config(region_ids),
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
+            pair_rtts: pair_rtts::new_store(),
         }
     }
 

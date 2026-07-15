@@ -16,11 +16,11 @@ use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{notify, registry, session, tenant};
+use rally_point_coordinator::{notify, pair_rtts, registry, session, tenant};
 use rally_point_proto::control::{
     BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionBeaconTarget,
-    RegionId, RelayHello, RelayToCoordinator, ResultNotice, SessionDescriptor, SessionRequest,
-    TenantId,
+    RegionId, RegionRttReport, RelayHello, RelayToCoordinator, ResultNotice, SessionDescriptor,
+    SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -148,6 +148,7 @@ async fn serve_bare_coordinator(
         regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
+        pair_rtts: pair_rtts::new_store(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -229,6 +230,7 @@ async fn coordinator_with_session(
         regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
+        pair_rtts: pair_rtts::new_store(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -621,6 +623,7 @@ async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (Strin
         regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
+        pair_rtts: pair_rtts::new_store(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -975,6 +978,7 @@ async fn serve_coordinator_with_regions(regions: RegionsConfig) -> (String, Sess
         regions,
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
+        pair_rtts: pair_rtts::new_store(),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1346,5 +1350,84 @@ async fn no_region_beacons_are_pushed_without_a_region_config() {
         text.contains("\"type\":\"descriptors\""),
         "with no region config the descriptor re-sync directly follows the tenant keys, \
          with no region-beacons frame between: {text}",
+    );
+}
+
+// --- Backbone RTT ingest + serve (end to end) ---
+
+/// Fetches `GET {base_url}/regions` over a throwaway HTTP/1.1 connection and returns
+/// the parsed JSON body. A raw request keeps these tests free of an HTTP-client
+/// dependency; `Connection: close` lets the read run to EOF.
+async fn get_regions_json(base_url: &str) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = base_url
+        .strip_prefix("http://")
+        .expect("an http:// base url");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET /regions HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8(raw).expect("the response is UTF-8");
+    let (_headers, body) = text
+        .split_once("\r\n\r\n")
+        .expect("the response separates headers from the body");
+    serde_json::from_str(body).expect("the body is JSON")
+}
+
+#[tokio::test]
+async fn a_heartbeats_region_rtts_are_served_on_the_regions_endpoint() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A coordinator with two configured regions. A relay enrolls in region-a and
+    // heartbeats a measured round-trip to region-b; the coordinator folds it into the
+    // pair table and serves it on GET /regions.
+    let (base_url, _setup) = serve_coordinator_with_regions(two_region_config()).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
+    let frame = serde_json::to_string(&RelayToCoordinator::Hello(hello)).unwrap();
+    socket.send(Message::Text(frame.into())).await.unwrap();
+    common::prove_identity(&mut socket, &relay_key(9)).await;
+    // Drain the connect-time lead (tenant keys, region beacons, descriptor re-sync) so
+    // the socket is not backpressured before the heartbeat is sent.
+    let _ = read_to_descriptors(&mut socket).await;
+
+    // Report a round-trip to region-b (the relay's own region-a is skipped by the pair
+    // definition). The heartbeat is declarative, so one beat carries the whole set.
+    let heartbeat = RelayToCoordinator::Heartbeat {
+        sessions: vec![],
+        region_rtts: vec![RegionRttReport {
+            region: RegionId("region-b".to_owned()),
+            rtt_ms: 87,
+        }],
+    };
+    let beat = serde_json::to_string(&heartbeat).unwrap();
+    socket.send(Message::Text(beat.into())).await.unwrap();
+
+    // The ingest is asynchronous; poll GET /regions until the pair appears.
+    let mut served = None;
+    for _ in 0..100 {
+        let json = get_regions_json(&base_url).await;
+        if let Some(rtts) = json.get("backbone_rtts").and_then(|v| v.as_array())
+            && !rtts.is_empty()
+        {
+            served = Some(json);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let json = served.expect("the reported pair is served on GET /regions");
+    let rtts = json["backbone_rtts"].as_array().unwrap();
+    assert_eq!(rtts.len(), 1);
+    assert_eq!(rtts[0]["a"].as_str().unwrap(), "region-a");
+    assert_eq!(rtts[0]["b"].as_str().unwrap(), "region-b");
+    assert_eq!(rtts[0]["rtt_ms"].as_u64().unwrap(), 87);
+    assert!(
+        rtts[0].get("measured_at").is_some(),
+        "each served pair carries its recorded age",
     );
 }
