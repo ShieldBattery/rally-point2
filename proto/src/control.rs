@@ -875,6 +875,26 @@ pub struct TenantVerifyingKey {
     pub verifying_key: Vec<u8>,
 }
 
+/// One region's ping beacon, as the coordinator distributes it to relays: the
+/// region id paired with the `host:port` of that region's always-up UDP ping
+/// beacon — the target a relay measures a backbone round-trip to.
+///
+/// Named after the coordinator region registry's own `beacon` field, whose value
+/// this carries; the beacon is a `host:port` **string** (a DNS hostname the relay
+/// resolves at ping time), not a pre-resolved socket address, mirroring the
+/// registry where the same endpoint is the client-facing measurement target.
+/// Carried in a [`CoordinatorToRelay::RegionBeacons`] push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionBeaconTarget {
+    /// The region this beacon belongs to — the wire name a relay reports its
+    /// measured round-trip against.
+    pub region: RegionId,
+    /// `host:port` of the region's always-up ping beacon, the target a relay
+    /// measures the backbone round-trip to. A DNS hostname resolved at ping time,
+    /// not a pre-resolved socket address.
+    pub beacon: String,
+}
+
 /// The fixed prefix signed (and verified) in the enroll proof-of-possession
 /// exchange: the relay signs `ENROLL_POP_CONTEXT ++ nonce` — never the bare
 /// nonce — so a signature produced for this purpose can never be replayed as
@@ -979,6 +999,25 @@ pub enum CoordinatorToRelay {
     TenantKeys {
         /// The complete set of tenant verifying keys.
         keys: Vec<TenantVerifyingKey>,
+    },
+    /// The region ping beacons a relay measures backbone round-trips against —
+    /// one entry per region in the coordinator's registry, each naming the
+    /// region's always-up UDP ping beacon.
+    ///
+    /// The coordinator sends the whole set once when the control connection
+    /// starts, ahead of the first session descriptor, and the relay replaces its
+    /// stored set wholesale on the push — declarative complete state, exactly like
+    /// [`MeshPeers`](Self::MeshPeers) and [`TenantKeys`](Self::TenantKeys). The
+    /// region registry is immutable per coordinator process, so this is a one-time
+    /// connect-time push; a relay that reconnects re-syncs the full set. The set
+    /// names every configured region, **including the one the receiving relay
+    /// serves** — the relay drops its own before measuring, since a region's
+    /// round-trip to itself is zero by definition. A coordinator with no regions
+    /// configured omits this frame entirely, so a relay on a region-blind fleet
+    /// receives no targets and measures nothing.
+    RegionBeacons {
+        /// The complete set of region ping beacon targets.
+        beacons: Vec<RegionBeaconTarget>,
     },
     /// A random challenge proving the relay holds the private key matching the
     /// certificate its `Hello` presented (enroll proof-of-possession): the

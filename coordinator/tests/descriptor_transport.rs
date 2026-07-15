@@ -18,8 +18,9 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionId, RelayHello,
-    RelayToCoordinator, ResultNotice, SessionDescriptor, SessionRequest, TenantId,
+    BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionBeaconTarget,
+    RegionId, RelayHello, RelayToCoordinator, ResultNotice, SessionDescriptor, SessionRequest,
+    TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -37,8 +38,8 @@ use tokio::time::timeout;
 
 mod common;
 use common::{
-    connect_and_send_hello, expect_tenant_keys, prove_identity, read_to_descriptors, relay_cert,
-    relay_key,
+    connect_and_send_hello, expect_region_beacons, expect_tenant_keys, prove_identity,
+    read_to_descriptors, relay_cert, relay_key,
 };
 use rally_point_relay::auth::SharedRegistry;
 
@@ -1256,4 +1257,81 @@ async fn the_tenant_key_set_is_pushed_before_the_first_descriptor() {
     // The descriptor re-sync follows the tenant-key lead on the same connection.
     let descriptors = read_to_descriptors(&mut socket).await;
     assert!(descriptors.contains("\"type\":\"descriptors\""));
+}
+
+// --- Region ping-beacon distribution ---
+
+#[tokio::test]
+async fn the_region_beacon_set_is_pushed_before_the_first_descriptor() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A coordinator with two configured regions and the test tenant enrolled. A
+    // relay enrolls over a raw control socket so the test can read the exact
+    // post-enroll frame order.
+    let (base_url, _setup) = serve_coordinator_with_regions(two_region_config()).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(9, 14909))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(9)).await;
+
+    // The tenant-key lead comes first; the region-beacon set follows it, still
+    // ahead of any descriptor. Every configured region's beacon is pushed — the
+    // relay filters its own later — in file order.
+    let _ = expect_tenant_keys(&mut socket).await;
+    let beacons = expect_region_beacons(&mut socket).await;
+    assert_eq!(
+        beacons,
+        vec![
+            RegionBeaconTarget {
+                region: RegionId("region-a".to_owned()),
+                beacon: "a:20000".to_owned(),
+            },
+            RegionBeaconTarget {
+                region: RegionId("region-b".to_owned()),
+                beacon: "b:20000".to_owned(),
+            },
+        ],
+        "the beacon set names every configured region, in file order",
+    );
+
+    // The descriptor re-sync follows the beacon lead on the same connection.
+    let descriptors = read_to_descriptors(&mut socket).await;
+    assert!(descriptors.contains("\"type\":\"descriptors\""));
+}
+
+#[tokio::test]
+async fn no_region_beacons_are_pushed_without_a_region_config() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A coordinator with no region config: the region-blind posture has no beacons
+    // to measure, so the connect-time lead is the tenant keys followed directly by
+    // the descriptor re-sync, with no region-beacons frame between them.
+    let (base_url, _setup) = serve_coordinator_with_regions(RegionsConfig::default()).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(9, 14909))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(9)).await;
+
+    // After the tenant-key lead, the very next frame is the descriptor re-sync — a
+    // region-beacons frame interposed here would fail this assertion.
+    let _ = expect_tenant_keys(&mut socket).await;
+    let next = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator answers promptly")
+        .expect("a frame arrives before the stream ends")
+        .unwrap();
+    let Message::Text(text) = next else {
+        panic!("expected the descriptor re-sync, got {next:?}");
+    };
+    assert!(
+        text.contains("\"type\":\"descriptors\""),
+        "with no region config the descriptor re-sync directly follows the tenant keys, \
+         with no region-beacons frame between: {text}",
+    );
 }

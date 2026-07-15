@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rally_point_proto::control::{
-    CoordinatorToRelay, RelayHello, RelayToCoordinator, TenantVerifyingKey,
+    CoordinatorToRelay, RegionBeaconTarget, RelayHello, RelayToCoordinator, TenantVerifyingKey,
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::ProtocolVersion;
@@ -163,11 +163,31 @@ pub async fn expect_tenant_keys(socket: &mut ControlSocket) -> Vec<TenantVerifyi
     }
 }
 
+/// Reads the coordinator's next frame, asserts it is the `RegionBeacons` push, and
+/// returns its targets. A freshly enrolled connection to a coordinator with regions
+/// configured carries this frame — the region ping beacon targets — in its
+/// connect-time lead, ahead of any session descriptor.
+pub async fn expect_region_beacons(socket: &mut ControlSocket) -> Vec<RegionBeaconTarget> {
+    let frame = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator pushes region beacons promptly")
+        .expect("a frame arrives")
+        .unwrap();
+    let Message::Text(text) = frame else {
+        panic!("expected a region_beacons frame, got {frame:?}");
+    };
+    match serde_json::from_str(&text).unwrap() {
+        CoordinatorToRelay::RegionBeacons { beacons } => beacons,
+        other => panic!("expected a region_beacons frame, got: {other:?}"),
+    }
+}
+
 /// Reads down-frames until the enrolled path's initial `descriptors` re-sync
 /// arrives, returning that frame's text. A freshly enrolled connection is led by a
 /// `tenant_keys` push (the relay must be able to verify a session's client tokens
-/// before any descriptor for it lands), so a test that only needs to confirm the
-/// enrolled path proceeds reads past it here. Panics on a close (a refusal) or if
+/// before any descriptor for it lands) and, when the coordinator has regions
+/// configured, a `region_beacons` push — so a test that only needs to confirm the
+/// enrolled path proceeds reads past both here. Panics on a close (a refusal) or if
 /// the stream ends before a descriptor arrives.
 pub async fn read_to_descriptors(socket: &mut ControlSocket) -> String {
     loop {
@@ -180,7 +200,8 @@ pub async fn read_to_descriptors(socket: &mut ControlSocket) -> String {
             Message::Text(text) if text.contains("\"type\":\"descriptors\"") => {
                 return text.to_string();
             }
-            // Skip the tenant_keys lead (and any other non-descriptor push).
+            // Skip the tenant_keys and region_beacons leads (and any other
+            // non-descriptor push).
             Message::Text(_) => continue,
             Message::Close(frame) => {
                 panic!("expected the descriptor re-sync, got a close: {frame:?}")

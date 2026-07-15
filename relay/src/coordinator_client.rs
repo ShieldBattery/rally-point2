@@ -962,6 +962,13 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
                 "ignoring an IdentityChallenge received outside the enroll proof exchange"
             );
         }
+        // A RegionBeacons push names the beacons a relay could measure backbone
+        // round-trips against. This build performs no such measurement, so it
+        // ignores the targets — a no-op that keeps the match exhaustive without
+        // carrying any relay state.
+        CoordinatorToRelay::RegionBeacons { .. } => {
+            tracing::debug!("ignoring a RegionBeacons frame; this relay measures no backbone RTTs");
+        }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
         }

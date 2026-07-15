@@ -83,8 +83,9 @@ use axum::{
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RelayEndpoint, RelayHello, RelayToCoordinator,
-    SessionDescriptor, SessionRequest, SessionResponse, TenantId, TenantVerifyingKey,
+    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RelayEndpoint, RelayHello,
+    RelayToCoordinator, SessionDescriptor, SessionRequest, SessionResponse, TenantId,
+    TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -1162,6 +1163,7 @@ async fn serve_relay_control(
     push_and_watch(
         &mut socket,
         &setup,
+        &regions,
         &notices,
         &lifecycle,
         relay_id,
@@ -1264,9 +1266,11 @@ async fn challenge_and_verify(
 /// timer — leaving a wedged relay registered indefinitely, the exact degraded path
 /// this watch exists to catch. So each send (including the initial re-sync) races
 /// the same deadline, and a send that can't finish in time ends the connection.
+#[allow(clippy::too_many_arguments)]
 async fn push_and_watch(
     socket: &mut WebSocket,
     setup: &SessionSetup,
+    regions: &RegionsConfig,
     notices: &NoticeDedup,
     lifecycle: &Lifecycle,
     relay_id: RelayId,
@@ -1296,6 +1300,19 @@ async fn push_and_watch(
     // a future dynamic registry would re-push from a watch arm in the loop below.
     let tenant_keys = tenant::all_verifying_keys(setup.tenants());
     if !send_tenant_keys_before_deadline(socket, &tenant_keys, relay_id, deadline).await {
+        return;
+    }
+
+    // The region ping beacon targets, pushed once on connect ahead of the first
+    // descriptor, alongside the tenant keys. The region registry is immutable per
+    // process, so this is a one-time connect-time push — a relay that reconnects
+    // re-receives it. A coordinator with no regions configured sends nothing here:
+    // a region-blind fleet has no beacons to measure, so the frame stays off its
+    // connections entirely.
+    let beacon_targets = regions.beacon_targets();
+    if !beacon_targets.is_empty()
+        && !send_region_beacons_before_deadline(socket, &beacon_targets, relay_id, deadline).await
+    {
         return;
     }
 
@@ -1478,6 +1495,44 @@ async fn send_tenant_keys_before_deadline(
             tracing::info!(
                 relay_id = relay_id.0,
                 "tenant-keys push stalled past the liveness deadline; dropping",
+            );
+            false
+        }
+    }
+}
+
+/// Sends the region ping-beacon set down the connection, racing the same liveness
+/// deadline as a descriptor push (a relay that stopped reading must not hold its
+/// registry entry open while wedged). Returns whether the connection should keep
+/// running: `false` on a send error or a stall past the deadline.
+///
+/// Pushed once on connect, ahead of the first descriptor, so a relay learns the
+/// regions it can measure backbone round-trips against as soon as it enrolls. The
+/// caller omits it for a coordinator with no configured regions.
+async fn send_region_beacons_before_deadline(
+    socket: &mut WebSocket,
+    beacons: &[RegionBeaconTarget],
+    relay_id: RelayId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let message = CoordinatorToRelay::RegionBeacons {
+        beacons: beacons.to_vec(),
+    };
+    let json = serde_json::to_string(&message).expect("a region-beacons frame always serializes");
+    tokio::select! {
+        result = socket.send(Message::Text(json.into())) => {
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, relay_id = relay_id.0, "region-beacons push failed");
+                    false
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "region-beacons push stalled past the liveness deadline; dropping",
             );
             false
         }

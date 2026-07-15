@@ -23,7 +23,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rally_point_proto::control::RegionId;
+use rally_point_proto::control::{RegionBeaconTarget, RegionId};
 use serde::{Deserialize, Serialize};
 
 /// The maximum length of a region id, in bytes. Region ids are short opaque
@@ -216,6 +216,20 @@ impl RegionsConfig {
     /// The configured regions, in file (display) order.
     pub fn regions(&self) -> &[Region] {
         &self.regions
+    }
+
+    /// The region ping beacon targets the coordinator distributes to relays — one
+    /// per configured region, in file order, each pairing a region id with its
+    /// `beacon` endpoint. An empty config yields an empty vec, which is the signal
+    /// to omit the push (a region-blind fleet has no beacons to measure).
+    pub fn beacon_targets(&self) -> Vec<RegionBeaconTarget> {
+        self.regions
+            .iter()
+            .map(|region| RegionBeaconTarget {
+                region: region.id.clone(),
+                beacon: region.beacon.clone(),
+            })
+            .collect()
     }
 }
 
