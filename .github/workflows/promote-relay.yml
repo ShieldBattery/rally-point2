@@ -1,0 +1,92 @@
+name: Promote relay image to stable
+
+# Retags an already-published rp2-relay image as `stable` in every regional
+# ECR registry — the fleet's Fargate task definitions all reference
+# `:stable`, so promoting a sha is what puts it in front of real traffic, and
+# no task definition ever needs to change. This RETAGS rather than rebuilds:
+# the digest stays identical in each region, so the image that was tested is
+# bit-for-bit the image running in production. It retags in every regional
+# registry directly rather than retagging us-east-1 and trusting replication
+# to carry the tag move: replication is asynchronous with no completion
+# signal, and promotion should end with every region *provably* serving the
+# promoted digest — which the digest printout at the end confirms. The region
+# list is read from the registry's replication configuration (home region +
+# every destination), so adding a fleet region never requires editing this
+# workflow. Run it manually with the full commit SHA whose image should
+# become stable.
+#
+# Authentication is the same keyless OIDC role used to publish images, so
+# repos/forks without the RELAY_ECR_ROLE_ARN variable set skip this job
+# instead of failing.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA of the image to promote (its per-commit tag must exist in every region)
+        required: true
+        type: string
+
+jobs:
+  promote:
+    name: retag as stable
+    runs-on: ubuntu-latest
+    if: vars.RELAY_ECR_ROLE_ARN != ''
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.RELAY_ECR_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: docker/setup-buildx-action@v4
+      - name: Retag in every region
+        id: retag
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+
+          # Home region plus every replication destination = everywhere the
+          # image exists and every registry a task definition may pull from.
+          replica_regions="$(aws ecr describe-registry \
+            --query 'replicationConfiguration.rules[].destinations[].region' \
+            --output text)"
+          if [ "${replica_regions}" = "None" ]; then replica_regions=""; fi
+          regions="${AWS_REGION} ${replica_regions}"
+          echo "regions=${regions}" >> "$GITHUB_OUTPUT"
+
+          for region in ${regions}; do
+            registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
+            echo "== ${region} (${registry}) =="
+
+            aws ecr get-login-password --region "${region}" \
+              | docker login --username AWS --password-stdin "${registry}"
+
+            # Replication is asynchronous, so a sha pushed moments ago may not
+            # have landed in every replica yet — and a mistyped or
+            # never-published sha would otherwise fail with an opaque
+            # imagetools error. Check first and say plainly what's wrong.
+            if ! aws ecr describe-images \
+              --region "${region}" \
+              --repository-name rp2-relay \
+              --image-ids imageTag="${SHA}" >/dev/null 2>&1; then
+              echo "::error::rp2-relay:${SHA} not found in ${region} - either replication from us-east-1 hasn't caught up yet, or this sha was never published by the publish-relay workflow."
+              exit 1
+            fi
+
+            docker buildx imagetools create \
+              --tag "${registry}/rp2-relay:stable" \
+              "${registry}/rp2-relay:${SHA}"
+          done
+      - name: Show promoted digests
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+
+          for region in ${{ steps.retag.outputs.regions }}; do
+            registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
+            echo "== ${region} =="
+            docker buildx imagetools inspect "${registry}/rp2-relay:stable"
+          done

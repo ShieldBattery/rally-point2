@@ -1,0 +1,54 @@
+name: Publish relay image
+
+# Every commit on main gets an image at
+# <account>.dkr.ecr.us-east-1.amazonaws.com/rp2-relay tagged with its full SHA
+# (plus a moving `latest`). us-east-1 is the home registry; ECR replication
+# (configured by Terraform, not this workflow) copies each push to us-west-2
+# and eu-central-1 so a Fargate task never has to pull cold across regions.
+# Authentication is keyless: this job assumes an IAM role over GitHub's OIDC
+# identity token, so no long-lived AWS credential is stored in the repo. For
+# tamper-evident production pinning, prefer the image *digest* over the SHA
+# tag (tags are mutable in ECR; digests are not).
+#
+# `rp2-relay` is the ECR repository name and must match the Terraform
+# `repo_name` variable the account stack was applied with.
+#
+# Repos/forks that haven't set the RELAY_ECR_ROLE_ARN variable (see the
+# account stack's outputs) skip this job instead of failing, so a fork without
+# AWS access still gets a green CI run.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-relay-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build + push
+    runs-on: ubuntu-latest
+    if: vars.RELAY_ECR_ROLE_ARN != ''
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.RELAY_ECR_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: relay/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/rp2-relay:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/rp2-relay:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
