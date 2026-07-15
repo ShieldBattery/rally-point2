@@ -154,10 +154,17 @@ async fn run_tcp_accept(addr: SocketAddr) -> Result<()> {
 }
 
 fn init_tracing() {
+    use std::io::IsTerminal;
+
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    // Color only when stdout is a real terminal: container logs (docker, CloudWatch)
+    // otherwise fill with raw ANSI escape sequences.
+    fmt()
+        .with_env_filter(filter)
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
 }
 
 #[cfg(test)]
