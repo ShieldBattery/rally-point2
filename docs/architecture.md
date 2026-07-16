@@ -576,11 +576,58 @@ a pluggable sink. Two triggers: **session close** — the same moment the relay 
 the coordinator — and **drain**, which flushes every live recording concurrently under its own 10s
 deadline inside the drain budget (bounded rings × bounded live sessions ⇒ the flush always fits the 90s
 drain ≤ 120s Fargate stopTimeout; the size caps exist precisely so observability can never wedge a
-shutdown). The dev sink writes `<dir>/<tenant>/<session>/<relay_id>.json` (`--flight-dir`); the
-tenant-first prefix is the structural hook for tenant-scoped read authorization when the durable store
-(S3) lands. With no sink configured the relay still records — cheap, bounded — and a flush is a logged
-discard. The **read path is not built**: investigating a blob today means opening the JSON; tenant-facing
-reads land with the durable store, scoped by that same path prefix.
+shutdown). The dev sink writes `<dir>/<tenant>/<session>/<relay_id>.json` (`--flight-dir`) for loopback
+testing; a coordinator-connected relay ships automatically instead, sending the blob up its control
+connection as a `RelayToCoordinator::FlightRecording` frame carrying the tenant, session, a
+relay-computed `desynced` flag, and the blob JSON itself as an opaque string. The frame carries no relay
+id — the coordinator keys the upload on the identity *this connection* enrolled as, so a relay can only
+ever write under its own key, never another's. Shipping rather than storing directly is what keeps every
+relay credential-free: it never holds an object-store key and never reads a blob back, and the
+coordinator — the sole credential holder — is the one place those credentials live and get rotated. With
+no sink configured (dev) or no store configured (coordinator), the relay still records — cheap, bounded —
+and a flush is a logged discard.
+
+**Storage.** The coordinator persists each shipped blob to a DigitalOcean Spaces bucket over the S3 API,
+at one of two retention-selecting key prefixes: `flight/<tenant>/<session>/<relay_id>.json` (the normal
+class) and `desync/<tenant>/<session>/<relay_id>.json` (the pinned class) — `relay_id` always the
+coordinator's own enrolled id for the shipping connection, never a relay-supplied field. The retention
+class rides the key prefix rather than object metadata because that is what an S3-compatible lifecycle
+rule can filter on: a rule scoped to a key `Prefix` expires everything under it on its own schedule, and
+the two prefixes are disjoint by construction so the two schedules never collide. The tenant-first shape
+inside each prefix carries forward the same read-authorization hook the dev sink's directory layout
+already established. The store itself is named by `--flight-store`/`COORDINATOR_FLIGHT_STORE`, a JSON
+file naming the endpoint, region, bucket, and — like the tenant registry's signing keys — the *names* of
+the environment variables holding the Spaces access and secret keys, never the keys themselves; absent, a
+shipped recording is dropped with a rate-limited warning, and a malformed file or an unset/empty
+credential variable fails coordinator startup outright, the same fail-closed rule the tenant registry
+already follows.
+
+**Pin mechanics.** A recording is stored pinned when either the shipping relay's own `desynced` flag is
+set, or the coordinator's own record of the session already says so. Only the **authority** relay — the
+one running the desync comparator (see [Relay-side desync
+detection](#relay-side-desync-detection)) — ever sets the flag on its own recording, because it is the
+only relay that observes the divergence directly; every other relay in the session ships an unflagged
+blob. The coordinator covers that gap independently: a TTL-pruned mark per `(tenant, session)`, set the
+moment *any* relay's desync notice reaches the coordinator, regardless of which relay's flight blob has
+or hasn't shipped yet. A pinned store also sweeps every blob the session already has sitting under the
+normal prefix into the pinned one (copy, then delete the original) — the convergence a coordinator
+restart can force when a non-authority relay's blob lands before the authority's desync notice does,
+since blob arrival and the desync notice travel independent paths and can reorder. The sweep is
+idempotent and safe under a concurrent pinned store of the same session: every blob just ends up pinned.
+
+**Read path.** Investigating a blob is two tenant-signed `POST`s on the coordinator, authenticated and
+scoped exactly like every other tenant → coordinator request: `POST /flight/blobs` with `{"tenant",
+"session"}` lists the session's stored recordings, one entry per relay (`{"relayId", "pinned", "size",
+"lastModifiedMs"}`, the pinned copy winning the dedup when a relay briefly exists under both prefixes
+mid-sweep), and `POST /flight/blob` with `{"tenant", "session", "relay_id"}` returns that recording's
+stored JSON verbatim, or `404` if neither prefix holds it. The tenant is bound by the signature that
+authenticates the request (Ed25519 over `rp2-request-v1:<unix-ts>:<METHOD>:<path>:<raw body>`,
+`x-rp2-timestamp` + `x-rp2-signature` headers — the same scheme every tenant endpoint uses) — there is no
+tenant in the path to spoof, only the one the signature already committed to, so a request can never
+resolve to another tenant's blobs. Live-game tier: refused only for a revoked tenant, not merely a
+suspended one, since this is forensics on games that may still be running. With no store configured,
+`/flight/blobs` answers an empty list and `/flight/blob` answers `404` — there is simply nothing stored,
+not an error.
 
 **Retention + PII:** blobs are pseudonymous (slot-keyed, no user identity, no payload bytes — see above),
 so user erasure never touches flight data — the session↔user join lives only in the tenant's own records

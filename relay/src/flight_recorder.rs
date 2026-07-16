@@ -262,11 +262,12 @@ pub trait FlightSink: Send + Sync {
 }
 
 /// The dev/loopback sink: one JSON file per blob at
-/// `<dir>/<tenant>/<session>/<relay_id>.json`. The tenant-first prefix is the
-/// structural hook tenant-scoped read authorization will key on when the
-/// durable store lands; the file tree mirrors the object-key scheme so nothing
-/// about the layout changes shape then. No retention: files accumulate until
-/// deleted by hand (the S3 lifecycle rule is the production retention story).
+/// `<dir>/<tenant>/<session>/<relay_id>.json`. The tenant-first prefix mirrors
+/// the coordinator's durable store (DigitalOcean Spaces): the same
+/// tenant/session/relay shape, just rooted under a retention-class prefix
+/// there instead of a directory here. No retention: files accumulate until
+/// deleted by hand (the S3 lifecycle rules are the production retention
+/// story).
 pub struct FileSink {
     dir: PathBuf,
 }
