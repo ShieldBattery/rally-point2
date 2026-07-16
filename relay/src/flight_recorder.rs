@@ -42,12 +42,14 @@
 //! sink configured the recorder still records — cheap and bounded — and a
 //! flush logs what it discarded rather than storing it.
 //!
-//! The dev sink is [`FileSink`] (`--flight-dir`), writing
-//! `<dir>/<tenant>/<session>/<relay_id>.json`; the tenant-first prefix is the
-//! structural hook for tenant-scoped read authorization when the durable store
-//! (S3) lands. The **read path is not built** — investigating a blob today
-//! means opening the JSON; tenant-facing reads land with the durable store,
-//! scoped by that same path prefix.
+//! Two sinks exist. The dev/loopback [`FileSink`] (`--flight-dir`) writes one
+//! JSON file per blob at `<dir>/<tenant>/<session>/<relay_id>.json`. The
+//! [`CoordinatorSink`], installed by default on a coordinator-connected relay,
+//! ships each flushed blob up the relay's control connection as a
+//! [`FlightRecordingNotice`] — the relay holds no durable-store credentials, so it
+//! hands the blob to the coordinator and forgets it, never reading one back. Both
+//! sinks key on the tenant/session/relay identity the blob header carries; the
+//! tenant-first prefix is the structural hook for tenant-scoped read authorization.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -58,9 +60,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use rally_point_proto::control::DepartureKind;
-use rally_point_proto::ids::{RelayId, SlotId};
+use rally_point_proto::control::{DepartureKind, FlightRecordingNotice, TenantId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::mesh::ConditionsRegistry;
 use crate::routing::SessionKey;
@@ -313,6 +316,124 @@ impl FlightSink for FileSink {
             })
             .await
             .map_err(std::io::Error::other)?
+        })
+    }
+}
+
+/// The largest serialized flight blob [`CoordinatorSink`] will ship. The rings
+/// ([`MAX_EVENTS_PER_SESSION`], [`MAX_SAMPLES_PER_SESSION`]) bound a real blob far
+/// below this, so the cap never trips on genuine data; it is a wire-hygiene
+/// backstop so a pathological serialization can never hand the control connection
+/// an unbounded frame.
+pub const MAX_SHIPPED_BLOB_BYTES: usize = 4 * 1024 * 1024;
+
+/// The depth of the bounded channel a [`CoordinatorSink`] hands shipments to the
+/// coordinator control connection through. Flushes are rare (session close, drain)
+/// and the connection loop drains one shipment per iteration, so a shallow queue
+/// absorbs the normal burst. A full queue means the connection is wedged or gone;
+/// the sink then drops the blob rather than blocking a session teardown on
+/// observability — flight data is never backpressure.
+pub const FLIGHT_SHIP_QUEUE: usize = 32;
+
+/// How many session flushes the drain's wholesale flush ([`FlightRecorder::flush_all`])
+/// runs at once. Kept below [`FLIGHT_SHIP_QUEUE`] so the drain's own fan-out can
+/// never fill the [`CoordinatorSink`] shipment queue by itself — with headroom
+/// left for close-time flushes racing the drain.
+pub const DRAIN_FLUSH_CONCURRENCY: usize = 16;
+
+/// One flushed recording handed to the coordinator control connection: the notice
+/// to ship, and a one-shot the connection fires once the frame is on the socket.
+///
+/// The sink awaits that `sent` ack, so the drain path's
+/// [`DRAIN_FLUSH_TIMEOUT`]-bounded [`FlightRecorder::flush_all`] waits for real
+/// delivery rather than mere enqueueing.
+pub struct FlightShipment {
+    /// The recording to ship, already built into its wire notice.
+    pub notice: FlightRecordingNotice,
+    /// Fired by the connection loop once `notice`'s frame is written to the
+    /// socket. A dropped sender (loop or process teardown) resolves the sink's
+    /// await as an error, so a shipment the connection never sent is reported lost
+    /// rather than stored.
+    pub sent: oneshot::Sender<()>,
+}
+
+/// The production flight sink: ships each flushed blob up the relay's coordinator
+/// control connection as a [`FlightRecordingNotice`] for the coordinator — the
+/// sole durable-store client — to persist. The relay holds no store credentials,
+/// so it never touches storage directly and never reads a blob back.
+///
+/// A `store` call serializes the blob, refuses one past
+/// [`MAX_SHIPPED_BLOB_BYTES`], `try_send`s it onto the bounded channel (a full
+/// queue is a logged loss, never a block — flight data is observability, not
+/// backpressure on a session teardown), then awaits the connection's ack so the
+/// drain flush genuinely bounds delivery. Delivery is at-least-once: an ambiguous
+/// send failure re-ships, idempotently overwriting the same object key.
+pub struct CoordinatorSink {
+    tx: mpsc::Sender<FlightShipment>,
+}
+
+impl CoordinatorSink {
+    /// Builds a sink over `tx`, the send half of the bounded shipment channel the
+    /// coordinator control connection drains. Pair it with the receiver threaded
+    /// into
+    /// [`run_descriptor_subscriber`](crate::coordinator_client::run_descriptor_subscriber),
+    /// which ships each shipment and fires its ack.
+    pub fn new(tx: mpsc::Sender<FlightShipment>) -> Self {
+        Self { tx }
+    }
+}
+
+impl FlightSink for CoordinatorSink {
+    fn store<'a>(
+        &'a self,
+        blob: &'a FlightBlob,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+        // Build the notice from the blob's own header fields (the same
+        // single-argument reasoning as the `FlightSink` trait doc: the notice can
+        // never disagree with the envelope). `desynced` is derived by scanning the
+        // recording's own events, so the shipping relay reports what it actually
+        // saw — the coordinator needs it when its own desync record was lost to a
+        // restart.
+        let payload = serde_json::to_string(blob).expect("a flight blob always serializes");
+        let desynced = blob
+            .events
+            .iter()
+            .any(|record| matches!(record.event, FlightEvent::DesyncDetected { .. }));
+        let notice = FlightRecordingNotice {
+            tenant: TenantId(blob.tenant.clone()),
+            session: SessionId(blob.session),
+            desynced,
+            payload,
+        };
+        Box::pin(async move {
+            if notice.payload.len() > MAX_SHIPPED_BLOB_BYTES {
+                tracing::warn!(
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    bytes = notice.payload.len(),
+                    cap = MAX_SHIPPED_BLOB_BYTES,
+                    "flight recording exceeds the shipping cap; discarding it",
+                );
+                return Err(std::io::Error::other(
+                    "flight recording exceeds the shipping cap",
+                ));
+            }
+            let (sent_tx, sent_rx) = oneshot::channel();
+            // A full or closed queue is a lost blob, not a block: never let
+            // observability delay a session close or a drain.
+            self.tx
+                .try_send(FlightShipment {
+                    notice,
+                    sent: sent_tx,
+                })
+                .map_err(|error| {
+                    std::io::Error::other(format!("flight shipment queue unavailable: {error}"))
+                })?;
+            // Resolve only once the connection loop confirms the frame is on the
+            // socket; a dropped ack sender (loop teardown) means it was never sent.
+            sent_rx.await.map_err(|_| {
+                std::io::Error::other("flight shipment sender dropped before delivery")
+            })
         })
     }
 }
@@ -654,11 +775,21 @@ impl FlightRecorder {
         }
     }
 
-    /// Flushes every live recording concurrently, bounded by `deadline` — the
-    /// drain path's wholesale flush. Whatever the deadline cuts off is logged
-    /// and abandoned: flight data is observability, and the drain's own budget
-    /// (and Fargate's stopTimeout behind it) outranks it.
+    /// Flushes every live recording, bounded by `deadline` — the drain path's
+    /// wholesale flush. Whatever the deadline cuts off is logged and abandoned:
+    /// flight data is observability, and the drain's own budget (and Fargate's
+    /// stopTimeout behind it) outranks it.
+    ///
+    /// The fan-out is capped at [`DRAIN_FLUSH_CONCURRENCY`] rather than fully
+    /// concurrent: [`CoordinatorSink`] refuses (never blocks on) a full shipment
+    /// queue, so an unbounded burst here would overrun that queue on a relay
+    /// holding more live sessions than the queue is deep and lose the overflow
+    /// even over a healthy connection. Capped below the queue depth, a full
+    /// queue at drain time means a genuinely wedged connection, not this flush
+    /// racing its own fan-out.
     pub async fn flush_all(&self, deadline: Duration) {
+        use futures_util::StreamExt;
+
         let keys = self.recorded_sessions();
         if keys.is_empty() {
             return;
@@ -668,17 +799,17 @@ impl FlightRecorder {
             "flushing flight recordings for drain"
         );
         let completed = AtomicU64::new(0);
-        let flushes = keys.iter().map(|key| {
-            let completed = &completed;
-            async move {
-                self.flush_session(key).await;
-                completed.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        if tokio::time::timeout(deadline, futures_util::future::join_all(flushes))
-            .await
-            .is_err()
-        {
+        let flushes = futures_util::stream::iter(keys.iter()).for_each_concurrent(
+            DRAIN_FLUSH_CONCURRENCY,
+            |key| {
+                let completed = &completed;
+                async move {
+                    self.flush_session(key).await;
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        );
+        if tokio::time::timeout(deadline, flushes).await.is_err() {
             let abandoned = keys.len() as u64 - completed.load(Ordering::Relaxed);
             tracing::warn!(
                 abandoned,
@@ -968,5 +1099,136 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the drain flush returns at its deadline, not the sink's pace",
         );
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_sink_ships_a_notice_that_reconstructs_the_blob() {
+        let recorder = FlightRecorder::default();
+        recorder.set_identity(RelayId(9));
+        let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
+        let k = key(42);
+        recorder.record(
+            &k,
+            FlightEvent::SessionStart {
+                initial_buffer_turns: Some(3),
+            },
+        );
+        recorder.record(&k, FlightEvent::SessionClosed);
+
+        // `store` blocks awaiting the connection's ack, so drive the flush
+        // concurrently with the stand-in connection that pulls it and acks.
+        let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
+
+        let shipment = rx.recv().await.expect("a shipment is queued");
+        assert_eq!(shipment.notice.tenant.as_ref(), "sb-test");
+        assert_eq!(shipment.notice.session, SessionId(42));
+        assert!(!shipment.notice.desynced, "no desync event was recorded");
+        // The shipped payload is the blob itself, verbatim.
+        let blob: FlightBlob =
+            serde_json::from_str(&shipment.notice.payload).expect("the payload is the blob");
+        assert_eq!(blob.tenant, "sb-test");
+        assert_eq!(blob.session, 42);
+        assert_eq!(blob.relay_id, 9);
+        assert_eq!(blob.events.len(), 2);
+
+        // The ack resolves the store to Stored.
+        shipment
+            .sent
+            .send(())
+            .expect("the sink is still awaiting the ack");
+        assert_eq!(flush.await.unwrap(), FlushOutcome::Stored);
+    }
+
+    #[tokio::test]
+    async fn the_shipped_desynced_flag_is_set_only_when_a_desync_event_exists() {
+        let recorder = FlightRecorder::default();
+        let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
+        let k = key(1);
+        recorder.record(
+            &k,
+            FlightEvent::DesyncDetected {
+                sync_ordinal: 5,
+                diverged: vec![1],
+                no_majority: false,
+            },
+        );
+        let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
+        let shipment = rx.recv().await.expect("a shipment is queued");
+        assert!(
+            shipment.notice.desynced,
+            "a DesyncDetected event sets the shipped flag",
+        );
+        shipment.sent.send(()).unwrap();
+        assert_eq!(flush.await.unwrap(), FlushOutcome::Stored);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_blob_is_refused_and_ships_nothing() {
+        let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let sink = CoordinatorSink::new(tx);
+        // A blob whose serialized form exceeds the shipping cap — a pathological
+        // payload the rings would never actually produce, built by hand to
+        // exercise the wire-hygiene backstop.
+        let blob = FlightBlob {
+            version: BLOB_VERSION,
+            tenant: "x".repeat(MAX_SHIPPED_BLOB_BYTES + 1),
+            session: 1,
+            relay_id: 0,
+            started_at_ms: 1,
+            flushed_at_ms: 2,
+            events_dropped: 0,
+            samples_dropped: 0,
+            events: vec![],
+            samples: vec![],
+        };
+        assert!(
+            sink.store(&blob).await.is_err(),
+            "an oversized blob is refused",
+        );
+        assert!(rx.try_recv().is_err(), "nothing was shipped");
+    }
+
+    #[tokio::test]
+    async fn a_full_shipment_queue_fails_the_flush_without_blocking() {
+        let recorder = FlightRecorder::default();
+        // Capacity one, its single slot pre-filled: the receiver stays bound and
+        // alive, so the sink's next try_send sees a full (not closed) queue.
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(FlightShipment {
+            notice: FlightRecordingNotice {
+                tenant: TenantId("sb-test".to_owned()),
+                session: SessionId(0),
+                desynced: false,
+                payload: "{}".to_owned(),
+            },
+            sent: oneshot::channel().0,
+        })
+        .expect("the first send fills the slot");
+        recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
+        let k = key(1);
+        recorder.record(&k, FlightEvent::SessionClosed);
+        // A full queue is a lost blob reported Failed — and, crucially, the flush
+        // returns at once rather than blocking a session teardown.
+        let outcome = tokio::time::timeout(Duration::from_secs(1), recorder.flush_session(&k))
+            .await
+            .expect("the flush returns at once, it does not hang");
+        assert_eq!(outcome, FlushOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_ack_sender_fails_the_flush() {
+        let recorder = FlightRecorder::default();
+        let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
+        let k = key(1);
+        recorder.record(&k, FlightEvent::SessionClosed);
+        let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
+        let shipment = rx.recv().await.expect("a shipment is queued");
+        // The connection loop tears down before writing the frame: dropping the
+        // shipment drops its ack sender, so the sink reports the blob lost.
+        drop(shipment);
+        assert_eq!(flush.await.unwrap(), FlushOutcome::Failed);
     }
 }

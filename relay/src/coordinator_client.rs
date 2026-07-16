@@ -45,8 +45,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport, RelayHello,
-    RelayToCoordinator, SessionDescriptor, SessionPresence,
+    CoordinatorToRelay, ENROLL_POP_CONTEXT, FlightRecordingNotice, MeshPeerIdentity,
+    RegionRttReport, RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
@@ -54,7 +54,7 @@ use rally_point_proto::version::{
     CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -63,6 +63,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 use crate::auth::SharedRegistry;
 use crate::consensus::RelayNotice;
+use crate::flight_recorder::FlightShipment;
 use crate::mesh_control::MeshControl;
 use crate::region_ping::{RegionPingTargets, RegionRttCache};
 use crate::routing::{SessionKey, Sessions};
@@ -328,6 +329,18 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// decided while the coordinator is down goes out on the next successful
 /// connection rather than being lost.
 ///
+/// `flight` is the drain end of the flight recorder's coordinator sink: each
+/// flushed recording arrives as a [`FlightShipment`], and this loop ships it up
+/// the control connection as a [`RelayToCoordinator::FlightRecording`] frame,
+/// firing the shipment's ack once the frame is on the socket. It is a
+/// **deliberately separate** pipe from `notices`: the `SessionClosed` ordering
+/// guarantee is a property of the notice channel alone, and a blob frame must
+/// never delay a webhook-bearing notice. Bounded (unlike the unbounded notice
+/// channel), so a wedged connection drops recordings rather than growing without
+/// bound — flight data is observability, never backpressure. Held across
+/// reconnects, with a pulled-but-unsent shipment surviving in a `pending_flight`
+/// slot the same way `pending` holds an unsent notice.
+///
 /// `sessions` is the relay's live roster: each heartbeat snapshots it and carries
 /// the connected slots up as [`SessionPresence`] entries, feeding the
 /// coordinator's active-player presence store. Only tenant/session/slot ride the
@@ -389,6 +402,7 @@ pub async fn run_descriptor_subscriber(
     region_targets: RegionPingTargets,
     region_rtt_cache: RegionRttCache,
     notices: UnboundedReceiver<RelayNotice>,
+    flight: Receiver<FlightShipment>,
     drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
     control_connected: watch::Sender<bool>,
@@ -406,6 +420,7 @@ pub async fn run_descriptor_subscriber(
         region_targets,
         region_rtt_cache,
         notices,
+        flight,
         drain,
         drain_acked,
         control_connected,
@@ -447,6 +462,10 @@ pub async fn run_descriptor_subscriber_with(
     // round-trips the region-ping loop writes, independent of any reconnect.
     region_rtt_cache: RegionRttCache,
     mut notices: UnboundedReceiver<RelayNotice>,
+    // Held across connections like `notices`, but bounded: each connection ships
+    // one shipment at a time and holds an unsent one in `pending_flight`, so a
+    // recording flushed while the coordinator link was down rides the next one.
+    mut flight: Receiver<FlightShipment>,
     mut drain: watch::Receiver<bool>,
     drain_acked: watch::Sender<bool>,
     control_connected: watch::Sender<bool>,
@@ -459,6 +478,11 @@ pub async fn run_descriptor_subscriber_with(
     // link was down is flushed first on the next connection rather than lost. The
     // rest stay queued in the unbounded channel behind it.
     let mut pending: Option<RelayNotice> = None;
+    // The one flight shipment pulled but not yet confirmed sent, mirroring
+    // `pending`. Held across reconnects so a shipment half-sent when the link
+    // dropped rides the next connection; its `sent` ack fires only once the frame
+    // is truly on the socket, so the sink's await bounds real delivery.
+    let mut pending_flight: Option<FlightShipment> = None;
     let relay_id = relay_hello.relay_id;
 
     loop {
@@ -476,6 +500,8 @@ pub async fn run_descriptor_subscriber_with(
             &region_rtt_cache,
             &mut notices,
             &mut pending,
+            &mut flight,
+            &mut pending_flight,
             &mut drain,
             &drain_acked,
             &control_connected,
@@ -548,6 +574,8 @@ async fn connect_and_stream(
     region_rtt_cache: &RegionRttCache,
     notices: &mut UnboundedReceiver<RelayNotice>,
     pending: &mut Option<RelayNotice>,
+    flight: &mut Receiver<FlightShipment>,
+    pending_flight: &mut Option<FlightShipment>,
     drain: &mut watch::Receiver<bool>,
     drain_acked: &watch::Sender<bool>,
     control_connected: &watch::Sender<bool>,
@@ -638,6 +666,24 @@ async fn connect_and_stream(
         send_draining(&mut socket).await?;
     }
 
+    // Flush a flight shipment held over from a prior connection, after the pending
+    // notice and the drain re-assert. The flight pipe is deliberately separate
+    // from the notice pipe: `SessionClosed`'s "no earlier notice for the session
+    // still in flight" ordering is a property of the notice channel alone, and a
+    // blob frame must never delay a webhook-bearing notice. On send failure the
+    // shipment stays in `pending_flight` and rides the next reconnect; the ack
+    // fires only after the frame is on the socket.
+    if pending_flight.is_some() {
+        send_flight(
+            &mut socket,
+            &pending_flight.as_ref().expect("just checked").notice,
+        )
+        .await?;
+        if let Some(shipment) = pending_flight.take() {
+            let _ = shipment.sent.send(());
+        }
+    }
+
     // The Hello already proved liveness at t=0, so skip the immediate first tick
     // and send the first heartbeat one interval later.
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
@@ -646,6 +692,10 @@ async fn connect_and_stream(
     // Once the notifier's senders are all dropped (relay shutdown) `recv` yields
     // `None` forever; stop selecting on it so the loop doesn't spin.
     let mut notifier_open = true;
+    // Likewise for the flight channel: a standalone relay never installs the
+    // coordinator sink, so its sender is dropped and `recv` yields `None` forever;
+    // disable the arm on the first `None` rather than spin.
+    let mut flight_open = true;
     // Likewise for the drain watch: if its sender is dropped (a relay with no drain
     // sequence wired), `changed()` errors forever, so disable the arm on the first
     // error rather than spin.
@@ -747,6 +797,35 @@ async fn connect_and_stream(
                     None => notifier_open = false,
                 }
             }
+            // Ship one flight recording at a time: pull the next only once the
+            // current is confirmed sent (the `pending_flight.is_none()` guard), so
+            // an unsent shipment always sits in `pending_flight` for the reconnect
+            // flush above. Deliberately a SEPARATE pipe from the notices arm: the
+            // `SessionClosed` ordering guarantee ("no earlier notice for the
+            // session still in flight") is a property of the notice channel alone,
+            // and a blob frame — larger and never webhook-bearing — must never
+            // delay a notice.
+            shipment = flight.recv(), if pending_flight.is_none() && flight_open => {
+                match shipment {
+                    Some(shipment) => {
+                        *pending_flight = Some(shipment);
+                        // A send error ends the connection (via `?`) with the
+                        // shipment still pending, so the next connection flushes it.
+                        send_flight(
+                            &mut socket,
+                            &pending_flight.as_ref().expect("just set").notice,
+                        )
+                        .await?;
+                        // Fire the ack (and clear the slot) only after the frame is
+                        // on the socket, so the sink's await resolves to delivered
+                        // only for a shipment that truly went out.
+                        if let Some(shipment) = pending_flight.take() {
+                            let _ = shipment.sent.send(());
+                        }
+                    }
+                    None => flight_open = false,
+                }
+            }
             // The drain sequence flipped the flag: ask the coordinator to stop
             // assigning us new sessions. A send error ends the connection; the next
             // reconnect re-asserts the drain right after its Hello.
@@ -822,6 +901,18 @@ async fn send_notice(
     };
     let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
     socket.send(Message::Text(text.into())).await?;
+    Ok(())
+}
+
+/// Sends one flushed flight recording up the control connection as a tagged
+/// [`RelayToCoordinator::FlightRecording`] JSON frame.
+async fn send_flight(
+    socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    notice: &FlightRecordingNotice,
+) -> Result<(), ControlError> {
+    let frame = serde_json::to_string(&RelayToCoordinator::FlightRecording(notice.clone()))
+        .expect("a flight recording frame always serializes");
+    socket.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
@@ -1101,13 +1192,14 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
+    use crate::flight_recorder::FLIGHT_SHIP_QUEUE;
     use crate::mesh::MeshCommand;
     use rally_point_proto::control::{
         BufferBounds, DepartureNotice, DesyncNotice, DivergedSlot, RegionBeaconTarget, RegionId,
         RelayPeer, TenantId,
     };
     use rally_point_proto::ids::{RelayId, SessionId};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     const TENANT: &str = "sb-test";
 
@@ -1480,6 +1572,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             notices_rx,
+            no_flight(),
             drain_rx,
             drain_acked,
             no_connected(),
@@ -1532,6 +1625,29 @@ mod tests {
     /// on the connection-state signal itself.
     fn no_connected() -> watch::Sender<bool> {
         watch::channel(false).0
+    }
+
+    /// A closed flight receiver for tests that don't exercise the flight pipe: its
+    /// sender is dropped, so the loop's flight arm disables itself and never fires.
+    fn no_flight() -> Receiver<FlightShipment> {
+        mpsc::channel(1).1
+    }
+
+    /// A flight shipment for the connection-loop tests, paired with the ack
+    /// receiver its `sent` half resolves. The stand-in coordinator reads the
+    /// `FlightRecording` frame the loop ships for it.
+    fn flight_shipment() -> (FlightShipment, oneshot::Receiver<()>) {
+        let (sent, ack) = oneshot::channel();
+        let shipment = FlightShipment {
+            notice: FlightRecordingNotice {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(7),
+                desynced: false,
+                payload: r#"{"version":1}"#.to_owned(),
+            },
+            sent,
+        };
+        (shipment, ack)
     }
 
     #[test]
@@ -1684,6 +1800,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked_tx,
             no_connected(),
@@ -1751,6 +1868,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked_tx,
             no_connected(),
@@ -1825,6 +1943,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked_tx,
             no_connected(),
@@ -1904,6 +2023,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             notices_rx,
+            no_flight(),
             drain_rx,
             drain_acked_tx,
             no_connected(),
@@ -1989,6 +2109,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked,
             no_connected(),
@@ -2080,6 +2201,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked,
             no_connected(),
@@ -2331,6 +2453,7 @@ mod tests {
             RegionPingTargets::default(),
             RegionRttCache::default(),
             mpsc::unbounded_channel().1,
+            no_flight(),
             drain_rx,
             drain_acked,
             no_connected(),
@@ -2434,6 +2557,314 @@ mod tests {
         assert!(
             watch.has_changed().unwrap(),
             "a changed set signals the ping loop",
+        );
+    }
+
+    // --- Flight recording shipments ---
+
+    #[tokio::test]
+    async fn a_flight_shipment_is_delivered_after_enroll_as_a_tagged_frame() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: complete the enroll handshake, then read the flight
+        // frame the relay ships once it is enrolled.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = accept_enroll(&mut ws).await;
+            let Message::Text(hello) = hello else {
+                panic!("first frame is the Hello");
+            };
+            assert!(hello.contains("\"type\":\"hello\""));
+            let frame = ws.next().await.unwrap().unwrap();
+            let _ = frame_tx.send(frame);
+        });
+
+        // Queue a shipment before the subscriber starts: it ships right after enroll.
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, ack) = flight_shipment();
+        flight_tx.try_send(shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            throwaway_identity_key(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            FleetMeshPeers::default(),
+            SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
+            mpsc::unbounded_channel().1,
+            flight_rx,
+            drain_rx,
+            drain_acked,
+            no_connected(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        ));
+
+        let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+            .await
+            .expect("the flight frame is delivered")
+            .unwrap();
+        let Message::Text(text) = received else {
+            panic!("a text frame");
+        };
+        let RelayToCoordinator::FlightRecording(notice) = serde_json::from_str(&text).unwrap()
+        else {
+            panic!("the frame is a flight recording");
+        };
+        assert_eq!(notice.session, SessionId(7));
+        assert_eq!(notice.payload, r#"{"version":1}"#);
+        // The ack fires once the frame is on the socket, unblocking the sink's await.
+        tokio::time::timeout(Duration::from_secs(5), ack)
+            .await
+            .expect("the ack resolves after the send")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_queued_flight_shipment_is_delivered_after_a_reconnect() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: drop the first dial mid-handshake so the relay
+        // redials without touching the flight channel, then enroll and read the
+        // shipment on the second connection.
+        tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (second, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(second).await.unwrap();
+            let hello = accept_enroll(&mut ws).await;
+            let Message::Text(hello) = hello else {
+                panic!("first frame is the Hello");
+            };
+            assert!(hello.contains("\"type\":\"hello\""));
+            let frame = ws.next().await.unwrap().unwrap();
+            let _ = frame_tx.send(frame);
+        });
+
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, _ack) = flight_shipment();
+        flight_tx.try_send(shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            throwaway_identity_key(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            FleetMeshPeers::default(),
+            SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
+            mpsc::unbounded_channel().1,
+            flight_rx,
+            drain_rx,
+            drain_acked,
+            no_connected(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        ));
+
+        let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+            .await
+            .expect("the queued shipment is delivered after the reconnect")
+            .unwrap();
+        let Message::Text(text) = received else {
+            panic!("a text frame");
+        };
+        assert!(matches!(
+            serde_json::from_str::<RelayToCoordinator>(&text).unwrap(),
+            RelayToCoordinator::FlightRecording(_),
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_enroll_proof_precedes_a_pending_flight_shipment() {
+        use tokio::net::TcpListener;
+
+        // A relay that reconnects with a queued flight shipment must send its
+        // IdentityProof first: a blob frame ahead of the proof would be read as the
+        // proof and refused. Assert the proof is the first frame after the
+        // challenge, with the shipment strictly behind it.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = ws.next().await.unwrap().unwrap();
+            let Message::Text(hello) = hello else {
+                panic!("first frame is the Hello");
+            };
+            assert!(hello.contains("\"type\":\"hello\""));
+            let challenge =
+                serde_json::to_string(&CoordinatorToRelay::IdentityChallenge { nonce: [7u8; 32] })
+                    .unwrap();
+            ws.send(Message::Text(challenge.into())).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((first, second));
+        });
+
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, _ack) = flight_shipment();
+        flight_tx.try_send(shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            throwaway_identity_key(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            FleetMeshPeers::default(),
+            SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
+            mpsc::unbounded_channel().1,
+            flight_rx,
+            drain_rx,
+            drain_acked,
+            no_connected(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        ));
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("the relay sends the proof then the shipment")
+            .unwrap();
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        assert!(
+            matches!(decode(first), RelayToCoordinator::IdentityProof { .. }),
+            "the identity proof precedes the flight shipment",
+        );
+        assert!(
+            matches!(decode(second), RelayToCoordinator::FlightRecording(_)),
+            "the flight shipment goes out only after the proof",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_notice_and_flight_pipes_do_not_block_each_other() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: enroll, then read two frames — a notice and a
+        // flight shipment, in whichever order the two independent pipes flush them.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((first, second));
+        });
+
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        notices_tx
+            .send(RelayNotice::Departure(dropped_notice()))
+            .unwrap();
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, _ack) = flight_shipment();
+        flight_tx.try_send(shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            format!("http://{addr}"),
+            drain_hello(),
+            throwaway_identity_key(),
+            None,
+            control,
+            Arc::default(),
+            AppliedSessions::default(),
+            FleetMeshPeers::default(),
+            SharedRegistry::default(),
+            RegionPingTargets::default(),
+            RegionRttCache::default(),
+            notices_rx,
+            flight_rx,
+            drain_rx,
+            drain_acked,
+            no_connected(),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        ));
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("both pipes deliver")
+            .unwrap();
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        let frames = [decode(first), decode(second)];
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, RelayToCoordinator::Departure(_))),
+            "the notice pipe delivered",
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, RelayToCoordinator::FlightRecording(_))),
+            "the flight pipe delivered",
         );
     }
 }

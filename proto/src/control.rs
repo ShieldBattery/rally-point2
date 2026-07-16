@@ -1188,6 +1188,19 @@ pub enum RelayToCoordinator {
         /// The session this relay closed.
         session: SessionId,
     },
+    /// A flushed flight recording the relay ships for the coordinator to persist —
+    /// one session's full observability blob, sent when the session closes or the
+    /// relay drains. The relay holds no durable-store credentials, so the recording
+    /// travels up this same authenticated control connection rather than to storage
+    /// directly.
+    ///
+    /// Carries no relay id: the coordinator keys the stored blob on **this
+    /// connection's enrolled relay identity**, so a relay can never name another
+    /// relay's identity in the object key. Additive, so an older coordinator decodes
+    /// it as [`Unknown`](Self::Unknown) and skips it — the blob is simply lost
+    /// against a coordinator that predates this variant, consistent with the
+    /// deploy-order rule that coordinator images ship ahead of relay images.
+    FlightRecording(FlightRecordingNotice),
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -1416,6 +1429,33 @@ pub struct ResultNotice {
     /// `None` before that slot produced a framed turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_frame: Option<u32>,
+}
+
+/// A relay's shipment of one flushed flight recording, sent up the relay control
+/// connection ([`RelayToCoordinator::FlightRecording`]).
+///
+/// Like [`DepartureNotice`], it carries its own `tenant`/`session` because one
+/// control connection serves many sessions. It deliberately does **not** carry a
+/// relay id: the coordinator keys the stored blob on the connection's enrolled
+/// relay identity, so a relay cannot claim another's identity in the object key
+/// (the same connection-scoped authority the notice-serving check already relies
+/// on).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlightRecordingNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The coordinator-assigned session id the recording covers.
+    pub session: SessionId,
+    /// Whether this recording's events contain a confirmed desync — the shipping
+    /// relay scans its own events at flush. The coordinator combines this with its
+    /// own desync-notice record to choose the stored blob's retention class; the
+    /// flag matters when the coordinator's in-memory record was lost to a restart.
+    pub desynced: bool,
+    /// The serialized flight blob (JSON), opaque to the coordinator. Carried as
+    /// bytes-of-JSON rather than a typed structure so a coordinator built against
+    /// an older blob shape stores newer relays' recordings verbatim instead of
+    /// silently dropping fields it does not know.
+    pub payload: String,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -2160,6 +2200,39 @@ mod tests {
         // down-direction `CoordinatorToRelay` (which has no such variant) folds
         // into `Unknown` rather than erroring — an older coordinator's path.
         let json = r#"{"type":"session_closed","tenant":"sb-staging","session":42}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn relay_to_coordinator_flight_recording_roundtrips_json() {
+        let message = RelayToCoordinator::FlightRecording(FlightRecordingNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            desynced: true,
+            payload: r#"{"version":1,"session":42,"events":[]}"#.to_owned(),
+        });
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"flight_recording\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+        // The opaque payload survives the round trip byte-for-byte — the
+        // coordinator stores exactly what the relay shipped.
+        let RelayToCoordinator::FlightRecording(notice) = back else {
+            panic!("expected a flight_recording frame");
+        };
+        assert_eq!(notice.payload, r#"{"version":1,"session":42,"events":[]}"#);
+        assert!(notice.desynced);
+    }
+
+    #[test]
+    fn flight_recording_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `FlightRecording` up-frame decoded by the
+        // down-direction `CoordinatorToRelay` (which has no such variant) folds
+        // into `Unknown` rather than erroring — a coordinator that predates the
+        // variant skips the shipment (the blob is lost) instead of tearing the
+        // connection down.
+        let json = r#"{"type":"flight_recording","tenant":"sb-staging","session":42,"desynced":false,"payload":"{}"}"#;
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, CoordinatorToRelay::Unknown);
     }

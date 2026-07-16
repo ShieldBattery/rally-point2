@@ -176,10 +176,12 @@ struct Cli {
     drain_timeout_secs: u64,
 
     /// Directory the flight recorder flushes per-session blobs into
-    /// (`<dir>/<tenant>/<session>/<relay_id>.json`) — the dev/loopback sink.
-    /// Absent, the recorder still records (cheap, bounded) but a flush discards
-    /// the recording with a log line. The durable store (S3) replaces this in
-    /// production.
+    /// (`<dir>/<tenant>/<session>/<relay_id>.json`) — the dev/loopback sink, and a
+    /// deliberate override: when set it wins even on a coordinator-connected relay,
+    /// which otherwise ships each flushed recording to the coordinator over its
+    /// control connection. Absent on a standalone relay (no coordinator), the
+    /// recorder still records — cheap and bounded — but a flush discards the
+    /// recording with a log line.
     #[arg(long, env = "RELAY_FLIGHT_DIR")]
     flight_dir: Option<std::path::PathBuf>,
 
@@ -305,6 +307,15 @@ async fn main() -> Result<()> {
     // The flight recorder: per-session observability, always recording (cheap,
     // bounded). The sink and identity are optional startup wiring; the sampling
     // tick folds turn counters + link conditions into a row per live session.
+    //
+    // The flight-shipment channel: a CoordinatorSink installed below hands flushed
+    // blobs to the coordinator control connection through it, and the subscriber
+    // task drains the receiver. Created here — ahead of both the sink install and
+    // the subscriber spawn — so the same channel spans them. Only wired at both
+    // ends when a coordinator-connected relay installs the CoordinatorSink;
+    // otherwise the receiver is dropped or idles unused.
+    let (flight_tx, flight_rx) =
+        tokio::sync::mpsc::channel(rally_point_relay::flight_recorder::FLIGHT_SHIP_QUEUE);
     let flight = mesh_state.decision_makers.flight_recorder().clone();
     if let Some(relay_id) = cli.relay_id {
         flight.set_identity(RelayId(relay_id));
@@ -315,6 +326,12 @@ async fn main() -> Result<()> {
             flight.set_sink(Arc::new(rally_point_relay::flight_recorder::FileSink::new(
                 dir.clone(),
             )));
+        }
+        None if has_coordinator => {
+            tracing::info!("flight recordings ship to the coordinator over the control connection");
+            flight.set_sink(Arc::new(
+                rally_point_relay::flight_recorder::CoordinatorSink::new(flight_tx),
+            ));
         }
         None => {
             tracing::info!("no --flight-dir configured; flight recordings are discarded at flush")
@@ -537,6 +554,7 @@ async fn main() -> Result<()> {
                 region_targets.clone(),
                 region_rtt_cache.clone(),
                 notices_rx,
+                flight_rx,
                 drain_rx.clone(),
                 drain_acked_tx.clone(),
                 control_connected_tx,

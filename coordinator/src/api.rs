@@ -1920,6 +1920,13 @@ fn note_inbound(
             lifecycle.on_session_closed(tenant, session, relay_id);
             InboundAction::None
         }
+        Ok(RelayToCoordinator::FlightRecording(_)) => {
+            tracing::debug!(
+                relay_id = relay_id.0,
+                "dropping a flight recording frame; the coordinator does not persist recordings",
+            );
+            InboundAction::None
+        }
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => InboundAction::None,
         Err(error) => {
@@ -1974,9 +1981,10 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat, a departure, a desync, a result, an identity
-                    // proof, or any future up-frame before the enroll Hello is a
-                    // protocol violation: enrollment comes first.
+                    // A heartbeat, a departure, a desync, a result, a flight
+                    // recording, an identity proof, or any future up-frame before
+                    // the enroll Hello is a protocol violation: enrollment comes
+                    // first.
                     Ok(
                         RelayToCoordinator::Heartbeat { .. }
                         | RelayToCoordinator::Draining
@@ -1984,6 +1992,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)
                         | RelayToCoordinator::SessionClosed { .. }
+                        | RelayToCoordinator::FlightRecording(_)
                         | RelayToCoordinator::IdentityProof { .. }
                         | RelayToCoordinator::Unknown,
                     ) => {
