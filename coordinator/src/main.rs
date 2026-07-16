@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
     // startup — the table is informational telemetry, not a serving prerequisite.
     let pair_rtts = pair_rtts::new_store();
     if let Some(ledger) = &ledger {
-        match ledger.pair_rtts() {
+        match ledger.direction_rtts() {
             Ok(rows) => {
                 let count = rows.len();
                 pair_rtts.seed(rows);

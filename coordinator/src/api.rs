@@ -1702,12 +1702,11 @@ async fn send_drain_ack_before_deadline(
 /// [`note_inbound`], where each heartbeat's `region_rtts` fold into the coordinator's
 /// backbone-RTT table.
 ///
-/// `relay_region` is the reporting relay's own region — the near end of every pair it
-/// measures — validated at enroll; a region-less relay reports nothing. `regions` is
-/// the coordinator's configured set, so a report naming a region it does not list (a
-/// stale target after a config change) is dropped. `store` is the shared pair table,
-/// and `ledger` is the optional persistence a *changed* pair value is written through
-/// to.
+/// `relay_region` is the reporting relay's own region — the origin of every direction
+/// it measures — validated at enroll; a region-less relay reports nothing. `regions`
+/// is the coordinator's configured set, so a report naming a region it does not list
+/// (a stale target after a config change) is dropped. `store` is the shared pair table,
+/// and `ledger` is the optional persistence a *changed* direction is written through to.
 struct RegionRttIngest<'a> {
     relay_region: Option<&'a RegionId>,
     regions: &'a RegionsConfig,
@@ -1716,12 +1715,13 @@ struct RegionRttIngest<'a> {
 }
 
 /// Folds a heartbeat's `region_rtts` into the backbone-RTT table: each report pairs
-/// the reporting relay's own region with the region it measured, recorded
-/// last-write-wins. A report naming a region the coordinator does not configure is
-/// dropped (a stale target list after a config change); a relay with no region
-/// contributes nothing. When a value actually changed and a ledger is present, the
-/// change is persisted so last-known round-trips survive a restart — a steady-state
-/// re-report (the same value every heartbeat) changes nothing and writes nothing.
+/// the reporting relay's own region (the direction's origin) with the region it
+/// measured, recorded per-direction last-write-wins beyond a dead-band. A report naming
+/// a region the coordinator does not configure is dropped (a stale target list after a
+/// config change); a relay with no region contributes nothing. When a direction's value
+/// actually changed and a ledger is present, that direction is persisted (keyed by pair
+/// and origin) so last-known round-trips survive a restart — a steady-state re-report
+/// (the same value every heartbeat) changes nothing and writes nothing.
 ///
 /// `measured_at` is stamped with a plain Unix-seconds now, `0` on a pre-epoch clock
 /// rather than failing: the value is informational (it exposes a pair's age), not
@@ -1754,19 +1754,21 @@ fn ingest_region_rtts(rtt: &RegionRttIngest<'_>, relay_id: RelayId, reports: &[R
             .record(relay_region, &report.region, report.rtt_ms, now);
         if changed {
             let (a, b) = pair_rtts::canonical_pair(relay_region, &report.region);
-            // A beyond-dead-band change is rare — a pair's first fill, or a real
-            // backbone shift — so each one is worth a log line: the log stream is
-            // the pair table's change history (the table itself keeps only the
-            // latest value per pair).
+            // A beyond-dead-band change is rare — a direction's first fill, or a real
+            // backbone shift — so each one is worth a log line: the log stream is the
+            // pair table's per-direction change history (the table itself keeps only the
+            // latest value per direction).
             tracing::info!(
                 relay_id = relay_id.0,
                 pair_a = a.as_ref(),
                 pair_b = b.as_ref(),
+                origin = relay_region.as_ref(),
                 rtt_ms = report.rtt_ms,
                 "backbone RTT recorded",
             );
             if let Some(ledger) = rtt.ledger
-                && let Err(error) = ledger.record_pair_rtt(a, b, report.rtt_ms, now)
+                && let Err(error) =
+                    ledger.record_direction_rtt(a, b, relay_region, report.rtt_ms, now)
             {
                 tracing::warn!(
                     relay_id = relay_id.0,
@@ -2974,18 +2976,28 @@ mod tests {
     #[tokio::test]
     async fn regions_endpoint_serves_recorded_backbone_rtts() {
         // With pairs recorded, the endpoint serves them under backbone_rtts, canonical
-        // (a <= b) and sorted, alongside the region list.
+        // (a <= b) and sorted, alongside the region list. A pair measured from both ends
+        // serves the average of its two directions; a pair measured from one end serves
+        // that direction as-is.
         let mut state = state_with_relay_and_tenant();
         state.regions = regions_config(&["us-east", "eu-west", "ap-south"]);
         let now = 1_752_555_555;
-        // Recorded from either direction and in a non-sorted order — the serve path
-        // canonicalizes and sorts.
+        // The eu-west|us-east link is measured from both ends (87 one way, 93 the
+        // other), recorded in a non-sorted order — the serve path canonicalizes, sorts,
+        // and averages.
         state.pair_rtts.record(
             &RegionId("us-east".to_owned()),
             &RegionId("eu-west".to_owned()),
             87,
             now,
         );
+        state.pair_rtts.record(
+            &RegionId("eu-west".to_owned()),
+            &RegionId("us-east".to_owned()),
+            93,
+            now + 1,
+        );
+        // The ap-south|us-east link is measured from one end only.
         state.pair_rtts.record(
             &RegionId("ap-south".to_owned()),
             &RegionId("us-east".to_owned()),
@@ -3000,11 +3012,24 @@ mod tests {
         // Sorted by (a, b): ap-south|us-east precedes eu-west|us-east.
         assert_eq!(rtts[0]["a"], "ap-south");
         assert_eq!(rtts[0]["b"], "us-east");
-        assert_eq!(rtts[0]["rtt_ms"].as_u64().unwrap(), 142);
+        assert_eq!(
+            rtts[0]["rtt_ms"].as_u64().unwrap(),
+            142,
+            "a single-direction pair serves that direction as-is",
+        );
         assert_eq!(rtts[0]["measured_at"].as_u64().unwrap(), now);
         assert_eq!(rtts[1]["a"], "eu-west");
         assert_eq!(rtts[1]["b"], "us-east");
-        assert_eq!(rtts[1]["rtt_ms"].as_u64().unwrap(), 87);
+        assert_eq!(
+            rtts[1]["rtt_ms"].as_u64().unwrap(),
+            90,
+            "a two-direction pair serves the average: (87 + 93) / 2 = 90",
+        );
+        assert_eq!(
+            rtts[1]["measured_at"].as_u64().unwrap(),
+            now + 1,
+            "the served age is the newer of the two directions",
+        );
     }
 
     // -- Notice reporter authorization (cross-tenant forgery guard) --
@@ -3219,6 +3244,31 @@ mod tests {
             store.snapshot().len(),
             1,
             "a report for an unconfigured region is dropped",
+        );
+
+        // The reverse direction, measured from region-b, lands in the OTHER slot rather
+        // than overwriting region-a's reading: the served value becomes their average,
+        // and the pair stays a single served row.
+        let relay_region_b = RegionId("region-b".to_owned());
+        let rtt_from_b = RegionRttIngest {
+            relay_region: Some(&relay_region_b),
+            regions: &regions,
+            store: &store,
+            ledger: None,
+        };
+        ingest_region_rtts(
+            &rtt_from_b,
+            RelayId(2),
+            &[RegionRttReport {
+                region: RegionId("region-a".to_owned()),
+                rtt_ms: 93,
+            }],
+        );
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1, "the two directions serve one pair");
+        assert_eq!(
+            snap[0].rtt_ms, 90,
+            "both directions fold in and average: (87 + 93) / 2 = 90",
         );
     }
 

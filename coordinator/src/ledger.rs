@@ -46,7 +46,7 @@ use rally_point_proto::ids::RelayId;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::pair_rtts::PairRttEntry;
+use crate::pair_rtts::DirectionRttRow;
 
 /// How long a blocked writer waits for the database lock before erroring, rather
 /// than failing instantly on transient contention.
@@ -86,11 +86,10 @@ CREATE TABLE IF NOT EXISTS provisioned_relays (
 );
 PRAGMA user_version = 1;";
 
-/// The v2 migration: the backbone-RTT table the coordinator persists so last-known
-/// region-pair round-trips survive a restart or a scale-to-zero. One row per
-/// canonical region pair (`region_a <= region_b`), upserted on report and stamped
-/// with the Unix second it was recorded. Additive — it leaves every v1 table and its
-/// rows untouched — and stamps `user_version = 2`.
+/// The v2 migration: a backbone-RTT table keyed by canonical region pair, one value
+/// per pair. Superseded by [`SCHEMA_V3`], which drops this table for a per-direction
+/// one — but the step stays immutable so an existing v2 file migrates deterministically
+/// and a fresh file's version chain is unbroken. Stamps `user_version = 2`.
 const SCHEMA_V2: &str = "\
 CREATE TABLE IF NOT EXISTS region_pair_rtts (
   region_a    TEXT NOT NULL,
@@ -100,6 +99,36 @@ CREATE TABLE IF NOT EXISTS region_pair_rtts (
   PRIMARY KEY (region_a, region_b)
 );
 PRAGMA user_version = 2;";
+
+/// The v3 migration: replaces the single-value-per-pair backbone-RTT table with a
+/// per-direction one. `region_direction_rtts` holds one row per canonical region pair
+/// (`region_a <= region_b`) per `origin` region that measured it, so the two ends of a
+/// link — which measure genuinely different, persistently asymmetric paths — persist
+/// side by side instead of overwriting each other. Upserted on the (pair, origin) key,
+/// stamped with the Unix second recorded. It drops `region_pair_rtts` and stamps
+/// `user_version = 3`.
+///
+/// The v2 rows are dropped, not migrated: a v2 row carries no origin, so which
+/// direction it measured is unknowable and there is no honest way to place it in a
+/// directional slot. The loss is momentary — every live relay re-reports its measured
+/// medians on its next heartbeat (~10s), refilling the table within a beat — so
+/// dropping is cheaper and truer than inventing an origin for a value.
+///
+/// On a fresh file the version chain runs v1 → v2 → v3 in order, so v2 creates
+/// `region_pair_rtts` and v3 immediately drops it. That momentary create-then-drop is
+/// intentional: each migration step stays immutable and self-contained, which is worth
+/// far more than sparing a fresh file one redundant statement.
+const SCHEMA_V3: &str = "\
+CREATE TABLE IF NOT EXISTS region_direction_rtts (
+  region_a    TEXT NOT NULL,
+  region_b    TEXT NOT NULL,
+  origin      TEXT NOT NULL,
+  rtt_ms      INTEGER NOT NULL,
+  measured_at INTEGER NOT NULL,
+  PRIMARY KEY (region_a, region_b, origin)
+);
+DROP TABLE IF EXISTS region_pair_rtts;
+PRAGMA user_version = 3;";
 
 /// A failure operating the ledger's storage — distinct from an
 /// [`EnrollRefusal`], which is a *decision* the ledger reached, not a fault.
@@ -224,14 +253,18 @@ impl RelayLedger {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         // Apply each schema step whose version this file has not reached yet, in
         // order. Every step stamps its own `user_version`, so a fresh file (version 0)
-        // runs both and ends at 2, while a v1 file runs only the v2 migration —
-        // preserving its provisioned-relay rows.
+        // runs all three and ends at 3, while an existing file runs only the steps past
+        // its recorded version — preserving its provisioned-relay rows across the
+        // upgrade.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
         }
         if version < 2 {
             conn.execute_batch(SCHEMA_V2)?;
+        }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -576,27 +609,32 @@ impl RelayLedger {
         Ok(arn.flatten())
     }
 
-    /// Records `rtt_ms` for the canonical region pair `(region_a, region_b)` — the
-    /// caller orders them `region_a <= region_b` — stamped `measured_at` in Unix
-    /// seconds. Upserts on the pair's primary key, so a later report overwrites the
-    /// stored value. The coordinator calls this only when the in-memory value actually
-    /// changed, so a steady-state re-report every heartbeat costs no write.
-    pub fn record_pair_rtt(
+    /// Records `rtt_ms` for one direction of the canonical region pair
+    /// `(region_a, region_b)` — the caller orders them `region_a <= region_b` —
+    /// measured from `origin` (one of the pair's two regions), stamped `measured_at` in
+    /// Unix seconds. Upserts on the (pair, origin) primary key, so the two ends of a
+    /// link persist as two rows and a later report for one direction overwrites only
+    /// that direction. The coordinator calls this only when the in-memory value for
+    /// that direction actually changed, so a steady-state re-report every heartbeat
+    /// costs no write.
+    pub fn record_direction_rtt(
         &self,
         region_a: &RegionId,
         region_b: &RegionId,
+        origin: &RegionId,
         rtt_ms: u32,
         measured_at: u64,
     ) -> Result<(), LedgerError> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO region_pair_rtts (region_a, region_b, rtt_ms, measured_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(region_a, region_b)
+            "INSERT INTO region_direction_rtts (region_a, region_b, origin, rtt_ms, measured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(region_a, region_b, origin)
              DO UPDATE SET rtt_ms = excluded.rtt_ms, measured_at = excluded.measured_at",
             params![
                 region_a.as_ref(),
                 region_b.as_ref(),
+                origin.as_ref(),
                 as_i64(u64::from(rtt_ms)),
                 as_i64(measured_at),
             ],
@@ -604,20 +642,23 @@ impl RelayLedger {
         Ok(())
     }
 
-    /// Every stored region-pair round-trip, as canonical rows — the startup load the
-    /// coordinator seeds its in-memory table from so last-known values survive a
-    /// restart. Unordered; the caller sorts if it needs a deterministic order.
-    pub fn pair_rtts(&self) -> Result<Vec<PairRttEntry>, LedgerError> {
+    /// Every stored per-direction round-trip, as canonical rows tagged with the origin
+    /// that measured each — the startup load the coordinator seeds its in-memory table
+    /// from so last-known directional values survive a restart. Unordered; the seed
+    /// places each row into the directional slot its origin selects.
+    pub fn direction_rtts(&self) -> Result<Vec<DirectionRttRow>, LedgerError> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT region_a, region_b, rtt_ms, measured_at FROM region_pair_rtts")?;
+        let mut stmt = conn.prepare(
+            "SELECT region_a, region_b, origin, rtt_ms, measured_at FROM region_direction_rtts",
+        )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(PairRttEntry {
+                Ok(DirectionRttRow {
                     a: RegionId(row.get::<_, String>(0)?),
                     b: RegionId(row.get::<_, String>(1)?),
-                    rtt_ms: as_u64(row.get::<_, i64>(2)?) as u32,
-                    measured_at: as_u64(row.get::<_, i64>(3)?),
+                    origin: RegionId(row.get::<_, String>(2)?),
+                    rtt_ms: as_u64(row.get::<_, i64>(3)?) as u32,
+                    measured_at: as_u64(row.get::<_, i64>(4)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1281,37 +1322,65 @@ mod tests {
     }
 
     #[test]
-    fn record_pair_rtt_round_trips() {
+    fn record_direction_rtt_round_trips() {
         let ledger = ledger();
         ledger
-            .record_pair_rtt(&region("eu-west"), &region("us-east"), 87, 1_752_555_555)
+            .record_direction_rtt(
+                &region("eu-west"),
+                &region("us-east"),
+                &region("us-east"),
+                87,
+                1_752_555_555,
+            )
             .unwrap();
 
-        let rows = ledger.pair_rtts().unwrap();
+        let rows = ledger.direction_rtts().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].a, region("eu-west"));
         assert_eq!(rows[0].b, region("us-east"));
+        assert_eq!(rows[0].origin, region("us-east"));
         assert_eq!(rows[0].rtt_ms, 87);
         assert_eq!(rows[0].measured_at, 1_752_555_555);
     }
 
     #[test]
-    fn record_pair_rtt_upserts_on_the_pair() {
-        // A second report for the same pair overwrites the stored value rather than
-        // inserting a duplicate — the change-only write-through relies on one row per
-        // pair.
+    fn record_direction_rtt_upserts_on_pair_and_origin() {
+        // The two ends of a link are two rows (one per origin); re-reporting one
+        // direction upserts that row rather than inserting a duplicate. The change-only
+        // write-through relies on one row per (pair, origin).
         let ledger = ledger();
         ledger
-            .record_pair_rtt(&region("a"), &region("b"), 50, 10)
+            .record_direction_rtt(&region("a"), &region("b"), &region("a"), 50, 10)
             .unwrap();
         ledger
-            .record_pair_rtt(&region("a"), &region("b"), 75, 20)
+            .record_direction_rtt(&region("a"), &region("b"), &region("b"), 60, 11)
             .unwrap();
+        assert_eq!(
+            ledger.direction_rtts().unwrap().len(),
+            2,
+            "each direction of the pair is its own row",
+        );
 
-        let rows = ledger.pair_rtts().unwrap();
-        assert_eq!(rows.len(), 1, "the pair has a single row");
-        assert_eq!(rows[0].rtt_ms, 75, "the later report wins");
-        assert_eq!(rows[0].measured_at, 20);
+        // Re-report the a-origin direction: it upserts, leaving two rows.
+        ledger
+            .record_direction_rtt(&region("a"), &region("b"), &region("a"), 75, 20)
+            .unwrap();
+        let rows = ledger.direction_rtts().unwrap();
+        assert_eq!(rows.len(), 2, "the re-report upserts, not inserts");
+        let from_a = rows
+            .iter()
+            .find(|r| r.origin == region("a"))
+            .expect("the a-origin row is present");
+        assert_eq!(
+            from_a.rtt_ms, 75,
+            "the later report for that direction wins"
+        );
+        assert_eq!(from_a.measured_at, 20);
+        let from_b = rows
+            .iter()
+            .find(|r| r.origin == region("b"))
+            .expect("the b-origin row is untouched");
+        assert_eq!(from_b.rtt_ms, 60, "the other direction is left alone");
     }
 
     #[test]
@@ -1323,25 +1392,24 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 2,
+            version, 3,
             "a fresh file is created at the latest schema version"
         );
-        // Both versions' tables exist on a fresh file.
+        // The current backbone-RTT table exists and is usable on a fresh file.
         ledger
-            .record_pair_rtt(&region("a"), &region("b"), 1, 1)
+            .record_direction_rtt(&region("a"), &region("b"), &region("a"), 1, 1)
             .unwrap();
-        assert_eq!(ledger.pair_rtts().unwrap().len(), 1);
+        assert_eq!(ledger.direction_rtts().unwrap().len(), 1);
     }
 
     #[test]
-    fn a_v1_file_upgrades_to_v2_and_keeps_its_provisioned_relays() {
-        // A database created at schema v1 (before the backbone-RTT table existed) is
-        // opened by this build: the v2 migration adds the new table while every v1
-        // provisioned-relay row survives untouched.
+    fn a_v1_file_upgrades_to_v3_and_keeps_its_provisioned_relays() {
+        // A database created at schema v1 (before any backbone-RTT table existed) is
+        // opened by this build: the version chain runs straight through to v3, adding
+        // the per-direction table while every v1 provisioned-relay row survives.
         let path = temp_db_path();
 
-        // Stand up a v1-only file: the v1 schema plus one provisioned-relay row, with
-        // no v2 table.
+        // Stand up a v1-only file: the v1 schema plus one provisioned-relay row.
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
@@ -1357,14 +1425,14 @@ mod tests {
             assert_eq!(version, 1, "the hand-built file is at v1");
         }
 
-        // Open through the ledger: it migrates the file forward to v2.
+        // Open through the ledger: it migrates the file straight through to v3.
         let ledger = RelayLedger::open(&path).unwrap();
         let version: i64 = ledger
             .conn
             .lock()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2, "the file is migrated to v2");
+        assert_eq!(version, 3, "a v1 file migrates straight through to v3");
 
         // The v1 provisioned-relay row survived the upgrade.
         let relays: i64 = ledger
@@ -1379,14 +1447,89 @@ mod tests {
             "the v1 provisioned-relay row survives the migration"
         );
 
-        // The new backbone-RTT table exists and is usable.
+        // The per-direction backbone-RTT table exists and is usable.
         ledger
-            .record_pair_rtt(&region("a"), &region("b"), 42, 7)
+            .record_direction_rtt(&region("a"), &region("b"), &region("a"), 42, 7)
             .unwrap();
-        assert_eq!(ledger.pair_rtts().unwrap().len(), 1);
+        assert_eq!(ledger.direction_rtts().unwrap().len(), 1);
 
         // Drop the connection before removing the file: Windows refuses to delete a
         // file an open handle still holds.
+        drop(ledger);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn a_v2_file_upgrades_to_v3_dropping_the_pair_table_and_keeping_provisioned_relays() {
+        // A database created at schema v2 (the single-value-per-pair table) is opened by
+        // this build: the v3 migration drops `region_pair_rtts` and adds the
+        // per-direction table, while every provisioned-relay row survives.
+        let path = temp_db_path();
+
+        // Stand up a v2 file: v1 + v2 schema, a provisioned-relay row, and a v2 pair row
+        // (which carries no origin and so cannot be honestly migrated).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute(
+                "INSERT INTO provisioned_relays (token_hash, token_expires_at, launched_at)
+                 VALUES (?1, ?2, ?3)",
+                params![[0u8; 32].as_slice(), 9_999_i64, 1_000_i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO region_pair_rtts (region_a, region_b, rtt_ms, measured_at)
+                 VALUES ('a', 'b', 50, 10)",
+                [],
+            )
+            .unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 2, "the hand-built file is at v2");
+        }
+
+        // Open through the ledger: it migrates the file forward to v3.
+        let ledger = RelayLedger::open(&path).unwrap();
+        let version: i64 = ledger
+            .conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3, "the file is migrated to v3");
+
+        // The v2 single-value pair table is gone.
+        let old_tables: i64 = ledger
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'region_pair_rtts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_tables, 0, "the v2 region_pair_rtts table is dropped");
+
+        // The provisioned-relay row survived the migration.
+        let relays: i64 = ledger
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM provisioned_relays", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            relays, 1,
+            "the provisioned-relay rows survive the v3 migration",
+        );
+
+        // The per-direction table exists and is usable.
+        ledger
+            .record_direction_rtt(&region("a"), &region("b"), &region("a"), 42, 7)
+            .unwrap();
+        assert_eq!(ledger.direction_rtts().unwrap().len(), 1);
+
         drop(ledger);
         cleanup_db(&path);
     }
