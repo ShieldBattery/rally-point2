@@ -13,7 +13,7 @@
 //! A pair is unordered: `(a, b)` and `(b, a)` are the same backbone link, and either
 //! region's relay may measure it. Keys are canonicalized to `a <= b` by id string
 //! ([`canonical_pair`]), so both directions collapse to one entry. Aggregation is
-//! last-write-wins beyond a small dead-band ([`RTT_DEADBAND_MS`]) — the latest report
+//! last-write-wins beyond a small dead-band (`deadband_ms`) — the latest report
 //! for a pair replaces the stored value, except that a report within noise of the
 //! stored value keeps it, so the two ends' independently-measured medians (which
 //! agree only to within a few milliseconds) do not thrash the stored value — or the
@@ -35,14 +35,22 @@ use parking_lot::Mutex;
 use rally_point_proto::control::RegionId;
 use serde::Serialize;
 
-/// How far, in milliseconds, a reported round-trip may sit from the stored value and
-/// still count as the same measurement. Both ends of a pair measure it independently
-/// and repeat their medians on every heartbeat; two medians of one backbone path
-/// agree only to within measurement noise (single-digit milliseconds), while a real
-/// backbone shift — a re-route — moves a path by tens of milliseconds. The band
-/// absorbs the noise so alternating heartbeats cannot thrash the stored value or the
-/// ledger, and passes real shifts through unchanged.
-const RTT_DEADBAND_MS: u32 = 5;
+/// The floor of the measurement dead-band, in milliseconds — see [`deadband_ms`].
+const RTT_DEADBAND_MIN_MS: u32 = 5;
+
+/// How far a reported round-trip may sit from the stored value and still count as
+/// the same measurement: 5% of the stored value, floored at
+/// [`RTT_DEADBAND_MIN_MS`]. A pair's reporters — its two ends, and every relay in
+/// either region — measure it independently and repeat their medians on every
+/// heartbeat, and medians of one backbone path agree only to within noise that
+/// scales loosely with the path (single-digit milliseconds nearby, proportionally
+/// more trans-oceanic). A real backbone shift — a re-route — moves a path well
+/// beyond either bound. The band absorbs the noise so alternating heartbeats
+/// cannot thrash the stored value or the ledger, and passes real shifts through
+/// unchanged.
+fn deadband_ms(stored_rtt_ms: u32) -> u32 {
+    RTT_DEADBAND_MIN_MS.max(stored_rtt_ms / 20)
+}
 
 /// One region pair's measured backbone round-trip and when it was recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +111,7 @@ impl PairRttStore {
     /// path agree only to within measurement noise, so without it the stored value
     /// would flip between the two ends' readings on every alternating beat — and each
     /// flip would count as a change and cost a ledger write. A report within
-    /// [`RTT_DEADBAND_MS`] of the stored value therefore refreshes `measured_at` but
+    /// `deadband_ms` of the stored value therefore refreshes `measured_at` but
     /// keeps the stored round-trip; a real backbone shift (a re-route moves a path by
     /// tens of milliseconds) lands unchanged.
     ///
@@ -128,7 +136,7 @@ impl PairRttStore {
         let mut pairs = self.pairs.lock();
         match pairs.get_mut(&key) {
             Some(existing) => {
-                if existing.rtt_ms.abs_diff(rtt_ms) <= RTT_DEADBAND_MS {
+                if existing.rtt_ms.abs_diff(rtt_ms) <= deadband_ms(existing.rtt_ms) {
                     existing.measured_at = now_unix;
                     false
                 } else {
@@ -266,7 +274,7 @@ mod tests {
         let store = new_store();
         assert!(store.record(&region("a"), &region("b"), 87, 10));
         assert!(
-            !store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MS, 20),
+            !store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MIN_MS, 20),
             "a report inside the dead-band is not a change",
         );
 
@@ -278,8 +286,20 @@ mod tests {
         );
 
         // One past the band is a real shift: it lands and signals.
-        assert!(store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MS + 1, 30));
-        assert_eq!(store.snapshot()[0].rtt_ms, 87 + RTT_DEADBAND_MS + 1);
+        assert!(store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MIN_MS + 1, 30));
+        assert_eq!(store.snapshot()[0].rtt_ms, 87 + RTT_DEADBAND_MIN_MS + 1);
+
+        // On a long path the band scales: 5% of the stored value once that exceeds
+        // the floor. Stored 200 -> band 10: a report 10 away is absorbed, 11 lands.
+        let long = new_store();
+        assert!(long.record(&region("x"), &region("y"), 200, 10));
+        assert!(
+            !long.record(&region("x"), &region("y"), 210, 20),
+            "within 5% of a long path is the same measurement",
+        );
+        assert_eq!(long.snapshot()[0].rtt_ms, 200);
+        assert!(long.record(&region("x"), &region("y"), 211, 30));
+        assert_eq!(long.snapshot()[0].rtt_ms, 211);
     }
 
     #[test]

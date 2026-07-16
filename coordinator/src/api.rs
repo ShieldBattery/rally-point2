@@ -1752,9 +1752,22 @@ fn ingest_region_rtts(rtt: &RegionRttIngest<'_>, relay_id: RelayId, reports: &[R
         let changed = rtt
             .store
             .record(relay_region, &report.region, report.rtt_ms, now);
-        if changed && let Some(ledger) = rtt.ledger {
+        if changed {
             let (a, b) = pair_rtts::canonical_pair(relay_region, &report.region);
-            if let Err(error) = ledger.record_pair_rtt(a, b, report.rtt_ms, now) {
+            // A beyond-dead-band change is rare — a pair's first fill, or a real
+            // backbone shift — so each one is worth a log line: the log stream is
+            // the pair table's change history (the table itself keeps only the
+            // latest value per pair).
+            tracing::info!(
+                relay_id = relay_id.0,
+                pair_a = a.as_ref(),
+                pair_b = b.as_ref(),
+                rtt_ms = report.rtt_ms,
+                "backbone RTT recorded",
+            );
+            if let Some(ledger) = rtt.ledger
+                && let Err(error) = ledger.record_pair_rtt(a, b, report.rtt_ms, now)
+            {
                 tracing::warn!(
                     relay_id = relay_id.0,
                     %error,
