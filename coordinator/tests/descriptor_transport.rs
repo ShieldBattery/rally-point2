@@ -156,6 +156,7 @@ async fn serve_bare_coordinator(
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -238,6 +239,7 @@ async fn coordinator_with_session(
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -636,6 +638,7 @@ async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (Strin
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -991,6 +994,7 @@ async fn serve_coordinator_with_regions(regions: RegionsConfig) -> (String, Sess
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

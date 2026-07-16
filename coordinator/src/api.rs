@@ -78,14 +78,18 @@ use axum::{
         ConnectInfo, FromRequestParts, Path, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION, request::Parts},
+    http::{
+        HeaderMap, Method, StatusCode, Uri,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        request::Parts,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RegionId, RegionRttReport,
-    RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
-    SessionResponse, TenantId, TenantVerifyingKey,
+    CoordinatorToRelay, FlightRecordingNotice, MeshPeerIdentity, RegionBeaconTarget, RegionId,
+    RegionRttReport, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
+    SessionRequest, SessionResponse, TenantId, TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -97,6 +101,7 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::descriptors::SlotClose;
+use crate::flight_store::{self, S3FlightStore};
 use crate::identity;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
@@ -245,6 +250,13 @@ pub struct CoordinatorState {
     /// values survive a restart; memory-only otherwise. Shared (an `Arc`) across all
     /// relay control connections and the HTTP state.
     pub pair_rtts: PairRttStore,
+    /// The flight-recorder durable sink, when the coordinator was started with one
+    /// (`--flight-store`). Present ⇒ the recordings relays ship up their control
+    /// connections are stored, and the flight read endpoints serve them. Absent ⇒ a
+    /// shipped recording is dropped with a rate-limited warn and the read endpoints
+    /// report nothing — the dev / no-store posture. Shared (an `Arc`) across all relay
+    /// control connections and the HTTP state.
+    pub flight_store: Option<Arc<S3FlightStore>>,
 }
 
 /// Builds the coordinator's HTTP router over `state`.
@@ -254,6 +266,8 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/session/rehome", post(rehome_session))
         .route("/sessions/alive", post(sessions_alive))
         .route("/presence/query", post(presence_query))
+        .route("/flight/blobs", post(flight_blobs))
+        .route("/flight/blob", post(flight_blob))
         .route("/regions/warm", post(warm_regions))
         .route("/tenant/{tenant}/pubkey", get(tenant_pubkey))
         .route("/regions", get(regions))
@@ -767,6 +781,171 @@ async fn presence_query(
     Ok(Json(PresenceQueryResponse { users }))
 }
 
+/// Request body for `POST /flight/blobs`: the session whose stored recordings to
+/// list. Tenant-authenticated (snake_case control-plane surface, like
+/// [`SessionRequest`]); `tenant` must match the tenant the request signature verifies
+/// under, and is the only tenant whose blobs the request can name.
+#[derive(Debug, Deserialize)]
+struct FlightBlobsRequest {
+    /// The tenant the app server is acting for — must match the request signature.
+    tenant: TenantId,
+    /// The session, in the coordinator's `(tenant, session)` id space.
+    session: u64,
+}
+
+/// Response body for `POST /flight/blobs`: one entry per relay that stored a recording
+/// for the session, deduped by relay id (a pinned copy wins). camelCase, the tenant's
+/// own forensics-tooling surface.
+#[derive(Debug, Serialize)]
+struct FlightBlobsResponse {
+    /// The session's stored recordings, one per relay.
+    blobs: Vec<FlightBlobInfo>,
+}
+
+/// One stored recording in a [`FlightBlobsResponse`]: which relay produced it, whether
+/// it is pinned (the desynced-session retention class), and its size and last-modified
+/// stamp. camelCase field names (`relayId`, `lastModifiedMs`) match the tenant-facing
+/// forensics surface that consumes this.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FlightBlobInfo {
+    /// The relay whose recording this is.
+    relay_id: u64,
+    /// Whether the recording is in the pinned (desynced) retention class.
+    pinned: bool,
+    /// The recording's size in bytes.
+    size: u64,
+    /// The recording's last-modified time, unix-epoch milliseconds.
+    last_modified_ms: i64,
+}
+
+impl From<flight_store::RecordingListing> for FlightBlobInfo {
+    fn from(listing: flight_store::RecordingListing) -> Self {
+        Self {
+            relay_id: listing.relay_id,
+            pinned: listing.pinned,
+            size: listing.size,
+            last_modified_ms: listing.last_modified_ms,
+        }
+    }
+}
+
+/// Request body for `POST /flight/blob`: one relay's recording of one session to fetch.
+/// Same tenant-authentication and tenant-scoping as [`FlightBlobsRequest`].
+#[derive(Debug, Deserialize)]
+struct FlightBlobRequest {
+    /// The tenant the app server is acting for — must match the request signature.
+    tenant: TenantId,
+    /// The session, in the coordinator's `(tenant, session)` id space.
+    session: u64,
+    /// The relay whose recording to fetch.
+    relay_id: u64,
+}
+
+/// Lists a session's stored flight recordings.
+///
+/// **A POST, not a GET, with the tenant in the signed body** — the same shape every
+/// other tenant endpoint uses. The request signature (see the module docs) covers the
+/// body, so the `tenant` it names is bound by the signature: a body naming another
+/// tenant fails verification against this tenant's keys. The blobs are keyed on the
+/// authenticated tenant, and the path never names a tenant, so a request can only ever
+/// reach its own tenant's recordings. As forensics on past games, this is live-game
+/// machinery — refused (`403`) only for a revoked tenant, not a suspended one.
+///
+/// With no store configured the response is an empty list rather than an error: there
+/// is simply nothing stored. A store error is a `500`.
+async fn flight_blobs(
+    State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<FlightBlobsResponse>, StatusCode> {
+    let request: FlightBlobsRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        TenantAccess::LiveGame,
+    )?;
+
+    let Some(store) = state.flight_store.as_ref() else {
+        return Ok(Json(FlightBlobsResponse { blobs: Vec::new() }));
+    };
+    match flight_store::list_recordings(&**store, &request.tenant, SessionId(request.session)).await
+    {
+        Ok(listings) => Ok(Json(FlightBlobsResponse {
+            blobs: listings.into_iter().map(FlightBlobInfo::from).collect(),
+        })),
+        Err(error) => {
+            tracing::warn!(
+                tenant = request.tenant.as_ref(),
+                session = request.session,
+                %error,
+                "listing flight recordings failed",
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Fetches one relay's stored flight recording for a session, returning the stored JSON
+/// verbatim (`application/json`) or `404` when neither retention class holds it.
+///
+/// Authenticated and tenant-scoped exactly like [`flight_blobs`]: the tenant comes from
+/// the signed body, the key is built from that authenticated tenant, and the path names
+/// no tenant — so a request can never reach another tenant's recording. Live-game tier
+/// (refused only for a revoked tenant). With no store configured every blob reads as
+/// absent, so the answer is `404`.
+async fn flight_blob(
+    State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    let request: FlightBlobRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        TenantAccess::LiveGame,
+    )?;
+
+    let Some(store) = state.flight_store.as_ref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    match flight_store::fetch_recording(
+        &**store,
+        &request.tenant,
+        SessionId(request.session),
+        RelayId(request.relay_id),
+    )
+    .await
+    {
+        Ok(Some(bytes)) => Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response()),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(
+                tenant = request.tenant.as_ref(),
+                session = request.session,
+                relay_id = request.relay_id,
+                %error,
+                "fetching a flight recording failed",
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// Request body for `POST /regions/warm`: a tenant and the regions it wants kept
 /// warm. Tenant-authenticated (snake_case control-plane surface, like
 /// [`SessionRequest`]); `tenant` must match the tenant the request signature
@@ -974,6 +1153,7 @@ async fn relay_control(
     let regions = state.regions.clone();
     let ledger = state.ledger.clone();
     let pair_rtts = state.pair_rtts.clone();
+    let flight_store = state.flight_store.clone();
     let peer_ip = peer_addr.map(|addr| addr.ip());
     ws.on_upgrade(move |socket| {
         serve_relay_control(
@@ -987,6 +1167,7 @@ async fn relay_control(
             ledger,
             peer_ip,
             pair_rtts,
+            flight_store,
         )
     })
 }
@@ -1037,6 +1218,7 @@ async fn serve_relay_control(
     ledger: Option<Arc<RelayLedger>>,
     peer_ip: Option<IpAddr>,
     pair_rtts: PairRttStore,
+    flight_store: Option<Arc<S3FlightStore>>,
 ) {
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
@@ -1216,6 +1398,7 @@ async fn serve_relay_control(
         generation,
         liveness_timeout,
         &rtt_ingest,
+        flight_store.as_ref(),
     )
     .await;
 
@@ -1324,6 +1507,7 @@ async fn push_and_watch(
     generation: u64,
     liveness_timeout: Duration,
     rtt: &RegionRttIngest<'_>,
+    flight_store: Option<&Arc<S3FlightStore>>,
 ) {
     let mut rx = setup.descriptors().subscribe(relay_id);
     // The reap outbox for this relay: the reap policies push `CloseSlot`
@@ -1413,6 +1597,7 @@ async fn push_and_watch(
                     Some(Ok(message)) => {
                         let action = note_inbound(
                             setup, notices, lifecycle, relay_id, generation, &message, rtt,
+                            flight_store,
                         );
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
@@ -1810,6 +1995,7 @@ enum InboundAction {
 /// `sessionClosed` signal must track a session even for a tenant with no webhook
 /// configured. Redundant notices from multiple relays are idempotent in the
 /// accounting (a set insert), so feeding every copy is harmless.
+#[allow(clippy::too_many_arguments)]
 fn note_inbound(
     setup: &SessionSetup,
     notices: &NoticeDedup,
@@ -1818,6 +2004,7 @@ fn note_inbound(
     generation: u64,
     message: &Message,
     rtt: &RegionRttIngest<'_>,
+    flight_store: Option<&Arc<S3FlightStore>>,
 ) -> InboundAction {
     let Message::Text(text) = message else {
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
@@ -1898,7 +2085,13 @@ fn note_inbound(
                 );
                 return InboundAction::None;
             }
-            notify::handle_desync(setup, &notices.desyncs, lifecycle, notice);
+            notify::handle_desync(
+                setup,
+                &notices.desyncs,
+                &notices.desync_marks,
+                lifecycle,
+                notice,
+            );
             InboundAction::None
         }
         Ok(RelayToCoordinator::Result(notice)) => {
@@ -1920,11 +2113,8 @@ fn note_inbound(
             lifecycle.on_session_closed(tenant, session, relay_id);
             InboundAction::None
         }
-        Ok(RelayToCoordinator::FlightRecording(_)) => {
-            tracing::debug!(
-                relay_id = relay_id.0,
-                "dropping a flight recording frame; the coordinator does not persist recordings",
-            );
+        Ok(RelayToCoordinator::FlightRecording(notice)) => {
+            handle_flight_recording(setup, &notices.desync_marks, flight_store, relay_id, notice);
             InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
@@ -1934,6 +2124,169 @@ fn note_inbound(
             InboundAction::None
         }
     }
+}
+
+/// The most flight-recording uploads the coordinator runs at once, bounding the object
+/// -store PUTs a burst of session closes can have in flight — the flight sink's
+/// counterpart to the webhook dispatch semaphore. Each upload is spawned off the
+/// control-connection read loop, so a slow PUT never stalls the heartbeats that ride it.
+const MAX_CONCURRENT_FLIGHT_UPLOADS: usize = 8;
+
+/// The process-wide gate [`MAX_CONCURRENT_FLIGHT_UPLOADS`] enforces.
+static FLIGHT_UPLOAD_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_FLIGHT_UPLOADS);
+
+/// The shortest gap between "a recording arrived but no store is configured" warnings,
+/// so a fleet shipping recordings to a coordinator whose store config was forgotten
+/// logs the misconfiguration without one log line per recording.
+const NO_STORE_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Unix seconds of the last no-store warning, so [`warn_no_flight_store`] can rate-limit
+/// itself. `0` means it has never warned.
+static LAST_NO_STORE_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Ingests one relay's flight-recording frame: gate it (a configured store, a known
+/// tenant, a payload within the cap), decide its retention class, and spawn the upload
+/// so a slow object-store PUT never stalls the control-connection read loop the relay's
+/// heartbeats ride.
+///
+/// The blob is keyed on `relay_id` — the identity THIS connection enrolled as, never a
+/// relay-supplied field — so a relay can only ever write under its own id. The
+/// retention class is pinned when the shipping relay flagged a desync in its own events
+/// OR the coordinator has independently marked the session desynced: only the authority
+/// relay's own recording carries the flag, but every relay's desync notice reaches the
+/// coordinator, so the mark is what pins the non-authority relays' blobs. A pinned store
+/// also sweeps the session's already-stored unpinned blobs into the pinned class (see
+/// [`flight_store::store_recording`]), converging blobs that arrived before the desync
+/// was known.
+///
+/// Unlike its departure/desync/result siblings, this frame deliberately passes no
+/// [`relay_may_report`]-style serving-set check: a recording flushes at the same
+/// moment the relay reports `SessionClosed`, in no fixed order relative to it, so by
+/// the time the blob arrives the session's serving-set state may already be retired
+/// and a membership check would wrongly refuse exactly the blobs the store exists to
+/// keep. The exposure is proportionate: a notice can fire webhooks and move lifecycle
+/// state, but a forged recording can only land under the shipping relay's own key —
+/// pollution bounded to the identity that shipped it.
+fn handle_flight_recording(
+    setup: &SessionSetup,
+    desync_marks: &notify::DesyncMarks,
+    flight_store: Option<&Arc<S3FlightStore>>,
+    relay_id: RelayId,
+    notice: FlightRecordingNotice,
+) {
+    let tenant_known = tenant::tenant_state(setup.tenants(), &notice.tenant).is_some();
+    if let Err(drop) = flight_store::classify_ingest(
+        flight_store.is_some(),
+        tenant_known,
+        &notice.tenant,
+        notice.payload.len(),
+    ) {
+        match drop {
+            flight_store::FlightDrop::NoStore => warn_no_flight_store(relay_id),
+            flight_store::FlightDrop::UnknownTenant => tracing::warn!(
+                relay_id = relay_id.0,
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                "dropping a flight recording for a tenant not in the registry",
+            ),
+            flight_store::FlightDrop::TenantIdNotKeySafe => tracing::warn!(
+                relay_id = relay_id.0,
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                "dropping a flight recording: the tenant id cannot embed in an object key",
+            ),
+            flight_store::FlightDrop::TooLarge => tracing::warn!(
+                relay_id = relay_id.0,
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                bytes = notice.payload.len(),
+                "dropping an oversize flight recording",
+            ),
+        }
+        return;
+    }
+
+    let store = flight_store
+        .expect("classify_ingest permits storage only when a store is configured")
+        .clone();
+    let pinned = notice.desynced
+        || notify::is_session_desynced(
+            desync_marks,
+            &notice.tenant,
+            notice.session,
+            std::time::Instant::now(),
+        );
+    spawn_flight_upload(
+        store,
+        notice.tenant,
+        notice.session,
+        relay_id,
+        notice.payload.into_bytes(),
+        pinned,
+    );
+}
+
+/// Spawns the upload of one gated flight recording, bounded by [`FLIGHT_UPLOAD_PERMITS`].
+/// A failed store is a logged loss with no retry: flight data is observability, and the
+/// relay's at-least-once shipping already covers connection-level loss. Detached from the
+/// read loop so a slow PUT never stalls it.
+fn spawn_flight_upload(
+    store: Arc<S3FlightStore>,
+    tenant: TenantId,
+    session: SessionId,
+    relay_id: RelayId,
+    payload: Vec<u8>,
+    pinned: bool,
+) {
+    let bytes = payload.len();
+    tokio::spawn(async move {
+        let _permit = FLIGHT_UPLOAD_PERMITS
+            .acquire()
+            .await
+            .expect("FLIGHT_UPLOAD_PERMITS is never closed");
+        match flight_store::store_recording(&*store, &tenant, session, relay_id, payload, pinned)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                tenant = tenant.as_ref(),
+                session = session.0,
+                relay_id = relay_id.0,
+                pinned,
+                bytes,
+                "flight recording stored",
+            ),
+            Err(error) => tracing::warn!(
+                tenant = tenant.as_ref(),
+                session = session.0,
+                relay_id = relay_id.0,
+                pinned,
+                bytes,
+                %error,
+                "storing a flight recording failed; the recording is lost (no retry)",
+            ),
+        }
+    });
+}
+
+/// Warns that a recording arrived with no store configured, at most once per
+/// [`NO_STORE_WARN_INTERVAL_SECS`] — an operator who wired relays to ship but forgot the
+/// store config should see it, without one log line per dropped recording. A racing pair
+/// of warns is harmless (the store/load is best-effort, not a lock).
+fn warn_no_flight_store(relay_id: RelayId) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_NO_STORE_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < NO_STORE_WARN_INTERVAL_SECS {
+        return;
+    }
+    LAST_NO_STORE_WARN_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        relay_id = relay_id.0,
+        "a relay shipped a flight recording but no --flight-store is configured; dropping it",
+    );
 }
 
 /// Whether `relay_id` — the relay identity this control connection enrolled as —
@@ -2362,6 +2715,7 @@ mod tests {
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
             pair_rtts: pair_rtts::new_store(),
+            flight_store: None,
         }
     }
 
@@ -2768,6 +3122,7 @@ mod tests {
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
             pair_rtts: pair_rtts::new_store(),
+            flight_store: None,
         };
         let app = router(state);
 
@@ -2873,6 +3228,7 @@ mod tests {
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
             pair_rtts: pair_rtts::new_store(),
+            flight_store: None,
         };
         let app = router(state);
 
@@ -3215,6 +3571,7 @@ mod tests {
             stale_generation,
             &beat,
             &rtt,
+            None,
         );
         assert!(
             store.snapshot().is_empty(),
@@ -3230,6 +3587,7 @@ mod tests {
             current_generation,
             &beat,
             &rtt,
+            None,
         );
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
@@ -3248,6 +3606,7 @@ mod tests {
             current_generation,
             &unknown,
             &rtt,
+            None,
         );
         assert_eq!(
             store.snapshot().len(),
@@ -3319,6 +3678,7 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
+            None,
         );
 
         assert!(
@@ -3342,6 +3702,7 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
+            None,
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -3368,12 +3729,62 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(SessionId(4242), 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
+            None,
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("a notice for a session with no serving record still delivers")
             .expect("the receiver got it");
+    }
+
+    // --- Flight recording read endpoints ---
+
+    #[tokio::test]
+    async fn flight_blobs_lists_empty_with_no_store_configured() {
+        // With no --flight-store, the read endpoints still authenticate and answer
+        // "nothing stored" rather than erroring: an empty list here.
+        let app = router(state_with_relay_and_tenant());
+        let body =
+            serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "session": 7})).unwrap();
+        let resp = signed_post(app, "/flight/blobs", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["blobs"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn flight_blob_is_404_with_no_store_configured() {
+        let app = router(state_with_relay_and_tenant());
+        let body = serde_json::to_vec(
+            &serde_json::json!({"tenant": "sb-test", "session": 7, "relay_id": 3}),
+        )
+        .unwrap();
+        let resp = signed_post(app, "/flight/blob", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn flight_reads_reject_a_signature_from_the_wrong_key() {
+        // A request naming sb-test but signed with a key sb-test never enrolled is
+        // refused before any store lookup: the tenant identity is the signature's, and
+        // blobs are keyed on it, so a foreign signer can never reach sb-test's
+        // recordings.
+        let app = router(state_with_relay_and_tenant());
+        let list_body =
+            serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "session": 7})).unwrap();
+        let resp = signed_post(app.clone(), "/flight/blobs", &list_body, &OTHER_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let fetch_body = serde_json::to_vec(
+            &serde_json::json!({"tenant": "sb-test", "session": 7, "relay_id": 3}),
+        )
+        .unwrap();
+        let resp = signed_post(app, "/flight/blob", &fetch_body, &OTHER_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // --- Re-home endpoint ---
@@ -3882,6 +4293,7 @@ mod tests {
             player_token_lifetime: TEST_TOKEN_LIFETIME,
             ledger: None,
             pair_rtts: pair_rtts::new_store(),
+            flight_store: None,
         }
     }
 

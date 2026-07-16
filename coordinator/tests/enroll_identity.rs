@@ -59,6 +59,7 @@ async fn serve_bare_coordinator() -> (String, RelayRegistry) {
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -133,6 +134,7 @@ async fn a_relay_that_never_answers_the_challenge_is_refused_and_never_enrolls()
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
         pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

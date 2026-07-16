@@ -20,6 +20,11 @@
 //!   notices relays report up their control connections, enrich each with the
 //!   session's stored correlation ids + the tenant's notify config, and POST a
 //!   webhook to the tenant.
+//! - **flight_store** ([`flight_store`]) — the flight-recorder durable sink: the
+//!   coordinator persists the observability blobs relays ship up their control
+//!   connections into a DigitalOcean Spaces bucket under retention-selecting key
+//!   prefixes, and serves tenant-authenticated reads over them. The coordinator is
+//!   the sole object-store credential holder.
 //! - **presence** ([`presence`]) — active-player presence: the connected slots
 //!   relays piggyback on their heartbeats, aggregated so a tenant's app server
 //!   can ask "is user U in a live game" and block an in-game player from
@@ -66,6 +71,7 @@
 pub mod acme;
 pub mod api;
 pub mod descriptors;
+pub mod flight_store;
 pub mod identity;
 pub mod ledger;
 pub mod lifecycle;

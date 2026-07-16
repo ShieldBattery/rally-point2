@@ -62,6 +62,11 @@ rusqlite = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-ecs = { workspace = true }
 aws-sdk-ec2 = { workspace = true }
+# The flight-recorder durable sink: stores relay-shipped observability blobs into a
+# DigitalOcean Spaces bucket over the S3 API, and serves tenant-authenticated reads
+# over them. Ring-only TLS via the shared `aws-smithy-http-client` connector, the same
+# isolation the ECS/EC2 clients hold.
+aws-sdk-s3 = { workspace = true }
 aws-smithy-http-client = { workspace = true }
 
 [dev-dependencies]

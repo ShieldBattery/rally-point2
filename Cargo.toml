@@ -219,6 +219,18 @@ aws-sdk-ec2 = { version = "1.208", default-features = false, features = [
   "rt-tokio",
   "behavior-version-latest",
 ] }
+# The flight-recorder durable sink: the coordinator stores the observability blobs
+# relays ship up their control connections into a DigitalOcean Spaces bucket over the
+# S3 API. Declared exactly like the ECS/EC2 clients — `default-features = false` drops
+# the SDK's bundled aws-lc-rs HTTPS client, and the ring connector from
+# `aws-smithy-http-client` is supplied explicitly at construction — so the S3 client
+# reuses the workspace's single crypto backend and the tree grows no aws-lc-rs path.
+# Pinned exactly so adding it leaves the shared `aws-smithy-*` versions the other SDK
+# clients resolved untouched. Coordinator-only.
+aws-sdk-s3 = { version = "=1.119.0", default-features = false, features = [
+  "rt-tokio",
+  "behavior-version-latest",
+] }
 # The explicit HTTPS connector for the SDK clients, pinned to the rustls **ring**
 # provider so the AWS graph reuses the workspace's single crypto backend instead
 # of pulling aws-lc-rs.

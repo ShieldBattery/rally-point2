@@ -21,7 +21,7 @@ use rally_point_coordinator::provision::{
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{
-    acme, notify, pair_rtts, regions, registry, session, tenant, tenant_config,
+    acme, flight_store, notify, pair_rtts, regions, registry, session, tenant, tenant_config,
 };
 use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
@@ -277,6 +277,18 @@ struct Cli {
         default_value_t = 75
     )]
     provision_create_hold_secs: u64,
+
+    /// Path to the flight-recorder durable sink config JSON (`endpoint`, `region`,
+    /// `bucket`, and the NAMES of the environment variables holding the store's access
+    /// and secret keys — `accessKeyEnv` / `secretKeyEnv`, the same env-name indirection
+    /// the tenant registry uses so the keys stay out of the file). Present ⇒ the
+    /// observability blobs relays ship up their control connections are stored in the
+    /// bucket, and the flight read endpoints serve them. Loaded and validated at
+    /// startup; a malformed file or an unset credential variable fails the coordinator
+    /// to start (fail closed, like the tenant registry). Absent ⇒ no store: a shipped
+    /// recording is dropped with a rate-limited warn — the dev / no-store posture.
+    #[arg(long, env = "COORDINATOR_FLIGHT_STORE")]
+    flight_store: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -416,6 +428,28 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load and connect the flight-recorder durable sink when one is configured. Fail
+    // startup on a malformed config or an unset credential variable: a coordinator told
+    // to persist recordings but unable to reach its store must not silently drop every
+    // one, the same fail-closed posture as the tenant registry. Absent = no store, and
+    // shipped recordings are dropped with a rate-limited warn.
+    let flight_store = match &cli.flight_store {
+        Some(path) => {
+            let config = flight_store::load(path)
+                .with_context(|| format!("loading flight store config {}", path.display()))?;
+            let resolved = config
+                .resolve_secrets(|name| std::env::var(name).ok())
+                .context("resolving flight store credentials from the environment")?;
+            let store = flight_store::S3FlightStore::connect(resolved).await;
+            tracing::info!(path = %path.display(), "flight store configured");
+            Some(std::sync::Arc::new(store))
+        }
+        None => {
+            tracing::info!("no --flight-store configured; shipped flight recordings are dropped");
+            None
+        }
+    };
+
     let lifecycle = Lifecycle::new(setup.clone());
     let notices = notify::new_dedup();
     // Let the lifecycle prune these dedup sets when it removes a session's state,
@@ -443,6 +477,7 @@ async fn main() -> Result<()> {
         player_token_lifetime: Duration::from_secs(cli.player_token_lifetime_secs),
         ledger,
         pair_rtts,
+        flight_store,
     };
 
     let app = api::router(state);

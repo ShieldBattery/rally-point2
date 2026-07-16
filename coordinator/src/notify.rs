@@ -37,9 +37,9 @@
 //! timestamp would be rejected before the consumer even reaches its own
 //! dedup/idempotency check.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -79,6 +79,23 @@ pub type DesyncDedup = Arc<Mutex<HashSet<(TenantId, SessionId, u64)>>>;
 /// report to a single webhook.
 pub type ResultDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
+/// Sessions the coordinator has seen a desync for, keyed by `(tenant, session)` and
+/// stamped with when the mark was made. The flight-recorder sink reads this to pin a
+/// recording's retention class even when the desync webhook was ultimately dropped
+/// (no notify config, no gameId) or the shipping relay's own desync flag was lost to
+/// a restart — the desync FACT is what selects the retention class, independent of
+/// whether a webhook was delivered. Marks live beside the dedup sets, and
+/// [`handle_desync`] inserts one on every desync it sees.
+pub type DesyncMarks = Arc<Mutex<HashMap<(TenantId, SessionId), Instant>>>;
+
+/// How long a desync mark is honored before it is pruned. Generous because a desync
+/// is rare and a session's flight blobs arrive within minutes of its close, but the
+/// window is deliberately **not** tied to session retirement: a blob's arrival and
+/// the session-close bookkeeping travel two separate channels, so a blob can reach
+/// the coordinator after the session's other state has already been retired, and the
+/// mark must still be here to pin it.
+pub const DESYNC_MARK_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// The notice dedup sets a coordinator holds, bundled so the api layer
 /// threads one value rather than several through its control-connection handlers.
 #[derive(Clone)]
@@ -89,15 +106,48 @@ pub struct NoticeDedup {
     pub desyncs: DesyncDedup,
     /// Result dedup by `(tenant, session, slot)`.
     pub results: ResultDedup,
+    /// Desynced-session marks the flight-recorder sink reads to pin a recording's
+    /// retention class. Not a dedup set — one mark per `(tenant, session)`, refreshed
+    /// on every desync and pruned by [`DESYNC_MARK_TTL`], never by session retirement.
+    pub desync_marks: DesyncMarks,
 }
 
-/// Creates an empty notice dedup set (departures + desyncs + results).
+/// Creates an empty notice dedup set (departures + desyncs + results + desync marks).
 pub fn new_dedup() -> NoticeDedup {
     NoticeDedup {
         departures: Arc::new(Mutex::new(HashSet::new())),
         desyncs: Arc::new(Mutex::new(HashSet::new())),
         results: Arc::new(Mutex::new(HashSet::new())),
+        desync_marks: Arc::new(Mutex::new(HashMap::new())),
     }
+}
+
+/// Records that `(tenant, session)` desynced, stamped `now`, opportunistically
+/// pruning any mark older than [`DESYNC_MARK_TTL`] first. Idempotent: a repeated
+/// desync for the same session simply refreshes its stamp.
+pub fn mark_session_desynced(
+    marks: &DesyncMarks,
+    tenant: TenantId,
+    session: SessionId,
+    now: Instant,
+) {
+    let mut guard = marks.lock();
+    guard.retain(|_, marked_at| now.saturating_duration_since(*marked_at) < DESYNC_MARK_TTL);
+    guard.insert((tenant, session), now);
+}
+
+/// Whether `(tenant, session)` carries a live (un-expired) desync mark, pruning any
+/// mark older than [`DESYNC_MARK_TTL`] as it checks — so an expired mark reads as
+/// absent and is dropped in the same pass.
+pub fn is_session_desynced(
+    marks: &DesyncMarks,
+    tenant: &TenantId,
+    session: SessionId,
+    now: Instant,
+) -> bool {
+    let mut guard = marks.lock();
+    guard.retain(|_, marked_at| now.saturating_duration_since(*marked_at) < DESYNC_MARK_TTL);
+    guard.contains_key(&(tenant.clone(), session))
 }
 
 impl NoticeDedup {
@@ -533,12 +583,20 @@ pub fn handle_departure(
 /// delivers a correct webhook from the notice's self-stamped refs. Each diverged
 /// slot's `externalRef` resolves independently (notice ref, else the stored
 /// per-slot ref), so a partially-ref'd notice still names whom it can.
+///
+/// A desynced-session mark is recorded first of all, before the dedup and
+/// notify-config/gameId gates that can drop the webhook: the flight-recorder sink
+/// pins a session's recordings on the desync FACT, which holds regardless of whether
+/// a webhook is ever delivered for it.
 pub fn handle_desync(
     setup: &SessionSetup,
     dedup: &DesyncDedup,
+    marks: &DesyncMarks,
     lifecycle: &Lifecycle,
     notice: DesyncNotice,
 ) {
+    mark_session_desynced(marks, notice.tenant.clone(), notice.session, Instant::now());
+
     let is_new = dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.sync_ordinal));
@@ -1453,12 +1511,14 @@ mod tests {
         handle_desync(
             &setup,
             &dedup.desyncs,
+            &dedup.desync_marks,
             &lifecycle,
             desync(SessionId(7), 91, false),
         );
         handle_desync(
             &setup,
             &dedup.desyncs,
+            &dedup.desync_marks,
             &lifecycle,
             desync(SessionId(7), 91, false),
         );
@@ -1512,7 +1572,13 @@ mod tests {
         // null, and diverged is an empty array.
         let mut notice = desync(SessionId(8), 5, true);
         notice.game_frame = None;
-        handle_desync(&setup, &dedup.desyncs, &lifecycle, notice);
+        handle_desync(
+            &setup,
+            &dedup.desyncs,
+            &dedup.desync_marks,
+            &lifecycle,
+            notice,
+        );
 
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1543,7 +1609,13 @@ mod tests {
         let mut notice = desync(session, 1, false);
         notice.external_id = None;
         let tenant = notice.tenant.clone();
-        handle_desync(&setup, &dedup.desyncs, &lifecycle, notice);
+        handle_desync(
+            &setup,
+            &dedup.desyncs,
+            &dedup.desync_marks,
+            &lifecycle,
+            notice,
+        );
 
         assert!(
             timeout(Duration::from_millis(400), rx.recv())
@@ -1564,6 +1636,40 @@ mod tests {
             "a lifecycle state exists to eventually retire the dedup entry above -- \
              without it, an unresolvable desync notice would leak its dedup entry \
              for the life of the process",
+        );
+        // The desync mark is recorded regardless of the dropped webhook: the flight
+        // sink still pins this session's recordings.
+        assert!(
+            is_session_desynced(
+                &dedup.desync_marks,
+                &tenant,
+                session,
+                std::time::Instant::now(),
+            ),
+            "the desync fact is marked even when no webhook was delivered",
+        );
+    }
+
+    #[test]
+    fn a_desync_mark_is_read_back_and_expires_after_its_ttl() {
+        let marks: DesyncMarks = Arc::new(Mutex::new(HashMap::new()));
+        let tenant = TenantId("sb-test".to_owned());
+        let session = SessionId(7);
+        // Explicitly std's clock: the desync marks are stamped with it, not tokio's
+        // test clock, which this module's other tests bring into scope as `Instant`.
+        let now = std::time::Instant::now();
+
+        // Unmarked reads as not desynced; a mark reads back true.
+        assert!(!is_session_desynced(&marks, &tenant, session, now));
+        mark_session_desynced(&marks, tenant.clone(), session, now);
+        assert!(is_session_desynced(&marks, &tenant, session, now));
+
+        // A read past the TTL treats the mark as absent and prunes it in the pass.
+        let later = now + DESYNC_MARK_TTL + Duration::from_secs(1);
+        assert!(!is_session_desynced(&marks, &tenant, session, later));
+        assert!(
+            marks.lock().is_empty(),
+            "an expired mark is pruned, not merely read as absent",
         );
     }
 
