@@ -41,7 +41,8 @@ two sections:
   opaque label a relay enrolls with and a session slot requests). Each holds its
   `aws_region` and the client-facing `display_name`, plus OPTIONAL `beacon` and
   `fallback` latency-measurement endpoints. When those are omitted they default
-  formulaically from the AWS region: beacon `gamelift-ping.<aws_region>.api.aws:443`,
+  formulaically from the AWS region: beacon `gamelift-ping.<aws_region>.api.aws:7770`
+  (the port GameLift's UDP ping beacons echo on),
   fallback `dynamodb.<aws_region>.amazonaws.com:443`. Set them explicitly only to
   override.
 - **`environments`** — for each environment, the regions it runs mapped to that

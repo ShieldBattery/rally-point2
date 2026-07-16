@@ -23,7 +23,7 @@ locals {
     for id, cidr in local.catalog.environments[var.environment] :
     id => merge(local.catalog.regions[id], {
       ipv4_cidr = cidr
-      beacon    = try(local.catalog.regions[id].beacon, "gamelift-ping.${local.catalog.regions[id].aws_region}.api.aws:443")
+      beacon    = try(local.catalog.regions[id].beacon, "gamelift-ping.${local.catalog.regions[id].aws_region}.api.aws:7770")
       fallback  = try(local.catalog.regions[id].fallback, "dynamodb.${local.catalog.regions[id].aws_region}.amazonaws.com:443")
     })
   }
