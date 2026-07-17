@@ -2,10 +2,30 @@
   "regions": {
     "us-east": { "aws_region": "us-east-1", "display_name": "US East" },
     "us-west": { "aws_region": "us-west-2", "display_name": "US West" },
-    "eu-central": { "aws_region": "eu-central-1", "display_name": "EU Central" }
+    "eu-central": { "aws_region": "eu-central-1", "display_name": "EU Central" },
+    "kr": { "aws_region": "ap-northeast-2", "display_name": "Korea" },
+    "ca-east": { "aws_region": "ca-central-1", "display_name": "Canada East" },
+    "sa-east": { "aws_region": "sa-east-1", "display_name": "SA East" },
+    "eu-north": { "aws_region": "eu-north-1", "display_name": "EU North" },
+    "hk": { "aws_region": "ap-east-1", "display_name": "Hong Kong" },
+    "sg": { "aws_region": "ap-southeast-1", "display_name": "Singapore" },
+    "au": { "aws_region": "ap-southeast-2", "display_name": "Australia" },
+    "mx": { "aws_region": "mx-central-1", "display_name": "Mexico" }
   },
   "environments": {
     "staging": { "us-east": "10.80.0.0/22", "us-west": "10.81.0.0/22", "eu-central": "10.82.0.0/22" },
-    "prod": { "us-east": "10.84.0.0/22", "us-west": "10.85.0.0/22", "eu-central": "10.86.0.0/22" }
+    "prod": {
+      "us-east": "10.84.0.0/22",
+      "us-west": "10.85.0.0/22",
+      "eu-central": "10.86.0.0/22",
+      "kr": "10.87.0.0/22",
+      "ca-east": "10.88.0.0/22",
+      "sa-east": "10.89.0.0/22",
+      "eu-north": "10.90.0.0/22",
+      "hk": "10.91.0.0/22",
+      "sg": "10.92.0.0/22",
+      "au": "10.93.0.0/22",
+      "mx": "10.94.0.0/22"
+    }
   }
 }

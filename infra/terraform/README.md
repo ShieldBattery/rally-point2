@@ -45,6 +45,16 @@ two sections:
   (the port GameLift's UDP ping beacons echo on),
   fallback `dynamodb.<aws_region>.amazonaws.com:443`. Set them explicitly only to
   override.
+
+  Not every AWS region has a GameLift ping beacon (`mx` / mx-central-1 lacks one —
+  the formulaic hostname doesn't resolve). Such a region still works end to end,
+  by design, with no override: game clients catch the failed beacon measurement
+  and rank the region by TCP-connect time to the fallback endpoint instead, and
+  the backbone table fills from that region's relays measuring *outbound* to
+  other regions' beacons (pairs serve from whichever directions are present, and
+  coverage counts a pair covered with one). The deliberately-formulaic dead
+  hostname is also the upgrade path: if AWS ships the beacon later, clients and
+  relays start using UDP with no config change.
 - **`environments`** — for each environment, the regions it runs mapped to that
   environment's VPC IPv4 CIDR. A region's presence under an environment is what
   enables it there, so environments can run different region sets (staging is
