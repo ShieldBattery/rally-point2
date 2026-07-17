@@ -319,6 +319,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         if have >= total {
             // Every pair covered (or no pairs at all): nothing to bootstrap.
             self.coverage.remove(region);
+            crate::metrics::set_beacon_backoff(region, false);
             return 0;
         }
         let state = self
@@ -336,7 +337,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
             state.attempts = 0;
             state.phase = CoveragePhase::Trying { since: now };
         }
-        match state.phase {
+        let demand = match state.phase {
             CoveragePhase::Trying { since } => {
                 if now.saturating_sub(since) < COVERAGE_HOLD_SECS {
                     // Still within the window: keep asking for a relay.
@@ -370,7 +371,14 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     1
                 }
             }
-        }
+        };
+        // Publish the resulting phase so the beacon-backoff gauge reflects the
+        // loop-local coverage state.
+        crate::metrics::set_beacon_backoff(
+            region,
+            matches!(state.phase, CoveragePhase::BackingOff { .. }),
+        );
+        demand
     }
 
     /// Launches relays while `region` is under its target, crediting in-flight
@@ -396,6 +404,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
             {
                 Ok(minted) => minted,
                 Err(error) => {
+                    crate::metrics::relay_launch_failed(region);
                     tracing::warn!(
                         region = region.as_ref(),
                         %error,
@@ -411,6 +420,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
             };
             match self.provisioner.launch(&spec).await {
                 Ok(task) => {
+                    crate::metrics::relay_launched(region);
                     tracing::info!(
                         region = region.as_ref(),
                         relay_id = minted.relay_id.0,
@@ -424,6 +434,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     launching += 1;
                 }
                 Err(error) => {
+                    crate::metrics::relay_launch_failed(region);
                     tracing::warn!(
                         region = region.as_ref(),
                         relay_id = minted.relay_id.0,
@@ -475,6 +486,10 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 break;
             }
             if self.try_drain_one(relay_id, generation).await {
+                // Not counted toward the drain metric here: stopping the task makes
+                // the relay announce Draining on its control connection, and that
+                // announcement is where every drain — scale-down or relay-initiated
+                // — is counted exactly once.
                 live -= 1;
             }
         }
@@ -621,6 +636,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     "retiring an expired launch failed",
                 );
             }
+            crate::metrics::relay_reaped(relay.region.as_ref(), "launch_deadline");
             self.pending.retain(|p| p.relay_id != relay.relay_id);
             self.idle_since.remove(&relay.relay_id);
         }
@@ -658,6 +674,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                             "retiring a vanished relay failed",
                         );
                     }
+                    crate::metrics::relay_reaped(relay.region.as_ref(), "vanished");
                     self.idle_since.remove(&relay.relay_id);
                 }
                 Ok(_) => {}
@@ -698,6 +715,8 @@ impl<P: Provisioner> ProvisionLoop<P> {
         }
         for task in tasks {
             if !accounted.contains(&task.0) {
+                // An orphaned task has no ledger row, so no region is known for it.
+                crate::metrics::relay_reaped(None, "orphan");
                 tracing::info!(task = %task, "stopping an orphaned task no live ledger row references");
                 if let Err(error) = self.provisioner.stop(&task).await {
                     tracing::warn!(task = %task, %error, "stopping an orphaned task failed");

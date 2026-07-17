@@ -21,7 +21,8 @@ use rally_point_coordinator::provision::{
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{
-    acme, flight_store, notify, pair_rtts, regions, registry, session, tenant, tenant_config,
+    acme, flight_store, metrics, notify, pair_rtts, regions, registry, session, tenant,
+    tenant_config,
 };
 use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
@@ -36,6 +37,14 @@ struct Cli {
     /// reachable on it (443 in production) at the ACME domain; no port 80 is used.
     #[arg(long, env = "COORDINATOR_LISTEN", default_value_t = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), rally_point_coordinator::DEFAULT_PORT))]
     listen: SocketAddr,
+
+    /// Address to serve the Prometheus `/metrics` endpoint on, over plain HTTP. A
+    /// second, dedicated listener kept off the public control-plane port: it is
+    /// meant to be reachable only over the box's private sidecar (a tailnet TCP
+    /// forward), never published, so it carries no TLS and no peer-address
+    /// connect-info. Absent ⇒ no metrics listener and zero behavior change.
+    #[arg(long, env = "COORDINATOR_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
 
     /// Public hostname the coordinator obtains a Let's Encrypt certificate for and
     /// terminates TLS under. Present ⇒ TLS mode: the coordinator serves HTTPS on
@@ -479,6 +488,25 @@ async fn main() -> Result<()> {
         pair_rtts,
         flight_store,
     };
+
+    // Bring up the plaintext metrics listener before the primary serve, when one
+    // is configured. It serves Prometheus `/metrics` over a separate, never-TLS,
+    // never-published listener reachable only over the box's private sidecar. The
+    // bind is awaited here so an occupied port fails startup loudly; the serve
+    // itself is spawned so it runs alongside the primary API server. Absent ⇒ no
+    // listener and zero behavior change.
+    if let Some(metrics_addr) = cli.metrics_listen {
+        let metrics_router = metrics::router(state.clone());
+        let listener = tokio::net::TcpListener::bind(metrics_addr)
+            .await
+            .context("binding the metrics listen address")?;
+        tracing::info!("coordinator metrics listening on {} (HTTP)", metrics_addr);
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, metrics_router.into_make_service()).await {
+                tracing::error!(%error, "the metrics listener ended with an error");
+            }
+        });
+    }
 
     let app = api::router(state);
 

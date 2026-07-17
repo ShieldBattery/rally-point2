@@ -36,6 +36,10 @@
 //! - **api** ([`api`]) — the HTTP control-plane API: relay phone-home, session
 //!   setup, and the relay's persistent control connection (an authenticated
 //!   WebSocket), exposed as a testable router.
+//! - **metrics** ([`metrics`]) — the Prometheus text-exposition exporter served
+//!   on a separate, plaintext, sidecar-only listener: gauges snapshotted from the
+//!   coordinator's live state at scrape time plus counters the event sites
+//!   increment through module-level statics.
 //! - **acme** ([`acme`]) — optional in-process TLS: when a public domain is
 //!   configured, obtain and renew the coordinator's Let's Encrypt certificate
 //!   over TLS-ALPN-01 on the listening port, so TLS terminates in the process
@@ -75,6 +79,7 @@ pub mod flight_store;
 pub mod identity;
 pub mod ledger;
 pub mod lifecycle;
+pub mod metrics;
 pub mod notify;
 pub mod pair_rtts;
 pub mod presence;

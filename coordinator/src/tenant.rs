@@ -380,6 +380,31 @@ pub fn len(store: &TenantStore) -> usize {
     store.tenants.lock().len()
 }
 
+/// The number of enrolled tenants in each operational state, taken in one lock
+/// acquisition. The three counts sum to [`len`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantStateCounts {
+    /// Tenants in [`TenantState::Active`].
+    pub active: u64,
+    /// Tenants in [`TenantState::Suspended`].
+    pub suspended: u64,
+    /// Tenants in [`TenantState::Revoked`].
+    pub revoked: u64,
+}
+
+/// Counts the enrolled tenants by operational state.
+pub fn state_counts(store: &TenantStore) -> TenantStateCounts {
+    let mut counts = TenantStateCounts::default();
+    for entry in store.tenants.lock().values() {
+        match entry.state {
+            TenantState::Active => counts.active += 1,
+            TenantState::Suspended => counts.suspended += 1,
+            TenantState::Revoked => counts.revoked += 1,
+        }
+    }
+    counts
+}
+
 /// Whether the store has no tenants.
 pub fn is_empty(store: &TenantStore) -> bool {
     store.tenants.lock().is_empty()

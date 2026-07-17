@@ -601,6 +601,10 @@ pub fn handle_desync(
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.sync_ordinal));
     if is_new {
+        // Counted behind the dedup so an at-least-once redelivery of the same
+        // event (a relay resending an unacked notice across a reconnect) can't
+        // inflate the desync count.
+        crate::metrics::desync(&notice.tenant);
         // Every dedup entry inserted above must correspond to a lifecycle
         // state that will eventually retire it -- otherwise a notice this
         // coordinator can never resolve (dropped below as `NoNotifyConfig`
@@ -838,6 +842,7 @@ pub(crate) async fn dispatch(
             Ok(None) => {
                 // The tenant's signing key is gone (removed/never enrolled) —
                 // nothing to sign with, and that won't change on a retry.
+                crate::metrics::webhook_delivered(&tenant, "gave_up");
                 tracing::warn!(
                     tenant = tenant.as_ref(),
                     url = %config.url,
@@ -849,6 +854,7 @@ pub(crate) async fn dispatch(
             Err(error) => {
                 // A malformed URL/header is deterministic — retrying can't fix
                 // it, so give up now rather than burning the whole budget.
+                crate::metrics::webhook_delivered(&tenant, "gave_up");
                 tracing::warn!(url = %config.url, %error, kind, "webhook request is unbuildable; dropping");
                 return;
             }
@@ -873,6 +879,7 @@ pub(crate) async fn dispatch(
         match outcome {
             Ok(status) => {
                 if (200..300).contains(&status) {
+                    crate::metrics::webhook_delivered(&tenant, "ok");
                     tracing::debug!(url = %config.url, status, kind, "webhook delivered");
                     return;
                 }
@@ -901,12 +908,18 @@ pub(crate) async fn dispatch(
             }
         }
 
+        // Only a failed attempt reaches here — a 2xx delivery returned above — so
+        // every non-2xx status, timeout, oversize response, and transport error is
+        // counted once as a failed attempt.
+        crate::metrics::webhook_attempt_failed(&tenant);
+
         if attempt < MAX_ATTEMPTS {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     }
 
+    crate::metrics::webhook_delivered(&tenant, "gave_up");
     tracing::warn!(
         url = %config.url,
         attempts = MAX_ATTEMPTS,

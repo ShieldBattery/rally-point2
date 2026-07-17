@@ -137,8 +137,15 @@ const NOTICE_QUEUE_CAPACITY: usize = 128;
 /// full session queue — process-wide, not per-session. Expected to stay at
 /// zero in production; a nonzero value means [`NOTICE_QUEUE_CAPACITY`] was
 /// actually reached, which given its headroom is itself worth alerting on.
-/// Exposed only for tests to observe the drop without scraping logs.
+/// Exposed through [`dropped_notice_count`] so the metrics exposition and tests
+/// can observe drops without scraping logs.
 static DROPPED_NOTICE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide count of non-terminal notices dropped from a full session
+/// queue, for metrics exposition. See [`DROPPED_NOTICE_COUNT`].
+pub(crate) fn dropped_notice_count() -> u64 {
+    DROPPED_NOTICE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A `(tenant, session)` key for the per-session lifecycle map.
 type SessionRef = (TenantId, SessionId);
@@ -260,6 +267,29 @@ struct Inner {
     /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
     /// built without one (a test that never exercises dedup) simply skips pruning.
     dedup: OnceLock<NoticeDedup>,
+}
+
+/// A scrape-time census of the lifecycle map, produced by
+/// [`Lifecycle::metrics_census`] for the metrics exporter.
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleMetrics {
+    /// Per-tenant counts of sessions with an assigned serving relay, split by
+    /// whether a client has been observed.
+    pub(crate) sessions: HashMap<TenantId, SessionCensus>,
+    /// Per-tenant total depth of pending webhook queues across all of the
+    /// tenant's lifecycle states (serving and webhook-only alike).
+    pub(crate) notices_pending: HashMap<TenantId, u64>,
+}
+
+/// One tenant's serving-session counts, split by whether a real client has been
+/// seen for the session yet.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SessionCensus {
+    /// Sessions registered with a serving relay but not yet observed to have a
+    /// client present.
+    pub(crate) loading: u64,
+    /// Sessions a client has been observed to have dialed into.
+    pub(crate) started: u64,
 }
 
 impl Lifecycle {
@@ -525,6 +555,36 @@ impl Lifecycle {
         }
     }
 
+    /// A scrape-time census of the lifecycle map for metrics: per tenant, how
+    /// many sessions have an assigned serving relay (split by whether a client
+    /// has been seen), and the total depth of that tenant's pending webhook
+    /// queues. Taken in one lock acquisition.
+    pub(crate) fn metrics_census(&self) -> LifecycleMetrics {
+        let sessions = self.inner.sessions.lock();
+        let mut out = LifecycleMetrics::default();
+        for ((tenant, _session), state) in sessions.iter() {
+            // Only sessions with an assigned serving-relay set count toward the
+            // active gauge; a webhook-only state (empty serving set) is not a live
+            // session but still contributes its queue depth below.
+            if !state.serving_relays.is_empty() {
+                let census = out.sessions.entry(tenant.clone()).or_default();
+                if state.started {
+                    census.started += 1;
+                } else {
+                    census.loading += 1;
+                }
+            }
+            // Pending queue depth: how many sends the queue has taken that have not
+            // yet drained (its configured capacity minus its currently free slots).
+            let depth = state
+                .queue
+                .max_capacity()
+                .saturating_sub(state.queue.capacity()) as u64;
+            *out.notices_pending.entry(tenant.clone()).or_default() += depth;
+        }
+        out
+    }
+
     /// Records a relay's `SessionClosed`. When every assigned serving relay has
     /// closed, enqueues the final `sessionClosed` webhook (behind every prior
     /// notice in queue order) and reaps the session's state.
@@ -573,6 +633,7 @@ impl Lifecycle {
         let state = sessions.remove(&key).expect("just held it");
         drop(sessions);
         self.close_and_retire(tenant.clone(), session, state);
+        crate::metrics::session_closed(&tenant);
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,

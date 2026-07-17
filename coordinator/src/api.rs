@@ -351,6 +351,7 @@ async fn create_session(
             // coordinator warmed it and is holding the create; the caller re-sends
             // the identical signed request until a relay enrolls or the hold cap
             // elapses. Not a failure, so this does not log like one.
+            crate::metrics::session_held(&tenant);
             tracing::info!(
                 regions = regions.len(),
                 "session create held for a region with no relay yet",
@@ -402,6 +403,7 @@ async fn create_session(
             observer_slots,
             expires_at,
         );
+        crate::metrics::session_created(&tenant);
     }
 
     tracing::info!(
@@ -1306,6 +1308,10 @@ async fn serve_relay_control(
     // caller cannot probe which ids exist or whether a token was near-valid; the
     // specific class rides only the server-side log. A coordinator with no ledger
     // skips this entirely — the id claim is accepted as presented (dev / loopback).
+    // A first enroll carries the relay's cold-start duration (launch to enroll),
+    // observed into the histogram once the enroll fully succeeds. A reconnect and a
+    // no-ledger enroll carry none.
+    let mut cold_start_secs: Option<u64> = None;
     if let Some(ledger) = &ledger {
         let cert_fingerprint = registry::cert_fingerprint(&hello.cert_der);
         match ledger.authorize_enroll(
@@ -1314,7 +1320,13 @@ async fn serve_relay_control(
             hello.enroll_token.as_deref(),
             peer_ip,
         ) {
-            Ok(_authorized) => {
+            Ok(authorized) => {
+                if let crate::ledger::Authorized::FirstEnroll {
+                    cold_start_secs: cold_start,
+                } = authorized
+                {
+                    cold_start_secs = cold_start;
+                }
                 // Coordinator-sourced addresses win; the hello's self-report is the
                 // fallback. When the ledger recorded an advertise set for this id,
                 // override the hello's addresses with it (first entry is the
@@ -1376,6 +1388,10 @@ async fn serve_relay_control(
             return;
         }
     };
+    crate::metrics::relay_enrolled(relay_region.as_ref());
+    if let Some(secs) = cold_start_secs {
+        crate::metrics::observe_relay_cold_start(secs);
+    }
     tracing::info!(
         relay_id = relay_id.0,
         negotiated = %negotiated,
@@ -1842,6 +1858,8 @@ async fn handle_drain_request(
         );
         return true;
     }
+    let region = registry::entry(setup.registry(), relay_id).and_then(|entry| entry.region);
+    crate::metrics::relay_drained(region.as_ref());
     tracing::info!(relay_id = relay_id.0, "relay draining; sending set + ack");
     // Set before ack. Clone the set out of the watch borrow before awaiting — a
     // watch borrow must never be held across an await — and mark it seen so the
@@ -2183,26 +2201,40 @@ fn handle_flight_recording(
         notice.payload.len(),
     ) {
         match drop {
-            flight_store::FlightDrop::NoStore => warn_no_flight_store(relay_id),
-            flight_store::FlightDrop::UnknownTenant => tracing::warn!(
-                relay_id = relay_id.0,
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                "dropping a flight recording for a tenant not in the registry",
-            ),
-            flight_store::FlightDrop::TenantIdNotKeySafe => tracing::warn!(
-                relay_id = relay_id.0,
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                "dropping a flight recording: the tenant id cannot embed in an object key",
-            ),
-            flight_store::FlightDrop::TooLarge => tracing::warn!(
-                relay_id = relay_id.0,
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                bytes = notice.payload.len(),
-                "dropping an oversize flight recording",
-            ),
+            flight_store::FlightDrop::NoStore => {
+                // No store configured: the recording is unrecoverably lost, not a
+                // deliberate refusal.
+                crate::metrics::flight_recording_lost();
+                warn_no_flight_store(relay_id);
+            }
+            flight_store::FlightDrop::UnknownTenant => {
+                crate::metrics::flight_recording_refused();
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    "dropping a flight recording for a tenant not in the registry",
+                );
+            }
+            flight_store::FlightDrop::TenantIdNotKeySafe => {
+                crate::metrics::flight_recording_refused();
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    "dropping a flight recording: the tenant id cannot embed in an object key",
+                );
+            }
+            flight_store::FlightDrop::TooLarge => {
+                crate::metrics::flight_recording_refused();
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    bytes = notice.payload.len(),
+                    "dropping an oversize flight recording",
+                );
+            }
         }
         return;
     }
@@ -2248,23 +2280,33 @@ fn spawn_flight_upload(
         match flight_store::store_recording(&*store, &tenant, session, relay_id, payload, pinned)
             .await
         {
-            Ok(()) => tracing::info!(
-                tenant = tenant.as_ref(),
-                session = session.0,
-                relay_id = relay_id.0,
-                pinned,
-                bytes,
-                "flight recording stored",
-            ),
-            Err(error) => tracing::warn!(
-                tenant = tenant.as_ref(),
-                session = session.0,
-                relay_id = relay_id.0,
-                pinned,
-                bytes,
-                %error,
-                "storing a flight recording failed; the recording is lost (no retry)",
-            ),
+            Ok(()) => {
+                crate::metrics::flight_recording_stored();
+                if pinned {
+                    // A pinned store lands under the desync-selecting key prefix.
+                    crate::metrics::flight_recording_pinned();
+                }
+                tracing::info!(
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    relay_id = relay_id.0,
+                    pinned,
+                    bytes,
+                    "flight recording stored",
+                );
+            }
+            Err(error) => {
+                crate::metrics::flight_recording_lost();
+                tracing::warn!(
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    relay_id = relay_id.0,
+                    pinned,
+                    bytes,
+                    %error,
+                    "storing a flight recording failed; the recording is lost (no retry)",
+                );
+            }
         }
     });
 }

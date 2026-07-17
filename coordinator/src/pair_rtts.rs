@@ -268,6 +268,37 @@ impl PairRttStore {
         entries
     }
 
+    /// Every present direction of every stored pair as its own row, tagged with
+    /// the origin region that measured it, in an unspecified order. Unlike
+    /// [`snapshot`](Self::snapshot), which averages a pair's two directions into
+    /// one served value, this keeps the directions apart — one row per measured
+    /// direction — so a caller can expose each direction separately.
+    pub fn direction_snapshot(&self) -> Vec<DirectionRttRow> {
+        let pairs = self.pairs.lock();
+        let mut rows = Vec::new();
+        for ((a, b), directions) in pairs.iter() {
+            if let Some(dir) = directions.from_a {
+                rows.push(DirectionRttRow {
+                    a: a.clone(),
+                    b: b.clone(),
+                    origin: a.clone(),
+                    rtt_ms: dir.rtt_ms,
+                    measured_at: dir.measured_at,
+                });
+            }
+            if let Some(dir) = directions.from_b {
+                rows.push(DirectionRttRow {
+                    a: a.clone(),
+                    b: b.clone(),
+                    origin: b.clone(),
+                    rtt_ms: dir.rtt_ms,
+                    measured_at: dir.measured_at,
+                });
+            }
+        }
+        rows
+    }
+
     /// The set of region pairs that currently hold a value in at least one direction,
     /// as canonical keys (`a <= b`). The reconcile loop's coverage bootstrap diffs
     /// this against the configured region pairs to find backbone links still lacking
@@ -346,6 +377,30 @@ mod tests {
         assert_eq!(snap[0].b, region("us-east"));
         assert_eq!(snap[0].rtt_ms, 87, "a lone direction serves its own value");
         assert_eq!(snap[0].measured_at, 100);
+    }
+
+    #[test]
+    fn direction_snapshot_keeps_the_two_directions_apart() {
+        // The averaged snapshot collapses a pair to one row; the direction snapshot
+        // keeps each measured direction as its own origin-tagged row.
+        let store = new_store();
+        let east = region("us-east");
+        let west = region("us-west");
+        store.record(&east, &west, 54, 10);
+        store.record(&west, &east, 65, 11);
+
+        let mut rows = store.direction_snapshot();
+        rows.sort_by(|x, y| x.origin.as_ref().cmp(y.origin.as_ref()));
+        assert_eq!(rows.len(), 2, "one row per present direction");
+        // Origin us-east measured 54 toward us-west.
+        assert_eq!(rows[0].origin, east);
+        assert_eq!(rows[0].rtt_ms, 54);
+        // Origin us-west measured 65 toward us-east.
+        assert_eq!(rows[1].origin, west);
+        assert_eq!(rows[1].rtt_ms, 65);
+        // Both rows carry the canonical pair ordering (a <= b).
+        assert_eq!(rows[0].a, east);
+        assert_eq!(rows[0].b, west);
     }
 
     #[test]

@@ -177,6 +177,8 @@ pub(crate) struct ProvisionedTask {
     /// The provisioner task recorded for the id, or `None` if no task was ever
     /// recorded (an id that enrolled on its self-reported addresses).
     pub task_arn: Option<String>,
+    /// The region the id was minted for, or `None` for an untagged id.
+    pub region: Option<RegionId>,
 }
 
 /// The ledger authorized an enroll — how it did so.
@@ -184,7 +186,13 @@ pub(crate) struct ProvisionedTask {
 pub enum Authorized {
     /// The relay's certificate was bound to its id for the first time: the
     /// one-time token was consumed and the fingerprint recorded.
-    FirstEnroll,
+    FirstEnroll {
+        /// Seconds from the id's launch to this first enroll — the relay's
+        /// cold-start duration — or `None` when the clock could not be trusted
+        /// to measure it. Only meaningful on a first enroll (a reconnect is not
+        /// a cold start).
+        cold_start_secs: Option<u64>,
+    },
     /// The relay re-presented the certificate already bound to its id — its own
     /// reconnect — authorized without consuming any token.
     Reenroll,
@@ -358,7 +366,7 @@ impl RelayLedger {
         let row = conn
             .query_row(
                 "SELECT retired_at, cert_fingerprint, token_hash, token_expires_at,
-                        token_consumed_at, expected_ips
+                        token_consumed_at, expected_ips, launched_at
                  FROM provisioned_relays WHERE relay_id = ?1",
                 params![as_i64(relay_id.0)],
                 |row| {
@@ -368,6 +376,7 @@ impl RelayLedger {
                         token_hash: row.get(2)?,
                         token_expires_at: row.get(3)?,
                         expected_ips: row.get(5)?,
+                        launched_at: row.get(6)?,
                     })
                 },
             )
@@ -438,7 +447,12 @@ impl RelayLedger {
                     ],
                 )?;
                 if affected == 1 {
-                    Ok(Authorized::FirstEnroll)
+                    // The relay's cold-start duration: launch to this first enroll.
+                    // Guard the unusable-clock sentinel so a broken clock reports no
+                    // measurement rather than a nonsense delta.
+                    let cold_start_secs =
+                        (now != u64::MAX).then(|| now.saturating_sub(as_u64(row.launched_at)));
+                    Ok(Authorized::FirstEnroll { cold_start_secs })
                 } else {
                     Err(EnrollRefusal::TokenInvalid)
                 }
@@ -552,7 +566,7 @@ impl RelayLedger {
     pub(crate) fn expired_launching(&self, now: u64) -> Result<Vec<ProvisionedTask>, LedgerError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT relay_id, task_arn FROM provisioned_relays
+            "SELECT relay_id, task_arn, region FROM provisioned_relays
               WHERE retired_at IS NULL AND cert_fingerprint IS NULL
                 AND token_expires_at < ?1",
         )?;
@@ -569,7 +583,7 @@ impl RelayLedger {
     pub(crate) fn bound_unretired(&self) -> Result<Vec<ProvisionedTask>, LedgerError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT relay_id, task_arn FROM provisioned_relays
+            "SELECT relay_id, task_arn, region FROM provisioned_relays
               WHERE retired_at IS NULL AND cert_fingerprint IS NOT NULL",
         )?;
         let rows = stmt
@@ -672,6 +686,7 @@ fn row_to_provisioned_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provisio
     Ok(ProvisionedTask {
         relay_id: RelayId(as_u64(row.get(0)?)),
         task_arn: row.get(1)?,
+        region: row.get::<_, Option<String>>(2)?.map(RegionId),
     })
 }
 
@@ -682,6 +697,7 @@ struct LedgerRow {
     token_hash: Vec<u8>,
     token_expires_at: i64,
     expected_ips: Option<String>,
+    launched_at: i64,
 }
 
 /// Parses the stored expected-peer-IP set — a JSON array of canonical IP strings,
@@ -781,7 +797,13 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(outcome, Authorized::FirstEnroll);
+        // Minted at 1_000, first enroll at 1_100 -> a 100-second cold start.
+        assert_eq!(
+            outcome,
+            Authorized::FirstEnroll {
+                cold_start_secs: Some(100),
+            },
+        );
 
         // The row now records the binding, the consumption, and the enroll time.
         let conn = ledger.conn.lock();
@@ -815,7 +837,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(first, Authorized::FirstEnroll);
+        assert!(matches!(first, Authorized::FirstEnroll { .. }));
 
         let second = ledger.authorize_enroll_at(
             1_020,
@@ -1030,7 +1052,7 @@ mod tests {
                 Some(expected),
             )
             .unwrap();
-        assert_eq!(ok, Authorized::FirstEnroll);
+        assert!(matches!(ok, Authorized::FirstEnroll { .. }));
 
         // The gate still applies on reconnect: a mismatched peer with the bound
         // certificate is refused.
@@ -1077,7 +1099,7 @@ mod tests {
                 Some(v6),
             )
             .unwrap();
-        assert_eq!(over_v6, Authorized::FirstEnroll);
+        assert!(matches!(over_v6, Authorized::FirstEnroll { .. }));
 
         // Reconnect over the other family in the set is accepted too.
         let over_v4 = ledger
@@ -1115,7 +1137,7 @@ mod tests {
                 Some(any_peer),
             )
             .unwrap();
-        assert_eq!(ok, Authorized::FirstEnroll);
+        assert!(matches!(ok, Authorized::FirstEnroll { .. }));
     }
 
     #[test]
