@@ -113,6 +113,7 @@ async fn conduct(
             turn_bytes: cli.turn_bytes,
             slot_regions: cli.slot_regions.clone(),
             server_name: cli.relay_server_name.clone(),
+            ipv4_only: cli.ipv4_only,
             is_desync,
         };
         set.spawn(run_session(config));

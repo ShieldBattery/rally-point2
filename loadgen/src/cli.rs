@@ -73,4 +73,11 @@ pub struct Cli {
     /// relay's self-signed cert names `localhost`.
     #[arg(long, default_value = "localhost")]
     pub relay_server_name: String,
+
+    /// Dial only IPv4 relay addresses, skipping any advertised IPv6. For a load
+    /// box without IPv6 connectivity, where dialing the relay's IPv6-primary
+    /// address would burn a full connect timeout per player before falling back
+    /// to IPv4. Off by default — production clients are dual-stack.
+    #[arg(long, default_value_t = false)]
+    pub ipv4_only: bool,
 }

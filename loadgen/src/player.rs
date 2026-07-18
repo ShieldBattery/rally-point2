@@ -55,6 +55,8 @@ pub struct PlayerConfig {
     /// The relay this slot homes on, with the cert to pin.
     pub relay: RelayEndpoint,
     pub server_name: String,
+    /// Dial only IPv4 relay addresses, skipping advertised IPv6.
+    pub ipv4_only: bool,
     pub turn_rate: u32,
     pub game_secs: u64,
     pub builder: TurnBuilder,
@@ -75,6 +77,7 @@ pub async fn run_player(config: PlayerConfig) -> PlayerReport {
         pkcs8,
         relay,
         server_name,
+        ipv4_only,
         turn_rate,
         game_secs,
         builder,
@@ -122,8 +125,13 @@ pub async fn run_player(config: PlayerConfig) -> PlayerReport {
     };
 
     // Dial the relay's candidate addresses in advertised order, first that connects.
+    // With `ipv4_only`, skip any advertised IPv6 address rather than burn a connect
+    // timeout on it from a host that has no IPv6 route.
     let mut link = None;
     for addr in relay.addrs() {
+        if ipv4_only && !addr.is_ipv4() {
+            continue;
+        }
         match endpoint.connect(addr, &server_name, &identity).await {
             Ok(established) => {
                 link = Some(established);

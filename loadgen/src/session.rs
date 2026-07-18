@@ -38,6 +38,8 @@ pub struct SessionConfig {
     pub turn_bytes: usize,
     pub slot_regions: Vec<String>,
     pub server_name: String,
+    /// Dial only IPv4 relay addresses (see `Cli::ipv4_only`).
+    pub ipv4_only: bool,
     /// Whether this session should deliberately diverge (one player perturbs its
     /// sync hashes).
     pub is_desync: bool,
@@ -156,6 +158,7 @@ async fn run_players(
             pkcs8,
             relay,
             server_name: config.server_name.clone(),
+            ipv4_only: config.ipv4_only,
             turn_rate: config.turn_rate,
             game_secs: config.game_secs,
             builder,
