@@ -51,8 +51,12 @@ pub enum CreateOutcome {
     Failed { status: Option<u16> },
 }
 
-/// The `202 provisioning` body shape — only the retry delay is needed.
+/// The `202 provisioning` body shape — only the retry delay is needed. The
+/// coordinator serializes this camelCase (`retryAfterMs`), so the rename must
+/// match or the delay silently deserializes to the default and the retry loop
+/// spins through its hold ceiling with ~no waiting between attempts.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProvisioningResponse {
     #[serde(default)]
     retry_after_ms: u64,
@@ -139,5 +143,17 @@ pub async fn create_session(
         return CreateOutcome::Failed {
             status: Some(status.as_u16()),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_provisioning_body_parses_the_coordinators_camel_case_delay() {
+        let body = br#"{"status":"provisioning","regions":["loop-a"],"retryAfterMs":2000}"#;
+        let parsed: ProvisioningResponse = serde_json::from_slice(body).unwrap();
+        assert_eq!(parsed.retry_after_ms, 2000);
     }
 }
