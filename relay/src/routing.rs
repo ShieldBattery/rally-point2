@@ -2162,17 +2162,26 @@ fn end_slot_link(
 /// re-dial, whose link re-opens the close latch when it starts serving.
 ///
 /// Safe to call whenever the session *might* be closeable: a non-empty roster,
-/// a deferral, or an already-claimed close all make it a no-op. The roster
-/// check and the teardown below are not one atomic section (the same
-/// register-vs-teardown window the emptying itself has always had); the claim
-/// latch (`consensus::claim_close_report`) is what keeps two concurrent
-/// evaluations from both running the close.
+/// a deferral, or an already-claimed close all make it a no-op. The claim
+/// latch (`consensus::claim_close_report`) keeps two concurrent evaluations
+/// from both running the close; the roster lock, held from the emptiness
+/// check through the last registry erase, keeps a concurrent re-dial's
+/// `register` (which inserts under the same lock) from landing mid-teardown —
+/// without it, a quick re-dial into a never-started session (whose emptying
+/// closes immediately, with no deferral to hide the window) could be admitted
+/// and then have its lobby log and replay state erased underneath it while a
+/// premature `SessionClosed` retires the session coordinator-side. Every call
+/// inside the held section touches only its own module's lock (consensus,
+/// lobby, chat, turn ring, seen, drop holds, provisional), never this
+/// roster's, so holding it across them cannot deadlock or reenter — the same
+/// discipline `announce_departure` documents for its own roster-lock hold.
 pub(crate) fn maybe_close_emptied_session(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
 ) {
-    if sessions.lock().contains_key(key) {
+    let roster = sessions.lock();
+    if roster.contains_key(key) {
         // A slot is locally connected (or a reconnect already reclaimed one);
         // that link's own teardown re-evaluates when it ends.
         return;
