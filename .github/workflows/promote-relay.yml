@@ -26,6 +26,12 @@ on:
         required: true
         type: string
 
+# One promotion at a time: two concurrent runs interleaving their per-region
+# retags could leave different regions on different digests — the split fleet
+# the all-or-nothing structure below exists to prevent.
+concurrency:
+  group: promote-relay
+
 jobs:
   promote:
     name: retag as stable
@@ -34,20 +40,34 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    # The sha input reaches shell commands below, so it rides an env var and
+    # is validated first — a workflow_dispatch input is attacker-influenced
+    # text as far as a `run:` block is concerned, never safe to interpolate
+    # into a script directly.
+    env:
+      SHA: ${{ inputs.sha }}
     steps:
+      - name: Validate sha input
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::input must be a full 40-char lowercase commit sha"
+            exit 1
+          fi
       - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.RELAY_ECR_ROLE_ARN }}
           aws-region: us-east-1
       - uses: docker/setup-buildx-action@v4
-      - name: Retag in every region
-        id: retag
-        env:
-          SHA: ${{ inputs.sha }}
+      # Preflight EVERY region before retagging ANY: a region missing the
+      # image (replication lag, or a sha that was never published) must fail
+      # the promotion while the fleet is still uniformly on the old stable,
+      # not after some regions have already moved — a partial retag is a
+      # split fleet serving two digests until someone notices.
+      - name: Preflight every region
+        id: preflight
         run: |
           set -euo pipefail
-          account_id="$(aws sts get-caller-identity --query Account --output text)"
-
           # Home region plus every replication destination = everywhere the
           # image exists and every registry a task definition may pull from.
           replica_regions="$(aws ecr describe-registry \
@@ -57,13 +77,8 @@ jobs:
           regions="${AWS_REGION} ${replica_regions}"
           echo "regions=${regions}" >> "$GITHUB_OUTPUT"
 
+          missing=""
           for region in ${regions}; do
-            registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
-            echo "== ${region} (${registry}) =="
-
-            aws ecr get-login-password --region "${region}" \
-              | docker login --username AWS --password-stdin "${registry}"
-
             # Replication is asynchronous, so a sha pushed moments ago may not
             # have landed in every replica yet — and a mistyped or
             # never-published sha would otherwise fail with an opaque
@@ -73,19 +88,39 @@ jobs:
               --repository-name rp2-relay \
               --image-ids imageTag="${SHA}" >/dev/null 2>&1; then
               echo "::error::rp2-relay:${SHA} not found in ${region} - either replication from us-east-1 hasn't caught up yet, or this sha was never published by the publish-relay workflow."
-              exit 1
+              missing="${missing} ${region}"
             fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::promotion aborted before any retag; missing in:${missing}"
+            exit 1
+          fi
+      - name: Retag in every region
+        env:
+          REGIONS: ${{ steps.preflight.outputs.regions }}
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+
+          for region in ${REGIONS}; do
+            registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
+            echo "== ${region} (${registry}) =="
+
+            aws ecr get-login-password --region "${region}" \
+              | docker login --username AWS --password-stdin "${registry}"
 
             docker buildx imagetools create \
               --tag "${registry}/rp2-relay:stable" \
               "${registry}/rp2-relay:${SHA}"
           done
       - name: Show promoted digests
+        env:
+          REGIONS: ${{ steps.preflight.outputs.regions }}
         run: |
           set -euo pipefail
           account_id="$(aws sts get-caller-identity --query Account --output text)"
 
-          for region in ${{ steps.retag.outputs.regions }}; do
+          for region in ${REGIONS}; do
             registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
             echo "== ${region} =="
             docker buildx imagetools inspect "${registry}/rp2-relay:stable"
