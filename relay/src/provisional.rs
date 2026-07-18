@@ -347,7 +347,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_sweep_reaps_only_while_armed_and_a_rearm_restarts_the_window() {
-        let window = Duration::from_millis(60);
+        // A real-time test: the sweep compares deadlines against the wall clock
+        // (`std::time::Instant`), so paused tokio time can't drive it and the
+        // waits are real. The margins are therefore generous multiples of the
+        // window, and the sweep ticks at a tenth of it, so a slow/loaded CI
+        // runner's scheduling jitter has slack in every direction rather than
+        // riding the edge of an assertion.
+        let window = Duration::from_millis(100);
+        let tick = window / 10;
         let provisional = ProvisionalSessions::new(window);
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let sessions: Sessions = Arc::default();
@@ -360,30 +367,31 @@ mod tests {
             sessions,
             makers.clone(),
             armed_rx,
-            Duration::from_millis(10),
+            tick,
         ));
 
-        // Let the mark's window elapse while unarmed; several sweep ticks pass
-        // over the now-expired mark, and it is left alone -- an outage must
+        // Let the mark's window fully elapse while unarmed; many sweep ticks
+        // pass over the now-expired mark, and it is left alone -- an outage must
         // not reap a legitimate session.
-        tokio::time::sleep(window + Duration::from_millis(40)).await;
+        tokio::time::sleep(window * 2).await;
         assert!(
             provisional.is_marked(&key(1)),
             "an expired mark is left alone while the sweep is unarmed",
         );
 
         // Rearming (a reconnect) must restart the window, not reap on the
-        // accumulated debt: shortly after arming (well under `window`) the
-        // mark still stands.
+        // accumulated debt: a short moment after arming (well under a fresh
+        // `window`) the mark still stands.
         armed_tx.send(true).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(window / 4).await;
         assert!(
             provisional.is_marked(&key(1)),
             "arming restarts the deadline rather than reaping immediately on stale debt",
         );
 
-        // Once the restarted window actually elapses, the sweep reaps it.
-        tokio::time::sleep(window).await;
+        // Well past the restarted window -- a full extra window of slack for
+        // tick + scheduling jitter -- the sweep has reaped it.
+        tokio::time::sleep(window * 2).await;
         assert!(
             !provisional.is_marked(&key(1)),
             "the mark is reaped once its restarted deadline passes while armed",
