@@ -57,6 +57,19 @@ jobs:
       - name: test
         run: cargo test --workspace --all-features --locked
 
+  # Pinned to the exact `rust-version` declared in the workspace manifest, so a
+  # change that needs a newer compiler either bumps that declaration deliberately
+  # or fails here instead of only surfacing for whoever's toolchain is oldest.
+  msrv:
+    name: MSRV (cargo check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --workspace --all-targets --locked
+
   # The client crate is linked into the 32-bit game DLL, so it must keep building
   # for i686-pc-windows-msvc from day one (build plan WS-A / WS-K).
   client-i686:
