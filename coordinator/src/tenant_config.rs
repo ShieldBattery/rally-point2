@@ -57,6 +57,7 @@ const MAX_CLIENT_PUBKEYS: usize = 2;
 
 /// The wire shape of the whole registry file: `{"tenants": [ ... ]}`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TenantsFileRaw {
     /// The tenants listed in the file, in file order.
     #[serde(default)]
@@ -676,6 +677,19 @@ mod tests {
             from_json(&json),
             Err(TenantConfigError::DuplicateKid(kid)) if kid == "same"
         ));
+    }
+
+    #[test]
+    fn an_unknown_top_level_field_is_rejected() {
+        // A misspelled top-level key (`tenantz` for `tenants`) must fail to parse
+        // rather than silently loading an empty registry.
+        let pk = client_pubkey_hex(&[0x01; 32]);
+        let json = format!(
+            r#"{{"tenantz": [
+                {{"id": "solo", "state": "active", "kid": "kid-solo", "signing_key_env": "E", "client_pubkeys": ["{pk}"]}}
+            ]}}"#,
+        );
+        assert!(matches!(from_json(&json), Err(TenantConfigError::Parse(_))));
     }
 
     #[test]

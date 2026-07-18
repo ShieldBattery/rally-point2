@@ -173,6 +173,28 @@ impl RelayReaps {
             state.pending.remove(&(tenant.clone(), session));
         }
     }
+
+    /// Drops `relay_id`'s whole entry — pending directives and live sender alike.
+    ///
+    /// Reserved for a relay id that has been **permanently** retired (a ledger
+    /// tombstone that refuses the id from ever enrolling again): only then is it
+    /// certain nothing will ever subscribe under the id again, so nothing is lost
+    /// by dropping its shell. Calling this for a relay that merely disconnected —
+    /// and could legitimately reconnect and re-enroll under the same id — would
+    /// discard reap directives it still needs replayed on that reconnect. Idempotent:
+    /// forgetting an id with no entry (or already forgotten) is a no-op.
+    pub fn forget(&self, relay_id: RelayId) {
+        self.relays.lock().remove(&relay_id);
+    }
+
+    /// How many relay ids the outbox currently holds state for. Exists for
+    /// regression coverage of [`forget`](Self::forget) — a coordinator with a
+    /// long uptime and a steady stream of scale-to-zero churn depends on this
+    /// count staying bounded by the fleet's live relays rather than growing with
+    /// every relay id ever minted.
+    pub fn relay_count(&self) -> usize {
+        self.relays.lock().len()
+    }
 }
 
 /// The coordinator's per-relay descriptor outbox.
@@ -236,6 +258,30 @@ impl RelayDescriptors {
             .get(&relay_id)
             .map(|channel| channel.borrow().clone())
             .unwrap_or_default()
+    }
+
+    /// Drops `relay_id`'s whole channel — closing any subscriber still attached.
+    ///
+    /// Reserved for a relay id that has been **permanently** retired (a ledger
+    /// tombstone that refuses the id from ever enrolling again): only then is it
+    /// certain no control connection will ever subscribe under the id again, so
+    /// dropping the channel loses nothing a future reconnect would need. Calling
+    /// this for a relay that merely disconnected — and could legitimately reconnect
+    /// under the same id — would force its next subscribe to recreate the channel
+    /// from an empty set instead of the descriptors it should still be serving.
+    /// Idempotent: forgetting an id with no channel (or already forgotten) is a
+    /// no-op.
+    pub fn forget(&self, relay_id: RelayId) {
+        self.channels.lock().remove(&relay_id);
+    }
+
+    /// How many relay ids the outbox currently holds a channel for. Exists for
+    /// regression coverage of [`forget`](Self::forget) — a coordinator with a
+    /// long uptime and a steady stream of scale-to-zero churn depends on this
+    /// count staying bounded by the fleet's live relays rather than growing with
+    /// every relay id ever minted.
+    pub fn relay_count(&self) -> usize {
+        self.channels.lock().len()
     }
 }
 
@@ -378,6 +424,32 @@ mod tests {
     }
 
     #[test]
+    fn forget_drops_the_relays_whole_channel() {
+        let outbox = RelayDescriptors::new();
+        outbox.record(RelayId(1), descriptor("sb-test", 1, &[2]));
+        outbox.record(RelayId(2), descriptor("sb-test", 2, &[1]));
+        assert_eq!(outbox.relay_count(), 2);
+
+        outbox.forget(RelayId(1));
+        assert_eq!(
+            outbox.relay_count(),
+            1,
+            "the forgotten relay's shell is gone, not just emptied"
+        );
+        assert!(outbox.current_for(RelayId(1)).is_empty());
+        // The other relay's channel is untouched.
+        assert_eq!(outbox.current_for(RelayId(2)).len(), 1);
+    }
+
+    #[test]
+    fn descriptors_forget_on_an_unknown_relay_is_a_no_op() {
+        let outbox = RelayDescriptors::new();
+        outbox.record(RelayId(1), descriptor("sb-test", 1, &[2]));
+        outbox.forget(RelayId(9));
+        assert_eq!(outbox.relay_count(), 1);
+    }
+
+    #[test]
     fn a_subscriber_is_woken_on_record_and_sees_the_current_set() {
         let outbox = RelayDescriptors::new();
         let mut rx = outbox.subscribe(RelayId(1));
@@ -504,6 +576,39 @@ mod tests {
             rx2.try_recv().is_err(),
             "session 1 was retired for relay 2 too"
         );
+    }
+
+    #[test]
+    fn forget_drops_the_relays_whole_entry() {
+        let reaps = RelayReaps::new();
+        reaps.send(RelayId(1), slot_close("sb-test", 1, &[0]));
+        reaps.send(RelayId(2), slot_close("sb-test", 1, &[0]));
+        assert_eq!(reaps.relay_count(), 2);
+
+        reaps.forget(RelayId(1));
+        assert_eq!(
+            reaps.relay_count(),
+            1,
+            "the forgotten relay's shell is gone, not just emptied"
+        );
+        assert!(
+            reaps.subscribe(RelayId(1)).try_recv().is_err(),
+            "a forgotten relay's pending directive does not replay",
+        );
+        // The other relay's pending directive is untouched.
+        let close = reaps
+            .subscribe(RelayId(2))
+            .try_recv()
+            .expect("relay 2's directive survives");
+        assert_eq!(close.session, SessionId(1));
+    }
+
+    #[test]
+    fn reaps_forget_on_an_unknown_relay_is_a_no_op() {
+        let reaps = RelayReaps::new();
+        reaps.send(RelayId(1), slot_close("sb-test", 1, &[0]));
+        reaps.forget(RelayId(9));
+        assert_eq!(reaps.relay_count(), 1);
     }
 
     #[test]

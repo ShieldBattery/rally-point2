@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId};
@@ -54,6 +55,12 @@ pub const DESYNC_PREFIX: &str = "desync";
 /// rather than uploaded, bounding what a misbehaving relay build can push into the
 /// store.
 pub const MAX_FLIGHT_BLOB_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long [`S3FlightStore::connect`] waits for its startup reachability probe
+/// before treating the bucket as unreachable. Generous against ordinary S3-API
+/// latency, but still bounded — a hung probe must not hang coordinator startup
+/// indefinitely.
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One stored object as [`FlightStore::list`] reports it: its full key, byte size,
 /// and last-modified time in unix-epoch milliseconds.
@@ -494,12 +501,16 @@ pub struct S3FlightStore {
 }
 
 impl S3FlightStore {
-    /// Builds the store's S3 client from resolved config. The HTTPS connector is
-    /// pinned to the rustls **ring** provider, matching the workspace's single crypto
-    /// backend (no aws-lc-rs). Credentials are the static access/secret pair the config
-    /// resolved; the endpoint and region point the SigV4 signer at the Spaces bucket
-    /// (Spaces accepts `us-east-1` as the signing region).
-    pub async fn connect(resolved: ResolvedFlightStore) -> Self {
+    /// Builds the store's S3 client from resolved config and probes the bucket
+    /// before returning, so a misconfiguration (wrong bucket name, wrong region,
+    /// bad credentials) fails coordinator startup loudly instead of surfacing only
+    /// on the first shipped recording — where a failed `put` is just a logged loss
+    /// (see [`crate::flight_store`]'s module docs). The HTTPS connector is pinned
+    /// to the rustls **ring** provider, matching the workspace's single crypto
+    /// backend (no aws-lc-rs). Credentials are the static access/secret pair the
+    /// config resolved; the endpoint and region point the SigV4 signer at the
+    /// Spaces bucket (Spaces accepts `us-east-1` as the signing region).
+    pub async fn connect(resolved: ResolvedFlightStore) -> Result<Self, FlightStoreError> {
         let http = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
@@ -530,10 +541,34 @@ impl S3FlightStore {
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             )
             .build();
-        Self {
+        let store = Self {
             client: aws_sdk_s3::Client::from_conf(config),
             bucket: resolved.bucket,
+        };
+        match tokio::time::timeout(CONNECT_PROBE_TIMEOUT, store.probe_bucket()).await {
+            Ok(Ok(())) => Ok(store),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(FlightStoreError(format!(
+                "probing bucket {:?} timed out after {:?}",
+                store.bucket, CONNECT_PROBE_TIMEOUT
+            ))),
         }
+    }
+
+    /// Confirms the configured bucket is reachable and addressable with the
+    /// resolved credentials — a `HeadBucket` call, cheap and side-effect-free,
+    /// unlike a probe `put`/`get` which would leave (or require) an object. Wrapped
+    /// in a timeout by [`connect`](Self::connect) so a hung backend cannot hang
+    /// startup indefinitely.
+    async fn probe_bucket(&self) -> Result<(), FlightStoreError> {
+        use aws_sdk_s3::error::DisplayErrorContext;
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| FlightStoreError(format!("{}", DisplayErrorContext(&error))))
     }
 }
 

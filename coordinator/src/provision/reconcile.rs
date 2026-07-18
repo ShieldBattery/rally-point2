@@ -237,9 +237,15 @@ impl<P: Provisioner> ProvisionLoop<P> {
             let warm_target = self.warm.target_at(region, now);
             let coverage_target = self.coverage_demand(region, &covered, now);
             let target = warm_target.max(coverage_target);
+            // Draining relays are excluded: placement can no longer land a session on
+            // one (`registry::is_available` already refuses it), so counting it toward
+            // `live` would hide a real gap behind a relay that is on its way out —
+            // scale-up would stay suppressed for as long as the drain takes to finish
+            // (up to a full game's remaining length) even though nothing placeable
+            // covers the target.
             let live = enrolled
                 .iter()
-                .filter(|r| r.region.as_ref() == Some(region))
+                .filter(|r| !r.draining && r.region.as_ref() == Some(region))
                 .count() as u32;
             self.scale_up(region, live, target, now).await;
             self.scale_down(region, &enrolled, live, target, now).await;
@@ -441,7 +447,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                         %error,
                         "launching a relay task failed; retiring the minted id",
                     );
-                    if let Err(error) = self.ledger.retire(minted.relay_id) {
+                    if let Err(error) = self.retire_relay(minted.relay_id) {
                         tracing::warn!(
                             relay_id = minted.relay_id.0,
                             %error,
@@ -545,7 +551,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 );
             }
         }
-        if let Err(error) = self.ledger.retire(relay_id) {
+        if let Err(error) = self.retire_relay(relay_id) {
             tracing::warn!(relay_id = relay_id.0, %error, "retiring a drained relay failed");
         }
         self.idle_since.remove(&relay_id);
@@ -587,7 +593,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                         task = %launch.task,
                         "a launched task stopped before enrolling; retiring the id",
                     );
-                    if let Err(error) = self.ledger.retire(launch.relay_id) {
+                    if let Err(error) = self.retire_relay(launch.relay_id) {
                         tracing::warn!(
                             relay_id = launch.relay_id.0,
                             %error,
@@ -629,7 +635,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     "stopping an expired launch's task failed",
                 );
             }
-            if let Err(error) = self.ledger.retire(relay.relay_id) {
+            if let Err(error) = self.retire_relay(relay.relay_id) {
                 tracing::warn!(
                     relay_id = relay.relay_id.0,
                     %error,
@@ -667,7 +673,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                         relay_id = relay.relay_id.0,
                         "retiring a bound relay whose task has stopped and is not enrolled",
                     );
-                    if let Err(error) = self.ledger.retire(relay.relay_id) {
+                    if let Err(error) = self.retire_relay(relay.relay_id) {
                         tracing::warn!(
                             relay_id = relay.relay_id.0,
                             %error,
@@ -723,6 +729,28 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 }
             }
         }
+    }
+
+    /// Retires `relay_id` in the ledger — the tombstone that refuses the id from
+    /// ever enrolling again — and, only once that succeeds, forgets its descriptor
+    /// and reap outbox shells too.
+    ///
+    /// The ledger tombstone is what makes the forget safe: every one of this
+    /// method's callers reaches it only for an id that will never enroll again (a
+    /// drained, expired, or vanished relay), never for a live relay that merely
+    /// lost its connection and might reconnect under the same id. Without this, the
+    /// two outboxes grow one shell per relay id for the coordinator's entire
+    /// uptime — every Fargate task launched mints a fresh id, so a long-running
+    /// coordinator under steady scale-to-zero churn accumulates a shell per task
+    /// ever launched, and session cleanup that scans every relay's state
+    /// (`RelayReaps::retire`) pays for all of that history on every session close.
+    /// Skipped when the ledger write itself fails: an untombstoned id might still
+    /// legitimately enroll, so its shells must stay live for that possibility.
+    fn retire_relay(&self, relay_id: RelayId) -> Result<(), crate::ledger::LedgerError> {
+        self.ledger.retire(relay_id)?;
+        self.setup.descriptors().forget(relay_id);
+        self.setup.reaps().forget(relay_id);
+        Ok(())
     }
 }
 
@@ -1138,6 +1166,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_draining_relay_does_not_suppress_scale_up() {
+        let east = region("us-east");
+        let mut h = Harness::new(
+            vec![east.clone()],
+            Duration::from_secs(600),
+            Duration::from_secs(300),
+        );
+        let (id, generation) = h.seed_live_relay(&east, 1_000);
+        // The relay has asked to drain — placement can no longer land a session on
+        // it (`registry::is_available` already excludes it) — but it is still
+        // present in `enrolled_relays`.
+        assert!(registry::mark_draining(&h.reg, id, generation));
+
+        // Warm demand asks for one relay. The draining relay must not count toward
+        // it: a live count that included it would read the target as already met
+        // and launch nothing, stranding the region with zero placeable relays.
+        h.warm
+            .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+        h.provision.tick(1_000).await;
+
+        assert_eq!(
+            h.fake.launches().len(),
+            1,
+            "a draining relay must not be counted as live, so scale-up still fires",
+        );
+    }
+
+    #[tokio::test]
     async fn scale_down_drains_only_idle_zero_session_relays_past_the_grace() {
         let east = region("us-east");
         let mut h = Harness::new(
@@ -1446,6 +1502,53 @@ mod tests {
         assert!(
             !registry::is_available(&h.reg, id),
             "the relay is still marked draining despite the stop error",
+        );
+    }
+
+    #[tokio::test]
+    async fn many_enroll_and_retire_cycles_do_not_grow_the_outbox_shells() {
+        // Every launched task mints a fresh relay id (one-time ledger tokens, never
+        // reused — `RelayLedger::mint_at` hands out the row's autoincrement rowid).
+        // A coordinator with a long uptime under steady scale-to-zero churn runs
+        // this cycle continuously, so the descriptor and reap outboxes must not
+        // grow a permanent shell per id ever minted.
+        let east = region("us-east");
+        let mut h = Harness::new(
+            vec![east.clone()],
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+        );
+
+        let cycles = 50;
+        let mut now = 1_000u64;
+        for _ in 0..cycles {
+            let (id, _gen) = h.seed_live_relay(&east, now);
+            // A relay's control connection subscribes to both outboxes on enroll
+            // (mirroring the real control-connection handler), which is what
+            // creates each outbox's per-relay shell.
+            drop(h.setup.descriptors().subscribe(id));
+            drop(h.setup.reaps().subscribe(id));
+
+            // First tick starts the idle timer; the second, past the grace, drains
+            // and permanently retires the relay's id (no warm demand, so target 0
+            // makes the freshly idle relay a drain candidate).
+            h.provision.tick(now).await;
+            now += 10;
+            h.provision.tick(now).await;
+            now += 1;
+        }
+
+        assert_eq!(
+            h.setup.descriptors().relay_count(),
+            0,
+            "the descriptor outbox must not accumulate a shell per cycle across \
+             {cycles} enroll/retire cycles",
+        );
+        assert_eq!(
+            h.setup.reaps().relay_count(),
+            0,
+            "the reap outbox must not accumulate a shell per cycle across \
+             {cycles} enroll/retire cycles",
         );
     }
 

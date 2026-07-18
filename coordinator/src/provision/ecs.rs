@@ -64,6 +64,7 @@ const ENI_NOT_FOUND_CODE: &str = "InvalidNetworkInterfaceID.NotFound";
 /// so it must be unique per coordinator deployment — a staging and a production
 /// coordinator sharing a `started_by` would sweep each other's tasks.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EcsConfig {
     /// The `startedBy` tag stamped on every launched task and filtered on when
     /// listing this coordinator's tasks. Unique per coordinator deployment.
@@ -94,6 +95,7 @@ fn default_relay_port() -> u16 {
 /// Per-region ECS placement: the AWS region, cluster, and task definition a relay
 /// for this region runs in, plus its Fargate `awsvpc` networking.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EcsRegionConfig {
     /// The AWS region the cluster lives in (e.g. `us-east-1`).
     pub aws_region: String,
@@ -1327,6 +1329,32 @@ mod tests {
                 r#"{"started_by":"","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}}"#
             ),
             Err(EcsConfigError::Invalid(_)),
+        ));
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_top_level_field() {
+        // A misspelled top-level field (`started_bye` for `started_by`) must
+        // surface as a parse error rather than silently defaulting `started_by`
+        // to nothing and leaving the typo unread.
+        assert!(matches!(
+            EcsConfig::from_json(
+                r#"{"started_bye":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}}"#
+            ),
+            Err(EcsConfigError::Json(_)),
+        ));
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_per_region_field() {
+        // A misspelled region field (e.g. `security_group` for
+        // `security_groups`) must fail loudly rather than silently launching
+        // with no security groups applied.
+        assert!(matches!(
+            EcsConfig::from_json(
+                r#"{"started_by":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"],"security_group":["sg-1"]}}}"#
+            ),
+            Err(EcsConfigError::Json(_)),
         ));
     }
 }

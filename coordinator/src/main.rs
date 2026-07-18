@@ -438,10 +438,11 @@ async fn main() -> Result<()> {
     }
 
     // Load and connect the flight-recorder durable sink when one is configured. Fail
-    // startup on a malformed config or an unset credential variable: a coordinator told
-    // to persist recordings but unable to reach its store must not silently drop every
-    // one, the same fail-closed posture as the tenant registry. Absent = no store, and
-    // shipped recordings are dropped with a rate-limited warn.
+    // startup on a malformed config, an unset credential variable, or an unreachable
+    // bucket: a coordinator told to persist recordings but unable to reach its store
+    // must not silently drop every one, the same fail-closed posture as the tenant
+    // registry. Absent = no store, and shipped recordings are dropped with a
+    // rate-limited warn.
     let flight_store = match &cli.flight_store {
         Some(path) => {
             let config = flight_store::load(path)
@@ -449,7 +450,14 @@ async fn main() -> Result<()> {
             let resolved = config
                 .resolve_secrets(|name| std::env::var(name).ok())
                 .context("resolving flight store credentials from the environment")?;
-            let store = flight_store::S3FlightStore::connect(resolved).await;
+            let store = flight_store::S3FlightStore::connect(resolved)
+                .await
+                .with_context(|| {
+                    format!(
+                        "connecting to the flight store configured at {}",
+                        path.display()
+                    )
+                })?;
             tracing::info!(path = %path.display(), "flight store configured");
             Some(std::sync::Arc::new(store))
         }
@@ -523,6 +531,7 @@ async fn main() -> Result<()> {
                  when it is minted and bound through the ledger",
             ));
         };
+        validate_provision_tick_secs(cli.provision_tick_secs)?;
         let config = ProvisionConfig {
             regions: provision_regions,
             tick_interval: Duration::from_secs(cli.provision_tick_secs),
@@ -629,6 +638,23 @@ async fn main() -> Result<()> {
         )
         .await
         .context("coordinator API server ended with an error")?;
+    }
+    Ok(())
+}
+
+/// Rejects a zero provisioning tick interval before [`ProvisionConfig`] is ever
+/// built. `tokio::time::interval` panics on a zero duration, and the
+/// provisioning loop runs as a detached task — a panic there kills only
+/// provisioning while the API keeps serving, so a misconfigured interval would
+/// otherwise fail silent rather than loud. Called only when provisioning is
+/// enabled; a coordinator with no provisioning substrate configured never
+/// builds an interval from this value at all.
+fn validate_provision_tick_secs(secs: u64) -> Result<()> {
+    if secs == 0 {
+        return Err(eyre!(
+            "refusing to start: --provision-tick-secs (COORDINATOR_PROVISION_TICK_SECS) \
+             must be greater than zero",
+        ));
     }
     Ok(())
 }
@@ -852,5 +878,18 @@ mod tests {
         assert_eq!(cli.acme_domain.as_deref(), Some("coord.example.com"));
         assert_eq!(cli.acme_contact.as_deref(), Some("ops@example.com"));
         assert!(!cli.acme_staging);
+    }
+
+    #[test]
+    fn a_zero_provision_tick_is_rejected() {
+        // `tokio::time::interval(Duration::ZERO)` panics, and the provisioning loop
+        // runs detached, so a zero tick must fail startup rather than reach the loop.
+        assert!(validate_provision_tick_secs(0).is_err());
+    }
+
+    #[test]
+    fn a_nonzero_provision_tick_is_accepted() {
+        assert!(validate_provision_tick_secs(1).is_ok());
+        assert!(validate_provision_tick_secs(5).is_ok());
     }
 }
