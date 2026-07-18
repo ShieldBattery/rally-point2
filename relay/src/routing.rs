@@ -1238,6 +1238,63 @@ pub async fn run_slot_link(
         }
     }
 
+    // Replay the session's leave state the same way: a departure or a decided
+    // leave is pushed to each survivor exactly once, at the moment it happens
+    // (`broadcast_connectivity`, `fan_out_leave`), so a client whose link was
+    // down at that moment never hears it — the turn replay above brings it to
+    // the departed slot's last frame, and without the leave directive it then
+    // stalls at the next frame forever. The client-side twin of the mesh's
+    // `reconcile_leaves_on_join`: every recorded departure replays as a
+    // connectivity-down (a departure record at this moment means the slot is
+    // genuinely still gone — a re-registered slot's record was reinstated
+    // away), and every decided leave replays as the directive itself. Both are
+    // idempotent on the client (the leave tracker dedups by slot; connectivity
+    // is a level signal), so copies the client already held are harmless, and
+    // both skip this slot itself (a slot is never pushed its own departure —
+    // and a reconnect for a slot whose own leave was decided was refused at
+    // admission). Empty on a fresh dial: no session history, nothing missed.
+    let (departures, directives) = consensus::leave_reconcile(&decision_makers, &key);
+    for (departed, ..) in departures {
+        if departed == slot {
+            continue;
+        }
+        if let Err(error) = rally_point_transport::control::send_control_connectivity(
+            &mut control_send,
+            departed.0,
+            false,
+        )
+        .await
+        {
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                %error,
+                "replaying a departure to a reconnecting client failed; closing slot link",
+            );
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            return;
+        }
+    }
+    for leave in directives {
+        if leave.slot == u32::from(slot.0) {
+            continue;
+        }
+        if let Err(error) =
+            rally_point_transport::control::send_control_leave(&mut control_send, leave).await
+        {
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                %error,
+                "replaying a decided leave to a reconnecting client failed; closing slot link",
+            );
+            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            return;
+        }
+    }
+
     'serve: loop {
         tokio::select! {
             received = link.recv() => {

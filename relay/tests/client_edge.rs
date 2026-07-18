@@ -1683,6 +1683,124 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
     }
 }
 
+/// A leave decided while a client's link was down must reach that client when
+/// it reconnects. The live push (`fan_out_leave`) reaches only the survivors
+/// rostered at decision time — a blipped client is not among them — so without
+/// a reconnect-time replay the client replays turns up to the departed slot's
+/// last frame and then stalls forever waiting for a turn that will never come.
+/// The reconnect replays the session's leave state down the fresh control
+/// stream: the departed slot as a connectivity-down, the decided leave as the
+/// directive itself.
+#[tokio::test]
+async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+    use rally_point_transport::control::{
+        ControlInbound, send_control_leave_intent, spawn_control_reader,
+    };
+
+    // The native SC:R `pending_leave_reason` a voluntary quit writes -- see
+    // `relay::routing::LEAVE_REASON_LEFT`.
+    const LEAVE_REASON_LEFT: u32 = 3;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(310);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    // Authority over an expected {0, 1} set, so the session starts and a clean
+    // leave-intent is decided here rather than merely recorded.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let makers = mesh.decision_makers.clone();
+    let _ = consensus::sync_maker(
+        &makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut ctrl0 = spawn_control_reader(slot0.connection().clone());
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+
+    // A framed turn from slot 0 reaches slot 1 live: the session has started
+    // and `decide_leave` has a frame basis to schedule against.
+    slot0
+        .send(Some(Payload {
+            seq: 0,
+            slot: 0,
+            game_frame_count: Some(10),
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let mut got = Vec::new();
+    while got.is_empty() {
+        got = slot1.recv().await.unwrap().fresh;
+    }
+    assert_eq!(got[0].seq, 0);
+
+    // Slot 1's link dies. Wait until slot 0 hears the disconnect — proof the
+    // relay has run the departure path and holds slot 1's drop undecided (which
+    // is also what keeps the session's state alive once slot 0 leaves below).
+    drop(slot1);
+    wait_for_connectivity(&mut ctrl0, SlotId(1), false).await;
+
+    // While slot 1 is gone, slot 0 leaves cleanly. The authority decides the
+    // leave and pushes it to the survivors rostered right now — which the
+    // blipped slot 1 is not.
+    let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+    send_control_leave_intent(&mut leave_send).await.unwrap();
+    expect_closed(&mut slot0).await;
+
+    // Slot 1 re-dials while its own drop is still held. The reconnect must
+    // replay the leave state it missed: slot 0's departure as a
+    // connectivity-down and the decided leave as the directive itself.
+    let slot1b = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(0), 1)],
+    )
+    .await;
+    let mut ctrl1 = spawn_control_reader(slot1b.connection().clone());
+
+    let mut saw_departed_connectivity = false;
+    let leave = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ctrl1.recv())
+            .await
+            .expect("the replayed leave arrives before the timeout")
+            .expect("the reconnected control stream stays open");
+        match frame {
+            ControlInbound::Connectivity(change) if change.slot == 0 && !change.connected => {
+                saw_departed_connectivity = true;
+            }
+            ControlInbound::Leave(leave) => break leave,
+            _ => continue,
+        }
+    };
+    assert_eq!(leave.slot, 0, "the replayed leave names the departed slot");
+    assert_eq!(
+        leave.reason, LEAVE_REASON_LEFT,
+        "the replayed directive is the decided one, reason intact",
+    );
+    assert!(
+        saw_departed_connectivity,
+        "the departed slot replays as connectivity-down before its leave",
+    );
+}
+
 #[tokio::test]
 async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_closed() {
     // The same-relay resume regression, end to end: a client authorized on a NONZERO
