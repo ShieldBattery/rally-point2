@@ -1739,13 +1739,6 @@ pub async fn run_mesh_link(
     // so a repeat cursor push-on-advance check costs a hash lookup, not a
     // stream write the peer's monotonic guard would just discard anyway.
     let mut ack_cursors_sent: HashMap<(SessionId, SlotId), u64> = HashMap::new();
-    // Whether the peer's presence reader task is still feeding reports. Once
-    // it ends (the peer's stream closed or errored), `recv()` returns `None`
-    // on every poll — an always-ready future that would spin the loop —
-    // so the branch is disabled on the first `None`, exactly like the client
-    // driver's beacon branch. A dead presence stream is not itself a link
-    // failure; that surfaces through the datagram path.
-    let mut presence_alive = true;
 
     // One merged forward channel for every session on this link: fan_out_to_mesh
     // pushes (SessionId, Payload) tagged with the session id, so a single
@@ -2089,7 +2082,7 @@ pub async fn run_mesh_link(
             // buffer-authority verdict — this is the handoff path when the
             // authority relay's players all leave. The reader task assembled
             // the complete frame off a cancel-safe path; `recv` is cancel-safe.
-            received = presence_rx.recv(), if presence_alive => {
+            received = presence_rx.recv() => {
                 match received {
                     Some(report) => {
                         // Tenant-scope the bare wire session id through the
@@ -2137,7 +2130,22 @@ pub async fn run_mesh_link(
                             routing::reconcile_abandon(&sessions, &mesh_for_dispatch, &state.key);
                         }
                     }
-                    None => presence_alive = false,
+                    // The reader task ended: the peer's presence stream reset
+                    // or closed while the connection lives on. Presence is the
+                    // authority-handoff signal — live-player counts drive
+                    // `record_peer`/`recompute` and with them who decides the
+                    // session's buffer and leaves — so a link that keeps
+                    // carrying turns while its presence view is frozen can
+                    // strand a session with no authority (or two) when the
+                    // peer's players leave. There is no read-side re-open (the
+                    // outbound reconcile is write-only), so treat it exactly
+                    // like the control-stream reader dying just above: end the
+                    // driver and let the dial supervisor bring up a fresh
+                    // connection with every stream new.
+                    None => {
+                        tracing::info!("mesh presence stream reader ended; closing link");
+                        break MeshLinkExit::ConnectionFailed;
+                    }
                 }
             }
             // Idle teardown: the link served at least one session, went empty,

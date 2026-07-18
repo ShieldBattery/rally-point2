@@ -287,6 +287,15 @@ struct TargetInputs {
 /// per slot, 8 slots max = 1KB).
 const RTT_WINDOW_SIZE: usize = 32;
 
+/// Ceiling on any single ingested RTT sample, in microseconds (10 seconds).
+/// RTTs arrive as claims — a remote relay's conditions sidecar carries values
+/// its own clients influenced — and no playable link approaches this. The
+/// clamp keeps a hostile near-`u32::MAX` claim from saturating every
+/// effective-RTT sum built on the sample; the target it would inflate is
+/// clamped to the session's buffer bounds regardless, so this only tidies the
+/// arithmetic, never the outcome.
+const MAX_INGEST_RTT_US: u32 = 10_000_000;
+
 /// Tuning for the control law. The defaults encode the target formula with
 /// asymmetric "raise fast, lower slow" movement; they are `pub` so a test or
 /// a future tuning pass can override them without touching the law itself.
@@ -438,7 +447,10 @@ impl SlotState {
     /// The interval loss rate (`delta_lost / delta_sent`), or `None` when no
     /// prior sample exists (first sample) or the counters went backward (a
     /// re-delivered stale sidecar). `saturating_sub` clamps to zero so a stale
-    /// sample can't produce a negative rate.
+    /// sample can't produce a negative rate, and the result is clamped to 1.0:
+    /// the counters are peer-reported, so nothing structural stops a claimed
+    /// `delta_lost > delta_sent`, and a rate past certainty means nothing —
+    /// unclamped it would only inflate the loss-risk product downstream.
     fn loss_rate(&self) -> Option<f64> {
         if !self.has_delta {
             return None;
@@ -448,7 +460,7 @@ impl SlotState {
             return None;
         }
         let delta_lost = self.curr_lost.saturating_sub(self.prev_lost);
-        Some(delta_lost as f64 / delta_sent as f64)
+        Some((delta_lost as f64 / delta_sent as f64).min(1.0))
     }
 
     /// The loss risk: `loss_rate * eff_RTT` (in us). This is the expected burst
@@ -499,6 +511,18 @@ pub struct DecisionMaker {
     /// continues the numbering instead of restarting below what clients
     /// already hold (which they would ignore).
     decision_seq: u32,
+    /// The `authority_relay_id` carried by the directive `decision_seq`
+    /// currently reflects — this relay's own id when it authored the decision,
+    /// the stamp's id when [`observe_directive`](Self::observe_directive)
+    /// adopted a forwarded one. Each authority stamps its own `decision_seq`
+    /// count from where IT started, so during a staggered handoff two relays
+    /// can collide on the same seq with different buffers; clients break that
+    /// tie by relay id (see `directive::DirectiveTracker` in the client
+    /// crate), and this field lets `observe_directive` apply the identical
+    /// rule — otherwise a relay would latch whichever equal-seq copy it saw
+    /// first and could disagree with its clients about the session buffer
+    /// until the next decision.
+    decision_seq_tiebreak: Option<u64>,
     /// The buffer change currently being broadcast, if any. Set when a
     /// decision fires; handed out by
     /// [`active_directive`](Self::active_directive) for every forwarded turn,
@@ -1719,6 +1743,7 @@ impl DecisionMaker {
             slots: HashMap::new(),
             last_decision_frame: None,
             decision_seq: 0,
+            decision_seq_tiebreak: None,
             pending_directive: None,
             initial_directive_sent: false,
             delivery: crate::delivery::DeliveryTracking::default(),
@@ -1900,11 +1925,24 @@ impl DecisionMaker {
     ///
     /// Only ever called on a non-authority relay (the authority forwards its own
     /// directives through [`active_directive`](Self::active_directive), not here),
-    /// and only a strictly newer directive updates the buffer -- an out-of-order
-    /// stale copy is ignored by the same `seq` gate that guards the numbering.
+    /// and only a newer directive updates the buffer -- an out-of-order stale
+    /// copy is ignored by the same `seq` gate that guards the numbering. Newer
+    /// means a strictly higher `decision_seq`, or an equal one from a strictly
+    /// higher `authority_relay_id`: two relays in a staggered-handoff window can
+    /// each stamp the same seq (each counts from where it started), and this is
+    /// the client's own tie-break verbatim (`Option<u64>` ordering: `None` never
+    /// displaces `Some`, redundant copies of one decision never displace each
+    /// other), so relay and client always land on the same winner instead of
+    /// each latching whichever copy arrived first.
     pub fn observe_directive(&mut self, directive: &BufferDirective) {
-        if directive.decision_seq > self.decision_seq {
+        let newer = match directive.decision_seq.cmp(&self.decision_seq) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => directive.authority_relay_id > self.decision_seq_tiebreak,
+            std::cmp::Ordering::Less => false,
+        };
+        if newer {
             self.decision_seq = directive.decision_seq;
+            self.decision_seq_tiebreak = directive.authority_relay_id;
             self.buffer = BufferSize(directive.buffer_turns);
         }
     }
@@ -2159,8 +2197,12 @@ impl DecisionMaker {
             }
             let state = self.slots.entry(id).or_default();
             // RTT goes into the ring buffer for jitter-aware sizing. A `0`
-            // (no measurement) is skipped by `push`.
-            state.rtt_window.push(slot.rtt_us);
+            // (no measurement) is skipped by `push`. Clamped on the way in: the
+            // value is peer-reported (a remote relay's sidecar carries its own
+            // clients' claims), no playable link's RTT approaches the ceiling,
+            // and an unclamped near-u32::MAX claim would saturate every
+            // effective-RTT sum built on it.
+            state.rtt_window.push(slot.rtt_us.min(MAX_INGEST_RTT_US));
             // The mesh hop is a property of the relay-pair, not the client's
             // link, so it's set per-ingest (local = 0, remote = relay-pair RTT).
             state.mesh_rtt_us = mesh_rtt_us;
@@ -2235,7 +2277,11 @@ impl DecisionMaker {
         // when only one player has high latency -- lower buffer = less delay.
         eff_rtts.sort_unstable_by(|a, b| b.cmp(a)); // descending
         let path_us = if eff_rtts.len() >= 2 {
-            (eff_rtts[0] + eff_rtts[1]) / 2
+            // Summed in u64: each effective RTT is client-influenced and can
+            // saturate near u32::MAX, so a u32 sum could overflow (a
+            // debug-build panic; a silently small path in release). The
+            // halved sum always fits back into u32.
+            ((u64::from(eff_rtts[0]) + u64::from(eff_rtts[1])) / 2) as u32
         } else {
             // One slot: assume symmetric (both legs same eff_RTT).
             eff_rtts[0]
@@ -2256,7 +2302,11 @@ impl DecisionMaker {
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
 
         Some(TargetInputs {
-            target: path_turns + loss_turns,
+            // Saturating: both terms derive from client-influenced inputs, and
+            // an absurd target is clamped to the session bounds at `decide`
+            // anyway — overflow here would only trade that clamp for a
+            // debug-build panic.
+            target: path_turns.saturating_add(loss_turns),
             path_us,
             worst_loss_risk,
         })
@@ -2286,6 +2336,10 @@ impl DecisionMaker {
         // `decision_seq` tells clients the latest buffer wins even when copies of
         // both interleave on the wire.
         self.decision_seq += 1;
+        // This seq now reflects this relay's own authorship, so an equal-seq
+        // stamp observed later wins only from a strictly higher relay id --
+        // the same displacement rule clients apply.
+        self.decision_seq_tiebreak = self.own_relay_id.map(|id| id.0);
         self.pending_directive = Some(BufferDirective {
             buffer_turns: new_buffer,
             apply_at_frame: applied_frame.0,
@@ -5560,6 +5614,48 @@ mod tests {
             stamp.decision_seq > 7,
             "numbers above what clients already hold",
         );
+    }
+
+    /// Equal-seq directives tie-break by `authority_relay_id`, exactly as the
+    /// client's `DirectiveTracker` does. During a staggered authority handoff
+    /// two relays each stamp their own `decision_seq` count, so a peer relay
+    /// can see two directives at the same seq with different buffers — it must
+    /// latch the same winner the clients pick (the higher relay id), not
+    /// whichever copy arrived first, or its committed-buffer view (what a
+    /// later promotion re-affirms from) drifts from what clients hold.
+    #[test]
+    fn equal_seq_directives_tie_break_by_relay_id_like_the_client() {
+        let directive =
+            |buffer_turns: u32, decision_seq: u32, relay: Option<u64>| BufferDirective {
+                buffer_turns,
+                apply_at_frame: 100,
+                decision_seq,
+                authority_relay_id: relay,
+            };
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+
+        // First copy at seq 7 from relay 2.
+        maker.observe_directive(&directive(5, 7, Some(2)));
+        assert_eq!(maker.buffer(), BufferSize(5));
+
+        // The same seq from a LOWER relay id loses, whatever order they arrive.
+        maker.observe_directive(&directive(3, 7, Some(1)));
+        assert_eq!(maker.buffer(), BufferSize(5), "a lower id never displaces");
+
+        // The same seq from a HIGHER relay id wins — the client's rule.
+        maker.observe_directive(&directive(4, 7, Some(3)));
+        assert_eq!(maker.buffer(), BufferSize(4), "the higher id displaces");
+
+        // A redundant copy of the winner (same seq, same id) changes nothing,
+        // and an id-less stamp never displaces one that names its relay.
+        maker.observe_directive(&directive(4, 7, Some(3)));
+        maker.observe_directive(&directive(6, 7, None));
+        assert_eq!(maker.buffer(), BufferSize(4));
+
+        // A strictly higher seq still always wins, id or no id.
+        maker.observe_directive(&directive(6, 8, None));
+        assert_eq!(maker.buffer(), BufferSize(6));
     }
 
     /// The control-law input trace is rate-limited to once per
