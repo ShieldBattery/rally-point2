@@ -63,6 +63,9 @@
 //!   bounded per-session events + link-health samples + turn-stream counters
 //!   (summaries only, never payload bytes), flushed as a self-describing JSON
 //!   blob on session close and wholesale before a drain exits.
+//! - **task_stats** ([`task_stats`]) — self-reported Fargate task resources:
+//!   polls this relay's own ECS Task Metadata `/stats` endpoint and logs
+//!   CPU/memory/network, independent of CloudWatch. A no-op outside Fargate.
 //!
 //! Beyond what the bullets above name directly, the relay also negotiates
 //! protocol versions on connect, coordinates its own drain on shutdown (finish
@@ -90,6 +93,7 @@ pub mod provisional;
 pub mod region_ping;
 pub mod routing;
 pub mod server;
+pub mod task_stats;
 pub mod turn_ring;
 pub mod validation;
 

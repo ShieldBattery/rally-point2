@@ -193,6 +193,18 @@ struct Cli {
     /// enrolls unconditionally and is only ever the region-blind fallback pick.
     #[arg(long, env = "RELAY_REGION")]
     region: Option<String>,
+
+    /// How often the task-stats reporter reads this relay's own ECS Task
+    /// Metadata `/stats` endpoint and logs a CPU/memory/network line — a
+    /// load-test and production observability signal independent of
+    /// CloudWatch Container Insights, since it reads the task-local metadata
+    /// endpoint directly rather than any AWS-side aggregation. `0` disables
+    /// it. Fargate-only regardless of this value: the reporter is a no-op
+    /// unless `ECS_CONTAINER_METADATA_URI_V4` is set in the environment
+    /// (absent in dev/loopback and any non-Fargate run), so leaving this at
+    /// its default is harmless outside Fargate.
+    #[arg(long, env = "RELAY_TASK_STATS_INTERVAL_SECS", default_value_t = 10)]
+    task_stats_interval_secs: u64,
 }
 
 /// How long the drain sequence waits for the coordinator's `DrainAck` before
@@ -287,6 +299,13 @@ async fn main() -> Result<()> {
 
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::new_mesh_state();
+
+    // Self-reported Fargate task resources: a no-op outside Fargate (see the
+    // module doc), so this is safe to call unconditionally in dev/loopback too.
+    rally_point_relay::task_stats::spawn_if_enabled(
+        cli.task_stats_interval_secs,
+        Arc::clone(&sessions),
+    );
 
     // The coordinated-drain seam. On a shutdown signal the drain sequence flips
     // `drain_tx`, the coordinator client sends `Draining` up the control connection,

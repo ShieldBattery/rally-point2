@@ -2525,10 +2525,14 @@ name = "rally-point-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "color-eyre",
  "futures-util",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "parking_lot",
  "rally-point-coordinator",
  "rally-point-proto",

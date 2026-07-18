@@ -612,6 +612,16 @@ pub fn holds_any_slots(sessions: &Sessions) -> bool {
     !sessions.lock().is_empty()
 }
 
+/// The number of routing groups (distinct `(tenant, session)` keys) this relay
+/// currently serves, regardless of how many slots each holds. A load signal to
+/// pair with a resource sample (e.g. the task-stats reporter), not a substitute
+/// for [`holds_any_slots`]: a relay can hold zero groups yet still have a slot
+/// mid-deregistration, which `holds_any_slots` alone answers correctly and this
+/// count does not need to.
+pub fn session_count(sessions: &Sessions) -> usize {
+    sessions.lock().len()
+}
+
 /// The live roster: every routing group with at least one connected slot, each
 /// paired with its currently-connected slots (sorted, for a stable order).
 ///
