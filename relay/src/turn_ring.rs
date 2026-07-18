@@ -12,15 +12,22 @@
 //!
 //! The ring is bounded two ways — a turn *count* and a total *byte* budget,
 //! whichever binds first — and drops oldest-first on overflow. The count bound is
-//! sized to a nominal outage window (see `RING_WINDOW_SECS`): over that window a
-//! session of the most slots SC:R allows produces at most `window_secs × turns/s ×
-//! slots` turns, so a ring sized to that (with headroom) covers the reconnect. An
-//! outage can outlast that window — a disconnect is no longer bounded by any timer
-//! — but during it the survivors stall in lockstep waiting on the disconnected
-//! slot, so few new turns are produced regardless of how long it runs; the ring's
-//! growth is bounded by lockstep, not by the outage length. The byte bound is the
-//! backstop against a spray of maximum-size oversize turns, which the count bound
-//! alone would let occupy far more memory than an ordinary game's tiny turns.
+//! sized to a nominal outage window (see `RING_WINDOW_SECS`) at the session's
+//! **actual slot count**: over that window a session produces at most
+//! `window_secs × turns/s × slots` turns, so a ring sized to that (with headroom)
+//! covers the reconnect. Sizing per session rather than for the largest possible
+//! game matters because the relay holds one ring per session and most sessions
+//! are far smaller than the maximum: a 2-slot session's producers can only ever
+//! fill a sixth of a 12-slot window in the same wall-clock time, so a
+//! max-slots-sized ring would retain ~6× the window it exists to cover — across
+//! hundreds of concurrent sessions, hundreds of megabytes of relay memory
+//! covering nothing. An outage can outlast the window — a disconnect is no
+//! longer bounded by any timer — but during it the survivors stall in lockstep
+//! waiting on the disconnected slot, so few new turns are produced regardless of
+//! how long it runs; the ring's growth is bounded by lockstep, not by the outage
+//! length. The byte bound is the backstop against a spray of maximum-size
+//! oversize turns, which the count bound alone would let occupy far more memory
+//! than an ordinary game's tiny turns.
 //!
 //! The record is **local and ephemeral**, like the drop holds it serves: it is not
 //! replicated, and it is dropped when the relay's last local slot for the session
@@ -40,7 +47,21 @@ use crate::routing::SessionKey;
 const NOMINAL_TURNS_PER_SEC_PER_SLOT: usize = 24;
 
 /// The most slots a single SC:R game can hold (8 players + up to 4 observers).
-const MAX_GAME_SLOTS: usize = 12;
+/// The slot count the bounds assume when a session's actual count is unknown
+/// (`slots == 0` at [`TurnRing::record`]) — unknown must never under-retain —
+/// and the ceiling a hostile or nonsensical count is clamped to.
+pub const MAX_GAME_SLOTS: usize = 12;
+
+/// The slot count the bounds are actually derived from: the caller's count
+/// clamped into `1..=MAX_GAME_SLOTS`, with `0` (shape unknown) mapped to the
+/// full-game assumption rather than a zero-capacity ring.
+const fn effective_slots(slots: usize) -> usize {
+    if slots == 0 || slots > MAX_GAME_SLOTS {
+        MAX_GAME_SLOTS
+    } else {
+        slots
+    }
+}
 
 /// The nominal outage window, in whole seconds, the replay ring is sized to
 /// cover — keyed to the drop-unlock floor, since a survivor cannot request a
@@ -57,25 +78,48 @@ const MAX_GAME_SLOTS: usize = 12;
 /// case with ample headroom in practice.
 const RING_WINDOW_SECS: usize = crate::drop_hold::DROP_UNLOCK.as_secs() as usize;
 
-/// The turn-count ceiling: every slot's turns across a full nominal window, times
-/// a ~1.5× headroom. A client that returns after such an outage missed at most the
-/// turns produced over that window (`RING_WINDOW_SECS × turns/s × slots`), so a
-/// ring this deep always holds them; the headroom absorbs a faster-than-nominal
-/// turn rate. Drop-oldest past it.
-const TURN_RING_MAX_TURNS: usize =
-    RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS * 3 / 2;
+/// The turn-count ceiling for a session of `slots` slots: every slot's turns
+/// across a full nominal window, times a ~1.5× headroom. A client that returns
+/// after such an outage missed at most the turns produced over that window
+/// (`RING_WINDOW_SECS × turns/s × slots`), so a ring this deep always holds
+/// them; the headroom absorbs a faster-than-nominal turn rate. Drop-oldest past
+/// it.
+pub(crate) const fn max_turns(slots: usize) -> usize {
+    RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * effective_slots(slots) * 3 / 2
+}
 
-/// The byte ceiling on one session's recorded turns, counting each turn's command
-/// bytes (the variable, dominant cost; the fixed envelope fields are negligible).
+/// The byte ceiling on a full 12-slot session's recorded turns, counting each
+/// turn's command bytes (the variable, dominant cost; the fixed envelope fields
+/// are negligible). [`max_bytes`] scales it by the session's slot count exactly
+/// like the count bound, floored at [`TURN_RING_MIN_BYTES`].
 ///
-/// An ordinary lockstep turn is a few hundred bytes, so a full [`TURN_RING_MAX_TURNS`]
-/// ring of them sits at roughly a megabyte — well under this. The bound bites only
-/// a pathological case: a client spraying maximum-size oversize turns
-/// (`MAX_OVERSIZE_TURN_COMMANDS_LEN`, 8 KiB each), which count-bounded alone would
-/// let occupy `TURN_RING_MAX_TURNS × 8 KiB` ≈ 34 MiB. Capping at 4 MiB keeps the
-/// worst case modest; the oldest turns drop until the budget holds, exactly as for
-/// the count bound.
-const TURN_RING_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// An ordinary lockstep turn is a few hundred bytes, so a full
+/// [`max_turns`]`(MAX_GAME_SLOTS)` ring of them sits at roughly a megabyte —
+/// well under this. The bound bites only a pathological case: a client spraying
+/// maximum-size oversize turns (`MAX_OVERSIZE_TURN_COMMANDS_LEN`, 8 KiB each),
+/// which count-bounded alone would let occupy `max_turns × 8 KiB` ≈ 34 MiB.
+/// Capping at 4 MiB keeps the worst case modest; the oldest turns drop until
+/// the budget holds, exactly as for the count bound.
+const TURN_RING_FULL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The floor under the slot-scaled byte bound. The byte bound exists to catch
+/// oversize-turn spray, not ordinary play, so it must sit comfortably above the
+/// count bound's worth of ordinary turns even for the smallest session: a
+/// 1-slot count bound (~1,080 turns) of few-hundred-byte turns is ~300 KiB, so
+/// a 1 MiB floor keeps ~3× headroom before the byte bound could bite traffic
+/// the count bound was sized to keep.
+const TURN_RING_MIN_BYTES: usize = 1024 * 1024;
+
+/// The byte ceiling for a session of `slots` slots — [`TURN_RING_FULL_BYTES`]
+/// scaled linearly by the slot count, floored at [`TURN_RING_MIN_BYTES`].
+const fn max_bytes(slots: usize) -> usize {
+    let scaled = TURN_RING_FULL_BYTES * effective_slots(slots) / MAX_GAME_SLOTS;
+    if scaled < TURN_RING_MIN_BYTES {
+        TURN_RING_MIN_BYTES
+    } else {
+        scaled
+    }
+}
 
 /// Where a recorded turn reached this relay from — stamped once, at the
 /// moment it wins the topological dedup and is recorded here, rather than
@@ -109,6 +153,12 @@ struct Entry {
 struct SessionRing {
     turns: VecDeque<Entry>,
     bytes: usize,
+    /// The bounds currently in force, re-derived from the caller's slot count on
+    /// every record so the ring follows the session's live shape: slots depart
+    /// over a game's life, and the window only ever needs to cover the slots
+    /// still producing turns.
+    max_turns: usize,
+    max_bytes: usize,
 }
 
 impl SessionRing {
@@ -118,12 +168,15 @@ impl SessionRing {
         payload.commands.len()
     }
 
-    /// Records `payload` (tagged with where it came from) and evicts oldest
-    /// turns until both the count and byte bounds hold.
-    fn record(&mut self, payload: Payload, origin: TurnOrigin) {
+    /// Records `payload` (tagged with where it came from), re-derives the bounds
+    /// for a session of `slots` slots, and evicts oldest turns until both the
+    /// count and byte bounds hold.
+    fn record(&mut self, payload: Payload, origin: TurnOrigin, slots: usize) {
+        self.max_turns = max_turns(slots);
+        self.max_bytes = max_bytes(slots);
         self.bytes += Self::cost(&payload);
         self.turns.push_back(Entry { payload, origin });
-        while self.turns.len() > TURN_RING_MAX_TURNS || self.bytes > TURN_RING_MAX_BYTES {
+        while self.turns.len() > self.max_turns || self.bytes > self.max_bytes {
             let Some(evicted) = self.turns.pop_front() else {
                 break;
             };
@@ -141,6 +194,15 @@ pub struct TurnRing {
     sessions: Arc<Mutex<HashMap<SessionKey, SessionRing>>>,
 }
 
+/// One [`TurnRing::totals`] snapshot: ring count plus recorded-turn and
+/// command-byte totals across every session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingTotals {
+    pub sessions: usize,
+    pub turns: usize,
+    pub command_bytes: usize,
+}
+
 impl TurnRing {
     /// An empty registry.
     pub fn new() -> Self {
@@ -154,12 +216,17 @@ impl TurnRing {
     /// under whichever origin the winning copy actually arrived by. The
     /// caller gates this on the session having started; pre-start lobby
     /// traffic has its own replay log and must not be double-buffered here.
-    pub fn record(&self, key: &SessionKey, payload: &Payload, origin: TurnOrigin) {
+    ///
+    /// `slots` is the session's slot count as best the caller knows it — it
+    /// sizes the ring's bounds to the session's actual shape (see the module
+    /// doc). Pass `0` when the shape is genuinely unknown; that sizes the ring
+    /// for a maximum-slot game, since unknown must never under-retain.
+    pub fn record(&self, key: &SessionKey, payload: &Payload, origin: TurnOrigin, slots: usize) {
         self.sessions
             .lock()
             .entry(key.clone())
             .or_default()
-            .record(payload.clone(), origin);
+            .record(payload.clone(), origin, slots);
     }
 
     /// The recorded turns a reconnecting client has not yet received, oldest-first.
@@ -250,6 +317,25 @@ impl TurnRing {
         self.sessions.lock().remove(key);
     }
 
+    /// A point-in-time occupancy snapshot across every session's ring, for the
+    /// task-stats reporter: how much relay memory the replay record is holding
+    /// right now. `command_bytes` counts only the turns' command bytes (what
+    /// the byte bound charges), which undercounts real memory — every entry
+    /// also carries its fixed envelope — so for sessions of tiny turns the turn
+    /// count is the primary footprint signal.
+    pub fn totals(&self) -> RingTotals {
+        let sessions = self.sessions.lock();
+        let mut totals = RingTotals {
+            sessions: sessions.len(),
+            ..Default::default()
+        };
+        for ring in sessions.values() {
+            totals.turns += ring.turns.len();
+            totals.command_bytes += ring.bytes;
+        }
+        totals
+    }
+
     /// The number of turns currently recorded for `key` — for tests asserting the
     /// count bound and drop-oldest behavior.
     #[cfg(test)]
@@ -290,26 +376,43 @@ mod tests {
         }
     }
 
-    /// [`TurnRing::record`] with the origin most of these tests don't care
-    /// about — they exercise the cursor/bound mechanics, which behave
-    /// identically regardless of origin.
+    /// [`TurnRing::record`] with the origin and slot count most of these tests
+    /// don't care about — they exercise the cursor/bound mechanics, which behave
+    /// identically regardless of origin, at the full-game bounds.
     fn record_local(ring: &TurnRing, key: &SessionKey, payload: &Payload) {
-        ring.record(key, payload, TurnOrigin::Local);
+        ring.record(key, payload, TurnOrigin::Local, MAX_GAME_SLOTS);
     }
 
     #[test]
-    fn the_count_bound_is_at_least_the_full_nominal_window() {
+    fn the_count_bound_is_at_least_the_nominal_window_at_every_slot_count() {
         // The whole point of deriving the bound from the nominal window is that the
-        // ring can always hold that window's worth of turns for every slot. Both
-        // sides are compile-time constants, so this is checked in a `const` block (a
+        // ring can always hold that window's worth of turns for every slot. All
+        // inputs are compile-time constants, so this is checked in a `const` block (a
         // plain runtime `assert!` on two constants is itself a clippy lint) — it
         // still catches a future edit to the derivation that breaks the invariant,
         // just at compile time instead of test time.
         const {
-            assert!(
-                TURN_RING_MAX_TURNS
-                    >= RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * MAX_GAME_SLOTS
-            );
+            let mut slots = 1;
+            while slots <= MAX_GAME_SLOTS {
+                assert!(
+                    max_turns(slots) >= RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * slots
+                );
+                slots += 1;
+            }
+            // Unknown shape sizes for the largest game, never a smaller one.
+            assert!(max_turns(0) == max_turns(MAX_GAME_SLOTS));
+            assert!(max_bytes(0) == max_bytes(MAX_GAME_SLOTS));
+        }
+    }
+
+    #[test]
+    fn the_byte_floor_clears_a_count_bound_of_ordinary_turns() {
+        // The byte bound exists for oversize spray, so even at the smallest
+        // session shape it must not bite a count bound's worth of ordinary
+        // few-hundred-byte turns.
+        const ORDINARY_TURN_BYTES: usize = 300;
+        const {
+            assert!(max_bytes(1) >= max_turns(1) * ORDINARY_TURN_BYTES);
         }
     }
 
@@ -360,23 +463,92 @@ mod tests {
         // Overfill by a handful past the count bound with tiny turns (so the byte
         // bound never binds first): the ring holds exactly the cap, and the oldest
         // seqs are the ones dropped.
+        let cap = max_turns(MAX_GAME_SLOTS);
         let overflow = 5;
-        for seq in 0..(TURN_RING_MAX_TURNS + overflow) as u64 {
+        for seq in 0..(cap + overflow) as u64 {
             record_local(&ring, &k, &turn(0, seq, 1));
         }
-        assert_eq!(
-            ring.len(&k),
-            TURN_RING_MAX_TURNS,
-            "capped at the count bound"
-        );
+        assert_eq!(ring.len(&k), cap, "capped at the count bound");
 
         // The lowest `overflow` seqs were evicted; the newest cap-worth remain.
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
         let seqs: Vec<u64> = ring.replay(&k, &cursors).iter().map(|p| p.seq).collect();
         assert_eq!(seqs.first().copied(), Some(overflow as u64));
+        assert_eq!(seqs.last().copied(), Some((cap + overflow - 1) as u64));
+    }
+
+    #[test]
+    fn the_count_bound_scales_with_the_session_slot_count() {
+        // A 2-slot session's producers can only fill a sixth of a 12-slot
+        // window, and its ring is bounded accordingly.
+        let cap = max_turns(2);
         assert_eq!(
-            seqs.last().copied(),
-            Some((TURN_RING_MAX_TURNS + overflow - 1) as u64),
+            cap,
+            RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * 2 * 3 / 2
+        );
+        assert_eq!(max_turns(MAX_GAME_SLOTS), cap * 6);
+
+        let ring = TurnRing::new();
+        let k = key();
+        let overflow = 5;
+        for seq in 0..(cap + overflow) as u64 {
+            ring.record(&k, &turn(0, seq, 1), TurnOrigin::Local, 2);
+        }
+        assert_eq!(ring.len(&k), cap, "capped at the 2-slot count bound");
+    }
+
+    #[test]
+    fn a_shrinking_slot_count_tightens_the_bounds_on_the_next_record() {
+        // A session's slots depart over its life; once the caller reports the
+        // smaller shape, the very next record re-derives the bounds and evicts
+        // down to them rather than coasting on the larger session's ring.
+        let ring = TurnRing::new();
+        let k = key();
+        let big_cap = max_turns(MAX_GAME_SLOTS);
+        let small_cap = max_turns(2);
+        for seq in 0..big_cap as u64 {
+            record_local(&ring, &k, &turn(0, seq, 1));
+        }
+        assert_eq!(ring.len(&k), big_cap);
+
+        ring.record(&k, &turn(0, big_cap as u64, 1), TurnOrigin::Local, 2);
+        assert_eq!(ring.len(&k), small_cap, "evicted down to the smaller bound");
+    }
+
+    #[test]
+    fn an_unknown_slot_count_sizes_for_a_full_game() {
+        // `0` means the caller genuinely doesn't know the session's shape;
+        // under-retaining on unknown would break the reconnect the ring exists
+        // for, so it gets the full-game bound.
+        let ring = TurnRing::new();
+        let k = key();
+        let cap = max_turns(MAX_GAME_SLOTS);
+        let small_cap = max_turns(2);
+        for seq in 0..(small_cap + 5) as u64 {
+            ring.record(&k, &turn(0, seq, 1), TurnOrigin::Local, 0);
+        }
+        assert!(ring.len(&k) > small_cap, "not bounded like a small session");
+        assert!(ring.len(&k) <= cap);
+    }
+
+    #[test]
+    fn totals_sum_turns_and_command_bytes_across_sessions() {
+        let ring = TurnRing::new();
+        let k = key();
+        let other = SessionKey {
+            tenant: TenantId("t".to_owned()),
+            session: SessionId(2),
+        };
+        record_local(&ring, &k, &turn(0, 0, 10));
+        record_local(&ring, &k, &turn(0, 1, 10));
+        record_local(&ring, &other, &turn(0, 0, 7));
+        assert_eq!(
+            ring.totals(),
+            RingTotals {
+                sessions: 2,
+                turns: 3,
+                command_bytes: 27,
+            },
         );
     }
 
@@ -385,15 +557,16 @@ mod tests {
         let ring = TurnRing::new();
         let k = key();
         // Large turns so the byte budget binds well before the count would: each is
-        // 64 KiB, so the ring holds at most TURN_RING_MAX_BYTES / 64 KiB of them.
+        // 64 KiB, so the ring holds at most the full-game byte bound / 64 KiB of them.
         let big = 64 * 1024;
-        let per = TURN_RING_MAX_BYTES / big;
+        let budget = max_bytes(MAX_GAME_SLOTS);
+        let per = budget / big;
         for seq in 0..(per + 3) as u64 {
             record_local(&ring, &k, &turn(0, seq, big));
         }
         assert!(ring.len(&k) <= per, "the byte bound capped the count");
         assert!(
-            ring.bytes(&k) <= TURN_RING_MAX_BYTES,
+            ring.bytes(&k) <= budget,
             "the byte total holds under the budget",
         );
         // What remains is the newest run — the oldest seqs were evicted.
@@ -428,9 +601,9 @@ mod tests {
         // (the mesh resume-reply form) must only ever return the `Local` ones.
         let ring = TurnRing::new();
         let k = key();
-        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local);
-        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh);
-        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local);
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
 
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
         assert_eq!(
@@ -461,8 +634,8 @@ mod tests {
         // here either way.
         let ring = TurnRing::new();
         let k = key();
-        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Mesh);
-        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh);
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
 
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
         assert!(ring.replay_local(&k, &cursors, false).is_empty());
@@ -487,9 +660,9 @@ mod tests {
         // sparse overlap it already has.
         let ring = TurnRing::new();
         let k = key();
-        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local);
-        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Local);
-        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local);
+        ring.record(&k, &turn(0, 0, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
+        ring.record(&k, &turn(0, 1, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
+        ring.record(&k, &turn(0, 2, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
 
         // Slot 0 is entirely absent from the cursor map -- unlisted, not
         // listed-at-zero.

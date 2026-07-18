@@ -55,10 +55,19 @@ type StatsClient = Client<HttpConnector, Full<Bytes>>;
 /// and returns without spawning anything.
 ///
 /// `interval_secs` is `--task-stats-interval-secs` / `RELAY_TASK_STATS_INTERVAL_SECS`.
-/// `sessions` is cloned into the spawned task and its length (never held across
-/// an await) is read on every tick, so each log line pairs a resource sample
-/// with the relay's session count at that moment.
-pub fn spawn_if_enabled(interval_secs: u64, sessions: Sessions) {
+/// `relay_id` stamps each line so a multi-relay run's samples are attributable
+/// (absent from the line when the relay has no configured id). `sessions` and
+/// `turn_ring` are cloned into the spawned task and read on every tick (their
+/// locks never held across an await), so each log line pairs a resource sample
+/// with the relay's session count and its replay-ring occupancy at that moment
+/// — the ring is the largest deliberately-held per-session memory, so the line
+/// shows directly how much of the working set it accounts for.
+pub fn spawn_if_enabled(
+    interval_secs: u64,
+    relay_id: Option<u64>,
+    sessions: Sessions,
+    turn_ring: crate::turn_ring::TurnRing,
+) {
     if interval_secs == 0 {
         tracing::debug!("task-stats reporter disabled: interval is 0");
         return;
@@ -84,7 +93,9 @@ pub fn spawn_if_enabled(interval_secs: u64, sessions: Sessions) {
         client,
         uri,
         Duration::from_secs(interval_secs),
+        relay_id,
         sessions,
+        turn_ring,
     ));
 }
 
@@ -93,7 +104,14 @@ pub fn spawn_if_enabled(interval_secs: u64, sessions: Sessions) {
 /// timed-out GET, or a response that doesn't parse, is logged at debug and
 /// skipped — one bad read never stops the loop, it just leaves the next
 /// successful read to reseed the baseline.
-async fn run(client: StatsClient, uri: Uri, interval: Duration, sessions: Sessions) {
+async fn run(
+    client: StatsClient,
+    uri: Uri,
+    interval: Duration,
+    relay_id: Option<u64>,
+    sessions: Sessions,
+    turn_ring: crate::turn_ring::TurnRing,
+) {
     tracing::info!(
         interval_secs = interval.as_secs(),
         "task-stats reporter started"
@@ -122,13 +140,17 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, sessions: Sessio
         };
         let derived = derive(Some(&prev_sample), &curr, now.duration_since(prev_at));
         let sessions = crate::routing::session_count(&sessions);
+        let ring = turn_ring.totals();
         tracing::info!(
+            relay_id,
             cpu_pct = ?derived.cpu_pct,
             mem_mib = derived.mem_working_set_mib,
             mem_limit_mib = derived.mem_limit_mib,
             net_rx_mibps = ?derived.net_rx_mibps,
             net_tx_mibps = ?derived.net_tx_mibps,
             sessions,
+            ring_turns = ring.turns,
+            ring_cmd_mib = ring.command_bytes as f64 / MIB,
             "relay task stats",
         );
         prev = Some((curr, now));

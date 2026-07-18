@@ -1421,13 +1421,15 @@ fn deliver_turn_to_locals(
     // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
     // even when the mesh delivers it by more than one path. Buffered only once the
     // session has started: pre-start lobby traffic has its own ordered replay log
-    // and must not be double-buffered here.
-    if crate::consensus::session_started(decision_makers, key) {
+    // and must not be double-buffered here. The session's slot count rides along
+    // so the ring's bounds fit the session's actual shape rather than assuming
+    // the largest possible game.
+    if let Some(slots) = crate::consensus::started_session_slot_count(decision_makers, key) {
         let origin = match home {
             crate::delivery::DeliveryHome::Local => crate::turn_ring::TurnOrigin::Local,
             crate::delivery::DeliveryHome::Peer(_) => crate::turn_ring::TurnOrigin::Mesh,
         };
-        turn_ring.record(key, &payload, origin);
+        turn_ring.record(key, &payload, origin, slots);
     }
     Some(payload)
 }
@@ -3611,6 +3613,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Local,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
         mesh.turn_ring.record(
             &key,
@@ -3620,6 +3623,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Mesh,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
         mesh.turn_ring.record(
             &key,
@@ -3629,6 +3633,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Local,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
 
         let mut joined = HashMap::new();
@@ -3689,6 +3694,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Local,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
         mesh.turn_ring.record(
             &key,
@@ -3698,6 +3704,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Local,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
 
         let mut joined = HashMap::new();
@@ -3802,6 +3809,7 @@ mod tests {
                 ..Default::default()
             },
             crate::turn_ring::TurnOrigin::Local,
+            crate::turn_ring::MAX_GAME_SLOTS,
         );
 
         let mut joined = HashMap::new();
@@ -4462,6 +4470,61 @@ mod tests {
             game_frame_count: Some(1000 + u32::from(ordinal)),
             ..Default::default()
         }
+    }
+
+    /// The replay ring's bounds must follow the session's actual shape through
+    /// the production path: `deliver_turn_to_locals` reads the decision-maker's
+    /// slot count and sizes the ring with it, so a 2-slot session's ring caps
+    /// at the 2-slot bound rather than the largest-game bound. Exercised
+    /// through the choke point itself (not `TurnRing` in isolation) to prove
+    /// the count actually arrives there.
+    #[test]
+    fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+
+        let sessions = routing::Sessions::default();
+        let seen = new_seen_registries();
+        let decision_makers = Arc::new(consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
+        let key = control_key();
+        let _ = consensus::sync_maker(
+            &decision_makers,
+            &key,
+            BufferBounds::new(1, 6).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            [SlotId(0), SlotId(1)].into(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        consensus::mark_session_started(&decision_makers, &key);
+
+        // Overfill past the 2-slot count bound (empty commands, so the byte
+        // bound never binds): the ring holds exactly the 2-slot cap, proving
+        // it was not sized for the largest possible game.
+        let cap = crate::turn_ring::max_turns(2);
+        for seq in 0..(cap + 5) as u64 {
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &turn_ring,
+                &key,
+                SlotId(0),
+                Payload {
+                    seq,
+                    slot: 0,
+                    ..Default::default()
+                },
+                crate::delivery::DeliveryHome::Local,
+            );
+        }
+        assert_eq!(turn_ring.len(&key), cap);
+        assert!(
+            cap < crate::turn_ring::max_turns(crate::turn_ring::MAX_GAME_SLOTS),
+            "the 2-slot bound is genuinely tighter than the full-game bound",
+        );
     }
 
     /// The desync comparator must observe each distinct `(slot, seq)` turn

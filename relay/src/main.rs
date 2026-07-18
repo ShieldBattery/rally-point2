@@ -304,7 +304,9 @@ async fn main() -> Result<()> {
     // module doc), so this is safe to call unconditionally in dev/loopback too.
     rally_point_relay::task_stats::spawn_if_enabled(
         cli.task_stats_interval_secs,
+        cli.relay_id,
         Arc::clone(&sessions),
+        mesh_state.turn_ring.clone(),
     );
 
     // The coordinated-drain seam. On a shutdown signal the drain sequence flips

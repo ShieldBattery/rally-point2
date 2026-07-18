@@ -3181,6 +3181,20 @@ impl DecisionMaker {
         self.started
     }
 
+    /// The slot count the session is currently shaped for, for sizing
+    /// per-session state whose need scales with turn production (every live
+    /// slot produces turns at the same nominal cadence — see the forwarded-turn
+    /// replay ring). The larger of the accumulated live-slot view and the
+    /// descriptor's expected set: live covers slots a descriptor never named
+    /// (an unenforced dev session), expected covers a freshly resumed relay
+    /// whose live view hasn't re-accumulated yet — either alone can transiently
+    /// under-count, and under-counting under-retains. `0` when both are empty:
+    /// the shape is genuinely unknown, and the caller must assume the largest
+    /// game rather than a small one.
+    pub fn session_slot_count(&self) -> usize {
+        self.live_slots.len().max(self.expected_slots.len())
+    }
+
     /// The one-shot start decision: fires (latching `started`, returning `true`)
     /// exactly when this relay is the authority, the expected set is non-empty,
     /// and the accumulated live slots cover it. Every other case returns `false`
@@ -3867,6 +3881,18 @@ pub fn session_started(registry: &DecisionMakers, key: &SessionKey) -> bool {
         .lock()
         .get(key)
         .is_some_and(DecisionMaker::is_started)
+}
+
+/// The slot count `key`'s session is shaped for, or `None` when the session has
+/// not started (or no maker exists). The started gate mirrors
+/// [`session_started`] so a caller sizing started-session state gets the gate
+/// and the shape in one registry lock; the count itself is
+/// [`DecisionMaker::session_slot_count`], including its `0`-means-unknown
+/// convention.
+pub fn started_session_slot_count(registry: &DecisionMakers, key: &SessionKey) -> Option<usize> {
+    let makers = registry.lock();
+    let maker = makers.get(key)?;
+    maker.is_started().then(|| maker.session_slot_count())
 }
 
 /// Latches `key`'s session started without firing — used when a peer relay's
