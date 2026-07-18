@@ -116,18 +116,23 @@ const MESH_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// concurrently.
 ///
 /// Held only across the handshake window this const is named for -- acquired
-/// before [`recv_mesh_hello`], dropped once the connection is ready to become
-/// a `MeshLink` and [`mesh::run_mesh_link`] takes over its lifetime. Never
-/// held across the established link's own lifetime, which can run for the
-/// life of the relay-pair. A connection past the cap simply waits its turn
-/// (the semaphore queues acquires) rather than being refused outright: unlike
-/// the client edge's admission bound (sized to shed load fast under a flood
-/// of real players), the failure mode here is a handful of concurrently
-/// (re)connecting peers, which is exactly what queueing resolves on its own
-/// within the existing hello/control timeouts below -- and every acquired
-/// permit is bounded to at most those timeouts' worth of hold time, so a
-/// stalled or hostile connection can only ever camp on one permit for a
-/// bounded window, never indefinitely.
+/// in the accept loop before the connection gets a task of its own, dropped
+/// once the connection is ready to become a `MeshLink` and
+/// [`mesh::run_mesh_link`] takes over its lifetime. Never held across the
+/// established link's own lifetime, which can run for the life of the
+/// relay-pair. Acquiring in the loop (not per-connection tasks racing on the
+/// semaphore) is what makes the whole waiting room bounded: at most one
+/// connection waits at the loop itself, the bounded hand-off channel from the
+/// ALPN dispatch queues a few more, and the dispatch refuses
+/// ([`MESH_CLOSE_AT_CAPACITY`](rally_point_proto::version::MESH_CLOSE_AT_CAPACITY))
+/// past that -- so a flood of anonymous
+/// `MESH_ALPN` dials can never accumulate an unbounded set of parked tasks
+/// each pinning a live connection. A real fleet's concurrent (re)connect
+/// burst is a handful of peers, resolved within the queue and the existing
+/// hello/control timeouts below -- and every acquired permit is bounded to at
+/// most those timeouts' worth of hold time, so a stalled or hostile
+/// connection can only ever camp on one permit for a bounded window, never
+/// indefinitely.
 const MESH_ACCEPT_CONCURRENCY: usize = 8;
 
 /// The process-wide gate [`MESH_ACCEPT_CONCURRENCY`] enforces.
@@ -355,21 +360,25 @@ pub async fn run_mesh_accept(
     require_peer_auth: bool,
 ) {
     while let Some(connection) = mesh_accept.recv().await {
+        // Gate the handshake window behind the dedicated mesh-accept cap
+        // BEFORE the connection gets a task of its own: acquiring here makes
+        // this loop stop taking connections off the channel while every slot
+        // is busy — at most one connection waits right here, the channel's own
+        // bound is the rest of the waiting room, and the ALPN dispatch sheds
+        // on overflow past that — so a burst of anonymous dials can never
+        // accumulate one parked permit-waiting task per connection, each
+        // pinning a live `quinn::Connection`. The permit moves into the task
+        // and is dropped there before the link driver takes over, never held
+        // across the established link's own lifetime.
+        let accept_permit = MESH_ACCEPT_PERMITS
+            .acquire()
+            .await
+            .expect("MESH_ACCEPT_PERMITS is never closed");
         let sessions = Arc::clone(&sessions);
         let mesh = mesh.clone();
         let links = links.clone();
         let fleet_peers = fleet_peers.clone();
         tokio::spawn(async move {
-            // Gate the handshake window behind the dedicated mesh-accept cap
-            // before any handshake work begins -- queues rather than refusing
-            // outright (see `MESH_ACCEPT_CONCURRENCY`'s doc), and is dropped
-            // below before the link driver takes over, never held across the
-            // established link's own lifetime.
-            let accept_permit = MESH_ACCEPT_PERMITS
-                .acquire()
-                .await
-                .expect("MESH_ACCEPT_PERMITS is never closed");
-
             let (peer_id, hello_stream) = match recv_mesh_hello(&connection).await {
                 Ok((hello, stream)) => {
                     // The acceptor is the version-enforcement point for the pair:
@@ -997,6 +1006,46 @@ mod tests {
             MESH_ACCEPT_PERMITS.available_permits(),
             MESH_ACCEPT_CONCURRENCY,
             "the permit is released once the stalled connection ends",
+        );
+
+        // Part three: back-pressure. With every handshake slot held, the
+        // accept loop must stop draining the hand-off channel: at most one
+        // connection waits at the loop itself (taken off the channel, parked
+        // on its permit) and the channel's own bound queues the rest — never
+        // one parked task per connection. Proven by filling both stations and
+        // watching a third connection find the cap-1 channel still full.
+        let mut held = Vec::new();
+        for _ in 0..MESH_ACCEPT_CONCURRENCY {
+            held.push(MESH_ACCEPT_PERMITS.acquire().await.unwrap());
+        }
+        let (parked_conn, _pc, _pe1, _pe2) = silent_mesh_connection().await;
+        mesh_accept_tx.send(parked_conn.clone()).await.unwrap();
+        let (queued_conn, _qc, _qe1, _qe2) = silent_mesh_connection().await;
+        mesh_accept_tx.send(queued_conn.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (overflow_conn, _oc, _oe1, _oe2) = silent_mesh_connection().await;
+        assert!(
+            mesh_accept_tx.try_send(overflow_conn).is_err(),
+            "with every handshake slot busy, one connection waits at the loop and \
+             the channel holds the next — a third finds the queue full",
+        );
+
+        // Freeing the slots drains the waiting room into handshake tasks.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            MESH_ACCEPT_PERMITS.available_permits(),
+            MESH_ACCEPT_CONCURRENCY - 2,
+            "both waiting connections were admitted once slots freed",
+        );
+        parked_conn.close(quinn::VarInt::from_u32(0), b"test done");
+        queued_conn.close(quinn::VarInt::from_u32(0), b"test done");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            MESH_ACCEPT_PERMITS.available_permits(),
+            MESH_ACCEPT_CONCURRENCY,
+            "every permit released once the drained connections end",
         );
 
         drop(mesh_accept_tx);

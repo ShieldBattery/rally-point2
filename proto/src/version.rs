@@ -228,6 +228,16 @@ pub const MESH_CLOSE_UNKNOWN_PEER: u32 = 0x12;
 /// mismatched. Sent while peer-identity enforcement is active.
 pub const MESH_CLOSE_CERT_MISMATCH: u32 = 0x13;
 
+/// QUIC application close code a relay uses to refuse a mesh connection when
+/// its accept path is saturated: every handshake slot is busy and the bounded
+/// hand-off queue between the ALPN dispatch and the mesh accept loop is full.
+/// Sent before any handshake work runs for the refused connection — shedding
+/// promptly is what keeps a flood of anonymous `MESH_ALPN` dials from
+/// accumulating parked tasks that each pin a live connection. A legitimate
+/// peer's dial supervision treats the closure like any failed connection and
+/// redials on its ordinary delay, by which time the burst has drained.
+pub const MESH_CLOSE_AT_CAPACITY: u32 = 0x14;
+
 /// The local and peer protocol-version support windows have no version in common.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error(

@@ -258,8 +258,34 @@ async fn serve_reader(
                 // permit so the admission slot frees for the next client.
                 drop(permit);
                 if let Some(tx) = mesh_accept {
-                    if tx.send(connection).await.is_err() {
-                        tracing::info!("mesh accept channel closed; dropping connection");
+                    // The channel is the bounded waiting room between this
+                    // dispatch and the mesh accept loop, which admits
+                    // connections into its handshake slots one permit at a
+                    // time. Shed on overflow rather than awaiting space: an
+                    // awaited send would park this task holding a live
+                    // connection, and enough anonymous `MESH_ALPN` dials would
+                    // accumulate one such task each, unbounded. A real fleet's
+                    // concurrent (re)connect burst is a handful of peers, far
+                    // under the queue; anything overflowing it is load worth
+                    // refusing, and a refused legitimate peer just redials on
+                    // its supervisor's delay.
+                    match tx.try_send(connection) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(connection)) => {
+                            tracing::info!(
+                                remote = %connection.remote_address(),
+                                "mesh accept queue full; refusing connection",
+                            );
+                            connection.close(
+                                VarInt::from_u32(
+                                    rally_point_proto::version::MESH_CLOSE_AT_CAPACITY,
+                                ),
+                                b"mesh accept at capacity",
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::info!("mesh accept channel closed; dropping connection");
+                        }
                     }
                 } else {
                     connection.close(VarInt::from_u32(0), b"mesh not configured");
