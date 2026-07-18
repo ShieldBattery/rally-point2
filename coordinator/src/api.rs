@@ -385,7 +385,10 @@ async fn create_session(
         Err(e) => {
             tracing::warn!(error = %e, "session setup failed");
             return Err(match e {
-                registry::SessionSetupError::NoRelaysAvailable => StatusCode::SERVICE_UNAVAILABLE,
+                registry::SessionSetupError::NoRelaysAvailable
+                | registry::SessionSetupError::SessionCeilingReached => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 registry::SessionSetupError::IdempotentCreateMismatch => StatusCode::CONFLICT,
                 registry::SessionSetupError::TenantNotFound(_)
                 | registry::SessionSetupError::SlotOutOfRange(_)

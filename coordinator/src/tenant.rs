@@ -198,7 +198,10 @@ pub fn enroll_generated(
 }
 
 /// Registers a tenant from a pre-generated PKCS#8 keypair (e.g. loaded from
-/// durable storage). Returns the verifying key.
+/// durable storage). Accepts both the v1 form (private key only — what
+/// `openssl genpkey -algorithm ed25519` and Node's `generateKeyPair` emit) and
+/// the v2 form (public key included — what ring's own `generate_pkcs8` emits).
+/// Returns the verifying key.
 pub fn enroll_from_pkcs8(
     store: &TenantStore,
     kid: KeyId,
@@ -206,7 +209,12 @@ pub fn enroll_from_pkcs8(
     bounds: BufferBounds,
     pkcs8: &[u8],
 ) -> Result<[u8; PUBLIC_KEY_LEN], KeyError> {
-    let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| KeyError::InvalidPkcs8)?;
+    // `maybe_unchecked`: ring verifies the embedded public key when the
+    // document carries one (v2) and simply has none to check in the v1 form —
+    // the verifying key returned below is derived from the private half either
+    // way, so a v1 document yields exactly the key its private half implies.
+    let pair =
+        Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8).map_err(|_| KeyError::InvalidPkcs8)?;
     let pubkey: [u8; PUBLIC_KEY_LEN] = pair.public_key().as_ref().try_into().unwrap();
     store.tenants.lock().insert(
         tenant.clone(),
@@ -519,6 +527,47 @@ mod tests {
     use rally_point_proto::control::{BufferBounds, TenantId};
     use rally_point_proto::ids::{SessionId, SlotId};
     use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
+
+    #[test]
+    fn a_pkcs8_v1_document_enrolls_and_derives_the_matching_verifying_key() {
+        // The RFC 5208 v1 prefix for an Ed25519 private key, followed by the
+        // raw 32-byte seed — the exact document `openssl genpkey -algorithm
+        // ed25519` emits (no embedded public key).
+        const V1_PREFIX: [u8; 16] = [
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        let seed = [0x42u8; 32];
+        let mut doc = V1_PREFIX.to_vec();
+        doc.extend_from_slice(&seed);
+
+        let store = new_store();
+        let enrolled = enroll_from_pkcs8(
+            &store,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+            &doc,
+        )
+        .unwrap();
+
+        let expected = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        assert_eq!(enrolled.as_slice(), expected.public_key().as_ref());
+    }
+
+    #[test]
+    fn non_pkcs8_bytes_still_fail_enrollment() {
+        let store = new_store();
+        let err = enroll_from_pkcs8(
+            &store,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+            b"not a key document",
+        )
+        .unwrap_err();
+        assert!(matches!(err, KeyError::InvalidPkcs8));
+    }
 
     fn store_with_tenant() -> (TenantStore, KeyId, TenantId) {
         let store = new_store();

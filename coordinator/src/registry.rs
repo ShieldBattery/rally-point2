@@ -472,6 +472,11 @@ pub enum SessionSetupError {
     /// No relays have phoned home, so there is no relay to assign.
     #[error("no relays available in the registry")]
     NoRelaysAvailable,
+    /// The coordinator's global live-session ceiling is reached, so a fresh
+    /// create is refused until sessions close. Idempotent replays of a
+    /// still-live session are unaffected — they mint nothing.
+    #[error("the coordinator's live-session ceiling is reached")]
+    SessionCeilingReached,
     /// A player's slot index is out of range (max 11: 8 players + 4
     /// observers, BW's 12 network participants).
     #[error("slot {0} is out of range (max 11)")]

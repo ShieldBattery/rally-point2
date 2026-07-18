@@ -598,15 +598,25 @@ impl FlightStore for S3FlightStore {
             .await
         {
             Ok(output) => {
-                let bytes = output
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|error| {
-                        FlightStoreError(format!("reading flight blob body: {error}"))
-                    })?
-                    .into_bytes()
-                    .to_vec();
+                // Every write this module makes is gated at `MAX_FLIGHT_BLOB_BYTES` by
+                // `classify_ingest`, so a well-formed object never exceeds it. Reading
+                // the body still walks it chunk-by-chunk with a running cap, rather
+                // than collecting it whole, so a bucket object outside that
+                // invariant — corrupted, or written by something other than this
+                // module — can't be read into an unbounded in-memory buffer.
+                let mut body = output.body;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = body.try_next().await.map_err(|error| {
+                    FlightStoreError(format!("reading flight blob body: {error}"))
+                })? {
+                    bytes.extend_from_slice(&chunk);
+                    if bytes.len() > MAX_FLIGHT_BLOB_BYTES {
+                        return Err(FlightStoreError(format!(
+                            "flight blob at {key:?} exceeds the \
+                             {MAX_FLIGHT_BLOB_BYTES}-byte read cap"
+                        )));
+                    }
+                }
                 Ok(Some(bytes))
             }
             Err(error) => {

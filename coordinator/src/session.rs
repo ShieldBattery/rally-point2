@@ -150,6 +150,11 @@ pub struct SessionRefs {
 /// - each player's `region` — selects the slot's home relay, so the same
 ///   `external_id` retried with different per-slot regions reads as a genuine
 ///   roster mismatch (a `409`), not a replay.
+/// - the request's `latency_estimate_ms` — recorded into the session's
+///   correlation state and carried into every serving relay's descriptor,
+///   where the authority relay sizes the initial buffer from it, so replaying
+///   a cached response for a request naming a different estimate would bind
+///   the wrong depth input to the session.
 ///
 /// Equality is plain struct equality ([`PartialEq`]), never a hash: a hash
 /// collision must not be able to bind two genuinely different rosters to one
@@ -160,6 +165,8 @@ struct CreateFingerprint {
     /// A request cannot name a slot twice (`validate_request` rejects a
     /// duplicate), so the slot totally orders this list.
     players: Vec<FingerprintPlayer>,
+    /// The request's worst-pairwise one-way path-latency estimate.
+    latency_estimate_ms: Option<u32>,
 }
 
 /// One player's contribution to a [`CreateFingerprint`]: the fields of a
@@ -192,7 +199,10 @@ impl CreateFingerprint {
             })
             .collect();
         players.sort_by_key(|p| p.slot);
-        Self { players }
+        Self {
+            players,
+            latency_estimate_ms: request.latency_estimate_ms,
+        }
     }
 }
 
@@ -432,6 +442,14 @@ pub struct SessionSetup {
     /// by a lazy prune of abandoned anchors. Empty and unused on a coordinator with
     /// no provisioning loop.
     pending_creates: Arc<Mutex<HashMap<(TenantId, String), u64>>>,
+    /// The global cap on concurrently live sessions across every tenant, or
+    /// `None` for uncapped. An emergency brake for the coordinator as a whole:
+    /// at the cap a fresh create is refused
+    /// ([`SessionSetupError::SessionCeilingReached`]) until sessions close, so
+    /// a runaway caller or an abuse burst degrades into refused creates
+    /// instead of unbounded session/descriptor/lifecycle growth. Idempotent
+    /// replays of a still-live session are exempt — they mint nothing.
+    session_ceiling: Option<usize>,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -466,7 +484,15 @@ impl SessionSetup {
             create_idempotency: Arc::new(Mutex::new(HashMap::new())),
             provision: ProvisionGate::dormant(),
             pending_creates: Arc::new(Mutex::new(HashMap::new())),
+            session_ceiling: None,
         }
+    }
+
+    /// Sets the global live-session ceiling (see the field docs). `None` — the
+    /// default — is uncapped.
+    pub fn with_session_ceiling(mut self, ceiling: Option<usize>) -> Self {
+        self.session_ceiling = ceiling;
+        self
     }
 
     /// Installs the provisioning gate, enabling hold-until-ready create and giving
@@ -543,6 +569,18 @@ impl SessionSetup {
             .lock()
             .values()
             .filter(|relays| relays.contains(&relay))
+            .count()
+    }
+
+    /// How many sessions are currently live: recorded serving sets, across
+    /// every tenant, that still name at least one relay. Read the same way the
+    /// idempotent-replay liveness check reads a single session — a set that is
+    /// empty (or gone) is a session that already closed.
+    fn live_session_count(&self) -> usize {
+        self.session_relays
+            .lock()
+            .values()
+            .filter(|relays| !relays.is_empty())
             .count()
     }
 
@@ -1163,6 +1201,19 @@ fn create_body(
     }
 
     validate_request(&request)?;
+
+    // The global live-session ceiling: at the cap, a fresh create is refused
+    // outright. Deliberately after the replay check above (an idempotent retry
+    // of a live session mints nothing, so an ordinary HTTP retry must keep
+    // succeeding at the cap) and before the hold-until-ready path below
+    // (capacity, not region warmth, is the bottleneck at the cap — holding
+    // could not succeed until sessions close, and the immediate refusal tells
+    // the tenant so).
+    if let Some(ceiling) = setup.session_ceiling
+        && setup.live_session_count() >= ceiling
+    {
+        return Err(SessionSetupError::SessionCeilingReached);
+    }
 
     // Hold-until-ready: on a provisioning-enabled coordinator, a request naming a
     // region with no available relay warms that region and holds — returning a
@@ -1830,6 +1881,56 @@ mod tests {
 
         // Bounds come from the tenant's policy.
         assert_eq!(resp.bounds, BufferBounds::new(1, 6).unwrap());
+    }
+
+    #[test]
+    fn a_latency_estimate_change_is_a_create_mismatch_not_a_replay() {
+        let setup = setup_with_two_relays_and_tenant();
+        let request = |latency: Option<u32>| SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: Some("game-1".to_owned()),
+            latency_estimate_ms: latency,
+        };
+
+        create_session(&setup, request(Some(40)), ExpiresAt(u64::MAX)).unwrap();
+
+        // Same roster + same estimate: an honest retry, replayed.
+        let retry = create_session(&setup, request(Some(40)), ExpiresAt(u64::MAX)).unwrap();
+        assert!(retry.replayed);
+
+        // Same roster, different estimate: a different logical create — the
+        // cached response would bind the wrong initial-buffer input to the
+        // session, so it is refused rather than replayed.
+        let err = create_session(&setup, request(Some(90)), ExpiresAt(u64::MAX)).unwrap_err();
+        assert!(matches!(err, SessionSetupError::IdempotentCreateMismatch));
+    }
+
+    #[test]
+    fn the_session_ceiling_refuses_fresh_creates_and_frees_on_close() {
+        let setup = setup_with_two_relays_and_tenant().with_session_ceiling(Some(1));
+        let tenant = TenantId("sb-test".to_owned());
+        let request = |external_id: &str| SessionRequest {
+            tenant: tenant.clone(),
+            players: two_players(),
+            external_id: Some(external_id.to_owned()),
+            latency_estimate_ms: None,
+        };
+
+        let first = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+
+        // At the cap a fresh create is refused...
+        let err = create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap_err();
+        assert!(matches!(err, SessionSetupError::SessionCeilingReached));
+
+        // ...but an idempotent retry of the live session still replays — it
+        // mints nothing, so the cap must not fail an ordinary HTTP retry.
+        let retry = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+        assert!(retry.replayed);
+
+        // Closing the live session frees the capacity.
+        setup.forget_session_membership(&tenant, first.response.session);
+        create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap();
     }
 
     #[test]

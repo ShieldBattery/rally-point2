@@ -129,6 +129,14 @@ struct Cli {
     )]
     player_token_lifetime_secs: u64,
 
+    /// Global ceiling on concurrently live sessions across every tenant. At the
+    /// cap, fresh session creates are refused (503) until sessions close — an
+    /// emergency brake so a runaway caller or an abuse burst degrades into
+    /// refused creates instead of unbounded coordinator state. Idempotent
+    /// retries of already-live sessions are unaffected. Absent = uncapped.
+    #[arg(long, env = "COORDINATOR_MAX_SESSIONS")]
+    max_sessions: Option<usize>,
+
     /// Path to a JSON tenant registry (`{"tenants": [...]}`) — the production
     /// tenant source. Each entry carries a tenant's id, operational state
     /// (active / suspended / revoked), signing-key `kid`, the NAME of the
@@ -173,7 +181,8 @@ struct Cli {
     kid: String,
 
     /// Hex-encoded PKCS#8 Ed25519 keypair for the dev tenant — either a file
-    /// path containing the hex or the hex itself. Pins the signing key so the
+    /// path containing the hex or the hex itself; the v1 (openssl/Node) and v2
+    /// (ring) document forms are both accepted. Pins the signing key so the
     /// public key stays stable across coordinator restarts. If absent, a fresh
     /// keypair is generated and both halves are logged (the public for the
     /// relay's `--tenant-pubkey`, the private so it can be pinned next run).
@@ -362,7 +371,11 @@ async fn main() -> Result<()> {
     // substrate is configured). Present ⇒ hold-until-ready create is on and the
     // warm endpoint's demand is shared with the loop. Absent ⇒ the setup keeps its
     // dormant gate and every hold-until-ready behavior is off.
-    let mut setup = session::SessionSetup::new(registry::new_registry(), tenants);
+    let mut setup = session::SessionSetup::new(registry::new_registry(), tenants)
+        .with_session_ceiling(cli.max_sessions);
+    if let Some(ceiling) = cli.max_sessions {
+        tracing::info!(ceiling, "global live-session ceiling enabled");
+    }
     if provisioning_enabled {
         setup = setup.with_provision_gate(session::ProvisionGate::provisioning(
             warm.clone(),
