@@ -864,7 +864,7 @@ async fn an_old_relay_below_min_supported_is_refused_and_never_enrolled() {
     let hello = RelayHello::new(
         RelayId(9),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 14909)),
-        ProtocolVersion(1),
+        ProtocolVersion(ProtocolVersion::MIN_SUPPORTED.0 - 1),
         vec![0xC9; 4],
     );
     let mut socket = connect_and_send_hello(&base_url, hello).await;

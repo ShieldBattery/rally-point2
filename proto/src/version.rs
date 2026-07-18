@@ -32,9 +32,10 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
-    /// The version implemented by this build.
+    /// The version implemented by this build. `1` is the first version shipped
+    /// to production, so there is no earlier protocol any real peer speaks.
     ///
-    /// `3` adds proof-of-possession to relay enrollment: after the enroll
+    /// It includes proof-of-possession on relay enrollment: after the enroll
     /// `Hello` and version negotiation, the coordinator challenges the relay
     /// with a random nonce
     /// ([`CoordinatorToRelay::IdentityChallenge`](crate::control::CoordinatorToRelay::IdentityChallenge))
@@ -44,34 +45,33 @@ impl ProtocolVersion {
     /// proving it actually holds that key rather than having copied a cert it
     /// observed elsewhere. See [`Self::ENROLL_POP_MIN`] for exactly when the
     /// coordinator challenges.
-    ///
-    /// `2` folds a TLS channel binding into the connection-binding challenge
-    /// proof, which a v1 peer can neither produce nor verify.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(3);
+    pub const CURRENT: ProtocolVersion = ProtocolVersion(1);
 
-    /// The oldest version this build can still interoperate with.
+    /// The oldest version this build can still interoperate with — the floor of
+    /// the `[MIN_SUPPORTED, CURRENT]` window a peer's advertised window
+    /// negotiates against.
     ///
-    /// Tracks [`Self::CURRENT`]. Enroll proof-of-possession (added at `3`) has
-    /// no backward-compatible form — a relay that cannot prove possession of
-    /// its certificate's private key must not enroll — exactly like the `1`→`2`
-    /// channel-binding bump, which moved `MIN_SUPPORTED` up with `CURRENT` to
-    /// drop `1`. Because it tracks `CURRENT`, a relay advertising a window
-    /// below it shares no version with this build and is refused at
-    /// negotiation, so the coordinator never reaches an enroll path that could
-    /// skip the challenge. The invariant tying the two together —
+    /// Equal to [`Self::CURRENT`] today only because `1` is the sole shipped
+    /// version; this is deliberately a *floor*, not a synonym for `CURRENT`.
+    /// When a later build advances `CURRENT`, this may lag behind so a gradual
+    /// rollout keeps serving peers still on an older version — down to, but
+    /// never below, [`Self::ENROLL_POP_MIN`]: enroll proof-of-possession has no
+    /// un-bound form, so no *negotiable* version may fall under it and reach an
+    /// enroll path that skips the challenge. The invariant that bounds the lag —
     /// `MIN_SUPPORTED >= ENROLL_POP_MIN` — is asserted at compile time below.
-    pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(3);
+    pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(1);
 
-    /// The lowest *negotiated* version at which the coordinator runs the
-    /// enroll proof-of-possession exchange (see [`Self::CURRENT`]'s `3` entry).
-    /// Named separately from [`Self::CURRENT`] so a later bump for an unrelated
-    /// reason (say `4`) does not silently change when this specific check
-    /// applies.
+    /// The lowest *negotiated* version at which the coordinator runs the enroll
+    /// proof-of-possession exchange. `1`, because proof-of-possession is part of
+    /// the first shipped protocol, so it applies to every negotiable version.
     ///
-    /// [`Self::MIN_SUPPORTED`] must stay at or above this: the challenge admits
-    /// no un-bound form, so no *negotiable* version may fall below it and skip
-    /// the challenge. The compile-time assertion below enforces that.
-    pub const ENROLL_POP_MIN: ProtocolVersion = ProtocolVersion(3);
+    /// Named separately from [`Self::CURRENT`] so a later bump for an unrelated
+    /// reason does not silently change when this specific check applies, and so
+    /// [`Self::MIN_SUPPORTED`] has an explicit floor it must stay at or above:
+    /// the challenge admits no un-bound form, so no *negotiable* version may fall
+    /// below it and skip the challenge. The compile-time assertion below enforces
+    /// that.
+    pub const ENROLL_POP_MIN: ProtocolVersion = ProtocolVersion(1);
 }
 
 // Enroll proof-of-possession admits no un-bound form, so no negotiable version
@@ -261,59 +261,55 @@ mod tests {
 
     #[test]
     fn negotiates_highest_common_version() {
-        // Peer supports a wide window that includes ours.
-        let v = negotiate(ProtocolVersion(1), ProtocolVersion(5)).unwrap();
+        // A peer whose window reaches past this build's CURRENT still negotiates
+        // down to CURRENT (our cap) — the shape a gradual rollout relies on when
+        // a newer peer meets an older one.
+        let future = ProtocolVersion(ProtocolVersion::CURRENT.0 + 1);
+        let v = negotiate(ProtocolVersion::MIN_SUPPORTED, future).unwrap();
         assert_eq!(v, ProtocolVersion::CURRENT);
     }
 
     #[test]
     fn rejects_disjoint_windows() {
         // Peer only speaks future versions this build doesn't support yet.
-        assert!(negotiate(ProtocolVersion(7), ProtocolVersion(9)).is_err());
+        let above = ProtocolVersion(ProtocolVersion::CURRENT.0 + 5);
+        let higher = ProtocolVersion(ProtocolVersion::CURRENT.0 + 7);
+        assert!(negotiate(above, higher).is_err());
     }
 
     #[test]
-    fn a_downgrade_window_below_the_pop_threshold_is_refused() {
-        // A relay advertising a window that tops out below the current version —
-        // e.g. a downgrade Hello pinning the version just under CURRENT to try to
-        // dodge the enroll challenge — shares no version with this build, since
-        // MIN_SUPPORTED tracks CURRENT. Negotiation refuses it outright rather
-        // than settling on a version that would skip proof-of-possession.
-        let downgrade = ProtocolVersion(ProtocolVersion::CURRENT.0 - 1);
+    fn a_window_below_the_supported_floor_is_refused() {
+        // A relay advertising a window that tops out below MIN_SUPPORTED — a peer
+        // too old for this build, or a downgrade Hello pinning a version under
+        // the floor to try to dodge the enroll challenge (MIN_SUPPORTED is also
+        // the PoP floor) — shares no version with this build. Negotiation refuses
+        // it outright rather than settling on a version that would skip
+        // proof-of-possession.
+        let below = ProtocolVersion(ProtocolVersion::MIN_SUPPORTED.0 - 1);
         assert!(
-            negotiate(downgrade, downgrade).is_err(),
-            "a sub-current advertiser has no overlap with [MIN_SUPPORTED, CURRENT]",
+            negotiate(below, below).is_err(),
+            "a sub-floor advertiser has no overlap with [MIN_SUPPORTED, CURRENT]",
         );
     }
 
     #[test]
-    fn a_current_relays_window_negotiates_at_the_pop_threshold() {
-        // A relay advertising this build's own window negotiates exactly at
-        // CURRENT, which is also ENROLL_POP_MIN — the coordinator challenges it.
+    fn a_current_peers_window_negotiates_at_the_pop_threshold() {
+        // A peer advertising this build's own window negotiates at CURRENT, which
+        // is at or above ENROLL_POP_MIN — the coordinator challenges it.
         let negotiated = negotiate(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT)
-            .expect("a current relay's window overlaps");
+            .expect("a current peer's window overlaps");
         assert_eq!(negotiated, ProtocolVersion::CURRENT);
         assert!(negotiated >= ProtocolVersion::ENROLL_POP_MIN);
     }
 
     #[test]
-    fn a_future_max_peer_still_negotiates_current() {
-        // A peer whose window reaches past CURRENT still negotiates down to
-        // CURRENT (this build's cap), and CURRENT reaches the PoP threshold.
-        let future = ProtocolVersion(ProtocolVersion::CURRENT.0 + 1);
-        let negotiated = negotiate(ProtocolVersion::CURRENT, future)
-            .expect("a future-capable peer overlaps at CURRENT");
-        assert_eq!(negotiated, ProtocolVersion::CURRENT);
-        assert!(negotiated >= ProtocolVersion::ENROLL_POP_MIN);
-    }
-
-    #[test]
-    fn min_supported_tracks_current_so_no_negotiable_version_skips_pop() {
-        // Enroll proof-of-possession has no un-bound form, so MIN_SUPPORTED
-        // tracks CURRENT: every negotiable version reaches ENROLL_POP_MIN,
-        // leaving no window a relay could advertise that both negotiates and
-        // skips the challenge.
-        assert_eq!(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT);
+    fn no_negotiable_version_skips_enroll_pop() {
+        // The durable invariant: MIN_SUPPORTED stays at or above ENROLL_POP_MIN,
+        // so every version in the negotiable window reaches the challenge. This
+        // is NOT `MIN_SUPPORTED == CURRENT` — a future gradual rollout may lower
+        // MIN_SUPPORTED below CURRENT to keep serving older peers, and that stays
+        // sound exactly as long as it does not cross the PoP floor (which the
+        // compile-time assertion in this module also guards).
         assert!(ProtocolVersion::MIN_SUPPORTED >= ProtocolVersion::ENROLL_POP_MIN);
     }
 }

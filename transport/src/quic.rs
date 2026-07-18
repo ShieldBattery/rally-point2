@@ -29,32 +29,11 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 /// ALPN protocol id negotiated on every client ↔ relay QUIC connection. The
 /// trailing number is bumped on any change an older peer can't interoperate
 /// with — the datagram wire framing, the connection-binding handshake, or the
-/// connection's stream shape — so a peer on the old protocol is rejected at the
-/// TLS handshake rather than later, as a malformed datagram or a puzzling
-/// credential failure.
-///
-/// `5`: each side opens a reliable **control stream** (one bidirectional
-/// stream, after the auth handshake) carrying length-prefixed `ControlFrame`s —
-/// the divert path for a turn too large to ever ride a datagram. A `4` peer
-/// never accepts the stream and never opens its own, so an oversize turn
-/// diverted to it would sit unread while lockstep stalls on the missing seq —
-/// a silent mid-game hang, rejected at the handshake instead.
-///
-/// `4`: the payload `seq` is now the turn's origin identity — assigned by the
-/// sending client and preserved end-to-end, never restamped per hop — and each
-/// slot carries its own seq space. The ack-beacon frame correspondingly carries
-/// a `(slot, cursor)` pair, not a bare cursor. A `3` peer restamps seq per link
-/// and sends a bare beacon cursor, so its dedup, retirement, and ordering are
-/// incompatible.
-///
-/// `3`: the connection now opens an ack-beacon unidirectional stream after the
-/// authorization handshake, so each side can force-advance the peer's unacked
-/// window. A `2` peer opens no such stream and never sends beacons, so its
-/// `retire_through` never fires — incompatible.
-///
-/// `2`: the connection-binding challenge is signed together with a TLS channel
-/// binding, not the nonce alone, so a `1` peer's proof no longer verifies and is
-/// deliberately not accepted — the old proof was replayable.
+/// connection's stream shape — so a peer on an incompatible protocol is
+/// rejected at the TLS handshake rather than later, as a malformed datagram or
+/// a puzzling credential failure. `1` is the first version shipped to
+/// production; there is no earlier one, so every bump from here is a real
+/// wire-compat boundary a gradual rollout crosses deliberately.
 ///
 /// This is the client-edge ALPN. Mesh links use [`MESH_ALPN`] — a separate
 /// `rp2-mesh/N` namespace, not this `rp2/N` line — so a relay server advertises
@@ -64,68 +43,26 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 /// connection may exchange. A client dialing with this ALPN can never produce a
 /// `MeshPacket` even by mistake: the type lives in a code path the client crate
 /// never touches.
-pub const ALPN: &[u8] = b"rp2/5";
+pub const ALPN: &[u8] = b"rp2/1";
 
 /// ALPN protocol id negotiated on every relay ↔ relay mesh QUIC connection. A
 /// relay-pair shares one connection across every game both relays jointly serve,
 /// so it is distinct from the client-edge [`ALPN`]: the connection carries
 /// `MeshPacket` datagrams (a `Packet` wrapped with the session it belongs to),
-/// not client-edge `Packet` datagrams.
+/// not client-edge `Packet` datagrams. `1` is the first version shipped to
+/// production, and like the client edge it bumps on any wire- or
+/// connection-shape change an older peer can't interoperate with.
 ///
-/// Versions on a **separate line** from the client-edge [`ALPN`] (`rp2-mesh/N`,
+/// Versioned on a **separate line** from the client-edge [`ALPN`] (`rp2-mesh/N`,
 /// not `rp2/N`), because the server advertises both and dispatches by which one
 /// negotiated — so the two strings must stay distinct forever, even as each
 /// bumps independently. A shared `rp2/N` line would collide: a future
-/// client-edge-only bump (a handshake change the mesh's own establishment
-/// doesn't share, like the channel-binding change that took client to `rp2/2`)
-/// would push client to the same number mesh already occupies, the server would
-/// advertise two identical strings, and `protocol()` couldn't tell a client
-/// from a peer relay. The separate namespace makes that impossible.
-///
-/// `1`: introduces `MeshPacket` — one connection per relay-pair carries every
-/// jointly-served game's traffic, demultiplexed by a session id, so the mesh has
-/// one congestion controller per backbone path rather than N competing ones. A
-/// peer that doesn't know `MeshPacket` sends bare `Packet` datagrams that can't
-/// be demuxed by session — incompatible.
-///
-/// `2`: the dialing relay sends a `MeshHello` (its relay id) on a fresh
-/// unidirectional stream immediately after connecting, and the accepting relay
-/// now *requires* it before serving the link (it labels the link with the peer's
-/// id so session joins can target it). A `1` peer never sends that hello, so a
-/// mixed pair would connect and then stall until the acceptor's hello timeout —
-/// an asymmetric runtime failure. Bumping the version rejects the mismatch
-/// cleanly at TLS negotiation instead.
-///
-/// `3`: both sides carry per-session presence (`MeshPresence` frames — live
-/// home-client counts, driving buffer-authority handoff) on reliable
-/// uni-streams: the dialer appends frames to its hello stream and keeps it
-/// open; the acceptor opens a uni-stream of its own that carries presence
-/// alone. A `2` peer closes its hello stream after the hello and never reads
-/// the acceptor's stream, so a mixed pair would half-work — presence flowing
-/// one way or not at all, leaving a session with a frozen buffer authority —
-/// which is worse to debug than a clean connect-time refusal.
-///
-/// `4`: both sides carry a bidirectional mesh control stream — the dialer opens
-/// it right after its hello and the acceptor `accept_bi`s it — on which they
-/// propagate synced player-leaves across the mesh (`MeshControlFrame`s:
-/// `SlotDeparted` and `LeaveDirective`). A `3` peer never opens or accepts that
-/// stream, so a mixed pair would leave the acceptor's bounded `accept_bi` to time
-/// out and drop the connection — an asymmetric runtime failure. Bumping the
-/// version rejects the mismatch cleanly at TLS negotiation instead, exactly as
-/// `2` and `3` did for their new streams. (Both relays of a deployment update
-/// together, so no long-lived mixed pair is expected.)
-///
-/// `5`: the dialer now presents a TLS client certificate on the mesh connection
-/// — the same self-signed certificate it serves with — and the acceptor pins it
-/// against the coordinator-distributed fleet set (relay id → cert fingerprint)
-/// before the link driver ever spawns. `MeshPacket` also gains the session's
-/// tenant alongside the bare session id (an additive field an older decoder
-/// would ignore, staying tenant-blind). A `4` peer presents no client
-/// certificate at all, so against an enforcing acceptor a mixed pair would
-/// complete the TLS handshake and then be refused post-handshake — bumping the
-/// ALPN rejects the pair cleanly at TLS negotiation instead, and gives both
-/// changes a single fleet-upgrade boundary.
-pub const MESH_ALPN: &[u8] = b"rp2-mesh/5";
+/// client-edge-only bump (a handshake or stream-shape change the mesh's own
+/// establishment doesn't share) would push the client number onto one the mesh
+/// already occupies, the server would advertise two identical strings, and
+/// `protocol()` couldn't tell a client from a peer relay. The separate namespace
+/// makes that impossible.
+pub const MESH_ALPN: &[u8] = b"rp2-mesh/1";
 
 /// Failure to assemble a QUIC TLS configuration.
 #[derive(Debug, thiserror::Error)]
@@ -494,17 +431,17 @@ mod tests {
         );
     }
 
-    /// A peer on an older protocol — here, advertising the previous ALPN — is
-    /// rejected at the TLS handshake instead of connecting and then failing later.
-    /// This is the rollout gate for an incompatible change like the channel-bound
-    /// auth proof: old and new builds simply can't form a connection.
+    /// A peer advertising a mismatched client-edge ALPN is rejected at the TLS
+    /// handshake instead of connecting and then failing later. This is the
+    /// rollout gate for any wire-incompatible change: once a bump moves the ALPN,
+    /// old and new builds simply can't form a connection.
     ///
     /// The server task drives its end of the handshake to completion and the test
     /// asserts *both* ends fail, so the client can't pass by failing on a dropped
     /// server instead of on ALPN. The matching-ALPN success case is the positive
     /// control in [`loopback_connects_and_exchanges_a_datagram`].
     #[tokio::test]
-    async fn rejects_a_peer_with_a_stale_alpn() {
+    async fn rejects_a_peer_with_a_mismatched_alpn() {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
 
@@ -520,7 +457,8 @@ mod tests {
             incoming.await
         });
 
-        // A client identical to the real one except it advertises the prior ALPN.
+        // A client identical to the real one except it advertises an ALPN the
+        // server doesn't offer (`rp2/0` — no such version exists).
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
         let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
@@ -528,38 +466,37 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        tls.alpn_protocols = vec![b"rp2/1".to_vec()];
-        let stale_cfg =
+        tls.alpn_protocols = vec![b"rp2/0".to_vec()];
+        let mismatched_cfg =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
         let mut client = quinn::Endpoint::client(bind).unwrap();
-        client.set_default_client_config(stale_cfg);
+        client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;
         let server_result = server_task.await.unwrap();
 
         assert!(
             client_result.is_err(),
-            "a stale-ALPN client must fail the handshake"
+            "a mismatched-ALPN client must fail the handshake"
         );
         assert!(
             server_result.is_err(),
-            "the server must reject a stale-ALPN handshake"
+            "the server must reject a mismatched-ALPN handshake"
         );
     }
 
-    /// A relay still on the previous mesh ALPN (`rp2-mesh/1`, before the
-    /// mandatory post-connect identity hello) is rejected at the handshake by a
-    /// current relay, rather than connecting and then stalling until the
+    /// A relay advertising a mismatched mesh ALPN is rejected at the handshake by
+    /// a current relay, rather than connecting and then stalling until the
     /// acceptor's hello timeout. The mesh establishment protocol is versioned on
-    /// its own `rp2-mesh/N` line, so a connection-shape change like requiring
-    /// the hello is an incompatible bump old and new builds can't negotiate.
+    /// its own `rp2-mesh/N` line, so any connection-shape bump is one old and new
+    /// builds can't negotiate.
     ///
-    /// Mirrors [`rejects_a_peer_with_a_stale_alpn`] for the mesh edge: the server
-    /// advertises both current ALPNs, and a dialer offering only the stale
-    /// `rp2-mesh/1` matches neither.
+    /// Mirrors [`rejects_a_peer_with_a_mismatched_alpn`] for the mesh edge: the
+    /// server advertises both current ALPNs, and a dialer offering only a
+    /// non-current `rp2-mesh/0` matches neither.
     #[tokio::test]
-    async fn rejects_a_mesh_peer_with_a_stale_alpn() {
+    async fn rejects_a_mesh_peer_with_a_mismatched_alpn() {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
 
@@ -572,8 +509,8 @@ mod tests {
             incoming.await
         });
 
-        // A mesh dialer identical to the real one except it advertises the prior
-        // mesh ALPN — neither current ALPN the server offers.
+        // A mesh dialer identical to the real one except it advertises an ALPN
+        // the server doesn't offer (`rp2-mesh/0`) — neither current ALPN.
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
         let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
@@ -581,23 +518,23 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        tls.alpn_protocols = vec![b"rp2-mesh/1".to_vec()];
-        let stale_cfg =
+        tls.alpn_protocols = vec![b"rp2-mesh/0".to_vec()];
+        let mismatched_cfg =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
         let mut client = quinn::Endpoint::client(bind).unwrap();
-        client.set_default_client_config(stale_cfg);
+        client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;
         let server_result = server_task.await.unwrap();
 
         assert!(
             client_result.is_err(),
-            "a stale mesh-ALPN dialer must fail the handshake"
+            "a mismatched mesh-ALPN dialer must fail the handshake"
         );
         assert!(
             server_result.is_err(),
-            "the server must reject a stale mesh-ALPN handshake"
+            "the server must reject a mismatched mesh-ALPN handshake"
         );
     }
 }

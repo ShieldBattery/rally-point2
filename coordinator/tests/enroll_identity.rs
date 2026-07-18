@@ -199,10 +199,11 @@ async fn a_signature_from_the_wrong_key_is_refused_with_identity_unproven() {
 #[tokio::test]
 async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_live_entry() {
     // A bootstrap-secret holder cannot dodge proof-of-possession by advertising
-    // an older protocol version: MIN_SUPPORTED tracks CURRENT, so a Hello whose
-    // window tops out below the current version shares no version with the
-    // coordinator and is refused at negotiation — it never reaches the challenge,
-    // never enrolls, and never displaces a relay that legitimately holds the id.
+    // an older protocol version: MIN_SUPPORTED sits at or above ENROLL_POP_MIN,
+    // so a Hello whose window tops out below the supported floor shares no version
+    // with the coordinator and is refused at negotiation — it never reaches the
+    // challenge, never enrolls, and never displaces a relay that legitimately
+    // holds the id.
     let (base_url, reg) = serve_bare_coordinator().await;
 
     // A legitimate current relay enrolls under id 5, proving possession, and
@@ -215,8 +216,8 @@ async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_liv
     let live_fingerprint = registry::live_cert_fingerprint(&reg, RelayId(5));
     assert!(live_fingerprint.is_some());
 
-    // The downgrade attempt claims the same id, advertising a version just below
-    // the current one to try to reach the unconditional-replace path enroll PoP
+    // The downgrade attempt claims the same id, advertising a version below the
+    // supported floor to try to reach the unconditional-replace path enroll PoP
     // closed. Negotiation refuses it outright.
     let downgrade = ProtocolVersion(ProtocolVersion::CURRENT.0 - 1);
     let hello = RelayHello::new(

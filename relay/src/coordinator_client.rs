@@ -317,10 +317,10 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// loop signs that challenge with it (see [`sign_enroll_proof`]) the moment one
 /// arrives. The challenge is not optional: the relay advertises a window
 /// bottoming out at [`ProtocolVersion::MIN_SUPPORTED`](rally_point_proto::version::ProtocolVersion::MIN_SUPPORTED),
-/// which tracks the current version, so any coordinator it can enroll with
-/// negotiates a version reaching [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN)
-/// and challenges — a coordinator too old to challenge shares no version with
-/// this relay and is refused at negotiation before any enroll.
+/// which stays at or above [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN),
+/// so any coordinator it can enroll with negotiates a version that reaches the
+/// proof-of-possession challenge — a coordinator too old to challenge shares no
+/// version with this relay and is refused at negotiation before any enroll.
 ///
 /// `notices` is the drain end of the decision-maker registry's notifier: the
 /// leave sites push a departure and the desync comparator pushes a desync (both

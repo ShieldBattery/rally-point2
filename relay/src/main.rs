@@ -493,11 +493,10 @@ async fn main() -> Result<()> {
             // The hello carries our client-edge leaf cert so the coordinator
             // can hand it to clients in session responses — they pin exactly
             // this cert to connect — the `[MIN_SUPPORTED, CURRENT]` protocol
-            // window the coordinator negotiates against before enrolling
-            // (MIN_SUPPORTED tracks CURRENT because enroll proof-of-possession
-            // admits no lower form, so the window is a single version today),
-            // and the complete advertised address set (empty for a
-            // single-address relay), so a dual-stack relay's consumers can pick
+            // window the coordinator negotiates against before enrolling (a
+            // single version today, since MIN_SUPPORTED == CURRENT while only one
+            // version ships), and the complete advertised address set (empty for
+            // a single-address relay), so a dual-stack relay's consumers can pick
             // a family.
             let mut relay_hello = RelayHello::new(
                 RelayId(our_id),

@@ -1496,7 +1496,9 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     let connection = ep.connect(relay_b.addr, "localhost")?.await?;
 
     let mut hello_stream = connection.open_uni().await?;
-    let hello = MeshHello::new(RelayId(1), ProtocolVersion(1));
+    // A version below the supported floor — one this build cannot negotiate.
+    let incompatible = ProtocolVersion(ProtocolVersion::MIN_SUPPORTED.0 - 1);
+    let hello = MeshHello::new(RelayId(1), incompatible);
     hello_stream.write_all(&hello.encode()).await?;
 
     // The acceptor refuses with the protocol-mismatch application close...
