@@ -597,6 +597,28 @@ pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// effectively unbounded.
 const MESH_UNACKED_WINDOW_CAP: usize = 8 * 1024;
 
+/// How long one write on a mesh link's reliable streams (a control frame, a
+/// presence push) may sit suspended on QUIC stream flow control before the
+/// link is treated as failed.
+///
+/// The driver writes these streams inline in its select loop, so a suspended
+/// write suspends the whole loop — no datagram receives, no turn fan-out, no
+/// presence — for every session on the relay-pair, while the outbound control
+/// queue keeps growing. QUIC's own idle timeout never ends that state: it
+/// tears down a *silent* peer, but a peer whose connection stays alive
+/// (keepalives are answered by the QUIC stack itself) while its application
+/// stops reading a stream's receive half stalls the write indefinitely.
+/// Resetting the link instead puts recovery on the same path a full forward
+/// queue already takes: the dial supervisor redials, and the Join-time
+/// reconcile + resume-cursor exchange re-sync what the reset interrupted.
+///
+/// Generous against the normal case — a control frame drains in microseconds
+/// on a healthy backbone link, so only a wedged, overloaded, or hostile peer
+/// ever holds a write this long — and it also bounds how much the unbounded
+/// outbound control queue can grow during a stall (a stall window's worth of
+/// rare, small frames, not an open-ended accumulation).
+const MESH_STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Whether one session's mesh-link unacked window has crossed
 /// [`MESH_UNACKED_WINDOW_CAP`] -- the driver's cue to reset the link rather
 /// than let the window grow further. Mirrors the client edge's own
@@ -1525,14 +1547,28 @@ async fn send_turn_over_link(
             session: session_id.0,
             kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
         };
-        if let Err(error) = rally_point_transport::mesh_control_stream::send_mesh_control_frame(
-            control_send,
-            &frame,
+        // Deadline-bounded like every reliable-stream write the driver makes
+        // inline: a peer that stops reading its control receive-half would
+        // otherwise suspend the whole driver loop on this write indefinitely.
+        // See `MESH_STREAM_WRITE_TIMEOUT`.
+        match tokio::time::timeout(
+            MESH_STREAM_WRITE_TIMEOUT,
+            rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+                control_send,
+                &frame,
+            ),
         )
         .await
         {
-            tracing::info!(%error, context, "mesh control send failed; closing link");
-            return false;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::info!(%error, context, "mesh control send failed; closing link");
+                return false;
+            }
+            Err(_) => {
+                tracing::warn!(context, "mesh control send stalled; closing link");
+                return false;
+            }
         }
         return true;
     }
@@ -1849,15 +1885,29 @@ pub async fn run_mesh_link(
             outbound = control_forward_rx.recv() => {
                 match outbound {
                     Some(frame) => {
-                        if let Err(error) =
+                        // Deadline-bounded: a peer that keeps its connection
+                        // alive but stops reading this stream would otherwise
+                        // suspend the whole loop here indefinitely while the
+                        // unbounded forward channel keeps growing. See
+                        // `MESH_STREAM_WRITE_TIMEOUT`.
+                        match tokio::time::timeout(
+                            MESH_STREAM_WRITE_TIMEOUT,
                             rally_point_transport::mesh_control_stream::send_mesh_control_frame(
                                 &mut control_send,
                                 &frame,
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
-                            tracing::info!(%error, "mesh control send failed; closing link");
-                            break MeshLinkExit::ConnectionFailed;
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::info!(%error, "mesh control send failed; closing link");
+                                break MeshLinkExit::ConnectionFailed;
+                            }
+                            Err(_) => {
+                                tracing::warn!("mesh control send stalled; closing link");
+                                break MeshLinkExit::ConnectionFailed;
+                            }
                         }
                         continue;
                     }
@@ -2011,12 +2061,21 @@ pub async fn run_mesh_link(
                 // feeds. This reliable push is also why a relay whose players
                 // have all left — and which therefore sends no datagrams at
                 // all — still gets its "I'm out" to the peer.
-                if reconcile_presence(&mut presence_tx, &mut presence_sent, &sessions, &joined)
-                    .await
-                    .is_err()
+                // Deadline-bounded like the control-stream writes: the
+                // presence stream is written inline here too, so a peer that
+                // stops reading it could suspend the whole loop. See
+                // `MESH_STREAM_WRITE_TIMEOUT`.
+                match tokio::time::timeout(
+                    MESH_STREAM_WRITE_TIMEOUT,
+                    reconcile_presence(&mut presence_tx, &mut presence_sent, &sessions, &joined),
+                )
+                .await
                 {
-                    tracing::info!("mesh presence push failed; closing link");
-                    break MeshLinkExit::ConnectionFailed;
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::info!("mesh presence push failed or stalled; closing link");
+                        break MeshLinkExit::ConnectionFailed;
+                    }
                 }
                 // Reconcile this link's own receive cursors on the same tick:
                 // push each session's per-slot delivered-through advance to
@@ -2159,18 +2218,26 @@ pub async fn run_mesh_link(
                         // than waiting a flush tick: a fresh join (or a
                         // rejoin on a redialed link, whose `presence_sent`
                         // starts empty) is exactly when the peer knows
-                        // nothing yet.
-                        if reconcile_presence(
-                            &mut presence_tx,
-                            &mut presence_sent,
-                            &sessions,
-                            &joined,
+                        // nothing yet. Deadline-bounded like every inline
+                        // stream write here — see `MESH_STREAM_WRITE_TIMEOUT`.
+                        match tokio::time::timeout(
+                            MESH_STREAM_WRITE_TIMEOUT,
+                            reconcile_presence(
+                                &mut presence_tx,
+                                &mut presence_sent,
+                                &sessions,
+                                &joined,
+                            ),
                         )
                         .await
-                        .is_err()
                         {
-                            tracing::info!("mesh presence push failed; closing link");
-                            break MeshLinkExit::ConnectionFailed;
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => {
+                                tracing::info!(
+                                    "mesh presence push failed or stalled; closing link"
+                                );
+                                break MeshLinkExit::ConnectionFailed;
+                            }
                         }
                         continue;
                     }
