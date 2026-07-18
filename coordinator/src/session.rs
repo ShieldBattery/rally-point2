@@ -1678,8 +1678,10 @@ fn place_by_region(
 }
 
 /// The maximum slot id (11: BW supports 12 network participants — 8 players
-/// plus 4 observers).
-const MAX_SLOT: u8 = 11;
+/// plus 4 observers). `pub(crate)` so a heartbeat's reported slot list — which
+/// arrives with no shape validation of its own — can be capped against the
+/// same ceiling a session's own slots are validated against.
+pub(crate) const MAX_SLOT: u8 = 11;
 
 #[cfg(test)]
 mod tests {

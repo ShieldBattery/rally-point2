@@ -198,6 +198,22 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// (a few times over) so ordinary jitter or a single dropped beat never trips it.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most bytes a single control-connection WebSocket message (reassembled
+/// from its frames) may carry, applied to both the message and the frame —
+/// legitimate control frames are never fragmented, so a lower frame cap would
+/// just reject the same traffic in a more confusing way.
+///
+/// Sized off [`flight_store::MAX_FLIGHT_BLOB_BYTES`], the largest legitimate
+/// payload this connection ever carries (a flushed flight recording): the
+/// blob rides as a JSON *string* inside the envelope, so quote/backslash/
+/// control-byte escaping can inflate its wire size well past its raw byte
+/// count. Doubling the raw cap covers that escaping plus the small envelope
+/// overhead with room to spare. Left unset, axum/tungstenite default to 64
+/// MiB / 16 MiB — high enough that a single connection could pin tens of
+/// megabytes per frame it merely claims to be sending, before any
+/// application-level check (like the flight-blob cap itself) ever runs.
+const MAX_CONTROL_MESSAGE_BYTES: usize = flight_store::MAX_FLIGHT_BLOB_BYTES * 2;
+
 /// The shared state the HTTP handlers operate over: the coordinator's
 /// session-setup context plus the relay control-connection auth posture.
 /// Cloned cheaply (the setup's fields are `Arc`-backed), so axum's per-request
@@ -1157,33 +1173,69 @@ async fn relay_control(
     let pair_rtts = state.pair_rtts.clone();
     let flight_store = state.flight_store.clone();
     let peer_ip = peer_addr.map(|addr| addr.ip());
-    ws.on_upgrade(move |socket| {
-        serve_relay_control(
-            socket,
-            setup,
-            notices,
-            lifecycle,
-            hello_timeout,
-            liveness_timeout,
-            regions,
-            ledger,
-            peer_ip,
-            pair_rtts,
-            flight_store,
-        )
-    })
+    ws.max_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            serve_relay_control(
+                socket,
+                setup,
+                notices,
+                lifecycle,
+                hello_timeout,
+                liveness_timeout,
+                regions,
+                ledger,
+                peer_ip,
+                pair_rtts,
+                flight_store,
+            )
+        })
 }
+
+/// The most control connections allowed to sit between a completed WebSocket
+/// upgrade and a verified `Hello` at once. A connection in that window has
+/// cleared only the bootstrap secret — proof of *a* relay, not proof of which
+/// one — and [`HELLO_TIMEOUT`] bounds how long any single such connection may
+/// sit there, but nothing bounds how many can sit there together: a caller
+/// that keeps opening connections and never finishing enrollment would
+/// otherwise accumulate one parked task and socket per connection, without
+/// limit, for as long as it keeps churning. Sized well above a full relay
+/// fleet reconnecting at once (a rolling deploy, a coordinator failover), so a
+/// legitimate reconnect burst never trips it.
+const MAX_PENDING_CONTROL_HELLOS: usize = 512;
+
+/// The process-wide gate [`MAX_PENDING_CONTROL_HELLOS`] enforces.
+static PENDING_HELLO_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_PENDING_CONTROL_HELLOS);
+
+/// The standard WebSocket "try again later" close code (RFC 6455 / the IANA
+/// close-code registry), used to refuse a connection when
+/// [`PENDING_HELLO_PERMITS`] is saturated. Distinct from the
+/// `CONTROL_CLOSE_*` codes in [`rally_point_proto::version`]: those name a
+/// specific enroll refusal a relay recognizes and reacts to individually
+/// (`classify_control_close` on the relay side); this one carries no such
+/// meaning; an unrecognized code already falls back to the relay's ordinary
+/// short-delay reconnect, which is exactly the right reaction to a transient
+/// capacity refusal.
+const CONTROL_CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 
 /// Serves one relay's control connection: enroll from its `Hello`, push
 /// descriptors, watch the relay's liveness, and deregister it when the connection
 /// drops.
 ///
 /// The relay's first frame must be its [`RelayToCoordinator::Hello`], sent within
-/// `hello_timeout`. After version negotiation and region validation succeed, the
-/// connection must prove possession of its certificate's private key (see
-/// [`crate::identity`]) and clear the duplicate-id check before
-/// [`registry::try_enroll`] runs and yields the connection's generation —
-/// negotiation already refused any relay advertising a version below
+/// `hello_timeout`. Before it is even read, the connection must claim one of
+/// [`MAX_PENDING_CONTROL_HELLOS`] pending-Hello slots — refused outright, never
+/// queued, when the gate is saturated, since a connection waiting on a permit
+/// would still be exactly the parked, unauthenticated socket the gate exists to
+/// bound. The slot is held only across the unauthenticated window: released the
+/// moment proof-of-possession succeeds below, so a long-lived enrolled
+/// connection never occupies it. After version negotiation and region
+/// validation succeed, the connection must prove possession of its
+/// certificate's private key (see [`crate::identity`]) and clear the
+/// duplicate-id check before [`registry::try_enroll`] runs and yields the
+/// connection's generation — negotiation already refused any relay advertising
+/// a version below
 /// [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN),
 /// so the challenge runs on every connection that reaches it. The connection
 /// then serves descriptors and watches liveness ([`push_and_watch`]) until it
@@ -1222,6 +1274,22 @@ async fn serve_relay_control(
     pair_rtts: PairRttStore,
     flight_store: Option<Arc<S3FlightStore>>,
 ) {
+    // Claimed before anything else: a connection that never proves an identity
+    // still costs a parked task and socket for up to `hello_timeout`, and
+    // nothing else bounds how many of those can pile up at once. `try_acquire`
+    // rather than `.acquire().await` — a caller queued on the semaphore is
+    // still an unbounded number of parked connections, just parked on the
+    // permit instead of on the Hello read.
+    let Ok(pending_permit) = PENDING_HELLO_PERMITS.try_acquire() else {
+        tracing::warn!("relay control connection refused: too many connections pending a Hello");
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CONTROL_CLOSE_TRY_AGAIN_LATER,
+                reason: "too many pending control connections; retry shortly".into(),
+            })))
+            .await;
+        return;
+    };
     // The first frame enrolls the relay, and must arrive within the deadline — a
     // connection that opens the socket but never sends a Hello is dropped rather
     // than left to pin a task. A bad/absent first frame likewise just closes.
@@ -1299,6 +1367,11 @@ async fn serve_relay_control(
     if !challenge_and_verify(&mut socket, &hello, hello_timeout).await {
         return;
     }
+    // The connection has now proven its claimed identity, so it no longer
+    // belongs to the anonymous-churn population the pending-Hello gate exists
+    // to bound — release the slot regardless of how much longer ledger
+    // authorization and enrollment take.
+    drop(pending_permit);
 
     // A ledger-backed coordinator authorizes the enroll against its provisioned
     // record before touching the registry: the id must be one the ledger minted,
@@ -1998,6 +2071,28 @@ enum InboundAction {
     DrainRequested,
 }
 
+/// The most sessions a single heartbeat's roster may name. No relay's live
+/// session count is tracked anywhere the coordinator could size this exactly,
+/// so this is a generous ceiling rather than a tight one: bounding the
+/// per-beat iteration cost against a roster a relay never legitimately grows
+/// close to, while leaving enormous headroom over any real deployment.
+const MAX_HEARTBEAT_SESSIONS: usize = 4096;
+
+/// The most connected slots a single session entry in a heartbeat's roster may
+/// name — [`session::MAX_SLOT`] plus one, the same ceiling a session's own
+/// slots are validated against at creation. A heartbeat's roster carries no
+/// such validation on the wire, so an entry naming more slots than a session
+/// could ever legitimately have is definitely forged, not just generous.
+const MAX_HEARTBEAT_SESSION_SLOTS: usize = session::MAX_SLOT as usize + 1;
+
+/// The most backbone round-trip reports a single heartbeat may carry. A
+/// legitimate report never exceeds the coordinator's own configured region
+/// count (an unconfigured region's report is dropped in
+/// [`ingest_region_rtts`]), so this is a large multiple of any realistic fleet
+/// region catalog — bounding the per-beat iteration cost without ever
+/// crowding out real headroom for the fleet to grow.
+const MAX_HEARTBEAT_REGION_RTTS: usize = 256;
+
 /// Handles an inbound relay frame, returning what the connection loop should do
 /// next. Any frame already counts as the liveness signal; a
 /// [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
@@ -2005,7 +2100,9 @@ enum InboundAction {
 /// additionally drives its webhook and lifecycle paths here; a
 /// [`RelayToCoordinator::Draining`] returns [`InboundAction::DrainRequested`] so the
 /// loop can run the drain exchange (which needs the socket + generation it owns). A
-/// heartbeat is just liveness; anything undecodable is flagged.
+/// heartbeat is just liveness plus a presence/RTT ingest — bounded against an
+/// oversize roster and validated against the reporting relay's own serving
+/// sessions, both below — anything undecodable is flagged.
 ///
 /// The lifecycle accounting (result/departure account a slot; `SessionClosed`
 /// closes a serving relay) is fed *before* the webhook path and independent of the
@@ -2029,10 +2126,49 @@ fn note_inbound(
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
         Ok(RelayToCoordinator::Heartbeat {
-            sessions,
-            region_rtts,
+            mut sessions,
+            mut region_rtts,
         }) => {
             tracing::trace!(relay_id = relay_id.0, "relay heartbeat");
+            // Shape-bound the wire data before any of it is applied: a beat's
+            // vectors carry no length limit of their own, so a roster or report
+            // list past the generous ceilings above is definitely forged (or a
+            // relay bug), not a fleet this coordinator was ever going to see.
+            // Truncated rather than the whole beat rejected — the beat still
+            // carries the relay's own liveness signal and whatever legitimate
+            // entries precede the excess.
+            if sessions.len() > MAX_HEARTBEAT_SESSIONS {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    reported = sessions.len(),
+                    cap = MAX_HEARTBEAT_SESSIONS,
+                    "heartbeat session roster exceeds the per-beat cap; truncating",
+                );
+                sessions.truncate(MAX_HEARTBEAT_SESSIONS);
+            }
+            for session in &mut sessions {
+                if session.slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        tenant = session.tenant.as_ref(),
+                        session = session.session.0,
+                        reported = session.slots.len(),
+                        cap = MAX_HEARTBEAT_SESSION_SLOTS,
+                        "heartbeat session slot list exceeds the per-session cap; truncating",
+                    );
+                    session.slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+                }
+            }
+            if region_rtts.len() > MAX_HEARTBEAT_REGION_RTTS {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    reported = region_rtts.len(),
+                    cap = MAX_HEARTBEAT_REGION_RTTS,
+                    "heartbeat region-RTT report exceeds the per-beat cap; truncating",
+                );
+                region_rtts.truncate(MAX_HEARTBEAT_REGION_RTTS);
+            }
+
             // The beat's roster feeds active-player presence — but only from the
             // relay's CURRENT connection. A stale connection's late beat (a
             // reconnect raced it) is dropped whole: its roster describes a
@@ -2040,6 +2176,31 @@ fn note_inbound(
             // connection reports. (The store's own generation fences are the
             // second line of defense.)
             if registry::generation_is_current(setup.registry(), relay_id, generation) {
+                // A relay may only beat presence for sessions it actually
+                // serves — the same membership check the departure/desync/result
+                // arms apply, applied per roster entry rather than to the whole
+                // beat, since a heartbeat legitimately batches many sessions and
+                // one forged entry must not cost the rest. Unchecked, any
+                // enrolled relay could name a victim `(tenant, session, slot)`
+                // and forge it present: blocking that slot from re-queueing, and
+                // (via `on_presence_seen` below) cancelling a reap timer that was
+                // never supposed to be cancelled. `relay_serves_session` itself
+                // stays fail-open when the coordinator holds no serving-relay
+                // record for a session (the post-restart tail), so a legitimate
+                // pre-existing session's beat is unaffected.
+                sessions.retain(|session| {
+                    let allowed =
+                        relay_serves_session(setup, relay_id, &session.tenant, session.session);
+                    if !allowed {
+                        tracing::warn!(
+                            relay_id = relay_id.0,
+                            tenant = session.tenant.as_ref(),
+                            session = session.session.0,
+                            "heartbeat presence for a session this relay does not serve; rejecting",
+                        );
+                    }
+                    allowed
+                });
                 presence::apply_heartbeat(
                     setup.presence(),
                     relay_id,
@@ -2057,7 +2218,9 @@ fn note_inbound(
                 }
                 // Backbone RTTs fold in under the same generation fence as presence: a
                 // stale connection's beat describes a superseded view, so its measured
-                // pairs must not overwrite what the live connection reports.
+                // pairs must not overwrite what the live connection reports. Unlike the
+                // session roster, RTTs carry no per-relay ownership to check — a
+                // report only ever names the relay's own measured pair.
                 ingest_region_rtts(rtt, relay_id, &region_rtts);
             } else {
                 tracing::debug!(
@@ -2263,6 +2426,17 @@ fn handle_flight_recording(
 /// A failed store is a logged loss with no retry: flight data is observability, and the
 /// relay's at-least-once shipping already covers connection-level loss. Detached from the
 /// read loop so a slow PUT never stalls it.
+///
+/// The permit is claimed here, synchronously, before `payload` moves anywhere —
+/// never inside the spawned task. `FLIGHT_UPLOAD_PERMITS` bounds concurrent PUTs,
+/// but a task blocked on `.acquire().await` would still hold its full (up to
+/// [`flight_store::MAX_FLIGHT_BLOB_BYTES`]) payload in memory for as long as it
+/// waited — turning eight permits into an unbounded backlog of parked, payload-
+/// holding tasks the moment uploads fall behind arrivals (a slow object store, or
+/// a relay shipping faster than the store can drain). `try_acquire` makes a
+/// saturated gate an immediate, synchronous refusal instead: the recording joins
+/// the same accepted-loss path as an oversize or unknown-tenant one rather than
+/// queuing behind seven others already in flight.
 fn spawn_flight_upload(
     store: Arc<S3FlightStore>,
     tenant: TenantId,
@@ -2272,11 +2446,20 @@ fn spawn_flight_upload(
     pinned: bool,
 ) {
     let bytes = payload.len();
+    let Ok(permit) = FLIGHT_UPLOAD_PERMITS.try_acquire() else {
+        crate::metrics::flight_recording_refused();
+        tracing::warn!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            relay_id = relay_id.0,
+            pinned,
+            bytes,
+            "dropping a flight recording: upload concurrency is saturated",
+        );
+        return;
+    };
     tokio::spawn(async move {
-        let _permit = FLIGHT_UPLOAD_PERMITS
-            .acquire()
-            .await
-            .expect("FLIGHT_UPLOAD_PERMITS is never closed");
+        let _permit = permit;
         match flight_store::store_recording(&*store, &tenant, session, relay_id, payload, pinned)
             .await
         {
@@ -3572,6 +3755,18 @@ mod tests {
         Message::Text(serde_json::to_string(&heartbeat).unwrap().into())
     }
 
+    /// A `Heartbeat` framed as an inbound control message, carrying the given
+    /// session roster and no RTT reports.
+    fn heartbeat_with_sessions(
+        sessions: Vec<rally_point_proto::control::SessionPresence>,
+    ) -> Message {
+        let heartbeat = RelayToCoordinator::Heartbeat {
+            sessions,
+            region_rtts: vec![],
+        };
+        Message::Text(serde_json::to_string(&heartbeat).unwrap().into())
+    }
+
     #[test]
     fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
         // A relay enrolled in region-a reports a round-trip to region-b. The reports
@@ -3701,6 +3896,321 @@ mod tests {
         assert!(
             relay_serves_session(&setup, RelayId(2), &tenant, SessionId(999_999)),
             "with no serving record there is nothing to check against, so allow",
+        );
+    }
+
+    #[test]
+    fn heartbeat_presence_from_a_relay_not_serving_the_session_is_rejected() {
+        // Relay 1 serves the session; relay 2 is enrolled but was never assigned
+        // it -- a compromised relay 2 heartbeats the session's slot anyway.
+        let (setup, _notices, _lifecycle, session) =
+            setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
+        let relay_2_generation = registry::enroll(
+            setup.registry(),
+            RelayHello::new(
+                RelayId(2),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14902)),
+                ProtocolVersion::CURRENT,
+                vec![0xC2; 4],
+            ),
+        );
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let tenant = TenantId("sb-test".to_owned());
+
+        let beat = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
+            tenant: tenant.clone(),
+            session,
+            slots: vec![SlotId(0)],
+        }]);
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(2),
+            relay_2_generation,
+            &beat,
+            &rtt,
+            None,
+        );
+
+        assert!(
+            presence::fresh_slots(setup.presence(), &tenant, std::time::Instant::now()).is_empty(),
+            "a relay outside the session's serving set cannot forge its presence",
+        );
+    }
+
+    #[test]
+    fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
+        // Relay 1 (untagged) serves session_a; relay 2 (region-b) serves
+        // session_b. Relay 2's beat legitimately reports session_b and also
+        // forges session_a's slot -- only the forged entry is dropped.
+        let reg = registry::new_registry();
+        registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            ),
+        );
+        let relay_2_generation = registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(2),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14902)),
+                ProtocolVersion::CURRENT,
+                vec![0xC2; 4],
+            )
+            .with_region(RegionId("region-b".to_owned())),
+        );
+        let tenants = crate::tenant::new_store();
+        crate::tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = session::SessionSetup::new(reg, tenants);
+        let tenant = TenantId("sb-test".to_owned());
+
+        let session_a = session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: tenant.clone(),
+                players: vec![PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: None,
+                    observer: false,
+                    region: None,
+                }],
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response
+        .session;
+        let session_b = session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: tenant.clone(),
+                players: vec![PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xBB; 32]),
+                    external_ref: None,
+                    observer: false,
+                    region: Some(RegionId("region-b".to_owned())),
+                }],
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response
+        .session;
+        assert_eq!(
+            setup.serving_relays(&tenant, session_a),
+            vec![RelayId(1)],
+            "test setup sanity: session_a homes on relay 1",
+        );
+        assert_eq!(
+            setup.serving_relays(&tenant, session_b),
+            vec![RelayId(2)],
+            "test setup sanity: session_b homes on relay 2",
+        );
+
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+
+        let beat = heartbeat_with_sessions(vec![
+            rally_point_proto::control::SessionPresence {
+                tenant: tenant.clone(),
+                session: session_b,
+                slots: vec![SlotId(0)],
+            },
+            rally_point_proto::control::SessionPresence {
+                tenant: tenant.clone(),
+                session: session_a,
+                slots: vec![SlotId(0)],
+            },
+        ]);
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(2),
+            relay_2_generation,
+            &beat,
+            &rtt,
+            None,
+        );
+
+        let mut present =
+            presence::fresh_slots(setup.presence(), &tenant, std::time::Instant::now());
+        present.sort_by_key(|(s, _)| s.0);
+        assert_eq!(
+            present,
+            vec![(session_b, SlotId(0))],
+            "the relay's own session lands; the forged one does not, and the rest of the beat still applies",
+        );
+    }
+
+    #[test]
+    fn heartbeat_session_roster_beyond_the_cap_is_truncated() {
+        let reg = registry::new_registry();
+        let generation = registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            ),
+        );
+        let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let tenant = TenantId("sb-test".to_owned());
+
+        // No serving-relay record exists for any of these sessions (the
+        // fail-open tail), so the roster's own size is the only thing that
+        // could cap how many entries land.
+        let overshoot = MAX_HEARTBEAT_SESSIONS + 5;
+        let sessions: Vec<_> = (0..overshoot as u64)
+            .map(|id| rally_point_proto::control::SessionPresence {
+                tenant: tenant.clone(),
+                session: SessionId(id),
+                slots: vec![SlotId(0)],
+            })
+            .collect();
+        let beat = heartbeat_with_sessions(sessions);
+
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            generation,
+            &beat,
+            &rtt,
+            None,
+        );
+
+        assert_eq!(
+            presence::fresh_slots(setup.presence(), &tenant, std::time::Instant::now()).len(),
+            MAX_HEARTBEAT_SESSIONS,
+            "a roster past the cap is truncated, not rejected whole or applied whole",
+        );
+    }
+
+    #[test]
+    fn heartbeat_session_slot_list_beyond_the_cap_is_truncated() {
+        let reg = registry::new_registry();
+        let generation = registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            ),
+        );
+        let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let tenant = TenantId("sb-test".to_owned());
+
+        let overshoot = MAX_HEARTBEAT_SESSION_SLOTS + 5;
+        let slots: Vec<SlotId> = (0..overshoot as u8).map(SlotId).collect();
+        let beat = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
+            tenant: tenant.clone(),
+            session: SessionId(1),
+            slots,
+        }]);
+
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            generation,
+            &beat,
+            &rtt,
+            None,
+        );
+
+        assert_eq!(
+            presence::fresh_slots(setup.presence(), &tenant, std::time::Instant::now()).len(),
+            MAX_HEARTBEAT_SESSION_SLOTS,
+            "a session's slot list past the cap is truncated, not applied whole",
+        );
+    }
+
+    #[test]
+    fn heartbeat_region_rtt_reports_beyond_the_cap_are_truncated() {
+        let reg = registry::new_registry();
+        let generation = registry::enroll(
+            &reg,
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                vec![0xC1; 4],
+            )
+            .with_region(RegionId("origin".to_owned())),
+        );
+        let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+        let lifecycle = Lifecycle::new(setup.clone());
+        let notices = notify::new_dedup();
+
+        let overshoot = MAX_HEARTBEAT_REGION_RTTS + 5;
+        let region_ids: Vec<String> = (0..overshoot).map(|i| format!("region-{i}")).collect();
+        let region_id_strs: Vec<&str> = region_ids.iter().map(String::as_str).collect();
+        let regions = regions_config(&region_id_strs);
+        let store = pair_rtts::new_store();
+        let relay_region = RegionId("origin".to_owned());
+        let rtt = RegionRttIngest {
+            relay_region: Some(&relay_region),
+            regions: &regions,
+            store: &store,
+            ledger: None,
+        };
+
+        let rtts: Vec<(&str, u32)> = region_id_strs.iter().map(|&r| (r, 10u32)).collect();
+        let beat = heartbeat_with_rtts(&rtts);
+        note_inbound(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            generation,
+            &beat,
+            &rtt,
+            None,
+        );
+
+        assert_eq!(
+            store.snapshot().len(),
+            MAX_HEARTBEAT_REGION_RTTS,
+            "a region-RTT report list past the cap is truncated, not applied whole",
         );
     }
 

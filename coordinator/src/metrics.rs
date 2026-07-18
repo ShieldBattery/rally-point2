@@ -261,8 +261,8 @@ pub(crate) fn flight_recording_stored() {
     FLIGHT_RECORDINGS.incr("stored".to_owned());
 }
 
-/// Records a flight recording deliberately refused before storage (bad tenant or
-/// oversize payload).
+/// Records a flight recording deliberately refused before storage (bad tenant,
+/// oversize payload, or the upload concurrency gate was saturated).
 pub(crate) fn flight_recording_refused() {
     FLIGHT_RECORDINGS.incr("refused".to_owned());
 }
