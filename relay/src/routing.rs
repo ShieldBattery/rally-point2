@@ -1282,28 +1282,19 @@ pub async fn run_slot_link(
                         Ok(turn) => {
                             let payload = turn.payload;
                             flight_counters.note_validated(payload.seq);
-                            // Only a *validated* turn's frame feeds the consensus
-                            // coordinate — a rejected packet must not leave a
-                            // trace in decision state. (And the coordinate is the
-                            // minimum across slots, so even a validated turn's
-                            // inflated claim can only mislead its own slot.)
-                            if let Some(frame) = payload.game_frame_count {
-                                consensus::observe_turn_frame(
-                                    &decision_makers,
-                                    &key,
-                                    slot,
-                                    payload.seq,
-                                    rally_point_proto::ids::GameFrameCount(frame),
-                                    crate::delivery::DeliveryHome::Local,
-                                );
-                            }
-                            // NOTE: the desync comparator is NOT fed here. The
-                            // mesh delivers a turn to the authority via more
-                            // than one path, so counting has to happen exactly
-                            // once per distinct (slot, seq) turn -- that's
+                            // NOTE: neither the frame observation nor the
+                            // desync comparator is fed here. The mesh delivers
+                            // a turn to a relay via more than one path, so
+                            // consensus has to be fed exactly once per
+                            // distinct (slot, seq) turn -- that's
                             // `deliver_turn_to_locals`, right after its
                             // mark_seen dedup, which `forward_turn` below
-                            // funnels into.
+                            // funnels into. Only *validated* turns reach that
+                            // feed point (a rejected packet breaks the link
+                            // above without a trace in decision state), and
+                            // the coordinate is the minimum across slots, so
+                            // even a validated turn's inflated claim can only
+                            // mislead its own slot.
                             crate::mesh::forward_turn(
                                 &sessions,
                                 &mesh_links,
@@ -1313,7 +1304,7 @@ pub async fn run_slot_link(
                                 &key,
                                 slot,
                                 payload,
-                                crate::turn_ring::TurnOrigin::Local,
+                                crate::delivery::DeliveryHome::Local,
                             );
                         }
                         Err(error) => {
@@ -1709,22 +1700,11 @@ pub async fn run_slot_link(
                         match validate_turn(slot, payload.seq, payload.game_frame_count, &payload.commands) {
                             Ok(turn) => {
                                 let payload = turn.payload;
-                                // A validated turn's frame feeds the consensus
-                                // coordinate, exactly as on the datagram path —
-                                // via the seq-aware path so the leave-frame clamp
-                                // has this turn's history too.
-                                if let Some(frame) = payload.game_frame_count {
-                                    consensus::observe_turn_frame(
-                                        &decision_makers,
-                                        &key,
-                                        slot,
-                                        payload.seq,
-                                        rally_point_proto::ids::GameFrameCount(frame),
-                                        crate::delivery::DeliveryHome::Local,
-                                    );
-                                }
-                                // NOTE: no desync-comparator call here either —
-                                // see the datagram path's note above.
+                                // NOTE: no frame-observation or desync-comparator
+                                // call here either — `forward_turn` funnels into
+                                // the one post-dedup consensus feed point,
+                                // exactly as on the datagram path (see its note
+                                // above).
                                 crate::mesh::forward_turn(
                                     &sessions,
                                     &mesh_links,
@@ -1734,7 +1714,7 @@ pub async fn run_slot_link(
                                     &key,
                                     slot,
                                     payload,
-                                    crate::turn_ring::TurnOrigin::Local,
+                                    crate::delivery::DeliveryHome::Local,
                                 );
                             }
                             Err(error) => {
@@ -3259,7 +3239,7 @@ mod tests {
             &k,
             SlotId(0),
             stamped,
-            crate::turn_ring::TurnOrigin::Mesh,
+            crate::delivery::DeliveryHome::Peer(rally_point_proto::ids::RelayId(2)),
         );
 
         let delivered = inbox
@@ -3318,7 +3298,7 @@ mod tests {
             &k,
             SlotId(0),
             duplicate,
-            crate::turn_ring::TurnOrigin::Mesh,
+            crate::delivery::DeliveryHome::Peer(rally_point_proto::ids::RelayId(2)),
         );
         assert!(
             inbox.forward_rx.try_recv().is_none(),

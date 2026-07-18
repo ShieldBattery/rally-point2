@@ -313,8 +313,76 @@ impl MeshLink {
             .entry(key.into())
             .or_insert_with(|| SessionLink {
                 acks: AckManager::new(),
-                dedup: Dedup::new(),
+                // Forward-collapsing rather than strict: a session enters a mesh
+                // link mid-stream whenever a link redials or a relay joins a
+                // running session, so its slots' seqs start wherever the game
+                // currently is — a from-zero strict window would reject the live
+                // stream forever, resetting the link in a loop. The mesh peer is
+                // an authenticated relay, so the collapse's trust is warranted;
+                // see `Dedup::with_forward_collapse`.
+                dedup: Dedup::with_forward_collapse(),
             })
+    }
+
+    /// Anchors this link's receive window for `(key, slot)` to `anchor`,
+    /// treating every seq below `anchor` as already delivered — the per-session
+    /// twin of [`Link::anchor_receive_window`](crate::Link::anchor_receive_window).
+    ///
+    /// A session joins a mesh link mid-stream whenever the link redials (or the
+    /// relay joins a running session), so the caller anchors each slot at the
+    /// seq it actually still needs — its session-level forwarded-to-locals
+    /// cursor — rather than leaving the window based at 0. The collapsing
+    /// window (see [`open_session`](Self::open_session)) would recover from an
+    /// unanchored base on its own, but only by walking the prefix forward
+    /// through window pressure; the anchor starts it in the right place, so the
+    /// delivered-through cursors this link reports to its peer are truthful
+    /// from the first datagram.
+    ///
+    /// Only meaningful on a pristine slot (nothing received on this link yet);
+    /// it never rewinds a prefix already forming. A no-op for a session (or
+    /// key) that isn't open — callers anchor right after
+    /// [`open_session`](Self::open_session).
+    pub fn anchor_receive_window(
+        &mut self,
+        key: impl Into<MeshSessionKey>,
+        slot: SlotId,
+        anchor: u64,
+    ) {
+        if let Some(session_link) = self.sessions.get_mut(&key.into()) {
+            session_link.dedup.anchor(slot, anchor);
+        }
+    }
+
+    /// Folds a payload that arrived *outside* the datagram path — the reliable
+    /// mesh control stream, where oversize turns ride — into `(key, slot)`'s
+    /// receive state: the same per-slot dedup and delivered-prefix bookkeeping
+    /// a datagram delivery runs, with no ack-state change (QUIC's stream
+    /// reliability already guarantees the delivery). The per-session twin of
+    /// [`Link::deliver_external`](crate::Link::deliver_external), and just as
+    /// load-bearing here: a stream-delivered seq the dedup never learns about
+    /// would hold a permanent gap in the slot's delivered prefix, stalling the
+    /// ack-cursor push and pinning the peer's unacked window until the receive
+    /// window collapses over it.
+    ///
+    /// Returns whether the payload is new (`true`) or an already-delivered
+    /// duplicate (`false`). Sending for a session that isn't open is a driver
+    /// bug, surfaced as [`UnknownSession`](MeshLinkError::UnknownSession) like
+    /// [`send`](Self::send).
+    pub fn deliver_external(
+        &mut self,
+        key: impl Into<MeshSessionKey>,
+        slot: SlotId,
+        seq: u64,
+    ) -> Result<bool, MeshLinkError> {
+        let key = key.into();
+        let Some(session_link) = self.sessions.get_mut(&key) else {
+            return Err(MeshLinkError::UnknownSession(key.session));
+        };
+        match session_link.dedup.accept(slot, seq) {
+            Delivery::New => Ok(true),
+            Delivery::Duplicate => Ok(false),
+            Delivery::OutOfWindow => Err(MeshLinkError::PayloadOutOfWindow { slot, seq }),
+        }
     }
 
     /// Drops a session's transport state. Called when the game ends or the
@@ -972,12 +1040,15 @@ mod tests {
     }
 
     /// The mesh-link counterpart of `Link`'s transactional-recv regression
-    /// test: a packet whose earlier payload is genuinely in-window but whose
-    /// later payload is out of window must roll back the whole packet's
-    /// dedup commit, not leave the earlier payload marked delivered while
-    /// discarding it from the returned `fresh`.
+    /// test: a packet whose earlier payload is genuinely acceptable but whose
+    /// later payload fails the whole packet must roll back the earlier
+    /// payload's dedup commit, not leave it marked delivered while discarding
+    /// it from the returned `fresh`. The packet-ending failure here is a
+    /// malformed slot (out of `SlotId` range): a far-ahead seq no longer ends
+    /// a mesh packet — the forward-collapsing window admits it — so a bad slot
+    /// is the failure that still exercises the rollback on this path.
     #[tokio::test]
-    async fn a_mid_packet_out_of_window_payload_rolls_back_the_session_link_too() {
+    async fn a_mid_packet_malformed_slot_rolls_back_the_session_link_too() {
         let (sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
 
         let session = SessionId(1);
@@ -992,8 +1063,8 @@ mod tests {
                 payloads: vec![
                     turn(0, 0, 0xAA),
                     Payload {
-                        seq: u64::MAX,
-                        slot: 0,
+                        seq: 0,
+                        slot: 300, // out of u8 range
                         commands: vec![0xBB].into(),
                         ..Default::default()
                     },
@@ -1008,11 +1079,8 @@ mod tests {
             .unwrap();
 
         match receiver.recv().await {
-            Err(MeshLinkError::PayloadOutOfWindow { slot, seq }) => {
-                assert_eq!(slot, SlotId(0));
-                assert_eq!(seq, u64::MAX);
-            }
-            other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+            Err(MeshLinkError::MalformedSlot(slot)) => assert_eq!(slot, 300),
+            other => panic!("expected MalformedSlot, got {other:?}"),
         }
         assert_eq!(
             receiver.delivered_through(session, SlotId(0)),
@@ -1452,6 +1520,155 @@ mod tests {
 
         drop(sender);
         drainer.abort();
+    }
+
+    /// A mesh session's receive window admits a mid-stream first contact far
+    /// past a from-zero window — a link that redialed deep into a game, or a
+    /// relay newly joining a running session, receives the live stream at
+    /// whatever seq the game has reached. The strict client-edge behavior
+    /// (reject and close) would reset the link forever; the mesh window
+    /// instead collapses forward and keeps a full window open *below* the far
+    /// seq, so the sender's still-unacked backlog behind it is delivered too,
+    /// not misread as already-seen.
+    #[tokio::test]
+    async fn a_mesh_session_accepts_a_mid_stream_first_contact_far_past_the_window() {
+        let (sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(1);
+        receiver.open_session(session);
+
+        // The live stream's freshest seq arrives first (seq 8000, far past the
+        // 4096-seq window), then the backlog behind it (the sender's unacked
+        // re-carries). Deliver them as raw wire packets so the receiver's
+        // acceptance is what's under test, not the sender's ack state.
+        let mut send_seq = 0u32;
+        let mut send_raw = |seqs: &[u64]| {
+            let mesh_packet = MeshPacket {
+                session: session.0,
+                packet: Some(Packet {
+                    seq: send_seq,
+                    ack: None,
+                    ack_bits: 0,
+                    payloads: seqs.iter().map(|&seq| turn(0, seq, seq as u8)).collect(),
+                }),
+                conditions: None,
+                tenant: None,
+            };
+            send_seq += 1;
+            sender
+                .connection()
+                .send_datagram(mesh_packet.encode_to_vec().into())
+                .unwrap();
+        };
+
+        send_raw(&[8000]);
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(
+            received.delivery.fresh.len(),
+            1,
+            "the far first-contact seq is delivered, not rejected as out-of-window",
+        );
+
+        // The backlog behind it is still within the collapsed window and must
+        // be delivered as fresh — landing the window base any higher than a
+        // full window below the far seq would silently drop it.
+        send_raw(&[7990, 7991, 7992]);
+        let received = receiver.recv().await.unwrap();
+        let seqs: Vec<u64> = received.delivery.fresh.iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![7990, 7991, 7992]);
+    }
+
+    /// `anchor_receive_window` resumes a session's slot mid-stream at its
+    /// forwarded-to-locals cursor: the resumed stream is accepted from the
+    /// anchor, copies below it dedup as already-delivered, and the
+    /// delivered-through cursor is truthful from the first datagram (no
+    /// collapse detour through a below-anchor base).
+    #[tokio::test]
+    async fn anchor_receive_window_resumes_a_mesh_session_at_its_cursor() {
+        let (sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(1);
+        receiver.open_session(session);
+        receiver.anchor_receive_window(session, SlotId(0), 5000);
+
+        let mesh_packet = MeshPacket {
+            session: session.0,
+            packet: Some(Packet {
+                seq: 0,
+                ack: None,
+                ack_bits: 0,
+                // A replayed already-forwarded copy (4999) rides alongside the
+                // resumed stream (5000..5002) — the anchor makes the former a
+                // duplicate and the latter fresh.
+                payloads: vec![
+                    turn(0, 4999, 0x00),
+                    turn(0, 5000, 0x01),
+                    turn(0, 5001, 0x02),
+                    turn(0, 5002, 0x03),
+                ],
+            }),
+            conditions: None,
+            tenant: None,
+        };
+        sender
+            .connection()
+            .send_datagram(mesh_packet.encode_to_vec().into())
+            .unwrap();
+
+        let received = receiver.recv().await.unwrap();
+        let seqs: Vec<u64> = received.delivery.fresh.iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![5000, 5001, 5002]);
+        assert_eq!(
+            receiver.delivered_through(session, SlotId(0)),
+            Some(5002),
+            "the prefix advances from the anchor, so the ack-cursor push is truthful",
+        );
+    }
+
+    /// `deliver_external` folds a stream-delivered seq into the same per-slot
+    /// dedup the datagram path uses, exactly like the client edge's fold: the
+    /// delivered prefix advances across the stream-delivered gap (so the
+    /// ack-cursor push doesn't stall behind it forever), and a duplicate is
+    /// reported rather than re-delivered.
+    #[tokio::test]
+    async fn deliver_external_folds_a_stream_delivered_seq_into_the_session_dedup() {
+        let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(1);
+        sender.open_session(session);
+        receiver.open_session(session);
+
+        // Datagram seqs 0 and 1 arrive normally.
+        sender.send(session, Some(turn(0, 0, 0xA0)), None).unwrap();
+        sender.send(session, Some(turn(0, 1, 0xA1)), None).unwrap();
+        for _ in 0..2 {
+            receiver.recv().await.unwrap();
+        }
+        assert_eq!(receiver.delivered_through(session, SlotId(0)), Some(1));
+
+        // Seq 2 was too large for a datagram and arrived over the control
+        // stream: folding it advances the prefix as a datagram delivery would.
+        assert!(receiver.deliver_external(session, SlotId(0), 2).unwrap());
+        assert_eq!(
+            receiver.delivered_through(session, SlotId(0)),
+            Some(2),
+            "the stream-delivered seq closes the gap instead of stalling the prefix",
+        );
+
+        // A redundant copy of the same stream-delivered seq is a duplicate.
+        assert!(!receiver.deliver_external(session, SlotId(0), 2).unwrap());
+
+        // The datagram path continues past the folded seq without a gap.
+        sender.send(session, Some(turn(0, 3, 0xA3)), None).unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.delivery.fresh.len(), 1);
+        assert_eq!(receiver.delivered_through(session, SlotId(0)), Some(3));
+
+        // A session that was never opened is a driver bug, surfaced like send.
+        match receiver.deliver_external(SessionId(9), SlotId(0), 0) {
+            Err(MeshLinkError::UnknownSession(sid)) => assert_eq!(sid, SessionId(9)),
+            other => panic!("expected UnknownSession, got {other:?}"),
+        }
     }
 
     #[test]

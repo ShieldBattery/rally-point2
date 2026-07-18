@@ -500,8 +500,26 @@ pub(crate) struct Dedup {
     /// `u64` to `retire_through` could retire turns the peer never received —
     /// silent lockstep desync, worse than a crash.
     retired_through: HashMap<SlotId, u64>,
-    /// How far above the prefix a seq may sit before it's rejected.
+    /// How far above the prefix a seq may sit before it's rejected — or, with
+    /// `forward_collapse`, before the prefix collapses forward to admit it.
     window: u64,
+    /// Whether a seq beyond the window collapses the delivered prefix forward
+    /// over the outstanding gaps (treating them as delivered) instead of being
+    /// rejected as `OutOfWindow`.
+    ///
+    /// The strict mode is for links whose peer is untrusted (the relay's client
+    /// edge): a seq racing past the window there means a broken or hostile
+    /// sender, and the safe response is to refuse and close. The collapsing
+    /// mode is for links whose peer is an authenticated relay (the mesh): a
+    /// session legitimately enters a mesh link mid-stream — a link that died
+    /// and redialed, a relay newly joining a running session — so its slots'
+    /// seqs start wherever the game currently is, far past a from-zero window.
+    /// A gap left a full window behind the live stream never fills (its turns
+    /// are lost for good or were delivered on an earlier link), so collapsing
+    /// over it mirrors the session-level forward gate's own cap behavior: a
+    /// false "already delivered" merely drops a redundant copy, while refusing
+    /// the live stream would reset the link forever.
+    forward_collapse: bool,
 }
 
 /// One slot's receive-side dedup state.
@@ -511,6 +529,69 @@ pub(crate) struct SlotDedup {
     delivered_through: Option<u64>,
     /// Delivered seqs above the prefix, kept until the gaps below them fill.
     ahead: BTreeSet<u64>,
+}
+
+impl SlotDedup {
+    /// Folds the run of seqs sitting immediately above the contiguous prefix
+    /// out of the `ahead` set and into the prefix. Stops rather than overflows
+    /// if the run reaches `u64::MAX`; there is no valid seq beyond it to keep
+    /// absorbing anyway.
+    fn absorb_contiguous_run(&mut self) {
+        let mut next = match self.delivered_through {
+            Some(top) => match top.checked_add(1) {
+                Some(next) => next,
+                None => return,
+            },
+            None => 0,
+        };
+        while self.ahead.remove(&next) {
+            self.delivered_through = Some(next);
+            let Some(after) = next.checked_add(1) else {
+                return;
+            };
+            next = after;
+        }
+    }
+
+    /// Collapses the delivered prefix forward until `seq` fits the receive
+    /// window, treating the gaps it advances over as delivered. Only ever
+    /// called from a forward-collapsing [`Dedup`] (see its `forward_collapse`
+    /// field for the trust argument), with `seq` already known to be at least
+    /// `window` past the current base.
+    ///
+    /// Advances over the lowest out-of-order seqs first — each pop may absorb a
+    /// contiguous run above it — so the prefix lands on real delivery evidence
+    /// wherever any exists. When nothing out-of-order remains (a pristine slot
+    /// meeting a mid-stream session, or a prefix stalled behind a dead gap with
+    /// nothing above it), the prefix jumps so `seq` sits at the window's top
+    /// edge, keeping the full window *below* `seq` open: the sender's
+    /// still-unacked backlog rides behind its freshest seq, and landing the
+    /// base any higher would misread that backlog as already delivered and
+    /// silently drop it.
+    ///
+    /// The prefix only ever moves forward here: every `ahead` entry is strictly
+    /// below `seq` (each was accepted inside the then-current window, which sat
+    /// entirely below a seq now at least a full window past base), and the
+    /// empty-`ahead` jump target `seq - window` is at or above the base that
+    /// proved too far behind.
+    fn collapse_forward_until_fits(&mut self, seq: u64, window: u64) {
+        loop {
+            let base = self.delivered_through.map_or(0, |t| t + 1);
+            if seq - base < window {
+                return;
+            }
+            match self.ahead.pop_first() {
+                Some(lowest) => {
+                    self.delivered_through = Some(lowest);
+                    self.absorb_contiguous_run();
+                }
+                None => {
+                    self.delivered_through = Some(seq - window);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl Dedup {
@@ -523,6 +604,17 @@ impl Dedup {
             slots: HashMap::new(),
             retired_through: HashMap::new(),
             window,
+            forward_collapse: false,
+        }
+    }
+
+    /// A dedup whose receive window collapses forward over outstanding gaps
+    /// instead of rejecting a far-ahead seq — see the `forward_collapse` field
+    /// for when that trust is warranted (authenticated mesh peers only).
+    pub(crate) fn with_forward_collapse() -> Self {
+        Self {
+            forward_collapse: true,
+            ..Self::with_window(RECEIVE_WINDOW)
         }
     }
 
@@ -578,26 +670,15 @@ impl Dedup {
         let base = state.delivered_through.map_or(0, |t| t + 1);
 
         if seq - base >= self.window {
-            return Delivery::OutOfWindow;
+            if !self.forward_collapse {
+                return Delivery::OutOfWindow;
+            }
+            state.collapse_forward_until_fits(seq, self.window);
         }
         if !state.ahead.insert(seq) {
             return Delivery::Duplicate;
         }
-
-        // Absorb any now-contiguous run into the delivered prefix. Stops rather
-        // than overflows if the run reaches `u64::MAX`; there is no valid seq
-        // beyond it to keep absorbing anyway.
-        let mut next = base;
-        loop {
-            if !state.ahead.remove(&next) {
-                break;
-            }
-            state.delivered_through = Some(next);
-            let Some(after) = next.checked_add(1) else {
-                break;
-            };
-            next = after;
-        }
+        state.absorb_contiguous_run();
         Delivery::New
     }
 
@@ -779,6 +860,49 @@ mod tests {
         // be out-of-window against a from-zero base is fine here.
         assert_eq!(dedup.delivered_through(SlotId(1)), Some(21));
         assert_eq!(dedup.accept(SlotId(1), 25), Delivery::New);
+    }
+
+    /// A forward-collapsing dedup admits a seq beyond the window by walking
+    /// the prefix forward instead of rejecting: first over any out-of-order
+    /// delivery evidence it holds (each pop absorbing the contiguous run above
+    /// it), then — with nothing outstanding — by jumping so the far seq sits
+    /// at the window's top edge, keeping the full window below it open for the
+    /// sender's in-flight backlog. Seqs inside a swallowed gap thereafter read
+    /// as duplicates, never fresh: the safe failure direction, exactly as the
+    /// session-level forward gate argues for its own cap collapse.
+    #[test]
+    fn forward_collapse_admits_a_far_seq_by_walking_the_prefix_forward() {
+        let mut dedup = Dedup {
+            slots: HashMap::new(),
+            retired_through: HashMap::new(),
+            window: 8,
+            forward_collapse: true,
+        };
+
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 3), Delivery::New); // gap at 1, 2
+        assert_eq!(dedup.accept(SlotId(0), 4), Delivery::New);
+
+        // Far past the window (20 - 1 >= 8): strict mode would reject; the
+        // collapse pops the out-of-order run (3, 4), finds the base still too
+        // far behind, and jumps so 20 sits at the window's top edge (base 13).
+        assert_eq!(dedup.accept(SlotId(0), 20), Delivery::New);
+        assert_eq!(
+            dedup.delivered_through(SlotId(0)),
+            Some(12),
+            "the prefix jumped to a full window below the far seq",
+        );
+
+        // The window below the far seq stayed open: the backlog riding behind
+        // it is fresh, and once contiguous the prefix absorbs through it.
+        for seq in 13..20u64 {
+            assert_eq!(dedup.accept(SlotId(0), seq), Delivery::New);
+        }
+        assert_eq!(dedup.delivered_through(SlotId(0)), Some(20));
+
+        // Seqs inside the swallowed gap are duplicates, never a re-delivery.
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::Duplicate);
+        assert_eq!(dedup.accept(SlotId(0), 5), Delivery::Duplicate);
     }
 
     #[test]

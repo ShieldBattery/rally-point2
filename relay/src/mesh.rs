@@ -896,6 +896,67 @@ fn apply_ack_cursors(
     }
 }
 
+/// Folds an `OversizeTurn` frame's `(slot, seq)` into this link's per-session
+/// receive dedup — the stream-delivered turn must advance the same
+/// delivered-through prefix a datagram delivery would, or the seq holds a
+/// permanent gap that stalls the ack-cursor push and pins the peer's unacked
+/// window (mirroring the client edge's own `deliver_external` fold on its
+/// oversize ingress). Returns whether the frame should still be dispatched:
+/// `false` only for an oversize turn the link's dedup has already delivered
+/// (dropping a redundant copy before it burns a session-level dedup pass);
+/// every other frame kind, and every defensively-skipped case (zero/unjoined
+/// session, out-of-range slot — the dispatch's own arms log and drop those),
+/// passes through as `true`.
+///
+/// Called from [`run_mesh_link`]'s own select branch before
+/// [`dispatch_mesh_control`], like [`apply_ack_cursors`]: it needs direct
+/// access to this link's transport state, which the dispatch does not have.
+/// A fold failure is logged and the turn still dispatched — delivering a turn
+/// whose transport bookkeeping hiccuped merely leans on the session-level
+/// dedup, while dropping it would strand a gap in every local client.
+fn fold_oversize_into_link(
+    link: &mut rally_point_transport::MeshLink,
+    frame: &MeshControlFrame,
+    joined: &HashMap<SessionId, SessionState>,
+) -> bool {
+    let Some(mesh_control_frame::Kind::OversizeTurn(payload)) = &frame.kind else {
+        return true;
+    };
+    if frame.session == 0 {
+        return true;
+    }
+    let Some(state) = joined.get(&SessionId(frame.session)) else {
+        return true;
+    };
+    let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+        return true;
+    };
+    match link.deliver_external(mesh_session_key(&state.key), slot, payload.seq) {
+        Ok(fresh) => {
+            if !fresh {
+                tracing::debug!(
+                    tenant = state.key.tenant.as_ref(),
+                    session = frame.session,
+                    slot = slot.0,
+                    seq = payload.seq,
+                    "oversize mesh turn already delivered on this link; dropping",
+                );
+            }
+            fresh
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = frame.session,
+                slot = slot.0,
+                seq = payload.seq,
+                "folding oversize mesh turn into link dedup failed; delivering anyway",
+            );
+            true
+        }
+    }
+}
+
 /// Pushes each joined session's mesh-link delivered-through cursors to the
 /// peer when they've advanced past what it last heard -- the mesh-link
 /// counterpart of the client edge's ack-beacon push. Riding the same flush
@@ -1226,7 +1287,7 @@ pub fn forward_turn(
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
-    origin: crate::turn_ring::TurnOrigin,
+    home: crate::delivery::DeliveryHome,
 ) {
     if let Some(payload) = deliver_turn_to_locals(
         sessions,
@@ -1236,7 +1297,7 @@ pub fn forward_turn(
         key,
         slot,
         payload,
-        origin,
+        home,
     ) {
         fan_out_to_mesh(mesh_links, key, payload);
     }
@@ -1246,10 +1307,10 @@ pub fn forward_turn(
 /// stamping, and fan-out to this relay's local slots — everything except the
 /// mesh flood. Returns the (possibly stamped) payload when it was fresh, so
 /// [`forward_turn`] can flood it onward, or `None` for a topological duplicate
-/// already delivered via an earlier path. `origin` names where this specific
-/// delivery arrived from — the client edge or the mesh — and is recorded
-/// alongside the turn in the replay ring, not re-derived from anything else
-/// (see [`crate::turn_ring::TurnOrigin`]).
+/// already delivered via an earlier path. `home` names where this specific
+/// delivery arrived from — this relay's own client edge, or a peer relay over
+/// the mesh — feeding both the delivery-tracking home stamp and the replay
+/// ring's [`crate::turn_ring::TurnOrigin`].
 ///
 /// Also the whole receive step for an oversize turn arriving over the mesh
 /// control stream: the origin relay diverted a copy to *every* link serving the
@@ -1257,7 +1318,7 @@ pub fn forward_turn(
 /// re-flood — re-broadcasting would only produce the echo the dedup exists to
 /// drop (harmless, but pure waste on a reliable stream).
 // Same escape hatch as `forward_turn` just above (see its own comment): one
-// more reference (`origin`) alongside its existing bundle-worthy set, not
+// more reference (`home`) alongside its existing bundle-worthy set, not
 // worth the call-site churn of a struct.
 #[allow(clippy::too_many_arguments)]
 fn deliver_turn_to_locals(
@@ -1268,13 +1329,34 @@ fn deliver_turn_to_locals(
     key: &SessionKey,
     slot: SlotId,
     mut payload: Payload,
-    origin: crate::turn_ring::TurnOrigin,
+    home: crate::delivery::DeliveryHome,
 ) -> Option<Payload> {
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
         // Only the duplicate (mesh-echo) branch touches the recorder's maps —
         // the fresh-turn common path stays lock-free for the recorder.
         decision_makers.flight_recorder().note_dedup_drop(key, slot);
         return None;
+    }
+    // The frame observation's one and only feed point, right after the
+    // `mark_seen` dedup, for the same reason as the desync comparator just
+    // below: the mesh legitimately delivers the same turn to a relay via more
+    // than one path, and while the per-slot frame max is a harmless monotone,
+    // the seq-keyed frame *history* behind the leave-frame clamp is a bounded
+    // append — duplicates walked twice would evict genuine history and shrink
+    // the clamp's window — and the delivery-tracking home stamp must follow
+    // the slot's true source, not whichever flooded copy raced in. Lobby turns
+    // carry no frame and don't move the consensus coordinate. Every turn here
+    // was validated at its ingress client edge (the mesh never re-validates),
+    // so only validated turns feed the coordinate.
+    if let Some(frame) = payload.game_frame_count {
+        crate::consensus::observe_turn_frame(
+            decision_makers,
+            key,
+            slot,
+            payload.seq,
+            rally_point_proto::ids::GameFrameCount(frame),
+            home,
+        );
     }
     // The desync comparator's one and only feed point. Every turn-delivery
     // path — client edge (datagram and oversize-control), mesh datagram, and
@@ -1319,6 +1401,10 @@ fn deliver_turn_to_locals(
     // session has started: pre-start lobby traffic has its own ordered replay log
     // and must not be double-buffered here.
     if crate::consensus::session_started(decision_makers, key) {
+        let origin = match home {
+            crate::delivery::DeliveryHome::Local => crate::turn_ring::TurnOrigin::Local,
+            crate::delivery::DeliveryHome::Peer(_) => crate::turn_ring::TurnOrigin::Mesh,
+        };
         turn_ring.record(key, &payload, origin);
     }
     Some(payload)
@@ -1720,27 +1806,14 @@ pub async fn run_mesh_link(
                         }
                         for payload in mesh_received.delivery.fresh {
                             let slot = SlotId(payload.slot as u8);
-                            // A remote slot's frame observation, validated by its
-                            // home relay. Lobby turns carry no frame and don't
-                            // move the consensus coordinate.
-                            if let Some(frame) = payload.game_frame_count {
-                                crate::consensus::observe_turn_frame(
-                                    &decision_makers,
-                                    &key,
-                                    slot,
-                                    payload.seq,
-                                    rally_point_proto::ids::GameFrameCount(frame),
-                                    crate::delivery::DeliveryHome::Peer(peer_id),
-                                );
-                            }
-                            // NOTE: no desync-comparator call here. This relay
-                            // may also reach the same turn via a different
-                            // mesh path (or the client edge, if it's local),
-                            // so counting it here — before dedup — would
-                            // double-count it. `forward_turn` below funnels
-                            // into `deliver_turn_to_locals`, which feeds the
-                            // comparator exactly once, right after its
-                            // mark_seen check.
+                            // NOTE: no frame-observation or desync-comparator
+                            // call here. This relay may also reach the same
+                            // turn via a different mesh path (or the client
+                            // edge, if it's local), so feeding consensus here
+                            // — before dedup — would double-count it.
+                            // `forward_turn` below funnels into
+                            // `deliver_turn_to_locals`, which feeds both
+                            // exactly once, right after its mark_seen check.
                             forward_turn(
                                 &sessions,
                                 &mesh_links,
@@ -1750,7 +1823,7 @@ pub async fn run_mesh_link(
                                 &key,
                                 slot,
                                 payload,
-                                crate::turn_ring::TurnOrigin::Mesh,
+                                crate::delivery::DeliveryHome::Peer(peer_id),
                             );
                         }
                         continue;
@@ -1822,13 +1895,18 @@ pub async fn run_mesh_link(
                         {
                             break MeshLinkExit::ConnectionFailed;
                         }
-                        dispatch_mesh_control(
-                            frame,
-                            peer_id,
-                            &joined,
-                            &sessions,
-                            &mesh_for_dispatch,
-                        );
+                        // An oversize turn's transport-dedup fold also needs
+                        // direct link access, so it too runs here. A copy the
+                        // link has already delivered stops before dispatch.
+                        if fold_oversize_into_link(&mut link, &frame, &joined) {
+                            dispatch_mesh_control(
+                                frame,
+                                peer_id,
+                                &joined,
+                                &sessions,
+                                &mesh_for_dispatch,
+                            );
+                        }
                     }
                     // The reader task ended: a one-sided stream reset, an
                     // over-cap frame, a decode failure, or a clean EOF. This
@@ -2033,6 +2111,20 @@ pub async fn run_mesh_link(
                             continue;
                         }
                         link.open_session(mesh_session_key(&key));
+                        // Anchor each slot's receive window at the seq this
+                        // session actually still needs — its forwarded-to-locals
+                        // cursor — rather than 0. A session joins a link
+                        // mid-stream whenever the link redialed (or this relay
+                        // joined a running session), so an unanchored window
+                        // would open a full window's width behind the live
+                        // stream. The peer's resume replay (asked for just
+                        // below) starts from these same cursors, so the window
+                        // and the replay agree on where the stream resumes.
+                        // No-op on slots with no contiguous forwarded prefix;
+                        // the window's own forward collapse covers those.
+                        for (slot, next_needed) in resume_cursor_snapshot(&seen_registries, &key) {
+                            link.anchor_receive_window(mesh_session_key(&key), slot, next_needed);
+                        }
                         let registration = register_mesh_link(
                             &mesh_links,
                             key.clone(),
@@ -2288,25 +2380,14 @@ fn dispatch_mesh_control(
                 );
                 return;
             };
-            // The same receive step a datagram-delivered mesh turn runs: a
-            // validated remote slot's frame observation, then the shared local
-            // delivery (dedup, stamp, local fan-out). Delivery below the fan-out
-            // needs nothing new — a slot link whose client's path can't take the
-            // turn diverts it onto that client's own control stream.
-            if let Some(frame) = payload.game_frame_count {
-                crate::consensus::observe_turn_frame(
-                    &mesh.decision_makers,
-                    &key,
-                    slot,
-                    payload.seq,
-                    rally_point_proto::ids::GameFrameCount(frame),
-                    crate::delivery::DeliveryHome::Peer(peer_id),
-                );
-            }
-            // NOTE: no desync-comparator call here — `deliver_turn_to_locals`
-            // below feeds it, after its own mark_seen dedup, so a redundant
-            // control-stream copy (or an echo also seen via a datagram path)
-            // isn't double-counted.
+            // The same receive step a datagram-delivered mesh turn runs: the
+            // shared local delivery (dedup, frame observation, stamp, local
+            // fan-out). Delivery below the fan-out needs nothing new — a slot
+            // link whose client's path can't take the turn diverts it onto
+            // that client's own control stream. The transport-level dedup fold
+            // for this stream-delivered seq already ran in the driver's own
+            // select branch (`fold_oversize_into_link`), which has the link
+            // access this dispatch doesn't.
             let _ = deliver_turn_to_locals(
                 sessions,
                 &mesh.seen,
@@ -2315,7 +2396,7 @@ fn dispatch_mesh_control(
                 &key,
                 slot,
                 payload,
-                crate::turn_ring::TurnOrigin::Mesh,
+                crate::delivery::DeliveryHome::Peer(peer_id),
             );
         }
         Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
@@ -4354,7 +4435,7 @@ mod tests {
                 &key,
                 SlotId(0),
                 first.clone(),
-                crate::turn_ring::TurnOrigin::Local,
+                crate::delivery::DeliveryHome::Local,
             )
             .is_some(),
             "the first delivery is fresh",
@@ -4368,7 +4449,7 @@ mod tests {
                 &key,
                 SlotId(0),
                 first,
-                crate::turn_ring::TurnOrigin::Local,
+                crate::delivery::DeliveryHome::Local,
             )
             .is_none(),
             "the redelivery is caught by mark_seen and never reaches the comparator",
@@ -4388,7 +4469,7 @@ mod tests {
             &key,
             SlotId(1),
             sync_payload(0, 1, 0, value),
-            crate::turn_ring::TurnOrigin::Local,
+            crate::delivery::DeliveryHome::Local,
         );
         for ordinal in 1..12u8 {
             deliver_turn_to_locals(
@@ -4399,7 +4480,7 @@ mod tests {
                 &key,
                 SlotId(0),
                 sync_payload(u64::from(ordinal), 0, ordinal, value),
-                crate::turn_ring::TurnOrigin::Local,
+                crate::delivery::DeliveryHome::Local,
             );
             deliver_turn_to_locals(
                 &sessions,
@@ -4409,13 +4490,97 @@ mod tests {
                 &key,
                 SlotId(1),
                 sync_payload(u64::from(ordinal), 1, ordinal, value),
-                crate::turn_ring::TurnOrigin::Local,
+                crate::delivery::DeliveryHome::Local,
             );
         }
 
         assert!(
             rx.try_recv().is_err(),
             "no desync notice: the duplicate delivery did not perturb ordinal alignment",
+        );
+    }
+
+    /// The leave-frame clamp's history must record each distinct `(slot, seq)`
+    /// turn exactly once, even though a multi-relay mesh legitimately delivers
+    /// the same turn to a relay via more than one path (a peer's direct copy
+    /// plus another peer's reflood). The history is a bounded append — unlike
+    /// the per-slot frame max, which is a harmless monotone — so duplicates
+    /// walked twice would evict genuine low-seq history and leave
+    /// `reachable_frame` with nothing at or below its threshold, pushing its
+    /// fallback frames too high: exactly the opening a departing slot's
+    /// inflated frame claim needs to strand survivors past a reachable frame.
+    #[test]
+    fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+
+        let sessions = routing::Sessions::default();
+        let seen = new_seen_registries();
+        let decision_makers = Arc::new(consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
+        let key = control_key();
+        let _ = consensus::sync_maker(
+            &decision_makers,
+            &key,
+            BufferBounds::new(1, 6).unwrap(),
+            Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+
+        // The survivor's turns each arrive twice: the home peer's direct copy,
+        // then another peer's reflood of the same turn. Only the first passes
+        // the topological dedup; the reflood must leave no trace in the frame
+        // history.
+        for seq in 0..=21u64 {
+            let payload = Payload {
+                seq,
+                slot: 0,
+                game_frame_count: Some(100 + seq as u32),
+                commands: vec![0x05].into(),
+                ..Default::default()
+            };
+            assert!(
+                deliver_turn_to_locals(
+                    &sessions,
+                    &seen,
+                    &decision_makers,
+                    &turn_ring,
+                    &key,
+                    SlotId(0),
+                    payload.clone(),
+                    crate::delivery::DeliveryHome::Peer(RelayId(2)),
+                )
+                .is_some(),
+                "the direct copy is fresh",
+            );
+            assert!(
+                deliver_turn_to_locals(
+                    &sessions,
+                    &seen,
+                    &decision_makers,
+                    &turn_ring,
+                    &key,
+                    SlotId(0),
+                    payload,
+                    crate::delivery::DeliveryHome::Peer(RelayId(3)),
+                )
+                .is_none(),
+                "the reflood is a topological duplicate",
+            );
+        }
+
+        // With bounds max 6 the history keeps 10 entries (seqs 12..=21) and the
+        // frontier is seq 21, so the proven-executed threshold is seq 15: the
+        // survivor's provable frame is 115. Doubled appends would have evicted
+        // everything at or below the threshold (leaving seqs 17..=21 twice) and
+        // pushed the fallback to 117 — past what the survivor provably reached.
+        assert_eq!(
+            consensus::reachable_frame(&decision_makers, &key, SlotId(1)),
+            Some(115),
+            "the clamp ceiling reflects single-counted history",
         );
     }
 
@@ -4572,6 +4737,60 @@ mod tests {
             "slot 1 fully retired despite the malformed entry alongside it; \
              only slot 0's seq 2 remains",
         );
+    }
+
+    /// `fold_oversize_into_link` records a stream-delivered oversize turn in
+    /// the link's per-session receive dedup — advancing the delivered-through
+    /// cursor the ack-beacon pushes — and gates dispatch: a fresh turn (and
+    /// every non-oversize frame) proceeds, an already-delivered copy is
+    /// dropped before it burns a session-level dedup pass, and a frame for an
+    /// unjoined session passes through for the dispatch's own defensive drop.
+    #[tokio::test]
+    async fn fold_oversize_into_link_advances_the_dedup_and_gates_dispatch() {
+        let (mut link, _client_ep, _server_ep) = connected_mesh_link().await;
+        let key = control_key();
+        let session = key.session;
+        link.open_session(mesh_session_key(&key));
+        let mut joined = HashMap::new();
+        joined.insert(session, bare_session_state(key.clone()));
+
+        let oversize = MeshControlFrame {
+            session: session.0,
+            kind: Some(mesh_control_frame::Kind::OversizeTurn(Payload {
+                seq: 0,
+                slot: 0,
+                commands: vec![0xAB; 2000].into(),
+                ..Default::default()
+            })),
+        };
+
+        assert!(
+            fold_oversize_into_link(&mut link, &oversize, &joined),
+            "a fresh oversize turn proceeds to dispatch",
+        );
+        assert_eq!(
+            link.delivered_through(mesh_session_key(&key), SlotId(0)),
+            Some(0),
+            "the stream-delivered seq advances the link's delivered prefix",
+        );
+
+        assert!(
+            !fold_oversize_into_link(&mut link, &oversize, &joined),
+            "a redundant copy is dropped before dispatch",
+        );
+
+        // Any other frame kind passes straight through.
+        let other = ack_cursors_frame(session, vec![(SlotId(0), 0)]);
+        assert!(fold_oversize_into_link(&mut link, &other, &joined));
+
+        // A session this link hasn't joined has no transport state to fold
+        // into; the frame still reaches the dispatch's own unjoined-session
+        // drop.
+        let unjoined = MeshControlFrame {
+            session: 99,
+            ..oversize.clone()
+        };
+        assert!(fold_oversize_into_link(&mut link, &unjoined, &joined));
     }
 
     /// `reconcile_ack_cursors` pushes a session's advanced cursors exactly

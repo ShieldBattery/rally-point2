@@ -1036,7 +1036,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
 -> Result<(), AnyError> {
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus;
-    use rally_point_relay::turn_ring::TurnOrigin;
+    use rally_point_relay::delivery::DeliveryHome;
 
     let tenant = make_tenant();
     let session = SessionId(9);
@@ -1160,7 +1160,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         &key,
         SlotId(0),
         turn(0, triggering_seq),
-        TurnOrigin::Local,
+        DeliveryHome::Local,
     );
 
     // A's driver resets on the full queue and redials; B's real accept loop
