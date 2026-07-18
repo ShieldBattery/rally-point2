@@ -40,10 +40,13 @@ tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 # The session-create HTTP client, built on hyper + hyper-util directly (the same
 # stack the coordinator's webhook client uses) rather than adding reqwest — the
-# workspace pins a ring-only TLS graph and the create path is plain HTTP over
-# loopback/staging anyway.
+# workspace pins a ring-only TLS graph. hyper-rustls adds https:// support (the
+# staging coordinator's in-process ACME cert) on top of the same connector, on
+# the ring provider, while still falling through to plain http:// for the
+# loopback dev flow.
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 

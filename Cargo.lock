@@ -2494,6 +2494,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "rally-point-client",
  "rally-point-proto",

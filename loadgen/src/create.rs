@@ -2,17 +2,21 @@
 //! session, exactly as the coordinator's inbound-request contract expects it.
 //!
 //! Built on hyper + hyper-util directly (the same stack the coordinator's own
-//! outbound webhook client uses) rather than pulling in a heavier HTTP client:
-//! the create path is plain JSON over HTTP against a loopback/staging
-//! coordinator. A `202 provisioning` hold is handled by re-sending the identical
-//! body after the response's `retry_after_ms` (idempotent on the request's
-//! `external_id`), signing fresh each attempt so the replay-window check passes.
+//! outbound webhook client uses) rather than pulling in a heavier HTTP client.
+//! The connector handles both `https://` (a staging/prod coordinator, which
+//! terminates TLS itself via in-process ACME) and `http://` (a loopback dev
+//! coordinator), mirroring the coordinator's own webhook client
+//! (`coordinator::notify::WEBHOOK_CLIENT`). A `202 provisioning` hold is
+//! handled by re-sending the identical body after the response's
+//! `retry_after_ms` (idempotent on the request's `external_id`), signing fresh
+//! each attempt so the replay-window check passes.
 
 use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rally_point_proto::control::SessionResponse;
@@ -27,13 +31,20 @@ const SESSION_CREATE_PATH: &str = "/session/create";
 /// request cannot hold a session task forever.
 const MAX_PROVISIONING_HOLDS: u64 = 60;
 
-/// The shared HTTP client the harness posts creates on. Plain HTTP (no TLS):
-/// the create path targets a loopback/staging coordinator over `http://`.
-pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
+/// The shared HTTP client the harness posts creates on. Negotiates rustls
+/// (ring provider, webpki public-CA roots) for an `https://` coordinator URL
+/// and falls through to plain HTTP for `http://` (the loopback dev flow) —
+/// the same connector configuration as the coordinator's own webhook client.
+pub type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 /// Builds the shared create client.
 pub fn build_client() -> HttpClient {
-    Client::builder(hyper_util::rt::TokioExecutor::new()).build_http()
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Client::builder(hyper_util::rt::TokioExecutor::new()).build(https)
 }
 
 /// The outcome of a create attempt.
