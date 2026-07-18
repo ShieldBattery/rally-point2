@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["proto", "transport", "client", "relay", "coordinator", "dev-beacon"]
+members = ["proto", "transport", "client", "relay", "coordinator", "dev-beacon", "loadgen"]
 # `infra/` (Fargate / beacon IaC, Phase 5) is intentionally NOT a workspace
 # member — its tooling (CDK vs Terraform vs Pulumi) is undecided and is not Rust.
 

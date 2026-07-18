@@ -1,0 +1,54 @@
+[package]
+name = "rally-point-loadgen"
+description = "Synthetic load harness for netcode v2: drives many concurrent sessions through a real coordinator and relays without running any game clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "rally-point-loadgen"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The same client transport the game DLL links: dial, credentials, LinkDriver.
+# Re-exports rally-point-proto (control/token/messages) and rally-point-transport
+# (quinn/rustls), so the harness depends on one client surface.
+rally-point-client = { workspace = true }
+rally-point-proto = { workspace = true }
+# Multi-thread runtime, the conductor's ramp timer, and per-player tasks.
+tokio = { workspace = true }
+# Session-create request/response JSON.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# CLI.
+clap = { workspace = true }
+# --client-key seed decoding and the request signature's hex header.
+hex = { workspace = true }
+# Ed25519: per-player keypair generation and the request-signing key.
+ring = { workspace = true }
+# Structured logs.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Top-level error handling.
+color-eyre = { workspace = true }
+# The session-create HTTP client, built on hyper + hyper-util directly (the same
+# stack the coordinator's webhook client uses) rather than adding reqwest — the
+# workspace pins a ring-only TLS graph and the create path is plain HTTP over
+# loopback/staging anyway.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+# The relay's turn validator, so the turn-builder tests assert every generated
+# turn validates clean with zero stripped commands — exactly what the relay's
+# ingress does to each turn on the wire.
+rally-point-relay = { workspace = true }
