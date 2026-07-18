@@ -1,0 +1,11 @@
+# Both Dockerfiles `COPY . .` into their build stage; without this the build
+# context ships the host's `target/` (gigabytes, invalidating the layer cache
+# on every local build) and `.git/` — neither belongs in an image build, and a
+# hermetic build should see only the sources `cargo build --locked` needs.
+target/
+.git/
+.github/
+docs/
+deployment/
+infra/
+*.md

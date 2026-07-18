@@ -1,0 +1,37 @@
+name: Terraform
+
+# Format and validity gates for the infra stacks — the two checks that need no
+# AWS credentials or state, so they can run on every PR: `fmt -check` keeps the
+# two stacks' style uniform, and `validate` catches syntax/reference errors
+# before an operator's manual `plan`/`apply` (the runbook's own steps) would
+# trip over them against real state.
+on:
+  push:
+    branches: [main]
+    paths: ['infra/terraform/**']
+  pull_request:
+    paths: ['infra/terraform/**']
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt + validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stack: [account, fleet]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v3
+      - name: fmt
+        working-directory: infra/terraform/${{ matrix.stack }}
+        run: terraform fmt -check -recursive -diff
+      - name: validate
+        working-directory: infra/terraform/${{ matrix.stack }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

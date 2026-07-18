@@ -20,7 +20,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p rally-point-relay
+RUN cargo build --locked --release -p rally-point-relay
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/rally-point-relay /usr/local/bin/rally-point-relay

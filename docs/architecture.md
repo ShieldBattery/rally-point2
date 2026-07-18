@@ -385,7 +385,7 @@ relay, else `unavailable` — updating the serving set (which is also the descri
 rebuilding every serving relay's descriptor as **resumed**, and pushing R_new's first so it is staged before
 the response returns (the client's backoff absorbs the residual descriptor/dial race). The response is
 snake_case `{ "decision", "relay"? }`, where `relay` (present only when `decision` is `newTarget`) is
-`{ "relay_id", "relay_addr", "cert_der" }` with the cert hex-encoded.
+`{ "relay_id", "relay_addr", "cert_der" }` with the cert DER as a JSON byte array (serde_bytes under serde_json).
 The decision is idempotent per `(session, dead_relay)`, so concurrent or repeated asks return the same target
 without re-mutating — and this recorded-target lookup runs *before* the stay check, so a dead relay that has
 since restarted and re-enrolled under a fresh cert does not flip an already-re-homed straggler (still pinned to

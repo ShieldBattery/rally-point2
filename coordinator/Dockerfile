@@ -17,7 +17,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p rally-point-coordinator && mkdir /data-skel
+RUN cargo build --locked --release -p rally-point-coordinator && mkdir /data-skel
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 # /data exists in the image owned by the runtime user (nonroot, 65532) so a
