@@ -13,3 +13,7 @@ relay_image_tag = "latest"
 # was anywhere near CPU-bound.
 task_cpu    = 1024
 task_memory = 2048
+
+# The publish workflow ships the relay image multi-arch, and Graviton runs
+# ~20% cheaper per vCPU-hour than x86 at Fargate's on-demand rates.
+cpu_architecture = "ARM64"
