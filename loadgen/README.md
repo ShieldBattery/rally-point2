@@ -86,6 +86,37 @@ Each player's turn is a valid SC:R command stream the relay's validator accepts:
 - the turn's `game_frame_count` advances by one per turn — it is the consensus coordinate the
   buffer/leave engines key on and the harness's latency-correlation key.
 
+## Load box setup (cloud runs)
+
+The harness is CPU-light but network-sensitive; a mis-tuned box produces failures that look
+exactly like relay problems. A known-good recipe (EC2, us-east-1, co-located with the staging
+relays so the internet isn't the confound):
+
+- **Instance:** `c7g.2xlarge` (8-vCPU Graviton) on Amazon Linux 2023 arm64, 30 GB gp3. Big
+  enough that the box is never the bottleneck at hundreds of clients; the crate builds from a
+  source tarball in ~35 s (`dnf install -y gcc perl`, rustup stable minimal,
+  `cargo build --release -p rally-point-loadgen`).
+- **UDP socket buffers — REQUIRED.** AL2023's default `net.core.rmem_max` (~208 KiB) drops
+  datagrams under even moderate multi-session QUIC load. Symptoms measured before tuning, at
+  just 75 2-player sessions: ~48% of players failing to dial (handshake packets lost), turn
+  fan-out p50 of ~36 ms, tens of thousands of stalls — all of it vanishing (p50 ~0.5 ms, zero
+  stalls, zero dial-fails) with the same load shape after:
+
+      sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=8388608 \
+                   net.core.wmem_max=33554432 net.core.wmem_default=8388608 \
+                   net.core.netdev_max_backlog=5000
+
+  A dial-fail rate that survives a low `--arrival-rate` is this, not a relay connect limit —
+  rule it out before concluding anything about per-relay capacity.
+- **`--ipv4-only` on a v6-less box.** A default-VPC subnet has no IPv6 route; relays advertise
+  v6-primary, so without the flag every player burns (or fails) the v6 dial first. The flag is
+  load-box hygiene only — it does not touch relays.
+- **Security group:** SSH inbound from the operator's IP only; no other inbound needed (the
+  group is stateful, so QUIC egress return traffic flows on its own).
+- **Driving ssh from Windows:** pass `-o IdentityAgent=none` — an installed-but-unresponsive
+  Pageant pipe otherwise wedges every connection at the agent lookup, which presents as ssh
+  hanging before authentication.
+
 ## Load-testing playbook (the runs that matter)
 
 1. **Single-relay saturation (loopback or one cloud relay):** ramp sessions on one relay until
