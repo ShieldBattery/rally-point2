@@ -1,11 +1,18 @@
 name: Publish relay image
 
-# Every commit on main gets an image at
+# Every commit on main gets a MULTI-ARCH image (linux/amd64 + linux/arm64) at
 # <account>.dkr.ecr.us-east-1.amazonaws.com/rp2-relay tagged with its full SHA
-# (plus a moving `latest`). us-east-1 is the home registry; ECR replication
-# (configured by Terraform, not this workflow) copies each push to us-west-2
+# (plus a moving `latest`). Each architecture builds natively on its own hosted
+# runner — no QEMU emulation, which would make the Rust build an order of
+# magnitude slower — pushing an arch-suffixed tag, and a final job stitches the
+# two into one manifest list under the SHA and `latest` tags. The fleet's
+# Fargate task definitions pick the architecture via their `cpu_architecture`
+# runtime platform; either choice pulls the right image from the same tag.
+#
+# us-east-1 is the home registry; ECR replication (configured by Terraform, not
+# this workflow) copies each push — including the manifest list — to us-west-2
 # and eu-central-1 so a Fargate task never has to pull cold across regions.
-# Authentication is keyless: this job assumes an IAM role over GitHub's OIDC
+# Authentication is keyless: these jobs assume an IAM role over GitHub's OIDC
 # identity token, so no long-lived AWS credential is stored in the repo. For
 # tamper-evident production pinning, prefer the image *digest* over the SHA
 # tag (tags are mutable in ECR; digests are not).
@@ -14,8 +21,8 @@ name: Publish relay image
 # `repo_name` variable the account stack was applied with.
 #
 # Repos/forks that haven't set the RELAY_ECR_ROLE_ARN variable (see the
-# account stack's outputs) skip this job instead of failing, so a fork without
-# AWS access still gets a green CI run.
+# account stack's outputs) skip these jobs instead of failing, so a fork
+# without AWS access still gets a green CI run.
 on:
   push:
     branches: [main]
@@ -26,10 +33,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: build + push
-    runs-on: ubuntu-latest
+  build:
+    name: build + push (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     if: vars.RELAY_ECR_ROLE_ARN != ''
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       id-token: write
       contents: read
@@ -47,8 +61,33 @@ jobs:
           context: .
           file: relay/Dockerfile
           push: true
-          tags: |
-            ${{ steps.login-ecr.outputs.registry }}/rp2-relay:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/rp2-relay:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Arch-suffixed tag only; the manifest job below owns the SHA and
+          # `latest` tags so they are always complete two-arch lists.
+          tags: ${{ steps.login-ecr.outputs.registry }}/rp2-relay:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=relay-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=relay-${{ matrix.arch }}
+
+  manifest:
+    name: stitch multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: build
+    if: vars.RELAY_ECR_ROLE_ARN != ''
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.RELAY_ECR_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - name: Create the SHA + latest manifest lists
+        run: |
+          docker buildx imagetools create \
+            -t "$REGISTRY/rp2-relay:$GITHUB_SHA" \
+            -t "$REGISTRY/rp2-relay:latest" \
+            "$REGISTRY/rp2-relay:$GITHUB_SHA-amd64" \
+            "$REGISTRY/rp2-relay:$GITHUB_SHA-arm64"
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
