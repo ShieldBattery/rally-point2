@@ -33,6 +33,7 @@ use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
 use rally_point_relay::coordinator_client;
+use rally_point_relay::idle_exit;
 use rally_point_relay::mesh;
 use rally_point_relay::mesh_control;
 use rally_point_relay::mesh_dialer;
@@ -205,6 +206,16 @@ struct Cli {
     /// its default is harmless outside Fargate.
     #[arg(long, env = "RELAY_TASK_STATS_INTERVAL_SECS", default_value_t = 10)]
     task_stats_interval_secs: u64,
+
+    /// How long the relay must continuously hold zero sessions AND no coordinator
+    /// control connection before it exits on its own, so the task platform can
+    /// reclaim an idle task whose coordinator vanished (died, restarted with ledger
+    /// loss, or left this task orphaned). `0` disables the self-exit. A relay with
+    /// no coordinator configured never self-exits regardless of this value — a
+    /// standalone/dev relay has no enrollment to lose and serves for as long as it
+    /// runs.
+    #[arg(long, env = "RELAY_IDLE_UNENROLLED_EXIT_SECS", default_value_t = 900)]
+    idle_unenrolled_exit_secs: u64,
 }
 
 /// How long the drain sequence waits for the coordinator's `DrainAck` before
@@ -372,6 +383,13 @@ async fn main() -> Result<()> {
         Arc::clone(&mesh_state.decision_makers),
         rally_point_relay::flight_recorder::SAMPLE_INTERVAL,
     ));
+
+    // A read handle onto the coordinator control-connection state, hoisted out of
+    // the coordinator-config block so the idle self-exit can watch it. Populated
+    // with a clone of the control-connected receiver only when a coordinator is
+    // configured; left `None` otherwise, which is exactly what makes a relay with
+    // no coordinator never self-exit.
+    let mut idle_exit_connected_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
 
     // The mesh-edge connection half. When a relay-id is configured, spawn the
     // accept drain (peer relays dialing us arrive on `mesh_accept`) and one
@@ -566,6 +584,10 @@ async fn main() -> Result<()> {
             // (no coordinator URL) never constructs it and never spawns the
             // sweep task at all — the simplest possible "never arms".
             let (control_connected_tx, control_connected_rx) = tokio::sync::watch::channel(false);
+            // Hand the idle self-exit a read handle onto the same signal: a relay
+            // that loses this control connection and holds no session self-reaps
+            // once both have held for the exit threshold.
+            idle_exit_connected_rx = Some(control_connected_rx.clone());
 
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
                 coordinator_client::EnrollConfig {
@@ -620,9 +642,11 @@ async fn main() -> Result<()> {
 
     // Keep serving during the drain: existing sessions' clients still connect and
     // play while we wind down, so the server runs on its own task rather than being
-    // awaited inline. Clone the roster first so the drain path can watch local slot
-    // liveness after `sessions` moves into the server.
+    // awaited inline. Clone the roster first so the drain path (and the idle
+    // self-exit) can watch local slot liveness after `sessions` moves into the
+    // server.
     let sessions_for_drain = Arc::clone(&sessions);
+    let sessions_for_idle = Arc::clone(&sessions);
     let mut server = tokio::spawn(server::run(
         cli.listen,
         server_config,
@@ -654,8 +678,40 @@ async fn main() -> Result<()> {
             // coordinator-mediated failover re-homes their clients onto a live relay.
             tracing::info!("drain complete; exiting");
         }
+        report = idle_exit::run(
+            sessions_for_idle,
+            idle_exit_connected_rx,
+            cli.idle_unenrolled_exit_secs,
+        ) => {
+            // Zero sessions and no coordinator control connection held past the exit
+            // threshold: the coordinator vanished, so exit and let the task platform
+            // reclaim the task. This one line is what distinguishes a self-reap from
+            // a crash in the task logs.
+            tracing::info!(
+                idle_secs = report.idle_for.as_secs(),
+                "idle with no coordinator control connection past the exit threshold; exiting",
+            );
+            // Zero sessions is the precondition, so there is nothing to drain and no
+            // coordinator to exchange a drain with — just flush any pending flight
+            // recordings before the process goes away.
+            flush_flight_recordings(&flight).await;
+        }
     }
     Ok(())
+}
+
+/// Flushes whatever flight recordings remain to their sink, bounded by
+/// [`flight_recorder::DRAIN_FLUSH_TIMEOUT`](rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT).
+/// Both process-exit paths — the coordinated drain and the idle self-exit — end
+/// with this so a session's observability is not lost when the process goes away.
+/// Whatever the deadline cuts off is logged and abandoned: flight data is
+/// observability, never backpressure, and the rings are size-capped and live
+/// sessions bounded, so the volume always fits the timeout, which nests under
+/// Fargate's `stopTimeout`.
+async fn flush_flight_recordings(flight: &rally_point_relay::flight_recorder::FlightRecorder) {
+    flight
+        .flush_all(rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT)
+        .await;
 }
 
 /// Resolves when the process receives a shutdown signal: `Ctrl-C` everywhere, plus
@@ -741,16 +797,10 @@ async fn drain_and_exit(
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
 
-    // Flush whatever flight recordings remain — sessions that never reached
-    // their ordinary close-time flush (still running at the deadline, or ended
-    // by a descriptor removal with no local slot to close). Bounded by its own
-    // deadline inside the drain budget: the rings are size-capped and live
-    // sessions bounded, so the volume always fits DRAIN_FLUSH_TIMEOUT, which
-    // nests under the 90s drain timeout and Fargate's 120s stopTimeout — the
-    // size caps exist precisely so this flush can never wedge the shutdown.
-    flight
-        .flush_all(rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT)
-        .await;
+    // Flush whatever flight recordings remain — sessions that never reached their
+    // ordinary close-time flush (still running at the deadline, or ended by a
+    // descriptor removal with no local slot to close).
+    flush_flight_recordings(flight).await;
 }
 
 fn init_tracing() {

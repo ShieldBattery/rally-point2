@@ -647,10 +647,14 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// queues the connection ships up ([`OutboundQueues`], which documents the
 /// park-across-reconnect discipline); `sessions` and `region_rtt_cache` are what
 /// each heartbeat carries; `drain` (with `apply_targets.drain_acked`) is the
-/// coordinated-drain seam; `control_connected` reports whether the connection is
-/// currently established, so the provisional-admission sweep
+/// coordinated-drain seam; `control_connected` reports whether this relay is
+/// enrolled and receiving coordinator pushes — set `true` on the first inbound
+/// application frame (which an accepted enroll always sends and a refusal never
+/// does), cleared on every disconnect — so the provisional-admission sweep
 /// ([`crate::provisional::run_sweep`]) arms only while it is `true` rather than
-/// reaping across a reconnect gap.
+/// reaping across a reconnect gap, and the idle self-exit
+/// ([`crate::idle_exit::run`]) reads it as the "not enrolled" half of its exit
+/// condition.
 ///
 /// This entry injects the production reconnect delays and heartbeat interval;
 /// [`run_descriptor_subscriber_with`] takes them explicitly so a test need not wait
@@ -793,12 +797,6 @@ async fn connect_and_stream(
         relay_id = relay_id.0,
         "coordinator control connection established",
     );
-    // Reported established the instant the Hello is on the wire, matching
-    // this connection's own "on connect, the full descriptor set resyncs
-    // immediately" contract: the provisional-admission sweep arming here is
-    // exactly what lets it restart every mark's window right as that resync
-    // is about to land, rather than waiting on it.
-    let _ = control_connected.send(true);
 
     // Complete the enroll proof-of-possession handshake before sending any
     // application frame. The coordinator sends an `IdentityChallenge` as the
@@ -904,7 +902,7 @@ async fn connect_and_stream(
     // by the writer through `&mut` — carry whatever stayed undelivered straight back
     // to the caller no matter which half ended the connection.
     tokio::select! {
-        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx, read_stats) => result,
+        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx, read_stats, control_connected) => result,
         result = write_control_frames(
             sink,
             outbound,
@@ -932,6 +930,13 @@ async fn connect_and_stream(
 /// write half through `challenge_tx` rather than answered here. A `Close` (or the
 /// stream ending, or a read/decode error) ends the connection with the same
 /// classification a close carries anywhere.
+///
+/// The first successfully decoded application frame reports the control connection
+/// established through `control_connected`: an accepted enroll always leads with a
+/// connect-time push (tenant keys first), while every refusal — version, region,
+/// identity, or ledger enrollment — closes without ever pushing one, so the first
+/// inbound frame here is precisely the "this enroll was accepted" signal, and a
+/// refusal loop never reads as connected.
 async fn read_control_frames(
     mut stream: impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
     + Unpin,
@@ -940,7 +945,12 @@ async fn read_control_frames(
     challenge_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     flight_grant_tx: UnboundedSender<FlightGrant>,
     stats: ControlConnStats,
+    control_connected: &watch::Sender<bool>,
 ) -> Result<ControlDisconnect, ControlError> {
+    // Set once, on the first decoded application frame: it is the accepted-enroll
+    // signal (see this function's doc). The reconnect loop clears it uniformly on
+    // disconnect, so it never carries a stale reading into the next connection.
+    let mut connected_reported = false;
     loop {
         // The stream ended (no close frame): let the caller redial.
         let Some(message) = stream.next().await else {
@@ -949,6 +959,10 @@ async fn read_control_frames(
         match message? {
             Message::Text(text) => {
                 let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
+                if !connected_reported {
+                    let _ = control_connected.send(true);
+                    connected_reported = true;
+                }
                 match message {
                     CoordinatorToRelay::DrainAck => {
                         // The coordinator has marked us ineligible and pushed our
@@ -2949,6 +2963,126 @@ mod tests {
             rest.contains(&RelayToCoordinator::Draining),
             "the drain re-assert goes out only after the proof",
         );
+    }
+
+    // --- Control-connected reporting ---
+
+    #[tokio::test]
+    async fn an_enroll_refused_after_the_proof_never_reports_control_connected() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Stand-in coordinator: accept, complete the enroll challenge/proof, then
+        // refuse the enrollment with the ledger-unauthorized close — the refusal
+        // that lands only AFTER the proof round trip, so it exercises the path
+        // where an application frame could otherwise be mistaken for acceptance.
+        // No application frame is ever pushed, so the connection must never report
+        // connected.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let _ = ws
+                .close(Some(CloseFrame {
+                    code: CloseCode::from(CONTROL_CLOSE_ENROLL_UNAUTHORIZED),
+                    reason: "not authorized by the ledger".into(),
+                }))
+                .await;
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let (connected_tx, mut connected_rx) = watch::channel(false);
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlConnStats::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            connected_tx,
+            // A long refusal backoff so the relay does not redial and re-drive the
+            // handshake during the observation window (an enroll-unauthorized close
+            // takes the refusal backoff).
+            backoff(Duration::from_millis(20), Duration::from_secs(3600)),
+        ));
+
+        // Actively wait for connected to flip true across the whole attempt; the
+        // wait must time out, since a post-proof refusal never pushes the
+        // application frame that would report it.
+        let observed = tokio::time::timeout(
+            Duration::from_millis(500),
+            connected_rx.wait_for(|connected| *connected),
+        )
+        .await;
+        assert!(
+            observed.is_err(),
+            "a post-proof enroll refusal must never report the control connection connected",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_proof_application_frame_reports_control_connected() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Stand-in coordinator: accept, complete the enroll handshake, then push a
+        // TenantKeys frame — the connect-time application frame an accepted enroll
+        // always leads with. Hold the connection open so the relay does not redial.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let keys =
+                serde_json::to_string(&CoordinatorToRelay::TenantKeys { keys: vec![] }).unwrap();
+            ws.send(Message::Text(keys.into())).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let (connected_tx, mut connected_rx) = watch::channel(false);
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlConnStats::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            connected_tx,
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        // The relay reports connected once it reads the first post-proof
+        // application frame (the TenantKeys push).
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            connected_rx.wait_for(|connected| *connected),
+        )
+        .await
+        .expect("the relay reports the control connection connected on the first push")
+        .unwrap();
     }
 
     #[tokio::test]
