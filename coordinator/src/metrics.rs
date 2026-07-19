@@ -250,6 +250,9 @@ static REAP_DIRECTIVES_SENT: AtomicU64 = AtomicU64::new(0);
 static REAP_NUDGES_COALESCED: AtomicU64 = AtomicU64::new(0);
 static CONTROL_SEND_DURATION: SendDurationHistogram = SendDurationHistogram::new();
 static CONTROL_CONNECTION_ENDS: LabeledCounter<String> = LabeledCounter::new();
+static DESCRIPTOR_DELTAS_SENT: AtomicU64 = AtomicU64::new(0);
+static DESCRIPTOR_FULL_SETS_SENT: AtomicU64 = AtomicU64::new(0);
+static DESCRIPTOR_DELTA_ENTRIES_SENT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the coverage bootstrap is currently backing off each region, published
 /// by the reconcile loop as its coverage phase changes (the phase is otherwise
@@ -371,6 +374,25 @@ pub(crate) fn observe_control_send(millis: u64) {
 /// within the liveness window).
 pub(crate) fn control_connection_ended(cause: &str) {
     CONTROL_CONNECTION_ENDS.incr(cause.to_owned());
+}
+
+/// Records one steady-state descriptor delta written down a relay control
+/// connection: a single frame carrying `upserts` descriptors to apply and
+/// `removals` sessions to leave. Bumps the delta-frame count by one and the
+/// delta-entry count by their sum, so a pathological diff (a frame carrying nearly
+/// the whole set) shows as a high entries-per-frame ratio.
+pub(crate) fn descriptor_delta_sent(upserts: usize, removals: usize) {
+    DESCRIPTOR_DELTAS_SENT.fetch_add(1, Ordering::Relaxed);
+    DESCRIPTOR_DELTA_ENTRIES_SENT.fetch_add((upserts + removals) as u64, Ordering::Relaxed);
+}
+
+/// Records one steady-state full descriptor set written down a relay control
+/// connection — the fallback for a relay whose negotiated version predates deltas.
+/// Counted only on the steady-state change arm, never for the connect-time re-sync
+/// or the drain exchange (both of which always send the full set regardless of
+/// version), so the delta-vs-full ratio reflects steady-state pushes alone.
+pub(crate) fn descriptor_full_set_sent() {
+    DESCRIPTOR_FULL_SETS_SENT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Publishes whether the coverage bootstrap is backing off `region`, so the
@@ -566,6 +588,45 @@ pub fn render(state: &CoordinatorState) -> String {
         "rp2_reap_nudges_coalesced_total",
         &[],
         REAP_NUDGES_COALESCED.load(Ordering::Relaxed),
+    );
+
+    write_meta(
+        &mut out,
+        "rp2_descriptor_deltas_sent_total",
+        "Steady-state descriptor delta frames written down relay control connections.",
+        "counter",
+    );
+    write_series(
+        &mut out,
+        "rp2_descriptor_deltas_sent_total",
+        &[],
+        DESCRIPTOR_DELTAS_SENT.load(Ordering::Relaxed),
+    );
+
+    write_meta(
+        &mut out,
+        "rp2_descriptor_full_sets_sent_total",
+        "Steady-state full descriptor sets written down relay control connections (a pre-delta relay's fallback).",
+        "counter",
+    );
+    write_series(
+        &mut out,
+        "rp2_descriptor_full_sets_sent_total",
+        &[],
+        DESCRIPTOR_FULL_SETS_SENT.load(Ordering::Relaxed),
+    );
+
+    write_meta(
+        &mut out,
+        "rp2_descriptor_delta_entries_sent_total",
+        "Descriptor delta entries (upserts plus removals) written down relay control connections.",
+        "counter",
+    );
+    write_series(
+        &mut out,
+        "rp2_descriptor_delta_entries_sent_total",
+        &[],
+        DESCRIPTOR_DELTA_ENTRIES_SENT.load(Ordering::Relaxed),
     );
 
     render_counter_1(

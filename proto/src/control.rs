@@ -820,6 +820,22 @@ pub struct DepartedSlot {
     pub kind: DepartureKind,
 }
 
+/// Identifies one session's descriptor within a relay's set — the `(tenant,
+/// session)` pair a [`SessionDescriptor`] is keyed by. Session ids are unique only
+/// within a tenant, so the tenant is part of the key, mirroring the relay's own
+/// routing key.
+///
+/// A [`CoordinatorToRelay::DescriptorDelta`] names one of these per session it
+/// removes, and the coordinator diffs a relay's descriptor set by this key to
+/// decide what a delta carries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorKey {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session, unique only within `tenant`.
+    pub session: SessionId,
+}
+
 // ---------------------------------------------------------------------------
 // Persistent control connection (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
@@ -971,6 +987,54 @@ pub enum CoordinatorToRelay {
         /// the field, in which case the relay records no fresh lag sample.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         staged_at_unix_ms: Option<u64>,
+    },
+    /// A steady-state change to the relay's session-descriptor set, carrying only
+    /// what changed since the last push on this connection rather than the whole
+    /// set — the bandwidth win that keeps a create ramp from re-serializing an
+    /// O(N) set on every one of N changes. `upserts` are descriptors to apply (a
+    /// session newly assigned to this relay, or an existing one whose descriptor
+    /// changed by value); `removals` name sessions to leave. The relay applies each
+    /// upsert through the same idempotent per-descriptor path a full
+    /// [`Descriptors`](Self::Descriptors) set uses, and leaves each removal the same
+    /// way a session vanishing from a full set is left, so a delta and a full set
+    /// converge to the same applied state.
+    ///
+    /// A delta is only meaningful against the state a full set established, so the
+    /// coordinator sends deltas **only** in steady state and **only** to a relay
+    /// whose negotiated protocol version is at least
+    /// [`ProtocolVersion::DESCRIPTOR_DELTA_MIN`](crate::version::ProtocolVersion::DESCRIPTOR_DELTA_MIN):
+    /// the connect-time re-sync is always a full [`Descriptors`](Self::Descriptors)
+    /// set (which seeds the baseline the deltas build on), and the single ordered
+    /// control connection guarantees that re-sync precedes every delta. A relay that
+    /// predates this variant decodes it as [`Unknown`](Self::Unknown) and would
+    /// silently miss the change — which is exactly why the coordinator gates it on
+    /// the negotiated version and falls back to full sets for an older relay. A
+    /// relay that reconnects re-syncs the full current set, so a delta lost to a
+    /// dropped connection is corrected by the next connection's re-sync, exactly as
+    /// for a full set. The drain exchange keeps pushing the full set, never a delta.
+    DescriptorDelta {
+        /// The coordinator's wall-clock, unix epoch milliseconds, at the moment
+        /// this delta left its outbox — the same staging stamp
+        /// [`Descriptors`](Self::Descriptors) carries, with the same coarse
+        /// cross-host semantics. The coordinator and relay keep independent wall
+        /// clocks, so the difference the relay records as apply lag is meaningful at
+        /// the scale of seconds, not microseconds, and a small skew that reads
+        /// slightly negative is clamped to zero. Absent from a coordinator that
+        /// predates the field, in which case the relay records no fresh lag sample.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged_at_unix_ms: Option<u64>,
+        /// The descriptors to apply — each a session newly assigned to this relay,
+        /// or one whose descriptor changed by value since the last push. Applied
+        /// through the same per-descriptor path a full set uses. Empty (and omitted
+        /// from the wire) for a removal-only delta.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        upserts: Vec<SessionDescriptor>,
+        /// The sessions to leave — each named by its `(tenant, session)` key,
+        /// dropped from the relay's set since the last push. Left through the same
+        /// path a session vanishing from a full set takes. Empty (and omitted from
+        /// the wire) for an upsert-only delta.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removals: Vec<DescriptorKey>,
     },
     /// A reap directive: close the named slots' links so their normal link-death
     /// path (a synced leave, a departure notice) runs. The coordinator arms this
@@ -1867,6 +1931,90 @@ mod tests {
             serde_json::from_str::<CoordinatorToRelay>(old).unwrap(),
             unstamped,
         );
+    }
+
+    #[test]
+    fn coordinator_to_relay_descriptor_delta_roundtrips_json() {
+        // A steady-state delta carrying an upsert, a removal, and the staging stamp
+        // round-trips through its tagged frame intact.
+        let message = CoordinatorToRelay::DescriptorDelta {
+            staged_at_unix_ms: Some(1_700_000_000_123),
+            upserts: vec![SessionDescriptor {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                peers: vec![RelayPeer {
+                    relay_id: RelayId(2),
+                    relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                    cert_der: vec![0x30, 0x82, 0xCC, 0xDD],
+                    relay_addrs: vec![],
+                }],
+                bounds: BufferBounds::new(1, 6).unwrap(),
+                authority_order: vec![RelayId(1), RelayId(2)],
+                external_id: None,
+                slot_refs: vec![],
+                observer_slots: vec![],
+                expected_slots: vec![],
+                homed_slots: vec![],
+                resumed: false,
+                departed_slots: vec![],
+                latency_estimate_ms: Some(45),
+            }],
+            removals: vec![DescriptorKey {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(7),
+            }],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"descriptor_delta\""));
+        assert!(json.contains("\"staged_at_unix_ms\":1700000000123"));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn coordinator_to_relay_descriptor_delta_without_stamp_omits_empty_fields_and_defaults() {
+        // A removal-only delta with no stamp keeps the stamp and the (empty) upserts
+        // off the wire, and round-trips back to the same value.
+        let removal_only = CoordinatorToRelay::DescriptorDelta {
+            staged_at_unix_ms: None,
+            upserts: vec![],
+            removals: vec![DescriptorKey {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(7),
+            }],
+        };
+        let json = serde_json::to_string(&removal_only).unwrap();
+        assert!(!json.contains("staged_at_unix_ms"));
+        assert!(!json.contains("upserts"));
+        assert_eq!(
+            serde_json::from_str::<CoordinatorToRelay>(&json).unwrap(),
+            removal_only,
+        );
+
+        // A bare delta naming only its type — every list field defaulting — parses
+        // rather than erroring, so a minimal frame stays readable.
+        let bare = r#"{"type":"descriptor_delta"}"#;
+        assert_eq!(
+            serde_json::from_str::<CoordinatorToRelay>(bare).unwrap(),
+            CoordinatorToRelay::DescriptorDelta {
+                staged_at_unix_ms: None,
+                upserts: vec![],
+                removals: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn descriptor_delta_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility, the direction that matters here: a relay that
+        // predates `DescriptorDelta` (modeled by the up-direction
+        // `RelayToCoordinator`, which has no such variant) folds the frame into
+        // `Unknown` rather than erroring. That silent skip is exactly the drift the
+        // coordinator's version gate exists to prevent — an older relay is sent full
+        // sets, never a delta.
+        let json = r#"{"type":"descriptor_delta","upserts":[],"removals":[{"tenant":"sb-staging","session":7}]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
     }
 
     #[test]

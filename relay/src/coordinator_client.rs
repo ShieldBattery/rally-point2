@@ -46,8 +46,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport, RelayHello,
-    RelayToCoordinator, SessionDescriptor, SessionPresence,
+    CoordinatorToRelay, DescriptorKey, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport,
+    RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
@@ -1620,6 +1620,22 @@ fn apply_message(
             stats.record_descriptor_apply(descriptors.len(), staged_at_unix_ms);
             reconcile(control, &descriptors, applied);
         }
+        CoordinatorToRelay::DescriptorDelta {
+            staged_at_unix_ms,
+            upserts,
+            removals,
+        } => {
+            // A delta is only meaningful against the applied state the connect-time
+            // full set established. Ordering on the single control connection
+            // guarantees that re-sync precedes every delta (the coordinator sends the
+            // full set before any delta, and a reconnect re-syncs the full set
+            // first), so the relay needs no version or sequence tracking of its own to
+            // apply one safely. Apply first, then record the lag and the resulting
+            // applied-set size — the size of what this relay now holds, not the
+            // delta's entry count.
+            let applied_len = reconcile_delta(control, &upserts, &removals, applied);
+            stats.record_descriptor_apply(applied_len, staged_at_unix_ms);
+        }
         CoordinatorToRelay::CloseSlot {
             tenant,
             session,
@@ -1746,6 +1762,45 @@ fn reconcile(control: &MeshControl, descriptors: &[SessionDescriptor], applied: 
     *applied = present;
 }
 
+/// Applies a descriptor delta against the already-applied full set: each upsert
+/// goes through the same per-descriptor apply a full-set [`reconcile`] uses — which
+/// is what preserves the roster-reconcile-on-apply that resolves a dial race for a
+/// session arriving as a delta upsert — and each removal through the same
+/// per-session leave a descriptor vanishing from a full set takes. Returns the
+/// applied set's size after the delta, so the caller records it as the descriptor
+/// set length (the size of what this relay now holds, not the delta's entry count).
+///
+/// A delta is meaningful only against the state a full set established; the single
+/// ordered control connection guarantees that full-set re-sync precedes every delta
+/// (a reconnect re-syncs the full set first), so no version or sequence tracking is
+/// needed here. The `applied` lock is held across the (sync, await-free) Join-source
+/// calls so the set and the issued commands can never be observed out of step, the
+/// same discipline [`reconcile`] follows.
+fn reconcile_delta(
+    control: &MeshControl,
+    upserts: &[SessionDescriptor],
+    removals: &[DescriptorKey],
+    applied: &AppliedSessions,
+) -> usize {
+    let mut applied = applied.inner.lock();
+    for descriptor in upserts {
+        control.apply_descriptor(descriptor);
+        applied.insert(SessionKey {
+            tenant: descriptor.tenant.clone(),
+            session: descriptor.session,
+        });
+    }
+    for removal in removals {
+        let key = SessionKey {
+            tenant: removal.tenant.clone(),
+            session: removal.session,
+        };
+        control.end_session(&key);
+        applied.remove(&key);
+    }
+    applied.len()
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1863,6 +1918,199 @@ mod tests {
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
         assert!(rx2.try_recv().is_err(), "session 2 stays joined");
         assert_eq!(applied.snapshot(), HashSet::from([key(2)]));
+    }
+
+    #[test]
+    fn a_delta_adds_removes_and_mutates_converging_to_a_full_reconcile() {
+        // The delta path and a full-set reconcile of the same target leave the relay
+        // in the same applied state — a delta is only a cheaper way to reach it.
+        let delta_control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (d2_tx, mut d2_rx) = mpsc::unbounded_channel();
+        let (d3_tx, mut d3_rx) = mpsc::unbounded_channel();
+        delta_control.register_link(RelayId(2), d2_tx);
+        delta_control.register_link(RelayId(3), d3_tx);
+        let delta_applied = AppliedSessions::new();
+
+        // Connect-time full set: sessions 1 and 2 both mesh peer 2.
+        reconcile(
+            &delta_control,
+            &[descriptor(1, &[2]), descriptor(2, &[2])],
+            &delta_applied,
+        );
+        // Drain the baseline joins so the post-delta command stream is clean.
+        while d2_rx.try_recv().is_ok() {}
+        while d3_rx.try_recv().is_ok() {}
+
+        // One delta: add session 3 (meshing peer 2), remove session 1, and mutate
+        // session 2 in place to mesh peer 3 instead of peer 2.
+        apply_message(
+            &delta_control,
+            CoordinatorToRelay::DescriptorDelta {
+                staged_at_unix_ms: None,
+                upserts: vec![descriptor(3, &[2]), descriptor(2, &[3])],
+                removals: vec![DescriptorKey {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(1),
+                }],
+            },
+            &delta_applied,
+            &ControlConnStats::new(),
+        );
+
+        let d2: Vec<MeshCommand> = std::iter::from_fn(|| d2_rx.try_recv().ok()).collect();
+        let d3: Vec<MeshCommand> = std::iter::from_fn(|| d3_rx.try_recv().ok()).collect();
+        assert!(
+            d2.contains(&MeshCommand::Join(key(3))),
+            "the added session joins peer 2: {d2:?}",
+        );
+        assert!(
+            d2.contains(&MeshCommand::Leave(key(1))),
+            "the removed session leaves peer 2: {d2:?}",
+        );
+        assert!(
+            d3.contains(&MeshCommand::Join(key(2))),
+            "the mutated session re-applies and joins its new peer 3: {d3:?}",
+        );
+
+        // A full-set reconcile straight to the same target set on a fresh relay.
+        let full_control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let full_applied = AppliedSessions::new();
+        reconcile(
+            &full_control,
+            &[descriptor(2, &[3]), descriptor(3, &[2])],
+            &full_applied,
+        );
+
+        assert_eq!(
+            delta_applied.snapshot(),
+            full_applied.snapshot(),
+            "the delta converges to the same applied set as the full reconcile",
+        );
+        assert_eq!(delta_applied.snapshot(), HashSet::from([key(2), key(3)]));
+    }
+
+    #[test]
+    fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let applied = AppliedSessions::new();
+        let stats = ControlConnStats::new();
+
+        // Seed a four-session baseline via the connect-time full set.
+        apply_message(
+            &control,
+            CoordinatorToRelay::Descriptors {
+                descriptors: vec![
+                    descriptor(1, &[]),
+                    descriptor(2, &[]),
+                    descriptor(3, &[]),
+                    descriptor(4, &[]),
+                ],
+                staged_at_unix_ms: None,
+            },
+            &applied,
+            &stats,
+        );
+
+        // A delta that only removes one session, staged ~1.5s ago.
+        let staged = now_unix_ms().saturating_sub(1_500);
+        apply_message(
+            &control,
+            CoordinatorToRelay::DescriptorDelta {
+                staged_at_unix_ms: Some(staged),
+                upserts: vec![],
+                removals: vec![DescriptorKey {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(1),
+                }],
+            },
+            &applied,
+            &stats,
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.descriptor_set_len, 3,
+            "the recorded length is the applied-set size after the delta, not the delta's one entry",
+        );
+        assert!(
+            (1_500..10_000).contains(&snap.descriptor_apply_lag_ms),
+            "the delta's stamp yields an apply-lag sample exactly like a full set (observed {}ms)",
+            snap.descriptor_apply_lag_ms,
+        );
+    }
+
+    #[test]
+    fn a_delta_upsert_reconciles_dials_that_raced_it_and_starts_the_session() {
+        // The dial-race fix must still fire when the session's descriptor arrives as
+        // a delta upsert, not only as a full set: both clients register before the
+        // descriptor lands, their maker-less announces drop, and the delta's
+        // per-descriptor apply reconciles the roster it already holds, reaches
+        // coverage, and delivers the start directive to the connected clients.
+        use rally_point_proto::ids::SlotId;
+
+        let makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
+        let sessions: crate::routing::Sessions = std::sync::Arc::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+            .expect("slot 0 registers into an empty roster");
+        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+            .expect("slot 1 registers into an empty roster");
+        assert!(
+            !crate::consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+            "an announce with no maker yet drops the presence",
+        );
+        assert!(
+            !crate::consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+            "an announce with no maker yet drops the presence",
+        );
+
+        let control = MeshControl::new(RelayId(1), makers.clone(), std::sync::Arc::default())
+            .with_broadcast(sessions.clone(), mesh_links);
+        let applied = AppliedSessions::new();
+
+        // The session's descriptor arrives as a delta upsert (single relay, no peers).
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        apply_message(
+            &control,
+            CoordinatorToRelay::DescriptorDelta {
+                staged_at_unix_ms: None,
+                upserts: vec![desc],
+                removals: vec![],
+            },
+            &applied,
+            &ControlConnStats::new(),
+        );
+
+        assert!(
+            makers.lock().get(&key(1)).unwrap().is_started(),
+            "the delta upsert reconciles the already-registered roster and covers the expected set",
+        );
+        assert!(
+            inbox0.try_recv_start().is_some(),
+            "slot 0's connected client receives the start directive",
+        );
+        assert!(
+            inbox1.try_recv_start().is_some(),
+            "slot 1's connected client receives the start directive",
+        );
+        assert!(
+            applied.snapshot().contains(&key(1)),
+            "the delta upsert records the session into the applied set",
+        );
     }
 
     #[tokio::test]

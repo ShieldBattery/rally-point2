@@ -18,9 +18,9 @@ use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::{notify, pair_rtts, registry, session, tenant};
 use rally_point_proto::control::{
-    BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionBeaconTarget,
-    RegionId, RegionRttReport, RelayHello, RelayToCoordinator, ResultNotice, SessionDescriptor,
-    SessionRequest, TenantId,
+    BufferBounds, CoordinatorToRelay, DescriptorKey, MeshPeerIdentity, PlayerHandoff,
+    RegionBeaconTarget, RegionId, RegionRttReport, RelayHello, RelayPeer, RelayToCoordinator,
+    ResultNotice, SessionDescriptor, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -304,6 +304,431 @@ fn relay_one_with_peer_link() -> (MeshControl, mpsc::UnboundedReceiver<MeshComma
     let (tx2, rx2) = mpsc::unbounded_channel::<MeshCommand>();
     control.register_link(RelayId(2), tx2);
     (control, rx2)
+}
+
+/// Serves a bare coordinator (empty registry/tenant, given control auth) on an
+/// ephemeral port and returns its base URL plus a handle to its descriptor outbox,
+/// so a test can enroll a relay against it and then drive descriptor changes
+/// directly to exercise the writer's steady-state push (full set vs. delta).
+async fn serve_coordinator_returning_setup(control_auth: ControlAuth) -> (String, SessionSetup) {
+    let reg = registry::new_registry();
+    let setup = session::SessionSetup::new(reg, tenant::new_store());
+    let lifecycle = Lifecycle::new(setup.clone());
+    let outbox = setup.clone();
+    let app = api::router(CoordinatorState {
+        setup,
+        notices: notify::new_dedup(),
+        lifecycle,
+        control_auth,
+        hello_timeout: api::HELLO_TIMEOUT,
+        liveness_timeout: LIVENESS,
+        regions: RegionsConfig::default(),
+        player_token_lifetime: Duration::from_secs(3600),
+        ledger: None,
+        pair_rtts: pair_rtts::new_store(),
+        flight_store: None,
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), outbox)
+}
+
+/// A session descriptor for `session` meshing the given peer relays, for driving
+/// the descriptor outbox directly.
+fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
+    SessionDescriptor {
+        tenant: TenantId(TENANT.to_owned()),
+        session: SessionId(session),
+        peers: peers
+            .iter()
+            .map(|&id| RelayPeer {
+                relay_id: RelayId(id),
+                relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900 + id as u16)),
+                cert_der: vec![id as u8; 4],
+                relay_addrs: vec![],
+            })
+            .collect(),
+        bounds: BufferBounds::new(1, 6).unwrap(),
+        authority_order: vec![],
+        external_id: None,
+        slot_refs: vec![],
+        observer_slots: vec![],
+        expected_slots: vec![],
+        homed_slots: vec![],
+        resumed: false,
+        departed_slots: vec![],
+        latency_estimate_ms: None,
+    }
+}
+
+/// A relay `Hello` (id + loopback address) advertising the single version
+/// `protocol` — no `min_protocol`, so its negotiation window is exactly that one
+/// version. Lets a test negotiate a pre-delta version to exercise the writer's
+/// full-set fallback.
+fn relay_hello_at(id: u64, port: u16, protocol: ProtocolVersion) -> RelayHello {
+    RelayHello::new(
+        RelayId(id),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        protocol,
+        relay_cert(id),
+    )
+}
+
+/// Reads the coordinator's next control frame, decoding it. Panics on a close or a
+/// non-text frame.
+async fn next_control_frame(socket: &mut common::ControlSocket) -> CoordinatorToRelay {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let frame = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator sends a frame promptly")
+        .expect("a frame arrives before the stream ends")
+        .unwrap();
+    match frame {
+        Message::Text(text) => {
+            serde_json::from_str(&text).expect("a coordinator control frame decodes")
+        }
+        Message::Close(f) => panic!("expected a control frame, got a close: {f:?}"),
+        other => panic!("expected a text frame, got {other:?}"),
+    }
+}
+
+/// Reads down-frames until a descriptor push arrives — either a full
+/// [`CoordinatorToRelay::Descriptors`] set or a [`CoordinatorToRelay::DescriptorDelta`]
+/// — returning it. Skips the connect-time `tenant_keys`/`region_beacons` lead and any
+/// `mesh_peers` push, so a test asserts only on the descriptor transport itself.
+async fn read_to_descriptor_update(socket: &mut common::ControlSocket) -> CoordinatorToRelay {
+    loop {
+        match next_control_frame(socket).await {
+            frame @ (CoordinatorToRelay::Descriptors { .. }
+            | CoordinatorToRelay::DescriptorDelta { .. }) => return frame,
+            _ => continue,
+        }
+    }
+}
+
+/// Whether no descriptor push (full set or delta) arrives within `dur`. A
+/// `mesh_peers` or other non-descriptor frame in the window is skipped, not counted;
+/// only a descriptor push makes this return `false`.
+async fn no_descriptor_update_within(socket: &mut common::ControlSocket, dur: Duration) -> bool {
+    timeout(dur, read_to_descriptor_update(socket))
+        .await
+        .is_err()
+}
+
+/// Sends a [`RelayToCoordinator::Draining`] up the socket, asking the coordinator to
+/// run its drain exchange (a full descriptor set, then a `DrainAck`).
+async fn send_draining(socket: &mut common::ControlSocket) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let frame = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
+    socket.send(Message::Text(frame.into())).await.unwrap();
+}
+
+/// Reads the coordinator's next frame and asserts it is the drain acknowledgement.
+async fn expect_drain_ack(socket: &mut common::ControlSocket) {
+    match next_control_frame(socket).await {
+        CoordinatorToRelay::DrainAck => {}
+        other => panic!("expected a DrainAck, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_delta_capable_relay_gets_a_full_set_then_deltas() {
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    // The connect-time re-sync is always the full set (here empty), whatever the
+    // negotiated version — it seeds the baseline every later delta diffs against.
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::Descriptors { descriptors, .. } => assert!(descriptors.is_empty()),
+        other => panic!("expected a full descriptor set on connect, got {other:?}"),
+    }
+
+    // An add: one upsert, no removals.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(1, &[2]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert_eq!(
+                upserts.iter().map(|d| d.session).collect::<Vec<_>>(),
+                vec![SessionId(1)],
+            );
+            assert!(removals.is_empty());
+        }
+        other => panic!("expected an add delta, got {other:?}"),
+    }
+
+    // A second add is likewise carried as just its own upsert, not the whole set.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(2, &[3]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert_eq!(
+                upserts.iter().map(|d| d.session).collect::<Vec<_>>(),
+                vec![SessionId(2)],
+            );
+            assert!(removals.is_empty());
+        }
+        other => panic!("expected a second add delta, got {other:?}"),
+    }
+
+    // An in-place mutation: session 1's peers change. The diff is by value, so the
+    // unchanged key still surfaces as an upsert carrying the new value.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(1, &[9]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert_eq!(upserts.len(), 1);
+            assert_eq!(upserts[0].session, SessionId(1));
+            assert_eq!(upserts[0].peers[0].relay_id, RelayId(9));
+            assert!(removals.is_empty());
+        }
+        other => panic!("expected an in-place mutation delta, got {other:?}"),
+    }
+
+    // A removal: one removal, no upserts.
+    setup
+        .descriptors()
+        .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(2));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert!(upserts.is_empty());
+            assert_eq!(
+                removals,
+                vec![DescriptorKey {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(2),
+                }],
+            );
+        }
+        other => panic!("expected a removal delta, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_pre_delta_relay_receives_full_sets_not_deltas() {
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    // A relay negotiating only the supported floor — below the delta threshold, so it
+    // would decode a delta as an unknown frame and drift.
+    let mut socket = connect_and_send_hello(
+        &base_url,
+        relay_hello_at(1, 14900, ProtocolVersion::MIN_SUPPORTED),
+    )
+    .await;
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::Descriptors { descriptors, .. } => assert!(descriptors.is_empty()),
+        other => panic!("expected a full set on connect, got {other:?}"),
+    }
+
+    // Every steady-state change is the whole current set, never a delta.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(1, &[2]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::Descriptors { descriptors, .. } => assert_eq!(
+            descriptors.iter().map(|d| d.session).collect::<Vec<_>>(),
+            vec![SessionId(1)],
+        ),
+        other => panic!("a pre-delta relay must receive a full set, got {other:?}"),
+    }
+
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(2, &[3]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::Descriptors { descriptors, .. } => assert_eq!(
+            descriptors.iter().map(|d| d.session).collect::<Vec<_>>(),
+            vec![SessionId(1), SessionId(2)],
+            "the whole current set, not just the change",
+        ),
+        other => panic!("a pre-delta relay must receive a full set, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_drain_exchange_pushes_a_full_set_and_later_deltas_stay_correct() {
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    // Full set on connect, then two adds delivered as deltas.
+    let _ = read_to_descriptor_update(&mut socket).await;
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(1, &[2]));
+    let _ = read_to_descriptor_update(&mut socket).await;
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(2, &[3]));
+    let _ = read_to_descriptor_update(&mut socket).await;
+
+    // The relay requests a drain: the coordinator pushes the whole current set (a full
+    // set, not a delta), then a DrainAck.
+    send_draining(&mut socket).await;
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::Descriptors { descriptors, .. } => assert_eq!(
+            descriptors.iter().map(|d| d.session).collect::<Vec<_>>(),
+            vec![SessionId(1), SessionId(2)],
+            "the drain exchange pushes the whole set",
+        ),
+        other => panic!("the drain exchange must push a full set, got {other:?}"),
+    }
+    expect_drain_ack(&mut socket).await;
+
+    // Steady state resumes as deltas, correct against the baseline the drain refreshed
+    // from its full set: removing session 1 yields a removal-only delta.
+    setup
+        .descriptors()
+        .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(1));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert!(upserts.is_empty());
+            assert_eq!(
+                removals,
+                vec![DescriptorKey {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(1),
+                }],
+            );
+        }
+        other => panic!("post-drain steady state must resume deltas, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_empty_diff_wake_sends_no_frame() {
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    // The connect-time full set, then a real add to establish the baseline.
+    let _ = read_to_descriptor_update(&mut socket).await;
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(1, &[2]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta { upserts, .. } => assert_eq!(upserts.len(), 1),
+        other => panic!("expected the baseline-establishing delta, got {other:?}"),
+    }
+
+    // Add then immediately remove the same session, with no await between the two
+    // synchronous outbox calls: on the current-thread test runtime the writer cannot
+    // run between them, so it wakes once to a set identical to what it last sent — an
+    // empty diff — and must send nothing.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(2, &[3]));
+    setup
+        .descriptors()
+        .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(2));
+    assert!(
+        no_descriptor_update_within(&mut socket, Duration::from_millis(300)).await,
+        "an empty-diff wake must send no frame",
+    );
+
+    // A subsequent real change still produces a delta — the writer resumed normally.
+    setup
+        .descriptors()
+        .record(RelayId(1), a_descriptor(3, &[4]));
+    match read_to_descriptor_update(&mut socket).await {
+        CoordinatorToRelay::DescriptorDelta {
+            upserts, removals, ..
+        } => {
+            assert_eq!(
+                upserts.iter().map(|d| d.session).collect::<Vec<_>>(),
+                vec![SessionId(3)],
+            );
+            assert!(removals.is_empty());
+        }
+        other => panic!("expected a delta for the real change, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn churn_through_the_real_client_converges_to_the_watch_set() {
+    // The full delta round trip end to end: the real coordinator writer emits deltas
+    // and the real relay client applies them. A burst of adds and removals must leave
+    // the relay's meshed sessions equal to the coordinator's final watch set.
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    let (control, mut rx2) = relay_one_with_peer_link();
+
+    tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: None,
+            relay_hello: relay_hello(1, 14900),
+            identity_key: relay_key(1),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)),
+        no_drain_rx(),
+        no_control_connected(),
+        backoff(),
+    ));
+
+    // Churn: add sessions 1..=6 (each meshing peer 2), then remove the even ones.
+    for s in 1..=6u64 {
+        setup
+            .descriptors()
+            .record(RelayId(1), a_descriptor(s, &[2]));
+    }
+    for s in [2u64, 4, 6] {
+        setup
+            .descriptors()
+            .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(s));
+    }
+
+    // The relay's meshed sessions (the net of the Join/Leave stream on peer 2's link)
+    // converge to the odd sessions — exactly the coordinator's final watch set.
+    let want: std::collections::HashSet<SessionKey> = [1u64, 3, 5]
+        .into_iter()
+        .map(|s| session_key(SessionId(s)))
+        .collect();
+    let mut net: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), rx2.recv()).await {
+            Ok(Some(MeshCommand::Join(k))) => {
+                net.insert(k);
+            }
+            Ok(Some(MeshCommand::Leave(k))) => {
+                net.remove(&k);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if net == want {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        net, want,
+        "the relay's meshed sessions converge to the coordinator's watch set",
+    );
 }
 
 #[tokio::test]
@@ -1548,15 +1973,26 @@ async fn an_inbound_flood_does_not_delay_a_descriptor_push() {
     // Create a session homed on the relay; its descriptor must be pushed.
     let session = create_one_slot_session(&setup);
 
-    // Despite the flood, the descriptor frame naming the session arrives quickly.
+    // Despite the flood, the descriptor push naming the session arrives quickly. The
+    // session is created after enroll, so a delta-capable relay receives it as a
+    // delta upsert; either the full set or a delta naming the session counts.
     let found = timeout(Duration::from_secs(3), async {
         while let Some(Ok(message)) = read.next().await {
             if let Message::Text(text) = message
-                && let Ok(CoordinatorToRelay::Descriptors { descriptors, .. }) =
-                    serde_json::from_str::<CoordinatorToRelay>(&text)
-                && descriptors.iter().any(|d| d.session == session)
+                && let Ok(frame) = serde_json::from_str::<CoordinatorToRelay>(&text)
             {
-                return true;
+                let names_session = match &frame {
+                    CoordinatorToRelay::Descriptors { descriptors, .. } => {
+                        descriptors.iter().any(|d| d.session == session)
+                    }
+                    CoordinatorToRelay::DescriptorDelta { upserts, .. } => {
+                        upserts.iter().any(|d| d.session == session)
+                    }
+                    _ => false,
+                };
+                if names_session {
+                    return true;
+                }
             }
         }
         false

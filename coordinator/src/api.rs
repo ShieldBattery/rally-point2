@@ -89,14 +89,15 @@ use axum::{
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RegionId, RegionRttReport,
-    RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
-    SessionResponse, TenantId, TenantVerifyingKey,
+    CoordinatorToRelay, DescriptorKey, MeshPeerIdentity, RegionBeaconTarget, RegionId,
+    RegionRttReport, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
+    SessionRequest, SessionResponse, TenantId, TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
     self, CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
     CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    ProtocolVersion,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -1483,7 +1484,7 @@ async fn serve_relay_control(
         rtt: &rtt_ingest,
         flight_store: flight_store.as_ref(),
     };
-    push_and_watch(socket, &inbound, &regions, liveness_timeout).await;
+    push_and_watch(socket, &inbound, &regions, liveness_timeout, negotiated).await;
 
     // The connection ended: clear the presence this connection reported, so its
     // players read as queueable promptly rather than waiting out the TTL. Fenced
@@ -1654,6 +1655,7 @@ async fn push_and_watch(
     inbound: &ControlInbound<'_>,
     regions: &RegionsConfig,
     liveness_timeout: Duration,
+    negotiated: ProtocolVersion,
 ) {
     let (mut write_half, mut read_half) = socket.split();
     let setup = inbound.setup;
@@ -1691,7 +1693,7 @@ async fn push_and_watch(
     // awaits mid-send on a connection that is ending anyway — so no effect is left
     // half-applied and nothing is double-run.
     tokio::select! {
-        () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout) => {}
+        () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout, negotiated) => {}
         () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx, grants_tx) => {}
     }
 }
@@ -1706,11 +1708,18 @@ async fn push_and_watch(
 /// preempt a session-start descriptor) and above reaps. Returns (ending the
 /// connection) when a send stalls or errors, a watch closes on shutdown, or the
 /// reader ends.
+///
+/// The connect-time descriptor set is always the full set (it seeds the relay's
+/// baseline), but the steady-state descriptor arm sends only what changed — a
+/// [`CoordinatorToRelay::DescriptorDelta`] — to a relay whose `negotiated` version
+/// supports it, falling back to the full set for an older relay. `last_sent` tracks
+/// the set the relay currently holds so each delta diffs against exactly that.
 async fn run_writer(
     write_half: &mut ControlWrite,
     sources: &mut WriterSources,
     relay_id: RelayId,
     liveness_timeout: Duration,
+    negotiated: ProtocolVersion,
 ) {
     // Split the sources into the individual channels + payloads the loop drives;
     // they are disjoint fields, so each arm borrows its own.
@@ -1760,7 +1769,12 @@ async fn run_writer(
     // The initial descriptor and mesh-peer re-syncs. Clone each set out of its watch
     // borrow before awaiting — a watch borrow must never be held across an await —
     // and mark it seen so the steady-state arm does not redundantly re-push it.
+    //
+    // The connect-time descriptor re-sync is always the full set, whatever the
+    // negotiated version: it is the baseline every later delta on this connection
+    // diffs against, so `last_sent` is seeded from it before it goes out.
     let initial = rx.borrow_and_update().clone();
+    let mut last_sent = index_descriptors(&initial);
     if !writer_send(
         write_half,
         descriptors_frame(initial),
@@ -1800,11 +1814,15 @@ async fn run_writer(
                 // Set before ack. `borrow_and_update` reads the latest set — which
                 // already reflects every descriptor staged before the reader's
                 // assignment-locked mark — and marks it seen so the descriptor arm
-                // does not redundantly re-push the same set right after.
+                // does not redundantly re-push the same set right after. The drain
+                // exchange always pushes the full set (rare, and self-verifying on
+                // the relay), whatever the negotiated version, and refreshes the
+                // baseline from it so a later steady-state delta diffs against what
+                // the relay actually now holds.
                 let set = rx.borrow_and_update().clone();
                 if !writer_send(
                     write_half,
-                    descriptors_frame(set),
+                    descriptors_frame(set.clone()),
                     relay_id,
                     liveness_timeout,
                     "descriptor",
@@ -1813,6 +1831,7 @@ async fn run_writer(
                 {
                     break;
                 }
+                last_sent = index_descriptors(&set);
                 if !writer_send(
                     write_half,
                     control_frame(&CoordinatorToRelay::DrainAck),
@@ -1830,12 +1849,13 @@ async fn run_writer(
                     break; // the outbox was dropped: coordinator shutting down
                 }
                 let set = rx.borrow_and_update().clone();
-                if !writer_send(
+                if !send_descriptor_change(
                     write_half,
-                    descriptors_frame(set),
+                    &mut last_sent,
+                    set,
+                    negotiated,
                     relay_id,
                     liveness_timeout,
-                    "descriptor",
                 )
                 .await
                 {
@@ -2016,6 +2036,125 @@ fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
         descriptors,
         staged_at_unix_ms: Some(now_unix_ms()),
     })
+}
+
+/// Emits one steady-state descriptor change on the write half. A relay whose
+/// negotiated version supports deltas receives only what changed since the last
+/// send — a [`CoordinatorToRelay::DescriptorDelta`] diffed against `last_sent` by
+/// `(tenant, session)` and by value (so an in-place descriptor mutation surfaces as
+/// an upsert) — and nothing at all when the set is unchanged. An older relay
+/// receives the whole set, exactly as every steady-state push did before deltas
+/// existed. `last_sent` advances to the current set only after a delta send
+/// succeeds, so it always mirrors what the relay actually holds. Returns whether the
+/// connection should keep running.
+async fn send_descriptor_change(
+    write_half: &mut ControlWrite,
+    last_sent: &mut std::collections::HashMap<DescriptorKey, SessionDescriptor>,
+    set: Vec<SessionDescriptor>,
+    negotiated: ProtocolVersion,
+    relay_id: RelayId,
+    liveness_timeout: Duration,
+) -> bool {
+    if negotiated < ProtocolVersion::DESCRIPTOR_DELTA_MIN {
+        // An older relay decodes a DescriptorDelta as an unknown frame and would
+        // silently drift, so it always gets the whole current set. Its baseline is
+        // never diffed, so there is nothing to advance.
+        if !writer_send(
+            write_half,
+            descriptors_frame(set),
+            relay_id,
+            liveness_timeout,
+            "descriptor",
+        )
+        .await
+        {
+            return false;
+        }
+        crate::metrics::descriptor_full_set_sent();
+        return true;
+    }
+
+    let (upserts, removals) = diff_descriptors(last_sent, &set);
+    if upserts.is_empty() && removals.is_empty() {
+        // The relay already holds exactly this set — a coalesced wake that produced
+        // no net change. An empty delta would be pure overhead, so send nothing and
+        // leave the metrics untouched.
+        return true;
+    }
+    let upsert_count = upserts.len();
+    let removal_count = removals.len();
+    let frame = control_frame(&CoordinatorToRelay::DescriptorDelta {
+        staged_at_unix_ms: Some(now_unix_ms()),
+        upserts,
+        removals,
+    });
+    if !writer_send(
+        write_half,
+        frame,
+        relay_id,
+        liveness_timeout,
+        "descriptor-delta",
+    )
+    .await
+    {
+        return false;
+    }
+    // The send landed, so the relay now holds this set: advance the baseline to it,
+    // keeping the update ordered strictly after the successful send.
+    *last_sent = index_descriptors(&set);
+    crate::metrics::descriptor_delta_sent(upsert_count, removal_count);
+    true
+}
+
+/// Diffs the descriptor set the relay currently holds (`last_sent`, keyed by
+/// `(tenant, session)`) against the coordinator's `current` set, producing the
+/// upserts and removals a [`CoordinatorToRelay::DescriptorDelta`] carries. A session
+/// present in `current` is an upsert when the relay holds no descriptor for it or
+/// holds one that differs by value — so an in-place mutation (a rehomed
+/// `homed_slots`, say) surfaces even though its key is unchanged. A session the
+/// relay holds but `current` no longer names is a removal.
+fn diff_descriptors(
+    last_sent: &std::collections::HashMap<DescriptorKey, SessionDescriptor>,
+    current: &[SessionDescriptor],
+) -> (Vec<SessionDescriptor>, Vec<DescriptorKey>) {
+    let mut upserts = Vec::new();
+    let mut current_keys = std::collections::HashSet::with_capacity(current.len());
+    for descriptor in current {
+        let key = DescriptorKey {
+            tenant: descriptor.tenant.clone(),
+            session: descriptor.session,
+        };
+        if last_sent.get(&key) != Some(descriptor) {
+            upserts.push(descriptor.clone());
+        }
+        current_keys.insert(key);
+    }
+    let removals = last_sent
+        .keys()
+        .filter(|key| !current_keys.contains(*key))
+        .cloned()
+        .collect();
+    (upserts, removals)
+}
+
+/// Indexes a full descriptor set by `(tenant, session)` — the baseline a later
+/// [`CoordinatorToRelay::DescriptorDelta`] diffs against. Owns a clone of each
+/// descriptor so the baseline is a stable snapshot of exactly what the relay was
+/// sent, independent of the coordinator's live set.
+fn index_descriptors(
+    set: &[SessionDescriptor],
+) -> std::collections::HashMap<DescriptorKey, SessionDescriptor> {
+    set.iter()
+        .map(|d| {
+            (
+                DescriptorKey {
+                    tenant: d.tenant.clone(),
+                    session: d.session,
+                },
+                d.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Sends one frame on the write half, racing a fixed per-send stall bound measured
@@ -3073,6 +3212,72 @@ mod tests {
         );
         let sig = pair.sign(&message);
         (ts, hex::encode(sig.as_ref()))
+    }
+
+    /// A session descriptor for `session` meshing the given peer relays — a compact
+    /// fixture for the descriptor-diff unit tests.
+    fn diff_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
+        SessionDescriptor {
+            tenant: TenantId("sb-test".to_owned()),
+            session: SessionId(session),
+            peers: peers
+                .iter()
+                .map(|&id| rally_point_proto::control::RelayPeer {
+                    relay_id: RelayId(id),
+                    relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900 + id as u16)),
+                    cert_der: vec![id as u8; 4],
+                    relay_addrs: vec![],
+                })
+                .collect(),
+            bounds: BufferBounds::new(1, 6).unwrap(),
+            authority_order: vec![],
+            external_id: None,
+            slot_refs: vec![],
+            observer_slots: vec![],
+            expected_slots: vec![],
+            homed_slots: vec![],
+            resumed: false,
+            departed_slots: vec![],
+            latency_estimate_ms: None,
+        }
+    }
+
+    #[test]
+    fn diff_of_an_unchanged_set_is_empty() {
+        // The steady-state arm relies on this: a coalesced wake that nets to no change
+        // diffs to nothing, so the writer sends no frame.
+        let set = vec![diff_descriptor(1, &[2]), diff_descriptor(2, &[3])];
+        let baseline = index_descriptors(&set);
+        let (upserts, removals) = diff_descriptors(&baseline, &set);
+        assert!(upserts.is_empty(), "an unchanged set produces no upserts");
+        assert!(removals.is_empty(), "an unchanged set produces no removals");
+    }
+
+    #[test]
+    fn diff_reports_adds_removals_and_in_place_mutations() {
+        // Baseline: sessions 1 and 2. Target: session 1 mutated in place (its peers
+        // change), session 2 removed, session 3 added.
+        let baseline = index_descriptors(&[diff_descriptor(1, &[2]), diff_descriptor(2, &[2])]);
+        let current = vec![diff_descriptor(1, &[9]), diff_descriptor(3, &[2])];
+        let (upserts, removals) = diff_descriptors(&baseline, &current);
+
+        let mut upsert_sessions: Vec<u64> = upserts.iter().map(|d| d.session.0).collect();
+        upsert_sessions.sort_unstable();
+        assert_eq!(
+            upsert_sessions,
+            vec![1, 3],
+            "the mutated session and the added one are both upserts",
+        );
+        // The mutated session's upsert carries the new value, not the stale one.
+        let one = upserts.iter().find(|d| d.session == SessionId(1)).unwrap();
+        assert_eq!(one.peers[0].relay_id, RelayId(9));
+        assert_eq!(
+            removals,
+            vec![DescriptorKey {
+                tenant: TenantId("sb-test".to_owned()),
+                session: SessionId(2),
+            }],
+        );
     }
 
     /// Sends a signed `POST` to `app`, signing `body` with `seed` for `path`.

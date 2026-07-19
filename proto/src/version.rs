@@ -32,31 +32,40 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
-    /// The version implemented by this build. `1` is the first version shipped
-    /// to production, so there is no earlier protocol any real peer speaks.
+    /// The version implemented by this build. Negotiation caps at this value, so
+    /// a peer advertising a newer version still settles here.
     ///
-    /// It includes proof-of-possession on relay enrollment: after the enroll
-    /// `Hello` and version negotiation, the coordinator challenges the relay
-    /// with a random nonce
-    /// ([`CoordinatorToRelay::IdentityChallenge`](crate::control::CoordinatorToRelay::IdentityChallenge))
-    /// and the relay must answer with a signature made by the TLS private key
-    /// matching `Hello.cert_der`
-    /// ([`RelayToCoordinator::IdentityProof`](crate::control::RelayToCoordinator::IdentityProof)),
-    /// proving it actually holds that key rather than having copied a cert it
-    /// observed elsewhere. See [`Self::ENROLL_POP_MIN`] for exactly when the
-    /// coordinator challenges.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(1);
+    /// Version history, each a superset of the last:
+    /// - `1` — the first version shipped to production. Includes
+    ///   proof-of-possession on relay enrollment: after the enroll `Hello` and
+    ///   version negotiation, the coordinator challenges the relay with a random
+    ///   nonce
+    ///   ([`CoordinatorToRelay::IdentityChallenge`](crate::control::CoordinatorToRelay::IdentityChallenge))
+    ///   and the relay must answer with a signature made by the TLS private key
+    ///   matching `Hello.cert_der`
+    ///   ([`RelayToCoordinator::IdentityProof`](crate::control::RelayToCoordinator::IdentityProof)),
+    ///   proving it actually holds that key rather than having copied a cert it
+    ///   observed elsewhere. See [`Self::ENROLL_POP_MIN`] for exactly when the
+    ///   coordinator challenges.
+    /// - `2` — adds the steady-state descriptor delta
+    ///   ([`CoordinatorToRelay::DescriptorDelta`](crate::control::CoordinatorToRelay::DescriptorDelta)):
+    ///   after the connect-time full-set re-sync, the coordinator pushes only the
+    ///   descriptors that changed since its last push rather than the whole set on
+    ///   every change. A relay negotiating at least [`Self::DESCRIPTOR_DELTA_MIN`]
+    ///   receives deltas; an older one keeps receiving full sets, so the two
+    ///   interoperate across a rolling deploy.
+    pub const CURRENT: ProtocolVersion = ProtocolVersion(2);
 
     /// The oldest version this build can still interoperate with — the floor of
     /// the `[MIN_SUPPORTED, CURRENT]` window a peer's advertised window
     /// negotiates against.
     ///
-    /// Equal to [`Self::CURRENT`] today only because `1` is the sole shipped
-    /// version; this is deliberately a *floor*, not a synonym for `CURRENT`.
-    /// When a later build advances `CURRENT`, this may lag behind so a gradual
-    /// rollout keeps serving peers still on an older version — down to, but
-    /// never below, [`Self::ENROLL_POP_MIN`]: enroll proof-of-possession has no
-    /// un-bound form, so no *negotiable* version may fall under it and reach an
+    /// Deliberately a *floor* below [`Self::CURRENT`], not a synonym for it: a
+    /// relay that still speaks only version `1` negotiates down to `1` and
+    /// receives full descriptor sets rather than deltas, so a rolling deploy where
+    /// the coordinator advances ahead of the fleet keeps every relay served. It
+    /// never drops below [`Self::ENROLL_POP_MIN`]: enroll proof-of-possession has
+    /// no un-bound form, so no *negotiable* version may fall under it and reach an
     /// enroll path that skips the challenge. The invariant that bounds the lag —
     /// `MIN_SUPPORTED >= ENROLL_POP_MIN` — is asserted at compile time below.
     pub const MIN_SUPPORTED: ProtocolVersion = ProtocolVersion(1);
@@ -72,6 +81,20 @@ impl ProtocolVersion {
     /// below it and skip the challenge. The compile-time assertion below enforces
     /// that.
     pub const ENROLL_POP_MIN: ProtocolVersion = ProtocolVersion(1);
+
+    /// The lowest *negotiated* version at which the coordinator sends steady-state
+    /// descriptor changes as deltas
+    /// ([`CoordinatorToRelay::DescriptorDelta`](crate::control::CoordinatorToRelay::DescriptorDelta))
+    /// rather than re-pushing the whole set. `2`, the version that introduced the
+    /// delta frame.
+    ///
+    /// A relay that negotiates at or above this receives deltas after its
+    /// connect-time full-set re-sync. One below it decodes the delta frame as
+    /// [`CoordinatorToRelay::Unknown`](crate::control::CoordinatorToRelay::Unknown)
+    /// and would silently miss the change, so the coordinator sends it full sets
+    /// instead. Named separately from [`Self::CURRENT`] so a later version bump for
+    /// an unrelated reason does not silently change which relays receive deltas.
+    pub const DESCRIPTOR_DELTA_MIN: ProtocolVersion = ProtocolVersion(2);
 }
 
 // Enroll proof-of-possession admits no un-bound form, so no negotiable version
@@ -300,6 +323,26 @@ mod tests {
             .expect("a current peer's window overlaps");
         assert_eq!(negotiated, ProtocolVersion::CURRENT);
         assert!(negotiated >= ProtocolVersion::ENROLL_POP_MIN);
+    }
+
+    #[test]
+    fn a_current_relay_negotiates_at_or_above_the_descriptor_delta_threshold() {
+        // A relay advertising this build's own window negotiates at CURRENT, which
+        // is at or above DESCRIPTOR_DELTA_MIN — the coordinator sends it deltas.
+        let negotiated = negotiate(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT)
+            .expect("a current relay's window overlaps");
+        assert!(negotiated >= ProtocolVersion::DESCRIPTOR_DELTA_MIN);
+    }
+
+    #[test]
+    fn a_relay_at_the_supported_floor_negotiates_below_the_descriptor_delta_threshold() {
+        // A relay that speaks only the supported floor (below the delta threshold)
+        // negotiates there and must be sent full descriptor sets, not deltas — it
+        // would decode a delta frame as an unknown message and silently drift.
+        let floor = ProtocolVersion::MIN_SUPPORTED;
+        let negotiated = negotiate(floor, floor).expect("the floor overlaps this build's window");
+        assert_eq!(negotiated, floor);
+        assert!(negotiated < ProtocolVersion::DESCRIPTOR_DELTA_MIN);
     }
 
     #[test]

@@ -219,7 +219,7 @@ async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_liv
     // The downgrade attempt claims the same id, advertising a version below the
     // supported floor to try to reach the unconditional-replace path enroll PoP
     // closed. Negotiation refuses it outright.
-    let downgrade = ProtocolVersion(ProtocolVersion::CURRENT.0 - 1);
+    let downgrade = ProtocolVersion(ProtocolVersion::MIN_SUPPORTED.0 - 1);
     let hello = RelayHello::new(
         RelayId(5),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 14999)),
