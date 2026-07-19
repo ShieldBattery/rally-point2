@@ -459,6 +459,16 @@ impl SlotInbox {
     pub(crate) fn try_recv_leave(&mut self) -> Option<LeaveDirective> {
         self.leave_push_rx.try_recv().ok()
     }
+
+    /// Non-blockingly pulls the next session-start directive pushed to this slot,
+    /// for a cross-module test asserting the start directive reached a connected
+    /// client. The outer `Option` reports whether a directive was queued; the
+    /// inner carries the stamped initial buffer depth. `None` when nothing is
+    /// queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_start(&mut self) -> Option<Option<u32>> {
+        self.start_push_rx.try_recv().ok()
+    }
 }
 
 /// Identifies one game's routing group. Session ids are unique only *within* a

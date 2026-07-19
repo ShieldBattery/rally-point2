@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{RelayPeer, SessionDescriptor};
-use rally_point_proto::ids::RelayId;
+use rally_point_proto::ids::{RelayId, SlotId};
 use tokio::sync::{mpsc, watch};
 
 use crate::consensus::{self, Authority, DecisionMakers};
@@ -393,6 +393,52 @@ impl MeshControl {
                 crate::flight_recorder::FlightEvent::ResumedDescriptorApplied {
                     departed_slots: descriptor.departed_slots.len() as u32,
                 },
+            );
+        }
+        // Reconcile the roster into the maker this descriptor just created or
+        // updated. A slot that dialed and registered before this descriptor
+        // arrived announced its presence when the session had no maker yet, so
+        // the announce found nothing to record and the presence was dropped;
+        // the maker is then created with the expected set seeded but no live
+        // slots, and coverage can never be reached for a session whose every
+        // dial raced ahead of its descriptor. Re-note every slot the roster
+        // currently holds so the maker sees the presence that was lost.
+        // `note_slot_present` inserts into a set, so re-noting a slot its own
+        // live announce already recorded is idempotent — no double count.
+        // Registration seats a slot in the roster before its link task
+        // announces, so any slot whose announce found no maker is already
+        // visible in this snapshot; a slot that registers after this rescan
+        // reaches the maker through its own later announce, and none can fall
+        // between the two. Snapshot the slot ids under the sessions lock and
+        // drop it before touching the decision makers — these two locks are
+        // only ever taken sessions-then-decision-makers, never nested the other
+        // way.
+        let registered_slots: Vec<SlotId> = {
+            let roster = self.sessions.lock();
+            roster
+                .get(&key)
+                .map(|slots| slots.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        // A re-note that completes the expected set latches the session started
+        // inside the maker, so the `maybe_start_session` below would then see an
+        // already-started session and deliver nothing. Drive delivery from the
+        // note that completed coverage instead: fan the start directive to every
+        // local slot and across the mesh, exactly as a live announce's
+        // completion does. The `|=` keeps every remaining slot seeded into the
+        // live set after coverage latches, since only the first covering note
+        // returns true.
+        let mut reconcile_started_session = false;
+        for slot in registered_slots {
+            reconcile_started_session |=
+                consensus::note_slot_present(&self.decision_makers, &key, slot);
+        }
+        if reconcile_started_session {
+            crate::routing::deliver_session_start(
+                &self.sessions,
+                &self.decision_makers,
+                &self.mesh_links,
+                &key,
             );
         }
         // A descriptor push that promotes this relay to authority (the
@@ -1154,6 +1200,107 @@ mod tests {
         assert!(
             !registry.get(&key(1)).unwrap().is_started(),
             "a fresh descriptor does not latch the session started",
+        );
+    }
+
+    #[test]
+    fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
+        // Both of a two-player single-relay session's clients dial and register
+        // before the coordinator's descriptor applies. Each slot's link task
+        // announces its presence while the session has no maker yet, so the
+        // announce finds nothing to record and the presence is dropped. The
+        // descriptor must reconcile the roster it already holds into the maker it
+        // creates, reach coverage, and deliver the start directive to the
+        // connected clients.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+
+        // Seat slots {0, 1} in the roster, as registration does before a link
+        // task runs — hold the guards and inboxes so the slots stay registered
+        // and the delivered start directive can be observed.
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+            .expect("slot 0 registers into an empty roster");
+        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+            .expect("slot 1 registers into an empty roster");
+
+        // Each slot's announce raced ahead of the descriptor: with no maker yet,
+        // `note_slot_present` takes its no-maker path and reports no start, so the
+        // presence is dropped.
+        assert!(
+            !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+            "an announce with no maker yet drops the presence and fires no start",
+        );
+        assert!(
+            !consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+            "an announce with no maker yet drops the presence and fires no start",
+        );
+
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_links);
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        control.apply_descriptor(&desc);
+
+        assert!(
+            makers.lock().get(&key(1)).unwrap().is_started(),
+            "the descriptor reconciles the already-registered roster and covers the expected set",
+        );
+        // The start directive reached both connected clients, not merely the
+        // maker's latch — the fix must fan the directive, not just flip the flag.
+        assert!(
+            inbox0.try_recv_start().is_some(),
+            "slot 0's connected client receives the start directive",
+        );
+        assert!(
+            inbox1.try_recv_start().is_some(),
+            "slot 1's connected client receives the start directive",
+        );
+    }
+
+    #[test]
+    fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
+        // Only slot 0 raced the descriptor; slot 1 has not dialed yet. The
+        // reconcile must not start the session on the partial roster — the
+        // session starts only once slot 1 later announces.
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+            .expect("slot 0 registers into an empty roster");
+        assert!(
+            !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+            "slot 0's announce with no maker yet drops the presence",
+        );
+
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_links);
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        control.apply_descriptor(&desc);
+
+        assert!(
+            !makers.lock().get(&key(1)).unwrap().is_started(),
+            "a reconcile over a partial roster does not start the session",
+        );
+        assert!(
+            inbox0.try_recv_start().is_none(),
+            "no start directive is delivered before the expected set is covered",
+        );
+
+        // Slot 1 dials and announces after the descriptor applied: this completes
+        // the expected set and starts the session, exactly as the live announce
+        // path does. No premature start came from the reconcile.
+        let (_reg1, _inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+            .expect("slot 1 registers after the descriptor applied");
+        assert!(
+            consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+            "slot 1's announce completes the expected set and fires the start",
+        );
+        assert!(
+            makers.lock().get(&key(1)).unwrap().is_started(),
+            "the session is started once slot 1 arrives",
         );
     }
 
