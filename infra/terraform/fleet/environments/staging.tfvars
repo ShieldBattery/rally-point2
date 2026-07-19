@@ -7,10 +7,12 @@ coordinator_url = "https://staging-rp2-coordinator.shieldbattery.net"
 # whatever `latest` currently points at.
 relay_image_tag = "latest"
 
-# Sized above the smallest Fargate class: 0.25-vCPU tasks carry the smallest
-# network/connection-tracking allowances, which silently dropped QUIC handshakes
-# and turn datagrams at a few hundred concurrent players before the relay itself
-# was anywhere near CPU-bound.
+# Sized by measurement, not CPU need: small Fargate classes carry small
+# network/connection-tracking allowances, and past them a relay silently drops
+# QUIC handshakes and turn datagrams while its CPU sits far from saturated.
+# Measured on ARM64: 0.25 vCPU degrades near 100 connected players, 0.5 vCPU
+# near 300; 1 vCPU served 600 cleanly. The failure mode is silent packet loss
+# into live games, so the size stays a step above expected per-relay load.
 task_cpu    = 1024
 task_memory = 2048
 
