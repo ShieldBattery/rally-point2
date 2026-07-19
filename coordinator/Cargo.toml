@@ -68,6 +68,10 @@ aws-sdk-ec2 = { workspace = true }
 # isolation the ECS/EC2 clients hold.
 aws-sdk-s3 = { workspace = true }
 aws-smithy-http-client = { workspace = true }
+# Decompresses a stored recording (zstd-of-JSON, the encoding the relay uploads) on the
+# tenant read path, so `flight_blob` serves the original JSON. Decode side only — the
+# coordinator never compresses; the relay does that before uploading.
+zstd = { workspace = true }
 
 [dev-dependencies]
 rally-point-relay = { workspace = true }

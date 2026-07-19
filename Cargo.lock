@@ -2511,6 +2511,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

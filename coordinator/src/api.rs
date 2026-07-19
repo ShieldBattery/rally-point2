@@ -837,7 +837,8 @@ struct FlightBlobInfo {
     relay_id: u64,
     /// Whether the recording is in the pinned (desynced) retention class.
     pinned: bool,
-    /// The recording's size in bytes.
+    /// The stored recording's size in bytes — the *compressed* (zstd) size, not the
+    /// size of the JSON a fetch of it returns.
     size: u64,
     /// The recording's last-modified time, unix-epoch milliseconds.
     last_modified_ms: i64,
@@ -917,8 +918,15 @@ async fn flight_blobs(
     }
 }
 
-/// Fetches one relay's stored flight recording for a session, returning the stored JSON
-/// verbatim (`application/json`) or `404` when neither retention class holds it.
+/// Fetches one relay's stored flight recording for a session, decompressing the stored
+/// zstd blob into the recording's JSON and returning it (`application/json`), or `404`
+/// when neither retention class holds it.
+///
+/// A stored blob is zstd-compressed JSON (the encoding the relay uploads), so
+/// [`flight_store::fetch_recording`] decompresses it — bounded against a decompression
+/// bomb — before it is served, keeping this endpoint's contract ready-to-use JSON. A
+/// blob that fails to decompress or expands past the read cap is a store-integrity
+/// error, served as a `500` (the store-error path below), never as the raw bytes.
 ///
 /// Authenticated and tenant-scoped exactly like [`flight_blobs`]: the tenant comes from
 /// the signed body, the key is built from that authenticated tenant, and the path names

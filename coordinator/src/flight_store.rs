@@ -302,7 +302,8 @@ pub struct RecordingListing {
     pub relay_id: u64,
     /// Whether the blob is in the pinned (desynced) retention class.
     pub pinned: bool,
-    /// The blob's size in bytes.
+    /// The stored blob's size in bytes — the *compressed* (zstd) size the object store
+    /// reports, not the size of the JSON a fetch decompresses it back to.
     pub size: u64,
     /// The blob's last-modified time, unix-epoch milliseconds.
     pub last_modified_ms: i64,
@@ -344,25 +345,77 @@ pub async fn list_recordings<S: FlightStore>(
     Ok(by_relay.into_values().collect())
 }
 
-/// Fetches one relay's recording of a session, preferring the pinned [`DESYNC_PREFIX`]
-/// copy over the normal [`FLIGHT_PREFIX`] one (they carry the same bytes when both
-/// exist, but the pinned one is the surviving copy after a convergence sweep). `None`
-/// when neither exists.
+/// The largest **decompressed** flight recording the read path will materialize. A
+/// stored blob is zstd-compressed JSON, bounded at [`MAX_FLIGHT_BLOB_BYTES`] compressed;
+/// the recorder's size-capped rings keep a real recording's uncompressed JSON well below
+/// this, so it never trips on genuine data. It exists to bound the read path's memory
+/// against a hostile or corrupt stored object whose few compressed bytes expand far
+/// beyond any real recording (a decompression bomb): the decoder stops just past this
+/// rather than inflating an unbounded buffer, and the over-cap object is refused as a
+/// store-integrity error rather than served.
+pub const MAX_DECOMPRESSED_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decompresses a stored recording's zstd bytes into the JSON a read serves, bounded at
+/// [`MAX_DECOMPRESSED_BLOB_BYTES`] so a decompression bomb cannot balloon memory. A blob
+/// that is not valid zstd, or that expands past the cap, is a store-integrity failure (a
+/// corrupt or hostile object) surfaced as an error — the caller serves it as a store
+/// error, never the raw bytes.
+fn decompress_recording(compressed: &[u8]) -> Result<Vec<u8>, FlightStoreError> {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|error| {
+        FlightStoreError(format!(
+            "opening a stored flight blob's zstd decoder: {error}"
+        ))
+    })?;
+    // Read at most one byte past the cap, so an over-cap object is detected without
+    // ever materializing the whole (possibly enormous) decompressed stream: the `take`
+    // stops the decoder there regardless of how much more it would produce.
+    let mut out = Vec::new();
+    decoder
+        .take(MAX_DECOMPRESSED_BLOB_BYTES as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|error| {
+            FlightStoreError(format!("decompressing a stored flight blob: {error}"))
+        })?;
+    if out.len() > MAX_DECOMPRESSED_BLOB_BYTES {
+        return Err(FlightStoreError(format!(
+            "a stored flight blob decompresses past the {MAX_DECOMPRESSED_BLOB_BYTES}-byte cap"
+        )));
+    }
+    Ok(out)
+}
+
+/// Fetches one relay's recording of a session and decompresses it into the JSON a read
+/// serves, preferring the pinned [`DESYNC_PREFIX`] copy over the normal [`FLIGHT_PREFIX`]
+/// one (they carry the same bytes when both exist, but the pinned one is the surviving
+/// copy after a convergence sweep). `None` when neither exists.
+///
+/// A stored blob is zstd-compressed JSON; this decompresses it (bounded — see
+/// [`decompress_recording`]) so the caller serves ready-to-use JSON. A blob that is not
+/// valid zstd, or that decompresses past [`MAX_DECOMPRESSED_BLOB_BYTES`], is a
+/// store-integrity error, not a `None` — the caller serves it as a store error rather
+/// than the raw bytes.
 pub async fn fetch_recording<S: FlightStore>(
     store: &S,
     tenant: &TenantId,
     session: SessionId,
     relay_id: RelayId,
 ) -> Result<Option<Vec<u8>>, FlightStoreError> {
-    if let Some(bytes) = store
+    let compressed = match store
         .get(&object_key(true, tenant, session, relay_id))
         .await?
     {
-        return Ok(Some(bytes));
+        Some(bytes) => Some(bytes),
+        None => {
+            store
+                .get(&object_key(false, tenant, session, relay_id))
+                .await?
+        }
+    };
+    match compressed {
+        Some(bytes) => Ok(Some(decompress_recording(&bytes)?)),
+        None => Ok(None),
     }
-    store
-        .get(&object_key(false, tenant, session, relay_id))
-        .await
 }
 
 /// A validated flight-store configuration: where the bucket lives and the NAMES of the
@@ -853,6 +906,12 @@ mod tests {
         TenantId("sb-test".to_owned())
     }
 
+    /// zstd-compresses `bytes` the way the relay does before uploading, so a test can
+    /// store a genuine `.json.zst` object the read path decompresses back.
+    fn zstd_bytes(bytes: &[u8]) -> Vec<u8> {
+        zstd::encode_all(bytes, 0).expect("compressing test bytes")
+    }
+
     #[test]
     fn object_key_selects_the_prefix_and_preserves_the_tenant_first_shape() {
         assert_eq!(
@@ -948,11 +1007,12 @@ mod tests {
     async fn a_late_pin_sweeps_an_earlier_flight_blob_into_the_desync_prefix() {
         let store = FakeFlightStore::new();
         // A non-authority relay uploaded its recording unpinned first (the relay PUTs
-        // straight to the object key; here we write it directly to stand in for that).
+        // the compressed bytes straight to the object key; here we write them directly
+        // to stand in for that).
         store
             .put(
                 &object_key(false, &tenant(), SessionId(7), RelayId(2)),
-                b"early".to_vec(),
+                zstd_bytes(b"early"),
             )
             .await
             .unwrap();
@@ -961,7 +1021,7 @@ mod tests {
         store
             .put(
                 &object_key(true, &tenant(), SessionId(7), RelayId(3)),
-                b"late".to_vec(),
+                zstd_bytes(b"late"),
             )
             .await
             .unwrap();
@@ -973,7 +1033,8 @@ mod tests {
                 "desync/sb-test/7/3.json.zst".to_owned(),
             ],
         );
-        // The moved blob keeps its bytes, and its original is gone.
+        // The moved blob keeps its bytes (the read path decompresses them back), and its
+        // original is gone.
         assert_eq!(
             fetch_recording(&store, &tenant(), SessionId(7), RelayId(2))
                 .await
@@ -1043,7 +1104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_prefers_the_pinned_copy_then_flight_then_none() {
+    async fn fetch_decompresses_and_prefers_the_pinned_copy_then_flight_then_none() {
         let store = FakeFlightStore::new();
         assert_eq!(
             fetch_recording(&store, &tenant(), SessionId(7), RelayId(3))
@@ -1051,26 +1112,69 @@ mod tests {
                 .unwrap(),
             None,
         );
+        // A stored blob is zstd-compressed JSON; a fetch decompresses it back.
+        let flight_json = br#"{"version":1,"source":"flight"}"#;
         store
-            .put("flight/sb-test/7/3.json.zst", b"flight".to_vec())
+            .put("flight/sb-test/7/3.json.zst", zstd_bytes(flight_json))
             .await
             .unwrap();
         assert_eq!(
             fetch_recording(&store, &tenant(), SessionId(7), RelayId(3))
                 .await
                 .unwrap(),
-            Some(b"flight".to_vec()),
+            Some(flight_json.to_vec()),
+        );
+        let desync_json = br#"{"version":1,"source":"desync"}"#;
+        store
+            .put("desync/sb-test/7/3.json.zst", zstd_bytes(desync_json))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_recording(&store, &tenant(), SessionId(7), RelayId(3))
+                .await
+                .unwrap(),
+            Some(desync_json.to_vec()),
+            "the pinned copy is preferred over the flight copy",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_corrupt_non_zstd_stored_object() {
+        // An object that is not valid zstd (corruption, or something other than this
+        // module wrote it) is a store-integrity error, not a `None` — the caller serves
+        // it as a store error, never the raw bytes.
+        let store = FakeFlightStore::new();
+        store
+            .put("desync/sb-test/7/3.json.zst", b"not zstd at all".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            fetch_recording(&store, &tenant(), SessionId(7), RelayId(3))
+                .await
+                .is_err(),
+            "a corrupt stored object is refused, not served",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_an_over_cap_decompression_bomb() {
+        // A tiny compressed object that expands past the decompressed cap must be
+        // refused rather than materialized — the decompression-bomb guard.
+        let store = FakeFlightStore::new();
+        let bomb = zstd_bytes(&vec![0u8; MAX_DECOMPRESSED_BLOB_BYTES + 1]);
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb's compressed form is tiny; only its expansion is large",
         );
         store
-            .put("desync/sb-test/7/3.json.zst", b"desync".to_vec())
+            .put("desync/sb-test/7/3.json.zst", bomb)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(
             fetch_recording(&store, &tenant(), SessionId(7), RelayId(3))
                 .await
-                .unwrap(),
-            Some(b"desync".to_vec()),
-            "the pinned copy is preferred over the flight copy",
+                .is_err(),
+            "an over-cap decompression is refused",
         );
     }
 
