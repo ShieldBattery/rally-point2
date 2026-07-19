@@ -7,14 +7,13 @@ coordinator_url = "https://staging-rp2-coordinator.shieldbattery.net"
 # whatever `latest` currently points at.
 relay_image_tag = "latest"
 
-# Sized by measurement, not CPU need: small Fargate classes carry small
-# network/connection-tracking allowances, and past them a relay silently drops
-# QUIC handshakes and turn datagrams while its CPU sits far from saturated.
-# Measured on ARM64: 0.25 vCPU degrades near 100 connected players, 0.5 vCPU
-# near 300; 1 vCPU served 600 cleanly. The failure mode is silent packet loss
-# into live games, so the size stays a step above expected per-relay load.
-task_cpu    = 1024
-task_memory = 2048
+# Half the production size: staging's day-to-day sessions never approach the
+# ~300-connected-player allowance ceiling measured for this class (prod runs
+# 1 vCPU, whose ceiling sits near 1000+). A load-test round that needs the
+# production ceiling bumps these to match prod.tfvars for the run and drops
+# them back after.
+task_cpu    = 512
+task_memory = 1024
 
 # The publish workflow ships the relay image multi-arch, and Graviton runs
 # ~20% cheaper per vCPU-hour than x86 at Fargate's on-demand rates.
