@@ -24,6 +24,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
+use rally_point_proto::control::RegionId;
 use serde::Deserialize;
 
 use super::{LaunchSpec, ProvisionError, Provisioner, TaskId, TaskState};
@@ -331,6 +332,10 @@ impl Provisioner for EcsProvisioner {
     async fn list(&self) -> Result<Vec<TaskId>, ProvisionError> {
         self.inner.list().await
     }
+
+    fn expects_public_ipv4(&self, region: Option<&RegionId>) -> bool {
+        self.inner.expects_public_ipv4(region)
+    }
 }
 
 /// The substrate-independent core: it turns a [`LaunchSpec`] into a launch, an ECS
@@ -450,6 +455,16 @@ impl<Api: EcsApi> EcsCore<Api> {
             }
         }
         Ok(tasks)
+    }
+
+    /// Whether `region`'s Fargate networking assigns a public IPv4 address to a
+    /// launched task's network interface — the same flag [`launch`](Self::launch)
+    /// passes through as `assign_public_ip`. A region-blind query, or one naming a
+    /// region this config does not cover, never expects one.
+    fn expects_public_ipv4(&self, region: Option<&RegionId>) -> bool {
+        region
+            .and_then(|region_id| self.config.regions.get(region_id.as_ref()))
+            .is_some_and(|region| region.assign_public_ip)
     }
 }
 
@@ -1288,6 +1303,23 @@ mod tests {
                 "arn-c".to_owned(),
                 "arn-d".to_owned(),
             ],
+        );
+    }
+
+    #[test]
+    fn expects_public_ipv4_reflects_the_region_configs_flag() {
+        let core = core(FakeEcsApi::new());
+        assert!(
+            core.expects_public_ipv4(Some(&RegionId("us-east".to_owned()))),
+            "the one-region config assigns a public IPv4",
+        );
+        assert!(
+            !core.expects_public_ipv4(Some(&RegionId("eu-west".to_owned()))),
+            "an unconfigured region never expects one",
+        );
+        assert!(
+            !core.expects_public_ipv4(None),
+            "a region-blind query never expects one",
         );
     }
 

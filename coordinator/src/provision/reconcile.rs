@@ -61,13 +61,36 @@ pub struct ProvisionConfig {
 }
 
 /// A launched task whose addresses have not been recorded yet — the loop polls it
-/// each tick until it reports running.
+/// each tick until it reports running. `expects_public_ipv4` and `launched_at`
+/// gate that recording against a substrate whose task can report running with an
+/// address set that is still missing an address family it will carry once fully
+/// up (see [`PUBLIC_IPV4_WAIT_SECS`]).
 struct PendingLaunch {
     /// The id the task runs as.
     relay_id: RelayId,
     /// The provisioner handle for the task.
     task: TaskId,
+    /// Whether this launch's substrate is expected to eventually attach a public
+    /// IPv4 address to the task. When true, an address set reporting running
+    /// without one is treated as still incomplete rather than final.
+    expects_public_ipv4: bool,
+    /// When the task was launched (Unix seconds) — what
+    /// [`PUBLIC_IPV4_WAIT_SECS`] is measured from when deciding whether a
+    /// still-v4-less address set has waited long enough to record as-is.
+    launched_at: u64,
 }
+
+/// How long an address set missing an expected public IPv4 is treated as still
+/// incomplete after its task's launch. Some substrates attach a task's network
+/// interface with other addresses first and its public-IPv4 association only
+/// afterward, so an early poll can observe an address set missing the v4 the
+/// launch expects; recording that set as final would leave the relay reachable
+/// over only its other address family for the rest of its life. Past this many
+/// seconds since launch the set is recorded as-is regardless, so a deployment
+/// that legitimately never gets a public IPv4 is not blocked forever — the
+/// launch-deadline sweep remains the backstop for a task that never truly comes
+/// up.
+const PUBLIC_IPV4_WAIT_SECS: u64 = 90;
 
 /// How long a region may demand a bootstrap relay without any of its pairs gaining
 /// a value before the loop counts the attempt failed and starts backing off. Kept
@@ -251,7 +274,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
             self.scale_down(region, &enrolled, live, target, now).await;
         }
 
-        self.resolve_pending().await;
+        self.resolve_pending(now).await;
         self.launch_deadline_sweep(now).await;
         self.vanished_task_sweep().await;
         self.orphan_sweep().await;
@@ -435,7 +458,9 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     );
                     self.pending.push(PendingLaunch {
                         relay_id: minted.relay_id,
+                        expects_public_ipv4: self.provisioner.expects_public_ipv4(Some(region)),
                         task,
+                        launched_at: now,
                     });
                     launching += 1;
                 }
@@ -558,12 +583,17 @@ impl<P: Provisioner> ProvisionLoop<P> {
         true
     }
 
-    /// Polls each pending launch. A task that reports running has its addresses
-    /// recorded and leaves the pending set; one still starting stays; one that
-    /// stopped before enrolling is a failed launch — its id is retired so it can
-    /// never enroll, and the next tick re-mints. A record or poll error keeps the
-    /// task pending for a later tick.
-    async fn resolve_pending(&mut self) {
+    /// Polls each pending launch at `now` (Unix seconds). A task that reports
+    /// running has its addresses recorded and leaves the pending set — unless the
+    /// launch expects a public IPv4 address that the reported set does not carry
+    /// yet, in which case the launch stays pending until the address appears or
+    /// [`PUBLIC_IPV4_WAIT_SECS`] has elapsed since launch, whichever comes first
+    /// (past that point the set is recorded as-is, so a deployment with no public
+    /// IPv4 at all is never blocked forever). A task still starting stays
+    /// pending; one that stopped before enrolling is a failed launch — its id is
+    /// retired so it can never enroll, and the next tick re-mints. A record or
+    /// poll error keeps the task pending for a later tick.
+    async fn resolve_pending(&mut self, now: u64) {
         let pending = std::mem::take(&mut self.pending);
         let mut still = Vec::with_capacity(pending.len());
         for launch in pending {
@@ -572,6 +602,28 @@ impl<P: Provisioner> ProvisionLoop<P> {
                     expected_ips,
                     addrs,
                 }) => {
+                    let missing_ipv4 =
+                        launch.expects_public_ipv4 && !expected_ips.iter().any(|ip| ip.is_ipv4());
+                    if missing_ipv4
+                        && now < launch.launched_at.saturating_add(PUBLIC_IPV4_WAIT_SECS)
+                    {
+                        tracing::debug!(
+                            relay_id = launch.relay_id.0,
+                            task = %launch.task,
+                            "task's public IPv4 association has not appeared yet; waiting \
+                             before recording its addresses",
+                        );
+                        still.push(launch);
+                        continue;
+                    }
+                    if missing_ipv4 {
+                        tracing::warn!(
+                            relay_id = launch.relay_id.0,
+                            task = %launch.task,
+                            "recording a relay's addresses without the expected public IPv4; \
+                             the association never appeared",
+                        );
+                    }
                     if let Err(error) = self.ledger.record_task(
                         launch.relay_id,
                         &launch.task.0,
@@ -805,6 +857,8 @@ mod tests {
         fail_state: bool,
         fail_stop: bool,
         fail_list: bool,
+        /// What [`Provisioner::expects_public_ipv4`] reports for every region.
+        expects_public_ipv4: bool,
     }
 
     /// A running-task state at a fixed loopback address — the usual scripted
@@ -829,6 +883,7 @@ mod tests {
                     fail_state: false,
                     fail_stop: false,
                     fail_list: false,
+                    expects_public_ipv4: false,
                 }),
             })
         }
@@ -857,6 +912,10 @@ mod tests {
 
         fn set_fail_list(&self, fail: bool) {
             self.state.lock().fail_list = fail;
+        }
+
+        fn set_expects_public_ipv4(&self, expects: bool) {
+            self.state.lock().expects_public_ipv4 = expects;
         }
 
         fn launches(&self) -> Vec<LaunchSpec> {
@@ -915,6 +974,10 @@ mod tests {
                 .filter(|(_, s)| **s != TaskState::Stopped)
                 .map(|(id, _)| TaskId(id.clone()))
                 .collect())
+        }
+
+        fn expects_public_ipv4(&self, _region: Option<&RegionId>) -> bool {
+            self.state.lock().expects_public_ipv4
         }
     }
 
@@ -1138,6 +1201,121 @@ mod tests {
         assert!(
             h.provision.pending.is_empty(),
             "a recorded task leaves pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
+        let east = region("us-east");
+        let mut h = Harness::new(
+            vec![east.clone()],
+            Duration::from_secs(600),
+            Duration::from_secs(300),
+        );
+        h.fake.set_expects_public_ipv4(true);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_addr: SocketAddr = "[2001:db8::1]:14900".parse().unwrap();
+        h.fake.set_launch_state(TaskState::Running {
+            expected_ips: vec![v6],
+            addrs: vec![v6_addr],
+        });
+        h.warm
+            .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+
+        h.provision.tick(1_000).await;
+        let minted_id = h.fake.launches()[0].relay_id;
+        assert_eq!(
+            h.ledger.task_arn(minted_id).unwrap(),
+            None,
+            "a v6-only address set is not recorded while the public IPv4 may still appear",
+        );
+        assert_eq!(h.provision.pending.len(), 1);
+
+        // The public IPv4 association appears: a later, still-within-window tick
+        // records the full dual-stack set.
+        let v4: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        let v4_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 14_900));
+        h.fake.set_task_state(
+            "task-0",
+            TaskState::Running {
+                expected_ips: vec![v6, v4],
+                addrs: vec![v6_addr, v4_addr],
+            },
+        );
+        h.provision.tick(1_010).await;
+        assert_eq!(
+            h.ledger.task_arn(minted_id).unwrap(),
+            Some("task-0".to_owned()),
+            "once the v4 association appears the dual-stack set is recorded",
+        );
+        assert!(
+            h.provision.pending.is_empty(),
+            "the now-recorded launch leaves pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v6_only_running_state_is_recorded_once_the_wait_lapses() {
+        let east = region("us-east");
+        let mut h = Harness::new(
+            vec![east.clone()],
+            Duration::from_secs(600),
+            Duration::from_secs(3_600),
+        );
+        h.fake.set_expects_public_ipv4(true);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_addr: SocketAddr = "[2001:db8::1]:14900".parse().unwrap();
+        h.fake.set_launch_state(TaskState::Running {
+            expected_ips: vec![v6],
+            addrs: vec![v6_addr],
+        });
+        h.warm
+            .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+
+        h.provision.tick(1_000).await;
+        let minted_id = h.fake.launches()[0].relay_id;
+        assert_eq!(
+            h.ledger.task_arn(minted_id).unwrap(),
+            None,
+            "still within the wait, the v6-only set is not yet recorded",
+        );
+
+        // Past PUBLIC_IPV4_WAIT_SECS since launch, with the v4 association never
+        // having appeared: the v6-only set is recorded as-is rather than held
+        // forever.
+        h.provision.tick(1_000 + PUBLIC_IPV4_WAIT_SECS + 1).await;
+        assert_eq!(
+            h.ledger.task_arn(minted_id).unwrap(),
+            Some("task-0".to_owned()),
+            "past the wait the v6-only set is recorded rather than blocked forever",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v6_only_running_state_is_recorded_immediately_when_ipv4_is_not_expected() {
+        let east = region("us-east");
+        let mut h = Harness::new(
+            vec![east.clone()],
+            Duration::from_secs(600),
+            Duration::from_secs(300),
+        );
+        // `expects_public_ipv4` stays at its default (false): a genuinely
+        // v6-only deployment must not be held waiting for a v4 that never comes.
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_addr: SocketAddr = "[2001:db8::1]:14900".parse().unwrap();
+        h.fake.set_launch_state(TaskState::Running {
+            expected_ips: vec![v6],
+            addrs: vec![v6_addr],
+        });
+        h.warm
+            .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+
+        h.provision.tick(1_000).await;
+        let minted_id = h.fake.launches()[0].relay_id;
+        assert_eq!(
+            h.ledger.task_arn(minted_id).unwrap(),
+            Some("task-0".to_owned()),
+            "a v6-only deployment records immediately when no public IPv4 is expected",
         );
     }
 

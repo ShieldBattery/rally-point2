@@ -119,6 +119,15 @@ pub trait Provisioner: Send + Sync {
     /// The tasks this provisioner started that the substrate still knows about —
     /// the input to the orphan sweep.
     fn list(&self) -> impl Future<Output = Result<Vec<TaskId>, ProvisionError>> + Send;
+
+    /// Whether a task launched for `region` is expected to eventually carry a
+    /// public IPv4 address (so an address set without one is still incomplete).
+    /// Defaults to `false`: a substrate with no public-v4 concept (or a
+    /// region-blind launch) never expects one.
+    fn expects_public_ipv4(&self, region: Option<&RegionId>) -> bool {
+        let _ = region;
+        false
+    }
 }
 
 /// A shared provisioner is itself a provisioner: the loop owns one handle while a
@@ -144,5 +153,9 @@ impl<P: Provisioner> Provisioner for std::sync::Arc<P> {
 
     fn list(&self) -> impl Future<Output = Result<Vec<TaskId>, ProvisionError>> + Send {
         (**self).list()
+    }
+
+    fn expects_public_ipv4(&self, region: Option<&RegionId>) -> bool {
+        (**self).expects_public_ipv4(region)
     }
 }
