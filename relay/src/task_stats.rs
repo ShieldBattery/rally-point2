@@ -61,12 +61,16 @@ type StatsClient = Client<HttpConnector, Full<Bytes>>;
 /// locks never held across an await), so each log line pairs a resource sample
 /// with the relay's session count and its replay-ring occupancy at that moment
 /// — the ring is the largest deliberately-held per-session memory, so the line
-/// shows directly how much of the working set it accounts for.
+/// shows directly how much of the working set it accounts for. `control_queue_depths`
+/// adds the coordinator control connection's outbound queue depths to the same
+/// line — the load-test observable for control-plane pressure — and stays all-zero
+/// on a relay with no coordinator connection.
 pub fn spawn_if_enabled(
     interval_secs: u64,
     relay_id: Option<u64>,
     sessions: Sessions,
     turn_ring: crate::turn_ring::TurnRing,
+    control_queue_depths: crate::coordinator_client::ControlQueueDepths,
 ) {
     if interval_secs == 0 {
         tracing::debug!("task-stats reporter disabled: interval is 0");
@@ -96,6 +100,7 @@ pub fn spawn_if_enabled(
         relay_id,
         sessions,
         turn_ring,
+        control_queue_depths,
     ));
 }
 
@@ -111,6 +116,7 @@ async fn run(
     relay_id: Option<u64>,
     sessions: Sessions,
     turn_ring: crate::turn_ring::TurnRing,
+    control_queue_depths: crate::coordinator_client::ControlQueueDepths,
 ) {
     tracing::info!(
         interval_secs = interval.as_secs(),
@@ -141,6 +147,7 @@ async fn run(
         let derived = derive(Some(&prev_sample), &curr, now.duration_since(prev_at));
         let sessions = crate::routing::session_count(&sessions);
         let ring = turn_ring.totals();
+        let control = control_queue_depths.snapshot();
         tracing::info!(
             relay_id,
             cpu_pct = ?derived.cpu_pct,
@@ -151,6 +158,9 @@ async fn run(
             sessions,
             ring_turns = ring.turns,
             ring_cmd_mib = ring.command_bytes as f64 / MIB,
+            control_notice_depth = control.notices,
+            control_flight_depth = control.flights,
+            control_blob_mib = control.pending_blob_bytes as f64 / MIB,
             "relay task stats",
         );
         prev = Some((curr, now));

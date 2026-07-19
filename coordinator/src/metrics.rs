@@ -164,6 +164,70 @@ impl ColdStartHistogram {
     }
 }
 
+/// The finite bucket bounds, in whole milliseconds, for a control-connection
+/// frame send. Sends are normally sub-millisecond, so the low end is dense; the
+/// top bound reaches the liveness timeout, past which a send is treated as a
+/// stall, so a stalled send lands in the overflow (`+Inf`) bucket.
+const SEND_DURATION_BUCKET_BOUNDS_MS: [u64; 12] =
+    [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000];
+
+/// A fixed-bucket histogram for control-connection frame send durations, in
+/// milliseconds. Shaped exactly like [`ColdStartHistogram`]: non-cumulative
+/// bucket counts cumulated at render, so `observe` is one atomic add per field.
+struct SendDurationHistogram {
+    /// One non-cumulative count per finite bound, plus a trailing `+Inf` bucket.
+    buckets: [AtomicU64; SEND_DURATION_BUCKET_BOUNDS_MS.len() + 1],
+    /// The sum of all observed values, in whole milliseconds.
+    sum: AtomicU64,
+    /// The total number of observations.
+    count: AtomicU64,
+}
+
+impl SendDurationHistogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; SEND_DURATION_BUCKET_BOUNDS_MS.len() + 1],
+            sum: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, millis: u64) {
+        let idx = SEND_DURATION_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|&bound| millis <= bound)
+            .unwrap_or(SEND_DURATION_BUCKET_BOUNDS_MS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(millis, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str) {
+        write_meta(
+            out,
+            name,
+            "Duration of a coordinator control-connection frame send, in milliseconds.",
+            "histogram",
+        );
+        let bucket_name = format!("{name}_bucket");
+        let mut cumulative = 0u64;
+        for (idx, bound) in SEND_DURATION_BUCKET_BOUNDS_MS.iter().enumerate() {
+            cumulative += self.buckets[idx].load(Ordering::Relaxed);
+            let le = bound.to_string();
+            write_series(out, &bucket_name, &[("le", le.as_str())], cumulative);
+        }
+        cumulative += self.buckets[SEND_DURATION_BUCKET_BOUNDS_MS.len()].load(Ordering::Relaxed);
+        write_series(out, &bucket_name, &[("le", "+Inf")], cumulative);
+        write_series(
+            out,
+            &format!("{name}_sum"),
+            &[],
+            self.sum.load(Ordering::Relaxed),
+        );
+        write_series(out, &format!("{name}_count"), &[], cumulative);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The metric statics
 // ---------------------------------------------------------------------------
@@ -182,6 +246,10 @@ static WEBHOOK_ATTEMPT_FAILURES: LabeledCounter<String> = LabeledCounter::new();
 static FLIGHT_RECORDINGS: LabeledCounter<String> = LabeledCounter::new();
 static FLIGHT_RECORDINGS_PINNED: AtomicU64 = AtomicU64::new(0);
 static RELAY_COLD_START: ColdStartHistogram = ColdStartHistogram::new();
+static REAP_DIRECTIVES_SENT: AtomicU64 = AtomicU64::new(0);
+static REAP_NUDGES_COALESCED: AtomicU64 = AtomicU64::new(0);
+static CONTROL_SEND_DURATION: SendDurationHistogram = SendDurationHistogram::new();
+static CONTROL_CONNECTION_ENDS: LabeledCounter<String> = LabeledCounter::new();
 
 /// Whether the coverage bootstrap is currently backing off each region, published
 /// by the reconcile loop as its coverage phase changes (the phase is otherwise
@@ -280,6 +348,29 @@ pub(crate) fn flight_recording_pinned() {
 /// Observes a relay's cold-start duration (launch to first enroll), in seconds.
 pub(crate) fn observe_relay_cold_start(seconds: u64) {
     RELAY_COLD_START.observe(seconds);
+}
+
+/// Records `count` slot-close directives written down relay control connections.
+pub(crate) fn reap_directives_sent(count: u64) {
+    REAP_DIRECTIVES_SENT.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Records `count` queued slot-close nudges that collapsed into an already-pending
+/// directive for the same session before a single frame was written for it.
+pub(crate) fn reap_nudges_coalesced(count: u64) {
+    REAP_NUDGES_COALESCED.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Observes one control-connection frame send's duration, in whole milliseconds.
+pub(crate) fn observe_control_send(millis: u64) {
+    CONTROL_SEND_DURATION.observe(millis);
+}
+
+/// Records a control connection ended by `cause` — `write_stall` (a send could not
+/// complete within the liveness window) or `liveness_lapse` (the relay sent nothing
+/// within the liveness window).
+pub(crate) fn control_connection_ended(cause: &str) {
+    CONTROL_CONNECTION_ENDS.incr(cause.to_owned());
 }
 
 /// Publishes whether the coverage bootstrap is backing off `region`, so the
@@ -450,6 +541,42 @@ pub fn render(state: &CoordinatorState) -> String {
     );
 
     RELAY_COLD_START.render(&mut out, "rp2_relay_cold_start_seconds");
+
+    write_meta(
+        &mut out,
+        "rp2_reap_directives_sent_total",
+        "Slot-close directives written down relay control connections.",
+        "counter",
+    );
+    write_series(
+        &mut out,
+        "rp2_reap_directives_sent_total",
+        &[],
+        REAP_DIRECTIVES_SENT.load(Ordering::Relaxed),
+    );
+
+    write_meta(
+        &mut out,
+        "rp2_reap_nudges_coalesced_total",
+        "Queued slot-close nudges collapsed into a same-session directive before a frame was sent.",
+        "counter",
+    );
+    write_series(
+        &mut out,
+        "rp2_reap_nudges_coalesced_total",
+        &[],
+        REAP_NUDGES_COALESCED.load(Ordering::Relaxed),
+    );
+
+    render_counter_1(
+        &mut out,
+        "rp2_control_connection_ends_total",
+        "Relay control connections ended by a send stall or a liveness lapse, by cause.",
+        &CONTROL_CONNECTION_ENDS,
+        "cause",
+    );
+
+    CONTROL_SEND_DURATION.render(&mut out, "rp2_control_send_duration_milliseconds");
 
     out
 }
@@ -822,6 +949,46 @@ mod tests {
         assert!(out.contains("test_cold_bucket{le=\"+Inf\"} 3"), "{out}");
         assert!(out.contains("test_cold_sum 1010"), "{out}");
         assert!(out.contains("test_cold_count 3"), "{out}");
+    }
+
+    #[test]
+    fn send_duration_histogram_buckets_are_cumulative() {
+        let histogram = SendDurationHistogram::new();
+        histogram.observe(0); // le=1
+        histogram.observe(7); // le=10
+        histogram.observe(100_000); // +Inf only (past the top finite bound)
+        let mut out = String::new();
+        histogram.render(&mut out, "test_send");
+
+        assert!(out.contains("test_send_bucket{le=\"1\"} 1"), "{out}");
+        assert!(out.contains("test_send_bucket{le=\"10\"} 2"), "{out}");
+        // The 100000ms observation falls only into +Inf, so every finite bucket at
+        // or above 10 stays at 2.
+        assert!(out.contains("test_send_bucket{le=\"30000\"} 2"), "{out}");
+        assert!(out.contains("test_send_bucket{le=\"+Inf\"} 3"), "{out}");
+        assert!(out.contains("test_send_sum 100007"), "{out}");
+        assert!(out.contains("test_send_count 3"), "{out}");
+    }
+
+    #[test]
+    fn control_connection_end_causes_are_counted_by_label() {
+        // Counter statics are process-global, so assert the delta a single increment
+        // produces. A cause word unique to this test isolates it from any other.
+        let state = test_state();
+        let before = series_value(
+            &render(&state),
+            "rp2_control_connection_ends_total",
+            "metrics-test-cause",
+        )
+        .unwrap_or(0);
+        control_connection_ended("metrics-test-cause");
+        let after = series_value(
+            &render(&state),
+            "rp2_control_connection_ends_total",
+            "metrics-test-cause",
+        )
+        .expect("the series exists after an increment");
+        assert_eq!(after - before, 1);
     }
 
     #[test]

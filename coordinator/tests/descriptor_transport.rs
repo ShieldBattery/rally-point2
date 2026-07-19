@@ -81,6 +81,47 @@ fn no_control_connected() -> watch::Sender<bool> {
     watch::channel(false).0
 }
 
+/// Apply targets with default (empty) stores and a throwaway drain-ack sender, over
+/// the given Join source — the common case for these transport tests.
+fn apply_targets(control: MeshControl) -> coordinator_client::ControlApplyTargets {
+    coordinator_client::ControlApplyTargets {
+        control,
+        applied: coordinator_client::AppliedSessions::default(),
+        fleet: coordinator_client::FleetMeshPeers::default(),
+        verifying_keys: SharedRegistry::default(),
+        region_targets: region_ping::RegionPingTargets::default(),
+        drain_acked: no_drain_ack(),
+    }
+}
+
+/// Empty outbound queues (no notices, no flight) with a fresh depth reporter — these
+/// tests don't exercise the notice or flight pipes.
+fn no_outbound() -> coordinator_client::OutboundQueues {
+    coordinator_client::OutboundQueues::new(
+        no_notices(),
+        no_flight(),
+        coordinator_client::ControlQueueDepths::new(),
+    )
+}
+
+/// A heartbeat over an empty roster and RTT cache at the given interval.
+fn heartbeat(interval: Duration) -> coordinator_client::HeartbeatConfig {
+    coordinator_client::HeartbeatConfig {
+        sessions: std::sync::Arc::default(),
+        region_rtt_cache: region_ping::RegionRttCache::default(),
+        interval,
+    }
+}
+
+/// The transport tests' redial backoff: a fast ordinary delay and a longer
+/// version-refusal delay.
+fn backoff() -> coordinator_client::ReconnectBackoff {
+    coordinator_client::ReconnectBackoff {
+        ordinary: Duration::from_millis(50),
+        version_refused: Duration::from_secs(60),
+    }
+}
+
 fn session_key(session: SessionId) -> SessionKey {
     SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -273,25 +314,18 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
 
     // The relay holds its control connection open with the matching secret.
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(1, 14900),
-        relay_key(1),
-        Some(secret.to_owned()),
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: Some(secret.to_owned()),
+            relay_hello: relay_hello(1, 14900),
+            identity_key: relay_key(1),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)),
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_secs(3600),
+        backoff(),
     ));
 
     // The coordinator pushes relay 1's current set on connect; it names peer 2,
@@ -309,25 +343,18 @@ async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
     let (control, mut rx2) = relay_one_with_peer_link();
 
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(1, 14900),
-        relay_key(1),
-        None,
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: None,
+            relay_hello: relay_hello(1, 14900),
+            identity_key: relay_key(1),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)),
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_secs(3600),
+        backoff(),
     ));
 
     // The initial push joins the session.
@@ -357,25 +384,18 @@ async fn a_wrong_bootstrap_secret_drives_no_join() {
     // The relay presents the wrong secret, so every handshake is rejected (401)
     // and it keeps retrying without ever receiving a descriptor.
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(1, 14900),
-        relay_key(1),
-        Some("wrong-secret".to_owned()),
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: Some("wrong-secret".to_owned()),
+            relay_hello: relay_hello(1, 14900),
+            identity_key: relay_key(1),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)),
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_secs(3600),
+        backoff(),
     ));
 
     let result = timeout(Duration::from_millis(500), rx2.recv()).await;
@@ -400,25 +420,18 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
         std::sync::Arc::default(),
     );
     tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(5, 15000),
-        relay_key(5),
-        None,
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: None,
+            relay_hello: relay_hello(5, 15000),
+            identity_key: relay_key(5),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)),
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_secs(3600),
+        backoff(),
     ));
 
     assert!(
@@ -533,25 +546,18 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
         std::sync::Arc::default(),
     );
     let handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(7, 15007),
-        relay_key(7),
-        None,
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: None,
+            relay_hello: relay_hello(7, 15007),
+            identity_key: relay_key(7),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_secs(3600)), // effectively no heartbeat during the test
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_secs(3600), // effectively no heartbeat during the test
+        backoff(),
     ));
     assert!(
         wait_for_enrollment(&reg, RelayId(7)).await,
@@ -612,6 +618,16 @@ async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
 /// [`serve_bare_coordinator`], this exposes the setup and enrolls a tenant, which a
 /// drain test needs to prove the assignment path excludes the drained relay.
 async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (String, SessionSetup) {
+    serve_coordinator_with_liveness(pre_enrolled, LIVENESS).await
+}
+
+/// Like [`serve_coordinator_exposing_setup`] but with a caller-chosen liveness
+/// deadline, for tests that must observe a timeout-driven drop without waiting the
+/// production window.
+async fn serve_coordinator_with_liveness(
+    pre_enrolled: &[(u64, u16)],
+    liveness_timeout: Duration,
+) -> (String, SessionSetup) {
     let reg = registry::new_registry();
     for &(id, port) in pre_enrolled {
         registry::enroll(&reg, relay_hello(id, port));
@@ -633,7 +649,7 @@ async fn serve_coordinator_exposing_setup(pre_enrolled: &[(u64, u16)]) -> (Strin
         lifecycle,
         control_auth: ControlAuth::Open,
         hello_timeout: api::HELLO_TIMEOUT,
-        liveness_timeout: LIVENESS,
+        liveness_timeout,
         regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
         ledger: None,
@@ -1127,25 +1143,18 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         std::sync::Arc::default(),
     );
     let _handle = tokio::spawn(coordinator_client::run_descriptor_subscriber_with(
-        base_url,
-        relay_hello(7, 15007),
-        relay_key(7),
-        None,
-        control,
-        std::sync::Arc::default(),
-        coordinator_client::AppliedSessions::default(),
-        coordinator_client::FleetMeshPeers::default(),
-        SharedRegistry::default(),
-        region_ping::RegionPingTargets::default(),
-        region_ping::RegionRttCache::default(),
-        no_notices(),
-        no_flight(),
+        coordinator_client::EnrollConfig {
+            coordinator_url: base_url,
+            bootstrap_secret: None,
+            relay_hello: relay_hello(7, 15007),
+            identity_key: relay_key(7),
+        },
+        apply_targets(control),
+        no_outbound(),
+        heartbeat(Duration::from_millis(100)), // heartbeat three times inside the 300ms deadline
         no_drain_rx(),
-        no_drain_ack(),
         no_control_connected(),
-        Duration::from_millis(50),
-        Duration::from_secs(60),
-        Duration::from_millis(100), // heartbeat three times inside the 300ms deadline
+        backoff(),
     ));
     assert!(
         wait_for_enrollment(&reg, RelayId(7)).await,
@@ -1446,5 +1455,248 @@ async fn a_heartbeats_region_rtts_are_served_on_the_regions_endpoint() {
     assert!(
         rtts[0].get("measured_at").is_some(),
         "each served pair carries its recorded age",
+    );
+}
+
+// --- Split reader/writer: concurrency, reap coalescing, and the send-stall bound ---
+
+#[tokio::test]
+async fn an_inbound_flood_does_not_delay_a_descriptor_push() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A relay enrolls, then floods the coordinator with inbound heartbeats while a
+    // session is created. Because reads and writes run on independent halves, the
+    // writer keeps making progress under the reader's load, so the descriptor push
+    // naming the new session still arrives promptly.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    common::prove_identity(&mut socket, &relay_key(1)).await;
+    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
+
+    let (mut write, mut read) = socket.split();
+
+    // Flood inbound heartbeats continuously from a side task.
+    let flood = tokio::spawn(async move {
+        let beat = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+            sessions: vec![],
+            region_rtts: vec![],
+        })
+        .unwrap();
+        loop {
+            if write
+                .send(Message::Text(beat.clone().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    // Create a session homed on the relay; its descriptor must be pushed.
+    let session = create_one_slot_session(&setup);
+
+    // Despite the flood, the descriptor frame naming the session arrives quickly.
+    let found = timeout(Duration::from_secs(3), async {
+        while let Some(Ok(message)) = read.next().await {
+            if let Message::Text(text) = message
+                && let Ok(CoordinatorToRelay::Descriptors { descriptors }) =
+                    serde_json::from_str::<CoordinatorToRelay>(&text)
+                && descriptors.iter().any(|d| d.session == session)
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the descriptor push must arrive well within the bound despite the flood");
+    assert!(
+        found,
+        "the writer pushed the new session's descriptor while the reader was flooded",
+    );
+    flood.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_reaps_for_one_session_arrive_as_a_single_frame() {
+    use futures_util::{SinkExt, StreamExt};
+    use rally_point_coordinator::descriptors::SlotClose;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A burst of reap nudges for the SAME session, queued before the writer's reap
+    // arm wakes, coalesces into one CloseSlot frame carrying the merged slot union.
+    // A single-threaded runtime makes the burst-before-drain deterministic: the
+    // writer task cannot run while this test task fires the nudges without awaiting.
+    let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    common::prove_identity(&mut socket, &relay_key(1)).await;
+    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
+
+    // Drain the connect-time lead so the next frames read are the reap directives,
+    // and so the writer is parked in its steady-state select before the burst.
+    let _ = read_to_descriptors(&mut socket).await;
+
+    // Fire the nudges synchronously (no await between), so they all queue on the
+    // relay's reap channel before the writer drains any. Each nudge carries the
+    // merged-so-far slot union for its session, so the last is the most complete.
+    let tenant = TenantId(TENANT.to_owned());
+    for slot in 0u8..8 {
+        setup.reaps().send(
+            RelayId(1),
+            SlotClose {
+                tenant: tenant.clone(),
+                session: SessionId(1),
+                slots: (0..=slot).map(SlotId).collect(),
+            },
+        );
+    }
+
+    // Exactly one CloseSlot frame arrives, carrying the full union of every nudge's
+    // slots.
+    let (session, slots) = timeout(Duration::from_secs(5), async {
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            if let Ok(CoordinatorToRelay::CloseSlot { session, slots, .. }) =
+                serde_json::from_str::<CoordinatorToRelay>(&text)
+            {
+                return (session, slots);
+            }
+        }
+        panic!("no CloseSlot frame arrived");
+    })
+    .await
+    .expect("a CloseSlot frame should arrive");
+    assert_eq!(session, SessionId(1));
+    assert_eq!(
+        slots,
+        (0u8..8).map(SlotId).collect::<Vec<_>>(),
+        "the single frame carries the union of every coalesced nudge",
+    );
+
+    // No further CloseSlot for the same session follows within a short window — the
+    // queued nudges collapsed into the one frame.
+    let another = timeout(Duration::from_millis(300), async {
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            if matches!(
+                serde_json::from_str::<CoordinatorToRelay>(&text),
+                Ok(CoordinatorToRelay::CloseSlot { .. })
+            ) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(another, Err(_) | Ok(false)),
+        "the queued nudges coalesced into a single frame, not one per nudge",
+    );
+}
+
+#[tokio::test]
+async fn a_relay_that_stops_reading_is_dropped_by_the_send_stall_bound_despite_heartbeats() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The send-stall bound: a relay that keeps heartbeating — refreshing the
+    // reader's liveness deadline forever — but stops READING must still lose its
+    // registry entry, because the writer's per-send timeout runs from each send's
+    // start, independent of the reader-refreshed deadline.
+    //
+    // Arranged over a real socket without guessing OS buffer sizes: a short liveness
+    // plus a descriptor set the coordinator re-pushes (in full) every time it grows.
+    // The peer never drains those pushes, so the unread bytes climb past whatever the
+    // buffers hold and a writer send eventually stalls — while the heartbeats keep
+    // the reader's deadline fresh throughout, so only the writer's bound can be what
+    // drops the connection.
+    let liveness = Duration::from_millis(400);
+    let (base_url, setup) = serve_coordinator_with_liveness(&[(1, 14900)], liveness).await;
+
+    // A sizeable initial set, so each re-push already carries real weight.
+    for _ in 0..1000 {
+        create_one_slot_session(&setup);
+    }
+
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+    // Enroll (the handshake requires reading the coordinator's challenge)...
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    common::prove_identity(&mut socket, &relay_key(1)).await;
+    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
+
+    // ...then never read again, only heartbeat — every ~25ms, well inside the 400ms
+    // liveness — while growing the descriptor set so the coordinator keeps re-pushing
+    // an ever-larger full set to a peer that never reads it.
+    let heartbeat = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+        sessions: vec![],
+        region_rtts: vec![],
+    })
+    .unwrap();
+    let mut beats = 0u32;
+    let dropped = loop {
+        // Deregistration is the drop being waited for; check before doing more work
+        // (once the relay is gone, no session can home on it).
+        if registry::peer(setup.registry(), RelayId(1)).is_none() {
+            break true;
+        }
+        if socket
+            .send(Message::Text(heartbeat.clone().into()))
+            .await
+            .is_err()
+        {
+            break true; // the coordinator tore the connection down; the send errors
+        }
+        beats += 1;
+        if beats > 400 {
+            break false; // ~10s of heartbeats with no drop: the bound never fired
+        }
+        // One more session → one more full re-push the peer will not drain, so the
+        // coordinator's unread backlog keeps rising until a send stalls. A create
+        // that fails for want of a relay means the drop already happened.
+        let created = session::create_session(
+            &setup,
+            SessionRequest {
+                tenant: TenantId(TENANT.to_owned()),
+                players: vec![PlayerHandoff {
+                    slot: SlotId(0),
+                    client_pubkey: ClientPublicKey([0xAA; 32]),
+                    external_ref: None,
+                    observer: false,
+                    region: None,
+                }],
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .is_ok();
+        if !created {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        dropped,
+        "a relay that heartbeats but never reads is dropped by the send-stall bound",
+    );
+    assert!(
+        beats >= 2,
+        "the relay actually heartbeated (refreshing the reader deadline) before the drop",
+    );
+    assert!(
+        wait_for_deregistration(setup.registry(), RelayId(1)).await,
+        "the wedged relay is deregistered",
     );
 }

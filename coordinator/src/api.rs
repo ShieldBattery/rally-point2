@@ -86,6 +86,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use rally_point_proto::control::{
     CoordinatorToRelay, FlightRecordingNotice, MeshPeerIdentity, RegionBeaconTarget, RegionId,
     RegionRttReport, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
@@ -1164,33 +1166,10 @@ async fn relay_control(
         tracing::warn!("relay control connection rejected: bad bootstrap secret");
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let setup = state.setup.clone();
-    let notices = state.notices.clone();
-    let lifecycle = state.lifecycle.clone();
-    let hello_timeout = state.hello_timeout;
-    let liveness_timeout = state.liveness_timeout;
-    let regions = state.regions.clone();
-    let ledger = state.ledger.clone();
-    let pair_rtts = state.pair_rtts.clone();
-    let flight_store = state.flight_store.clone();
     let peer_ip = peer_addr.map(|addr| addr.ip());
     ws.max_message_size(MAX_CONTROL_MESSAGE_BYTES)
         .max_frame_size(MAX_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| {
-            serve_relay_control(
-                socket,
-                setup,
-                notices,
-                lifecycle,
-                hello_timeout,
-                liveness_timeout,
-                regions,
-                ledger,
-                peer_ip,
-                pair_rtts,
-                flight_store,
-            )
-        })
+        .on_upgrade(move |socket| serve_relay_control(socket, state, peer_ip))
 }
 
 /// The most control connections allowed to sit between a completed WebSocket
@@ -1261,20 +1240,26 @@ const CONTROL_CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 /// that already reconnected (a newer connection re-enrolled it) keeps its live
 /// entry, so a stale drop racing a reconnect does not evict a relay that is in fact
 /// connected.
-#[allow(clippy::too_many_arguments)]
 async fn serve_relay_control(
     mut socket: WebSocket,
-    setup: SessionSetup,
-    notices: NoticeDedup,
-    lifecycle: Lifecycle,
-    hello_timeout: Duration,
-    liveness_timeout: Duration,
-    regions: RegionsConfig,
-    ledger: Option<Arc<RelayLedger>>,
+    state: CoordinatorState,
     peer_ip: Option<IpAddr>,
-    pair_rtts: PairRttStore,
-    flight_store: Option<Arc<S3FlightStore>>,
 ) {
+    // The per-connection dependencies travel together as the shared coordinator
+    // state; unpack the ones this handler drives (the control-auth posture and
+    // player-token lifetime are consumed before the upgrade, not here).
+    let CoordinatorState {
+        setup,
+        notices,
+        lifecycle,
+        hello_timeout,
+        liveness_timeout,
+        regions,
+        ledger,
+        pair_rtts,
+        flight_store,
+        ..
+    } = state;
     // Claimed before anything else: a connection that never proves an identity
     // still costs a parked task and socket for up to `hello_timeout`, and
     // nothing else bounds how many of those can pile up at once. `try_acquire`
@@ -1478,19 +1463,16 @@ async fn serve_relay_control(
         store: &pair_rtts,
         ledger: ledger.as_deref(),
     };
-    push_and_watch(
-        &mut socket,
-        &setup,
-        &regions,
-        &notices,
-        &lifecycle,
+    let inbound = ControlInbound {
+        setup: &setup,
+        notices: &notices,
+        lifecycle: &lifecycle,
         relay_id,
         generation,
-        liveness_timeout,
-        &rtt_ingest,
-        flight_store.as_ref(),
-    )
-    .await;
+        rtt: &rtt_ingest,
+        flight_store: flight_store.as_ref(),
+    };
+    push_and_watch(socket, &inbound, &regions, liveness_timeout).await;
 
     // The connection ended: clear the presence this connection reported, so its
     // players read as queueable promptly rather than waiting out the TTL. Fenced
@@ -1573,93 +1555,268 @@ async fn challenge_and_verify(
     proven
 }
 
-/// Subscribes to `relay_id`'s descriptor set, re-syncs it on connect, then pushes
-/// every change down the connection while watching the relay's liveness. Returns
-/// when the connection ends: the relay closes, the socket errors, the liveness
-/// deadline lapses (the relay went silent *or* a descriptor send stalled), or the
-/// coordinator's outbox is dropped on shutdown.
-///
-/// Liveness is a single absolute deadline that every inbound frame pushes forward.
-/// Crucially, the deadline also bounds the descriptor sends: a relay that stops
-/// reading stalls the WebSocket send under backpressure, and if that send couldn't
-/// be raced against the deadline it would block the loop from ever polling the
-/// timer — leaving a wedged relay registered indefinitely, the exact degraded path
-/// this watch exists to catch. So each send (including the initial re-sync) races
-/// the same deadline, and a send that can't finish in time ends the connection.
-#[allow(clippy::too_many_arguments)]
-async fn push_and_watch(
-    socket: &mut WebSocket,
-    setup: &SessionSetup,
-    regions: &RegionsConfig,
-    notices: &NoticeDedup,
-    lifecycle: &Lifecycle,
+/// The send half of a relay's split control socket — every coordinator→relay
+/// frame goes out through this, owned solely by the writer.
+type ControlWrite = SplitSink<WebSocket, Message>;
+/// The receive half of a relay's split control socket — every relay→coordinator
+/// frame comes in through this, owned solely by the reader.
+type ControlRead = SplitStream<WebSocket>;
+
+/// A reader→writer directive to run the send half of a coordinated-drain exchange:
+/// push the relay's current descriptor set, then a [`CoordinatorToRelay::DrainAck`].
+/// Carries no data — the reader already applied the draining mark, and the writer
+/// reads the current set from its own descriptor watch — so this is purely the
+/// "now emit set-then-ack" signal that must originate from the writer to keep every
+/// send on one task.
+struct DrainSend;
+
+/// The immutable inputs for handling one inbound relay frame: the coordinator state
+/// a frame's side effects read and update, this connection's identity and
+/// generation, and the RTT-ingest and flight-store handles a heartbeat or recording
+/// lands through. Bundled because they travel together from enroll into the reader
+/// and on into [`note_inbound`] on every frame, never individually — the borrowed
+/// fields let the reader hold them without owning any of the shared state.
+struct ControlInbound<'a> {
+    /// The session-setup context: registry, membership, and outboxes a frame reads
+    /// or mutates.
+    setup: &'a SessionSetup,
+    /// The relay-notice dedup sets a departure/desync/result collapses against.
+    notices: &'a NoticeDedup,
+    /// The per-session lifecycle a notice or `SessionClosed` advances.
+    lifecycle: &'a Lifecycle,
+    /// The relay identity this connection enrolled as — the only id a frame may
+    /// report under.
     relay_id: RelayId,
+    /// This connection's enroll generation, fencing a stale connection's late frame
+    /// against a reconnect.
     generation: u64,
+    /// The backbone-RTT ingest a heartbeat's `region_rtts` fold through.
+    rtt: &'a RegionRttIngest<'a>,
+    /// The durable flight sink a shipped recording is stored into, when configured.
+    flight_store: Option<&'a Arc<S3FlightStore>>,
+}
+
+/// The writer half's outbound sources: the per-relay descriptor and reap outboxes,
+/// the fleet mesh-peer watch, the reader's drain-exchange directives, and the
+/// connect-time payloads led out ahead of any steady-state push. Bundled because
+/// they are all consumed by the one writer and nowhere else, so they are moved in
+/// together and owned for the connection's life.
+struct WriterSources {
+    /// This relay's current descriptor set, latest-wins, re-synced on connect and
+    /// pushed on every change.
+    descriptors: tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
+    /// The fleet mesh-peer set, shared across every connection and pushed on
+    /// membership changes.
+    mesh_peers: tokio::sync::watch::Receiver<Vec<MeshPeerIdentity>>,
+    /// This relay's reap directives, coalesced per session before each is sent.
+    reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
+    /// The reader's directives to emit a drain exchange's set-then-ack.
+    drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
+    /// The tenant verifying keys, led out first so a relay can verify a session's
+    /// client tokens before that session's descriptor arrives.
+    tenant_keys: Vec<TenantVerifyingKey>,
+    /// The region ping-beacon targets, led out after the keys; empty on a
+    /// region-blind coordinator.
+    beacon_targets: Vec<RegionBeaconTarget>,
+}
+
+/// Serves an enrolled relay's control connection by splitting the socket into a
+/// reader and a writer that run until either ends. Returns when the connection is
+/// over — the relay closes, the socket errors, the relay goes silent past
+/// `liveness_timeout`, a send stalls past `liveness_timeout`, or the coordinator's
+/// outbox is dropped on shutdown — so the caller then runs the single
+/// deregistration path.
+///
+/// The split lets reading and writing proceed independently: a relay that stops
+/// reading can back-pressure the writer's sends without also blocking the reader,
+/// so the coordinator keeps processing that relay's inbound frames and — via the
+/// writer's own per-send stall bound — still tears the wedged connection down. The
+/// reader owns inbound frames and the liveness deadline (every frame pushes it
+/// forward; a lapse ends the connection); the writer owns the connect-time lead and
+/// every steady-state push. Whichever half ends first drops the other, so no task
+/// leaks and every side effect runs on exactly one half.
+async fn push_and_watch(
+    socket: WebSocket,
+    inbound: &ControlInbound<'_>,
+    regions: &RegionsConfig,
     liveness_timeout: Duration,
-    rtt: &RegionRttIngest<'_>,
-    flight_store: Option<&Arc<S3FlightStore>>,
 ) {
-    let mut rx = setup.descriptors().subscribe(relay_id);
-    // The reap outbox for this relay: the reap policies push `CloseSlot`
-    // directives here, and this loop forwards each down the connection. A fresh
-    // subscribe replaces any prior sender, so a reconnect owns the live receiver.
-    let mut reaps = setup.reaps().subscribe(relay_id);
-    // The fleet mesh-peer set: shared across every relay's connection, re-synced
-    // in full on connect and pushed again whenever fleet membership changes. The
-    // relay pins a dialing peer's cert against it at mesh-accept time.
-    let mut mesh_peers_rx = registry::subscribe_mesh_peers(setup.registry());
+    let (mut write_half, mut read_half) = socket.split();
+    let setup = inbound.setup;
+    let relay_id = inbound.relay_id;
 
-    // A relay silent past this deadline — or one whose send stalls past it — is
-    // treated as dead. Every inbound frame pushes it forward; a heartbeat lands
-    // well inside the window, so it only lapses when the relay stops making
-    // progress (a crash, a half-open connection, or a peer that stopped reading).
-    let mut deadline = tokio::time::Instant::now() + liveness_timeout;
+    // The reader directs the writer to emit a drain exchange's set-then-ack over
+    // this channel once its synchronous draining mark has applied — keeping every
+    // send on the writer so set-before-ack holds on the wire.
+    let (drain_tx, drain) = tokio::sync::mpsc::unbounded_channel::<DrainSend>();
 
-    // The tenant verifying keys, pushed once on connect and strictly ahead of the
-    // first descriptor: a descriptor must never reach a relay that cannot yet
-    // verify its clients' tokens. Tenant config is immutable per process, so this
-    // is a one-time connect-time push — a relay that reconnects re-receives it, and
-    // a future dynamic registry would re-push from a watch arm in the loop below.
-    let tenant_keys = tenant::all_verifying_keys(setup.tenants());
-    if !send_tenant_keys_before_deadline(socket, &tenant_keys, relay_id, deadline).await {
-        return;
+    // Every coordinator→relay source the writer draws from. The descriptor and reap
+    // outboxes' fresh subscribes replace any prior sender, so a reconnect owns the
+    // live receivers; the mesh-peer watch is shared across every connection. The
+    // tenant keys and region beacons are immutable per process, snapshotted here and
+    // led out ahead of the first descriptor (a relay that reconnects re-receives
+    // them).
+    let mut sources = WriterSources {
+        descriptors: setup.descriptors().subscribe(relay_id),
+        mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
+        reaps: setup.reaps().subscribe(relay_id),
+        drain,
+        tenant_keys: tenant::all_verifying_keys(setup.tenants()),
+        beacon_targets: regions.beacon_targets(),
+    };
+
+    // The two halves run concurrently until one returns; the other's future is then
+    // dropped (cancelled) here. A drop is safe on both sides: the reader only ever
+    // awaits between whole synchronous `note_inbound` runs, and the writer only ever
+    // awaits mid-send on a connection that is ending anyway — so no effect is left
+    // half-applied and nothing is double-run.
+    tokio::select! {
+        () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout) => {}
+        () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx) => {}
     }
+}
 
-    // The region ping beacon targets, pushed once on connect ahead of the first
-    // descriptor, alongside the tenant keys. The region registry is immutable per
-    // process, so this is a one-time connect-time push — a relay that reconnects
-    // re-receives it. A coordinator with no regions configured sends nothing here:
-    // a region-blind fleet has no beacons to measure, so the frame stays off its
-    // connections entirely.
-    let beacon_targets = regions.beacon_targets();
-    if !beacon_targets.is_empty()
-        && !send_region_beacons_before_deadline(socket, &beacon_targets, relay_id, deadline).await
+/// Owns the write half and every coordinator→relay send. Leads with the
+/// connect-time sequence in a fixed order — tenant keys, region beacons (when any),
+/// the initial descriptor set, the initial mesh-peer set — strictly before any
+/// steady-state push, then serves a `biased` priority loop: the drain exchange
+/// first, then the latest-wins descriptor watch, the mesh-peer watch, and the reap
+/// receiver last. Returns (ending the connection) when a send stalls or errors, a
+/// watch closes on shutdown, or the reader ends.
+async fn run_writer(
+    write_half: &mut ControlWrite,
+    sources: &mut WriterSources,
+    relay_id: RelayId,
+    liveness_timeout: Duration,
+) {
+    // Split the sources into the individual channels + payloads the loop drives;
+    // they are disjoint fields, so each arm borrows its own.
+    let WriterSources {
+        descriptors: rx,
+        mesh_peers: mesh_peers_rx,
+        reaps,
+        drain: drain_rx,
+        tenant_keys,
+        beacon_targets,
+    } = sources;
+    // Tenant keys first — a descriptor is meaningless to a relay that cannot yet
+    // verify the session's client tokens.
+    let keys_frame = control_frame(&CoordinatorToRelay::TenantKeys {
+        keys: tenant_keys.to_vec(),
+    });
+    if !writer_send(
+        write_half,
+        keys_frame,
+        relay_id,
+        liveness_timeout,
+        "tenant-keys",
+    )
+    .await
     {
         return;
     }
-
-    // Initial re-sync, bounded by the deadline. Clone the set out of the watch
-    // borrow before awaiting — a watch borrow must never be held across an await.
+    // Region beacons only when the coordinator configures regions: a region-blind
+    // fleet has none to measure, so the frame stays off its connections entirely.
+    if !beacon_targets.is_empty() {
+        let beacons_frame = control_frame(&CoordinatorToRelay::RegionBeacons {
+            beacons: beacon_targets.to_vec(),
+        });
+        if !writer_send(
+            write_half,
+            beacons_frame,
+            relay_id,
+            liveness_timeout,
+            "region-beacons",
+        )
+        .await
+        {
+            return;
+        }
+    }
+    // The initial descriptor and mesh-peer re-syncs. Clone each set out of its watch
+    // borrow before awaiting — a watch borrow must never be held across an await —
+    // and mark it seen so the steady-state arm does not redundantly re-push it.
     let initial = rx.borrow_and_update().clone();
-    if !send_before_deadline(socket, &initial, relay_id, deadline).await {
+    if !writer_send(
+        write_half,
+        control_frame(&CoordinatorToRelay::Descriptors {
+            descriptors: initial,
+        }),
+        relay_id,
+        liveness_timeout,
+        "descriptor",
+    )
+    .await
+    {
         return;
     }
-    // The fleet mesh-peer set rides the same connect-time re-sync, alongside the
-    // descriptor set: the relay learns every enrolled peer's cert fingerprint the
-    // moment it connects.
     let initial_peers = mesh_peers_rx.borrow_and_update().clone();
-    if !send_mesh_peers_before_deadline(socket, &initial_peers, relay_id, deadline).await {
+    if !writer_send(
+        write_half,
+        control_frame(&CoordinatorToRelay::MeshPeers {
+            peers: initial_peers,
+        }),
+        relay_id,
+        liveness_timeout,
+        "mesh-peers",
+    )
+    .await
+    {
         return;
     }
 
     loop {
         tokio::select! {
+            biased;
+
+            directive = drain_rx.recv() => {
+                // The reader marked the relay draining and asked for the exchange's
+                // send half. `None` means the reader ended, so this half ends too.
+                if directive.is_none() {
+                    break;
+                }
+                // Set before ack. `borrow_and_update` reads the latest set — which
+                // already reflects every descriptor staged before the reader's
+                // assignment-locked mark — and marks it seen so the descriptor arm
+                // does not redundantly re-push the same set right after.
+                let set = rx.borrow_and_update().clone();
+                if !writer_send(
+                    write_half,
+                    control_frame(&CoordinatorToRelay::Descriptors { descriptors: set }),
+                    relay_id,
+                    liveness_timeout,
+                    "descriptor",
+                )
+                .await
+                {
+                    break;
+                }
+                if !writer_send(
+                    write_half,
+                    control_frame(&CoordinatorToRelay::DrainAck),
+                    relay_id,
+                    liveness_timeout,
+                    "drain-ack",
+                )
+                .await
+                {
+                    break;
+                }
+            }
             changed = rx.changed() => {
                 if changed.is_err() {
                     break; // the outbox was dropped: coordinator shutting down
                 }
                 let set = rx.borrow_and_update().clone();
-                if !send_before_deadline(socket, &set, relay_id, deadline).await {
+                if !writer_send(
+                    write_half,
+                    control_frame(&CoordinatorToRelay::Descriptors { descriptors: set }),
+                    relay_id,
+                    liveness_timeout,
+                    "descriptor",
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -1668,39 +1825,105 @@ async fn push_and_watch(
                     break; // the registry's mesh-peer channel was dropped: shutting down
                 }
                 let peers = mesh_peers_rx.borrow_and_update().clone();
-                if !send_mesh_peers_before_deadline(socket, &peers, relay_id, deadline).await {
+                if !writer_send(
+                    write_half,
+                    control_frame(&CoordinatorToRelay::MeshPeers { peers }),
+                    relay_id,
+                    liveness_timeout,
+                    "mesh-peers",
+                )
+                .await
+                {
                     break;
                 }
             }
-            close = reaps.recv() => {
+            first = reaps.recv() => {
                 // The reap outbox never closes on its own (the sender lives in the
                 // shared outbox), so `None` here would only mean a replaced
                 // subscription — treat it as end-of-stream and stop selecting.
-                let Some(close) = close else { break };
-                if !send_reap_before_deadline(socket, close, relay_id, deadline).await {
+                let Some(first) = first else { break };
+                if !send_coalesced_reaps(write_half, reaps, first, relay_id, liveness_timeout).await
+                {
                     break;
                 }
             }
-            inbound = socket.recv() => {
-                match inbound {
+        }
+    }
+}
+
+/// Coalesces a burst of reap nudges into one `CloseSlot` frame per session, then
+/// sends them. When the reap arm wakes with `first`, every other nudge already
+/// queued is drained and deduped by `(tenant, session)` keeping the **last** — each
+/// nudge carries the merged-so-far slot union for its session, so the last is the
+/// most complete — collapsing a teardown storm's hundreds of redundant nudges into
+/// at most one frame per session per wake. Returns whether the connection should
+/// keep running.
+async fn send_coalesced_reaps(
+    write_half: &mut ControlWrite,
+    reaps: &mut tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
+    first: SlotClose,
+    relay_id: RelayId,
+    liveness_timeout: Duration,
+) -> bool {
+    let mut received: u64 = 1;
+    let mut latest: std::collections::BTreeMap<(String, u64), SlotClose> =
+        std::collections::BTreeMap::new();
+    latest.insert((first.tenant.as_ref().to_owned(), first.session.0), first);
+    while let Ok(next) = reaps.try_recv() {
+        received += 1;
+        latest.insert((next.tenant.as_ref().to_owned(), next.session.0), next);
+    }
+    let unique = latest.len() as u64;
+    crate::metrics::reap_nudges_coalesced(received - unique);
+    for (_, close) in latest {
+        let frame = control_frame(&CoordinatorToRelay::CloseSlot {
+            tenant: close.tenant,
+            session: close.session,
+            slots: close.slots,
+        });
+        if !writer_send(write_half, frame, relay_id, liveness_timeout, "close-slot").await {
+            return false;
+        }
+        crate::metrics::reap_directives_sent(1);
+    }
+    true
+}
+
+/// Owns the read half, the liveness deadline, and every inbound side effect. Runs
+/// `note_inbound` synchronously on each frame in arrival order, refreshes the
+/// deadline on every frame (any frame proves the relay alive), and — on a
+/// `Draining` frame — applies the synchronous draining mark and directs the writer
+/// to emit the exchange's set-then-ack. Returns (ending the connection) on a close,
+/// a stream end, a read error, or the deadline lapsing with nothing read.
+async fn run_reader(
+    read_half: &mut ControlRead,
+    inbound: &ControlInbound<'_>,
+    liveness_timeout: Duration,
+    drain_tx: &tokio::sync::mpsc::UnboundedSender<DrainSend>,
+) {
+    let relay_id = inbound.relay_id;
+    // A relay silent past this deadline is treated as dead. Every inbound frame
+    // pushes it forward; a heartbeat lands well inside the window, so it only lapses
+    // when the relay stops sending at all (a crash or a half-open connection). A
+    // relay that keeps sending but stops reading is caught separately, by the
+    // writer's per-send stall bound.
+    let mut deadline = tokio::time::Instant::now() + liveness_timeout;
+    loop {
+        tokio::select! {
+            frame = read_half.next() => {
+                match frame {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        let action = note_inbound(
-                            setup, notices, lifecycle, relay_id, generation, &message, rtt,
-                            flight_store,
-                        );
+                        let action = note_inbound(inbound, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
-                        // A Draining frame additionally runs the drain exchange: mark
-                        // the relay ineligible for new assignments, then push its
-                        // current descriptor set followed by a DrainAck (set before
-                        // ack, racing the refreshed deadline). A send that stalls or
-                        // errors ends the connection like any other.
+                        // A Draining frame applies the synchronous draining mark here,
+                        // then hands the send half (its current descriptor set, then a
+                        // DrainAck) to the writer so set-before-ack holds on the wire. A
+                        // dropped writer (its half ended) means the connection is over.
                         if action == InboundAction::DrainRequested
-                            && !handle_drain_request(
-                                socket, setup, relay_id, generation, &mut rx, deadline,
-                            )
-                            .await
+                            && apply_drain_mark(inbound.setup, relay_id, inbound.generation)
+                            && drain_tx.send(DrainSend).is_err()
                         {
                             break;
                         }
@@ -1716,210 +1939,68 @@ async fn push_and_watch(
                     relay_id = relay_id.0,
                     "relay control connection went silent past the liveness deadline; dropping",
                 );
+                crate::metrics::control_connection_ended("liveness_lapse");
                 break;
             }
         }
     }
 }
 
-/// Sends a `CloseSlot` reap directive down the connection, racing the same
-/// liveness deadline as a descriptor push. Returns whether the connection should
-/// keep running.
-async fn send_reap_before_deadline(
-    socket: &mut WebSocket,
-    close: SlotClose,
+/// Serializes a coordinator→relay control message into its tagged JSON text frame.
+fn control_frame(message: &CoordinatorToRelay) -> Message {
+    let json =
+        serde_json::to_string(message).expect("a coordinator control frame always serializes");
+    Message::Text(json.into())
+}
+
+/// Sends one frame on the write half, racing a fixed per-send stall bound measured
+/// from this send's start and recording the send's duration. The bound is fixed
+/// (not a reader-refreshed deadline) so a relay that keeps heartbeating but stops
+/// reading — refreshing the reader's deadline forever — still cannot hold its
+/// registry entry open: its stalled send trips this bound instead. Returns whether
+/// the connection should keep running: `false` on a stall past `liveness_timeout`
+/// or a socket error, which ends it. `what` names the frame for the log line.
+async fn writer_send(
+    write_half: &mut ControlWrite,
+    message: Message,
     relay_id: RelayId,
-    deadline: tokio::time::Instant,
+    liveness_timeout: Duration,
+    what: &str,
 ) -> bool {
-    let message = CoordinatorToRelay::CloseSlot {
-        tenant: close.tenant,
-        session: close.session,
-        slots: close.slots,
-    };
-    let json = serde_json::to_string(&message).expect("a close-slot frame always serializes");
-    tokio::select! {
-        result = socket.send(Message::Text(json.into())) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "close-slot push failed");
-                    false
-                }
-            }
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(liveness_timeout, write_half.send(message)).await;
+    crate::metrics::observe_control_send(started.elapsed().as_millis() as u64);
+    match outcome {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, relay_id = relay_id.0, "{what} push failed");
+            false
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        Err(_elapsed) => {
             tracing::info!(
                 relay_id = relay_id.0,
-                "close-slot push stalled past the liveness deadline; dropping",
+                "{what} push stalled past the liveness deadline; dropping",
             );
+            crate::metrics::control_connection_ended("write_stall");
             false
         }
     }
 }
 
-/// Pushes a descriptor set, but only up to the liveness `deadline`: if the send
-/// can't complete before then — the relay stopped reading and backpressure stalled
-/// the socket — the connection is treated as dead so it can't hold a registry entry
-/// open while wedged. Returns whether the connection should keep running: `false`
-/// on a send error or a stall past the deadline (the caller then ends it).
-async fn send_before_deadline(
-    socket: &mut WebSocket,
-    set: &[SessionDescriptor],
-    relay_id: RelayId,
-    deadline: tokio::time::Instant,
-) -> bool {
-    tokio::select! {
-        result = push_descriptors(socket, set) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "descriptor push failed");
-                    false
-                }
-            }
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            tracing::info!(
-                relay_id = relay_id.0,
-                "descriptor push stalled past the liveness deadline; dropping",
-            );
-            false
-        }
-    }
-}
-
-/// Sends the tenant verifying-key set down the connection, racing the same liveness
-/// deadline as a descriptor push (a relay that stopped reading must not hold its
-/// registry entry open while wedged). Returns whether the connection should keep
-/// running: `false` on a send error or a stall past the deadline.
-///
-/// Pushed once on connect, ahead of the first descriptor, so the relay can verify a
-/// session's client tokens by the time that session's descriptor arrives.
-async fn send_tenant_keys_before_deadline(
-    socket: &mut WebSocket,
-    keys: &[TenantVerifyingKey],
-    relay_id: RelayId,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let message = CoordinatorToRelay::TenantKeys {
-        keys: keys.to_vec(),
-    };
-    let json = serde_json::to_string(&message).expect("a tenant-keys frame always serializes");
-    tokio::select! {
-        result = socket.send(Message::Text(json.into())) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "tenant-keys push failed");
-                    false
-                }
-            }
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            tracing::info!(
-                relay_id = relay_id.0,
-                "tenant-keys push stalled past the liveness deadline; dropping",
-            );
-            false
-        }
-    }
-}
-
-/// Sends the region ping-beacon set down the connection, racing the same liveness
-/// deadline as a descriptor push (a relay that stopped reading must not hold its
-/// registry entry open while wedged). Returns whether the connection should keep
-/// running: `false` on a send error or a stall past the deadline.
-///
-/// Pushed once on connect, ahead of the first descriptor, so a relay learns the
-/// regions it can measure backbone round-trips against as soon as it enrolls. The
-/// caller omits it for a coordinator with no configured regions.
-async fn send_region_beacons_before_deadline(
-    socket: &mut WebSocket,
-    beacons: &[RegionBeaconTarget],
-    relay_id: RelayId,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let message = CoordinatorToRelay::RegionBeacons {
-        beacons: beacons.to_vec(),
-    };
-    let json = serde_json::to_string(&message).expect("a region-beacons frame always serializes");
-    tokio::select! {
-        result = socket.send(Message::Text(json.into())) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "region-beacons push failed");
-                    false
-                }
-            }
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            tracing::info!(
-                relay_id = relay_id.0,
-                "region-beacons push stalled past the liveness deadline; dropping",
-            );
-            false
-        }
-    }
-}
-
-/// Sends the fleet mesh-peer set down the connection, racing the same liveness
-/// deadline as a descriptor push (a relay that stopped reading must not hold its
-/// registry entry open while wedged). Returns whether the connection should keep
-/// running: `false` on a send error or a stall past the deadline.
-async fn send_mesh_peers_before_deadline(
-    socket: &mut WebSocket,
-    peers: &[MeshPeerIdentity],
-    relay_id: RelayId,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let message = CoordinatorToRelay::MeshPeers {
-        peers: peers.to_vec(),
-    };
-    let json = serde_json::to_string(&message).expect("a mesh-peers frame always serializes");
-    tokio::select! {
-        result = socket.send(Message::Text(json.into())) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "mesh-peers push failed");
-                    false
-                }
-            }
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            tracing::info!(
-                relay_id = relay_id.0,
-                "mesh-peers push stalled past the liveness deadline; dropping",
-            );
-            false
-        }
-    }
-}
-
-/// Runs a relay's coordinated-drain exchange after it sent a
-/// [`RelayToCoordinator::Draining`]: mark it ineligible for new assignments, then —
-/// if the mark applied — push its current descriptor set followed by a
-/// [`CoordinatorToRelay::DrainAck`]. Returns whether the connection should keep
-/// running (`false` on a send stall/error, which ends it like any other).
+/// Applies the synchronous part of a relay's coordinated-drain exchange after it
+/// sent a [`RelayToCoordinator::Draining`]: mark it ineligible for new assignments,
+/// returning whether the mark applied (so the caller then directs the writer to send
+/// the set + ack).
 ///
 /// The mark is taken under the assignment lock ([`SessionSetup::lock_assignment`]),
 /// so it linearizes against any in-flight `create_session`/`rehome`: after it lands,
 /// every session that will ever name this relay has already staged its descriptor in
-/// the relay's outbox. The set is then pushed **before** the ack, so a relay that
-/// sees an empty descriptor set at ack time knows it is provably unassigned.
+/// the relay's outbox, so the set the writer then reads is provably complete.
 ///
 /// A mark that does **not** apply — a stale generation, meaning a newer connection
 /// re-enrolled this relay (its fresh enroll cleared the flag) — draws no ack: that
 /// live connection runs its own drain exchange when its `Draining` arrives.
-async fn handle_drain_request(
-    socket: &mut WebSocket,
-    setup: &SessionSetup,
-    relay_id: RelayId,
-    generation: u64,
-    rx: &mut tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
-    deadline: tokio::time::Instant,
-) -> bool {
+fn apply_drain_mark(setup: &SessionSetup, relay_id: RelayId, generation: u64) -> bool {
     let applied = {
         let _assign = setup.lock_assignment();
         registry::mark_draining(setup.registry(), relay_id, generation)
@@ -1930,49 +2011,12 @@ async fn handle_drain_request(
             relay_id = relay_id.0,
             "ignoring a Draining frame from a stale control connection",
         );
-        return true;
+        return false;
     }
     let region = registry::entry(setup.registry(), relay_id).and_then(|entry| entry.region);
     crate::metrics::relay_drained(region.as_ref());
     tracing::info!(relay_id = relay_id.0, "relay draining; sending set + ack");
-    // Set before ack. Clone the set out of the watch borrow before awaiting — a
-    // watch borrow must never be held across an await — and mark it seen so the
-    // loop's `changed()` doesn't redundantly re-push the same set right after.
-    let set = rx.borrow_and_update().clone();
-    if !send_before_deadline(socket, &set, relay_id, deadline).await {
-        return false;
-    }
-    send_drain_ack_before_deadline(socket, relay_id, deadline).await
-}
-
-/// Sends a [`CoordinatorToRelay::DrainAck`] down the connection, racing the same
-/// liveness deadline as a descriptor push. Returns whether the connection should
-/// keep running.
-async fn send_drain_ack_before_deadline(
-    socket: &mut WebSocket,
-    relay_id: RelayId,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let json = serde_json::to_string(&CoordinatorToRelay::DrainAck)
-        .expect("a drain-ack frame always serializes");
-    tokio::select! {
-        result = socket.send(Message::Text(json.into())) => {
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!(%error, relay_id = relay_id.0, "drain-ack push failed");
-                    false
-                }
-            }
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            tracing::info!(
-                relay_id = relay_id.0,
-                "drain-ack push stalled past the liveness deadline; dropping",
-            );
-            false
-        }
-    }
+    true
 }
 
 /// The inputs a relay control connection threads from enroll down to
@@ -2111,17 +2155,16 @@ const MAX_HEARTBEAT_REGION_RTTS: usize = 256;
 /// `sessionClosed` signal must track a session even for a tenant with no webhook
 /// configured. Redundant notices from multiple relays are idempotent in the
 /// accounting (a set insert), so feeding every copy is harmless.
-#[allow(clippy::too_many_arguments)]
-fn note_inbound(
-    setup: &SessionSetup,
-    notices: &NoticeDedup,
-    lifecycle: &Lifecycle,
-    relay_id: RelayId,
-    generation: u64,
-    message: &Message,
-    rtt: &RegionRttIngest<'_>,
-    flight_store: Option<&Arc<S3FlightStore>>,
-) -> InboundAction {
+fn note_inbound(inbound: &ControlInbound<'_>, message: &Message) -> InboundAction {
+    let &ControlInbound {
+        setup,
+        notices,
+        lifecycle,
+        relay_id,
+        generation,
+        rtt,
+        flight_store,
+    } = inbound;
     let Message::Text(text) = message else {
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
     };
@@ -2623,19 +2666,6 @@ async fn read_identity_proof(socket: &mut WebSocket) -> Option<Vec<u8>> {
             }
         }
     }
-}
-
-/// Sends a descriptor set down a relay's control connection as one tagged JSON
-/// text frame.
-async fn push_descriptors(
-    socket: &mut WebSocket,
-    set: &[SessionDescriptor],
-) -> Result<(), axum::Error> {
-    let message = CoordinatorToRelay::Descriptors {
-        descriptors: set.to_vec(),
-    };
-    let json = serde_json::to_string(&message).expect("a descriptor set always serializes");
-    socket.send(Message::Text(json.into())).await
 }
 
 /// Whether a request may open the control connection under `auth`. `Open` admits
@@ -3738,6 +3768,32 @@ mod tests {
         }
     }
 
+    /// Runs [`note_inbound`] over one frame's inputs, bundling them into a
+    /// [`ControlInbound`] with no flight store — these direct-call tests never
+    /// exercise the flight-recording path.
+    fn note_inbound_frame(
+        setup: &SessionSetup,
+        notices: &NoticeDedup,
+        lifecycle: &Lifecycle,
+        relay_id: RelayId,
+        generation: u64,
+        message: &Message,
+        rtt: &RegionRttIngest<'_>,
+    ) -> InboundAction {
+        note_inbound(
+            &ControlInbound {
+                setup,
+                notices,
+                lifecycle,
+                relay_id,
+                generation,
+                rtt,
+                flight_store: None,
+            },
+            message,
+        )
+    }
+
     /// A `Heartbeat` framed as an inbound control message, carrying the given
     /// `(region, rtt_ms)` backbone measurements and an empty session roster.
     fn heartbeat_with_rtts(rtts: &[(&str, u32)]) -> Message {
@@ -3800,7 +3856,7 @@ mod tests {
         let beat = heartbeat_with_rtts(&[("region-b", 87)]);
 
         // The stale connection's beat writes nothing.
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -3808,7 +3864,6 @@ mod tests {
             stale_generation,
             &beat,
             &rtt,
-            None,
         );
         assert!(
             store.snapshot().is_empty(),
@@ -3816,7 +3871,7 @@ mod tests {
         );
 
         // The current connection's beat folds the pair in.
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -3824,7 +3879,6 @@ mod tests {
             current_generation,
             &beat,
             &rtt,
-            None,
         );
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
@@ -3835,7 +3889,7 @@ mod tests {
         // A report for a region the coordinator does not configure is dropped, leaving
         // the known pair untouched.
         let unknown = heartbeat_with_rtts(&[("region-z", 42)]);
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -3843,7 +3897,6 @@ mod tests {
             current_generation,
             &unknown,
             &rtt,
-            None,
         );
         assert_eq!(
             store.snapshot().len(),
@@ -3926,7 +3979,7 @@ mod tests {
             session,
             slots: vec![SlotId(0)],
         }]);
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -3934,7 +3987,6 @@ mod tests {
             relay_2_generation,
             &beat,
             &rtt,
-            None,
         );
 
         assert!(
@@ -4046,7 +4098,7 @@ mod tests {
                 slots: vec![SlotId(0)],
             },
         ]);
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4054,7 +4106,6 @@ mod tests {
             relay_2_generation,
             &beat,
             &rtt,
-            None,
         );
 
         let mut present =
@@ -4100,7 +4151,7 @@ mod tests {
             .collect();
         let beat = heartbeat_with_sessions(sessions);
 
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4108,7 +4159,6 @@ mod tests {
             generation,
             &beat,
             &rtt,
-            None,
         );
 
         assert_eq!(
@@ -4146,7 +4196,7 @@ mod tests {
             slots,
         }]);
 
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4154,7 +4204,6 @@ mod tests {
             generation,
             &beat,
             &rtt,
-            None,
         );
 
         assert_eq!(
@@ -4196,7 +4245,7 @@ mod tests {
 
         let rtts: Vec<(&str, u32)> = region_id_strs.iter().map(|&r| (r, 10u32)).collect();
         let beat = heartbeat_with_rtts(&rtts);
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4204,7 +4253,6 @@ mod tests {
             generation,
             &beat,
             &rtt,
-            None,
         );
 
         assert_eq!(
@@ -4222,7 +4270,7 @@ mod tests {
         let (url, mut rx) = spawn_webhook_receiver().await;
         let (setup, notices, lifecycle, session) = setup_with_session_and_notify(url);
 
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4230,7 +4278,6 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
-            None,
         );
 
         assert!(
@@ -4246,7 +4293,7 @@ mod tests {
         let (url, mut rx) = spawn_webhook_receiver().await;
         let (setup, notices, lifecycle, session) = setup_with_session_and_notify(url);
 
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4254,7 +4301,6 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(session, 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
-            None,
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -4273,7 +4319,7 @@ mod tests {
 
         // A session id the coordinator never created this lifetime -> empty serving
         // set, so even an arbitrary relay id is allowed through.
-        note_inbound(
+        note_inbound_frame(
             &setup,
             &notices,
             &lifecycle,
@@ -4281,7 +4327,6 @@ mod tests {
             0, // no live connection generation in this direct-call test
             &result_message(SessionId(4242), 0),
             &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
-            None,
         );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())

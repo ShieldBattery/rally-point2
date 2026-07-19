@@ -300,6 +300,12 @@ async fn main() -> Result<()> {
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::new_mesh_state();
 
+    // Shared observable of the coordinator control connection's outbound queue
+    // depths: the coordinator client's writer refreshes it, the task-stats reporter
+    // logs it. Created up front so both share one handle; it stays all-zero without
+    // a coordinator connection (nothing writes it).
+    let control_queue_depths = coordinator_client::ControlQueueDepths::new();
+
     // Self-reported Fargate task resources: a no-op outside Fargate (see the
     // module doc), so this is safe to call unconditionally in dev/loopback too.
     rally_point_relay::task_stats::spawn_if_enabled(
@@ -307,6 +313,7 @@ async fn main() -> Result<()> {
         cli.relay_id,
         Arc::clone(&sessions),
         mesh_state.turn_ring.clone(),
+        control_queue_depths.clone(),
     );
 
     // The coordinated-drain seam. On a shutdown signal the drain sequence flips
@@ -560,23 +567,30 @@ async fn main() -> Result<()> {
             let (control_connected_tx, control_connected_rx) = tokio::sync::watch::channel(false);
 
             tokio::spawn(coordinator_client::run_descriptor_subscriber(
-                coordinator_url,
-                relay_hello,
-                identity_key,
-                cli.coordinator_secret.clone(),
-                mesh_control.clone(),
+                coordinator_client::EnrollConfig {
+                    coordinator_url,
+                    bootstrap_secret: cli.coordinator_secret.clone(),
+                    relay_hello,
+                    identity_key,
+                },
+                coordinator_client::ControlApplyTargets {
+                    control: mesh_control.clone(),
+                    applied: applied.clone(),
+                    fleet: fleet_peers,
+                    verifying_keys: shared_registry
+                        .clone()
+                        .expect("coordinator mode constructs a shared tenant-key registry"),
+                    region_targets: region_targets.clone(),
+                    drain_acked: drain_acked_tx.clone(),
+                },
+                coordinator_client::OutboundQueues::new(
+                    notices_rx,
+                    flight_rx,
+                    control_queue_depths,
+                ),
                 Arc::clone(&sessions),
-                applied.clone(),
-                fleet_peers,
-                shared_registry
-                    .clone()
-                    .expect("coordinator mode constructs a shared tenant-key registry"),
-                region_targets.clone(),
                 region_rtt_cache.clone(),
-                notices_rx,
-                flight_rx,
                 drain_rx.clone(),
-                drain_acked_tx.clone(),
                 control_connected_tx,
             ));
             tokio::spawn(provisional::run_sweep(

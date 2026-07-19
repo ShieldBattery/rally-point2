@@ -40,6 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -135,8 +136,10 @@ enum ControlDisconnect {
 /// at DrainAck time means the coordinator's post-mark truth names this relay in no
 /// session at all. The DrainAck contract guarantees the pre-ack descriptor push is
 /// processed (through `apply_message`/`reconcile`, updating this set) before
-/// the ack flips the drain-acked signal — same socket, sequential loop — so the set
-/// is authoritative at exactly the moment the drain sequence consults it.
+/// the ack flips the drain-acked signal — both frames applied in arrival order by
+/// the single read-half frame processor, so the descriptor push lands before the
+/// ack — so the set is authoritative at exactly the moment the drain sequence
+/// consults it.
 ///
 /// A plain (non-async) mutex: every critical section is a short, await-free set
 /// read or replace, following the same rule as the roster and mesh registries.
@@ -255,6 +258,200 @@ impl FleetMeshPeersReader {
     }
 }
 
+/// Point-in-time depths of the coordinator control connection's outbound queues,
+/// published for the task-stats reporter to log next to its resource sample.
+/// These are the load-test observables for control-plane pressure: how many
+/// notices and flight recordings are queued to go up the connection, and how many
+/// bytes the one blob currently parked for sending holds.
+///
+/// The connection's writer refreshes them as it works the queues; the reporter
+/// reads a [`snapshot`](Self::snapshot). All zero on a relay with no coordinator
+/// connection — nothing writes them — which reads correctly as "no pressure".
+/// Relaxed atomics: each field is an independent counter a single writer stores
+/// and a single reader loads, with no cross-field invariant to protect.
+#[derive(Clone, Default)]
+pub struct ControlQueueDepths {
+    inner: Arc<ControlQueueDepthsInner>,
+}
+
+#[derive(Default)]
+struct ControlQueueDepthsInner {
+    notices: AtomicUsize,
+    flights: AtomicUsize,
+    pending_blob_bytes: AtomicUsize,
+}
+
+impl ControlQueueDepths {
+    /// Creates a fresh, all-zero handle (a relay that has not connected yet, or
+    /// one that never will).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the current queue depths: `notices` and `flights` count everything
+    /// waiting to go up the connection (each includes the one item parked mid-send,
+    /// if any), and `pending_blob_bytes` is the serialized size of the flight blob
+    /// currently parked for sending, or zero when none is.
+    fn store(&self, notices: usize, flights: usize, pending_blob_bytes: usize) {
+        self.inner.notices.store(notices, Ordering::Relaxed);
+        self.inner.flights.store(flights, Ordering::Relaxed);
+        self.inner
+            .pending_blob_bytes
+            .store(pending_blob_bytes, Ordering::Relaxed);
+    }
+
+    /// The latest recorded depths, for the task-stats reporter to log.
+    pub fn snapshot(&self) -> ControlQueueSnapshot {
+        ControlQueueSnapshot {
+            notices: self.inner.notices.load(Ordering::Relaxed),
+            flights: self.inner.flights.load(Ordering::Relaxed),
+            pending_blob_bytes: self.inner.pending_blob_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A snapshot of the coordinator control connection's outbound queue depths (see
+/// [`ControlQueueDepths`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlQueueSnapshot {
+    /// Notices queued to go up the connection, including one parked mid-send.
+    pub notices: usize,
+    /// Flight recordings queued to go up the connection, including one parked
+    /// mid-send.
+    pub flights: usize,
+    /// Serialized bytes of the flight blob currently parked for sending, or zero.
+    pub pending_blob_bytes: usize,
+}
+
+/// How the relay reaches and enrolls with the coordinator: where it dials, the
+/// optional bootstrap secret the upgrade request presents, the `Hello` it enrolls
+/// with, and the private key it proves possession of when challenged. The dial and
+/// enroll handshake consume all four; afterward `relay_hello.relay_id` labels every
+/// log line and close classification, and `identity_key` answers a mid-stream
+/// re-challenge.
+pub struct EnrollConfig {
+    /// The coordinator base URL; the control endpoint path and `ws(s)` scheme are
+    /// derived from it.
+    pub coordinator_url: String,
+    /// The bootstrap secret the WebSocket upgrade presents as a bearer token, when
+    /// one is configured. Absent on a relay the coordinator authenticates another
+    /// way.
+    pub bootstrap_secret: Option<String>,
+    /// The relay's identity + reachable address, sent as the first frame to enroll.
+    pub relay_hello: RelayHello,
+    /// The private key matching `relay_hello`'s certificate; signs the coordinator's
+    /// enroll proof-of-possession challenge.
+    pub identity_key: PrivateKeyDer<'static>,
+}
+
+/// The shared handles the connection's read half applies coordinator pushes into.
+/// Each store holds declarative current state the coordinator re-sends in full on
+/// connect, so a push replaces (or, for the descriptor set, reconciles) wholesale.
+/// Held across reconnects so the mesh acceptor, client edge, region-ping loop, and
+/// drain predicate keep observing the same handles.
+pub struct ControlApplyTargets {
+    /// The Join source a descriptor set drives to targeted mesh `Join`/`Leave`, and
+    /// the reconcile target that keeps `applied` in step with the pushed set.
+    pub control: MeshControl,
+    /// The last-applied session set, reconciled on every descriptor push. Its
+    /// interior is mutated in place across reconnects, so a session removed while
+    /// disconnected is left when the next full-set re-sync arrives without it. The
+    /// drain sequence reads it through [`drained_idle`] to tell an
+    /// assigned-but-undialed session from a provably unassigned relay.
+    pub applied: AppliedSessions,
+    /// The fleet mesh-peer map, replaced wholesale on every `MeshPeers` push; the
+    /// mesh acceptor pins a dialing peer's certificate against it.
+    pub fleet: FleetMeshPeers,
+    /// The tenant verifying-key registry, replaced wholesale on every `TenantKeys`
+    /// push; the client edge checks authorization tokens against it. The coordinator
+    /// sends it before the first descriptor, so a session's clients are verifiable by
+    /// the time its descriptor lands.
+    pub verifying_keys: SharedRegistry,
+    /// The region ping-beacon targets, replaced wholesale on every `RegionBeacons`
+    /// push; the region-ping loop measures a backbone round-trip to each.
+    pub region_targets: RegionPingTargets,
+    /// Flipped to `true` when a `DrainAck` is read, unblocking the drain sequence.
+    /// Because the read half applies inbound frames in arrival order, the pre-ack
+    /// descriptor push has already reconciled `applied` by the time this fires.
+    pub drain_acked: watch::Sender<bool>,
+}
+
+/// The relay's outbound work queues and the depth handle that reports their
+/// occupancy. Each pipe is a channel plus the one in-flight slot holding the item
+/// pulled from it but not yet confirmed sent.
+///
+/// **Caller-owned across reconnects.** The subscriber owns this and lends `&mut`
+/// per connection: an item parked in a slot when a connection dies stays parked and
+/// rides the next connection's flush rather than being lost. The write half sets a
+/// slot *before* the send await and clears it only *after* the send returns, with
+/// no await between — so a dropped or errored send leaves the undelivered item
+/// parked, while a completed send's item is already cleared and never re-sent.
+pub struct OutboundQueues {
+    /// The unbounded notice pipe: departure/desync/result/session-closed notices to
+    /// forward up the connection. Drained strictly FIFO through `pending`, which is
+    /// what keeps `SessionClosed`'s "no earlier notice for the session still in
+    /// flight" guarantee.
+    pub notices: UnboundedReceiver<RelayNotice>,
+    /// The one notice pulled but not yet confirmed sent.
+    pub pending: Option<RelayNotice>,
+    /// The bounded flight pipe: flushed recordings to ship up the connection.
+    /// Deliberately separate from `notices` so a blob frame never delays a notice;
+    /// bounded so a wedged connection drops recordings rather than growing unbounded.
+    pub flight: Receiver<FlightShipment>,
+    /// The one flight shipment pulled but not yet confirmed sent; its `sent` ack
+    /// fires only once the frame is on the socket, so the sink's await bounds real
+    /// delivery.
+    pub pending_flight: Option<FlightShipment>,
+    /// Publishes the two queue depths (and the parked blob's byte count) for the
+    /// task-stats reporter.
+    pub depths: ControlQueueDepths,
+}
+
+impl OutboundQueues {
+    /// Builds the queues over the given channels and depth reporter, with both
+    /// in-flight slots empty.
+    pub fn new(
+        notices: UnboundedReceiver<RelayNotice>,
+        flight: Receiver<FlightShipment>,
+        depths: ControlQueueDepths,
+    ) -> Self {
+        Self {
+            notices,
+            pending: None,
+            flight,
+            pending_flight: None,
+            depths,
+        }
+    }
+}
+
+/// What each heartbeat carries and how often it goes up. A beat snapshots the live
+/// roster and the measured region round-trips at send time; both handles are held
+/// across reconnects so a beat reads current state independent of any reconnect.
+pub struct HeartbeatConfig {
+    /// The live roster; each beat carries its connected slots as [`SessionPresence`]
+    /// entries (tenant/session/slot only — the relay holds no user identity to leak).
+    pub sessions: Sessions,
+    /// The measured region round-trip cache the ping loop writes; each beat carries
+    /// its current medians.
+    pub region_rtt_cache: RegionRttCache,
+    /// How often a beat goes up. Well under the coordinator's liveness deadline, and
+    /// the send doubles as the relay's own dead-coordinator detector.
+    pub interval: Duration,
+}
+
+/// The two redial delays the reconnect loop keys its next dial on: the ordinary
+/// delay after a plain close, and the far longer delay after an
+/// operator-fix-not-redial refusal (protocol version, region, identity, or
+/// enrollment) where hot-retrying changes nothing until a deploy.
+pub struct ReconnectBackoff {
+    /// Delay after an ordinary close, an error, or a duplicate-relay-id refusal that
+    /// resolves on its own.
+    pub ordinary: Duration,
+    /// Delay after a version/region/identity/enrollment refusal.
+    pub version_refused: Duration,
+}
+
 /// Whether the relay is drained-idle — safe to exit without abandoning anyone: it
 /// holds **no local slot** ([`crate::routing::holds_any_slots`]) *and* its
 /// last-applied descriptor set is **empty**.
@@ -308,204 +505,78 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// reconnecting whenever it drops. Spawned as a task on the relay when a
 /// coordinator URL is configured; never returns.
 ///
-/// `relay_hello` is the relay's identity + reachable address, sent as the first
-/// frame on each connection to enroll into the coordinator's registry.
+/// The relay dials `enroll.coordinator_url`, enrolls with `enroll.relay_hello`, and
+/// proves possession of `enroll.identity_key` when the coordinator challenges — a
+/// challenge that always happens, since the relay's advertised protocol window
+/// bottoms out at or above the proof-of-possession minimum, so any coordinator it
+/// shares a version with reaches the challenge.
 ///
-/// `identity_key` is the private key matching `relay_hello.cert_der` — the same
-/// key the relay serves its client and mesh edges with. The coordinator
-/// challenges the relay to prove it holds this key before enrolling it, and this
-/// loop signs that challenge with it (see [`sign_enroll_proof`]) the moment one
-/// arrives. The challenge is not optional: the relay advertises a window
-/// bottoming out at [`ProtocolVersion::MIN_SUPPORTED`](rally_point_proto::version::ProtocolVersion::MIN_SUPPORTED),
-/// which stays at or above [`ProtocolVersion::ENROLL_POP_MIN`](rally_point_proto::version::ProtocolVersion::ENROLL_POP_MIN),
-/// so any coordinator it can enroll with negotiates a version that reaches the
-/// proof-of-possession challenge — a coordinator too old to challenge shares no
-/// version with this relay and is refused at negotiation before any enroll.
+/// `apply_targets` are the shared handles inbound coordinator pushes are applied
+/// into ([`ControlApplyTargets`]); `outbound` is the caller-owned notice and flight
+/// queues the connection ships up ([`OutboundQueues`], which documents the
+/// park-across-reconnect discipline); `sessions` and `region_rtt_cache` are what
+/// each heartbeat carries; `drain` (with `apply_targets.drain_acked`) is the
+/// coordinated-drain seam; `control_connected` reports whether the connection is
+/// currently established, so the provisional-admission sweep
+/// ([`crate::provisional::run_sweep`]) arms only while it is `true` rather than
+/// reaping across a reconnect gap.
 ///
-/// `notices` is the drain end of the decision-maker registry's notifier: the
-/// leave sites push a departure and the desync comparator pushes a desync (both
-/// as [`RelayNotice`]) onto it, and this loop forwards each up the control
-/// connection. The channel is unbounded and held across reconnects, so a notice
-/// decided while the coordinator is down goes out on the next successful
-/// connection rather than being lost.
-///
-/// `flight` is the drain end of the flight recorder's coordinator sink: each
-/// flushed recording arrives as a [`FlightShipment`], and this loop ships it up
-/// the control connection as a [`RelayToCoordinator::FlightRecording`] frame,
-/// firing the shipment's ack once the frame is on the socket. It is a
-/// **deliberately separate** pipe from `notices`: the `SessionClosed` ordering
-/// guarantee is a property of the notice channel alone, and a blob frame must
-/// never delay a webhook-bearing notice. Bounded (unlike the unbounded notice
-/// channel), so a wedged connection drops recordings rather than growing without
-/// bound — flight data is observability, never backpressure. Held across
-/// reconnects, with a pulled-but-unsent shipment surviving in a `pending_flight`
-/// slot the same way `pending` holds an unsent notice.
-///
-/// `sessions` is the relay's live roster: each heartbeat snapshots it and carries
-/// the connected slots up as [`SessionPresence`] entries, feeding the
-/// coordinator's active-player presence store. Only tenant/session/slot ride the
-/// wire — the relay holds no user identity to leak.
-///
-/// `applied` is the shared last-applied session set ([`AppliedSessions`]): this
-/// loop reconciles it on every descriptor push, and the drain sequence reads it
-/// through [`drained_idle`] to tell an assigned-but-not-yet-dialed session from a
-/// provably unassigned relay.
-///
-/// `fleet` is the fleet mesh-peer map ([`FleetMeshPeers`]): this loop replaces it
-/// wholesale on every [`CoordinatorToRelay::MeshPeers`] push, and the mesh acceptor
-/// reads it through a [`FleetMeshPeersReader`] to pin a dialing peer's certificate.
-///
-/// `verifying_keys` is the client edge's tenant-key registry ([`SharedRegistry`]):
-/// this loop replaces it wholesale on every [`CoordinatorToRelay::TenantKeys`] push,
-/// and the client edge reads it through a snapshot handle to verify client
-/// authorization tokens. The coordinator sends the set before the first descriptor,
-/// so a session's clients can always be verified by the time its descriptor lands.
-///
-/// `region_targets` is the region ping-beacon target set ([`RegionPingTargets`]):
-/// this loop stores each [`CoordinatorToRelay::RegionBeacons`] push into it wholesale,
-/// and the [`crate::region_ping::run_region_ping`] loop measures a backbone
-/// round-trip to each named beacon.
-///
-/// `region_rtt_cache` is the measured-round-trip cache ([`RegionRttCache`]) the ping
-/// loop writes: every heartbeat snapshots it into the beat's `region_rtts`, so the
-/// coordinator can aggregate a measured region-pair backbone table.
-///
-/// `drain` and `drain_acked` are the coordinated-drain seam: when the relay
-/// receives its shutdown signal, the drain sequence flips `drain` to `true`, and
-/// this loop sends a [`RelayToCoordinator::Draining`] up the connection asking the
-/// coordinator to stop assigning new sessions. Because a re-enroll clears the
-/// coordinator-side flag, the loop *remembers* it is draining and re-sends
-/// `Draining` right after the `Hello` on every subsequent reconnect. When the
-/// coordinator answers with [`CoordinatorToRelay::DrainAck`], the loop flips
-/// `drain_acked` to `true`, unblocking the drain sequence — and because the
-/// coordinator pushes the descriptor set *before* the ack on the same socket, this
-/// sequential loop has already reconciled `applied` to the post-mark truth by then.
-///
-/// `control_connected` reports whether the control connection is *currently*
-/// established: `true` from a successful enroll until the connection drops,
-/// `false` otherwise (including every reconnect gap). The provisional-admission
-/// sweep ([`crate::provisional::run_sweep`]) arms only while this is `true` —
-/// while the connection is down the coordinator cannot push a descriptor to
-/// clear a provisional mark, so reaping then would punish an outage rather than
-/// an actually-undescribed session.
-#[allow(clippy::too_many_arguments)]
+/// This entry injects the production reconnect delays and heartbeat interval;
+/// [`run_descriptor_subscriber_with`] takes them explicitly so a test need not wait
+/// the production intervals.
 pub async fn run_descriptor_subscriber(
-    coordinator_url: String,
-    relay_hello: RelayHello,
-    identity_key: PrivateKeyDer<'static>,
-    bootstrap_secret: Option<String>,
-    control: MeshControl,
+    enroll: EnrollConfig,
+    apply_targets: ControlApplyTargets,
+    outbound: OutboundQueues,
     sessions: Sessions,
-    applied: AppliedSessions,
-    fleet: FleetMeshPeers,
-    verifying_keys: SharedRegistry,
-    region_targets: RegionPingTargets,
     region_rtt_cache: RegionRttCache,
-    notices: UnboundedReceiver<RelayNotice>,
-    flight: Receiver<FlightShipment>,
     drain: watch::Receiver<bool>,
-    drain_acked: watch::Sender<bool>,
     control_connected: watch::Sender<bool>,
 ) {
     run_descriptor_subscriber_with(
-        coordinator_url,
-        relay_hello,
-        identity_key,
-        bootstrap_secret,
-        control,
-        sessions,
-        applied,
-        fleet,
-        verifying_keys,
-        region_targets,
-        region_rtt_cache,
-        notices,
-        flight,
+        enroll,
+        apply_targets,
+        outbound,
+        HeartbeatConfig {
+            sessions,
+            region_rtt_cache,
+            interval: HEARTBEAT_INTERVAL,
+        },
         drain,
-        drain_acked,
         control_connected,
-        RECONNECT_DELAY,
-        VERSION_REFUSED_RECONNECT_DELAY,
-        HEARTBEAT_INTERVAL,
+        ReconnectBackoff {
+            ordinary: RECONNECT_DELAY,
+            version_refused: VERSION_REFUSED_RECONNECT_DELAY,
+        },
     )
     .await
 }
 
-/// [`run_descriptor_subscriber`] with the reconnect delays (ordinary and
-/// version-refused) and heartbeat interval injected, so a test need not wait the
-/// production intervals.
-#[allow(clippy::too_many_arguments)]
+/// [`run_descriptor_subscriber`] with the reconnect delays and heartbeat interval
+/// injected via `heartbeat` and `backoff`, so a test need not wait the production
+/// intervals.
 pub async fn run_descriptor_subscriber_with(
-    coordinator_url: String,
-    relay_hello: RelayHello,
-    identity_key: PrivateKeyDer<'static>,
-    bootstrap_secret: Option<String>,
-    control: MeshControl,
-    sessions: Sessions,
-    // Mutated in place across connections, so it keeps the persist-across-
-    // reconnects semantics the loop-local set had: a session removed while
-    // disconnected is left when the next connection's full-set re-sync arrives
-    // without it.
-    applied: AppliedSessions,
-    // Held across connections so the mesh acceptor's read handle keeps observing
-    // the same map: each connection re-syncs the full set on connect, replacing it.
-    fleet: FleetMeshPeers,
-    // Held across connections so the client edge's snapshot handle keeps observing
-    // the same registry: each connection re-syncs the full tenant-key set on connect,
-    // replacing it wholesale.
-    verifying_keys: SharedRegistry,
-    // Held across connections so the region-ping loop keeps observing the same
-    // target set: each connection re-syncs the full beacon set on connect, and an
-    // unchanged re-push wakes no sweep.
-    region_targets: RegionPingTargets,
-    // Held across connections so the heartbeat builder reads the same measured
-    // round-trips the region-ping loop writes, independent of any reconnect.
-    region_rtt_cache: RegionRttCache,
-    mut notices: UnboundedReceiver<RelayNotice>,
-    // Held across connections like `notices`, but bounded: each connection ships
-    // one shipment at a time and holds an unsent one in `pending_flight`, so a
-    // recording flushed while the coordinator link was down rides the next one.
-    mut flight: Receiver<FlightShipment>,
+    enroll: EnrollConfig,
+    apply_targets: ControlApplyTargets,
+    // Caller-owned across reconnects: this loop owns the outbound queues and lends
+    // `&mut` per connection, so a notice or shipment parked when a connection dies
+    // rides the next connection's flush rather than being lost.
+    mut outbound: OutboundQueues,
+    heartbeat: HeartbeatConfig,
     mut drain: watch::Receiver<bool>,
-    drain_acked: watch::Sender<bool>,
     control_connected: watch::Sender<bool>,
-    reconnect_delay: Duration,
-    version_refused_delay: Duration,
-    heartbeat_interval: Duration,
+    backoff: ReconnectBackoff,
 ) {
-    // The one notice pulled from the channel but not yet confirmed sent. Held
-    // across reconnects so a notice decided (or half-sent) while the coordinator
-    // link was down is flushed first on the next connection rather than lost. The
-    // rest stay queued in the unbounded channel behind it.
-    let mut pending: Option<RelayNotice> = None;
-    // The one flight shipment pulled but not yet confirmed sent, mirroring
-    // `pending`. Held across reconnects so a shipment half-sent when the link
-    // dropped rides the next connection; its `sent` ack fires only once the frame
-    // is truly on the socket, so the sink's await bounds real delivery.
-    let mut pending_flight: Option<FlightShipment> = None;
-    let relay_id = relay_hello.relay_id;
+    let relay_id = enroll.relay_hello.relay_id;
 
     loop {
         let delay = match connect_and_stream(
-            &coordinator_url,
-            &relay_hello,
-            &identity_key,
-            bootstrap_secret.as_deref(),
-            &control,
-            &sessions,
-            &applied,
-            &fleet,
-            &verifying_keys,
-            &region_targets,
-            &region_rtt_cache,
-            &mut notices,
-            &mut pending,
-            &mut flight,
-            &mut pending_flight,
+            &enroll,
+            &apply_targets,
+            &mut outbound,
+            &heartbeat,
             &mut drain,
-            &drain_acked,
             &control_connected,
-            heartbeat_interval,
         )
         .await
         {
@@ -514,7 +585,7 @@ pub async fn run_descriptor_subscriber_with(
                     relay_id = relay_id.0,
                     "coordinator control connection closed; reconnecting",
                 );
-                reconnect_delay
+                backoff.ordinary
             }
             // Already logged (with the coordinator's reason) where the close frame
             // was read; only the far longer backoff is decided here. A version
@@ -529,14 +600,14 @@ pub async fn run_descriptor_subscriber_with(
                 | ControlDisconnect::RegionRefused
                 | ControlDisconnect::IdentityUnproven
                 | ControlDisconnect::EnrollUnauthorized,
-            ) => version_refused_delay,
+            ) => backoff.version_refused,
             Err(error) => {
                 tracing::warn!(
                     %error,
                     relay_id = relay_id.0,
                     "coordinator control connection failed; reconnecting",
                 );
-                reconnect_delay
+                backoff.ordinary
             }
         };
         // The connection just ended, however it ended -- report it down
@@ -556,38 +627,35 @@ pub async fn run_descriptor_subscriber_with(
 /// ([`ControlDisconnect`]), so the caller can back off a version refusal far
 /// longer than an ordinary close.
 ///
+/// Everything through the enroll handshake and its immediately-following flushes
+/// runs sequentially on the whole socket. After that the socket is split into a
+/// read half and a write half driven **concurrently**, so a large outbound frame
+/// (a heartbeat, a close notice, or a multi-megabyte flight blob) can never stall
+/// the reader while it is being sent: coordinator pushes keep applying while a blob
+/// goes up. The two halves cooperate on one task — dropping either when the other
+/// ends closes the connection with no task to leak — and every send is owned by the
+/// write half, keeping the notice pipe strictly ordered and the caller-owned
+/// `pending`/`pending_flight` slots the single source of undelivered state across a
+/// reconnect.
+///
 /// A heartbeat send that fails ends the connection so the caller redials: on a
 /// half-open socket (a silently dead coordinator) the periodic send is what
 /// eventually surfaces the failure, since no inbound frame arrives to reveal it.
-#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
-    coordinator_url: &str,
-    relay_hello: &RelayHello,
-    identity_key: &PrivateKeyDer<'static>,
-    secret: Option<&str>,
-    control: &MeshControl,
-    sessions: &Sessions,
-    applied: &AppliedSessions,
-    fleet: &FleetMeshPeers,
-    verifying_keys: &SharedRegistry,
-    region_targets: &RegionPingTargets,
-    region_rtt_cache: &RegionRttCache,
-    notices: &mut UnboundedReceiver<RelayNotice>,
-    pending: &mut Option<RelayNotice>,
-    flight: &mut Receiver<FlightShipment>,
-    pending_flight: &mut Option<FlightShipment>,
+    enroll: &EnrollConfig,
+    apply_targets: &ControlApplyTargets,
+    outbound: &mut OutboundQueues,
+    heartbeat: &HeartbeatConfig,
     drain: &mut watch::Receiver<bool>,
-    drain_acked: &watch::Sender<bool>,
     control_connected: &watch::Sender<bool>,
-    heartbeat_interval: Duration,
 ) -> Result<ControlDisconnect, ControlError> {
-    let relay_id = relay_hello.relay_id;
-    let request = build_request(coordinator_url, secret)?;
+    let relay_id = enroll.relay_hello.relay_id;
+    let request = build_request(&enroll.coordinator_url, enroll.bootstrap_secret.as_deref())?;
     let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
 
     // Enroll: the first frame is this relay's Hello, registering it on the same
     // authenticated connection that then carries descriptor pushes back.
-    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello.clone()))
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(enroll.relay_hello.clone()))
         .expect("a relay hello always serializes");
     socket.send(Message::Text(hello.into())).await?;
     tracing::info!(
@@ -613,8 +681,13 @@ async fn connect_and_stream(
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<CoordinatorToRelay>(text.as_str())? {
                     CoordinatorToRelay::IdentityChallenge { nonce } => {
-                        answer_identity_challenge(&mut socket, identity_key, &nonce, relay_id)
-                            .await?;
+                        answer_identity_challenge(
+                            &mut socket,
+                            &enroll.identity_key,
+                            &nonce,
+                            relay_id,
+                        )
+                        .await?;
                         break;
                     }
                     // The coordinator always challenges first, so any other frame
@@ -651,9 +724,9 @@ async fn connect_and_stream(
     // the coordinator was down (or one a failed send left pending) must go out on
     // this fresh connection before anything else, so it is not lost to the
     // reconnect. On send failure it stays pending and rides the next reconnect.
-    if let Some(notice) = pending.as_ref() {
+    if let Some(notice) = outbound.pending.as_ref() {
         send_notice(&mut socket, notice).await?;
-        *pending = None;
+        outbound.pending = None;
     }
 
     // Re-assert a drain that is already in progress. A re-enroll clears the
@@ -673,21 +746,169 @@ async fn connect_and_stream(
     // blob frame must never delay a webhook-bearing notice. On send failure the
     // shipment stays in `pending_flight` and rides the next reconnect; the ack
     // fires only after the frame is on the socket.
-    if pending_flight.is_some() {
+    if outbound.pending_flight.is_some() {
         send_flight(
             &mut socket,
-            &pending_flight.as_ref().expect("just checked").notice,
+            &outbound
+                .pending_flight
+                .as_ref()
+                .expect("just checked")
+                .notice,
         )
         .await?;
-        if let Some(shipment) = pending_flight.take() {
+        if let Some(shipment) = outbound.pending_flight.take() {
             let _ = shipment.sent.send(());
         }
     }
 
+    // Split the enrolled socket into a read half and a write half, driven
+    // concurrently. The write half owns every send, so a large frame in flight
+    // (a heartbeat, a notice, or a multi-megabyte flight blob) never stalls the
+    // read half — coordinator pushes keep applying while a blob goes up.
+    let (sink, stream) = socket.split();
+
+    // A mid-stream identity challenge's answer is a *send*, and only the write
+    // half may send, so the read half routes the nonce here for the writer to
+    // answer. The coordinator does not re-challenge after enroll, so this is a
+    // rarely-if-ever-used defensive path.
+    let (challenge_tx, challenge_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Run both halves until either ends; the first to finish is the connection's
+    // outcome, and dropping the other closes its half of the socket. There is no
+    // spawned task to leak, and the caller-owned `outbound` slots — mutated in place
+    // by the writer through `&mut` — carry whatever stayed undelivered straight back
+    // to the caller no matter which half ended the connection.
+    tokio::select! {
+        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx) => result,
+        result = write_control_frames(
+            sink,
+            outbound,
+            drain,
+            heartbeat,
+            &enroll.identity_key,
+            relay_id,
+            challenge_rx,
+        ) => result,
+    }
+}
+
+/// The read half of an enrolled control connection: receives coordinator frames
+/// one at a time and applies each synchronously, in arrival order. A descriptor
+/// push reconciles the Join source and the applied set; `MeshPeers`/`TenantKeys`/
+/// `RegionBeacons` replace their stores; a `DrainAck` flips the drain-acked
+/// signal. Because frames apply strictly in arrival order, a descriptor push the
+/// coordinator sends just before a `DrainAck` has already updated the applied set
+/// by the time the ack fires.
+///
+/// A mid-stream `IdentityChallenge`'s answer is a send, so it is routed to the
+/// write half through `challenge_tx` rather than answered here. A `Close` (or the
+/// stream ending, or a read/decode error) ends the connection with the same
+/// classification a close carries anywhere.
+async fn read_control_frames(
+    mut stream: impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+    + Unpin,
+    apply_targets: &ControlApplyTargets,
+    relay_id: RelayId,
+    challenge_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
+) -> Result<ControlDisconnect, ControlError> {
+    loop {
+        // The stream ended (no close frame): let the caller redial.
+        let Some(message) = stream.next().await else {
+            return Ok(ControlDisconnect::Ordinary);
+        };
+        match message? {
+            Message::Text(text) => {
+                let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
+                match message {
+                    CoordinatorToRelay::DrainAck => {
+                        // The coordinator has marked us ineligible and pushed our
+                        // current descriptor set just before this ack; signal the
+                        // drain sequence it may proceed (empty set ⇒ unassigned).
+                        let _ = apply_targets.drain_acked.send(true);
+                    }
+                    CoordinatorToRelay::MeshPeers { peers } => {
+                        // The fleet's currently-enrolled mesh peers: store the whole
+                        // set, replacing the prior one. Declarative current state — a
+                        // reconnect re-syncs the full set — so a wholesale replace is
+                        // correct.
+                        apply_targets.fleet.store(peers);
+                    }
+                    CoordinatorToRelay::TenantKeys { keys } => {
+                        // The tenant verifying keys the client edge checks
+                        // authorization tokens against: replace the whole registry,
+                        // skipping any malformed entry. Declarative current state,
+                        // sent before the first descriptor, so the relay can always
+                        // verify a session's clients by the time its descriptor
+                        // arrives.
+                        apply_targets.verifying_keys.apply(keys);
+                    }
+                    CoordinatorToRelay::RegionBeacons { beacons } => {
+                        // The region ping-beacon targets: store the whole set,
+                        // replacing the prior one. Declarative current state — a
+                        // reconnect re-syncs the full set — so a wholesale replace is
+                        // correct, and an unchanged re-push wakes no sweep.
+                        apply_targets.region_targets.store(beacons);
+                    }
+                    CoordinatorToRelay::IdentityChallenge { nonce } => {
+                        // Answering is a send, which only the write half may do, so
+                        // route the nonce there. A dropped receiver means the write
+                        // half is already gone and the connection is ending, so a
+                        // failed route is a harmless no-op.
+                        let _ = challenge_tx.send(nonce);
+                    }
+                    other => apply_message(&apply_targets.control, other, &apply_targets.applied),
+                }
+            }
+            Message::Close(frame) => {
+                // Classify the refusal (and log its stated reason) with the same
+                // helper the enroll handshake uses, so a close is read identically
+                // wherever it arrives.
+                return Ok(classify_control_close(frame, relay_id));
+            }
+            // The coordinator sends no pings today and the relay reads only
+            // descriptor text frames; any other frame is ignored.
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
+/// The write half of an enrolled control connection: owns every send and drives a
+/// `biased` priority order so bulk can never delay control. Highest first: a drain
+/// re-assert, then queued notices, then a routed identity-proof answer, then the
+/// periodic heartbeat, and last the flight blobs — so a close-bearing notice
+/// always outruns a multi-megabyte recording.
+///
+/// The caller-owned `outbound` slots (`pending`, `pending_flight`) are this half's
+/// only durable state across a reconnect. A notice or shipment is parked in its
+/// slot *before* the send await and cleared only *after* the send returns, with no
+/// await in between: if this future is dropped (the read half ended the connection)
+/// or a send errors mid-frame, the slot still holds the undelivered item and the
+/// next connection's flush delivers it, while an item whose send completed is
+/// already cleared and never re-sent.
+async fn write_control_frames(
+    mut sink: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    outbound: &mut OutboundQueues,
+    drain: &mut watch::Receiver<bool>,
+    heartbeat: &HeartbeatConfig,
+    identity_key: &PrivateKeyDer<'static>,
+    relay_id: RelayId,
+    mut challenge_rx: UnboundedReceiver<[u8; 32]>,
+) -> Result<ControlDisconnect, ControlError> {
+    // Split the caller-owned queues into their fields. The park/clear discipline
+    // below mutates these in place, so whatever stays parked in a slot here is
+    // exactly what the caller's `outbound` holds when this future ends.
+    let OutboundQueues {
+        notices,
+        pending,
+        flight,
+        pending_flight,
+        depths,
+    } = outbound;
+
     // The Hello already proved liveness at t=0, so skip the immediate first tick
     // and send the first heartbeat one interval later.
-    let mut heartbeat = tokio::time::interval(heartbeat_interval);
-    heartbeat.tick().await;
+    let mut heartbeat_tick = tokio::time::interval(heartbeat.interval);
+    heartbeat_tick.tick().await;
 
     // Once the notifier's senders are all dropped (relay shutdown) `recv` yields
     // `None` forever; stop selecting on it so the loop doesn't spin.
@@ -700,132 +921,26 @@ async fn connect_and_stream(
     // sequence wired), `changed()` errors forever, so disable the arm on the first
     // error rather than spin.
     let mut drain_open = true;
+    // The read half holds the challenge sender for the connection's life, so this
+    // normally stays open until both halves are dropped together; the guard is a
+    // belt-and-suspenders against a closed channel busy-looping the biased select.
+    let mut challenge_open = true;
 
     loop {
+        // Publish the current queue depths for the task-stats reporter. Each count
+        // includes the one item parked mid-send, so a blob in flight is visible for
+        // its whole send rather than only in the instant between sends.
+        depths.store(
+            notices.len() + usize::from(pending.is_some()),
+            flight.len() + usize::from(pending_flight.is_some()),
+            pending_flight
+                .as_ref()
+                .map_or(0, |shipment| shipment.notice.payload.len()),
+        );
+
         tokio::select! {
-            _ = heartbeat.tick() => {
-                // Every beat carries the full current roster — declarative and
-                // self-healing (a lost or reordered beat is corrected by the next
-                // one), bounded by the relay's live slots. A delta scheme is a
-                // scale option, not needed at these payload sizes.
-                let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
-                    sessions: heartbeat_presence(sessions),
-                    region_rtts: heartbeat_region_rtts(region_rtt_cache),
-                })
-                .expect("a heartbeat always serializes");
-                socket.send(Message::Text(frame.into())).await?;
-            }
-            message = socket.next() => {
-                let Some(message) = message else { break };
-                match message? {
-                    Message::Text(text) => {
-                        let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
-                        match message {
-                            CoordinatorToRelay::DrainAck => {
-                                // The coordinator has marked us ineligible and pushed
-                                // our current descriptor set just before this ack;
-                                // signal the drain sequence it may proceed (empty set
-                                // ⇒ unassigned).
-                                let _ = drain_acked.send(true);
-                            }
-                            CoordinatorToRelay::MeshPeers { peers } => {
-                                // The fleet's currently-enrolled mesh peers: store the
-                                // whole set, replacing the prior one. Declarative
-                                // current state — a reconnect re-syncs the full set —
-                                // so a wholesale replace is correct.
-                                fleet.store(peers);
-                            }
-                            CoordinatorToRelay::TenantKeys { keys } => {
-                                // The tenant verifying keys the client edge checks
-                                // authorization tokens against: replace the whole
-                                // registry, skipping any malformed entry. Declarative
-                                // current state, sent before the first descriptor, so
-                                // the relay can always verify a session's clients by
-                                // the time its descriptor arrives.
-                                verifying_keys.apply(keys);
-                            }
-                            CoordinatorToRelay::RegionBeacons { beacons } => {
-                                // The region ping-beacon targets: store the whole set,
-                                // replacing the prior one. Declarative current state —
-                                // a reconnect re-syncs the full set — so a wholesale
-                                // replace is correct, and an unchanged re-push wakes no
-                                // sweep.
-                                region_targets.store(beacons);
-                            }
-                            CoordinatorToRelay::IdentityChallenge { nonce } => {
-                                // The enroll handshake above already answered the
-                                // coordinator's challenge before this loop began, and
-                                // the coordinator does not re-challenge. This arm
-                                // answers one anyway, wherever it might arrive, so the
-                                // match stays exhaustive and the "answer wherever it
-                                // lands" robustness is preserved.
-                                answer_identity_challenge(
-                                    &mut socket,
-                                    identity_key,
-                                    &nonce,
-                                    relay_id,
-                                )
-                                .await?;
-                            }
-                            other => apply_message(control, other, applied),
-                        }
-                    }
-                    Message::Close(frame) => {
-                        // Classify the refusal (and log its stated reason) with the
-                        // same helper the enroll handshake uses, so a close is read
-                        // identically wherever it arrives.
-                        return Ok(classify_control_close(frame, relay_id));
-                    }
-                    // The coordinator sends no pings today and the relay reads only
-                    // descriptor text frames; any other frame is ignored.
-                    Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
-                }
-            }
-            // Drain one notice at a time: pull the next only once the current one
-            // is confirmed sent (the `pending.is_none()` guard), so an undelivered
-            // notice always sits in `pending` where the reconnect flush above
-            // picks it up.
-            notice = notices.recv(), if pending.is_none() && notifier_open => {
-                match notice {
-                    Some(notice) => {
-                        *pending = Some(notice);
-                        // A send error ends the connection (via `?`) with the
-                        // notice still pending, so the next connection flushes it.
-                        send_notice(&mut socket, pending.as_ref().expect("just set")).await?;
-                        *pending = None;
-                    }
-                    None => notifier_open = false,
-                }
-            }
-            // Ship one flight recording at a time: pull the next only once the
-            // current is confirmed sent (the `pending_flight.is_none()` guard), so
-            // an unsent shipment always sits in `pending_flight` for the reconnect
-            // flush above. Deliberately a SEPARATE pipe from the notices arm: the
-            // `SessionClosed` ordering guarantee ("no earlier notice for the
-            // session still in flight") is a property of the notice channel alone,
-            // and a blob frame — larger and never webhook-bearing — must never
-            // delay a notice.
-            shipment = flight.recv(), if pending_flight.is_none() && flight_open => {
-                match shipment {
-                    Some(shipment) => {
-                        *pending_flight = Some(shipment);
-                        // A send error ends the connection (via `?`) with the
-                        // shipment still pending, so the next connection flushes it.
-                        send_flight(
-                            &mut socket,
-                            &pending_flight.as_ref().expect("just set").notice,
-                        )
-                        .await?;
-                        // Fire the ack (and clear the slot) only after the frame is
-                        // on the socket, so the sink's await resolves to delivered
-                        // only for a shipment that truly went out.
-                        if let Some(shipment) = pending_flight.take() {
-                            let _ = shipment.sent.send(());
-                        }
-                    }
-                    None => flight_open = false,
-                }
-            }
+            biased;
+
             // The drain sequence flipped the flag: ask the coordinator to stop
             // assigning us new sessions. A send error ends the connection; the next
             // reconnect re-asserts the drain right after its Hello.
@@ -833,16 +948,96 @@ async fn connect_and_stream(
                 match changed {
                     Ok(()) => {
                         if *drain.borrow_and_update() {
-                            send_draining(&mut socket).await?;
+                            send_draining(&mut sink).await?;
                         }
                     }
                     // The drain sender was dropped: no drain will ever come.
                     Err(_) => drain_open = false,
                 }
             }
+
+            // Drain one notice at a time: pull the next only once the current one
+            // is confirmed sent (the `pending.is_none()` guard), so an undelivered
+            // notice always sits in `pending` where the reconnect flush picks it up.
+            // Strictly ordered — one ordered pipe, one in-flight slot — which is what
+            // keeps `SessionClosed`'s "no earlier notice for the session still in
+            // flight" guarantee.
+            notice = notices.recv(), if pending.is_none() && notifier_open => {
+                match notice {
+                    Some(notice) => {
+                        *pending = Some(notice);
+                        // A send error ends the connection (via `?`) with the notice
+                        // still pending, so the next connection flushes it.
+                        send_notice(&mut sink, pending.as_ref().expect("just set")).await?;
+                        *pending = None;
+                    }
+                    None => notifier_open = false,
+                }
+            }
+
+            // A mid-stream identity challenge the read half routed here: answering
+            // is a send, so it happens on this half. A dropped sender means the read
+            // half has ended and this half is about to be dropped too.
+            nonce = challenge_rx.recv(), if challenge_open => {
+                match nonce {
+                    Some(nonce) => {
+                        answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id).await?;
+                    }
+                    None => challenge_open = false,
+                }
+            }
+
+            _ = heartbeat_tick.tick() => {
+                // Every beat carries the full current roster — declarative and
+                // self-healing (a lost or reordered beat is corrected by the next
+                // one), bounded by the relay's live slots. A delta scheme is a
+                // scale option, not needed at these payload sizes.
+                let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+                    sessions: heartbeat_presence(&heartbeat.sessions),
+                    region_rtts: heartbeat_region_rtts(&heartbeat.region_rtt_cache),
+                })
+                .expect("a heartbeat always serializes");
+                sink.send(Message::Text(frame.into())).await?;
+            }
+
+            // Ship one flight recording at a time: pull the next only once the
+            // current is confirmed sent (the `pending_flight.is_none()` guard), so an
+            // unsent shipment always sits in `pending_flight` for the reconnect flush.
+            // Deliberately below the notices arm: a blob frame — larger and never
+            // webhook-bearing — must never delay a notice, which is why the priority
+            // order sits it here.
+            shipment = flight.recv(), if pending_flight.is_none() && flight_open => {
+                match shipment {
+                    Some(shipment) => {
+                        *pending_flight = Some(shipment);
+                        // Republish now that the blob is parked, so its byte count is
+                        // visible for the whole send rather than only after it returns.
+                        depths.store(
+                            notices.len() + usize::from(pending.is_some()),
+                            flight.len() + usize::from(pending_flight.is_some()),
+                            pending_flight
+                                .as_ref()
+                                .map_or(0, |shipment| shipment.notice.payload.len()),
+                        );
+                        // A send error ends the connection (via `?`) with the shipment
+                        // still pending, so the next connection flushes it.
+                        send_flight(
+                            &mut sink,
+                            &pending_flight.as_ref().expect("just set").notice,
+                        )
+                        .await?;
+                        // Fire the ack (and clear the slot) only after the frame is on
+                        // the socket, so the sink's await resolves to delivered only
+                        // for a shipment that truly went out.
+                        if let Some(shipment) = pending_flight.take() {
+                            let _ = shipment.sent.send(());
+                        }
+                    }
+                    None => flight_open = false,
+                }
+            }
         }
     }
-    Ok(ControlDisconnect::Ordinary)
 }
 
 /// Snapshots the relay's live roster into the [`SessionPresence`] entries a
@@ -1555,30 +1750,22 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            RelayHello::new(
-                RelayId(1),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-                rally_point_proto::version::ProtocolVersion::CURRENT,
-                vec![0xAB; 4],
+            enroll(
+                addr,
+                RelayHello::new(
+                    RelayId(1),
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                    rally_point_proto::version::ProtocolVersion::CURRENT,
+                    vec![0xAB; 4],
+                ),
             ),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            notices_rx,
-            no_flight(),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(notices_rx, no_flight(), ControlQueueDepths::new()),
+            heartbeat(Duration::from_secs(3600)), // no heartbeat during the test
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20), // redial fast after the failed first dial
-            Duration::from_secs(60),
-            Duration::from_secs(3600), // no heartbeat during the test
+            // Redial fast after the failed first dial.
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
@@ -1631,6 +1818,52 @@ mod tests {
     /// sender is dropped, so the loop's flight arm disables itself and never fires.
     fn no_flight() -> Receiver<FlightShipment> {
         mpsc::channel(1).1
+    }
+
+    /// The enroll config for a subscriber pointed at the stand-in coordinator at
+    /// `addr`, presenting `relay_hello` and a signable throwaway identity key.
+    fn enroll(addr: std::net::SocketAddr, relay_hello: RelayHello) -> EnrollConfig {
+        EnrollConfig {
+            coordinator_url: format!("http://{addr}"),
+            bootstrap_secret: None,
+            relay_hello,
+            identity_key: throwaway_identity_key(),
+        }
+    }
+
+    /// Apply targets with default (empty) stores and the given Join source and
+    /// drain-ack signal — the common case for tests not asserting on a specific
+    /// store.
+    fn apply_targets(
+        control: MeshControl,
+        drain_acked: watch::Sender<bool>,
+    ) -> ControlApplyTargets {
+        ControlApplyTargets {
+            control,
+            applied: AppliedSessions::default(),
+            fleet: FleetMeshPeers::default(),
+            verifying_keys: SharedRegistry::default(),
+            region_targets: RegionPingTargets::default(),
+            drain_acked,
+        }
+    }
+
+    /// A heartbeat config over an empty roster and RTT cache at the given interval —
+    /// the common case for tests not asserting on heartbeat content.
+    fn heartbeat(interval: Duration) -> HeartbeatConfig {
+        HeartbeatConfig {
+            sessions: Arc::default(),
+            region_rtt_cache: RegionRttCache::default(),
+            interval,
+        }
+    }
+
+    /// The two redial delays as a backoff config.
+    fn backoff(ordinary: Duration, version_refused: Duration) -> ReconnectBackoff {
+        ReconnectBackoff {
+            ordinary,
+            version_refused,
+        }
     }
 
     /// A flight shipment for the connection-loop tests, paired with the ack
@@ -1788,25 +2021,17 @@ mod tests {
             std::sync::Arc::default(),
         );
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked_tx),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked_tx,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         // Trigger the drain; the relay must send a Draining frame after its Hello.
@@ -1856,25 +2081,17 @@ mod tests {
             std::sync::Arc::default(),
         );
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked_tx),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked_tx,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         // The DrainAck flips the acked watch to true.
@@ -1931,25 +2148,17 @@ mod tests {
             std::sync::Arc::default(),
         );
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked_tx),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked_tx,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         tokio::time::timeout(Duration::from_secs(5), done_rx)
@@ -2011,25 +2220,13 @@ mod tests {
             std::sync::Arc::default(),
         );
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            notices_rx,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked_tx),
+            OutboundQueues::new(notices_rx, no_flight(), ControlQueueDepths::new()),
+            heartbeat(Duration::from_secs(3600)), // no heartbeat during the test
             drain_rx,
-            drain_acked_tx,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600), // no heartbeat during the test
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let (first, second, third) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
@@ -2097,25 +2294,21 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::clone(&sessions),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            HeartbeatConfig {
+                sessions: Arc::clone(&sessions),
+                region_rtt_cache: RegionRttCache::default(),
+                interval: Duration::from_millis(50), // beat quickly so the test observes one
+            },
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_millis(50), // beat quickly so the test observes one
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let beat = tokio::time::timeout(Duration::from_secs(5), frame_rx)
@@ -2189,25 +2382,17 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            reconnect_delay,
-            version_refused_delay,
-            Duration::from_secs(3600),
+            backoff(reconnect_delay, version_refused_delay),
         ));
     }
 
@@ -2441,25 +2626,24 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            fleet,
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            no_flight(),
+            enroll(addr, drain_hello()),
+            ControlApplyTargets {
+                control,
+                applied: AppliedSessions::default(),
+                fleet,
+                verifying_keys: SharedRegistry::default(),
+                region_targets: RegionPingTargets::default(),
+                drain_acked,
+            },
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         // The pushed set lands in the shared map the reader observes.
@@ -2596,25 +2780,17 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            flight_rx,
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
@@ -2673,25 +2849,17 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            flight_rx,
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
@@ -2747,25 +2915,17 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            mpsc::unbounded_channel().1,
-            flight_rx,
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
@@ -2822,25 +2982,13 @@ mod tests {
         );
         let (drain_rx, drain_acked) = no_drain();
         tokio::spawn(run_descriptor_subscriber_with(
-            format!("http://{addr}"),
-            drain_hello(),
-            throwaway_identity_key(),
-            None,
-            control,
-            Arc::default(),
-            AppliedSessions::default(),
-            FleetMeshPeers::default(),
-            SharedRegistry::default(),
-            RegionPingTargets::default(),
-            RegionRttCache::default(),
-            notices_rx,
-            flight_rx,
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new()),
+            heartbeat(Duration::from_secs(3600)),
             drain_rx,
-            drain_acked,
             no_connected(),
-            Duration::from_millis(20),
-            Duration::from_secs(60),
-            Duration::from_secs(3600),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
@@ -2865,6 +3013,259 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, RelayToCoordinator::FlightRecording(_))),
             "the flight pipe delivered",
+        );
+    }
+
+    /// A flight shipment carrying a caller-sized payload, for the split's
+    /// concurrency tests: a payload larger than the socket buffers makes the write
+    /// half's send block against a coordinator that stops reading, so the read
+    /// half's independence and the pending-slot survival can be observed.
+    fn flight_shipment_with_payload(payload: String) -> (FlightShipment, oneshot::Receiver<()>) {
+        let (sent, ack) = oneshot::channel();
+        let shipment = FlightShipment {
+            notice: FlightRecordingNotice {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(7),
+                desynced: false,
+                payload,
+            },
+            sent,
+        };
+        (shipment, ack)
+    }
+
+    /// A sink whose sends never complete: `poll_ready`/`poll_flush` stay Pending
+    /// forever, modeling a coordinator that never drains what the write half sends.
+    /// Once the writer parks an item and begins sending, it is stuck mid-send —
+    /// exactly the state the read half ending the connection would drop it in.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notice_parked_mid_send_survives_the_write_half_being_dropped() {
+        // The split's new exit path: the read half ends the connection while the
+        // write half holds a notice parked mid-send. The notice must stay in the
+        // caller-owned slot so the next connection's flush delivers it. Drive the
+        // write half against a sink that never completes a send, so it parks the
+        // notice and blocks, then drop it — the caller's slot must still hold it.
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        notices_tx
+            .send(RelayNotice::Departure(dropped_notice()))
+            .unwrap();
+        let (_flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        // Live senders so the drain and challenge arms stay pending (not disabled),
+        // leaving the notices arm the one that fires.
+        let (_drain_tx, mut drain_rx) = watch::channel(false);
+        let (_challenge_tx, challenge_rx) = mpsc::unbounded_channel::<[u8; 32]>();
+
+        let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new());
+        let heartbeat = heartbeat(Duration::from_secs(3600));
+        let identity_key = throwaway_identity_key();
+
+        // The write half never completes (the sink stalls), so a short timeout drops
+        // it exactly as the read half ending the connection would.
+        let writer = write_control_frames(
+            StalledSink,
+            &mut outbound,
+            &mut drain_rx,
+            &heartbeat,
+            &identity_key,
+            RelayId(1),
+            challenge_rx,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), writer)
+                .await
+                .is_err(),
+            "the write half stays parked on the stalled send",
+        );
+
+        // The notice is back in the caller-owned slot — parked before the send await
+        // and never cleared — ready for the next connection's flush.
+        assert_eq!(
+            outbound.pending,
+            Some(RelayNotice::Departure(dropped_notice())),
+            "a notice parked mid-send survives the write half being dropped",
+        );
+        assert_eq!(
+            outbound.depths.snapshot().notices,
+            1,
+            "the parked notice is reflected in the reported queue depth",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_flight_blob_does_not_delay_a_queued_notice() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: enroll, then read the first two frames. With both a
+        // notice and a large flight blob queued, the write half's priority order
+        // must put the notice first — if the flight arm outranked it, the
+        // coordinator would read the blob ahead of the notice.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((first, second));
+        });
+
+        // Queue the notice AND a large flight blob before the subscriber starts.
+        let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+        notices_tx
+            .send(RelayNotice::Departure(dropped_notice()))
+            .unwrap();
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, _ack) = flight_shipment_with_payload("x".repeat(256 * 1024));
+        flight_tx.try_send(shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new()),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("both frames arrive")
+            .unwrap();
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        assert_eq!(
+            decode(first),
+            RelayToCoordinator::Departure(dropped_notice()),
+            "the notice ships before the queued flight blob",
+        );
+        assert!(
+            matches!(decode(second), RelayToCoordinator::FlightRecording(_)),
+            "the flight blob ships after the notice",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_read_half_applies_a_descriptor_while_a_large_flight_blob_is_in_flight() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Stand-in coordinator: enroll, push a descriptor set, then STOP reading.
+        // The relay has a large flight blob queued, so its write half blocks sending
+        // the blob once our receive buffer fills — but its read half must still
+        // apply the descriptor. If reads were coupled to writes, the descriptor
+        // would never land (we never drain the blob) and the applied set stays empty.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let descriptors = serde_json::to_string(&CoordinatorToRelay::Descriptors {
+                descriptors: vec![descriptor(1, &[])],
+            })
+            .unwrap();
+            ws.send(Message::Text(descriptors.into())).await.unwrap();
+            // Never read the queued blob; hold the connection open.
+            std::future::pending::<()>().await;
+        });
+
+        // A large flight blob queued (under the 16 MiB WebSocket frame limit but
+        // well past the socket send buffer): against a coordinator that stops
+        // reading, its send parks the write half mid-frame. A single read+write
+        // select would then be stuck in that send and never process the descriptor;
+        // the split's independent read half applies it regardless.
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (shipment, _ack) = flight_shipment_with_payload("x".repeat(13 * 1024 * 1024));
+        flight_tx.try_send(shipment).unwrap();
+
+        // The shared applied set the read half reconciles is the observable.
+        let applied = AppliedSessions::new();
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            ControlApplyTargets {
+                control,
+                applied: applied.clone(),
+                fleet: FleetMeshPeers::default(),
+                verifying_keys: SharedRegistry::default(),
+                region_targets: RegionPingTargets::default(),
+                drain_acked,
+            },
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        // The read half applies the pushed descriptor even though the write half is
+        // blocked sending the large blob to a coordinator that stopped reading.
+        let landed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if applied.snapshot().contains(&key(1)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            landed.is_ok(),
+            "the read half applied the descriptor while a blob was in flight",
         );
     }
 }
