@@ -1,21 +1,24 @@
 //! Flight-recording durable sink: the coordinator's DigitalOcean Spaces (S3-API)
-//! store for the observability blobs relays ship up their control connections, plus
-//! the tenant-authenticated read path over them.
+//! store for the observability blobs relays record, plus the tenant-authenticated
+//! read path over them.
 //!
-//! A relay holds no object-store credentials; it ships each flushed recording as a
-//! [`FlightRecordingNotice`](rally_point_proto::control::FlightRecordingNotice) up
-//! its control connection, and the coordinator — the sole credential holder — is what
-//! persists it. Blobs are keyed under one of two retention-selecting prefixes,
-//! [`FLIGHT_PREFIX`] (the normal class) and [`DESYNC_PREFIX`] (the pinned class),
-//! each `<prefix>/<tenant>/<session>/<relay_id>.json`. The bucket's own lifecycle
-//! rules expire the two prefixes on different schedules, which is why the retention
-//! class is a key prefix rather than object metadata: an S3-compatible store filters
-//! a lifecycle rule by key prefix, not by tag, and the two prefixes are disjoint by
-//! construction. The tenant-first shape inside each prefix is the read-authorization
-//! hook — a read only ever names blobs under the tenant its request signature
-//! authenticates as, and the key's relay id is the coordinator's own enrolled id for
-//! the shipping connection, so a relay can never write (or a reader reach) under
-//! another identity.
+//! A relay holds no long-lived object-store credentials. It asks the coordinator — the
+//! sole credential holder — for a presigned upload URL ([`S3FlightStore::presign_put`])
+//! and PUTs each flushed recording, compressed, straight to storage itself; the blob
+//! never rides the control connection. Blobs are keyed under one of two
+//! retention-selecting prefixes, [`FLIGHT_PREFIX`] (the normal class) and
+//! [`DESYNC_PREFIX`] (the pinned class), each
+//! `<prefix>/<tenant>/<session>/<relay_id>.json.zst` (the `.zst` marks the
+//! zstd-compressed-JSON encoding the relay uploads). The bucket's own lifecycle rules
+//! expire the two prefixes on different schedules, which is why the retention class is
+//! a key prefix rather than object metadata: an S3-compatible store filters a lifecycle
+//! rule by key prefix, not by tag, and the two prefixes are disjoint by construction.
+//! The tenant-first shape inside each prefix is the read-authorization hook — a read
+//! only ever names blobs under the tenant its request signature authenticates as, and
+//! the key's relay id is the coordinator's own enrolled id for the requesting
+//! connection (never a relay-supplied value), so a relay can never upload (or a reader
+//! reach) under another identity. A pinned-class store also converges the session's
+//! already-stored unpinned blobs ([`pin_session`]).
 //!
 //! # Config and secrets
 //!
@@ -50,11 +53,19 @@ pub const FLIGHT_PREFIX: &str = "flight";
 /// survive long enough to adjudicate.
 pub const DESYNC_PREFIX: &str = "desync";
 
-/// The largest recording payload the coordinator will store: a defense-in-depth
-/// backstop behind the relay's own ship-side cap. A recording over this is dropped
-/// rather than uploaded, bounding what a misbehaving relay build can push into the
-/// store.
+/// The largest **compressed** recording the coordinator grants an upload for: a
+/// defense-in-depth backstop behind the relay's own ship-side cap. A request whose
+/// byte count exceeds this is refused (no upload URL minted), bounding what a
+/// misbehaving relay build can push into the store. The byte count the request carries
+/// is also bound into the presigned URL, so a granted upload cannot exceed it either.
 pub const MAX_FLIGHT_BLOB_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long a minted presigned upload URL stays valid. Short: the relay uploads
+/// promptly once its request is granted, and a long-lived URL widens the window for a
+/// leaked grant to be reused — but long enough to absorb the relay's bounded upload
+/// retries. Also the lifetime the coordinator keeps an outstanding grant awaiting its
+/// done, since the URL is dead past this anyway.
+pub const PRESIGNED_PUT_EXPIRY: Duration = Duration::from_secs(5 * 60);
 
 /// How long [`S3FlightStore::connect`] waits for its startup reachability probe
 /// before treating the bucket as unreachable. Generous against ordinary S3-API
@@ -125,9 +136,10 @@ fn prefix_for(pinned: bool) -> &'static str {
 
 /// Builds the object key for one relay's recording of one session: the
 /// retention-selecting prefix ([`DESYNC_PREFIX`] when `pinned`, else [`FLIGHT_PREFIX`])
-/// followed by the ratified `<tenant>/<session>/<relay_id>.json` inner shape.
-/// `relay_id` is the coordinator's own enrolled id for the shipping connection, never
-/// a relay-supplied value.
+/// followed by the ratified `<tenant>/<session>/<relay_id>.json.zst` inner shape (the
+/// `.zst` marks the zstd-compressed-JSON encoding the relay uploads). `relay_id` is the
+/// coordinator's own enrolled id for the requesting connection, never a relay-supplied
+/// value.
 pub fn object_key(
     pinned: bool,
     tenant: &TenantId,
@@ -135,7 +147,7 @@ pub fn object_key(
     relay_id: RelayId,
 ) -> String {
     format!(
-        "{}/{}/{}/{}.json",
+        "{}/{}/{}/{}.json.zst",
         prefix_for(pinned),
         tenant.as_ref(),
         session.0,
@@ -152,13 +164,13 @@ pub fn session_prefix(pinned: bool, tenant: &TenantId, session: SessionId) -> St
 }
 
 /// Recovers the relay id from a stored object key by reading its final
-/// `<relay_id>.json` segment. `None` for a key whose last segment is not
-/// `<digits>.json` — a defensive skip for any object that does not match the shape
+/// `<relay_id>.json.zst` segment. `None` for a key whose last segment is not
+/// `<digits>.json.zst` — a defensive skip for any object that does not match the shape
 /// this module writes.
 fn relay_id_from_key(key: &str) -> Option<u64> {
     key.rsplit('/')
         .next()
-        .and_then(|name| name.strip_suffix(".json"))
+        .and_then(|name| name.strip_suffix(".json.zst"))
         .and_then(|digits| digits.parse::<u64>().ok())
 }
 
@@ -219,39 +231,52 @@ pub fn classify_ingest(
     Ok(())
 }
 
-/// Stores one relay's recording under the retention class `pinned` selects, then —
-/// when pinned — converges any of the session's blobs already sitting under the
-/// normal [`FLIGHT_PREFIX`] into the pinned [`DESYNC_PREFIX`].
-///
-/// The convergence sweep covers the race where a session's non-authority relays ship
-/// their (undesynced) recordings and land under `flight/` before the coordinator
-/// learns the authority relay flagged a desync — a coordinator restart can reorder
-/// the two, since the blob arrival and the desync notice travel separate channels.
-/// Sweeping on every pinned store moves those earlier blobs into the retention class
-/// the diverged game needs. It is idempotent (usually an empty list), and safe under
-/// concurrent pinned stores of the same session — each blob simply ends up pinned.
-pub async fn store_recording<S: FlightStore>(
-    store: &S,
+/// The object key and retention class a granted flight upload will store under, decided
+/// from an inbound upload request. The coordinator presigns a PUT to [`key`](Self::key)
+/// and, once the relay reports the upload done, runs the pinned-class convergence
+/// ([`pin_session`]) when [`pinned`](Self::pinned) is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightUploadPlan {
+    /// The full object key (retention prefix included) the upload stores under.
+    pub key: String,
+    /// Whether the recording lands in the pinned (desynced) retention class.
+    pub pinned: bool,
+}
+
+/// Decides how to grant one inbound flight-upload request: run the ingest gates (a
+/// configured store, a known and key-safe tenant, a byte count within the cap), and on
+/// success return the object key + retention class the coordinator presigns an upload
+/// for. `Err` is the reason to refuse the grant instead. `pinned` is the caller's
+/// retention decision (the relay's own desync flag OR a coordinator desync mark);
+/// `relay_id` is the connection's enrolled id, never a relay-supplied value.
+pub fn plan_flight_upload(
+    store_configured: bool,
+    tenant_known: bool,
     tenant: &TenantId,
     session: SessionId,
     relay_id: RelayId,
-    payload: Vec<u8>,
     pinned: bool,
-) -> Result<(), FlightStoreError> {
-    store
-        .put(&object_key(pinned, tenant, session, relay_id), payload)
-        .await?;
-    if pinned {
-        pin_session(store, tenant, session).await?;
-    }
-    Ok(())
+    bytes: u64,
+) -> Result<FlightUploadPlan, FlightDrop> {
+    classify_ingest(store_configured, tenant_known, tenant, bytes as usize)?;
+    Ok(FlightUploadPlan {
+        key: object_key(pinned, tenant, session, relay_id),
+        pinned,
+    })
 }
 
 /// Moves every object under a session's [`FLIGHT_PREFIX`] to its [`DESYNC_PREFIX`]
 /// twin (copy then delete), converging blobs stored before the desync was known into
 /// the pinned retention class. A blob's twin is the same key with the prefix swapped,
-/// so the move preserves the `<tenant>/<session>/<relay_id>.json` shape.
-async fn pin_session<S: FlightStore>(
+/// so the move preserves the `<tenant>/<session>/<relay_id>.json.zst` shape.
+///
+/// Run when a session's authority relay reports a *pinned* upload done: it covers the
+/// race where the session's non-authority relays uploaded their (undesynced) recordings
+/// under `flight/` before the coordinator learned of the desync — a coordinator restart
+/// can reorder the two, since an upload's completion and the desync notice travel
+/// separate channels. It is idempotent (usually an empty list), and safe under
+/// concurrent pinned uploads of the same session — each blob simply ends up pinned.
+pub async fn pin_session<S: FlightStore>(
     store: &S,
     tenant: &TenantId,
     session: SessionId,
@@ -511,6 +536,22 @@ impl S3FlightStore {
     /// config resolved; the endpoint and region point the SigV4 signer at the
     /// Spaces bucket (Spaces accepts `us-east-1` as the signing region).
     pub async fn connect(resolved: ResolvedFlightStore) -> Result<Self, FlightStoreError> {
+        let store = Self::build(resolved).await;
+        match tokio::time::timeout(CONNECT_PROBE_TIMEOUT, store.probe_bucket()).await {
+            Ok(Ok(())) => Ok(store),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(FlightStoreError(format!(
+                "probing bucket {:?} timed out after {:?}",
+                store.bucket, CONNECT_PROBE_TIMEOUT
+            ))),
+        }
+    }
+
+    /// Builds the S3 client + store from resolved config **without** the startup
+    /// reachability probe. [`connect`](Self::connect) wraps this with the probe;
+    /// presign-shape tests use it directly, since presigning is an offline signature
+    /// computation that needs no reachable bucket.
+    async fn build(resolved: ResolvedFlightStore) -> Self {
         let http = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
@@ -541,18 +582,36 @@ impl S3FlightStore {
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             )
             .build();
-        let store = Self {
+        Self {
             client: aws_sdk_s3::Client::from_conf(config),
             bucket: resolved.bucket,
-        };
-        match tokio::time::timeout(CONNECT_PROBE_TIMEOUT, store.probe_bucket()).await {
-            Ok(Ok(())) => Ok(store),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(FlightStoreError(format!(
-                "probing bucket {:?} timed out after {:?}",
-                store.bucket, CONNECT_PROBE_TIMEOUT
-            ))),
         }
+    }
+
+    /// Presigns a PUT to `key` for exactly `content_length` bytes, returning the URL a
+    /// relay uploads a compressed recording to. The byte count is signed into the URL,
+    /// so the granted URL can store neither a different object (the key is fixed) nor a
+    /// different size; the URL expires in [`PRESIGNED_PUT_EXPIRY`]. No network
+    /// round-trip — the signature is computed locally from the client's credentials and
+    /// endpoint.
+    pub async fn presign_put(
+        &self,
+        key: &str,
+        content_length: u64,
+    ) -> Result<String, FlightStoreError> {
+        use aws_sdk_s3::error::DisplayErrorContext;
+        let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(PRESIGNED_PUT_EXPIRY)
+            .map_err(|error| FlightStoreError(format!("building presigning config: {error}")))?;
+        let presigned = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_length(content_length as i64)
+            .presigned(config)
+            .await
+            .map_err(|error| FlightStoreError(format!("{}", DisplayErrorContext(&error))))?;
+        Ok(presigned.uri().to_string())
     }
 
     /// Confirms the configured bucket is reachable and addressable with the
@@ -798,11 +857,51 @@ mod tests {
     fn object_key_selects_the_prefix_and_preserves_the_tenant_first_shape() {
         assert_eq!(
             object_key(false, &tenant(), SessionId(7), RelayId(3)),
-            "flight/sb-test/7/3.json",
+            "flight/sb-test/7/3.json.zst",
         );
         assert_eq!(
             object_key(true, &tenant(), SessionId(7), RelayId(3)),
-            "desync/sb-test/7/3.json",
+            "desync/sb-test/7/3.json.zst",
+        );
+    }
+
+    #[test]
+    fn plan_flight_upload_gates_then_returns_the_retention_key() {
+        // The gates surface as the same drops `classify_ingest` returns.
+        assert_eq!(
+            plan_flight_upload(false, true, &tenant(), SessionId(7), RelayId(3), false, 0),
+            Err(FlightDrop::NoStore),
+        );
+        assert_eq!(
+            plan_flight_upload(true, false, &tenant(), SessionId(7), RelayId(3), false, 0),
+            Err(FlightDrop::UnknownTenant),
+        );
+        assert_eq!(
+            plan_flight_upload(
+                true,
+                true,
+                &tenant(),
+                SessionId(7),
+                RelayId(3),
+                false,
+                MAX_FLIGHT_BLOB_BYTES as u64 + 1,
+            ),
+            Err(FlightDrop::TooLarge),
+        );
+        // An unpinned grant plans the flight-prefix key; a pinned one the desync prefix.
+        assert_eq!(
+            plan_flight_upload(true, true, &tenant(), SessionId(7), RelayId(3), false, 10),
+            Ok(FlightUploadPlan {
+                key: "flight/sb-test/7/3.json.zst".to_owned(),
+                pinned: false,
+            }),
+        );
+        assert_eq!(
+            plan_flight_upload(true, true, &tenant(), SessionId(7), RelayId(3), true, 10),
+            Ok(FlightUploadPlan {
+                key: "desync/sb-test/7/3.json.zst".to_owned(),
+                pinned: true,
+            }),
         );
     }
 
@@ -846,67 +945,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unpinned_recording_lands_under_the_flight_prefix() {
-        let store = FakeFlightStore::new();
-        store_recording(
-            &store,
-            &tenant(),
-            SessionId(7),
-            RelayId(3),
-            b"{}".to_vec(),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(store.keys(), vec!["flight/sb-test/7/3.json".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn a_pinned_recording_lands_under_the_desync_prefix() {
-        let store = FakeFlightStore::new();
-        store_recording(
-            &store,
-            &tenant(),
-            SessionId(7),
-            RelayId(3),
-            b"{}".to_vec(),
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(store.keys(), vec!["desync/sb-test/7/3.json".to_owned()]);
-    }
-
-    #[tokio::test]
     async fn a_late_pin_sweeps_an_earlier_flight_blob_into_the_desync_prefix() {
         let store = FakeFlightStore::new();
-        // A non-authority relay's recording lands unpinned first.
-        store_recording(
-            &store,
-            &tenant(),
-            SessionId(7),
-            RelayId(2),
-            b"early".to_vec(),
-            false,
-        )
-        .await
-        .unwrap();
-        // The authority relay's pinned recording arrives and converges the earlier one.
-        store_recording(
-            &store,
-            &tenant(),
-            SessionId(7),
-            RelayId(3),
-            b"late".to_vec(),
-            true,
-        )
-        .await
-        .unwrap();
+        // A non-authority relay uploaded its recording unpinned first (the relay PUTs
+        // straight to the object key; here we write it directly to stand in for that).
+        store
+            .put(
+                &object_key(false, &tenant(), SessionId(7), RelayId(2)),
+                b"early".to_vec(),
+            )
+            .await
+            .unwrap();
+        // The authority relay's pinned upload lands, and the coordinator's Done
+        // bookkeeping converges the earlier one via the pinned sweep.
+        store
+            .put(
+                &object_key(true, &tenant(), SessionId(7), RelayId(3)),
+                b"late".to_vec(),
+            )
+            .await
+            .unwrap();
+        pin_session(&store, &tenant(), SessionId(7)).await.unwrap();
         assert_eq!(
             store.keys(),
             vec![
-                "desync/sb-test/7/2.json".to_owned(),
-                "desync/sb-test/7/3.json".to_owned(),
+                "desync/sb-test/7/2.json.zst".to_owned(),
+                "desync/sb-test/7/3.json.zst".to_owned(),
             ],
         );
         // The moved blob keeps its bytes, and its original is gone.
@@ -916,7 +980,7 @@ mod tests {
                 .unwrap(),
             Some(b"early".to_vec()),
         );
-        assert!(!store.contains("flight/sb-test/7/2.json"));
+        assert!(!store.contains("flight/sb-test/7/2.json.zst"));
     }
 
     #[tokio::test]
@@ -924,21 +988,21 @@ mod tests {
         let store = FakeFlightStore::new();
         // Relay 2 exists under BOTH prefixes (the transient sweep state); relay 3 only
         // under desync/, relay 4 only under flight/. Written directly so the pinned
-        // store's own convergence sweep does not disturb the mixed state.
+        // sweep does not disturb the mixed state.
         store
-            .put("flight/sb-test/7/2.json", b"a".to_vec())
+            .put("flight/sb-test/7/2.json.zst", b"a".to_vec())
             .await
             .unwrap();
         store
-            .put("desync/sb-test/7/2.json", b"a".to_vec())
+            .put("desync/sb-test/7/2.json.zst", b"a".to_vec())
             .await
             .unwrap();
         store
-            .put("desync/sb-test/7/3.json", b"bb".to_vec())
+            .put("desync/sb-test/7/3.json.zst", b"bb".to_vec())
             .await
             .unwrap();
         store
-            .put("flight/sb-test/7/4.json", b"c".to_vec())
+            .put("flight/sb-test/7/4.json.zst", b"c".to_vec())
             .await
             .unwrap();
 
@@ -961,13 +1025,13 @@ mod tests {
     async fn listing_ignores_a_sibling_session_sharing_a_numeric_prefix() {
         let store = FakeFlightStore::new();
         store
-            .put("flight/sb-test/7/1.json", b"a".to_vec())
+            .put("flight/sb-test/7/1.json.zst", b"a".to_vec())
             .await
             .unwrap();
         // Session 70's key shares the "7" numeric prefix; the trailing slash in the
         // session prefix keeps it out of session 7's listing.
         store
-            .put("flight/sb-test/70/1.json", b"b".to_vec())
+            .put("flight/sb-test/70/1.json.zst", b"b".to_vec())
             .await
             .unwrap();
 
@@ -988,7 +1052,7 @@ mod tests {
             None,
         );
         store
-            .put("flight/sb-test/7/3.json", b"flight".to_vec())
+            .put("flight/sb-test/7/3.json.zst", b"flight".to_vec())
             .await
             .unwrap();
         assert_eq!(
@@ -998,7 +1062,7 @@ mod tests {
             Some(b"flight".to_vec()),
         );
         store
-            .put("desync/sb-test/7/3.json", b"desync".to_vec())
+            .put("desync/sb-test/7/3.json.zst", b"desync".to_vec())
             .await
             .unwrap();
         assert_eq!(
@@ -1007,6 +1071,43 @@ mod tests {
                 .unwrap(),
             Some(b"desync".to_vec()),
             "the pinned copy is preferred over the flight copy",
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_put_signs_a_bounded_url_for_the_key_and_size() {
+        // Build the store offline (no reachability probe) against a Spaces-style
+        // endpoint; presigning is a local signature computation, no network.
+        let store = S3FlightStore::build(ResolvedFlightStore {
+            endpoint: "https://nyc3.digitaloceanspaces.com".to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "sb-rp2-flight".to_owned(),
+            access_key: "AKIAEXAMPLE".to_owned(),
+            secret_key: "s3cr3texamplekey".to_owned(),
+        })
+        .await;
+
+        let key = object_key(true, &tenant(), SessionId(7), RelayId(3));
+        let url = store.presign_put(&key, 4096).await.unwrap();
+
+        // The host comes from the configured endpoint and the object key is the path.
+        assert!(url.starts_with("https://"), "{url}");
+        assert!(url.contains("digitaloceanspaces.com"), "{url}");
+        assert!(url.contains("desync/sb-test/7/3.json.zst"), "{url}");
+        // The SigV4 presign query params: algorithm, the bounded expiry, the signed
+        // headers, and the signature — all present, all computed locally.
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{url}");
+        assert!(
+            url.contains("X-Amz-Expires=300"),
+            "expiry is 5 minutes: {url}"
+        );
+        assert!(url.contains("X-Amz-SignedHeaders="), "{url}");
+        assert!(url.contains("X-Amz-Signature="), "{url}");
+        // The exact content length is signed into the URL, so it cannot store a
+        // different-sized object.
+        assert!(
+            url.contains("content-length"),
+            "the signed headers bind content-length: {url}",
         );
     }
 

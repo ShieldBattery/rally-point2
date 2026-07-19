@@ -69,7 +69,7 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
@@ -89,9 +89,9 @@ use axum::{
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use rally_point_proto::control::{
-    CoordinatorToRelay, FlightRecordingNotice, MeshPeerIdentity, RegionBeaconTarget, RegionId,
-    RegionRttReport, RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor,
-    SessionRequest, SessionResponse, TenantId, TenantVerifyingKey,
+    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, RegionId, RegionRttReport,
+    RelayEndpoint, RelayHello, RelayToCoordinator, SessionDescriptor, SessionRequest,
+    SessionResponse, TenantId, TenantVerifyingKey,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::version::{
@@ -205,16 +205,19 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// legitimate control frames are never fragmented, so a lower frame cap would
 /// just reject the same traffic in a more confusing way.
 ///
-/// Sized off [`flight_store::MAX_FLIGHT_BLOB_BYTES`], the largest legitimate
-/// payload this connection ever carries (a flushed flight recording): the
-/// blob rides as a JSON *string* inside the envelope, so quote/backslash/
-/// control-byte escaping can inflate its wire size well past its raw byte
-/// count. Doubling the raw cap covers that escaping plus the small envelope
-/// overhead with room to spare. Left unset, axum/tungstenite default to 64
-/// MiB / 16 MiB — high enough that a single connection could pin tens of
-/// megabytes per frame it merely claims to be sending, before any
-/// application-level check (like the flight-blob cap itself) ever runs.
-const MAX_CONTROL_MESSAGE_BYTES: usize = flight_store::MAX_FLIGHT_BLOB_BYTES * 2;
+/// Flight recordings no longer ride this connection (a relay uploads them straight to
+/// object storage via a presigned URL), so the cap is sized to the largest frame that
+/// actually does: a relay's heartbeat roster. A heartbeat carries up to
+/// [`MAX_HEARTBEAT_SESSIONS`] session entries — each a tenant id (at most
+/// [`token::MAX_STRING_LEN`](rally_point_proto::token::MAX_STRING_LEN) = 255 bytes), a
+/// session id, and up to [`MAX_HEARTBEAT_SESSION_SLOTS`] slot numbers — plus up to
+/// [`MAX_HEARTBEAT_REGION_RTTS`] region-RTT entries. Even at a generous ~512 bytes per
+/// session entry that worst case is comfortably under 2 MiB, so this bounds every
+/// legitimate inbound frame with headroom. Left unset, axum/tungstenite default to
+/// 64 MiB / 16 MiB — high enough that a single connection could pin tens of megabytes
+/// per frame it merely claims to be sending, before any application-level check ever
+/// runs.
+const MAX_CONTROL_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The shared state the HTTP handlers operate over: the coordinator's
 /// session-setup context plus the relay control-connection auth posture.
@@ -1612,6 +1615,9 @@ struct WriterSources {
     reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
     /// The reader's directives to emit a drain exchange's set-then-ack.
     drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
+    /// Ready flight-upload grant/refusal frames the reader minted (a presign runs off
+    /// the read loop and pushes its result here), forwarded to the relay verbatim.
+    grants: tokio::sync::mpsc::UnboundedReceiver<CoordinatorToRelay>,
     /// The tenant verifying keys, led out first so a relay can verify a session's
     /// client tokens before that session's descriptor arrives.
     tenant_keys: Vec<TenantVerifyingKey>,
@@ -1650,6 +1656,11 @@ async fn push_and_watch(
     // send on the writer so set-before-ack holds on the wire.
     let (drain_tx, drain) = tokio::sync::mpsc::unbounded_channel::<DrainSend>();
 
+    // The reader (and the presigns it spawns) push ready flight-upload grant/refusal
+    // frames over this channel for the writer to send — keeping every send on the
+    // writer while the async presign runs off the read loop.
+    let (grants_tx, grants) = tokio::sync::mpsc::unbounded_channel::<CoordinatorToRelay>();
+
     // Every coordinator→relay source the writer draws from. The descriptor and reap
     // outboxes' fresh subscribes replace any prior sender, so a reconnect owns the
     // live receivers; the mesh-peer watch is shared across every connection. The
@@ -1661,6 +1672,7 @@ async fn push_and_watch(
         mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
         reaps: setup.reaps().subscribe(relay_id),
         drain,
+        grants,
         tenant_keys: tenant::all_verifying_keys(setup.tenants()),
         beacon_targets: regions.beacon_targets(),
     };
@@ -1672,7 +1684,7 @@ async fn push_and_watch(
     // half-applied and nothing is double-run.
     tokio::select! {
         () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout) => {}
-        () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx) => {}
+        () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx, grants_tx) => {}
     }
 }
 
@@ -1680,9 +1692,12 @@ async fn push_and_watch(
 /// connect-time sequence in a fixed order — tenant keys, region beacons (when any),
 /// the initial descriptor set, the initial mesh-peer set — strictly before any
 /// steady-state push, then serves a `biased` priority loop: the drain exchange
-/// first, then the latest-wins descriptor watch, the mesh-peer watch, and the reap
-/// receiver last. Returns (ending the connection) when a send stalls or errors, a
-/// watch closes on shutdown, or the reader ends.
+/// first, then the latest-wins descriptor watch, the mesh-peer watch, the
+/// flight-upload grants, and the reap receiver last. The grants sit below the
+/// descriptor/mesh pushes (a grant gates a relay's upload progress but must not
+/// preempt a session-start descriptor) and above reaps. Returns (ending the
+/// connection) when a send stalls or errors, a watch closes on shutdown, or the
+/// reader ends.
 async fn run_writer(
     write_half: &mut ControlWrite,
     sources: &mut WriterSources,
@@ -1696,6 +1711,7 @@ async fn run_writer(
         mesh_peers: mesh_peers_rx,
         reaps,
         drain: drain_rx,
+        grants: grants_rx,
         tenant_keys,
         beacon_targets,
     } = sources;
@@ -1837,6 +1853,23 @@ async fn run_writer(
                     break;
                 }
             }
+            grant = grants_rx.recv() => {
+                // A ready flight-upload grant or refusal the reader (or a presign it
+                // spawned) minted. `None` means every sender is gone — the reader ended
+                // and no presign is still in flight — so this half ends too.
+                let Some(grant) = grant else { break };
+                if !writer_send(
+                    write_half,
+                    control_frame(&grant),
+                    relay_id,
+                    liveness_timeout,
+                    "flight-grant",
+                )
+                .await
+                {
+                    break;
+                }
+            }
             first = reaps.recv() => {
                 // The reap outbox never closes on its own (the sender lives in the
                 // shared outbox), so `None` here would only mean a replaced
@@ -1900,8 +1933,13 @@ async fn run_reader(
     inbound: &ControlInbound<'_>,
     liveness_timeout: Duration,
     drain_tx: &tokio::sync::mpsc::UnboundedSender<DrainSend>,
+    grants_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorToRelay>,
 ) {
     let relay_id = inbound.relay_id;
+    // The flight-upload grant state for this connection: the channel to the writer plus
+    // the grants awaiting their done. Reader-local, so a stale connection's grants never
+    // outlive it.
+    let mut flight = FlightUploadState::new(grants_tx);
     // A relay silent past this deadline is treated as dead. Every inbound frame
     // pushes it forward; a heartbeat lands well inside the window, so it only lapses
     // when the relay stops sending at all (a crash or a half-open connection). A
@@ -1914,7 +1952,7 @@ async fn run_reader(
                 match frame {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(message)) => {
-                        let action = note_inbound(inbound, &message);
+                        let action = note_inbound(inbound, &mut flight, &message);
                         // Any frame proves the relay is alive — push the deadline out.
                         deadline = tokio::time::Instant::now() + liveness_timeout;
                         // A Draining frame applies the synchronous draining mark here,
@@ -2155,7 +2193,13 @@ const MAX_HEARTBEAT_REGION_RTTS: usize = 256;
 /// `sessionClosed` signal must track a session even for a tenant with no webhook
 /// configured. Redundant notices from multiple relays are idempotent in the
 /// accounting (a set insert), so feeding every copy is harmless.
-fn note_inbound(inbound: &ControlInbound<'_>, message: &Message) -> InboundAction {
+fn note_inbound(
+    inbound: &ControlInbound<'_>,
+    flight: &mut FlightUploadState,
+    message: &Message,
+) -> InboundAction {
+    // `flight_store` is read through `inbound` by the flight-upload handlers below, not
+    // bound here.
     let &ControlInbound {
         setup,
         notices,
@@ -2163,7 +2207,7 @@ fn note_inbound(inbound: &ControlInbound<'_>, message: &Message) -> InboundActio
         relay_id,
         generation,
         rtt,
-        flight_store,
+        ..
     } = inbound;
     let Message::Text(text) = message else {
         return InboundAction::None; // ping/pong/binary: liveness only, nothing to read
@@ -2338,8 +2382,20 @@ fn note_inbound(inbound: &ControlInbound<'_>, message: &Message) -> InboundActio
             lifecycle.on_session_closed(tenant, session, relay_id);
             InboundAction::None
         }
-        Ok(RelayToCoordinator::FlightRecording(notice)) => {
-            handle_flight_recording(setup, &notices.desync_marks, flight_store, relay_id, notice);
+        Ok(RelayToCoordinator::FlightUploadRequest {
+            request,
+            tenant,
+            session,
+            desynced,
+            bytes,
+        }) => {
+            handle_flight_upload_request(
+                inbound, flight, request, tenant, session, desynced, bytes,
+            );
+            InboundAction::None
+        }
+        Ok(RelayToCoordinator::FlightUploadDone { request }) => {
+            handle_flight_upload_done(inbound, flight, request);
             InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
@@ -2351,191 +2407,273 @@ fn note_inbound(inbound: &ControlInbound<'_>, message: &Message) -> InboundActio
     }
 }
 
-/// The most flight-recording uploads the coordinator runs at once, bounding the object
-/// -store PUTs a burst of session closes can have in flight — the flight sink's
-/// counterpart to the webhook dispatch semaphore. Each upload is spawned off the
-/// control-connection read loop, so a slow PUT never stalls the heartbeats that ride it.
-const MAX_CONCURRENT_FLIGHT_UPLOADS: usize = 8;
-
-/// The process-wide gate [`MAX_CONCURRENT_FLIGHT_UPLOADS`] enforces.
-static FLIGHT_UPLOAD_PERMITS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_FLIGHT_UPLOADS);
-
-/// The shortest gap between "a recording arrived but no store is configured" warnings,
-/// so a fleet shipping recordings to a coordinator whose store config was forgotten
-/// logs the misconfiguration without one log line per recording.
+/// The shortest gap between "a request arrived but no store is configured" warnings,
+/// so a fleet asking a coordinator whose store config was forgotten to grant uploads
+/// logs the misconfiguration without one log line per request.
 const NO_STORE_WARN_INTERVAL_SECS: u64 = 60;
 
 /// Unix seconds of the last no-store warning, so [`warn_no_flight_store`] can rate-limit
 /// itself. `0` means it has never warned.
 static LAST_NO_STORE_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Ingests one relay's flight-recording frame: gate it (a configured store, a known
-/// tenant, a payload within the cap), decide its retention class, and spawn the upload
-/// so a slow object-store PUT never stalls the control-connection read loop the relay's
-/// heartbeats ride.
-///
-/// The blob is keyed on `relay_id` — the identity THIS connection enrolled as, never a
-/// relay-supplied field — so a relay can only ever write under its own id. The
-/// retention class is pinned when the shipping relay flagged a desync in its own events
-/// OR the coordinator has independently marked the session desynced: only the authority
-/// relay's own recording carries the flag, but every relay's desync notice reaches the
-/// coordinator, so the mark is what pins the non-authority relays' blobs. A pinned store
-/// also sweeps the session's already-stored unpinned blobs into the pinned class (see
-/// [`flight_store::store_recording`]), converging blobs that arrived before the desync
-/// was known.
-///
-/// Unlike its departure/desync/result siblings, this frame deliberately passes no
-/// [`relay_may_report`]-style serving-set check: a recording flushes at the same
-/// moment the relay reports `SessionClosed`, in no fixed order relative to it, so by
-/// the time the blob arrives the session's serving-set state may already be retired
-/// and a membership check would wrongly refuse exactly the blobs the store exists to
-/// keep. The exposure is proportionate: a notice can fire webhooks and move lifecycle
-/// state, but a forged recording can only land under the shipping relay's own key —
-/// pollution bounded to the identity that shipped it.
-fn handle_flight_recording(
-    setup: &SessionSetup,
-    desync_marks: &notify::DesyncMarks,
-    flight_store: Option<&Arc<S3FlightStore>>,
-    relay_id: RelayId,
-    notice: FlightRecordingNotice,
-) {
-    let tenant_known = tenant::tenant_state(setup.tenants(), &notice.tenant).is_some();
-    if let Err(drop) = flight_store::classify_ingest(
-        flight_store.is_some(),
-        tenant_known,
-        &notice.tenant,
-        notice.payload.len(),
-    ) {
-        match drop {
-            flight_store::FlightDrop::NoStore => {
-                // No store configured: the recording is unrecoverably lost, not a
-                // deliberate refusal.
-                crate::metrics::flight_recording_lost();
-                warn_no_flight_store(relay_id);
-            }
-            flight_store::FlightDrop::UnknownTenant => {
-                crate::metrics::flight_recording_refused();
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    "dropping a flight recording for a tenant not in the registry",
-                );
-            }
-            flight_store::FlightDrop::TenantIdNotKeySafe => {
-                crate::metrics::flight_recording_refused();
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    "dropping a flight recording: the tenant id cannot embed in an object key",
-                );
-            }
-            flight_store::FlightDrop::TooLarge => {
-                crate::metrics::flight_recording_refused();
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    bytes = notice.payload.len(),
-                    "dropping an oversize flight recording",
-                );
-            }
-        }
-        return;
-    }
-
-    let store = flight_store
-        .expect("classify_ingest permits storage only when a store is configured")
-        .clone();
-    let pinned = notice.desynced
-        || notify::is_session_desynced(
-            desync_marks,
-            &notice.tenant,
-            notice.session,
-            std::time::Instant::now(),
-        );
-    spawn_flight_upload(
-        store,
-        notice.tenant,
-        notice.session,
-        relay_id,
-        notice.payload.into_bytes(),
-        pinned,
-    );
+/// Reader-local state for the flight-upload grant path on one control connection: the
+/// channel that hands ready grant/refusal frames to the writer, and the grants minted
+/// on this connection still awaiting their [`RelayToCoordinator::FlightUploadDone`].
+struct FlightUploadState {
+    /// The ready [`CoordinatorToRelay::FlightUploadGrant`] / `FlightUploadRefused` frames
+    /// the reader hands the writer to send. A presign runs off the read loop and pushes
+    /// its result here.
+    grants: tokio::sync::mpsc::UnboundedSender<CoordinatorToRelay>,
+    /// Grants minted on this connection, keyed by the relay's request id, awaiting their
+    /// `FlightUploadDone`. Swept opportunistically (on a new request or a done) at grant
+    /// expiry, never with a timer.
+    outstanding: std::collections::HashMap<u64, OutstandingGrant>,
 }
 
-/// Spawns the upload of one gated flight recording, bounded by [`FLIGHT_UPLOAD_PERMITS`].
-/// A failed store is a logged loss with no retry: flight data is observability, and the
-/// relay's at-least-once shipping already covers connection-level loss. Detached from the
-/// read loop so a slow PUT never stalls it.
-///
-/// The permit is claimed here, synchronously, before `payload` moves anywhere —
-/// never inside the spawned task. `FLIGHT_UPLOAD_PERMITS` bounds concurrent PUTs,
-/// but a task blocked on `.acquire().await` would still hold its full (up to
-/// [`flight_store::MAX_FLIGHT_BLOB_BYTES`]) payload in memory for as long as it
-/// waited — turning eight permits into an unbounded backlog of parked, payload-
-/// holding tasks the moment uploads fall behind arrivals (a slow object store, or
-/// a relay shipping faster than the store can drain). `try_acquire` makes a
-/// saturated gate an immediate, synchronous refusal instead: the recording joins
-/// the same accepted-loss path as an oversize or unknown-tenant one rather than
-/// queuing behind seven others already in flight.
-fn spawn_flight_upload(
-    store: Arc<S3FlightStore>,
+impl FlightUploadState {
+    fn new(grants: tokio::sync::mpsc::UnboundedSender<CoordinatorToRelay>) -> Self {
+        Self {
+            grants,
+            outstanding: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// One outstanding upload grant, recorded when the coordinator grants an upload and
+/// removed by its `FlightUploadDone`. Carries what the done bookkeeping needs: the
+/// tenant + session to run the pinned convergence sweep against, whether it was pinned,
+/// and the byte count for the stored metric — plus the mint instant, so a grant whose
+/// done never arrives (a refused presign, a relay that gave up uploading) expires rather
+/// than lingering for the connection's life.
+struct OutstandingGrant {
     tenant: TenantId,
     session: SessionId,
-    relay_id: RelayId,
-    payload: Vec<u8>,
     pinned: bool,
+    bytes: u64,
+    minted_at: Instant,
+}
+
+/// Prunes every grant past its expiry — [`flight_store::PRESIGNED_PUT_EXPIRY`] from its
+/// mint, the point its presigned URL is dead anyway. Opportunistic, run on each new
+/// request and done rather than by a timer, so a grant whose done never arrives cannot
+/// accumulate.
+fn prune_expired_grants(
+    outstanding: &mut std::collections::HashMap<u64, OutstandingGrant>,
+    now: Instant,
 ) {
-    let bytes = payload.len();
-    let Ok(permit) = FLIGHT_UPLOAD_PERMITS.try_acquire() else {
-        crate::metrics::flight_recording_refused();
-        tracing::warn!(
-            tenant = tenant.as_ref(),
-            session = session.0,
-            relay_id = relay_id.0,
-            pinned,
-            bytes,
-            "dropping a flight recording: upload concurrency is saturated",
+    outstanding.retain(|_, grant| {
+        now.saturating_duration_since(grant.minted_at) < flight_store::PRESIGNED_PUT_EXPIRY
+    });
+}
+
+/// Removes and returns the outstanding grant for `request`, first pruning any grant past
+/// its expiry — so an expired grant reads as absent. `None` for an unknown or expired
+/// request: a done the coordinator ignores.
+fn take_outstanding_grant(
+    outstanding: &mut std::collections::HashMap<u64, OutstandingGrant>,
+    request: u64,
+    now: Instant,
+) -> Option<OutstandingGrant> {
+    prune_expired_grants(outstanding, now);
+    outstanding.remove(&request)
+}
+
+/// Handles one relay's flight-upload request: gate it (a configured store, a known and
+/// key-safe tenant, a byte count within the cap), decide the retention class, record the
+/// outstanding grant, and spawn the presign off the read loop — the SDK call is async
+/// and must not run inline in the sync reader — which pushes the ready grant (or a
+/// refusal on presign failure) to the writer. A gate failure pushes a refusal the same
+/// way.
+///
+/// The object key is built from `relay_id` — the identity THIS connection enrolled as,
+/// never a relay-supplied field — so a relay can only ever upload under its own id. The
+/// retention class is pinned when the relay flagged a desync in its own recording OR the
+/// coordinator has independently marked the session desynced: only the authority relay's
+/// own recording carries the flag, but every relay's desync notice reaches the
+/// coordinator, so the mark is what pins the non-authority relays' recordings.
+///
+/// Unlike its departure/desync/result siblings, this deliberately passes no
+/// serving-set check: a recording flushes at the same moment the relay reports
+/// `SessionClosed`, in no fixed order relative to it, so by the time the request arrives
+/// the session's serving-set state may already be retired and a membership check would
+/// wrongly refuse exactly the recordings the store exists to keep. The exposure is
+/// proportionate: a forged request can only ever grant an upload under the requesting
+/// relay's own key — pollution bounded to the identity that requested it.
+fn handle_flight_upload_request(
+    inbound: &ControlInbound<'_>,
+    flight: &mut FlightUploadState,
+    request: u64,
+    tenant: TenantId,
+    session: SessionId,
+    desynced: bool,
+    bytes: u64,
+) {
+    let relay_id = inbound.relay_id;
+    let tenant_known = tenant::tenant_state(inbound.setup.tenants(), &tenant).is_some();
+    let pinned = desynced
+        || notify::is_session_desynced(
+            &inbound.notices.desync_marks,
+            &tenant,
+            session,
+            Instant::now(),
         );
-        return;
-    };
-    tokio::spawn(async move {
-        let _permit = permit;
-        match flight_store::store_recording(&*store, &tenant, session, relay_id, payload, pinned)
-            .await
-        {
-            Ok(()) => {
-                crate::metrics::flight_recording_stored();
-                if pinned {
-                    // A pinned store lands under the desync-selecting key prefix.
-                    crate::metrics::flight_recording_pinned();
-                }
-                tracing::info!(
-                    tenant = tenant.as_ref(),
-                    session = session.0,
-                    relay_id = relay_id.0,
-                    pinned,
+
+    match flight_store::plan_flight_upload(
+        inbound.flight_store.is_some(),
+        tenant_known,
+        &tenant,
+        session,
+        relay_id,
+        pinned,
+        bytes,
+    ) {
+        Ok(plan) => {
+            let store = inbound
+                .flight_store
+                .expect("a plan is only produced when a store is configured")
+                .clone();
+            // Record the grant before presigning; the presign pushes the URL (or a
+            // refusal) to the writer off this loop. Prune expired grants opportunistically.
+            prune_expired_grants(&mut flight.outstanding, Instant::now());
+            flight.outstanding.insert(
+                request,
+                OutstandingGrant {
+                    tenant,
+                    session,
+                    pinned: plan.pinned,
                     bytes,
-                    "flight recording stored",
-                );
+                    minted_at: Instant::now(),
+                },
+            );
+            spawn_presign(store, flight.grants.clone(), request, plan.key, bytes);
+        }
+        Err(drop) => {
+            match drop {
+                flight_store::FlightDrop::NoStore => {
+                    // No store configured: the recording is unrecoverably lost, not a
+                    // deliberate refusal.
+                    crate::metrics::flight_recording_lost();
+                    warn_no_flight_store(relay_id);
+                }
+                flight_store::FlightDrop::UnknownTenant => {
+                    crate::metrics::flight_recording_refused();
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        tenant = tenant.as_ref(),
+                        session = session.0,
+                        "refusing a flight upload for a tenant not in the registry",
+                    );
+                }
+                flight_store::FlightDrop::TenantIdNotKeySafe => {
+                    crate::metrics::flight_recording_refused();
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        tenant = tenant.as_ref(),
+                        session = session.0,
+                        "refusing a flight upload: the tenant id cannot embed in an object key",
+                    );
+                }
+                flight_store::FlightDrop::TooLarge => {
+                    crate::metrics::flight_recording_refused();
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        tenant = tenant.as_ref(),
+                        session = session.0,
+                        bytes,
+                        "refusing an oversize flight upload",
+                    );
+                }
             }
+            let _ = flight
+                .grants
+                .send(CoordinatorToRelay::FlightUploadRefused { request });
+        }
+    }
+}
+
+/// Spawns the presign of one granted upload off the read loop (the SDK call is async and
+/// must not run inline in the sync reader), pushing the ready
+/// [`CoordinatorToRelay::FlightUploadGrant`] — or a `FlightUploadRefused` when presigning
+/// fails — to the writer through `grants`. `content_length` is bound into the URL so it
+/// cannot store a different-sized object.
+fn spawn_presign(
+    store: Arc<S3FlightStore>,
+    grants: tokio::sync::mpsc::UnboundedSender<CoordinatorToRelay>,
+    request: u64,
+    key: String,
+    content_length: u64,
+) {
+    tokio::spawn(async move {
+        let frame = match store.presign_put(&key, content_length).await {
+            Ok(url) => CoordinatorToRelay::FlightUploadGrant { request, url },
             Err(error) => {
                 crate::metrics::flight_recording_lost();
                 tracing::warn!(
-                    tenant = tenant.as_ref(),
-                    session = session.0,
-                    relay_id = relay_id.0,
-                    pinned,
-                    bytes,
+                    request,
+                    key,
                     %error,
-                    "storing a flight recording failed; the recording is lost (no retry)",
+                    "presigning a flight upload URL failed; refusing the request",
+                );
+                CoordinatorToRelay::FlightUploadRefused { request }
+            }
+        };
+        let _ = grants.send(frame);
+    });
+}
+
+/// Handles one relay's [`RelayToCoordinator::FlightUploadDone`]: the relay uploaded the
+/// recording, so run the post-store bookkeeping — the stored (and, when pinned, pinned)
+/// metric, and for a pinned grant the same unpinned→pinned convergence sweep the direct
+/// store path used to trigger ([`flight_store::pin_session`]). A done for an unknown or
+/// expired request is logged and ignored.
+fn handle_flight_upload_done(
+    inbound: &ControlInbound<'_>,
+    flight: &mut FlightUploadState,
+    request: u64,
+) {
+    let relay_id = inbound.relay_id;
+    let Some(grant) = take_outstanding_grant(&mut flight.outstanding, request, Instant::now())
+    else {
+        tracing::debug!(
+            relay_id = relay_id.0,
+            request,
+            "flight upload done for an unknown or expired request; ignoring",
+        );
+        return;
+    };
+    crate::metrics::flight_recording_stored();
+    if grant.pinned {
+        crate::metrics::flight_recording_pinned();
+    }
+    tracing::info!(
+        relay_id = relay_id.0,
+        tenant = grant.tenant.as_ref(),
+        session = grant.session.0,
+        pinned = grant.pinned,
+        bytes = grant.bytes,
+        "flight recording uploaded",
+    );
+    // A pinned recording converges the session's already-stored unpinned blobs into the
+    // pinned retention class — the same sweep the direct store path ran on a pinned
+    // store. Off the read loop, since the sweep is a run of async store operations.
+    if grant.pinned
+        && let Some(store) = inbound.flight_store
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                flight_store::pin_session(&*store, &grant.tenant, grant.session).await
+            {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = grant.tenant.as_ref(),
+                    session = grant.session.0,
+                    %error,
+                    "converging a desynced session's earlier recordings failed",
                 );
             }
-        }
-    });
+        });
+    }
 }
 
 /// Warns that a recording arrived with no store configured, at most once per
@@ -2603,8 +2741,8 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<RelayToCoordinator>(&text) {
                     Ok(RelayToCoordinator::Hello(hello)) => Some(hello),
-                    // A heartbeat, a departure, a desync, a result, a flight
-                    // recording, an identity proof, or any future up-frame before
+                    // A heartbeat, a departure, a desync, a result, a flight-upload
+                    // request or done, an identity proof, or any future up-frame before
                     // the enroll Hello is a protocol violation: enrollment comes
                     // first.
                     Ok(
@@ -2614,7 +2752,8 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)
                         | RelayToCoordinator::SessionClosed { .. }
-                        | RelayToCoordinator::FlightRecording(_)
+                        | RelayToCoordinator::FlightUploadRequest { .. }
+                        | RelayToCoordinator::FlightUploadDone { .. }
                         | RelayToCoordinator::IdentityProof { .. }
                         | RelayToCoordinator::Unknown,
                     ) => {
@@ -3770,7 +3909,7 @@ mod tests {
 
     /// Runs [`note_inbound`] over one frame's inputs, bundling them into a
     /// [`ControlInbound`] with no flight store — these direct-call tests never
-    /// exercise the flight-recording path.
+    /// exercise the flight-upload path, so the flight state is a throwaway.
     fn note_inbound_frame(
         setup: &SessionSetup,
         notices: &NoticeDedup,
@@ -3780,6 +3919,7 @@ mod tests {
         message: &Message,
         rtt: &RegionRttIngest<'_>,
     ) -> InboundAction {
+        let mut flight = FlightUploadState::new(tokio::sync::mpsc::unbounded_channel().0);
         note_inbound(
             &ControlInbound {
                 setup,
@@ -3790,6 +3930,7 @@ mod tests {
                 rtt,
                 flight_store: None,
             },
+            &mut flight,
             message,
         )
     }
@@ -4333,6 +4474,53 @@ mod tests {
             .await
             .expect("a notice for a session with no serving record still delivers")
             .expect("the receiver got it");
+    }
+
+    // --- Flight upload grant bookkeeping ---
+
+    fn outstanding_grant(session: u64, pinned: bool, minted_at: Instant) -> OutstandingGrant {
+        OutstandingGrant {
+            tenant: TenantId("sb-test".to_owned()),
+            session: SessionId(session),
+            pinned,
+            bytes: 100,
+            minted_at,
+        }
+    }
+
+    #[test]
+    fn a_done_takes_its_grant_and_ignores_an_unknown_or_duplicate_one() {
+        let now = Instant::now();
+        let mut outstanding = std::collections::HashMap::new();
+        outstanding.insert(7, outstanding_grant(42, true, now));
+
+        // A done for a request the connection never granted is ignored.
+        assert!(take_outstanding_grant(&mut outstanding, 9, now).is_none());
+
+        // The matching done removes and returns its grant (carrying the pinned flag the
+        // sweep keys on).
+        let grant = take_outstanding_grant(&mut outstanding, 7, now).expect("the grant is found");
+        assert_eq!(grant.session, SessionId(42));
+        assert!(grant.pinned);
+
+        // A duplicate done for the same request is now ignored — the entry is gone.
+        assert!(take_outstanding_grant(&mut outstanding, 7, now).is_none());
+    }
+
+    #[test]
+    fn an_expired_grant_reads_as_absent_and_is_pruned() {
+        let now = Instant::now();
+        let mut outstanding = std::collections::HashMap::new();
+        outstanding.insert(3, outstanding_grant(1, false, now));
+
+        // Past the grant's expiry, a done for it reads as unknown, and the expired
+        // entry is swept in the same pass.
+        let later = now + flight_store::PRESIGNED_PUT_EXPIRY + Duration::from_secs(1);
+        assert!(
+            take_outstanding_grant(&mut outstanding, 3, later).is_none(),
+            "an expired grant's done is ignored",
+        );
+        assert!(outstanding.is_empty(), "the expired entry was pruned");
     }
 
     // --- Flight recording read endpoints ---

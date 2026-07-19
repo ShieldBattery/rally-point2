@@ -1058,6 +1058,37 @@ pub enum CoordinatorToRelay {
         /// A fresh random value, unique per connection attempt.
         nonce: [u8; 32],
     },
+    /// Grants a relay's [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest):
+    /// the relay may PUT the compressed recording directly to durable storage using
+    /// `url`, a short-lived presigned upload URL the coordinator minted.
+    ///
+    /// The coordinator — the sole store-credential holder — classifies the request,
+    /// decides the object key (retention class included), and presigns a PUT to
+    /// exactly that key with the request's exact byte count bound into the signature,
+    /// so the URL can neither store under a different key nor a different size. The
+    /// relay uploads and then reports [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone);
+    /// the blob never rides this control connection. `request` echoes the relay's own
+    /// per-connection correlation id so the relay matches the grant to its outstanding
+    /// request and ignores one for a request it no longer holds (a stale grant from a
+    /// prior connection).
+    FlightUploadGrant {
+        /// The relay's correlation id from the request this grants.
+        request: u64,
+        /// A short-lived presigned PUT URL the relay uploads the compressed recording
+        /// to. Expires within minutes of minting; a relay that cannot upload before
+        /// then drops the recording (flight data is observability, never backpressure).
+        url: String,
+    },
+    /// Refuses a relay's [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest):
+    /// the coordinator will mint no upload URL for it, so the relay drops the recording.
+    /// Sent when the coordinator has no store configured, does not hold the named tenant
+    /// enrolled, the byte count exceeds the store's cap, or presigning failed — the same
+    /// gate decisions the direct-store path applied, just answered as a refusal here
+    /// rather than a silent drop. `request` echoes the relay's correlation id.
+    FlightUploadRefused {
+        /// The relay's correlation id from the request this refuses.
+        request: u64,
+    },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -1188,19 +1219,54 @@ pub enum RelayToCoordinator {
         /// The session this relay closed.
         session: SessionId,
     },
-    /// A flushed flight recording the relay ships for the coordinator to persist —
-    /// one session's full observability blob, sent when the session closes or the
-    /// relay drains. The relay holds no durable-store credentials, so the recording
-    /// travels up this same authenticated control connection rather than to storage
-    /// directly.
+    /// Asks the coordinator to mint a presigned URL the relay uploads one flushed
+    /// flight recording to directly. The relay compresses each recording and PUTs it
+    /// to durable storage itself rather than shipping the bytes up this connection —
+    /// so the control socket carries only this small request, the coordinator's
+    /// [`FlightUploadGrant`](CoordinatorToRelay::FlightUploadGrant) or
+    /// [`FlightUploadRefused`](CoordinatorToRelay::FlightUploadRefused), and a final
+    /// [`FlightUploadDone`](Self::FlightUploadDone), never the blob.
     ///
-    /// Carries no relay id: the coordinator keys the stored blob on **this
-    /// connection's enrolled relay identity**, so a relay can never name another
-    /// relay's identity in the object key. Additive, so an older coordinator decodes
-    /// it as [`Unknown`](Self::Unknown) and skips it — the blob is simply lost
-    /// against a coordinator that predates this variant, consistent with the
-    /// deploy-order rule that coordinator images ship ahead of relay images.
-    FlightRecording(FlightRecordingNotice),
+    /// Carries no relay id: the coordinator keys the object on **this connection's
+    /// enrolled relay identity**, so a relay can never name another relay's identity
+    /// in the key it uploads under. `bytes` is the exact length of the compressed
+    /// payload, bound into the presigned URL's signature so the granted URL cannot be
+    /// used to store a different-sized object; `desynced` is whether the recording's
+    /// own events contain a confirmed desync (the coordinator combines it with its own
+    /// desync record to choose the stored blob's retention class). Additive, so an
+    /// older coordinator decodes it as [`Unknown`](Self::Unknown) and skips it — the
+    /// recording is simply lost against a coordinator that predates this variant,
+    /// consistent with the deploy-order rule that coordinator images ship ahead of
+    /// relay images.
+    FlightUploadRequest {
+        /// A per-connection correlation id the relay mints, echoed back on the grant
+        /// or refusal so the relay matches the answer to this request (and ignores an
+        /// answer for a request it no longer holds).
+        request: u64,
+        /// The tenant the session belongs to.
+        tenant: TenantId,
+        /// The coordinator-assigned session id the recording covers.
+        session: SessionId,
+        /// Whether this recording's own events contain a confirmed desync — the
+        /// coordinator combines it with its own desync record to pin the retention
+        /// class, so the flag matters when the coordinator's record was lost to a
+        /// restart.
+        desynced: bool,
+        /// The exact byte length of the compressed payload the relay will upload,
+        /// bound into the presigned URL so it cannot store a different-sized object.
+        bytes: u64,
+    },
+    /// Reports that the relay finished uploading the recording a prior
+    /// [`FlightUploadRequest`](Self::FlightUploadRequest) named, sent only after a
+    /// successful PUT. It tells the coordinator the object is now stored, so the
+    /// coordinator can run its post-store bookkeeping (metrics, and the pinned-class
+    /// convergence sweep for a desynced session). `request` echoes the correlation id
+    /// so the coordinator matches it to the grant it minted; a Done for an unknown or
+    /// expired request is ignored.
+    FlightUploadDone {
+        /// The correlation id from the request whose upload completed.
+        request: u64,
+    },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -1429,33 +1495,6 @@ pub struct ResultNotice {
     /// `None` before that slot produced a framed turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_frame: Option<u32>,
-}
-
-/// A relay's shipment of one flushed flight recording, sent up the relay control
-/// connection ([`RelayToCoordinator::FlightRecording`]).
-///
-/// Like [`DepartureNotice`], it carries its own `tenant`/`session` because one
-/// control connection serves many sessions. It deliberately does **not** carry a
-/// relay id: the coordinator keys the stored blob on the connection's enrolled
-/// relay identity, so a relay cannot claim another's identity in the object key
-/// (the same connection-scoped authority the notice-serving check already relies
-/// on).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlightRecordingNotice {
-    /// The tenant the session belongs to.
-    pub tenant: TenantId,
-    /// The coordinator-assigned session id the recording covers.
-    pub session: SessionId,
-    /// Whether this recording's events contain a confirmed desync — the shipping
-    /// relay scans its own events at flush. The coordinator combines this with its
-    /// own desync-notice record to choose the stored blob's retention class; the
-    /// flag matters when the coordinator's in-memory record was lost to a restart.
-    pub desynced: bool,
-    /// The serialized flight blob (JSON), opaque to the coordinator. Carried as
-    /// bytes-of-JSON rather than a typed structure so a coordinator built against
-    /// an older blob shape stores newer relays' recordings verbatim instead of
-    /// silently dropping fields it does not know.
-    pub payload: String,
 }
 
 /// serde helper for opaque byte slices (token wire bytes).
@@ -2205,36 +2244,92 @@ mod tests {
     }
 
     #[test]
-    fn relay_to_coordinator_flight_recording_roundtrips_json() {
-        let message = RelayToCoordinator::FlightRecording(FlightRecordingNotice {
+    fn relay_to_coordinator_flight_upload_request_roundtrips_json() {
+        let message = RelayToCoordinator::FlightUploadRequest {
+            request: 7,
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             desynced: true,
-            payload: r#"{"version":1,"session":42,"events":[]}"#.to_owned(),
-        });
+            bytes: 4096,
+        };
         let json = serde_json::to_string(&message).unwrap();
-        assert!(json.contains("\"type\":\"flight_recording\""));
+        assert!(json.contains("\"type\":\"flight_upload_request\""));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
-        // The opaque payload survives the round trip byte-for-byte — the
-        // coordinator stores exactly what the relay shipped.
-        let RelayToCoordinator::FlightRecording(notice) = back else {
-            panic!("expected a flight_recording frame");
+        let RelayToCoordinator::FlightUploadRequest {
+            request,
+            session,
+            desynced,
+            bytes,
+            ..
+        } = back
+        else {
+            panic!("expected a flight_upload_request frame");
         };
-        assert_eq!(notice.payload, r#"{"version":1,"session":42,"events":[]}"#);
-        assert!(notice.desynced);
+        assert_eq!(request, 7);
+        assert_eq!(session, SessionId(42));
+        assert!(desynced);
+        assert_eq!(bytes, 4096);
     }
 
     #[test]
-    fn flight_recording_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
-        // Forward compatibility: a `FlightRecording` up-frame decoded by the
-        // down-direction `CoordinatorToRelay` (which has no such variant) folds
-        // into `Unknown` rather than erroring — a coordinator that predates the
-        // variant skips the shipment (the blob is lost) instead of tearing the
-        // connection down.
-        let json = r#"{"type":"flight_recording","tenant":"sb-staging","session":42,"desynced":false,"payload":"{}"}"#;
+    fn relay_to_coordinator_flight_upload_done_roundtrips_json() {
+        let message = RelayToCoordinator::FlightUploadDone { request: 9 };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"flight_upload_done\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn coordinator_to_relay_flight_upload_grant_roundtrips_json() {
+        let message = CoordinatorToRelay::FlightUploadGrant {
+            request: 7,
+            url: "https://bucket.example/desync/sb-staging/42/3.json.zst?X-Amz-Signature=abc"
+                .to_owned(),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"flight_upload_grant\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+        let CoordinatorToRelay::FlightUploadGrant { request, url } = back else {
+            panic!("expected a flight_upload_grant frame");
+        };
+        assert_eq!(request, 7);
+        assert!(url.contains("X-Amz-Signature"));
+    }
+
+    #[test]
+    fn coordinator_to_relay_flight_upload_refused_roundtrips_json() {
+        let message = CoordinatorToRelay::FlightUploadRefused { request: 7 };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"flight_upload_refused\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn flight_upload_request_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // Forward compatibility: a `FlightUploadRequest` up-frame decoded by the
+        // down-direction `CoordinatorToRelay` (which has no such variant) folds into
+        // `Unknown` rather than erroring — a coordinator that predates the variant
+        // skips the request (the recording is lost) instead of tearing the connection
+        // down.
+        let json = r#"{"type":"flight_upload_request","request":1,"tenant":"sb-staging","session":42,"desynced":false,"bytes":10}"#;
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn flight_upload_grant_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // The mirror direction: a `FlightUploadGrant` down-frame decoded by the
+        // up-direction `RelayToCoordinator` (which has no such variant) folds into
+        // `Unknown` — a relay that predates the grant variant skips it, so a new
+        // coordinator against an old relay degrades to lost blobs rather than a torn
+        // connection.
+        let json = r#"{"type":"flight_upload_grant","request":1,"url":"https://x/y"}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
     }
 
     #[test]

@@ -43,13 +43,16 @@
 //! flush logs what it discarded rather than storing it.
 //!
 //! Two sinks exist. The dev/loopback [`FileSink`] (`--flight-dir`) writes one
-//! JSON file per blob at `<dir>/<tenant>/<session>/<relay_id>.json`. The
-//! [`CoordinatorSink`], installed by default on a coordinator-connected relay,
-//! ships each flushed blob up the relay's control connection as a
-//! [`FlightRecordingNotice`] — the relay holds no durable-store credentials, so it
-//! hands the blob to the coordinator and forgets it, never reading one back. Both
-//! sinks key on the tenant/session/relay identity the blob header carries; the
-//! tenant-first prefix is the structural hook for tenant-scoped read authorization.
+//! uncompressed pretty-JSON file per blob at
+//! `<dir>/<tenant>/<session>/<relay_id>.json` — its value is human inspectability.
+//! The [`CoordinatorSink`], installed by default on a coordinator-connected relay,
+//! compresses each flushed blob and hands it to the relay's control connection as a
+//! [`FlightShipment`]: the relay asks the coordinator for a presigned upload URL, PUTs
+//! the compressed bytes straight to durable storage, and reports completion — the blob
+//! never rides the control socket, and the relay holds no long-lived store
+//! credentials, only the short-lived URL. Both sinks key on the tenant/session/relay
+//! identity the blob header carries; the tenant-first prefix is the structural hook
+//! for tenant-scoped read authorization.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -59,8 +62,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
-use rally_point_proto::control::{DepartureKind, FlightRecordingNotice, TenantId};
+use rally_point_proto::control::{DepartureKind, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -321,11 +325,14 @@ impl FlightSink for FileSink {
     }
 }
 
-/// The largest serialized flight blob [`CoordinatorSink`] will ship. The rings
-/// ([`MAX_EVENTS_PER_SESSION`], [`MAX_SAMPLES_PER_SESSION`]) bound a real blob far
-/// below this, so the cap never trips on genuine data; it is a wire-hygiene
-/// backstop so a pathological serialization can never hand the control connection
-/// an unbounded frame.
+/// The largest **compressed** flight payload [`CoordinatorSink`] will ship. A shipped
+/// payload is a zstd-compressed compact-JSON document; this bounds its post-compression
+/// size, the exact byte count the relay asks the coordinator to presign an upload for.
+/// The rings ([`MAX_EVENTS_PER_SESSION`], [`MAX_SAMPLES_PER_SESSION`]) bound a real
+/// blob's *uncompressed* size far below this, and compression only shrinks it, so the
+/// cap never trips on genuine data; it stays as a wire-hygiene backstop so a
+/// pathological (e.g. incompressible) serialization can never ask the coordinator to
+/// grant an unbounded upload.
 pub const MAX_SHIPPED_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
 /// The depth of the bounded channel a [`CoordinatorSink`] hands shipments to the
@@ -342,33 +349,48 @@ pub const FLIGHT_SHIP_QUEUE: usize = 32;
 /// left for close-time flushes racing the drain.
 pub const DRAIN_FLUSH_CONCURRENCY: usize = 16;
 
-/// One flushed recording handed to the coordinator control connection: the notice
-/// to ship, and a one-shot the connection fires once the frame is on the socket.
+/// One flushed recording handed to the coordinator control connection: the metadata
+/// the relay's upload request carries, the compressed bytes it PUTs to storage, and a
+/// one-shot the connection fires once the recording is **stored**.
 ///
 /// The sink awaits that `sent` ack, so the drain path's
 /// [`DRAIN_FLUSH_TIMEOUT`]-bounded [`FlightRecorder::flush_all`] waits for real
-/// delivery rather than mere enqueueing.
+/// storage rather than mere enqueueing. The ack fires only after a successful upload
+/// PUT; a dropped sender (the coordinator refused the upload, the PUT failed or timed
+/// out, or the connection tore down) resolves the sink's await as an error, so the
+/// recording is reported lost rather than stored.
 pub struct FlightShipment {
-    /// The recording to ship, already built into its wire notice.
-    pub notice: FlightRecordingNotice,
-    /// Fired by the connection loop once `notice`'s frame is written to the
-    /// socket. A dropped sender (loop or process teardown) resolves the sink's
-    /// await as an error, so a shipment the connection never sent is reported lost
-    /// rather than stored.
+    /// The tenant the recording's session belongs to.
+    pub tenant: TenantId,
+    /// The coordinator-assigned session id the recording covers.
+    pub session: SessionId,
+    /// Whether the recording's own events contain a confirmed desync — the coordinator
+    /// combines this with its own desync record to pin the retention class.
+    pub desynced: bool,
+    /// The compressed recording bytes (zstd of compact JSON), the exact payload the
+    /// relay PUTs to the presigned URL. Cheaply cloneable so an in-progress upload can
+    /// own a copy while the shipment stays parked for a re-request across a reconnect.
+    pub payload: Bytes,
+    /// Fired by the connection once the recording is stored (a successful upload PUT).
+    /// A dropped sender (an upload refusal, PUT failure/timeout, or connection
+    /// teardown) resolves the sink's await as an error, so an unstored recording is
+    /// reported lost rather than stored.
     pub sent: oneshot::Sender<()>,
 }
 
-/// The production flight sink: ships each flushed blob up the relay's coordinator
-/// control connection as a [`FlightRecordingNotice`] for the coordinator — the
-/// sole durable-store client — to persist. The relay holds no store credentials,
-/// so it never touches storage directly and never reads a blob back.
+/// The production flight sink: hands each flushed blob to the relay's coordinator
+/// control connection as a [`FlightShipment`], which the connection uploads to durable
+/// storage via a coordinator-minted presigned URL. The relay compresses the blob but
+/// holds no long-lived store credentials — only the short-lived URL the coordinator
+/// grants per upload — and never reads a stored blob back.
 ///
-/// A `store` call serializes the blob, refuses one past
-/// [`MAX_SHIPPED_BLOB_BYTES`], `try_send`s it onto the bounded channel (a full
-/// queue is a logged loss, never a block — flight data is observability, not
-/// backpressure on a session teardown), then awaits the connection's ack so the
-/// drain flush genuinely bounds delivery. Delivery is at-least-once: an ambiguous
-/// send failure re-ships, idempotently overwriting the same object key.
+/// A `store` call serializes the blob to compact JSON, zstd-compresses it, refuses one
+/// whose compressed size exceeds [`MAX_SHIPPED_BLOB_BYTES`], `try_send`s the shipment
+/// onto the bounded channel (a full queue is a logged loss, never a block — flight data
+/// is observability, not backpressure on a session teardown), then awaits the
+/// connection's ack so the drain flush genuinely bounds storage. Delivery is
+/// at-least-once: an ambiguous failure re-ships, idempotently overwriting the same
+/// object key.
 pub struct CoordinatorSink {
     tx: mpsc::Sender<FlightShipment>,
 }
@@ -389,29 +411,32 @@ impl FlightSink for CoordinatorSink {
         &'a self,
         blob: &'a FlightBlob,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-        // Build the notice from the blob's own header fields (the same
-        // single-argument reasoning as the `FlightSink` trait doc: the notice can
+        // Derive the shipment metadata from the blob's own header fields (the same
+        // single-argument reasoning as the `FlightSink` trait doc: the shipment can
         // never disagree with the envelope). `desynced` is derived by scanning the
         // recording's own events, so the shipping relay reports what it actually
         // saw — the coordinator needs it when its own desync record was lost to a
         // restart.
-        let payload = serde_json::to_string(blob).expect("a flight blob always serializes");
+        let tenant = TenantId(blob.tenant.clone());
+        let session = SessionId(blob.session);
         let desynced = blob
             .events
             .iter()
             .any(|record| matches!(record.event, FlightEvent::DesyncDetected { .. }));
-        let notice = FlightRecordingNotice {
-            tenant: TenantId(blob.tenant.clone()),
-            session: SessionId(blob.session),
-            desynced,
-            payload,
-        };
+        // Compact JSON (not pretty) so the pre-compression bytes are already minimal,
+        // then zstd — a recording is repetitive, structured JSON that compresses
+        // heavily. The cap bounds the compressed size, the exact count the coordinator
+        // presigns the upload for.
+        let json = serde_json::to_vec(blob).expect("a flight blob always serializes");
         Box::pin(async move {
-            if notice.payload.len() > MAX_SHIPPED_BLOB_BYTES {
+            let compressed = zstd::encode_all(&json[..], 0).map_err(|error| {
+                std::io::Error::other(format!("compressing flight blob: {error}"))
+            })?;
+            if compressed.len() > MAX_SHIPPED_BLOB_BYTES {
                 tracing::warn!(
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    bytes = notice.payload.len(),
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    bytes = compressed.len(),
                     cap = MAX_SHIPPED_BLOB_BYTES,
                     "flight recording exceeds the shipping cap; discarding it",
                 );
@@ -424,17 +449,21 @@ impl FlightSink for CoordinatorSink {
             // observability delay a session close or a drain.
             self.tx
                 .try_send(FlightShipment {
-                    notice,
+                    tenant,
+                    session,
+                    desynced,
+                    payload: Bytes::from(compressed),
                     sent: sent_tx,
                 })
                 .map_err(|error| {
                     std::io::Error::other(format!("flight shipment queue unavailable: {error}"))
                 })?;
-            // Resolve only once the connection loop confirms the frame is on the
-            // socket; a dropped ack sender (loop teardown) means it was never sent.
-            sent_rx.await.map_err(|_| {
-                std::io::Error::other("flight shipment sender dropped before delivery")
-            })
+            // Resolve only once the connection reports the recording stored (a
+            // successful upload PUT); a dropped ack sender (a refusal, PUT failure, or
+            // teardown) means it was not stored.
+            sent_rx
+                .await
+                .map_err(|_| std::io::Error::other("flight shipment dropped before it was stored"))
         })
     }
 }
@@ -1103,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_coordinator_sink_ships_a_notice_that_reconstructs_the_blob() {
+    async fn the_coordinator_sink_compresses_a_shipment_that_reconstructs_the_blob() {
         let recorder = FlightRecorder::default();
         recorder.set_identity(RelayId(9));
         let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
@@ -1122,12 +1151,13 @@ mod tests {
         let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
 
         let shipment = rx.recv().await.expect("a shipment is queued");
-        assert_eq!(shipment.notice.tenant.as_ref(), "sb-test");
-        assert_eq!(shipment.notice.session, SessionId(42));
-        assert!(!shipment.notice.desynced, "no desync event was recorded");
-        // The shipped payload is the blob itself, verbatim.
-        let blob: FlightBlob =
-            serde_json::from_str(&shipment.notice.payload).expect("the payload is the blob");
+        assert_eq!(shipment.tenant.as_ref(), "sb-test");
+        assert_eq!(shipment.session, SessionId(42));
+        assert!(!shipment.desynced, "no desync event was recorded");
+        // The shipped payload is the zstd-compressed compact JSON of the blob;
+        // decompressing it reconstructs the blob exactly.
+        let json = zstd::decode_all(&shipment.payload[..]).expect("the payload decompresses");
+        let blob: FlightBlob = serde_json::from_slice(&json).expect("the payload is the blob");
         assert_eq!(blob.tenant, "sb-test");
         assert_eq!(blob.session, 42);
         assert_eq!(blob.relay_id, 9);
@@ -1158,7 +1188,7 @@ mod tests {
         let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
         let shipment = rx.recv().await.expect("a shipment is queued");
         assert!(
-            shipment.notice.desynced,
+            shipment.desynced,
             "a DesyncDetected event sets the shipped flag",
         );
         shipment.sent.send(()).unwrap();
@@ -1166,15 +1196,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_blob_is_refused_and_ships_nothing() {
+    async fn an_oversized_compressed_blob_is_refused_and_ships_nothing() {
         let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
         let sink = CoordinatorSink::new(tx);
-        // A blob whose serialized form exceeds the shipping cap — a pathological
-        // payload the rings would never actually produce, built by hand to
-        // exercise the wire-hygiene backstop.
+        // A blob whose *compressed* form exceeds the shipping cap — a pathological
+        // payload the rings would never actually produce, built by hand to exercise
+        // the wire-hygiene backstop. The tenant string is filled with high-entropy
+        // (incompressible) bytes so zstd cannot shrink it below the cap.
         let blob = FlightBlob {
             version: BLOB_VERSION,
-            tenant: "x".repeat(MAX_SHIPPED_BLOB_BYTES + 1),
+            // Twice the cap of high-entropy source: even at zstd's best case on a
+            // 6-bit-per-symbol alphabet (~0.75 ratio) the compressed form clears the
+            // 4 MiB cap comfortably.
+            tenant: incompressible_string(MAX_SHIPPED_BLOB_BYTES * 2),
             session: 1,
             relay_id: 0,
             started_at_ms: 1,
@@ -1186,9 +1220,29 @@ mod tests {
         };
         assert!(
             sink.store(&blob).await.is_err(),
-            "an oversized blob is refused",
+            "an oversized compressed blob is refused",
         );
         assert!(rx.try_recv().is_err(), "nothing was shipped");
+    }
+
+    /// Builds a `len`-byte string of high-entropy ASCII over a 64-symbol alphabet, so
+    /// zstd finds no structure to exploit and its output stays near the input size —
+    /// used to force the compressed-size backstop to trip in a test without a
+    /// multi-megabyte genuinely-recorded blob.
+    fn incompressible_string(len: usize) -> String {
+        // A 64-char JSON-safe alphabet: 6 bits of entropy per symbol.
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            // xorshift64: high-entropy output zstd finds no structure in.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push(ALPHABET[(state & 63) as usize] as char);
+        }
+        out
     }
 
     #[tokio::test]
@@ -1198,12 +1252,10 @@ mod tests {
         // alive, so the sink's next try_send sees a full (not closed) queue.
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(FlightShipment {
-            notice: FlightRecordingNotice {
-                tenant: TenantId("sb-test".to_owned()),
-                session: SessionId(0),
-                desynced: false,
-                payload: "{}".to_owned(),
-            },
+            tenant: TenantId("sb-test".to_owned()),
+            session: SessionId(0),
+            desynced: false,
+            payload: Bytes::from_static(b"{}"),
             sent: oneshot::channel().0,
         })
         .expect("the first send fills the slot");

@@ -46,8 +46,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    CoordinatorToRelay, ENROLL_POP_CONTEXT, FlightRecordingNotice, MeshPeerIdentity,
-    RegionRttReport, RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
+    CoordinatorToRelay, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport, RelayHello,
+    RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
@@ -55,8 +55,11 @@ use rally_point_proto::version::{
     CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
-use tokio::sync::watch;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
+
+use crate::flight_upload::{self, PutOutcome};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -91,6 +94,48 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// refused handshake as log noise. Still finite — the deploy that fixes the skew
 /// needs no relay restart to take effect.
 pub const VERSION_REFUSED_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// How long the relay waits for a coordinator's
+/// [`FlightUploadGrant`](CoordinatorToRelay::FlightUploadGrant) (or
+/// [`FlightUploadRefused`](CoordinatorToRelay::FlightUploadRefused)) after sending a
+/// [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest) before it gives up
+/// on that recording. Bounds the wait so a parked shipment can never wedge the flight
+/// pipe: flight data is observability, never backpressure. Also covers an *older*
+/// coordinator that decodes the request as an unknown frame and silently drops it — no
+/// grant will ever come, so the timeout drops the recording and unparks the slot.
+pub const FLIGHT_GRANT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The reader→writer routes on one control connection: frames the read half received
+/// but the write half must send (every send is owned by the write half). A mid-stream
+/// identity challenge's nonce — answering is a send — and the coordinator's flight-upload
+/// grant/refusal, which the writer acts on because it holds the parked shipment and
+/// drives the upload.
+struct WriterRoutes {
+    /// A routed identity-challenge nonce for the writer to answer with a proof send.
+    challenge_rx: UnboundedReceiver<[u8; 32]>,
+    /// A routed flight-upload grant or refusal for the writer's upload machinery.
+    flight_grant_rx: UnboundedReceiver<FlightGrant>,
+}
+
+/// A coordinator's answer to a [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
+/// routed from the read half to the write half (which owns the upload lifecycle).
+/// Carries the request's correlation id so the writer matches it to the shipment it
+/// still holds and ignores an answer for one it has already resolved (a stale answer
+/// from a prior connection).
+enum FlightGrant {
+    /// The coordinator minted a presigned upload URL; the writer PUTs the recording.
+    Granted {
+        /// The correlation id of the request this grants.
+        request: u64,
+        /// The presigned PUT URL.
+        url: String,
+    },
+    /// The coordinator refused; the writer drops the recording.
+    Refused {
+        /// The correlation id of the request this refuses.
+        request: u64,
+    },
+}
 
 /// How one control connection ended, when it ended without an error — what the
 /// reconnect loop keys its next-dial delay on.
@@ -739,32 +784,15 @@ async fn connect_and_stream(
         send_draining(&mut socket).await?;
     }
 
-    // Flush a flight shipment held over from a prior connection, after the pending
-    // notice and the drain re-assert. The flight pipe is deliberately separate
-    // from the notice pipe: `SessionClosed`'s "no earlier notice for the session
-    // still in flight" ordering is a property of the notice channel alone, and a
-    // blob frame must never delay a webhook-bearing notice. On send failure the
-    // shipment stays in `pending_flight` and rides the next reconnect; the ack
-    // fires only after the frame is on the socket.
-    if outbound.pending_flight.is_some() {
-        send_flight(
-            &mut socket,
-            &outbound
-                .pending_flight
-                .as_ref()
-                .expect("just checked")
-                .notice,
-        )
-        .await?;
-        if let Some(shipment) = outbound.pending_flight.take() {
-            let _ = shipment.sent.send(());
-        }
-    }
+    // A shipment held over from a prior connection is NOT flushed here: its bytes never
+    // ride the socket. It stays parked in `pending_flight`, and the write half re-sends
+    // its small `FlightUploadRequest` at its own entry (below), so a shipment orphaned
+    // by a dead connection simply re-requests an upload URL on the next one.
 
     // Split the enrolled socket into a read half and a write half, driven
-    // concurrently. The write half owns every send, so a large frame in flight
-    // (a heartbeat, a notice, or a multi-megabyte flight blob) never stalls the
-    // read half — coordinator pushes keep applying while a blob goes up.
+    // concurrently. The write half owns every send, so a stalled send never stalls the
+    // read half — coordinator pushes keep applying while the writer works its queues
+    // and drives an upload's request/grant/done handshake.
     let (sink, stream) = socket.split();
 
     // A mid-stream identity challenge's answer is a *send*, and only the write
@@ -773,13 +801,18 @@ async fn connect_and_stream(
     // rarely-if-ever-used defensive path.
     let (challenge_tx, challenge_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // A flight-upload grant or refusal is read on the read half but acted on by the
+    // write half (which owns the parked shipment and its upload lifecycle), so the read
+    // half routes it here — the same shape as the challenge channel.
+    let (flight_grant_tx, flight_grant_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // Run both halves until either ends; the first to finish is the connection's
     // outcome, and dropping the other closes its half of the socket. There is no
     // spawned task to leak, and the caller-owned `outbound` slots — mutated in place
     // by the writer through `&mut` — carry whatever stayed undelivered straight back
     // to the caller no matter which half ended the connection.
     tokio::select! {
-        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx) => result,
+        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx) => result,
         result = write_control_frames(
             sink,
             outbound,
@@ -787,7 +820,10 @@ async fn connect_and_stream(
             heartbeat,
             &enroll.identity_key,
             relay_id,
-            challenge_rx,
+            WriterRoutes {
+                challenge_rx,
+                flight_grant_rx,
+            },
         ) => result,
     }
 }
@@ -810,6 +846,7 @@ async fn read_control_frames(
     apply_targets: &ControlApplyTargets,
     relay_id: RelayId,
     challenge_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
+    flight_grant_tx: UnboundedSender<FlightGrant>,
 ) -> Result<ControlDisconnect, ControlError> {
     loop {
         // The stream ended (no close frame): let the caller redial.
@@ -856,6 +893,18 @@ async fn read_control_frames(
                         // failed route is a harmless no-op.
                         let _ = challenge_tx.send(nonce);
                     }
+                    CoordinatorToRelay::FlightUploadGrant { request, url } => {
+                        // The coordinator minted an upload URL: route it to the write
+                        // half, which holds the parked shipment and drives the PUT. A
+                        // dropped receiver means the write half is gone (the connection
+                        // is ending), so a failed route is a harmless no-op.
+                        let _ = flight_grant_tx.send(FlightGrant::Granted { request, url });
+                    }
+                    CoordinatorToRelay::FlightUploadRefused { request } => {
+                        // The coordinator refused the upload: route the refusal so the
+                        // write half drops the parked recording and unparks the slot.
+                        let _ = flight_grant_tx.send(FlightGrant::Refused { request });
+                    }
                     other => apply_message(&apply_targets.control, other, &apply_targets.applied),
                 }
             }
@@ -875,16 +924,28 @@ async fn read_control_frames(
 /// The write half of an enrolled control connection: owns every send and drives a
 /// `biased` priority order so bulk can never delay control. Highest first: a drain
 /// re-assert, then queued notices, then a routed identity-proof answer, then the
-/// periodic heartbeat, and last the flight blobs — so a close-bearing notice
-/// always outruns a multi-megabyte recording.
+/// flight-upload handshake arms, then the periodic heartbeat, and last a fresh flight
+/// shipment — so a close-bearing notice always outruns flight work, and the small
+/// upload request never rides ahead of a webhook-bearing notice.
+///
+/// **The flight recording's bytes never ride this connection.** When a shipment is
+/// parked, this half sends a small [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
+/// waits for the read half to route back the coordinator's grant or refusal, and on a
+/// grant spawns a detached PUT of the compressed bytes straight to the object store
+/// (see [`crate::flight_upload`]). Only after the PUT stores the object does it fire
+/// the shipment's `sent` ack (delivery means *stored*) and send a
+/// [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone). A refusal, an upload
+/// failure, or no grant within [`FLIGHT_GRANT_TIMEOUT`] (which also covers an older
+/// coordinator that drops the request as unknown) drops the recording with a log and
+/// unparks the slot — flight data is observability, never backpressure.
 ///
 /// The caller-owned `outbound` slots (`pending`, `pending_flight`) are this half's
-/// only durable state across a reconnect. A notice or shipment is parked in its
-/// slot *before* the send await and cleared only *after* the send returns, with no
-/// await in between: if this future is dropped (the read half ended the connection)
-/// or a send errors mid-frame, the slot still holds the undelivered item and the
-/// next connection's flush delivers it, while an item whose send completed is
-/// already cleared and never re-sent.
+/// only durable state across a reconnect. A notice is parked *before* its send await
+/// and cleared only *after* it returns; a shipment is parked *before* its request send
+/// and cleared only on ack (stored) or drop (lost) — so if this future is dropped (the
+/// read half ended the connection) or a send errors mid-frame, an undelivered item
+/// stays in its slot and the next connection re-delivers it (a shipment re-*requests*
+/// an upload URL), while a delivered/stored item is already cleared and never re-run.
 async fn write_control_frames(
     mut sink: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     outbound: &mut OutboundQueues,
@@ -892,8 +953,12 @@ async fn write_control_frames(
     heartbeat: &HeartbeatConfig,
     identity_key: &PrivateKeyDer<'static>,
     relay_id: RelayId,
-    mut challenge_rx: UnboundedReceiver<[u8; 32]>,
+    routes: WriterRoutes,
 ) -> Result<ControlDisconnect, ControlError> {
+    let WriterRoutes {
+        mut challenge_rx,
+        mut flight_grant_rx,
+    } = routes;
     // Split the caller-owned queues into their fields. The park/clear discipline
     // below mutates these in place, so whatever stays parked in a slot here is
     // exactly what the caller's `outbound` holds when this future ends.
@@ -925,17 +990,43 @@ async fn write_control_frames(
     // normally stays open until both halves are dropped together; the guard is a
     // belt-and-suspenders against a closed channel busy-looping the biased select.
     let mut challenge_open = true;
+    // The read half likewise holds the flight-grant sender for the connection's life.
+    let mut flight_grant_open = true;
+
+    // The flight upload's per-connection state. `flight_request` is the correlation id
+    // of the request outstanding for the currently-parked shipment on THIS connection
+    // (a fresh id each connection, so a stale grant from a prior one never matches);
+    // `flight_deadline` bounds the wait for its grant; `put_result` is present while a
+    // granted upload's detached PUT runs. A shipment parked from a prior connection is
+    // re-requested at loop entry below.
+    let mut next_request: u64 = 0;
+    let mut flight_request: Option<u64> = None;
+    let mut flight_deadline = Instant::now();
+    let mut put_result: Option<oneshot::Receiver<PutOutcome>> = None;
+
+    if pending_flight.is_some() {
+        next_request += 1;
+        flight_request = Some(next_request);
+        flight_deadline = Instant::now() + FLIGHT_GRANT_TIMEOUT;
+        send_flight_request(
+            &mut sink,
+            next_request,
+            pending_flight.as_ref().expect("just checked"),
+        )
+        .await?;
+    }
 
     loop {
         // Publish the current queue depths for the task-stats reporter. Each count
-        // includes the one item parked mid-send, so a blob in flight is visible for
-        // its whole send rather than only in the instant between sends.
+        // includes the one item parked mid-send, so a shipment awaiting its upload is
+        // visible for its whole lifetime rather than only between sends; the blob-bytes
+        // figure now reports the parked shipment's compressed size.
         depths.store(
             notices.len() + usize::from(pending.is_some()),
             flight.len() + usize::from(pending_flight.is_some()),
             pending_flight
                 .as_ref()
-                .map_or(0, |shipment| shipment.notice.payload.len()),
+                .map_or(0, |shipment| shipment.payload.len()),
         );
 
         tokio::select! {
@@ -987,6 +1078,72 @@ async fn write_control_frames(
                 }
             }
 
+            // A grant or refusal the read half routed here for the outstanding upload
+            // request. Above the heartbeat so it gates the flight pipe promptly, but
+            // below notices so it never delays a webhook-bearing frame.
+            grant = flight_grant_rx.recv(), if flight_grant_open => {
+                match grant {
+                    None => flight_grant_open = false,
+                    // A grant for the request we hold, not yet uploading: spawn the PUT
+                    // of the parked shipment's compressed bytes. The shipment stays
+                    // parked (its `sent` ack fires only on a stored PUT), so a
+                    // connection death mid-upload re-requests on the next connection.
+                    Some(FlightGrant::Granted { request, url })
+                        if flight_request == Some(request) && put_result.is_none() =>
+                    {
+                        let payload = pending_flight
+                            .as_ref()
+                            .expect("an outstanding request implies a parked shipment")
+                            .payload
+                            .clone();
+                        let (result_tx, result_rx) = oneshot::channel();
+                        flight_upload::spawn_put(url, payload, relay_id, result_tx);
+                        put_result = Some(result_rx);
+                    }
+                    // A refusal for the request we hold: drop the recording and unpark.
+                    Some(FlightGrant::Refused { request })
+                        if flight_request == Some(request) && put_result.is_none() =>
+                    {
+                        drop_parked_flight(pending_flight, relay_id, "coordinator refused the upload");
+                        flight_request = None;
+                    }
+                    // A stale answer (a mismatched id, or one arriving after we already
+                    // resolved this request) — ignore it.
+                    Some(_) => {}
+                }
+            }
+
+            // The detached PUT reported its outcome. On stored, fire the ack (delivery
+            // means stored) and tell the coordinator so it runs its post-store
+            // bookkeeping; on failure, drop the recording and unpark. `Err` means the
+            // task's sender dropped (a panic) — treated as a failure.
+            outcome = async { put_result.as_mut().expect("guarded").await }, if put_result.is_some() => {
+                put_result = None;
+                let request = flight_request.take().expect("an upload implies an outstanding request");
+                match outcome.unwrap_or(PutOutcome::Failed) {
+                    PutOutcome::Stored => {
+                        let shipment = pending_flight
+                            .take()
+                            .expect("an upload implies a parked shipment");
+                        let _ = shipment.sent.send(());
+                        send_flight_done(&mut sink, request).await?;
+                    }
+                    PutOutcome::Failed => {
+                        drop_parked_flight(pending_flight, relay_id, "upload failed");
+                    }
+                }
+            }
+
+            // The grant did not arrive within the timeout — a coordinator that never
+            // answers, or an older one that dropped the request as an unknown frame.
+            // Drop the recording and unpark so the next shipment can proceed.
+            _ = tokio::time::sleep_until(flight_deadline),
+                if flight_request.is_some() && put_result.is_none() =>
+            {
+                drop_parked_flight(pending_flight, relay_id, "no upload grant within the timeout");
+                flight_request = None;
+            }
+
             _ = heartbeat_tick.tick() => {
                 // Every beat carries the full current roster — declarative and
                 // self-healing (a lost or reordered beat is corrected by the next
@@ -1000,43 +1157,51 @@ async fn write_control_frames(
                 sink.send(Message::Text(frame.into())).await?;
             }
 
-            // Ship one flight recording at a time: pull the next only once the
-            // current is confirmed sent (the `pending_flight.is_none()` guard), so an
-            // unsent shipment always sits in `pending_flight` for the reconnect flush.
-            // Deliberately below the notices arm: a blob frame — larger and never
-            // webhook-bearing — must never delay a notice, which is why the priority
-            // order sits it here.
+            // Pull the next shipment only when the flight slot is idle (no parked
+            // shipment, so no request outstanding), then send its small upload request.
+            // Below every control arm: the request is small, but it must never ride
+            // ahead of a webhook-bearing notice.
             shipment = flight.recv(), if pending_flight.is_none() && flight_open => {
                 match shipment {
                     Some(shipment) => {
                         *pending_flight = Some(shipment);
-                        // Republish now that the blob is parked, so its byte count is
-                        // visible for the whole send rather than only after it returns.
-                        depths.store(
-                            notices.len() + usize::from(pending.is_some()),
-                            flight.len() + usize::from(pending_flight.is_some()),
-                            pending_flight
-                                .as_ref()
-                                .map_or(0, |shipment| shipment.notice.payload.len()),
-                        );
+                        next_request += 1;
+                        flight_request = Some(next_request);
+                        flight_deadline = Instant::now() + FLIGHT_GRANT_TIMEOUT;
                         // A send error ends the connection (via `?`) with the shipment
-                        // still pending, so the next connection flushes it.
-                        send_flight(
+                        // still parked, so the next connection re-requests it.
+                        send_flight_request(
                             &mut sink,
-                            &pending_flight.as_ref().expect("just set").notice,
+                            next_request,
+                            pending_flight.as_ref().expect("just set"),
                         )
                         .await?;
-                        // Fire the ack (and clear the slot) only after the frame is on
-                        // the socket, so the sink's await resolves to delivered only
-                        // for a shipment that truly went out.
-                        if let Some(shipment) = pending_flight.take() {
-                            let _ = shipment.sent.send(());
-                        }
                     }
                     None => flight_open = false,
                 }
             }
         }
+    }
+}
+
+/// Drops a parked flight shipment that will not be stored (refused, upload failed, or
+/// no grant in time), logging the loss. Dropping the shipment drops its `sent` ack,
+/// which resolves the sink's await as not-stored — flight data is observability, never
+/// backpressure on a session teardown.
+fn drop_parked_flight(
+    pending_flight: &mut Option<FlightShipment>,
+    relay_id: RelayId,
+    reason: &str,
+) {
+    if let Some(shipment) = pending_flight.take() {
+        tracing::warn!(
+            relay_id = relay_id.0,
+            tenant = shipment.tenant.as_ref(),
+            session = shipment.session.0,
+            bytes = shipment.payload.len(),
+            reason,
+            "dropping a flight recording; flight data is never backpressure",
+        );
     }
 }
 
@@ -1099,14 +1264,36 @@ async fn send_notice(
     Ok(())
 }
 
-/// Sends one flushed flight recording up the control connection as a tagged
-/// [`RelayToCoordinator::FlightRecording`] JSON frame.
-async fn send_flight(
+/// Sends a [`RelayToCoordinator::FlightUploadRequest`] up the control connection: asks
+/// the coordinator to mint a presigned upload URL for the parked shipment, naming the
+/// per-connection correlation id and the exact compressed byte count the coordinator
+/// binds into the URL's signature. The recording's bytes stay off the socket.
+async fn send_flight_request(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    notice: &FlightRecordingNotice,
+    request: u64,
+    shipment: &FlightShipment,
 ) -> Result<(), ControlError> {
-    let frame = serde_json::to_string(&RelayToCoordinator::FlightRecording(notice.clone()))
-        .expect("a flight recording frame always serializes");
+    let frame = serde_json::to_string(&RelayToCoordinator::FlightUploadRequest {
+        request,
+        tenant: shipment.tenant.clone(),
+        session: shipment.session,
+        desynced: shipment.desynced,
+        bytes: shipment.payload.len() as u64,
+    })
+    .expect("a flight upload request always serializes");
+    socket.send(Message::Text(frame.into())).await?;
+    Ok(())
+}
+
+/// Sends a [`RelayToCoordinator::FlightUploadDone`] up the control connection after a
+/// successful upload, so the coordinator runs its post-store bookkeeping. `request`
+/// echoes the correlation id of the completed upload.
+async fn send_flight_done(
+    socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    request: u64,
+) -> Result<(), ControlError> {
+    let frame = serde_json::to_string(&RelayToCoordinator::FlightUploadDone { request })
+        .expect("a flight upload done always serializes");
     socket.send(Message::Text(frame.into())).await?;
     Ok(())
 }
@@ -1304,6 +1491,15 @@ fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &A
                 "ignoring a RegionBeacons frame received outside the region-ping store"
             );
         }
+        // The connection loop intercepts the flight-upload grant/refusal (it routes
+        // them to the write half) before delegating here, so these arms are only
+        // defensive no-ops for a stray one.
+        CoordinatorToRelay::FlightUploadGrant { .. } => {
+            tracing::debug!("ignoring a FlightUploadGrant received outside the upload handshake");
+        }
+        CoordinatorToRelay::FlightUploadRefused { .. } => {
+            tracing::debug!("ignoring a FlightUploadRefused received outside the upload handshake");
+        }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
         }
@@ -1385,6 +1581,8 @@ fn reconcile(control: &MeshControl, descriptors: &[SessionDescriptor], applied: 
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+
+    use bytes::Bytes;
 
     use super::*;
     use crate::flight_recorder::FLIGHT_SHIP_QUEUE;
@@ -1866,18 +2064,22 @@ mod tests {
         }
     }
 
-    /// A flight shipment for the connection-loop tests, paired with the ack
-    /// receiver its `sent` half resolves. The stand-in coordinator reads the
-    /// `FlightRecording` frame the loop ships for it.
+    /// A flight shipment for the connection-loop tests, paired with the ack receiver
+    /// its `sent` half resolves once the recording is stored. The stand-in coordinator
+    /// reads the `FlightUploadRequest` frame the loop sends for it.
     fn flight_shipment() -> (FlightShipment, oneshot::Receiver<()>) {
+        flight_shipment_with_payload(Bytes::from_static(b"compressed-bytes"))
+    }
+
+    /// A flight shipment carrying `payload` (the compressed recording bytes), paired
+    /// with the ack receiver its `sent` half resolves once stored.
+    fn flight_shipment_with_payload(payload: Bytes) -> (FlightShipment, oneshot::Receiver<()>) {
         let (sent, ack) = oneshot::channel();
         let shipment = FlightShipment {
-            notice: FlightRecordingNotice {
-                tenant: TenantId(TENANT.to_owned()),
-                session: SessionId(7),
-                desynced: false,
-                payload: r#"{"version":1}"#.to_owned(),
-            },
+            tenant: TenantId(TENANT.to_owned()),
+            session: SessionId(7),
+            desynced: false,
+            payload,
             sent,
         };
         (shipment, ack)
@@ -2744,31 +2946,77 @@ mod tests {
         );
     }
 
-    // --- Flight recording shipments ---
+    // --- Flight recording uploads ---
 
-    #[tokio::test]
-    async fn a_flight_shipment_is_delivered_after_enroll_as_a_tagged_frame() {
+    /// A minimal in-process object store: an HTTP server that records every request's
+    /// method and exact body and answers 200, standing in for the presigned-URL target
+    /// a relay PUTs a recording to. Returns its base URL and the receive end of the
+    /// recorded requests.
+    async fn spawn_object_store() -> (String, mpsc::UnboundedReceiver<(String, Vec<u8>)>) {
         use tokio::net::TcpListener;
-
+        let (put_tx, put_rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, body: axum::body::Bytes| {
+                let put_tx = put_tx.clone();
+                async move {
+                    let _ = put_tx.send((method.to_string(), body.to_vec()));
+                    axum::http::StatusCode::OK
+                }
+            },
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/desync/sb-test/7/1.json.zst"), put_rx)
+    }
 
-        // Stand-in coordinator: complete the enroll handshake, then read the flight
-        // frame the relay ships once it is enrolled.
+    #[tokio::test]
+    async fn a_flight_recording_uploads_to_the_store_then_reports_done() {
+        use tokio::net::TcpListener;
+
+        // The object store the relay PUTs the compressed recording to.
+        let (store_url, mut store_puts) = spawn_object_store().await;
+
+        // The stand-in coordinator: enroll, read the upload request, grant the store
+        // URL, then read the Done the relay sends after a successful PUT.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let hello = accept_enroll(&mut ws).await;
-            let Message::Text(hello) = hello else {
-                panic!("first frame is the Hello");
+            let _hello = accept_enroll(&mut ws).await;
+
+            let request = ws.next().await.unwrap().unwrap();
+            let Message::Text(text) = request else {
+                panic!("a text frame");
             };
-            assert!(hello.contains("\"type\":\"hello\""));
-            let frame = ws.next().await.unwrap().unwrap();
-            let _ = frame_tx.send(frame);
+            let RelayToCoordinator::FlightUploadRequest {
+                request,
+                session,
+                bytes,
+                ..
+            } = serde_json::from_str(&text).unwrap()
+            else {
+                panic!("the frame is an upload request");
+            };
+            assert_eq!(session, SessionId(7));
+            // The request carries the exact compressed byte count, not the blob.
+            assert_eq!(bytes, "compressed-bytes".len() as u64);
+
+            let grant = serde_json::to_string(&CoordinatorToRelay::FlightUploadGrant {
+                request,
+                url: store_url,
+            })
+            .unwrap();
+            ws.send(Message::Text(grant.into())).await.unwrap();
+
+            let done = ws.next().await.unwrap().unwrap();
+            let _ = done_tx.send(done);
         });
 
-        // Queue a shipment before the subscriber starts: it ships right after enroll.
         let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
         let (shipment, ack) = flight_shipment();
         flight_tx.try_send(shipment).unwrap();
@@ -2793,24 +3041,127 @@ mod tests {
             backoff(Duration::from_millis(20), Duration::from_secs(60)),
         ));
 
-        let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+        // The store received a PUT of exactly the compressed bytes.
+        let (method, body) = tokio::time::timeout(Duration::from_secs(5), store_puts.recv())
             .await
-            .expect("the flight frame is delivered")
-            .unwrap();
-        let Message::Text(text) = received else {
-            panic!("a text frame");
-        };
-        let RelayToCoordinator::FlightRecording(notice) = serde_json::from_str(&text).unwrap()
-        else {
-            panic!("the frame is a flight recording");
-        };
-        assert_eq!(notice.session, SessionId(7));
-        assert_eq!(notice.payload, r#"{"version":1}"#);
-        // The ack fires once the frame is on the socket, unblocking the sink's await.
+            .expect("the store received the upload")
+            .expect("a PUT arrived");
+        assert_eq!(method, "PUT", "the recording is uploaded with PUT");
+        assert_eq!(
+            body, b"compressed-bytes",
+            "the exact compressed bytes are stored"
+        );
+
+        // The ack resolves only after the object is stored (delivery means stored).
         tokio::time::timeout(Duration::from_secs(5), ack)
             .await
-            .expect("the ack resolves after the send")
+            .expect("the ack resolves after storage")
             .unwrap();
+
+        // The relay reports Done, and only after the successful PUT.
+        let done = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("a done frame is sent")
+            .unwrap();
+        let Message::Text(text) = done else {
+            panic!("a text frame");
+        };
+        assert!(
+            matches!(
+                serde_json::from_str::<RelayToCoordinator>(&text).unwrap(),
+                RelayToCoordinator::FlightUploadDone { .. },
+            ),
+            "the relay reports the upload done",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_drops_the_recording_and_unparks_the_next() {
+        use tokio::net::TcpListener;
+
+        // The stand-in coordinator refuses the first request, then grants nothing more
+        // — it just reads the second request to prove the slot unparked.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+
+            let first = ws.next().await.unwrap().unwrap();
+            let Message::Text(text) = first else {
+                panic!("a text frame");
+            };
+            let RelayToCoordinator::FlightUploadRequest { request, .. } =
+                serde_json::from_str(&text).unwrap()
+            else {
+                panic!("the frame is an upload request");
+            };
+            let refused =
+                serde_json::to_string(&CoordinatorToRelay::FlightUploadRefused { request })
+                    .unwrap();
+            ws.send(Message::Text(refused.into())).await.unwrap();
+
+            // The second shipment's request must arrive: the refusal unparked the slot.
+            let second = ws.next().await.unwrap().unwrap();
+            let _ = second_tx.send(second);
+        });
+
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (first_shipment, first_ack) = flight_shipment();
+        let (second_shipment, _second_ack) =
+            flight_shipment_with_payload(Bytes::from_static(b"second-blob"));
+        flight_tx.try_send(first_shipment).unwrap();
+        flight_tx.try_send(second_shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlQueueDepths::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        // The refused recording's ack resolves as not-stored (the sender is dropped).
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), first_ack)
+                .await
+                .expect("the ack resolves promptly")
+                .is_err(),
+            "a refused upload reports the recording lost, not stored",
+        );
+
+        // The next shipment's request goes out — the slot unparked after the refusal.
+        let second = tokio::time::timeout(Duration::from_secs(5), second_rx)
+            .await
+            .expect("the second request arrives")
+            .unwrap();
+        let Message::Text(text) = second else {
+            panic!("a text frame");
+        };
+        let RelayToCoordinator::FlightUploadRequest { bytes, .. } =
+            serde_json::from_str(&text).unwrap()
+        else {
+            panic!("the frame is an upload request");
+        };
+        assert_eq!(
+            bytes,
+            "second-blob".len() as u64,
+            "the second shipment's request goes out after the first is dropped",
+        );
     }
 
     #[tokio::test]
@@ -2864,25 +3215,27 @@ mod tests {
 
         let received = tokio::time::timeout(Duration::from_secs(5), frame_rx)
             .await
-            .expect("the queued shipment is delivered after the reconnect")
+            .expect("the queued shipment re-requests after the reconnect")
             .unwrap();
         let Message::Text(text) = received else {
             panic!("a text frame");
         };
+        // The shipment parked when the first connection died re-requests an upload URL
+        // on the next connection — its small request, not the blob.
         assert!(matches!(
             serde_json::from_str::<RelayToCoordinator>(&text).unwrap(),
-            RelayToCoordinator::FlightRecording(_),
+            RelayToCoordinator::FlightUploadRequest { .. },
         ));
     }
 
     #[tokio::test]
-    async fn the_enroll_proof_precedes_a_pending_flight_shipment() {
+    async fn the_enroll_proof_precedes_a_pending_flight_request() {
         use tokio::net::TcpListener;
 
-        // A relay that reconnects with a queued flight shipment must send its
-        // IdentityProof first: a blob frame ahead of the proof would be read as the
-        // proof and refused. Assert the proof is the first frame after the
-        // challenge, with the shipment strictly behind it.
+        // A relay that reconnects with a parked flight shipment must send its
+        // IdentityProof first: an upload-request frame ahead of the proof would be read
+        // as the proof and refused. Assert the proof is the first frame after the
+        // challenge, with the request strictly behind it.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
@@ -2940,11 +3293,14 @@ mod tests {
         };
         assert!(
             matches!(decode(first), RelayToCoordinator::IdentityProof { .. }),
-            "the identity proof precedes the flight shipment",
+            "the identity proof precedes the flight upload request",
         );
         assert!(
-            matches!(decode(second), RelayToCoordinator::FlightRecording(_)),
-            "the flight shipment goes out only after the proof",
+            matches!(
+                decode(second),
+                RelayToCoordinator::FlightUploadRequest { .. }
+            ),
+            "the flight upload request goes out only after the proof",
         );
     }
 
@@ -3011,27 +3367,9 @@ mod tests {
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, RelayToCoordinator::FlightRecording(_))),
+                .any(|f| matches!(f, RelayToCoordinator::FlightUploadRequest { .. })),
             "the flight pipe delivered",
         );
-    }
-
-    /// A flight shipment carrying a caller-sized payload, for the split's
-    /// concurrency tests: a payload larger than the socket buffers makes the write
-    /// half's send block against a coordinator that stops reading, so the read
-    /// half's independence and the pending-slot survival can be observed.
-    fn flight_shipment_with_payload(payload: String) -> (FlightShipment, oneshot::Receiver<()>) {
-        let (sent, ack) = oneshot::channel();
-        let shipment = FlightShipment {
-            notice: FlightRecordingNotice {
-                tenant: TenantId(TENANT.to_owned()),
-                session: SessionId(7),
-                desynced: false,
-                payload,
-            },
-            sent,
-        };
-        (shipment, ack)
     }
 
     /// A sink whose sends never complete: `poll_ready`/`poll_flush` stay Pending
@@ -3081,10 +3419,11 @@ mod tests {
             .send(RelayNotice::Departure(dropped_notice()))
             .unwrap();
         let (_flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-        // Live senders so the drain and challenge arms stay pending (not disabled),
-        // leaving the notices arm the one that fires.
+        // Live senders so the drain, challenge, and flight-grant arms stay pending (not
+        // disabled), leaving the notices arm the one that fires.
         let (_drain_tx, mut drain_rx) = watch::channel(false);
         let (_challenge_tx, challenge_rx) = mpsc::unbounded_channel::<[u8; 32]>();
+        let (_flight_grant_tx, flight_grant_rx) = mpsc::unbounded_channel::<FlightGrant>();
 
         let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new());
         let heartbeat = heartbeat(Duration::from_secs(3600));
@@ -3099,7 +3438,10 @@ mod tests {
             &heartbeat,
             &identity_key,
             RelayId(1),
-            challenge_rx,
+            WriterRoutes {
+                challenge_rx,
+                flight_grant_rx,
+            },
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(200), writer)
@@ -3123,7 +3465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_queued_flight_blob_does_not_delay_a_queued_notice() {
+    async fn a_queued_flight_upload_does_not_delay_a_queued_notice() {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -3131,9 +3473,9 @@ mod tests {
         let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
 
         // Stand-in coordinator: enroll, then read the first two frames. With both a
-        // notice and a large flight blob queued, the write half's priority order
-        // must put the notice first — if the flight arm outranked it, the
-        // coordinator would read the blob ahead of the notice.
+        // notice and a flight shipment queued, the write half's priority order must put
+        // the notice first — if the flight arm outranked it, the coordinator would read
+        // the upload request ahead of the notice.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -3143,13 +3485,13 @@ mod tests {
             let _ = frames_tx.send((first, second));
         });
 
-        // Queue the notice AND a large flight blob before the subscriber starts.
+        // Queue the notice AND a flight shipment before the subscriber starts.
         let (notices_tx, notices_rx) = mpsc::unbounded_channel();
         notices_tx
             .send(RelayNotice::Departure(dropped_notice()))
             .unwrap();
         let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-        let (shipment, _ack) = flight_shipment_with_payload("x".repeat(256 * 1024));
+        let (shipment, _ack) = flight_shipment();
         flight_tx.try_send(shipment).unwrap();
 
         let control = MeshControl::new(
@@ -3181,46 +3523,45 @@ mod tests {
         assert_eq!(
             decode(first),
             RelayToCoordinator::Departure(dropped_notice()),
-            "the notice ships before the queued flight blob",
+            "the notice ships before the queued flight upload request",
         );
         assert!(
-            matches!(decode(second), RelayToCoordinator::FlightRecording(_)),
-            "the flight blob ships after the notice",
+            matches!(
+                decode(second),
+                RelayToCoordinator::FlightUploadRequest { .. }
+            ),
+            "the flight upload request ships after the notice",
         );
     }
 
     #[tokio::test]
-    async fn the_read_half_applies_a_descriptor_while_a_large_flight_blob_is_in_flight() {
+    async fn the_read_half_applies_a_descriptor_while_an_upload_awaits_its_grant() {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Stand-in coordinator: enroll, push a descriptor set, then STOP reading.
-        // The relay has a large flight blob queued, so its write half blocks sending
-        // the blob once our receive buffer fills — but its read half must still
-        // apply the descriptor. If reads were coupled to writes, the descriptor
-        // would never land (we never drain the blob) and the applied set stays empty.
+        // Stand-in coordinator: enroll, read the flight upload request but grant
+        // nothing, then push a descriptor set and hold the connection open. The relay's
+        // write half is parked awaiting the grant, so its read half must still apply
+        // the descriptor — if reads were coupled to the writer's flight work, the
+        // descriptor would never land and the applied set would stay empty.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _hello = accept_enroll(&mut ws).await;
+            // Read (and never answer) the upload request.
+            let _request = ws.next().await.unwrap().unwrap();
             let descriptors = serde_json::to_string(&CoordinatorToRelay::Descriptors {
                 descriptors: vec![descriptor(1, &[])],
             })
             .unwrap();
             ws.send(Message::Text(descriptors.into())).await.unwrap();
-            // Never read the queued blob; hold the connection open.
             std::future::pending::<()>().await;
         });
 
-        // A large flight blob queued (under the 16 MiB WebSocket frame limit but
-        // well past the socket send buffer): against a coordinator that stops
-        // reading, its send parks the write half mid-frame. A single read+write
-        // select would then be stuck in that send and never process the descriptor;
-        // the split's independent read half applies it regardless.
         let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-        let (shipment, _ack) = flight_shipment_with_payload("x".repeat(13 * 1024 * 1024));
+        let (shipment, _ack) = flight_shipment();
         flight_tx.try_send(shipment).unwrap();
 
         // The shared applied set the read half reconciles is the observable.
@@ -3253,7 +3594,7 @@ mod tests {
         ));
 
         // The read half applies the pushed descriptor even though the write half is
-        // blocked sending the large blob to a coordinator that stopped reading.
+        // still waiting for the upload grant.
         let landed = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if applied.snapshot().contains(&key(1)) {
@@ -3265,7 +3606,7 @@ mod tests {
         .await;
         assert!(
             landed.is_ok(),
-            "the read half applied the descriptor while a blob was in flight",
+            "the read half applied the descriptor while an upload awaited its grant",
         );
     }
 }

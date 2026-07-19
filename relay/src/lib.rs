@@ -83,6 +83,7 @@ pub mod coordinator_client;
 pub mod delivery;
 pub mod drop_hold;
 pub mod flight_recorder;
+pub mod flight_upload;
 pub mod lobby;
 pub mod mesh;
 pub mod mesh_control;

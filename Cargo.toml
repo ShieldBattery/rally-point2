@@ -73,6 +73,14 @@ ring = "0.17"
 # --- Serialization ---
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Compresses each flight recording before the relay uploads it to durable storage,
+# so a recording rides the network (and the store) as a compact zstd-of-JSON blob
+# rather than verbose JSON text. Relay-only (the coordinator never sees the bytes —
+# it only mints the upload URL). Uses the default compression level: a recording is
+# structured, repetitive JSON that compresses heavily even at the default, and the
+# flush path is rare (session close / drain), so trading a higher level's marginal
+# ratio for its CPU is not worth it.
+zstd = "0.13"
 # Protobuf runtime for the generated wire messages (proto crate).
 prost = "0.14"
 

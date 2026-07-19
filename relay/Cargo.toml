@@ -41,13 +41,18 @@ serde_json = { workspace = true }
 # Serialize/Deserialize derives for the flight recorder's blob envelope.
 serde = { workspace = true }
 # The task-stats reporter's client for the ECS Task Metadata endpoint
-# (link-local, plain HTTP — no TLS, so no hyper-rustls needed here). Same
-# hyper + hyper-util stack the coordinator's webhook client and the loadgen's
-# create client already build on.
+# (link-local, plain HTTP). Same hyper + hyper-util stack the coordinator's webhook
+# client and the loadgen's create client already build on. hyper-rustls adds the
+# HTTPS the flight-recording upload client needs to PUT a compressed recording to
+# the coordinator's presigned object-store URL (https:// in prod, http:// in a
+# loopback test); ring provider, keeping the ring-only / aws-lc-rs-free pin intact.
 bytes = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
 http-body-util = { workspace = true }
+# Compresses each flushed flight recording before uploading it to the object store.
+zstd = { workspace = true }
 
 [dev-dependencies]
 # The end-to-end provisioning test stands up a ledger-backed coordinator in-process
