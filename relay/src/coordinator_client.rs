@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -56,7 +56,7 @@ use rally_point_proto::version::{
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::flight_upload::{self, PutOutcome};
@@ -104,6 +104,15 @@ pub const VERSION_REFUSED_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 /// coordinator that decodes the request as an unknown frame and silently drops it — no
 /// grant will ever come, so the timeout drops the recording and unparks the slot.
 pub const FLIGHT_GRANT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many flight recordings the control connection ships at once. Each shipment
+/// runs its own request→grant→PUT→done cycle independently, so a mass session
+/// teardown (dozens of sessions closing together) drains the bounded shipment queue
+/// several times faster than shipping strictly one at a time — which is what keeps
+/// the queue from overflowing and shedding recordings under that burst. Kept small:
+/// flight data is observability, so a handful of concurrent uploads is enough to
+/// clear a teardown burst without turning a background pipe into a bandwidth spike.
+pub const MAX_INFLIGHT_FLIGHT_UPLOADS: usize = 4;
 
 /// The reader→writer routes on one control connection: frames the read half received
 /// but the write half must send (every send is owned by the write half). A mid-stream
@@ -303,40 +312,46 @@ impl FleetMeshPeersReader {
     }
 }
 
-/// Point-in-time depths of the coordinator control connection's outbound queues,
-/// published for the task-stats reporter to log next to its resource sample.
-/// These are the load-test observables for control-plane pressure: how many
-/// notices and flight recordings are queued to go up the connection, and how many
-/// bytes the one blob currently parked for sending holds.
+/// Point-in-time observables of the coordinator control connection, published for
+/// the task-stats reporter to log next to its resource sample. These are the
+/// load-test observables for control-plane pressure and delivery lag: how many
+/// notices and flight recordings are queued or in flight up the connection and how
+/// many blob bytes those in-flight recordings hold (outbound pressure), plus how far
+/// the last descriptor set applied behind the coordinator's staging clock and how
+/// large that set was (inbound apply lag).
 ///
-/// The connection's writer refreshes them as it works the queues; the reporter
-/// reads a [`snapshot`](Self::snapshot). All zero on a relay with no coordinator
-/// connection — nothing writes them — which reads correctly as "no pressure".
-/// Relaxed atomics: each field is an independent counter a single writer stores
-/// and a single reader loads, with no cross-field invariant to protect.
+/// The connection's writer refreshes the outbound-pressure fields as it works the
+/// queues, and its reader refreshes the apply-lag fields as descriptor sets apply;
+/// the task-stats reporter reads a [`snapshot`](Self::snapshot). All zero on a relay
+/// with no coordinator connection — nothing writes them — which reads correctly as
+/// "no pressure, no lag sample". Relaxed atomics: each field is an independent
+/// value a single writer stores and a single reader loads, with no cross-field
+/// invariant to protect.
 #[derive(Clone, Default)]
-pub struct ControlQueueDepths {
-    inner: Arc<ControlQueueDepthsInner>,
+pub struct ControlConnStats {
+    inner: Arc<ControlConnStatsInner>,
 }
 
 #[derive(Default)]
-struct ControlQueueDepthsInner {
+struct ControlConnStatsInner {
     notices: AtomicUsize,
     flights: AtomicUsize,
     pending_blob_bytes: AtomicUsize,
+    descriptor_apply_lag_ms: AtomicU64,
+    descriptor_set_len: AtomicUsize,
 }
 
-impl ControlQueueDepths {
+impl ControlConnStats {
     /// Creates a fresh, all-zero handle (a relay that has not connected yet, or
     /// one that never will).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Records the current queue depths: `notices` and `flights` count everything
-    /// waiting to go up the connection (each includes the one item parked mid-send,
-    /// if any), and `pending_blob_bytes` is the serialized size of the flight blob
-    /// currently parked for sending, or zero when none is.
+    /// Records the current outbound-queue occupancy: `notices` and `flights` count
+    /// everything queued or in flight up the connection (each includes the items
+    /// parked mid-cycle), and `pending_blob_bytes` is the summed compressed size of
+    /// every flight recording currently in flight, or zero when none is.
     fn store(&self, notices: usize, flights: usize, pending_blob_bytes: usize) {
         self.inner.notices.store(notices, Ordering::Relaxed);
         self.inner.flights.store(flights, Ordering::Relaxed);
@@ -345,27 +360,56 @@ impl ControlQueueDepths {
             .store(pending_blob_bytes, Ordering::Relaxed);
     }
 
-    /// The latest recorded depths, for the task-stats reporter to log.
-    pub fn snapshot(&self) -> ControlQueueSnapshot {
-        ControlQueueSnapshot {
+    /// Records a descriptor set apply: `set_len` is the size of the set just
+    /// applied, and — when the push carried a staging stamp — the observed apply
+    /// lag is `now - staged_at`, clamped at zero so a backward cross-host clock skew
+    /// never reads as a negative lag. A push with no stamp (a coordinator predating
+    /// the field) still updates the set length but leaves the last lag sample
+    /// unchanged, so the stat holds its most recent real reading rather than
+    /// resetting.
+    fn record_descriptor_apply(&self, set_len: usize, staged_at_unix_ms: Option<u64>) {
+        self.inner
+            .descriptor_set_len
+            .store(set_len, Ordering::Relaxed);
+        if let Some(staged_at) = staged_at_unix_ms {
+            let lag = now_unix_ms().saturating_sub(staged_at);
+            self.inner
+                .descriptor_apply_lag_ms
+                .store(lag, Ordering::Relaxed);
+        }
+    }
+
+    /// The latest recorded observables, for the task-stats reporter to log.
+    pub fn snapshot(&self) -> ControlConnStatsSnapshot {
+        ControlConnStatsSnapshot {
             notices: self.inner.notices.load(Ordering::Relaxed),
             flights: self.inner.flights.load(Ordering::Relaxed),
             pending_blob_bytes: self.inner.pending_blob_bytes.load(Ordering::Relaxed),
+            descriptor_apply_lag_ms: self.inner.descriptor_apply_lag_ms.load(Ordering::Relaxed),
+            descriptor_set_len: self.inner.descriptor_set_len.load(Ordering::Relaxed),
         }
     }
 }
 
-/// A snapshot of the coordinator control connection's outbound queue depths (see
-/// [`ControlQueueDepths`]).
+/// A snapshot of the coordinator control connection's observables (see
+/// [`ControlConnStats`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ControlQueueSnapshot {
-    /// Notices queued to go up the connection, including one parked mid-send.
+pub struct ControlConnStatsSnapshot {
+    /// Notices queued or in flight up the connection, including one parked mid-send.
     pub notices: usize,
-    /// Flight recordings queued to go up the connection, including one parked
-    /// mid-send.
+    /// Flight recordings queued or in flight up the connection, including those
+    /// mid-upload.
     pub flights: usize,
-    /// Serialized bytes of the flight blob currently parked for sending, or zero.
+    /// Summed compressed bytes of the flight recordings currently in flight, or zero.
     pub pending_blob_bytes: usize,
+    /// The last observed descriptor apply lag, in milliseconds: the wall-clock gap
+    /// between the coordinator staging a descriptor set and the relay applying it,
+    /// clamped at zero for a backward clock skew. Coarse cross-host measurement,
+    /// meaningful at seconds scale. Holds its last real reading across pushes that
+    /// carry no stamp; zero until the first stamped set applies.
+    pub descriptor_apply_lag_ms: u64,
+    /// The size of the last applied descriptor set.
+    pub descriptor_set_len: usize,
 }
 
 /// How the relay reaches and enrolls with the coordinator: where it dials, the
@@ -421,51 +465,93 @@ pub struct ControlApplyTargets {
     pub drain_acked: watch::Sender<bool>,
 }
 
-/// The relay's outbound work queues and the depth handle that reports their
-/// occupancy. Each pipe is a channel plus the one in-flight slot holding the item
-/// pulled from it but not yet confirmed sent.
+/// One flight recording in flight on the control connection: the parked shipment
+/// plus where it is in its request→grant→upload→done cycle. The connection ships up
+/// to [`MAX_INFLIGHT_FLIGHT_UPLOADS`] of these at once, each cycling independently.
+///
+/// **The shipment is the durable part.** It lives in the caller-owned
+/// [`OutboundQueues::pending_flights`] from the moment it is pulled until it is
+/// stored (its `sent` ack fires) or dropped (refused/failed/timeout), so a
+/// connection death leaves it parked for the next connection to re-request.
+/// `request` and `stage` are current-connection scratch: request ids are minted per
+/// connection, so the next connection re-arms every parked shipment with a fresh id
+/// (a stale grant from the dead connection can never match) at its flight-flush
+/// entry.
+struct PendingFlight {
+    /// The parked shipment: its compressed bytes, and the `sent` ack fired only once
+    /// the recording is stored.
+    shipment: FlightShipment,
+    /// The correlation id of the upload request outstanding for this shipment on the
+    /// CURRENT connection. Re-minted on every (re)request.
+    request: u64,
+    /// Where this shipment is in its upload cycle on the current connection.
+    stage: FlightStage,
+}
+
+/// Where a [`PendingFlight`] is in its request→grant→upload→done cycle on the
+/// current connection.
+enum FlightStage {
+    /// The upload request is sent; waiting for the coordinator's grant or refusal
+    /// until `deadline`, after which the recording is dropped (flight data is never
+    /// backpressure).
+    AwaitingGrant { deadline: Instant },
+    /// The grant arrived and a detached PUT is uploading the compressed bytes; the
+    /// PUT reports its outcome over the connection's shared completion channel.
+    Uploading,
+}
+
+/// The relay's outbound work queues and the stats handle that reports their
+/// occupancy. The notice pipe is a channel plus the one in-flight slot holding the
+/// notice pulled but not yet confirmed sent; the flight pipe is a channel plus a
+/// small in-flight table of the recordings currently cycling their uploads.
 ///
 /// **Caller-owned across reconnects.** The subscriber owns this and lends `&mut`
-/// per connection: an item parked in a slot when a connection dies stays parked and
-/// rides the next connection's flush rather than being lost. The write half sets a
-/// slot *before* the send await and clears it only *after* the send returns, with
-/// no await between — so a dropped or errored send leaves the undelivered item
-/// parked, while a completed send's item is already cleared and never re-sent.
+/// per connection: an item parked when a connection dies stays parked and rides the
+/// next connection's flush rather than being lost. For a notice, the write half sets
+/// `pending` *before* the send await and clears it only *after* the send returns,
+/// with no await between — so a dropped or errored send leaves it parked, while a
+/// completed send's notice is already cleared and never re-sent. For a flight
+/// recording, its shipment is pushed onto `pending_flights` before its request is
+/// sent and removed only when it is stored (ack fired) or dropped, so a connection
+/// death leaves every undelivered shipment findable; the next connection re-requests
+/// each with a fresh id.
 pub struct OutboundQueues {
     /// The unbounded notice pipe: departure/desync/result/session-closed notices to
     /// forward up the connection. Drained strictly FIFO through `pending`, which is
     /// what keeps `SessionClosed`'s "no earlier notice for the session still in
     /// flight" guarantee.
-    pub notices: UnboundedReceiver<RelayNotice>,
+    notices: UnboundedReceiver<RelayNotice>,
     /// The one notice pulled but not yet confirmed sent.
-    pub pending: Option<RelayNotice>,
+    pending: Option<RelayNotice>,
     /// The bounded flight pipe: flushed recordings to ship up the connection.
     /// Deliberately separate from `notices` so a blob frame never delays a notice;
     /// bounded so a wedged connection drops recordings rather than growing unbounded.
-    pub flight: Receiver<FlightShipment>,
-    /// The one flight shipment pulled but not yet confirmed sent; its `sent` ack
-    /// fires only once the frame is on the socket, so the sink's await bounds real
-    /// delivery.
-    pub pending_flight: Option<FlightShipment>,
-    /// Publishes the two queue depths (and the parked blob's byte count) for the
-    /// task-stats reporter.
-    pub depths: ControlQueueDepths,
+    flight: Receiver<FlightShipment>,
+    /// The recordings currently in flight, up to [`MAX_INFLIGHT_FLIGHT_UPLOADS`] at
+    /// once. Each entry's shipment is durable across a reconnect (its per-connection
+    /// request id and stage are re-armed on the next connection); an entry is removed
+    /// only once its recording is stored (ack fired) or dropped. Order carries no
+    /// meaning — recordings are independent — so entries are removed by swap.
+    pending_flights: Vec<PendingFlight>,
+    /// Publishes the outbound-queue occupancy (and, from the reader, the descriptor
+    /// apply lag) for the task-stats reporter.
+    stats: ControlConnStats,
 }
 
 impl OutboundQueues {
-    /// Builds the queues over the given channels and depth reporter, with both
-    /// in-flight slots empty.
+    /// Builds the queues over the given channels and stats reporter, with the notice
+    /// slot empty and no recording in flight.
     pub fn new(
         notices: UnboundedReceiver<RelayNotice>,
         flight: Receiver<FlightShipment>,
-        depths: ControlQueueDepths,
+        stats: ControlConnStats,
     ) -> Self {
         Self {
             notices,
             pending: None,
             flight,
-            pending_flight: None,
-            depths,
+            pending_flights: Vec::new(),
+            stats,
         }
     }
 }
@@ -680,8 +766,8 @@ pub async fn run_descriptor_subscriber_with(
 /// goes up. The two halves cooperate on one task — dropping either when the other
 /// ends closes the connection with no task to leak — and every send is owned by the
 /// write half, keeping the notice pipe strictly ordered and the caller-owned
-/// `pending`/`pending_flight` slots the single source of undelivered state across a
-/// reconnect.
+/// `pending` slot and `pending_flights` table the single source of undelivered
+/// state across a reconnect.
 ///
 /// A heartbeat send that fails ends the connection so the caller redials: on a
 /// half-open socket (a silently dead coordinator) the periodic send is what
@@ -784,16 +870,22 @@ async fn connect_and_stream(
         send_draining(&mut socket).await?;
     }
 
-    // A shipment held over from a prior connection is NOT flushed here: its bytes never
-    // ride the socket. It stays parked in `pending_flight`, and the write half re-sends
-    // its small `FlightUploadRequest` at its own entry (below), so a shipment orphaned
-    // by a dead connection simply re-requests an upload URL on the next one.
+    // Shipments held over from a prior connection are NOT flushed here: their bytes
+    // never ride the socket. They stay parked in `pending_flights`, and the write half
+    // re-sends each one's small `FlightUploadRequest` at its own entry (below), so a
+    // shipment orphaned by a dead connection simply re-requests an upload URL on the
+    // next one.
 
     // Split the enrolled socket into a read half and a write half, driven
     // concurrently. The write half owns every send, so a stalled send never stalls the
     // read half — coordinator pushes keep applying while the writer works its queues
-    // and drives an upload's request/grant/done handshake.
+    // and drives its uploads' request/grant/done handshakes.
     let (sink, stream) = socket.split();
+
+    // The reader records the descriptor apply lag into the same stats handle the
+    // writer refreshes the queue depths on; a clone points at the shared atomics, so
+    // the reader can write it without contending with the writer's `&mut outbound`.
+    let read_stats = outbound.stats.clone();
 
     // A mid-stream identity challenge's answer is a *send*, and only the write
     // half may send, so the read half routes the nonce here for the writer to
@@ -812,7 +904,7 @@ async fn connect_and_stream(
     // by the writer through `&mut` — carry whatever stayed undelivered straight back
     // to the caller no matter which half ended the connection.
     tokio::select! {
-        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx) => result,
+        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx, read_stats) => result,
         result = write_control_frames(
             sink,
             outbound,
@@ -830,11 +922,11 @@ async fn connect_and_stream(
 
 /// The read half of an enrolled control connection: receives coordinator frames
 /// one at a time and applies each synchronously, in arrival order. A descriptor
-/// push reconciles the Join source and the applied set; `MeshPeers`/`TenantKeys`/
-/// `RegionBeacons` replace their stores; a `DrainAck` flips the drain-acked
-/// signal. Because frames apply strictly in arrival order, a descriptor push the
-/// coordinator sends just before a `DrainAck` has already updated the applied set
-/// by the time the ack fires.
+/// push reconciles the Join source and the applied set (and records its apply lag
+/// and set size into `stats`); `MeshPeers`/`TenantKeys`/`RegionBeacons` replace
+/// their stores; a `DrainAck` flips the drain-acked signal. Because frames apply
+/// strictly in arrival order, a descriptor push the coordinator sends just before a
+/// `DrainAck` has already updated the applied set by the time the ack fires.
 ///
 /// A mid-stream `IdentityChallenge`'s answer is a send, so it is routed to the
 /// write half through `challenge_tx` rather than answered here. A `Close` (or the
@@ -847,6 +939,7 @@ async fn read_control_frames(
     relay_id: RelayId,
     challenge_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     flight_grant_tx: UnboundedSender<FlightGrant>,
+    stats: ControlConnStats,
 ) -> Result<ControlDisconnect, ControlError> {
     loop {
         // The stream ended (no close frame): let the caller redial.
@@ -905,7 +998,12 @@ async fn read_control_frames(
                         // write half drops the parked recording and unparks the slot.
                         let _ = flight_grant_tx.send(FlightGrant::Refused { request });
                     }
-                    other => apply_message(&apply_targets.control, other, &apply_targets.applied),
+                    other => apply_message(
+                        &apply_targets.control,
+                        other,
+                        &apply_targets.applied,
+                        &stats,
+                    ),
                 }
             }
             Message::Close(frame) => {
@@ -924,28 +1022,35 @@ async fn read_control_frames(
 /// The write half of an enrolled control connection: owns every send and drives a
 /// `biased` priority order so bulk can never delay control. Highest first: a drain
 /// re-assert, then queued notices, then a routed identity-proof answer, then the
-/// flight-upload handshake arms, then the periodic heartbeat, and last a fresh flight
-/// shipment — so a close-bearing notice always outruns flight work, and the small
-/// upload request never rides ahead of a webhook-bearing notice.
+/// flight-upload arms (a routed grant/refusal, a completed upload, an expired grant
+/// wait), then the periodic heartbeat, and last a fresh flight shipment — so a
+/// close-bearing notice always outruns flight work, and a small upload request never
+/// rides ahead of a webhook-bearing notice.
 ///
-/// **The flight recording's bytes never ride this connection.** When a shipment is
-/// parked, this half sends a small [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
-/// waits for the read half to route back the coordinator's grant or refusal, and on a
-/// grant spawns a detached PUT of the compressed bytes straight to the object store
-/// (see [`crate::flight_upload`]). Only after the PUT stores the object does it fire
-/// the shipment's `sent` ack (delivery means *stored*) and send a
+/// **Flight recordings' bytes never ride this connection, and up to
+/// [`MAX_INFLIGHT_FLIGHT_UPLOADS`] ship concurrently.** Each parked shipment gets a
+/// small [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest) carrying its
+/// own per-connection correlation id; the read half routes back the coordinator's
+/// grant or refusal for that id, and on a grant this half spawns a detached PUT of the
+/// compressed bytes straight to the object store (see [`crate::flight_upload`]), which
+/// reports its outcome over one shared per-connection completion channel. Only after a
+/// PUT stores the object does this half fire that shipment's `sent` ack (delivery
+/// means *stored*) and send a
 /// [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone). A refusal, an upload
 /// failure, or no grant within [`FLIGHT_GRANT_TIMEOUT`] (which also covers an older
-/// coordinator that drops the request as unknown) drops the recording with a log and
-/// unparks the slot — flight data is observability, never backpressure.
+/// coordinator that drops the request as unknown) drops that one recording with a log
+/// — flight data is observability, never backpressure. Because each shipment carries
+/// its own id and cycle stage, several can be awaiting grants or uploading at once
+/// without interfering.
 ///
-/// The caller-owned `outbound` slots (`pending`, `pending_flight`) are this half's
+/// The caller-owned `outbound` state (`pending`, `pending_flights`) is this half's
 /// only durable state across a reconnect. A notice is parked *before* its send await
-/// and cleared only *after* it returns; a shipment is parked *before* its request send
-/// and cleared only on ack (stored) or drop (lost) — so if this future is dropped (the
-/// read half ended the connection) or a send errors mid-frame, an undelivered item
-/// stays in its slot and the next connection re-delivers it (a shipment re-*requests*
-/// an upload URL), while a delivered/stored item is already cleared and never re-run.
+/// and cleared only *after* it returns; a shipment is pushed onto `pending_flights`
+/// *before* its request send and removed only on ack (stored) or drop (lost) — so if
+/// this future is dropped (the read half ended the connection) or a send errors
+/// mid-frame, every undelivered item stays parked and the next connection re-delivers
+/// it (a shipment re-*requests* an upload URL with a fresh id), while a
+/// delivered/stored item is already cleared and never re-run.
 async fn write_control_frames(
     mut sink: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     outbound: &mut OutboundQueues,
@@ -960,14 +1065,14 @@ async fn write_control_frames(
         mut flight_grant_rx,
     } = routes;
     // Split the caller-owned queues into their fields. The park/clear discipline
-    // below mutates these in place, so whatever stays parked in a slot here is
-    // exactly what the caller's `outbound` holds when this future ends.
+    // below mutates these in place, so whatever stays parked here is exactly what the
+    // caller's `outbound` holds when this future ends.
     let OutboundQueues {
         notices,
         pending,
         flight,
-        pending_flight,
-        depths,
+        pending_flights,
+        stats,
     } = outbound;
 
     // The Hello already proved liveness at t=0, so skip the immediate first tick
@@ -993,41 +1098,56 @@ async fn write_control_frames(
     // The read half likewise holds the flight-grant sender for the connection's life.
     let mut flight_grant_open = true;
 
-    // The flight upload's per-connection state. `flight_request` is the correlation id
-    // of the request outstanding for the currently-parked shipment on THIS connection
-    // (a fresh id each connection, so a stale grant from a prior one never matches);
-    // `flight_deadline` bounds the wait for its grant; `put_result` is present while a
-    // granted upload's detached PUT runs. A shipment parked from a prior connection is
-    // re-requested at loop entry below.
+    // The flight uploads' per-connection state. `next_request` mints a fresh
+    // correlation id per request on THIS connection, so a stale grant from a prior one
+    // can never match a live request; every granted PUT reports its outcome over
+    // `put_done`, one shared completion channel this half owns so waiting on many
+    // uploads at once is a single select arm rather than a fan of per-upload futures.
+    // This half holds `put_done_tx` for the connection's whole life, so `put_done_rx`
+    // yields a real completion or pends — never `None` — and its arm needs no guard.
     let mut next_request: u64 = 0;
-    let mut flight_request: Option<u64> = None;
-    let mut flight_deadline = Instant::now();
-    let mut put_result: Option<oneshot::Receiver<PutOutcome>> = None;
+    let (put_done_tx, mut put_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<flight_upload::FlightPutDone>();
 
-    if pending_flight.is_some() {
+    // Re-request every shipment parked from a prior connection: mint a fresh id and
+    // grant deadline for each and re-send its small upload request. This re-arms the
+    // per-connection scratch (`request`/`stage`) a reconnect invalidated, so a grant
+    // meant for the dead connection can never be mistaken for one of these.
+    for flight in pending_flights.iter_mut() {
         next_request += 1;
-        flight_request = Some(next_request);
-        flight_deadline = Instant::now() + FLIGHT_GRANT_TIMEOUT;
-        send_flight_request(
-            &mut sink,
-            next_request,
-            pending_flight.as_ref().expect("just checked"),
-        )
-        .await?;
+        flight.request = next_request;
+        flight.stage = FlightStage::AwaitingGrant {
+            deadline: Instant::now() + FLIGHT_GRANT_TIMEOUT,
+        };
+        // A send error ends the connection (via `?`) with the shipment still parked,
+        // so the next connection re-requests it.
+        send_flight_request(&mut sink, flight.request, &flight.shipment).await?;
     }
 
     loop {
-        // Publish the current queue depths for the task-stats reporter. Each count
-        // includes the one item parked mid-send, so a shipment awaiting its upload is
-        // visible for its whole lifetime rather than only between sends; the blob-bytes
-        // figure now reports the parked shipment's compressed size.
-        depths.store(
+        // Publish the current queue occupancy for the task-stats reporter. Each count
+        // includes items parked mid-cycle, so a shipment is visible for its whole
+        // upload lifetime rather than only between sends; the blob-bytes figure sums
+        // every in-flight recording's compressed size.
+        stats.store(
             notices.len() + usize::from(pending.is_some()),
-            flight.len() + usize::from(pending_flight.is_some()),
-            pending_flight
-                .as_ref()
-                .map_or(0, |shipment| shipment.payload.len()),
+            flight.len() + pending_flights.len(),
+            pending_flights
+                .iter()
+                .map(|f| f.shipment.payload.len())
+                .sum(),
         );
+
+        // The nearest grant-wait deadline across shipments still awaiting a grant, if
+        // any — the sleep the timeout arm races. An uploading shipment has no such
+        // deadline (its detached PUT owns its own retry budget), so it does not figure.
+        let earliest_grant_deadline = pending_flights
+            .iter()
+            .filter_map(|f| match f.stage {
+                FlightStage::AwaitingGrant { deadline } => Some(deadline),
+                FlightStage::Uploading => None,
+            })
+            .min();
 
         tokio::select! {
             biased;
@@ -1078,70 +1198,93 @@ async fn write_control_frames(
                 }
             }
 
-            // A grant or refusal the read half routed here for the outstanding upload
-            // request. Above the heartbeat so it gates the flight pipe promptly, but
+            // A grant or refusal the read half routed here, matched to its shipment by
+            // request id. Above the heartbeat so it gates the flight pipe promptly, but
             // below notices so it never delays a webhook-bearing frame.
             grant = flight_grant_rx.recv(), if flight_grant_open => {
                 match grant {
                     None => flight_grant_open = false,
-                    // A grant for the request we hold, not yet uploading: spawn the PUT
-                    // of the parked shipment's compressed bytes. The shipment stays
+                    // A grant for a shipment still awaiting one: spawn the detached PUT
+                    // of its compressed bytes and mark it uploading. The shipment stays
                     // parked (its `sent` ack fires only on a stored PUT), so a
-                    // connection death mid-upload re-requests on the next connection.
-                    Some(FlightGrant::Granted { request, url })
-                        if flight_request == Some(request) && put_result.is_none() =>
-                    {
-                        let payload = pending_flight
-                            .as_ref()
-                            .expect("an outstanding request implies a parked shipment")
-                            .payload
-                            .clone();
-                        let (result_tx, result_rx) = oneshot::channel();
-                        flight_upload::spawn_put(url, payload, relay_id, result_tx);
-                        put_result = Some(result_rx);
+                    // connection death mid-upload re-requests it on the next connection.
+                    Some(FlightGrant::Granted { request, url }) => {
+                        if let Some(flight) = pending_flights.iter_mut().find(|f| {
+                            f.request == request
+                                && matches!(f.stage, FlightStage::AwaitingGrant { .. })
+                        }) {
+                            flight_upload::spawn_put(
+                                url,
+                                flight.shipment.payload.clone(),
+                                relay_id,
+                                request,
+                                put_done_tx.clone(),
+                            );
+                            flight.stage = FlightStage::Uploading;
+                        }
+                        // else: a stale grant — its shipment already resolved, or the id
+                        // is from a prior connection — so ignore it.
                     }
-                    // A refusal for the request we hold: drop the recording and unpark.
-                    Some(FlightGrant::Refused { request })
-                        if flight_request == Some(request) && put_result.is_none() =>
-                    {
-                        drop_parked_flight(pending_flight, relay_id, "coordinator refused the upload");
-                        flight_request = None;
-                    }
-                    // A stale answer (a mismatched id, or one arriving after we already
-                    // resolved this request) — ignore it.
-                    Some(_) => {}
-                }
-            }
-
-            // The detached PUT reported its outcome. On stored, fire the ack (delivery
-            // means stored) and tell the coordinator so it runs its post-store
-            // bookkeeping; on failure, drop the recording and unpark. `Err` means the
-            // task's sender dropped (a panic) — treated as a failure.
-            outcome = async { put_result.as_mut().expect("guarded").await }, if put_result.is_some() => {
-                put_result = None;
-                let request = flight_request.take().expect("an upload implies an outstanding request");
-                match outcome.unwrap_or(PutOutcome::Failed) {
-                    PutOutcome::Stored => {
-                        let shipment = pending_flight
-                            .take()
-                            .expect("an upload implies a parked shipment");
-                        let _ = shipment.sent.send(());
-                        send_flight_done(&mut sink, request).await?;
-                    }
-                    PutOutcome::Failed => {
-                        drop_parked_flight(pending_flight, relay_id, "upload failed");
+                    // A refusal for a shipment still awaiting a grant: drop it.
+                    Some(FlightGrant::Refused { request }) => {
+                        if let Some(index) = pending_flights.iter().position(|f| {
+                            f.request == request
+                                && matches!(f.stage, FlightStage::AwaitingGrant { .. })
+                        }) {
+                            let flight = pending_flights.swap_remove(index);
+                            drop_flight(flight, relay_id, "coordinator refused the upload");
+                        }
+                        // else: a stale refusal — ignore it.
                     }
                 }
             }
 
-            // The grant did not arrive within the timeout — a coordinator that never
-            // answers, or an older one that dropped the request as an unknown frame.
-            // Drop the recording and unpark so the next shipment can proceed.
-            _ = tokio::time::sleep_until(flight_deadline),
-                if flight_request.is_some() && put_result.is_none() =>
-            {
-                drop_parked_flight(pending_flight, relay_id, "no upload grant within the timeout");
-                flight_request = None;
+            // A detached PUT reported its outcome over the shared completion channel.
+            // On stored, fire the ack (delivery means stored) and tell the coordinator
+            // so it runs its post-store bookkeeping; on failure, drop the recording.
+            done = put_done_rx.recv() => {
+                let flight_upload::FlightPutDone { request, outcome } = done
+                    .expect("the write half holds a completion sender for the connection's life");
+                if let Some(index) = pending_flights
+                    .iter()
+                    .position(|f| f.request == request && matches!(f.stage, FlightStage::Uploading))
+                {
+                    match outcome {
+                        PutOutcome::Stored => {
+                            let flight = pending_flights.swap_remove(index);
+                            let _ = flight.shipment.sent.send(());
+                            send_flight_done(&mut sink, request).await?;
+                        }
+                        PutOutcome::Failed => {
+                            let flight = pending_flights.swap_remove(index);
+                            drop_flight(flight, relay_id, "upload failed");
+                        }
+                    }
+                }
+                // else: a completion for a shipment no longer in the table (already
+                // resolved) — ignore it.
+            }
+
+            // A grant did not arrive within the timeout for one or more shipments — a
+            // coordinator that never answers, or an older one that dropped the request
+            // as an unknown frame. Drop every shipment whose grant deadline has now
+            // elapsed so the pipe keeps moving; the rest keep waiting.
+            _ = async {
+                tokio::time::sleep_until(earliest_grant_deadline.expect("guarded by is_some")).await
+            }, if earliest_grant_deadline.is_some() => {
+                let now = Instant::now();
+                let mut index = 0;
+                while index < pending_flights.len() {
+                    match pending_flights[index].stage {
+                        FlightStage::AwaitingGrant { deadline } if deadline <= now => {
+                            let flight = pending_flights.swap_remove(index);
+                            drop_flight(flight, relay_id, "no upload grant within the timeout");
+                            // swap_remove moved the last entry into `index`; re-check it
+                            // rather than advancing past it.
+                        }
+                        _ => index += 1,
+                    }
+                }
             }
 
             _ = heartbeat_tick.tick() => {
@@ -1157,23 +1300,29 @@ async fn write_control_frames(
                 sink.send(Message::Text(frame.into())).await?;
             }
 
-            // Pull the next shipment only when the flight slot is idle (no parked
-            // shipment, so no request outstanding), then send its small upload request.
-            // Below every control arm: the request is small, but it must never ride
-            // ahead of a webhook-bearing notice.
-            shipment = flight.recv(), if pending_flight.is_none() && flight_open => {
+            // Pull the next shipment while under the concurrency cap, then send its
+            // small upload request. Below every control arm: the request is small, but
+            // it must never ride ahead of a webhook-bearing notice.
+            shipment = flight.recv(),
+                if pending_flights.len() < MAX_INFLIGHT_FLIGHT_UPLOADS && flight_open =>
+            {
                 match shipment {
                     Some(shipment) => {
-                        *pending_flight = Some(shipment);
                         next_request += 1;
-                        flight_request = Some(next_request);
-                        flight_deadline = Instant::now() + FLIGHT_GRANT_TIMEOUT;
+                        let request = next_request;
+                        pending_flights.push(PendingFlight {
+                            shipment,
+                            request,
+                            stage: FlightStage::AwaitingGrant {
+                                deadline: Instant::now() + FLIGHT_GRANT_TIMEOUT,
+                            },
+                        });
                         // A send error ends the connection (via `?`) with the shipment
                         // still parked, so the next connection re-requests it.
                         send_flight_request(
                             &mut sink,
-                            next_request,
-                            pending_flight.as_ref().expect("just set"),
+                            request,
+                            &pending_flights.last().expect("just pushed").shipment,
                         )
                         .await?;
                     }
@@ -1184,25 +1333,31 @@ async fn write_control_frames(
     }
 }
 
-/// Drops a parked flight shipment that will not be stored (refused, upload failed, or
-/// no grant in time), logging the loss. Dropping the shipment drops its `sent` ack,
-/// which resolves the sink's await as not-stored — flight data is observability, never
-/// backpressure on a session teardown.
-fn drop_parked_flight(
-    pending_flight: &mut Option<FlightShipment>,
-    relay_id: RelayId,
-    reason: &str,
-) {
-    if let Some(shipment) = pending_flight.take() {
-        tracing::warn!(
-            relay_id = relay_id.0,
-            tenant = shipment.tenant.as_ref(),
-            session = shipment.session.0,
-            bytes = shipment.payload.len(),
-            reason,
-            "dropping a flight recording; flight data is never backpressure",
-        );
-    }
+/// Drops an in-flight flight shipment that will not be stored (refused, upload
+/// failed, or no grant in time), logging the loss. Dropping the entry drops its
+/// shipment's `sent` ack, which resolves the sink's await as not-stored — flight data
+/// is observability, never backpressure on a session teardown.
+fn drop_flight(flight: PendingFlight, relay_id: RelayId, reason: &str) {
+    let shipment = flight.shipment;
+    tracing::warn!(
+        relay_id = relay_id.0,
+        tenant = shipment.tenant.as_ref(),
+        session = shipment.session.0,
+        bytes = shipment.payload.len(),
+        reason,
+        "dropping a flight recording; flight data is never backpressure",
+    );
+    // `shipment` drops here, dropping its `sent` ack so the sink await resolves as
+    // not-stored.
+}
+
+/// Wall clock as unix epoch milliseconds — the base the descriptor apply-lag
+/// measurement differences the coordinator's staging stamp against.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Snapshots the relay's live roster into the [`SessionPresence`] entries a
@@ -1440,16 +1595,29 @@ pub fn sign_enroll_proof(
 
 /// Applies one decoded control message to the Join source.
 ///
-/// A descriptor set reconciles membership; an unrecognized message kind (one a
-/// newer coordinator sent that this build predates) is skipped, not an error —
-/// the [`CoordinatorToRelay::Unknown`] catch-all already kept the decode from
-/// failing, so the connection stays up and later descriptors keep flowing. A
-/// *malformed* known message still surfaces as a decode error at the call site,
-/// closing the connection so the next one re-syncs — that is a coordinator bug,
-/// not a forward-compatible addition, and should not be silently swallowed.
-fn apply_message(control: &MeshControl, message: CoordinatorToRelay, applied: &AppliedSessions) {
+/// A descriptor set reconciles membership and records its apply lag and size into
+/// `stats`; an unrecognized message kind (one a newer coordinator sent that this
+/// build predates) is skipped, not an error — the [`CoordinatorToRelay::Unknown`]
+/// catch-all already kept the decode from failing, so the connection stays up and
+/// later descriptors keep flowing. A *malformed* known message still surfaces as a
+/// decode error at the call site, closing the connection so the next one re-syncs —
+/// that is a coordinator bug, not a forward-compatible addition, and should not be
+/// silently swallowed.
+fn apply_message(
+    control: &MeshControl,
+    message: CoordinatorToRelay,
+    applied: &AppliedSessions,
+    stats: &ControlConnStats,
+) {
     match message {
-        CoordinatorToRelay::Descriptors { descriptors } => {
+        CoordinatorToRelay::Descriptors {
+            descriptors,
+            staged_at_unix_ms,
+        } => {
+            // Record the apply lag before reconciling so the sample reflects the
+            // moment the set is applied, and the set size regardless of whether the
+            // push carried a stamp.
+            stats.record_descriptor_apply(descriptors.len(), staged_at_unix_ms);
             reconcile(control, &descriptors, applied);
         }
         CoordinatorToRelay::CloseSlot {
@@ -1730,6 +1898,7 @@ mod tests {
                 ],
             },
             &applied,
+            &ControlConnStats::new(),
         );
 
         tokio::time::timeout(Duration::from_millis(100), shutdown.notified())
@@ -1753,13 +1922,20 @@ mod tests {
             &control,
             CoordinatorToRelay::Descriptors {
                 descriptors: vec![descriptor(1, &[2])],
+                staged_at_unix_ms: None,
             },
             &applied,
+            &ControlConnStats::new(),
         );
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
         // An unknown message is a no-op: no commands, applied state untouched.
-        apply_message(&control, CoordinatorToRelay::Unknown, &applied);
+        apply_message(
+            &control,
+            CoordinatorToRelay::Unknown,
+            &applied,
+            &ControlConnStats::new(),
+        );
         assert!(rx2.try_recv().is_err(), "an unknown message issues nothing");
         assert_eq!(applied.snapshot(), HashSet::from([key(1)]));
 
@@ -1769,8 +1945,10 @@ mod tests {
             &control,
             CoordinatorToRelay::Descriptors {
                 descriptors: vec![],
+                staged_at_unix_ms: None,
             },
             &applied,
+            &ControlConnStats::new(),
         );
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
     }
@@ -1793,9 +1971,76 @@ mod tests {
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         control.register_link(RelayId(2), tx2);
         let applied = AppliedSessions::new();
-        apply_message(&control, message, &applied);
+        apply_message(&control, message, &applied, &ControlConnStats::new());
         assert!(rx2.try_recv().is_err());
         assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let applied = AppliedSessions::new();
+        let stats = ControlConnStats::new();
+
+        // A set staged ~1.5s ago applies with a lag at least that large — the apply
+        // clock is never earlier than the staging stamp we synthesize here.
+        let staged = now_unix_ms().saturating_sub(1_500);
+        apply_message(
+            &control,
+            CoordinatorToRelay::Descriptors {
+                descriptors: vec![descriptor(1, &[]), descriptor(2, &[])],
+                staged_at_unix_ms: Some(staged),
+            },
+            &applied,
+            &stats,
+        );
+        let snap = stats.snapshot();
+        assert!(
+            (1_500..10_000).contains(&snap.descriptor_apply_lag_ms),
+            "the apply lag reflects the staging gap (observed {}ms)",
+            snap.descriptor_apply_lag_ms,
+        );
+        assert_eq!(snap.descriptor_set_len, 2, "the last applied set's size");
+
+        // A backward clock skew (a set stamped in the future) clamps to zero rather
+        // than reading as a huge lag, and still updates the set length.
+        apply_message(
+            &control,
+            CoordinatorToRelay::Descriptors {
+                descriptors: vec![descriptor(1, &[])],
+                staged_at_unix_ms: Some(now_unix_ms() + 60_000),
+            },
+            &applied,
+            &stats,
+        );
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.descriptor_apply_lag_ms, 0,
+            "a backward clock skew clamps the lag to zero",
+        );
+        assert_eq!(snap.descriptor_set_len, 1);
+
+        // An unstamped set (an older coordinator) holds the last lag sample but still
+        // updates the set length.
+        apply_message(
+            &control,
+            CoordinatorToRelay::Descriptors {
+                descriptors: vec![],
+                staged_at_unix_ms: None,
+            },
+            &applied,
+            &stats,
+        );
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.descriptor_apply_lag_ms, 0,
+            "an unstamped push leaves the last lag sample untouched",
+        );
+        assert_eq!(snap.descriptor_set_len, 0);
     }
 
     #[test]
@@ -1958,7 +2203,7 @@ mod tests {
                 ),
             ),
             apply_targets(control, drain_acked),
-            OutboundQueues::new(notices_rx, no_flight(), ControlQueueDepths::new()),
+            OutboundQueues::new(notices_rx, no_flight(), ControlConnStats::new()),
             heartbeat(Duration::from_secs(3600)), // no heartbeat during the test
             drain_rx,
             no_connected(),
@@ -2228,7 +2473,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -2288,7 +2533,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -2355,7 +2600,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -2424,7 +2669,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             enroll(addr, drain_hello()),
             apply_targets(control, drain_acked_tx),
-            OutboundQueues::new(notices_rx, no_flight(), ControlQueueDepths::new()),
+            OutboundQueues::new(notices_rx, no_flight(), ControlConnStats::new()),
             heartbeat(Duration::from_secs(3600)), // no heartbeat during the test
             drain_rx,
             no_connected(),
@@ -2501,7 +2746,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             HeartbeatConfig {
                 sessions: Arc::clone(&sessions),
@@ -2589,7 +2834,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -2840,7 +3085,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 no_flight(),
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3033,7 +3278,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 flight_rx,
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3076,11 +3321,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_upload_drops_the_recording_and_unparks_the_next() {
+    async fn a_refused_upload_drops_its_recording_while_the_other_stays_in_flight() {
         use tokio::net::TcpListener;
 
-        // The stand-in coordinator refuses the first request, then grants nothing more
-        // — it just reads the second request to prove the slot unparked.
+        // The stand-in coordinator refuses the FIRST request, reads the second (both
+        // are in flight at once), and holds the connection open so the relay processes
+        // the refusal on it rather than re-requesting on a reconnect.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
@@ -3103,9 +3349,13 @@ mod tests {
                     .unwrap();
             ws.send(Message::Text(refused.into())).await.unwrap();
 
-            // The second shipment's request must arrive: the refusal unparked the slot.
+            // The other shipment's request is already on the wire (both ship at once).
             let second = ws.next().await.unwrap().unwrap();
             let _ = second_tx.send(second);
+            // Hold the connection open so the relay drops the refused recording on it,
+            // rather than the read half ending the connection first (which would
+            // re-request the shipment on the next connection instead of dropping it).
+            std::future::pending::<()>().await;
         });
 
         let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
@@ -3127,7 +3377,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 flight_rx,
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3144,7 +3394,8 @@ mod tests {
             "a refused upload reports the recording lost, not stored",
         );
 
-        // The next shipment's request goes out — the slot unparked after the refusal.
+        // The other shipment's request went out too — it ships concurrently rather
+        // than waiting for the first to resolve.
         let second = tokio::time::timeout(Duration::from_secs(5), second_rx)
             .await
             .expect("the second request arrives")
@@ -3160,7 +3411,7 @@ mod tests {
         assert_eq!(
             bytes,
             "second-blob".len() as u64,
-            "the second shipment's request goes out after the first is dropped",
+            "the other shipment's request is in flight alongside the refused one",
         );
     }
 
@@ -3205,7 +3456,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 flight_rx,
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3273,7 +3524,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 flight_rx,
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3340,7 +3591,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             enroll(addr, drain_hello()),
             apply_targets(control, drain_acked),
-            OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new()),
+            OutboundQueues::new(notices_rx, flight_rx, ControlConnStats::new()),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
             no_connected(),
@@ -3425,7 +3676,7 @@ mod tests {
         let (_challenge_tx, challenge_rx) = mpsc::unbounded_channel::<[u8; 32]>();
         let (_flight_grant_tx, flight_grant_rx) = mpsc::unbounded_channel::<FlightGrant>();
 
-        let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new());
+        let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlConnStats::new());
         let heartbeat = heartbeat(Duration::from_secs(3600));
         let identity_key = throwaway_identity_key();
 
@@ -3458,7 +3709,7 @@ mod tests {
             "a notice parked mid-send survives the write half being dropped",
         );
         assert_eq!(
-            outbound.depths.snapshot().notices,
+            outbound.stats.snapshot().notices,
             1,
             "the parked notice is reflected in the reported queue depth",
         );
@@ -3503,7 +3754,7 @@ mod tests {
         tokio::spawn(run_descriptor_subscriber_with(
             enroll(addr, drain_hello()),
             apply_targets(control, drain_acked),
-            OutboundQueues::new(notices_rx, flight_rx, ControlQueueDepths::new()),
+            OutboundQueues::new(notices_rx, flight_rx, ControlConnStats::new()),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
             no_connected(),
@@ -3554,6 +3805,7 @@ mod tests {
             let _request = ws.next().await.unwrap().unwrap();
             let descriptors = serde_json::to_string(&CoordinatorToRelay::Descriptors {
                 descriptors: vec![descriptor(1, &[])],
+                staged_at_unix_ms: None,
             })
             .unwrap();
             ws.send(Message::Text(descriptors.into())).await.unwrap();
@@ -3585,7 +3837,7 @@ mod tests {
             OutboundQueues::new(
                 mpsc::unbounded_channel().1,
                 flight_rx,
-                ControlQueueDepths::new(),
+                ControlConnStats::new(),
             ),
             heartbeat(Duration::from_secs(3600)),
             drain_rx,
@@ -3607,6 +3859,163 @@ mod tests {
         assert!(
             landed.is_ok(),
             "the read half applied the descriptor while an upload awaited its grant",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_shipments_ship_concurrently_rather_than_one_at_a_time() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: enroll, then read TWO upload requests without granting
+        // either. A strictly serial pipe would not send the second request until the
+        // first shipment's whole grant→PUT→Done cycle finished, so reading both — with
+        // no grant sent — proves the two proceed concurrently.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((first, second));
+        });
+
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (first_shipment, _first_ack) = flight_shipment();
+        let (second_shipment, _second_ack) =
+            flight_shipment_with_payload(Bytes::from_static(b"second-blob"));
+        flight_tx.try_send(first_shipment).unwrap();
+        flight_tx.try_send(second_shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlConnStats::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("both upload requests go out before either is granted")
+            .unwrap();
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        let mut requests = Vec::new();
+        let mut byte_counts = HashSet::new();
+        for frame in [decode(first), decode(second)] {
+            let RelayToCoordinator::FlightUploadRequest { request, bytes, .. } = frame else {
+                panic!("both frames are flight upload requests, got {frame:?}");
+            };
+            requests.push(request);
+            byte_counts.insert(bytes);
+        }
+        assert_ne!(
+            requests[0], requests[1],
+            "each in-flight shipment carries a distinct correlation id",
+        );
+        assert_eq!(
+            byte_counts,
+            HashSet::from(["compressed-bytes".len() as u64, "second-blob".len() as u64,]),
+            "both shipments' requests are on the wire at once",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_death_re_requests_every_in_flight_shipment() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: on the FIRST connection, enroll and read both upload
+        // requests (granting neither), then drop the socket with both shipments still
+        // in flight. On the SECOND (reconnect), enroll and read both re-requests —
+        // proving a connection death re-requests BOTH parked shipments, not just one.
+        tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(first).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let _r1 = ws.next().await.unwrap().unwrap();
+            let _r2 = ws.next().await.unwrap().unwrap();
+            drop(ws);
+
+            let (second, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(second).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let re1 = ws.next().await.unwrap().unwrap();
+            let re2 = ws.next().await.unwrap().unwrap();
+            let _ = frames_tx.send((re1, re2));
+        });
+
+        let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+        let (first_shipment, _first_ack) = flight_shipment();
+        let (second_shipment, _second_ack) =
+            flight_shipment_with_payload(Bytes::from_static(b"second-blob"));
+        flight_tx.try_send(first_shipment).unwrap();
+        flight_tx.try_send(second_shipment).unwrap();
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                flight_rx,
+                ControlConnStats::new(),
+            ),
+            heartbeat(Duration::from_secs(3600)),
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        let (re1, re2) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("both shipments re-request after the reconnect")
+            .unwrap();
+        let decode = |message: Message| -> RelayToCoordinator {
+            let Message::Text(text) = message else {
+                panic!("a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        };
+        let mut byte_counts = HashSet::new();
+        for frame in [decode(re1), decode(re2)] {
+            let RelayToCoordinator::FlightUploadRequest { bytes, .. } = frame else {
+                panic!("both re-requests are flight upload requests, got {frame:?}");
+            };
+            byte_counts.insert(bytes);
+        }
+        assert_eq!(
+            byte_counts,
+            HashSet::from(["compressed-bytes".len() as u64, "second-blob".len() as u64,]),
+            "the reconnect re-requests both in-flight shipments",
         );
     }
 }

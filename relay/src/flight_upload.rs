@@ -22,7 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rally_point_proto::ids::RelayId;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 /// The outcome of an upload (its bounded internal retries included), reported back to
 /// the control connection's writer.
@@ -32,6 +32,17 @@ pub enum PutOutcome {
     Stored,
     /// Every attempt within the grant's useful lifetime failed; the recording is lost.
     Failed,
+}
+
+/// A finished upload reported back to the control connection's writer over the shared
+/// completion channel: which request it was for (the writer's per-connection
+/// correlation id) and how it ended. The id lets the writer match the report to the
+/// one in-flight shipment it belongs to, since many uploads can run at once.
+pub struct FlightPutDone {
+    /// The correlation id of the request whose upload this reports.
+    pub request: u64,
+    /// How the upload ended.
+    pub outcome: PutOutcome,
 }
 
 type UploadClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -70,18 +81,20 @@ const PUT_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// endpoint that streams an unbounded body, since only the status matters.
 const MAX_PUT_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Spawns the upload of `payload` to `url`, reporting the outcome on `result`. Detached
-/// so neither control-connection half blocks on the PUT; a dropped `result` sender (the
-/// task outliving a torn-down connection) is read by the writer as a failed upload.
+/// Spawns the upload of `payload` to `url`, reporting the outcome for `request` on the
+/// shared `done` channel. Detached so neither control-connection half blocks on the
+/// PUT; a dropped `done` receiver (the task outliving a torn-down connection) simply
+/// discards the report — the writer re-requests the shipment on the next connection.
 pub fn spawn_put(
     url: String,
     payload: Bytes,
     relay_id: RelayId,
-    result: oneshot::Sender<PutOutcome>,
+    request: u64,
+    done: mpsc::UnboundedSender<FlightPutDone>,
 ) {
     tokio::spawn(async move {
         let outcome = put_with_retry(&url, payload, relay_id).await;
-        let _ = result.send(outcome);
+        let _ = done.send(FlightPutDone { request, outcome });
     });
 }
 

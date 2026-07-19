@@ -336,11 +336,15 @@ impl FlightSink for FileSink {
 pub const MAX_SHIPPED_BLOB_BYTES: usize = 4 * 1024 * 1024;
 
 /// The depth of the bounded channel a [`CoordinatorSink`] hands shipments to the
-/// coordinator control connection through. Flushes are rare (session close, drain)
-/// and the connection loop drains one shipment per iteration, so a shallow queue
-/// absorbs the normal burst. A full queue means the connection is wedged or gone;
-/// the sink then drops the blob rather than blocking a session teardown on
-/// observability — flight data is never backpressure.
+/// coordinator control connection through. Flushes are rare (session close, drain),
+/// and the connection ships up to
+/// [`MAX_INFLIGHT_FLIGHT_UPLOADS`](crate::coordinator_client::MAX_INFLIGHT_FLIGHT_UPLOADS)
+/// recordings at once, so the queue drains several times faster than shipping strictly
+/// one at a time — deep enough that a mass session teardown's burst is absorbed rather
+/// than shed. A full queue means the connection is wedged or gone (or a burst large
+/// enough to outrun even the concurrent drain); the sink then drops the blob rather
+/// than blocking a session teardown on observability — flight data is never
+/// backpressure.
 pub const FLIGHT_SHIP_QUEUE: usize = 32;
 
 /// How many session flushes the drain's wholesale flush ([`FlightRecorder::flush_all`])

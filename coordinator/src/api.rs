@@ -1763,9 +1763,7 @@ async fn run_writer(
     let initial = rx.borrow_and_update().clone();
     if !writer_send(
         write_half,
-        control_frame(&CoordinatorToRelay::Descriptors {
-            descriptors: initial,
-        }),
+        descriptors_frame(initial),
         relay_id,
         liveness_timeout,
         "descriptor",
@@ -1806,7 +1804,7 @@ async fn run_writer(
                 let set = rx.borrow_and_update().clone();
                 if !writer_send(
                     write_half,
-                    control_frame(&CoordinatorToRelay::Descriptors { descriptors: set }),
+                    descriptors_frame(set),
                     relay_id,
                     liveness_timeout,
                     "descriptor",
@@ -1834,7 +1832,7 @@ async fn run_writer(
                 let set = rx.borrow_and_update().clone();
                 if !writer_send(
                     write_half,
-                    control_frame(&CoordinatorToRelay::Descriptors { descriptors: set }),
+                    descriptors_frame(set),
                     relay_id,
                     liveness_timeout,
                     "descriptor",
@@ -1997,6 +1995,27 @@ fn control_frame(message: &CoordinatorToRelay) -> Message {
     let json =
         serde_json::to_string(message).expect("a coordinator control frame always serializes");
     Message::Text(json.into())
+}
+
+/// Wall clock as unix epoch milliseconds — the staging stamp a descriptor push
+/// carries so the relay can measure its apply lag.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Builds a `Descriptors` control frame, stamping the coordinator's wall-clock at
+/// the moment the set snapshot leaves the outbox so the relay can measure how far
+/// its apply lags staging. Called at each `borrow_and_update` site — the
+/// connect-time resync, the steady-state change arm, and the drain exchange's set
+/// push — so every descriptor push carries a fresh stamp.
+fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
+    control_frame(&CoordinatorToRelay::Descriptors {
+        descriptors,
+        staged_at_unix_ms: Some(now_unix_ms()),
+    })
 }
 
 /// Sends one frame on the write half, racing a fixed per-send stall bound measured

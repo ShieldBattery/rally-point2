@@ -300,11 +300,12 @@ async fn main() -> Result<()> {
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::new_mesh_state();
 
-    // Shared observable of the coordinator control connection's outbound queue
-    // depths: the coordinator client's writer refreshes it, the task-stats reporter
-    // logs it. Created up front so both share one handle; it stays all-zero without
-    // a coordinator connection (nothing writes it).
-    let control_queue_depths = coordinator_client::ControlQueueDepths::new();
+    // Shared observable of the coordinator control connection: the coordinator
+    // client's writer refreshes its outbound queue depths and its reader refreshes the
+    // descriptor apply lag; the task-stats reporter logs both. Created up front so all
+    // share one handle; it stays all-zero without a coordinator connection (nothing
+    // writes it).
+    let control_conn_stats = coordinator_client::ControlConnStats::new();
 
     // Self-reported Fargate task resources: a no-op outside Fargate (see the
     // module doc), so this is safe to call unconditionally in dev/loopback too.
@@ -313,7 +314,7 @@ async fn main() -> Result<()> {
         cli.relay_id,
         Arc::clone(&sessions),
         mesh_state.turn_ring.clone(),
-        control_queue_depths.clone(),
+        control_conn_stats.clone(),
     );
 
     // The coordinated-drain seam. On a shutdown signal the drain sequence flips
@@ -583,11 +584,7 @@ async fn main() -> Result<()> {
                     region_targets: region_targets.clone(),
                     drain_acked: drain_acked_tx.clone(),
                 },
-                coordinator_client::OutboundQueues::new(
-                    notices_rx,
-                    flight_rx,
-                    control_queue_depths,
-                ),
+                coordinator_client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
                 Arc::clone(&sessions),
                 region_rtt_cache.clone(),
                 drain_rx.clone(),

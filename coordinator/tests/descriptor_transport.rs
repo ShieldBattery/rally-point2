@@ -100,7 +100,7 @@ fn no_outbound() -> coordinator_client::OutboundQueues {
     coordinator_client::OutboundQueues::new(
         no_notices(),
         no_flight(),
-        coordinator_client::ControlQueueDepths::new(),
+        coordinator_client::ControlConnStats::new(),
     )
 }
 
@@ -706,7 +706,7 @@ async fn read_until_drain_ack(
         while let Some(Ok(message)) = socket.next().await {
             if let Message::Text(text) = message {
                 match serde_json::from_str::<CoordinatorToRelay>(&text).unwrap() {
-                    CoordinatorToRelay::Descriptors { descriptors } => last = descriptors,
+                    CoordinatorToRelay::Descriptors { descriptors, .. } => last = descriptors,
                     CoordinatorToRelay::DrainAck => return,
                     _ => {}
                 }
@@ -1302,6 +1302,52 @@ async fn the_tenant_key_set_is_pushed_before_the_first_descriptor() {
     assert!(descriptors.contains("\"type\":\"descriptors\""));
 }
 
+/// Wall clock as unix epoch milliseconds — the same base both the coordinator's
+/// staging stamp and this in-process test read.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[tokio::test]
+async fn the_pushed_descriptor_set_carries_a_recent_staging_stamp() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A coordinator with a session relay 1 serves. Relay 1 enrolls over a raw
+    // control socket so the test can read the descriptor frame and inspect its
+    // staging stamp — the coordinator's wall-clock at the moment the set left its
+    // outbox, which the relay differences against its own clock to measure apply lag.
+    let (base_url, _session, _setup) = coordinator_with_session(None).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+
+    // The coordinator runs in this same process, so it stamps against this same
+    // clock: the stamp must land in `[before, after]`, bracketing the whole exchange.
+    let before = unix_ms_now();
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(1)).await;
+
+    let descriptors = read_to_descriptors(&mut socket).await;
+    let after = unix_ms_now();
+
+    let CoordinatorToRelay::Descriptors {
+        staged_at_unix_ms, ..
+    } = serde_json::from_str(&descriptors).unwrap()
+    else {
+        panic!("read_to_descriptors returns a descriptors frame");
+    };
+    let staged = staged_at_unix_ms.expect("a current coordinator stamps every descriptor push");
+    assert!(
+        (before..=after).contains(&staged),
+        "the stamp is the coordinator's wall-clock when the set was pushed \
+         (before={before}, staged={staged}, after={after})",
+    );
+}
+
 // --- Region ping-beacon distribution ---
 
 #[tokio::test]
@@ -1506,7 +1552,7 @@ async fn an_inbound_flood_does_not_delay_a_descriptor_push() {
     let found = timeout(Duration::from_secs(3), async {
         while let Some(Ok(message)) = read.next().await {
             if let Message::Text(text) = message
-                && let Ok(CoordinatorToRelay::Descriptors { descriptors }) =
+                && let Ok(CoordinatorToRelay::Descriptors { descriptors, .. }) =
                     serde_json::from_str::<CoordinatorToRelay>(&text)
                 && descriptors.iter().any(|d| d.session == session)
             {

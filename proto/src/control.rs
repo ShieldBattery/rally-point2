@@ -957,6 +957,20 @@ pub enum CoordinatorToRelay {
     Descriptors {
         /// The descriptors, one per session this relay currently serves.
         descriptors: Vec<SessionDescriptor>,
+        /// The coordinator's wall-clock, unix epoch milliseconds, at the moment
+        /// this whole-set snapshot was taken from its outbox — **not** when any
+        /// session in it was created. The relay differences it against its own
+        /// clock on apply to observe how far descriptor delivery is lagging behind
+        /// staging.
+        ///
+        /// A coarse cross-host measurement: the coordinator and relay keep
+        /// independent wall clocks, so the difference is meaningful at the scale of
+        /// seconds (where apply lag actually shows up under a create ramp), not
+        /// microseconds. A small clock skew can even make it read slightly negative,
+        /// which the relay clamps to zero. Absent from a coordinator that predates
+        /// the field, in which case the relay records no fresh lag sample.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged_at_unix_ms: Option<u64>,
     },
     /// A reap directive: close the named slots' links so their normal link-death
     /// path (a synced leave, a departure notice) runs. The coordinator arms this
@@ -1788,6 +1802,7 @@ mod tests {
     #[test]
     fn coordinator_to_relay_descriptors_roundtrips_json() {
         let message = CoordinatorToRelay::Descriptors {
+            staged_at_unix_ms: None,
             descriptors: vec![SessionDescriptor {
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
@@ -1815,6 +1830,43 @@ mod tests {
         assert!(json.contains("\"type\":\"descriptors\""));
         let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn coordinator_to_relay_descriptors_staging_stamp_roundtrips_and_defaults_absent() {
+        // A stamped set round-trips carrying the millisecond stamp.
+        let stamped = CoordinatorToRelay::Descriptors {
+            descriptors: vec![],
+            staged_at_unix_ms: Some(1_700_000_000_123),
+        };
+        let json = serde_json::to_string(&stamped).unwrap();
+        assert!(json.contains("\"staged_at_unix_ms\":1700000000123"));
+        assert_eq!(
+            serde_json::from_str::<CoordinatorToRelay>(&json).unwrap(),
+            stamped
+        );
+
+        // An absent stamp stays off the wire (byte-identical to the pre-field form)
+        // and round-trips back to `None`.
+        let unstamped = CoordinatorToRelay::Descriptors {
+            descriptors: vec![],
+            staged_at_unix_ms: None,
+        };
+        let json = serde_json::to_string(&unstamped).unwrap();
+        assert!(!json.contains("staged_at_unix_ms"));
+        assert_eq!(
+            serde_json::from_str::<CoordinatorToRelay>(&json).unwrap(),
+            unstamped
+        );
+
+        // An old coordinator's frame — one that predates the field entirely —
+        // parses with the stamp absent rather than erroring, so a new relay reads
+        // it as "no lag sample".
+        let old = r#"{"type":"descriptors","descriptors":[]}"#;
+        assert_eq!(
+            serde_json::from_str::<CoordinatorToRelay>(old).unwrap(),
+            unstamped,
+        );
     }
 
     #[test]
