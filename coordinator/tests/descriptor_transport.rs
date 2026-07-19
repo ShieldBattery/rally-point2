@@ -2096,11 +2096,14 @@ async fn a_relay_that_stops_reading_is_dropped_by_the_send_stall_bound_despite_h
     // start, independent of the reader-refreshed deadline.
     //
     // Arranged over a real socket without guessing OS buffer sizes: a short liveness
-    // plus a descriptor set the coordinator re-pushes (in full) every time it grows.
-    // The peer never drains those pushes, so the unread bytes climb past whatever the
-    // buffers hold and a writer send eventually stalls — while the heartbeats keep
-    // the reader's deadline fresh throughout, so only the writer's bound can be what
-    // drops the connection.
+    // plus a descriptor set the coordinator re-pushes every time it grows. The relay
+    // enrolls at the pre-delta protocol floor ON PURPOSE — that version receives the
+    // whole growing set on every change, so the unread bytes a never-draining peer
+    // accumulates climb quadratically past whatever the buffers hold and a writer
+    // send deterministically stalls. A delta-capable relay would receive only tiny
+    // per-session diffs, far too little volume to fill a socket buffer within this
+    // test's window. The heartbeats keep the reader's deadline fresh throughout, so
+    // only the writer's bound can be what drops the connection.
     let liveness = Duration::from_millis(400);
     let (base_url, setup) = serve_coordinator_with_liveness(&[(1, 14900)], liveness).await;
 
@@ -2113,7 +2116,12 @@ async fn a_relay_that_stops_reading_is_dropped_by_the_send_stall_bound_despite_h
     let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
     // Enroll (the handshake requires reading the coordinator's challenge)...
-    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello_at(
+        1,
+        14900,
+        ProtocolVersion::MIN_SUPPORTED,
+    )))
+    .unwrap();
     socket.send(Message::Text(hello.into())).await.unwrap();
     common::prove_identity(&mut socket, &relay_key(1)).await;
     assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
