@@ -892,3 +892,81 @@ exists solely in the coordinator's tenant-supplied refs, resolved at query time.
 | `client` | Portable client endpoint + link driver: per-slot ordering restoration and the buffer/leave directive trackers; linked into the game DLL. |
 | `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, topological dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves — plus the per-session flight recorder (bounded events/samples/counters, flushed on close and drain). (A replicated turn log is planned, not yet built.) |
 | `coordinator` | Multi-tenant control plane: per-tenant token issuance + inbound request-signature auth, the relay registry and descriptor push, session setup, region assignment/provisioning, and the tenant-notification (webhook) + session-lifecycle layer. |
+
+## Settled decisions (do not re-chase)
+
+Choices that were weighed deliberately and closed. They are recorded here — with the *why* — so a
+later review or design pass starts from the reasoning instead of re-deriving (or re-litigating) it.
+Entries marked **(SB-side)** bind the ShieldBattery integration rather than a crate in this repo.
+
+- **The two-directional tenant credential design is final.** The tenant's request-signing key
+  (app-server-held private) and the coordinator's per-tenant signing key (coordinator-held private)
+  are mirror images on purpose — a literal single shared credential would let either party forge as
+  the other — and the coordinator's key also mints the player tokens relays verify (same keypair as
+  webhook signing, domain-separated). "One credential" already means: one tenant identity, one
+  keygen run, one registry entry.
+- **Client pubkeys are per-queue-episode, submitted at queue/lobby-join (SB-side).** The app holds a
+  pending keypair copied (never moved) onto each launched game — matchmaking requeue reuses the
+  join-time pubkey with no new client request, so the private half must survive the episode;
+  orphaned pending keys are deliberately never cleaned up (harmless by construction). No long-lived
+  client keypair without a security review. A multi-human load missing a pubkey fails fast by
+  design.
+- **`mx` (Querétaro) ships with no GameLift beacon, deliberately, zero code:** clients rank it by
+  TCP-connect fallback; backbone mx pairs fill one-directionally from mx relays' outbound sweeps
+  (served value = average of present directions; coverage counts either); the formulaic dead
+  hostname auto-upgrades to UDP if AWS ever ships the beacon (invariant also documented in
+  `infra/terraform/README.md`).
+- **Monitoring shape:** coordinator `/metrics` is plaintext on a second listener reachable only via
+  the box's tailscale sidecar (never published; the public listener is untouched); relays are never
+  scrape targets (scale-to-zero makes them transient) — fleet health exports coordinator-side; no
+  alerting until production baselines exist.
+- **No auto-drop of disconnected players.** Holds are decided only by a survivor's `RequestDrop`
+  (30s relay floor) or the 45s abandoned-session force-decide.
+- **Game clients never talk to the coordinator.** Re-home is app-server-mediated (the client
+  authenticates to its app server exactly as for result submission; the app server makes the
+  tenant-signed coordinator call).
+- **Nothing sits in front of the coordinator or the relays** — no proxy, LB, or NAT anywhere: the
+  enrollment ledger gates on transport peer addresses, and the coordinator resolves relay addresses
+  from the task ENI. A proxy would replace every peer with itself; re-design the gate before ever
+  adding one. (This also settled ECS-metadata self-discovery: provisioned relays never
+  self-advertise at all.)
+- **Relay IPs are stable per task and fresh per launch** — no per-game rotation machinery; the DDoS
+  baseline is natural per-task churn plus the platform's default network protections. The trigger
+  for anything stronger (Shield Advanced / Spectrum-style fronting) is deliberately undefined until
+  targeted attacks materialize.
+- **Coordinator HA is a single restart-tolerant instance** (container restart policy). Running
+  games survive an outage — relays run the live game, and an idle+unenrolled relay reaps itself —
+  while create/re-home/presence pause until restart and relays re-enroll. Hot standby stays a
+  documented future option.
+- **A 1v1 checksum divergence voids** (no-majority by construction — and deliberately
+  unattributable, since a loss-dodger could self-desync); team games discard the diverged minority
+  and resolve from the majority. Client-originated desync/result reports may only void or dispute,
+  never claim a win; departure time/order arbitrates nothing. **(SB-side debug surface:)**
+  `forceUnsyncedLeave` on the caller's own slot is an ordinary drop and scores normally;
+  `forceDesync` is THE desync trigger — testing tools, never a way to end a game that needs a
+  scored result.
+- **Presence fail-open (35s TTL):** locking players out of queueing on infra flap is strictly worse
+  than the status quo (see the presence section above for the full argument).
+- **Lobby commands are not replayed on a same-relay resume (SB-side scope-out):** they have no
+  dedup identity, so a resume replay would double-apply them; the oversize-turn half of that
+  resume problem is handled.
+- **The relay-side coordinator-notice buffer is unbounded by deliberate choice** (delivery over
+  memory); the coordinator's own per-session webhook queues are bounded (128) with a drop counter
+  on `/metrics`. Relay-reported webhook events take precedence over coordinator-derived ones by
+  design, for restart survival. μs-seeded session ids stay in JS safe-integer range until ~2255.
+- **Home-relay enforcement fails open for unknown sessions** (an empty homed set is unenforced) —
+  this preserves the descriptor-arrival race's admit-first behavior; the fleet-amplification angle
+  is closed by mesh peer auth.
+- **Never-started sessions close immediately on an emptied roster** (nothing force-decides their
+  holds, so deferral would be unbounded); their holds still survive a quick re-dial. A session
+  whose clients *never* connect reaps at a fixed 15-minute grace, not the token lifetime — the
+  token lifetime protects connected-then-dropped clients, who never hit that reap.
+- **Player tokens are finite (default 6h) and checked only at (re)connect;** mid-game expiry is
+  harmless. Escape hatch if marathon games ever matter: mint fresh tokens on the rehome response
+  (noted, not built).
+- **Rollout rollback = fix forward (SB-side).** The platform's user base is small enough that a bad
+  client rollout is corrected by shipping a fix, not by reverting the client; no formal rollback
+  gate (no signal/threshold/owner). Revisit only if the user base grows enough that a botched
+  rollout would be costly.
+- **Downlink coalescing (if ever built) must define its recovery-window vs byte budget at
+  implementation time** — low-stakes: the window is small and coalescing is weak-downlink-only.

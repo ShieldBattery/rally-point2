@@ -120,6 +120,12 @@ Then:
   "Promote relay image" workflow before expecting prod launches to succeed —
   the prod task definitions pull `:stable`, and a task launch fails while the
   tag doesn't exist (the apply itself doesn't care).
+- **Rolling a relay image across a live fleet:** `MeshHello` carries the relay's
+  CURRENT protocol version, and mixed-version relays do not mesh-pair until the
+  fleet converges — each still serves its own single-relay sessions, but new
+  cross-relay sessions can't form across the version split. Bounce every
+  region's tasks promptly (rather than letting old and new coexist for long)
+  when the image rolls.
 
 ## 2. Apply a fleet environment
 
