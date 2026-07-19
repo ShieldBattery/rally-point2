@@ -33,13 +33,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard};
 use rally_point_proto::control::{DepartedSlot, DepartureKind, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
-use rally_point_proto::token::ExpiresAt;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -67,59 +66,27 @@ pub const LINGER_REAP_GRACE: Duration = Duration::from_secs(60);
 /// would leak for the process lifetime, one per in-flight game across a restart.
 pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 
-/// The floor under the never-started reap window: how long a freshly created
-/// session is given to actually start — a real client dialing in, reported
-/// either by a relay heartbeat or by an accounting event — before the
-/// coordinator concludes nobody ever will and retires it. Comfortably covers
-/// realistic matchmaking-to-dial latency (queueing, retries, a slow client)
-/// while still bounding an abandoned create's leak to a bounded span rather
-/// than forever.
+/// How long a freshly created session may sit with **no client ever having
+/// connected** — no relay heartbeat naming a connected slot for it, no
+/// accounting event — before the coordinator concludes nobody ever will and
+/// retires it. Comfortably covers realistic matchmaking-to-dial latency
+/// (queueing, retries, a slow client) while bounding an abandoned create's
+/// footprint — its lifecycle entry, its descriptors on every assigned relay,
+/// and the warm-relay demand those imply — to a bounded span rather than
+/// forever.
 ///
-/// This is the floor, not the whole story: `never_started_grace` takes the
-/// LATER of this and the session's own token expiry (plus
-/// [`NEVER_STARTED_EXPIRY_MARGIN`]), so a session whose tokens are still
-/// legitimately usable is never reaped out from under a client that could
-/// still dial in. A caller that wants tokens with no real expiry mints
-/// `ExpiresAt(u64::MAX)`, which `never_started_grace` reads as "no signal"
-/// rather than "584 billion years from now" — see its own doc — and falls back
-/// to this floor, so a no-expiry session is still bounded by it.
-pub const NEVER_STARTED_REAP_FLOOR: Duration = Duration::from_secs(15 * 60);
-
-/// Extra margin held past a session's token expiry (when it has a real one)
-/// before the never-started reap fires, so a client racing the exact expiry
-/// instant is not cut off by the reaper before its own token-expiry
-/// rejection would have applied anyway.
-pub const NEVER_STARTED_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
-
-/// How long a freshly created session gets before the never-started reap
-/// concludes nobody ever dialed in: the later of `floor` and however long
-/// `expires_at`'s tokens still have left, plus `expiry_margin`. Production
-/// calls always pass [`NEVER_STARTED_REAP_FLOOR`] and
-/// [`NEVER_STARTED_EXPIRY_MARGIN`]; both are parameters (rather than the bare
-/// constants) so a test can shrink the floor without waiting out the
-/// production window.
-///
-/// `u64::MAX` — the sentinel a caller mints when it wants tokens that
-/// effectively never expire — is treated as "no real expiry was set", not as a
-/// literal ~584-billion-year deadline: computing a duration from it and taking
-/// the max against the floor would make the floor irrelevant and the reaper
-/// never fire, exactly backwards from the point of having one. Only a genuinely
-/// finite `expires_at` can push the window out past the floor.
-fn never_started_grace(
-    expires_at: ExpiresAt,
-    floor: Duration,
-    expiry_margin: Duration,
-) -> Duration {
-    if expires_at.0 == u64::MAX {
-        return floor;
-    }
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let until_expiry = Duration::from_secs(expires_at.0.saturating_sub(now_unix));
-    floor.max(until_expiry.saturating_add(expiry_margin))
-}
+/// Deliberately NOT extended to the session's token lifetime. Tokens stay
+/// valid for hours so a client that connected and then dropped can redial
+/// across a long outage — but that client's session has *started* (its first
+/// presence permanently disarms this reap), so this window never governs it.
+/// A session nothing ever dialed has no such client to protect, and holding
+/// its state for the token lifetime instead would pin its descriptors (and
+/// keep its assigned relays looking busy, blocking their scale-down) for
+/// hours per abandoned create. A straggler whose first-ever dial lands after
+/// this window finds the session gone — its still-valid token buys nothing —
+/// and falls back to its caller's create path, exactly as if the create had
+/// never happened.
+pub const NEVER_STARTED_REAP_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// One session's ordered dispatch queue's capacity. A session's genuine
 /// notice volume is small and bounded by its slot count: at most one
@@ -257,12 +224,10 @@ struct Inner {
     /// queue-overflow test doesn't need to push the full production headroom
     /// through a fake endpoint to observe the drop policy.
     queue_capacity: usize,
-    /// The never-started reap's floor and expiry margin —
-    /// [`NEVER_STARTED_REAP_FLOOR`] and [`NEVER_STARTED_EXPIRY_MARGIN`] in
-    /// production; injectable ([`Lifecycle::with_test_tunables`]) for the
+    /// The never-started reap's grace window — [`NEVER_STARTED_REAP_GRACE`]
+    /// in production; injectable ([`Lifecycle::with_test_tunables`]) for the
     /// same reason as `queue_capacity`.
-    never_started_floor: Duration,
-    never_started_expiry_margin: Duration,
+    never_started_grace: Duration,
     /// The notice dedup sets to prune when a session's state is removed, wired in
     /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
     /// built without one (a test that never exercises dedup) simply skips pruning.
@@ -319,8 +284,7 @@ impl Lifecycle {
                 linger_grace,
                 webhook_grace,
                 queue_capacity: NOTICE_QUEUE_CAPACITY,
-                never_started_floor: NEVER_STARTED_REAP_FLOOR,
-                never_started_expiry_margin: NEVER_STARTED_EXPIRY_MARGIN,
+                never_started_grace: NEVER_STARTED_REAP_GRACE,
                 dedup: OnceLock::new(),
             }),
         }
@@ -328,10 +292,10 @@ impl Lifecycle {
 
     /// [`with_graces`](Self::with_graces) plus every other production
     /// constant a test might need to shrink: the per-session queue capacity
-    /// and the never-started reap's floor and expiry margin. Each defaults
-    /// to its production value in [`with_graces`](Self::with_graces); this
-    /// exists only so a test can override the ones it actually cares about
-    /// without waiting out the real windows.
+    /// and the never-started reap's grace. Each defaults to its production
+    /// value in [`with_graces`](Self::with_graces); this exists only so a
+    /// test can override the ones it actually cares about without waiting
+    /// out the real windows.
     #[cfg(test)]
     fn with_test_tunables(
         setup: SessionSetup,
@@ -339,8 +303,7 @@ impl Lifecycle {
         linger_grace: Duration,
         webhook_grace: Duration,
         queue_capacity: usize,
-        never_started_floor: Duration,
-        never_started_expiry_margin: Duration,
+        never_started_grace: Duration,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -350,8 +313,7 @@ impl Lifecycle {
                 linger_grace,
                 webhook_grace,
                 queue_capacity,
-                never_started_floor,
-                never_started_expiry_margin,
+                never_started_grace,
                 dedup: OnceLock::new(),
             }),
         }
@@ -369,10 +331,6 @@ impl Lifecycle {
     /// never-started reap for it (see `fire_never_started`). Called from
     /// `create_session`. A repeat call (a session id collision, or a re-create)
     /// replaces the accounting inputs while keeping the existing queue.
-    ///
-    /// `expires_at` is the tokens' expiry the create minted, carried through
-    /// only to size the never-started grace window
-    /// (`never_started_grace`) — it is not otherwise interpreted here.
     pub fn register_session(
         &self,
         tenant: TenantId,
@@ -380,7 +338,6 @@ impl Lifecycle {
         serving_relays: Vec<RelayId>,
         player_slots: HashSet<SlotId>,
         observer_slots: HashSet<SlotId>,
-        expires_at: ExpiresAt,
     ) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
@@ -405,12 +362,8 @@ impl Lifecycle {
             timer.abort();
         }
         if !state.started {
-            let grace = never_started_grace(
-                expires_at,
-                self.inner.never_started_floor,
-                self.inner.never_started_expiry_margin,
-            );
-            state.never_started_timer = Some(self.arm_never_started(tenant, session, grace));
+            state.never_started_timer =
+                Some(self.arm_never_started(tenant, session, self.inner.never_started_grace));
         }
     }
 
@@ -1300,7 +1253,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // Slot 0 accounts (departs); slot 1 is the lone holdout → holdout timer arms.
@@ -1329,7 +1281,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped); // arms holdout for slot 1
@@ -1356,7 +1307,6 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::from([SlotId(2)]),
-            ExpiresAt(u64::MAX),
         );
 
         // Both players report a result (accounted, but not departed) → linger arms.
@@ -1393,7 +1343,6 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // The first serving relay closes: no sessionClosed yet, and still alive.
@@ -1436,7 +1385,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // Enqueue a departure webhook (its delivery will hang at the receiver).
@@ -1484,7 +1432,7 @@ mod tests {
         let gate = StdArc::new(TokioNotify::new());
         let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
         let setup = setup_with_notify(url.clone());
-        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, CAPACITY, HOUR, HOUR);
+        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, CAPACITY, HOUR);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -1492,7 +1440,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // The first notice is picked up by the drain task immediately and
@@ -1581,17 +1528,10 @@ mod tests {
     async fn a_never_started_session_reaps_while_a_started_one_does_not() {
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
-        // Only the never-started floor is shrunk; every other grace stays at
+        // Only the never-started grace is shrunk; every other grace stays at
         // production scale so nothing else in this test fires early.
-        let lc = Lifecycle::with_test_tunables(
-            setup,
-            HOUR,
-            HOUR,
-            HOUR,
-            NOTICE_QUEUE_CAPACITY,
-            SHORT,
-            HOUR,
-        );
+        let lc =
+            Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT);
 
         // Session A: registered and never touched again -- no presence, no
         // accounting -- so it must reap once its grace lapses.
@@ -1602,7 +1542,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // Session B: a departure arrives before the grace -- proof a real
@@ -1614,7 +1553,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
         lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left);
 
@@ -1647,15 +1585,8 @@ mod tests {
     async fn the_never_started_reaper_cancels_on_late_presence() {
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
-        let lc = Lifecycle::with_test_tunables(
-            setup,
-            HOUR,
-            HOUR,
-            HOUR,
-            NOTICE_QUEUE_CAPACITY,
-            SHORT,
-            HOUR,
-        );
+        let lc =
+            Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT);
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -1663,7 +1594,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // A relay heartbeat reports the slot connected -- mirroring
@@ -1694,7 +1624,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
         assert!(lc.is_alive(&tid(), live), "a created session is alive");
 
@@ -1827,7 +1756,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // Arm and fire the holdout reap so a directive is pending for relay 1.
@@ -1865,7 +1793,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         dedup.departures.lock().insert((tid(), s, SlotId(0)));
@@ -1959,7 +1886,6 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // Membership is recorded; exhaust the session's limiter bucket so its later
@@ -2010,7 +1936,6 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // create_session staged a descriptor for the sole serving relay.
@@ -2120,7 +2045,6 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
         assert_eq!(setup.serving_relays(&tid(), s), vec![RelayId(1)]);
 
@@ -2170,7 +2094,6 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         registry::remove(setup.registry(), RelayId(1));
@@ -2297,7 +2220,6 @@ mod tests {
             setup.serving_relays(&tid(), s),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         assert!(registry::mark_draining(setup.registry(), RelayId(2), gen2));
@@ -2350,7 +2272,6 @@ mod tests {
             vec![RelayId(1)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         // The replacement's close arrives first, evaluated against the pre-swap
@@ -2397,7 +2318,6 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         lc.on_session_closed(tid(), s, RelayId(2));
@@ -2431,7 +2351,6 @@ mod tests {
             vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0)]),
             HashSet::new(),
-            ExpiresAt(u64::MAX),
         );
 
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(1));

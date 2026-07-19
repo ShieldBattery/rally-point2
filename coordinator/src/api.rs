@@ -305,10 +305,10 @@ pub fn router(state: CoordinatorState) -> Router {
 /// [`CoordinatorState::player_token_lifetime`] (saturating). A relay rejects an
 /// expired token at handshake, so the lifetime must outlast every (re)connection
 /// a client makes over a session's life — initial connect, same-relay reconnect,
-/// re-home. That same expiry also sizes the never-started reaper's grace window
-/// (see `lifecycle::never_started_grace`): a freshly created session is held at
-/// least until its tokens can no longer be used to dial in, so the reaper never
-/// retires a session a straggler could still legitimately connect to.
+/// re-home. The never-started reaper deliberately does NOT wait out this
+/// lifetime: a session no client ever dialed is retired after the fixed
+/// `lifecycle::NEVER_STARTED_REAP_GRACE`, token validity notwithstanding — see
+/// that constant's doc for the rationale.
 ///
 /// On a provisioning-enabled coordinator, a request naming a region with no
 /// available relay does not immediately fall back: the coordinator warms that
@@ -404,10 +404,9 @@ async fn create_session(
 
     // Arm the session's lifecycle only on a fresh mint: its serving relay set
     // (the distinct home relays of its slots) and its player/observer slots
-    // drive `sessionClosed` and the reap policies. `expires_at` sizes the
-    // never-started reap's grace window (see `lifecycle::never_started_grace`)
-    // -- the same value the tokens above just carried, so the reaper never
-    // gives up before a client's own token would have.
+    // drive `sessionClosed` and the reap policies, including the fixed
+    // never-started grace (see `lifecycle::NEVER_STARTED_REAP_GRACE` for why
+    // that window is deliberately shorter than the tokens' lifetime).
     //
     // A replayed create must skip this: the original create already registered
     // this session, and re-registering would reset its never-started clock and
@@ -420,7 +419,6 @@ async fn create_session(
             state.setup.serving_relays(&tenant, resp.session),
             player_slots,
             observer_slots,
-            expires_at,
         );
         crate::metrics::session_created(&tenant);
     }
@@ -3287,7 +3285,6 @@ mod tests {
             vec![RelayId(1)],
             std::collections::HashSet::from([SlotId(0)]),
             std::collections::HashSet::new(),
-            rally_point_proto::token::ExpiresAt(u64::MAX),
         );
         let app = router(state);
 
@@ -5102,7 +5099,6 @@ mod tests {
             vec![RelayId(1)],
             std::collections::HashSet::from([SlotId(0)]),
             std::collections::HashSet::new(),
-            rally_point_proto::token::ExpiresAt(u64::MAX),
         );
         let presence_session = create_session_with_user(&state, "sb-user-7");
         presence::apply_heartbeat(
@@ -5180,7 +5176,6 @@ mod tests {
             vec![RelayId(1)],
             std::collections::HashSet::from([SlotId(0)]),
             std::collections::HashSet::new(),
-            rally_point_proto::token::ExpiresAt(u64::MAX),
         );
         let _presence_session = create_session_with_user(&state, "sb-user-7");
 
