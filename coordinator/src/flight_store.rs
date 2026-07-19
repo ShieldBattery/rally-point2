@@ -390,11 +390,10 @@ fn decompress_recording(compressed: &[u8]) -> Result<Vec<u8>, FlightStoreError> 
 /// one (they carry the same bytes when both exist, but the pinned one is the surviving
 /// copy after a convergence sweep). `None` when neither exists.
 ///
-/// A stored blob is zstd-compressed JSON; this decompresses it (bounded — see
-/// [`decompress_recording`]) so the caller serves ready-to-use JSON. A blob that is not
-/// valid zstd, or that decompresses past [`MAX_DECOMPRESSED_BLOB_BYTES`], is a
-/// store-integrity error, not a `None` — the caller serves it as a store error rather
-/// than the raw bytes.
+/// A stored blob is zstd-compressed JSON; this decompresses it so the caller serves
+/// ready-to-use JSON. A blob that is not valid zstd, or that decompresses past
+/// [`MAX_DECOMPRESSED_BLOB_BYTES`], is a store-integrity error, not a `None` — the
+/// caller serves it as a store error rather than the raw bytes.
 pub async fn fetch_recording<S: FlightStore>(
     store: &S,
     tenant: &TenantId,
