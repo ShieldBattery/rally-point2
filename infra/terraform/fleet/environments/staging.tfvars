@@ -6,3 +6,10 @@ coordinator_url = "https://staging-rp2-coordinator.shieldbattery.net"
 # rather than the promoted `stable` tag prod uses. Each fresh task launch pulls
 # whatever `latest` currently points at.
 relay_image_tag = "latest"
+
+# Sized above the smallest Fargate class: 0.25-vCPU tasks carry the smallest
+# network/connection-tracking allowances, which silently dropped QUIC handshakes
+# and turn datagrams at a few hundred concurrent players before the relay itself
+# was anywhere near CPU-bound.
+task_cpu    = 1024
+task_memory = 2048
