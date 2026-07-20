@@ -26,11 +26,19 @@
 
 use libfuzzer_sys::fuzz_target;
 use rally_point_proto::ids::SlotId;
+use rally_point_proto::messages::Payload;
 use rally_point_relay::validation::{ValidationError, validate_turn};
 
 fuzz_target!(|commands: &[u8]| {
     let slot = SlotId(3);
-    match validate_turn(slot, 7, Some(41), commands) {
+    let payload = Payload {
+        seq: 7,
+        slot: u32::MAX,
+        commands: commands.to_vec().into(),
+        game_frame_count: Some(41),
+        buffer_directive: None,
+    };
+    match validate_turn(slot, payload) {
         Ok(validated) => {
             assert_eq!(validated.payload.slot, u32::from(slot.0));
             assert_eq!(validated.payload.seq, 7);
@@ -41,7 +49,7 @@ fuzz_target!(|commands: &[u8]| {
                 assert_eq!(&validated.payload.commands[..], commands);
             }
 
-            let again = validate_turn(slot, 7, Some(41), &validated.payload.commands)
+            let again = validate_turn(slot, validated.payload.clone())
                 .expect("sanitized output must re-validate");
             assert_eq!(again.stripped_control, 0, "sanitizing must be complete");
             assert_eq!(

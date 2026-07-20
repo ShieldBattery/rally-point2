@@ -122,31 +122,32 @@ pub enum ValidationError {
 }
 /// Validates and sanitizes one client turn, binding it to `slot`.
 ///
-/// `commands` is the raw native SC:R command stream the client submitted (with
-/// no transport framing), and `seq` is the turn's origin identity — assigned by
-/// the sending client and preserved end-to-end. On success the returned
-/// [`ValidatedTurn`] holds a payload safe to forward: bound to `slot`, the
-/// client's `seq` preserved verbatim, every command length-checked, and the
+/// `payload.commands` is the raw native SC:R command stream the client submitted
+/// (with no transport framing), and `payload.seq` is the turn's origin identity
+/// — assigned by the sending client and preserved end-to-end. On success the
+/// returned [`ValidatedTurn`] holds a payload safe to forward: bound to `slot`,
+/// the client's `seq` preserved verbatim, every command length-checked, and the
 /// commands a live turn shouldn't carry (relay-owned pacing, replay-playback)
-/// stripped. An empty `commands` (a bare turn signal, or a turn that stripped
-/// down to nothing) is valid and yields an empty payload.
+/// stripped. An empty command stream (a bare turn signal, or a turn that stripped
+/// down to nothing) is valid and yields an empty payload. When nothing needs
+/// stripping, validation reuses the decoded command buffer without copying it.
 ///
-/// `game_frame_count` is the consensus coordinate — which simulated step the
-/// turn belongs to. Like `seq`, it is preserved verbatim across the seam: a
-/// forwarded turn carries the sender's frame, never a relay-stamped one, so the
-/// relay never silently strips the coordinate the latency-buffer and leave
-/// consensus engines key on. `None` means the payload has no consensus coordinate
-/// (lobby turns); those don't participate in apply-at-turn-N decisions.
+/// `payload.game_frame_count` is the consensus coordinate — which simulated
+/// step the turn belongs to. Like `payload.seq`, it is preserved verbatim across
+/// the seam: a forwarded turn carries the sender's frame, never a relay-stamped
+/// one, so the relay never silently strips the coordinate the latency-buffer and
+/// leave consensus engines key on. `None` means the payload has no consensus
+/// coordinate (lobby turns); those don't participate in apply-at-turn-N decisions.
 ///
 /// This is the attacker-facing parse: it never panics and never reads beyond a
 /// command's declared length.
-pub fn validate_turn(
-    slot: SlotId,
-    seq: u64,
-    game_frame_count: Option<u32>,
-    commands: &[u8],
-) -> Result<ValidatedTurn, ValidationError> {
-    let mut forwarded = Vec::with_capacity(commands.len());
+pub fn validate_turn(slot: SlotId, mut payload: Payload) -> Result<ValidatedTurn, ValidationError> {
+    // The overwhelmingly common case is an honest turn with nothing to strip.
+    // Keep the decoded `Bytes` in place in that case. The first stripped command
+    // lazily creates a replacement and copies the already-validated prefix;
+    // later allowed commands append to it as the walk continues.
+    let commands = &payload.commands;
+    let mut forwarded: Option<Vec<u8>> = None;
     let mut stripped_control: u32 = 0;
     let mut offset = 0;
 
@@ -172,25 +173,29 @@ pub fn validate_turn(
 
         if is_stripped_from_live_turn(opcode) {
             stripped_control += 1;
-        } else {
-            forwarded.extend_from_slice(command);
+            if forwarded.is_none() {
+                let mut sanitized = Vec::with_capacity(commands.len());
+                sanitized.extend_from_slice(&commands[..offset]);
+                forwarded = Some(sanitized);
+            }
+        } else if let Some(sanitized) = forwarded.as_mut() {
+            sanitized.extend_from_slice(command);
         }
 
         offset += length;
     }
 
+    payload.slot = u32::from(slot.0);
+    // A freshly validated client turn carries no buffer directive: the relay
+    // stamps that onto turns it forwards, never onto ingress. (Leaves aren't on
+    // the turn envelope at all — they ride the control stream.)
+    payload.buffer_directive = None;
+    if let Some(forwarded) = forwarded {
+        payload.commands = forwarded.into();
+    }
+
     Ok(ValidatedTurn {
-        payload: Payload {
-            seq,
-            slot: u32::from(slot.0),
-            game_frame_count,
-            // A freshly validated client turn carries no buffer directive: the
-            // relay stamps that onto turns it forwards, never onto ingress.
-            // (Leaves aren't on the turn envelope at all — they ride the control
-            // stream.)
-            buffer_directive: None,
-            commands: forwarded.into(),
-        },
+        payload,
         stripped_control,
     })
 }
@@ -200,6 +205,28 @@ mod tests {
     use super::*;
 
     const SLOT: SlotId = SlotId(3);
+
+    fn payload(seq: u64, game_frame_count: Option<u32>, commands: &[u8]) -> Payload {
+        Payload {
+            seq,
+            // Deliberately untrusted: successful validation must replace it
+            // with the authorized slot.
+            slot: u32::MAX,
+            commands: commands.to_vec().into(),
+            game_frame_count,
+            buffer_directive: None,
+        }
+    }
+
+    fn validate_bytes(
+        slot: SlotId,
+        seq: u64,
+        game_frame_count: Option<u32>,
+        commands: &[u8],
+    ) -> Result<ValidatedTurn, ValidationError> {
+        validate_turn(slot, payload(seq, game_frame_count, commands))
+    }
+
     /// Validate `commands` for [`SLOT`] with `seq` and unwrap the sanitized turn.
     fn validated(commands: &[u8]) -> ValidatedTurn {
         validated_with_seq(SLOT, 0, commands)
@@ -207,7 +234,7 @@ mod tests {
 
     /// Validate `commands` for `slot` with `seq` and unwrap the sanitized turn.
     fn validated_with_seq(slot: SlotId, seq: u64, commands: &[u8]) -> ValidatedTurn {
-        validate_turn(slot, seq, None, commands).expect("turn should validate")
+        validate_bytes(slot, seq, None, commands).expect("turn should validate")
     }
 
     #[test]
@@ -237,7 +264,7 @@ mod tests {
         // never dropping or restamping it, so the latency-buffer and leave
         // consensus engines can key on it. A None (lobby turn) stays None.
         for frame in [None, Some(0u32), Some(1), Some(42), Some(u32::MAX)] {
-            let turn = validate_turn(SLOT, 0, frame, &[0x05]).unwrap();
+            let turn = validate_bytes(SLOT, 0, frame, &[0x05]).unwrap();
             assert_eq!(turn.payload.game_frame_count, frame);
         }
     }
@@ -247,7 +274,7 @@ mod tests {
         // A keep-alive carries no slot of its own, and the turn never does on the
         // wire either — the relay always stamps the authorized slot.
         for slot in [0u8, 1, 7, 255] {
-            let turn = validate_turn(SlotId(slot), 0, None, &[0x05]).unwrap();
+            let turn = validate_bytes(SlotId(slot), 0, None, &[0x05]).unwrap();
             assert_eq!(turn.payload.slot, u32::from(slot));
         }
     }
@@ -259,6 +286,27 @@ mod tests {
         let turn = validated(&build);
         assert_eq!(&turn.payload.commands[..], &build);
         assert_eq!(turn.stripped_control, 0);
+    }
+
+    #[test]
+    fn reuses_the_command_buffer_when_nothing_is_stripped() {
+        let build = [0x0C, 1, 2, 3, 4, 5, 6, 7];
+        let mut input = payload(9, Some(41), &build);
+        input.buffer_directive = Some(rally_point_proto::messages::BufferDirective {
+            buffer_turns: 6,
+            apply_at_frame: 40,
+            decision_seq: 5,
+            authority_relay_id: Some(7),
+        });
+        let input_ptr = input.commands.as_ptr();
+
+        let turn = validate_turn(SLOT, input).expect("turn should validate");
+
+        assert_eq!(turn.payload.commands.as_ptr(), input_ptr);
+        assert_eq!(&turn.payload.commands[..], &build);
+        // A client cannot smuggle a relay-owned envelope directive through the
+        // zero-copy path.
+        assert_eq!(turn.payload.buffer_directive, None);
     }
 
     #[test]
@@ -338,7 +386,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_opcode() {
         // 0x00 is a hole in the table; the whole turn is refused.
-        let err = validate_turn(SLOT, 0, None, &[0x00]).unwrap_err();
+        let err = validate_bytes(SLOT, 0, None, &[0x00]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -356,7 +404,7 @@ mod tests {
         // decision to revisit only if SB brings save/load back — not a claim that
         // the commands are inherently invalid.
         for opcode in [0x06u8, 0x07] {
-            let err = validate_turn(SLOT, 0, None, &[opcode]).unwrap_err();
+            let err = validate_bytes(SLOT, 0, None, &[opcode]).unwrap_err();
             assert_eq!(err, ValidationError::UnknownOpcode { offset: 0, opcode });
         }
     }
@@ -365,7 +413,7 @@ mod tests {
     fn reports_the_offset_of_a_bad_opcode_mid_stream() {
         // A valid KeepAlive, then garbage: the error points at the garbage.
         let stream = [0x05, 0xFF];
-        let err = validate_turn(SLOT, 0, None, &stream).unwrap_err();
+        let err = validate_bytes(SLOT, 0, None, &stream).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnknownOpcode {
@@ -378,7 +426,7 @@ mod tests {
     #[test]
     fn rejects_a_fixed_command_that_overruns_the_turn() {
         // Build claims 8 bytes but only 4 are present.
-        let err = validate_turn(SLOT, 0, None, &[0x0C, 1, 2, 3]).unwrap_err();
+        let err = validate_bytes(SLOT, 0, None, &[0x0C, 1, 2, 3]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -391,7 +439,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_missing_its_count_byte() {
         // Classic select with no count byte at all.
-        let err = validate_turn(SLOT, 0, None, &[0x09]).unwrap_err();
+        let err = validate_bytes(SLOT, 0, None, &[0x09]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -404,7 +452,7 @@ mod tests {
     #[test]
     fn rejects_a_variable_command_whose_count_overruns_the_turn() {
         // Select claims 3 entries (2 + 2*3 = 8 bytes) but only carries one.
-        let err = validate_turn(SLOT, 0, None, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
+        let err = validate_bytes(SLOT, 0, None, &[0x09, 3, 0xAA, 0xBB]).unwrap_err();
         assert_eq!(
             err,
             ValidationError::Truncated {
@@ -426,7 +474,7 @@ mod tests {
     /// coverage-guided fuzz target (`relay/fuzz/fuzz_targets/validate_turn.rs`)
     /// asserts the same set.
     fn assert_validator_invariants(commands: &[u8]) {
-        match validate_turn(SLOT, 7, Some(41), commands) {
+        match validate_bytes(SLOT, 7, Some(41), commands) {
             Ok(validated) => {
                 // Binding: everything but the command bytes comes from the
                 // caller, never from the attacker-controlled input.
@@ -442,7 +490,7 @@ mod tests {
                 // Fixpoint: what the relay forwards must itself validate
                 // clean, byte-for-byte — a peer re-parsing forwarded bytes
                 // must never disagree with the ingress validator.
-                let again = validate_turn(SLOT, 7, Some(41), &validated.payload.commands)
+                let again = validate_bytes(SLOT, 7, Some(41), &validated.payload.commands)
                     .expect("sanitized output must re-validate");
                 assert_eq!(again.stripped_control, 0, "sanitizing must be complete");
                 assert_eq!(again.payload.commands, validated.payload.commands);

@@ -100,14 +100,13 @@
 //! sidecar because the mesh RTT is a property of the relay-pair, not of any
 //! individual client's link.
 //!
-//! **N-relay gap.** The single `mesh_rtt_us` parameter models a 2-relay path
-//! (authority -> peer -> client). For N>2 relays, a turn between two *remote*
-//! slots on different peer relays traverses `peer1 -> authority -> peer2`, and
-//! the authority doesn't directly observe the peer1<->peer2 mesh RTT. The robust
-//! fix is accumulating one-way mesh RTT per hop as conditions flood across the
-//! mesh (a proto field + mesh-forward change). Until the mesh edge is wired,
-//! this 2-relay simplification is correct for the topology it serves and is
-//! not end-to-end testable with peer conditions.
+//! **N-relay gap.** The single `mesh_rtt_us` parameter models the authority's
+//! direct link to one peer. For N>2 relays, a turn between two *remote* slots on
+//! different peer relays traverses their direct peer1<->peer2 link, whose RTT
+//! the authority does not observe. A robust extension would distribute
+//! relay-pair RTT observations explicitly. Until then, this simplification is
+//! exact for two relays and approximate for remote-to-remote pairs in a larger
+//! full mesh.
 //!
 //! # Jitter awareness
 //!
@@ -167,7 +166,9 @@ use rally_point_proto::control::{
     ResultNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
-use rally_point_proto::messages::{BufferDirective, LeaveDirective, LinkConditions};
+use rally_point_proto::messages::{
+    BufferDirective, LeaveDirective, LinkConditions, SlotConditions,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::routing::SessionKey;
@@ -283,8 +284,7 @@ struct TargetInputs {
 
 /// How many recent RTT samples to keep per slot for jitter-aware sizing.
 /// At 24 turns/sec this is ~1.3s of history -- enough to catch the latency
-/// spikes that cause lockstep stalls without excessive memory (128 bytes
-/// per slot, 8 slots max = 1KB).
+/// spikes that cause lockstep stalls while retaining bounded, inline storage.
 const RTT_WINDOW_SIZE: usize = 32;
 
 /// Ceiling on any single ingested RTT sample, in microseconds (10 seconds).
@@ -336,11 +336,18 @@ impl Default for ControlLaw {
 ///
 /// A `0` RTT (QUIC's "no measurement yet" sentinel) is never pushed -- it
 /// means "no data," not "zero latency."
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RttWindow {
     samples: [u32; RTT_WINDOW_SIZE],
     head: usize,
     len: usize,
+    /// Sample indices in arrival order with strictly decreasing RTTs. The
+    /// front is always the current maximum; dominated samples are removed from
+    /// the back as a new sample arrives. Each index enters and leaves once, so
+    /// updates are amortized O(1) without a heap allocation.
+    max_indices: [u8; RTT_WINDOW_SIZE],
+    max_head: usize,
+    max_len: usize,
 }
 
 impl Default for RttWindow {
@@ -349,6 +356,9 @@ impl Default for RttWindow {
             samples: [0; RTT_WINDOW_SIZE],
             head: 0,
             len: 0,
+            max_indices: [0; RTT_WINDOW_SIZE],
+            max_head: 0,
+            max_len: 0,
         }
     }
 }
@@ -359,7 +369,37 @@ impl RttWindow {
         if rtt == 0 {
             return;
         }
-        self.samples[self.head] = rtt;
+
+        let sample_index = self.head;
+
+        // When full, `head` names the sample aging out. Monotonic-queue
+        // indices remain in arrival order, so the expired index, when it has
+        // not already been dominated, can only be at the front.
+        if self.len == RTT_WINDOW_SIZE
+            && self.max_len > 0
+            && usize::from(self.max_indices[self.max_head]) == sample_index
+        {
+            self.max_head = (self.max_head + 1) % RTT_WINDOW_SIZE;
+            self.max_len -= 1;
+        }
+
+        // Samples no larger than the new one can never become the maximum
+        // before it expires, so retire them from the back. Removing ties keeps
+        // the newest equal maximum, which outlives every older copy.
+        while self.max_len > 0 {
+            let back = (self.max_head + self.max_len - 1) % RTT_WINDOW_SIZE;
+            let back_index = usize::from(self.max_indices[back]);
+            if self.samples[back_index] > rtt {
+                break;
+            }
+            self.max_len -= 1;
+        }
+
+        self.samples[sample_index] = rtt;
+        let max_tail = (self.max_head + self.max_len) % RTT_WINDOW_SIZE;
+        self.max_indices[max_tail] = sample_index as u8;
+        self.max_len += 1;
+
         self.head = (self.head + 1) % RTT_WINDOW_SIZE;
         if self.len < RTT_WINDOW_SIZE {
             self.len += 1;
@@ -369,7 +409,10 @@ impl RttWindow {
     /// The recent max RTT -- the jitter-aware estimate. Returns `0` when no
     /// sample has been pushed yet (no measurement available).
     fn max(&self) -> u32 {
-        self.samples[..self.len].iter().copied().max().unwrap_or(0)
+        if self.max_len == 0 {
+            return 0;
+        }
+        self.samples[usize::from(self.max_indices[self.max_head])]
     }
 }
 
@@ -389,7 +432,7 @@ impl RttWindow {
 /// computed from a single cumulative snapshot. A high RTT on the first sample
 /// can still raise the target -- RTT is instantaneous and doesn't need a
 /// baseline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SlotState {
     /// Ring buffer of recent RTT samples for jitter-aware sizing.
     rtt_window: RttWindow,
@@ -462,15 +505,6 @@ impl SlotState {
         let delta_lost = self.curr_lost.saturating_sub(self.prev_lost);
         Some((delta_lost as f64 / delta_sent as f64).min(1.0))
     }
-
-    /// The loss risk: `loss_rate * eff_RTT` (in us). This is the expected burst
-    /// duration on this link -- how many us of packets could be lost during one
-    /// round-trip. Higher on high-latency links because more packets are in
-    /// flight during the burst window. Returns `None` when no loss delta is
-    /// available (first sample, or stale sidecar).
-    fn loss_risk(&self) -> Option<f64> {
-        self.loss_rate().map(|rate| rate * self.eff_rtt() as f64)
-    }
 }
 
 /// The latency-buffer decision-maker for one session.
@@ -506,8 +540,8 @@ pub struct DecisionMaker {
     /// broadcast directive, so clients receiving copies out of order (or a
     /// superseded directive after its replacement) keep only the newest. Also
     /// advanced by [`observe_directive`](Self::observe_directive) to the
-    /// highest seq seen on *forwarded* stamps: every directive floods through
-    /// every relay serving the session, so a relay promoted to authority
+    /// highest seq seen on *forwarded* stamps: an authority's local turns carry
+    /// each directive directly to every relay serving the session, so a relay promoted to authority
     /// continues the numbering instead of restarting below what clients
     /// already hold (which they would ignore).
     decision_seq: u32,
@@ -1015,16 +1049,15 @@ impl TokenBucket {
 /// counting wrong:
 ///
 /// - **Reordering and lead.** QUIC datagrams are unordered at both the client
-///   edge and across mesh flooding, and a client legitimately runs up to the
+///   edge and on each direct mesh link, and a client legitimately runs up to the
 ///   latency buffer's depth *ahead* of its slowest peer's arrivals at the
 ///   relay (producing turn `k+1` only requires having *executed* step
 ///   `k+1 - depth`, not having every peer's turn `k` already in hand). So a
 ///   slot's own turns can arrive at the relay out of order, and a slot's very
 ///   first observed sync command can already be several ordinals into its
 ///   stream.
-/// - **Duplication.** The mesh legitimately delivers the same turn to the
-///   authority via more than one path — that's what `mark_seen`/`MeshSeen`
-///   exist to catch. The comparator relies on its caller
+/// - **Duplication.** Link replacement, resume replay, and slot re-home overlap
+///   can present the same turn to the authority more than once. The comparator relies on its caller
 ///   ([`DecisionMaker::observe_sync`]) handing it each distinct `(slot, seq)`
 ///   turn exactly once; counting is not idempotent the way `observe_frame`'s
 ///   monotone max is, so a duplicate that reached this far would silently
@@ -2155,7 +2188,15 @@ impl DecisionMaker {
     /// turn observed yet, or this relay is not the authority). The caller
     /// translates a returned decision into a broadcast.
     pub fn ingest_local(&mut self, conditions: &LinkConditions) -> Option<Decision> {
-        self.ingest(conditions, 0)
+        self.ingest_slots(&conditions.slots, 0)
+    }
+
+    /// Ingests one home-client conditions sample without requiring a
+    /// one-element [`LinkConditions`] allocation. This is the slot-link hot
+    /// path; it shares the same slice-based state update and decision step as
+    /// [`ingest_local`](Self::ingest_local).
+    pub fn ingest_local_condition(&mut self, conditions: &SlotConditions) -> Option<Decision> {
+        self.ingest_slots(std::slice::from_ref(conditions), 0)
     }
 
     /// Ingests a peer relay's `LinkConditions` sidecar (conditions the peer
@@ -2174,13 +2215,17 @@ impl DecisionMaker {
         conditions: &LinkConditions,
         mesh_rtt_us: u32,
     ) -> Option<Decision> {
-        self.ingest(conditions, mesh_rtt_us)
+        self.ingest_slots(&conditions.slots, mesh_rtt_us)
     }
 
     /// Shared ingestion: pushes RTT samples, rotates loss counters, sets the
     /// mesh hop, then runs `decide` if this relay is the authority.
-    fn ingest(&mut self, conditions: &LinkConditions, mesh_rtt_us: u32) -> Option<Decision> {
-        for slot in &conditions.slots {
+    fn ingest_slots(
+        &mut self,
+        conditions: &[SlotConditions],
+        mesh_rtt_us: u32,
+    ) -> Option<Decision> {
+        for slot in conditions {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's tracked RTT/loss state, corrupting that
             // slot's decision inputs instead of merely dropping the malformed
@@ -2256,18 +2301,40 @@ impl DecisionMaker {
     /// the size for external callers. `None` when no slot has an RTT measurement
     /// yet.
     fn target_inputs(&self) -> Option<TargetInputs> {
-        // Collect effective RTTs (rtt + mesh hop) from all slots with a
-        // measurement. The effective RTT is the full one-way path from the
-        // client to the authority relay, so the pairwise formula naturally
-        // includes the mesh hop for cross-relay pairs.
-        let mut eff_rtts: Vec<u32> = self
-            .slots
-            .values()
-            .map(|s| s.eff_rtt())
-            .filter(|&r| r > 0)
-            .collect();
+        // Find the two highest effective RTTs and the worst loss risk in one
+        // pass. The former used to allocate and sort a Vec, while the latter
+        // walked every slot again and recomputed its effective RTT.
+        let mut measured = 0;
+        let mut highest = 0;
+        let mut second_highest = 0;
+        let mut worst_loss_risk = 0.0;
 
-        if eff_rtts.is_empty() {
+        for state in self.slots.values() {
+            // Effective RTT is the full one-way path from the client to the
+            // authority relay, including the mesh hop for remote slots.
+            let eff_rtt = state.eff_rtt();
+            if eff_rtt > 0 {
+                measured += 1;
+                if eff_rtt >= highest {
+                    second_highest = highest;
+                    highest = eff_rtt;
+                } else if eff_rtt > second_highest {
+                    second_highest = eff_rtt;
+                }
+            }
+
+            // Burst loss on high-latency links is worse because more packets
+            // are in flight during the burst window. Reuse the effective RTT
+            // already computed for the pairwise-path calculation.
+            if let Some(loss_rate) = state.loss_rate() {
+                let loss_risk = loss_rate * f64::from(eff_rtt);
+                if loss_risk > worst_loss_risk {
+                    worst_loss_risk = loss_risk;
+                }
+            }
+        }
+
+        if measured == 0 {
             return None; // no RTT data yet, hold
         }
 
@@ -2275,27 +2342,16 @@ impl DecisionMaker {
         // A turn from A to B travels eff_A/2 + eff_B/2 = (eff_A + eff_B) / 2.
         // Using the actual pairwise path (not max_eff) avoids overshooting
         // when only one player has high latency -- lower buffer = less delay.
-        eff_rtts.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        let path_us = if eff_rtts.len() >= 2 {
+        let path_us = if measured >= 2 {
             // Summed in u64: each effective RTT is client-influenced and can
             // saturate near u32::MAX, so a u32 sum could overflow (a
             // debug-build panic; a silently small path in release). The
             // halved sum always fits back into u32.
-            ((u64::from(eff_rtts[0]) + u64::from(eff_rtts[1])) / 2) as u32
+            ((u64::from(highest) + u64::from(second_highest)) / 2) as u32
         } else {
             // One slot: assume symmetric (both legs same eff_RTT).
-            eff_rtts[0]
+            highest
         };
-
-        // Loss recovery turns: burst loss on high-latency links is worse
-        // because more packets are in flight during the burst window. The
-        // term scales with loss_rate * eff_RTT.
-        let worst_loss_risk = self
-            .slots
-            .values()
-            .filter_map(|s| s.loss_risk())
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(0.0);
 
         let turn_us = self.law.turn_duration_us as f64;
         let path_turns = (path_us as f64 / turn_us).ceil() as u32;
@@ -3300,8 +3356,7 @@ impl DecisionMaker {
     /// **Caller contract: exactly once per distinct `(slot, seq)` turn.** The
     /// comparator's per-slot ordinal counting is not idempotent the way
     /// [`observe_frame`](Self::observe_frame)'s monotone max is — a turn handed
-    /// to this method twice (the mesh legitimately delivers the same turn to
-    /// the authority via more than one path) would be counted twice and
+    /// to this method twice (for example during reconnect/resume overlap) would be counted twice and
     /// silently misalign that slot's ordinals. The one call site
     /// (`deliver_turn_to_locals` in `mesh.rs`) is placed immediately after that
     /// function's own duplicate check for exactly this reason — don't add
@@ -4102,7 +4157,7 @@ pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId
 ///
 /// On a **first insert** for the slot — the leave newly entering this relay's
 /// cache — fires one departure notice up the coordinator connection. A redundant
-/// copy (a second mesh path, a reconcile-on-join re-send) inserts nothing and
+/// copy (for example a reconcile-on-join re-send) inserts nothing and
 /// fires nothing, so the coordinator sees at most one notice per relay per slot.
 ///
 /// Returns whether it was a first insert (mirroring
@@ -4382,10 +4437,31 @@ pub fn ingest_local_conditions(
     key: &SessionKey,
     conditions: &LinkConditions,
 ) -> Option<Decision> {
+    ingest_conditions(registry, key, &conditions.slots, 0)
+}
+
+/// The allocation-free single-slot counterpart to [`ingest_local_conditions`].
+/// Slot-link sampling produces exactly one [`SlotConditions`], so accepting it
+/// directly avoids wrapping every sample in a temporary `Vec` while retaining
+/// the identical state update, decision, logging, and flight-recording path.
+pub fn ingest_local_condition(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    conditions: &SlotConditions,
+) -> Option<Decision> {
+    ingest_conditions(registry, key, std::slice::from_ref(conditions), 0)
+}
+
+fn ingest_conditions(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    conditions: &[SlotConditions],
+    mesh_rtt_us: u32,
+) -> Option<Decision> {
     let (decision, directive) = {
         let mut makers = registry.lock();
         let maker = makers.get_mut(key)?;
-        let decision = maker.ingest_local(conditions)?;
+        let decision = maker.ingest_slots(conditions, mesh_rtt_us)?;
         // The queued broadcast carries the decision seq the Decision lacks;
         // read it under the same lock so the recorded event matches exactly
         // what clients will be stamped with.
@@ -4425,15 +4501,7 @@ pub fn ingest_remote_conditions(
     conditions: &LinkConditions,
     mesh_rtt_us: u32,
 ) -> Option<Decision> {
-    let (decision, directive) = {
-        let mut makers = registry.lock();
-        let maker = makers.get_mut(key)?;
-        let decision = maker.ingest_remote(conditions, mesh_rtt_us)?;
-        (decision, maker.pending_directive)
-    };
-    log_decision(key, decision);
-    record_buffer_event(registry, key, directive);
-    Some(decision)
+    ingest_conditions(registry, key, &conditions.slots, mesh_rtt_us)
 }
 
 /// The buffer directive to stamp onto a turn forwarded for this session, if
@@ -4712,7 +4780,195 @@ mod tests {
         maker.ingest_remote(c, mesh_rtt_us)
     }
 
+    /// The allocation-and-sort implementation that `target_inputs` used
+    /// before its single-pass fold. Kept in tests as an equivalence oracle.
+    fn reference_target_inputs(maker: &DecisionMaker) -> Option<TargetInputs> {
+        let mut eff_rtts: Vec<u32> = maker
+            .slots
+            .values()
+            .map(SlotState::eff_rtt)
+            .filter(|&rtt| rtt > 0)
+            .collect();
+        if eff_rtts.is_empty() {
+            return None;
+        }
+
+        eff_rtts.sort_unstable_by(|a, b| b.cmp(a));
+        let path_us = if eff_rtts.len() >= 2 {
+            ((u64::from(eff_rtts[0]) + u64::from(eff_rtts[1])) / 2) as u32
+        } else {
+            eff_rtts[0]
+        };
+        let worst_loss_risk = maker
+            .slots
+            .values()
+            .filter_map(|state| {
+                state
+                    .loss_rate()
+                    .map(|rate| rate * f64::from(state.eff_rtt()))
+            })
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        let turn_us = f64::from(maker.law.turn_duration_us);
+        let path_turns = (f64::from(path_us) / turn_us).ceil() as u32;
+        let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
+
+        Some(TargetInputs {
+            target: path_turns.saturating_add(loss_turns),
+            path_us,
+            worst_loss_risk,
+        })
+    }
+
+    fn assert_target_inputs_match_reference(maker: &DecisionMaker) {
+        let compact = |inputs: TargetInputs| {
+            (
+                inputs.target,
+                inputs.path_us,
+                inputs.worst_loss_risk.to_bits(),
+            )
+        };
+        assert_eq!(
+            maker.target_inputs().map(compact),
+            reference_target_inputs(maker).map(compact),
+        );
+    }
+
+    fn push_rtt_and_check_reference(
+        window: &mut RttWindow,
+        reference: &mut VecDeque<u32>,
+        sample: u32,
+    ) {
+        window.push(sample);
+        if sample != 0 {
+            if reference.len() == RTT_WINDOW_SIZE {
+                reference.pop_front();
+            }
+            reference.push_back(sample);
+        }
+        assert_eq!(
+            window.max(),
+            reference.iter().copied().max().unwrap_or(0),
+            "cached max diverged after pushing {sample}",
+        );
+    }
+
     // -- Target formula --
+
+    #[test]
+    fn single_slot_ingestion_matches_a_one_element_batch() {
+        let mut batch = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let mut single = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let samples = [
+            SlotConditions {
+                slot: 0,
+                rtt_us: 0,
+                lost_packets: 0,
+                sent_packets: 0,
+            },
+            SlotConditions {
+                slot: 0,
+                rtt_us: 150_000,
+                lost_packets: 0,
+                sent_packets: 100,
+            },
+            SlotConditions {
+                slot: 0,
+                rtt_us: 200_000,
+                lost_packets: 20,
+                sent_packets: 200,
+            },
+            SlotConditions {
+                slot: 0,
+                rtt_us: 100_000,
+                lost_packets: 20,
+                sent_packets: 300,
+            },
+        ];
+
+        for (index, sample) in samples.iter().enumerate() {
+            let frame = GameFrameCount(index as u32 + 1);
+            batch.observe_frame(SlotId(0), frame);
+            single.observe_frame(SlotId(0), frame);
+
+            let batch_decision = batch.ingest_local(&LinkConditions {
+                slots: vec![*sample],
+            });
+            let single_decision = single.ingest_local_condition(sample);
+
+            assert_eq!(single_decision, batch_decision, "sample {index}");
+            assert_eq!(single.slots, batch.slots, "sample {index}");
+            assert_eq!(single.buffer, batch.buffer, "sample {index}");
+            assert_eq!(single.last_decision_frame, batch.last_decision_frame);
+            assert_eq!(single.decision_seq, batch.decision_seq);
+            assert_eq!(single.pending_directive, batch.pending_directive);
+            assert_eq!(single.initial_directive_sent, batch.initial_directive_sent);
+            assert_eq!(single.last_trace_frame, batch.last_trace_frame);
+            assert_eq!(single.target(), batch.target(), "sample {index}");
+        }
+    }
+
+    #[test]
+    fn target_fold_matches_sorting_reference_for_ties_missing_rtts_departures_and_loss() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+
+        assert_target_inputs_match_reference(&maker);
+        maker.ingest_local(&conditions(3, 0, 0, 100));
+        assert_target_inputs_match_reference(&maker);
+        assert_eq!(maker.target(), None, "a missing RTT contributes no path");
+
+        maker.ingest_local(&multi_conditions(&[
+            (0, 100_000, 0, 100),
+            (1, 300_000, 0, 100),
+            (2, 300_000, 0, 100),
+            (3, 0, 0, 100),
+        ]));
+        assert_target_inputs_match_reference(&maker);
+        assert_eq!(maker.target_inputs().unwrap().path_us, 300_000);
+
+        maker.ingest_local(&multi_conditions(&[
+            (0, 90_000, 10, 200),
+            (1, 250_000, 20, 200),
+            (2, 200_000, 5, 200),
+            (3, 0, 100, 200),
+        ]));
+        assert_target_inputs_match_reference(&maker);
+        let inputs = maker.target_inputs().unwrap();
+        assert_eq!(inputs.path_us, 300_000, "the two top RTTs are tied");
+        assert_eq!(inputs.worst_loss_risk, 60_000.0);
+        assert_eq!(inputs.target, 10);
+
+        maker.record_departure(SlotId(1), None, None, None, DROPPED);
+        assert_target_inputs_match_reference(&maker);
+        let inputs = maker.target_inputs().unwrap();
+        assert_eq!(inputs.path_us, 200_000);
+        assert_eq!(inputs.worst_loss_risk, 15_000.0);
+        assert_eq!(inputs.target, 6);
+
+        maker.record_departure(SlotId(2), None, None, None, DROPPED);
+        assert_target_inputs_match_reference(&maker);
+        maker.remove_slot(SlotId(0));
+        assert_target_inputs_match_reference(&maker);
+        assert_eq!(maker.target(), None, "only the missing-RTT slot remains");
+    }
 
     /// At 150ms RTT, 0% loss: target == ceil(150000/41666.67) + 0 = 4.
     #[test]
@@ -4958,6 +5214,50 @@ mod tests {
     }
 
     // -- Jitter awareness --
+
+    #[test]
+    fn cached_rtt_max_matches_scanned_window_when_tied_maxima_expire() {
+        let mut window = RttWindow::default();
+        let mut reference = VecDeque::new();
+
+        let mut samples = vec![100_000, 20_000, 100_000];
+        samples.extend((1..=29).map(|sample| sample * 1_000));
+        for sample in samples {
+            push_rtt_and_check_reference(&mut window, &mut reference, sample);
+        }
+        assert_eq!(window.max(), 100_000);
+
+        // Zero is a sentinel and must neither enter nor advance the window.
+        push_rtt_and_check_reference(&mut window, &mut reference, 0);
+        // Expire the first tied maximum; the other copy keeps the same result.
+        push_rtt_and_check_reference(&mut window, &mut reference, 40_000);
+        assert_eq!(window.max(), 100_000);
+        push_rtt_and_check_reference(&mut window, &mut reference, 41_000);
+        // Expire the final copy; the cached value must fall to the true new max.
+        push_rtt_and_check_reference(&mut window, &mut reference, 42_000);
+        assert_eq!(window.max(), 42_000);
+    }
+
+    #[test]
+    fn cached_rtt_max_matches_scanned_window_across_many_wraps() {
+        for seed in 1_u32..=64 {
+            let mut window = RttWindow::default();
+            let mut reference = VecDeque::new();
+            let mut state = seed;
+
+            for _ in 0..512 {
+                // A small value range deliberately creates many tied maxima;
+                // occasional zeroes exercise the skipped-sentinel path.
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let sample = if state & 0xf == 0 {
+                    0
+                } else {
+                    ((state >> 16) % 17 + 1) * 1_000
+                };
+                push_rtt_and_check_reference(&mut window, &mut reference, sample);
+            }
+        }
+    }
 
     /// The decision-maker uses the recent max RTT, not the smoothed mean.
     #[test]
@@ -5975,8 +6275,7 @@ mod tests {
 
     /// A non-authority relay observing a peer authority's leave off the mesh
     /// fires exactly one notice on the first insert, classified "left" for a
-    /// non-drop reason; a redundant re-observe (a second mesh path or a
-    /// reconcile-on-join re-send) fires nothing.
+    /// non-drop reason; a redundant reconcile-on-join re-send fires nothing.
     #[test]
     fn observe_leave_fires_one_departure_notice_on_first_insert() {
         let registry = new_decision_makers();

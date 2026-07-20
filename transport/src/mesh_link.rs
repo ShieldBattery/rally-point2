@@ -41,7 +41,7 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, MeshPacket, Packet, Payload};
 
 use crate::ack_manager::{AckError, AckManager, PacketSeqExhausted};
-use crate::link::{Dedup, Delivery, LinkError, Received};
+use crate::link::{Dedup, Delivery, LinkError, Received, retain_fresh_payloads};
 
 /// Worst-case byte overhead a `MeshPacket` adds around the inner `Packet` when
 /// the wrapper carries no conditions sidecar and no tenant: the session field
@@ -662,51 +662,12 @@ impl SessionLink {
         // while an ack-only packet does not.
         let carried_payloads = !packet.payloads.is_empty();
 
-        // Process payloads low-seq first within each slot. A packet leads with
-        // its fresh (highest) seq per slot, so without this a deep-loss packet's
-        // high seq could shut the window on the older redundant seqs it carries.
-        packet.payloads.sort_by_key(|p| (p.slot, p.seq));
-
-        // Transactional commit: see `Link::process_incoming`'s matching
-        // comment for why a mid-packet failure must roll back every payload
-        // this packet already `accept`ed, not just stop processing — the
-        // same bug (dedup silently believing a payload was delivered that
-        // this call never actually returned in `fresh`) is reachable here
-        // too, since this mirrors that loop exactly.
-        let touched: Vec<SlotId> = {
-            let mut seen = std::collections::BTreeSet::new();
-            packet
-                .payloads
-                .iter()
-                .filter_map(|p| u8::try_from(p.slot).ok().map(SlotId))
-                .filter(|slot| seen.insert(*slot))
-                .collect()
-        };
-        let snapshot = self.dedup.snapshot(&touched);
-
-        let mut fresh = Vec::new();
-        for payload in packet.payloads {
-            // A truncating cast would alias an out-of-range wire slot onto a
-            // different, valid slot's dedup key — corrupting that slot's
-            // window instead of merely rejecting the malformed one.
-            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
-                self.dedup.restore(snapshot);
-                return Err(LinkError::MalformedSlot(payload.slot));
-            };
-            match self.dedup.accept(slot, payload.seq) {
-                Delivery::New => fresh.push(payload),
-                Delivery::Duplicate => {}
-                Delivery::OutOfWindow => {
-                    self.dedup.restore(snapshot);
-                    return Err(LinkError::PayloadOutOfWindow {
-                        slot,
-                        seq: payload.seq,
-                    });
-                }
-            }
-        }
+        // Shared with the client edge so sorting, malformed-slot handling,
+        // transactional rollback, and in-place compaction cannot drift between
+        // the two receive paths.
+        retain_fresh_payloads(&mut self.dedup, &mut packet.payloads)?;
         Ok(Received {
-            fresh,
+            fresh: packet.payloads,
             carried_payloads,
         })
     }
@@ -1107,6 +1068,38 @@ mod tests {
         let received = receiver.recv().await.unwrap();
         assert_eq!(received.delivery.fresh.len(), 1);
         assert_eq!(receiver.delivered_through(session, SlotId(0)), Some(0));
+    }
+
+    #[test]
+    fn session_receive_compacts_fresh_payloads_in_the_decoded_vector() {
+        let mut link = SessionLink {
+            acks: AckManager::new(),
+            dedup: Dedup::with_forward_collapse(),
+        };
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                turn(0, 1, 0xB1),
+                turn(0, 0, 0xA0),
+                turn(0, 0, 0xD0),
+                turn(1, 0, 0xC0),
+            ],
+        };
+        let allocation = packet.payloads.as_ptr();
+        let capacity = packet.payloads.capacity();
+
+        let received = link.process_incoming(packet).unwrap();
+
+        assert_eq!(received.fresh.as_ptr(), allocation);
+        assert_eq!(received.fresh.capacity(), capacity);
+        assert_eq!(received.fresh.len(), 3);
+        assert_eq!(received.fresh[0].commands.as_ref(), &[0xA0]);
+        assert_eq!(received.fresh[1].commands.as_ref(), &[0xB1]);
+        assert_eq!(received.fresh[2].commands.as_ref(), &[0xC0]);
+        assert_eq!(link.dedup.delivered_through(SlotId(0)), Some(1));
+        assert_eq!(link.dedup.delivered_through(SlotId(1)), Some(0));
     }
 
     /// The inner `Packet` is built to `max_datagram_size() - MESH_PACKET_OVERHEAD`

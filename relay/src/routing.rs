@@ -58,11 +58,11 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::{LeaveDirective, LinkConditions, Payload, SlotConditions};
-use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
+use rally_point_proto::messages::{LeaveDirective, Payload, SlotConditions};
+use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::ControlInbound;
 use rally_point_transport::quinn::VarInt;
-use rally_point_transport::{Link, LinkError};
+use rally_point_transport::{Link, LinkError, Received};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 
@@ -429,6 +429,14 @@ pub struct SlotInbox {
 }
 
 impl SlotInbox {
+    /// Non-blockingly pulls the next turn forwarded to this slot, for
+    /// cross-module tests of the local-delivery boundary. `None` when nothing
+    /// is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_forward(&mut self) -> Option<Payload> {
+        self.forward_rx.try_recv()
+    }
+
     /// The slot's shutdown signal, for a cross-module test that drives a close and
     /// asserts the link task would be told to exit.
     #[cfg(test)]
@@ -1056,13 +1064,7 @@ pub async fn run_slot_link(
     // seeds the mesh sidecar for this slot.
     let handshake_sample = sample_slot_conditions(link.connection(), slot);
     crate::mesh::publish_conditions(&conditions, &key, slot, handshake_sample);
-    let _ = consensus::ingest_local_conditions(
-        &decision_makers,
-        &key,
-        &LinkConditions {
-            slots: vec![handshake_sample],
-        },
-    );
+    let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
 
     // Announce this slot's presence to the mesh and record it into the session's
     // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -1154,9 +1156,9 @@ pub async fn run_slot_link(
     // registry until its own teardown drops it, so a `None` is unreachable
     // during the loop; the flag disarms the branch defensively.
     let mut chat_alive = true;
-    // The highest cursor the relay has pushed to the client, per slot. Push only
-    // on advance.
-    let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
+    // Pushes only advancing cursors and reuses one batch buffer for the life of
+    // this link.
+    let mut beacon_writer = BeaconWriter::new();
     // This destination's end-to-end cursor share to the session's mesh peers:
     // push-on-advance, at most one complete-map frame per
     // `DELIVERY_SYNC_MIN_INTERVAL`, so the authority (wherever it is) can fold
@@ -1331,48 +1333,44 @@ pub async fn run_slot_link(
                 if received.carried_payloads {
                     acks_owed = true;
                 }
-                // Sample this client's QUIC path stats on every received packet.
-                // A turn arrives every game step under active play, so this keeps
-                // the mesh's outgoing conditions current exactly when the
-                // decision-maker needs them. Quinn stats don't change while idle,
-                // so a quiet slot's last sample stays valid. Sampling once per
-                // packet (not per payload) is enough — all payloads in one packet
-                // share the same connection's path.
-                let sample = sample_slot_conditions(link.connection(), slot);
-                crate::mesh::publish_conditions(&conditions, &key, slot, sample);
-                // Feed the same sample into this session's decision-maker. The
-                // decision it may fire schedules against the frames observed off
-                // validated turns below — never off this packet's raw claims.
-                let observed = LinkConditions {
-                    slots: vec![sample],
-                };
-                // Any decision it fires is logged by the helper and broadcast
-                // later, at fan-out; nothing to do with it here.
-                let _ = consensus::ingest_local_conditions(&decision_makers, &key, &observed);
+                // Sample this client's QUIC path only when the packet advances
+                // delivery. Ack-only packets and all-redundant recovery copies
+                // cannot advance the game and would merely rotate the same
+                // cumulative counters through the decision-maker again. During
+                // active play a fresh turn arrives every game step, keeping the
+                // published conditions current; Quinn stats do not change while
+                // idle, so a quiet slot's last sample stays valid. Sampling once
+                // per packet (not per payload) is enough — all fresh payloads in
+                // one packet share the same connection path.
+                if should_sample_active_conditions(&received) {
+                    let sample = sample_slot_conditions(link.connection(), slot);
+                    crate::mesh::publish_conditions(&conditions, &key, slot, sample);
+                    // The decision it may fire schedules against frames observed
+                    // off validated turns below — never off raw packet claims —
+                    // and is broadcast later at fan-out.
+                    let _ = consensus::ingest_local_condition(
+                        &decision_makers,
+                        &key,
+                        &sample,
+                    );
+                }
                 for payload in received.fresh {
-                    match validate_turn(
-                        slot,
-                        payload.seq,
-                        payload.game_frame_count,
-                        &payload.commands,
-                    ) {
+                    match validate_turn(slot, payload) {
                         Ok(turn) => {
                             let payload = turn.payload;
                             flight_counters.note_validated(payload.seq);
                             // NOTE: neither the frame observation nor the
-                            // desync comparator is fed here. The mesh delivers
-                            // a turn to a relay via more than one path, so
-                            // consensus has to be fed exactly once per
-                            // distinct (slot, seq) turn -- that's
-                            // `deliver_turn_to_locals`, right after its
-                            // mark_seen dedup, which `forward_turn` below
-                            // funnels into. Only *validated* turns reach that
+                            // desync comparator is fed here. Both client and
+                            // mesh ingress funnel through the session-level
+                            // dedup before consensus, so each distinct
+                            // `(slot, seq)` turn is counted once. Only
+                            // *validated* turns reach that
                             // feed point (a rejected packet breaks the link
                             // above without a trace in decision state), and
                             // the coordinate is the minimum across slots, so
                             // even a validated turn's inflated claim can only
                             // mislead its own slot.
-                            crate::mesh::forward_turn(
+                            crate::mesh::forward_client_turn(
                                 &sessions,
                                 &mesh_links,
                                 &seen_registries,
@@ -1381,7 +1379,6 @@ pub async fn run_slot_link(
                                 &key,
                                 slot,
                                 payload,
-                                crate::delivery::DeliveryHome::Local,
                             );
                         }
                         Err(error) => {
@@ -1403,12 +1400,9 @@ pub async fn run_slot_link(
                 // client's own slot, so one per-slot cursor suffices. Push only on
                 // advance.
                 if let Some(cursor) = link.delivered_through(slot) {
-                    flush_beacon(
-                        &mut beacon_send,
-                        &mut last_beacon_sent,
-                        [(slot, cursor)].into(),
-                    )
-                    .await;
+                    beacon_writer
+                        .flush(&mut beacon_send, std::iter::once((slot, cursor)))
+                        .await;
                 }
                 if link.payloads_in_flight() > UNACKED_WINDOW_CAP {
                     tracing::warn!(
@@ -1774,15 +1768,17 @@ pub async fn run_slot_link(
                         if !fresh {
                             continue;
                         }
-                        match validate_turn(slot, payload.seq, payload.game_frame_count, &payload.commands) {
+                        match validate_turn(slot, payload) {
                             Ok(turn) => {
                                 let payload = turn.payload;
-                                // NOTE: no frame-observation or desync-comparator
-                                // call here either — `forward_turn` funnels into
-                                // the one post-dedup consensus feed point,
+                                flight_counters.note_validated(payload.seq);
+                                // NOTE: no frame-observation or
+                                // desync-comparator call here either —
+                                // `forward_client_turn` funnels into the one
+                                // post-dedup consensus feed point,
                                 // exactly as on the datagram path (see its note
                                 // above).
-                                crate::mesh::forward_turn(
+                                crate::mesh::forward_client_turn(
                                     &sessions,
                                     &mesh_links,
                                     &seen_registries,
@@ -1791,7 +1787,6 @@ pub async fn run_slot_link(
                                     &key,
                                     slot,
                                     payload,
-                                    crate::delivery::DeliveryHome::Local,
                                 );
                             }
                             Err(error) => {
@@ -2004,13 +1999,7 @@ pub async fn run_slot_link(
                 } else {
                     let sample = sample_slot_conditions(link.connection(), slot);
                     crate::mesh::publish_conditions(&conditions, &key, slot, sample);
-                    let _ = consensus::ingest_local_conditions(
-                        &decision_makers,
-                        &key,
-                        &LinkConditions {
-                            slots: vec![sample],
-                        },
-                    );
+                    let _ = consensus::ingest_local_condition(&decision_makers, &key, &sample);
                     pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
                 }
             }
@@ -2158,7 +2147,7 @@ fn end_slot_link(
 
 /// Closes out this relay's serving state for a session whose local roster is
 /// empty — the coordinator `SessionClosed` notice plus the per-session
-/// registries (lobby log, chat, forwarded-turn replay ring, echo-guard dedup,
+/// registries (lobby log, chat, forwarded-turn replay ring, session-level dedup,
 /// decided drop holds) — unless a still-held, undecided departure of a homed
 /// slot promises a reconnect.
 ///
@@ -2230,7 +2219,7 @@ pub(crate) fn maybe_close_emptied_session(
     // Same for the forwarded-turn replay ring: no local slot remains to resume,
     // so nothing more will be replayed from it.
     mesh.turn_ring.end_session(key);
-    // Same for this session's topological-dedup (echo guard) state: no local
+    // Same for this session's forward-once state: no local
     // slot remains to forward to, so there is nothing left for it to gate.
     // Its entry is created lazily on the first turn forwarded for the
     // session (there is no explicit "join" counterpart to pair this with),
@@ -2755,6 +2744,16 @@ fn log_link_closed(key: &SessionKey, slot: SlotId, error: &LinkError) {
     );
 }
 
+/// Whether an active-game receive should refresh this client's path sample.
+/// Transport dedup leaves both ack-only packets and packets containing only
+/// redundant payloads with an empty `fresh` slice; neither represents new game
+/// progress, while any fresh payload makes one sample for the whole datagram
+/// worthwhile.
+#[inline]
+fn should_sample_active_conditions(received: &Received) -> bool {
+    !received.fresh.is_empty()
+}
+
 /// Samples this client's QUIC connection path stats as a [`SlotConditions`], for
 /// both the mesh sidecar and the decision-maker. RTT comes from QUIC's smoothed
 /// path estimate (via [`crate::mesh::rtt_us`], which owns the "0 means no
@@ -2802,6 +2801,27 @@ mod tests {
             commands: vec![0u8; len].into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn active_conditions_sampling_requires_a_fresh_delivery() {
+        let ack_only = Received {
+            fresh: Vec::new(),
+            carried_payloads: false,
+        };
+        assert!(!should_sample_active_conditions(&ack_only));
+
+        let all_redundant = Received {
+            fresh: Vec::new(),
+            carried_payloads: true,
+        };
+        assert!(!should_sample_active_conditions(&all_redundant));
+
+        let fresh = Received {
+            fresh: vec![payload()],
+            carried_payloads: true,
+        };
+        assert!(should_sample_active_conditions(&fresh));
     }
 
     #[test]
@@ -3275,13 +3295,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
+    async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
         use crate::consensus::{self, Authority};
         use rally_point_proto::control::BufferBounds;
         use rally_point_proto::messages::BufferDirective;
 
         let sessions: Sessions = Arc::default();
-        let mesh_links = crate::mesh::new_mesh_links();
         let seen = crate::mesh::new_seen_registries();
         let makers = Arc::new(consensus::new_decision_makers());
         let turn_ring = crate::turn_ring::TurnRing::new();
@@ -3316,16 +3335,15 @@ mod tests {
             commands: vec![0x05].into(),
             ..payload()
         };
-        crate::mesh::forward_turn(
+        crate::mesh::deliver_mesh_turn(
             &sessions,
-            &mesh_links,
             &seen,
             &makers,
             &turn_ring,
             &k,
             SlotId(0),
             stamped,
-            crate::delivery::DeliveryHome::Peer(rally_point_proto::ids::RelayId(2)),
+            rally_point_proto::ids::RelayId(2),
         );
 
         let delivered = inbox
@@ -3368,27 +3386,26 @@ mod tests {
             "a promoted relay continues the session's numbering",
         );
 
-        // A duplicate of the stamped turn via a second mesh path is dropped
-        // before fan-out, stamp and all.
+        // A redundant copy of the stamped turn is dropped before local fan-out,
+        // stamp and all.
         let duplicate = Payload {
             buffer_directive: Some(stamp),
             commands: vec![0x05].into(),
             ..payload()
         };
-        crate::mesh::forward_turn(
+        crate::mesh::deliver_mesh_turn(
             &sessions,
-            &mesh_links,
             &seen,
             &makers,
             &turn_ring,
             &k,
             SlotId(0),
             duplicate,
-            crate::delivery::DeliveryHome::Peer(rally_point_proto::ids::RelayId(2)),
+            rally_point_proto::ids::RelayId(2),
         );
         assert!(
             inbox.forward_rx.try_recv().is_none(),
-            "the topological duplicate is dropped",
+            "the session-level duplicate is dropped",
         );
     }
 

@@ -28,6 +28,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 
+use crate::flight_recorder::{FlightRecorder, RelayWorkSnapshot};
 use crate::routing::Sessions;
 
 /// Env var Fargate injects with the task metadata endpoint's base URL.
@@ -50,6 +51,15 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 type StatsClient = Client<HttpConnector, Full<Bytes>>;
 
+/// Relay-local observables paired with every Docker resource sample.
+struct ReporterContext {
+    relay_id: Option<u64>,
+    sessions: Sessions,
+    turn_ring: crate::turn_ring::TurnRing,
+    control_stats: crate::coordinator_client::ControlConnStats,
+    flight_recorder: FlightRecorder,
+}
+
 /// Starts the periodic task-stats reporter if `interval_secs` is nonzero and
 /// this process is running as a Fargate task; otherwise logs one debug line
 /// and returns without spawning anything.
@@ -66,12 +76,15 @@ type StatsClient = Client<HttpConnector, Full<Bytes>>;
 /// queue depths (control-plane pressure) and its descriptor apply lag (how far
 /// descriptor delivery trailed staging) — and stays all-zero on a relay with no
 /// coordinator connection.
+/// `flight_recorder` supplies relay-lifetime work counters for CPU-efficiency
+/// denominators; its session flushes do not reset those totals.
 pub fn spawn_if_enabled(
     interval_secs: u64,
     relay_id: Option<u64>,
     sessions: Sessions,
     turn_ring: crate::turn_ring::TurnRing,
     control_stats: crate::coordinator_client::ControlConnStats,
+    flight_recorder: FlightRecorder,
 ) {
     if interval_secs == 0 {
         tracing::debug!("task-stats reporter disabled: interval is 0");
@@ -98,10 +111,13 @@ pub fn spawn_if_enabled(
         client,
         uri,
         Duration::from_secs(interval_secs),
-        relay_id,
-        sessions,
-        turn_ring,
-        control_stats,
+        ReporterContext {
+            relay_id,
+            sessions,
+            turn_ring,
+            control_stats,
+            flight_recorder,
+        },
     ));
 }
 
@@ -110,20 +126,12 @@ pub fn spawn_if_enabled(
 /// timed-out GET, or a response that doesn't parse, is logged at debug and
 /// skipped — one bad read never stops the loop, it just leaves the next
 /// successful read to reseed the baseline.
-async fn run(
-    client: StatsClient,
-    uri: Uri,
-    interval: Duration,
-    relay_id: Option<u64>,
-    sessions: Sessions,
-    turn_ring: crate::turn_ring::TurnRing,
-    control_stats: crate::coordinator_client::ControlConnStats,
-) {
+async fn run(client: StatsClient, uri: Uri, interval: Duration, context: ReporterContext) {
     tracing::info!(
         interval_secs = interval.as_secs(),
         "task-stats reporter started"
     );
-    let mut prev: Option<(Sample, std::time::Instant)> = None;
+    let mut prev: Option<(Sample, RelayWorkSnapshot, std::time::Instant)> = None;
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -139,23 +147,34 @@ async fn run(
                 continue;
             }
         };
+        let work = context.flight_recorder.relay_work_snapshot();
 
-        let Some((prev_sample, prev_at)) = prev else {
+        let Some((prev_sample, prev_work, prev_at)) = prev else {
             tracing::debug!("task-stats reporter: baseline sample recorded");
-            prev = Some((curr, now));
+            prev = Some((curr, work, now));
             continue;
         };
-        let derived = derive(Some(&prev_sample), &curr, now.duration_since(prev_at));
-        let sessions = crate::routing::session_count(&sessions);
-        let ring = turn_ring.totals();
-        let control = control_stats.snapshot();
+        let elapsed = now.duration_since(prev_at);
+        let derived = derive(Some(&prev_sample), &curr, elapsed);
+        let work_derived = derive_work(&prev_work, &work, &prev_sample, &curr, elapsed);
+        let sessions = crate::routing::session_count(&context.sessions);
+        let ring = context.turn_ring.totals();
+        let control = context.control_stats.snapshot();
         tracing::info!(
-            relay_id,
+            relay_id = context.relay_id,
             cpu_pct = ?derived.cpu_pct,
             mem_mib = derived.mem_working_set_mib,
             mem_limit_mib = derived.mem_limit_mib,
             net_rx_mibps = ?derived.net_rx_mibps,
             net_tx_mibps = ?derived.net_tx_mibps,
+            validated_turns_per_sec = ?work_derived.validated_turns_per_sec,
+            local_deliveries_per_sec = ?work_derived.local_deliveries_per_sec,
+            oversize_diverts_per_sec = ?work_derived.oversize_diverts_per_sec,
+            cpu_ns_per_validated_turn = ?work_derived.cpu_ns_per_validated_turn,
+            cpu_ns_per_local_delivery = ?work_derived.cpu_ns_per_local_delivery,
+            validated_turns_total = work.client_turns_validated,
+            local_deliveries_total = work.local_turn_deliveries,
+            oversize_diverts_total = work.oversize_diverts,
             sessions,
             ring_turns = ring.turns,
             ring_cmd_mib = ring.command_bytes as f64 / MIB,
@@ -166,7 +185,7 @@ async fn run(
             control_descriptor_set_len = control.descriptor_set_len,
             "relay task stats",
         );
-        prev = Some((curr, now));
+        prev = Some((curr, work, now));
     }
 }
 
@@ -319,6 +338,63 @@ struct Derived {
     net_tx_mibps: Option<f64>,
 }
 
+/// Relay work rates and CPU-time-per-work-unit for one successful poll interval.
+///
+/// CPU time is Docker's cumulative `total_usage`, measured in nanoseconds and
+/// summed across the process's threads. It includes all relay work, not only
+/// turn handling. A local delivery also scales with roster placement and fanout,
+/// so these ratios are intended to compare identical load-generator topologies
+/// and traffic mixes, not unlike workloads with different player/session shapes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorkDerived {
+    validated_turns_per_sec: Option<f64>,
+    local_deliveries_per_sec: Option<f64>,
+    oversize_diverts_per_sec: Option<f64>,
+    cpu_ns_per_validated_turn: Option<f64>,
+    cpu_ns_per_local_delivery: Option<f64>,
+}
+
+/// Differences two relay-lifetime work snapshots over the same interval as two
+/// Docker CPU samples. Pure and total so load-test interpretation is covered by
+/// unit tests without an ECS metadata endpoint.
+fn derive_work(
+    prev_work: &RelayWorkSnapshot,
+    curr_work: &RelayWorkSnapshot,
+    prev_sample: &Sample,
+    curr_sample: &Sample,
+    elapsed: Duration,
+) -> WorkDerived {
+    let validated = curr_work
+        .client_turns_validated
+        .saturating_sub(prev_work.client_turns_validated);
+    let deliveries = curr_work
+        .local_turn_deliveries
+        .saturating_sub(prev_work.local_turn_deliveries);
+    let oversize = curr_work
+        .oversize_diverts
+        .saturating_sub(prev_work.oversize_diverts);
+
+    let elapsed_secs = elapsed.as_secs_f64();
+    let rates = (elapsed_secs > 0.0).then_some((
+        validated as f64 / elapsed_secs,
+        deliveries as f64 / elapsed_secs,
+        oversize as f64 / elapsed_secs,
+    ));
+    let cpu_delta = curr_sample
+        .cpu_total_usage
+        .checked_sub(prev_sample.cpu_total_usage);
+
+    WorkDerived {
+        validated_turns_per_sec: rates.map(|rates| rates.0),
+        local_deliveries_per_sec: rates.map(|rates| rates.1),
+        oversize_diverts_per_sec: rates.map(|rates| rates.2),
+        cpu_ns_per_validated_turn: cpu_delta
+            .and_then(|cpu| (validated > 0).then_some(cpu as f64 / validated as f64)),
+        cpu_ns_per_local_delivery: cpu_delta
+            .and_then(|cpu| (deliveries > 0).then_some(cpu as f64 / deliveries as f64)),
+    }
+}
+
 /// Computes the metrics for one log line from `curr` and, when available, the
 /// sample taken `elapsed` earlier. Pure and total: never panics on any input
 /// (subtraction is checked/saturating throughout), which is what makes it
@@ -442,6 +518,103 @@ mod tests {
         };
         let derived = derive(Some(&prev), &curr, Duration::from_secs(2));
         assert_eq!(derived.cpu_pct, None);
+    }
+
+    // --- relay work efficiency ---
+
+    #[test]
+    fn work_rates_and_cpu_efficiency_difference_cumulative_snapshots() {
+        let prev_work = RelayWorkSnapshot {
+            client_turns_validated: 100,
+            local_turn_deliveries: 300,
+            oversize_diverts: 4,
+        };
+        let curr_work = RelayWorkSnapshot {
+            client_turns_validated: 140,
+            local_turn_deliveries: 420,
+            oversize_diverts: 10,
+        };
+        let prev_sample = Sample {
+            cpu_total_usage: 1_000_000_000,
+            ..Default::default()
+        };
+        let curr_sample = Sample {
+            cpu_total_usage: 1_600_000_000,
+            ..Default::default()
+        };
+
+        let derived = derive_work(
+            &prev_work,
+            &curr_work,
+            &prev_sample,
+            &curr_sample,
+            Duration::from_secs(2),
+        );
+        assert_eq!(derived.validated_turns_per_sec, Some(20.0));
+        assert_eq!(derived.local_deliveries_per_sec, Some(60.0));
+        assert_eq!(derived.oversize_diverts_per_sec, Some(3.0));
+        assert_eq!(derived.cpu_ns_per_validated_turn, Some(15_000_000.0));
+        assert_eq!(derived.cpu_ns_per_local_delivery, Some(5_000_000.0));
+    }
+
+    #[test]
+    fn zero_work_denominators_report_zero_rates_without_fabricated_cpu_ratios() {
+        let work = RelayWorkSnapshot {
+            client_turns_validated: 100,
+            local_turn_deliveries: 300,
+            oversize_diverts: 4,
+        };
+        let prev_sample = Sample {
+            cpu_total_usage: 1_000_000_000,
+            ..Default::default()
+        };
+        let curr_sample = Sample {
+            cpu_total_usage: 1_600_000_000,
+            ..Default::default()
+        };
+
+        let derived = derive_work(
+            &work,
+            &work,
+            &prev_sample,
+            &curr_sample,
+            Duration::from_secs(2),
+        );
+        assert_eq!(derived.validated_turns_per_sec, Some(0.0));
+        assert_eq!(derived.local_deliveries_per_sec, Some(0.0));
+        assert_eq!(derived.oversize_diverts_per_sec, Some(0.0));
+        assert_eq!(derived.cpu_ns_per_validated_turn, None);
+        assert_eq!(derived.cpu_ns_per_local_delivery, None);
+    }
+
+    #[test]
+    fn work_rates_survive_a_cpu_counter_reset_but_cpu_ratios_do_not() {
+        let prev_work = RelayWorkSnapshot::default();
+        let curr_work = RelayWorkSnapshot {
+            client_turns_validated: 10,
+            local_turn_deliveries: 20,
+            oversize_diverts: 0,
+        };
+        let prev_sample = Sample {
+            cpu_total_usage: 500,
+            ..Default::default()
+        };
+        let curr_sample = Sample {
+            cpu_total_usage: 100,
+            ..Default::default()
+        };
+
+        let derived = derive_work(
+            &prev_work,
+            &curr_work,
+            &prev_sample,
+            &curr_sample,
+            Duration::from_secs(1),
+        );
+        assert_eq!(derived.validated_turns_per_sec, Some(10.0));
+        assert_eq!(derived.local_deliveries_per_sec, Some(20.0));
+        assert_eq!(derived.cpu_ns_per_validated_turn, None);
+        assert_eq!(derived.cpu_ns_per_local_delivery, None);
     }
 
     // --- memory working set ---

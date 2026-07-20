@@ -294,10 +294,11 @@ impl Link {
         }
     }
 
-    /// Builds the next packet — `payload` plus redundant unacked ones, or
-    /// ack-only when `payload` is `None` — sends it as one QUIC datagram, and
-    /// returns how many still-unacked turns it re-carried as redundancy (the fresh
-    /// turn, if any, is not counted).
+    /// Builds the next packet — `payload` plus redundant unacked ones, or a
+    /// redundancy/ack flush when `payload` is `None` — sends it as one QUIC
+    /// datagram, and returns how many still-unacked turns it re-carried (the
+    /// fresh turn, if any, is not counted). A no-payload call is ack-only when
+    /// there is no unacked redundancy to pack.
     ///
     /// That count lets a caller tell whether retransmission is already riding the
     /// outbound stream (redundancy carried) or whether it must schedule a standalone
@@ -392,62 +393,70 @@ impl Link {
             }
         }
 
-        // Process payloads low-seq first within each slot. A packet leads with its
-        // fresh (highest) seq per slot, so without this a deep-loss packet's high
-        // seq could shut the window on the older redundant seqs it carries
-        // alongside.
-        packet.payloads.sort_by_key(|p| (p.slot, p.seq));
-
-        // Transactional commit: snapshot every slot this packet's payloads
-        // name (before any of them are `accept`ed) so a payload that fails
-        // partway through the packet — out of window, or a malformed slot —
-        // can be rolled back cleanly, restoring dedup to exactly the state it
-        // was in before this packet. Without this, an earlier payload in the
-        // SAME packet that was already `accept`ed (and so is remembered as
-        // delivered) would be dropped from the returned `fresh` on the error
-        // return below, while dedup keeps believing it reached the consumer
-        // — a permanent, silent gap: a later reconnect's replay re-sends that
-        // seq, dedup rejects it as a duplicate, and the consumer never
-        // receives a turn it was never actually handed. Malformed payloads
-        // don't themselves touch dedup, but an earlier payload in the same
-        // packet may already have, so the same rollback applies to that path
-        // too.
-        let touched: Vec<SlotId> = {
-            let mut seen = std::collections::BTreeSet::new();
-            packet
-                .payloads
-                .iter()
-                .filter_map(|p| u8::try_from(p.slot).ok().map(SlotId))
-                .filter(|slot| seen.insert(*slot))
-                .collect()
-        };
-        let snapshot = self.dedup.snapshot(&touched);
-
-        let mut fresh = Vec::new();
-        for payload in packet.payloads {
-            // A truncating cast would alias an out-of-range wire slot onto a
-            // different, valid slot's dedup key — corrupting that slot's
-            // window instead of merely rejecting the malformed one.
-            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
-                self.dedup.restore(snapshot);
-                return Err(LinkError::MalformedSlot(payload.slot));
-            };
-            match self.dedup.accept(slot, payload.seq) {
-                Delivery::New => fresh.push(payload),
-                Delivery::Duplicate => {}
-                Delivery::OutOfWindow => {
-                    self.dedup.restore(snapshot);
-                    return Err(LinkError::PayloadOutOfWindow {
-                        slot,
-                        seq: payload.seq,
-                    });
-                }
-            }
-        }
+        retain_fresh_payloads(&mut self.dedup, &mut packet.payloads)?;
         Ok(Received {
-            fresh,
+            // Dedup compacts the decoded protobuf vector in place, so delivery
+            // reuses its allocation rather than copying fresh payloads into a
+            // second vector.
+            fresh: packet.payloads,
             carried_payloads,
         })
+    }
+}
+
+/// Sorts, transactionally deduplicates, and retains only fresh payloads in the
+/// decoded protobuf vector.
+///
+/// A packet leads with its fresh (highest) seq per slot, so low-seq-first sorting
+/// keeps a deep-loss packet's high seq from shutting the window on older
+/// redundant seqs alongside it. Every valid slot is snapshotted before the first
+/// provisional `accept`: if a later payload is out of window or names a malformed
+/// slot, restoring the snapshot prevents dedup from remembering earlier payloads
+/// that the failed call never handed to its consumer.
+///
+/// On success `payloads` keeps its original allocation and contains only first
+/// deliveries, ordered by `(slot, seq)`.
+pub(crate) fn retain_fresh_payloads(
+    dedup: &mut Dedup,
+    payloads: &mut Vec<Payload>,
+) -> Result<(), LinkError> {
+    payloads.sort_by_key(|payload| (payload.slot, payload.seq));
+    let snapshot = dedup.snapshot_sorted_payload_slots(payloads);
+    let mut failure = None;
+
+    payloads.retain(|payload| {
+        // `Vec::retain` cannot stop early. Once the packet has failed, discard
+        // its remaining elements without making any further provisional dedup
+        // changes; the snapshot is restored after compaction completes.
+        if failure.is_some() {
+            return false;
+        }
+
+        // A truncating cast would alias an out-of-range wire slot onto a
+        // different, valid slot's dedup key — corrupting that slot's window
+        // instead of merely rejecting the malformed one.
+        let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+            failure = Some(LinkError::MalformedSlot(payload.slot));
+            return false;
+        };
+        match dedup.accept(slot, payload.seq) {
+            Delivery::New => true,
+            Delivery::Duplicate => false,
+            Delivery::OutOfWindow => {
+                failure = Some(LinkError::PayloadOutOfWindow {
+                    slot,
+                    seq: payload.seq,
+                });
+                false
+            }
+        }
+    });
+
+    if let Some(error) = failure {
+        dedup.restore(snapshot);
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 
@@ -532,6 +541,19 @@ pub(crate) struct SlotDedup {
 }
 
 impl SlotDedup {
+    /// Advances the contiguous prefix through `seq`, then folds in any
+    /// already-delivered run waiting immediately above it.
+    ///
+    /// The caller has established that `seq` is exactly the current receive
+    /// base. Handling that overwhelmingly common in-order case directly keeps
+    /// it out of `ahead`: inserting it there only for
+    /// [`absorb_contiguous_run`](Self::absorb_contiguous_run) to remove it again
+    /// would allocate a tree node on every in-order payload.
+    fn advance_contiguous(&mut self, seq: u64) {
+        self.delivered_through = Some(seq);
+        self.absorb_contiguous_run();
+    }
+
     /// Folds the run of seqs sitting immediately above the contiguous prefix
     /// out of the `ahead` set and into the prefix. Stops rather than overflows
     /// if the run reaches `u64::MAX`; there is no valid seq beyond it to keep
@@ -669,6 +691,16 @@ impl Dedup {
         // below `u64::MAX` and this `+ 1` cannot overflow.
         let base = state.delivered_through.map_or(0, |t| t + 1);
 
+        // In-order delivery is the normal case. Advance the prefix directly so
+        // it doesn't take a trip through the out-of-order tree (and allocate a
+        // node that the contiguous-run fold immediately frees). A zero-sized
+        // test window historically rejects even its base, so leave that edge
+        // case to the unchanged window logic below.
+        if self.window != 0 && seq == base {
+            state.advance_contiguous(seq);
+            return Delivery::New;
+        }
+
         if seq - base >= self.window {
             if !self.forward_collapse {
                 return Delivery::OutOfWindow;
@@ -682,23 +714,36 @@ impl Dedup {
         Delivery::New
     }
 
-    /// Snapshots the current dedup state for exactly `slots`, so a caller that
-    /// provisionally mutates some of them while processing a batch (a packet's
-    /// payloads, sorted and `accept`ed one at a time) can undo the whole batch
-    /// atomically with [`restore`](Self::restore) if a later entry in the same
-    /// batch turns out invalid. `None` for a slot with no entry yet, so a
-    /// restore can tell "existed but was empty" from "was created by this
-    /// batch and must be removed outright."
-    pub(crate) fn snapshot(&self, slots: &[SlotId]) -> Vec<(SlotId, Option<SlotDedup>)> {
-        slots
-            .iter()
-            .map(|&slot| (slot, self.slots.get(&slot).cloned()))
-            .collect()
+    /// Snapshots each distinct valid slot named by payloads already sorted by
+    /// `(slot, seq)`. Walking adjacent groups directly avoids first allocating a
+    /// set and a separate touched-slot vector. Invalid slots are omitted because
+    /// they can never mutate dedup before the packet is rejected.
+    ///
+    /// `None` means the slot had no entry, so restoring removes an entry created
+    /// by the provisional packet rather than leaving empty state behind.
+    fn snapshot_sorted_payload_slots(
+        &self,
+        payloads: &[Payload],
+    ) -> Vec<(SlotId, Option<SlotDedup>)> {
+        let mut snapshot = Vec::new();
+        let mut previous = None;
+        for payload in payloads {
+            let Ok(slot) = u8::try_from(payload.slot).map(SlotId) else {
+                continue;
+            };
+            if previous == Some(slot) {
+                continue;
+            }
+            previous = Some(slot);
+            snapshot.push((slot, self.slots.get(&slot).cloned()));
+        }
+        snapshot
     }
 
-    /// Restores exactly the slots a prior [`snapshot`](Self::snapshot) captured
-    /// to their captured state, removing an entry that did not exist when the
-    /// snapshot was taken. Slots outside the snapshot are untouched.
+    /// Restores exactly the slots a prior
+    /// [`snapshot_sorted_payload_slots`](Self::snapshot_sorted_payload_slots)
+    /// call captured to their prior state, removing an entry that did not exist
+    /// when the snapshot was taken. Slots outside the snapshot are untouched.
     pub(crate) fn restore(&mut self, snapshot: Vec<(SlotId, Option<SlotDedup>)>) {
         for (slot, state) in snapshot {
             match state {
@@ -760,6 +805,38 @@ mod tests {
         assert_eq!(dedup.accept(SlotId(0), 0), Delivery::Duplicate);
         assert_eq!(dedup.accept(SlotId(0), 1), Delivery::New);
         assert_eq!(dedup.accept(SlotId(0), 1), Delivery::Duplicate);
+    }
+
+    #[test]
+    fn dedup_contiguous_fast_path_never_buffers_in_order_seqs() {
+        let mut dedup = Dedup::with_window(8);
+
+        for seq in 0..32 {
+            assert_eq!(dedup.accept(SlotId(0), seq), Delivery::New);
+            let state = dedup.slots.get(&SlotId(0)).expect("slot was accepted");
+            assert_eq!(state.delivered_through, Some(seq));
+            assert!(state.ahead.is_empty());
+        }
+
+        assert_eq!(dedup.accept(SlotId(0), 31), Delivery::Duplicate);
+    }
+
+    #[test]
+    fn dedup_contiguous_fast_path_absorbs_a_buffered_run_after_gap_closes() {
+        let mut dedup = Dedup::with_window(8);
+
+        assert_eq!(dedup.accept(SlotId(0), 0), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 3), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 2), Delivery::New);
+        assert_eq!(dedup.accept(SlotId(0), 3), Delivery::Duplicate);
+
+        // Seq 1 is the receive base. The direct prefix advance must still fold
+        // the buffered 2..=3 run exactly as the tree insert/remove path did.
+        assert_eq!(dedup.accept(SlotId(0), 1), Delivery::New);
+        let state = dedup.slots.get(&SlotId(0)).expect("slot was accepted");
+        assert_eq!(state.delivered_through, Some(3));
+        assert!(state.ahead.is_empty());
+        assert_eq!(dedup.accept(SlotId(0), 2), Delivery::Duplicate);
     }
 
     #[test]
@@ -1139,6 +1216,60 @@ mod tests {
         assert_eq!(received.fresh.len(), 2);
         // Each wire slot advanced its own prefix; neither collapsed into the other.
         assert_eq!(link.delivered_through(SlotId(0)), Some(0));
+        assert_eq!(link.delivered_through(SlotId(1)), Some(0));
+    }
+
+    #[tokio::test]
+    async fn receive_compacts_fresh_payloads_in_the_decoded_vector() {
+        let (raw, _peer, _ea, _eb) = connected_connections().await;
+        let mut link = Link::new(raw);
+
+        // Deliberately unsorted, with two copies of (slot 0, seq 0). Stable
+        // low-seq sorting keeps the first copy, then in-place dedup removes the
+        // redundant one without replacing the protobuf decoder's Vec.
+        let packet = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: vec![
+                Payload {
+                    seq: 1,
+                    slot: 0,
+                    commands: vec![0xB1].into(),
+                    ..Default::default()
+                },
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xA0].into(),
+                    ..Default::default()
+                },
+                Payload {
+                    seq: 0,
+                    slot: 0,
+                    commands: vec![0xD0].into(),
+                    ..Default::default()
+                },
+                Payload {
+                    seq: 0,
+                    slot: 1,
+                    commands: vec![0xC0].into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let allocation = packet.payloads.as_ptr();
+        let capacity = packet.payloads.capacity();
+
+        let received = link.process_incoming(packet).unwrap();
+
+        assert_eq!(received.fresh.as_ptr(), allocation);
+        assert_eq!(received.fresh.capacity(), capacity);
+        assert_eq!(received.fresh.len(), 3);
+        assert_eq!(received.fresh[0].commands.as_ref(), &[0xA0]);
+        assert_eq!(received.fresh[1].commands.as_ref(), &[0xB1]);
+        assert_eq!(received.fresh[2].commands.as_ref(), &[0xC0]);
+        assert_eq!(link.delivered_through(SlotId(0)), Some(1));
         assert_eq!(link.delivered_through(SlotId(1)), Some(0));
     }
 

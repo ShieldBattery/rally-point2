@@ -18,8 +18,8 @@
 //!   ephemeral), plus a per-slot size and rate cap enforced at the relay.
 //! - **server** ([`server`]) — the client-facing accept loop tying the three
 //!   together: the single-relay `C–S–C` edge, no mesh.
-//! - **mesh + dedup** — one QUIC connection per relay-pair, topological fan-out,
-//!   topological dedup, degrade-to-single-relay (`C–S–C`).
+//! - **mesh + dedup** — one QUIC connection per relay-pair, direct origin-relay
+//!   fan-out, one-hop mesh delivery, and session-level duplicate gating.
 //! - **mesh_edge** ([`mesh_edge`]) — the mesh-edge connection half: establish
 //!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise),
 //!   exchange a peer-identity hello so each link is labeled with its peer's id,

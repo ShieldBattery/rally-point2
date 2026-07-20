@@ -9,7 +9,7 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 > plane. Built and wired:
 >
 > - **Mesh core.** The mesh-edge connection half (dial / accept with an identity hello, on-demand dialing,
->   idle teardown + reconnect supervision), topological turn dedup, and per-session `Join`/`Leave` driven by
+>   idle teardown + reconnect supervision), session-level turn dedup, and per-session `Join`/`Leave` driven by
 >   coordinator descriptors. Mesh peer certs are now **pinned from the session descriptor** — the coordinator
 >   carries each relay's leaf cert and the dialer trusts exactly that, mirroring how a client pins its
 >   relay's cert — with a fallback to configured roots for a descriptor that predates carrying them.
@@ -240,10 +240,15 @@ When a game's players span regions, each client connects to its own nearby relay
 routing through one. Those relays mesh over the cloud backbone (`S===S`): a turn a relay receives from
 a local client is fanned out both to its own local clients and to its peer relays, and each peer relay
 forwards it on to *its* local clients. There is **one QUIC connection per relay-pair** (separate streams
-don't isolate datagram congestion). Because a turn can reach a relay by more than one mesh path, the
-relay **dedups topologically** — it forwards each turn to a given client exactly once, on whichever copy
-arrives first, reusing the same `(slot, seq)` dedup the per-link transport already does — the origin
-identity is stable across the mesh because no hop restamps it.
+don't isolate datagram congestion). A mesh-received turn stops at that relay: it is delivered to local
+clients and is **never re-forwarded to another relay**. Thus every turn crosses at most one relay-to-relay
+link, and the peer it arrived from is its origin slot's home relay. A session-level `(slot, seq)` gate
+still protects local delivery against connection replacement, resume replay, and slot re-home overlap;
+the per-link transport dedup independently handles redundant copies within one connection.
+
+Delivery-hop inference relies on that one-hop rule. Treat it as a fleet-wide session boundary during
+deployment: a live session must not span this implementation and an older relay that still re-forwards
+mesh-origin turns, because then an arrival peer is no longer guaranteed to be the origin slot's home.
 
 The mesh edge's **connection half** runs in the relay binary: each `--relay-id` + `--mesh-peer ADDR#ID`
 pair dials (the lower-id side, via a `should_dial_mesh` tie-break) or accepts (the higher-id side), and
@@ -890,7 +895,7 @@ exists solely in the coordinator's tenant-supplied refs, resolved at query time.
 | `proto` | Frozen wire contracts: `Packet`/`Payload` framing, control-plane messages, tokens, protocol version, the SC:R command table. Anything crossing a component boundary is defined here first. |
 | `transport` | The per-link redundancy + ack + dedup machinery above, shared by `client` and `relay`. |
 | `client` | Portable client endpoint + link driver: per-slot ordering restoration and the buffer/leave directive trackers; linked into the game DLL. |
-| `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, topological dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves — plus the per-session flight recorder (bounded events/samples/counters, flushed on close and drain). (A replicated turn log is planned, not yet built.) |
+| `relay` | Validating client edge + per-session routing, the relay mesh (dial/accept, on-demand dialing, one-hop forwarding, session-level dedup, presence), and the authority-relay consensus off the turn stream — latency-buffer decision-maker, desync detection, and synced leaves — plus the per-session flight recorder (bounded events/samples/counters, flushed on close and drain). (A replicated turn log is planned, not yet built.) |
 | `coordinator` | Multi-tenant control plane: per-tenant token issuance + inbound request-signature auth, the relay registry and descriptor push, session setup, region assignment/provisioning, and the tenant-notification (webhook) + session-lifecycle layer. |
 
 ## Settled decisions (do not re-chase)

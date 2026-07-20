@@ -5,7 +5,9 @@ portable client, a shared per-link transport layer, a validating relay + mesh,
 and a multi-tenant coordinator. Replaces the Node.js `rally-point` with a newer,
 more scalable protocol + server structure.
 
-Discussion of the architecture is available [here](./docs/architecture.md)
+Discussion of the architecture is available [here](./docs/architecture.md). The
+repeatable microbenchmark and relay-load workflow is in
+[the performance guide](./docs/performance.md).
 
 ## Workspace
 

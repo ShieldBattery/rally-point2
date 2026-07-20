@@ -317,6 +317,10 @@ async fn main() -> Result<()> {
     // share one handle; it stays all-zero without a coordinator connection (nothing
     // writes it).
     let control_conn_stats = coordinator_client::ControlConnStats::new();
+    // Obtain the recorder handle before spawning task stats so its
+    // relay-lifetime work totals can be sampled alongside Docker CPU. The
+    // remaining recorder identity/sink/sampler wiring stays below.
+    let flight = mesh_state.decision_makers.flight_recorder().clone();
 
     // Self-reported Fargate task resources: a no-op outside Fargate (see the
     // module doc), so this is safe to call unconditionally in dev/loopback too.
@@ -326,6 +330,7 @@ async fn main() -> Result<()> {
         Arc::clone(&sessions),
         mesh_state.turn_ring.clone(),
         control_conn_stats.clone(),
+        flight.clone(),
     );
 
     // The coordinated-drain seam. On a shutdown signal the drain sequence flips
@@ -356,7 +361,6 @@ async fn main() -> Result<()> {
     // otherwise the receiver is dropped or idles unused.
     let (flight_tx, flight_rx) =
         tokio::sync::mpsc::channel(rally_point_relay::flight_recorder::FLIGHT_SHIP_QUEUE);
-    let flight = mesh_state.decision_makers.flight_recorder().clone();
     if let Some(relay_id) = cli.relay_id {
         flight.set_identity(RelayId(relay_id));
     }

@@ -16,7 +16,7 @@ mod signing;
 mod turn;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
@@ -24,7 +24,7 @@ use ring::signature::Ed25519KeyPair;
 use tokio::task::JoinSet;
 
 use crate::cli::Cli;
-use crate::metrics::{RunReport, SessionReport};
+use crate::metrics::{RunReport, SessionReport, Workload};
 use crate::session::{SessionConfig, run_session};
 
 /// Multiplier that spreads per-session seeds apart (the odd 64-bit golden ratio).
@@ -62,8 +62,24 @@ async fn main() -> Result<()> {
         "starting load run",
     );
 
+    let run_started = Instant::now();
     let reports = conduct(&cli, client, signing_key, &run_id, run_salt).await;
-    let report = RunReport::aggregate(cli.sessions, reports);
+    let report = RunReport::aggregate(
+        Workload {
+            run_id: run_id.clone(),
+            sessions: cli.sessions,
+            arrival_rate: cli.arrival_rate,
+            players_per_session: cli.players,
+            game_secs: cli.game_secs,
+            turn_rate: cli.turn_rate,
+            turn_bytes: cli.turn_bytes,
+            slot_regions: cli.slot_regions.clone(),
+            desync_fraction: cli.desync_fraction,
+            ipv4_only: cli.ipv4_only,
+        },
+        run_started.elapsed(),
+        reports,
+    );
 
     print!("{}", report.render());
 

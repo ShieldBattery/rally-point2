@@ -70,7 +70,7 @@ use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payload};
-use rally_point_transport::beacon::{flush_beacon, spawn_beacon_reader};
+use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
     send_control_lobby, send_control_request_drop, send_control_turn, spawn_control_reader,
@@ -783,10 +783,9 @@ impl LinkDriver {
             .await
             .map_err(|error| DriverError::Link(LinkError::from(error)))?;
         let mut control_rx = spawn_control_reader(link.connection().clone());
-        // The highest cursor the client has pushed to the peer, per slot. Push
-        // only on advance so a healthy link with a static receive prefix sends
-        // nothing.
-        let mut last_beacon_sent: HashMap<SlotId, u64> = HashMap::new();
+        // Pushes only advancing cursors and reuses one batch buffer for the
+        // life of this link.
+        let mut beacon_writer = BeaconWriter::new();
         // Whether the inbound beacon reader task is still feeding cursors. Once it
         // ends (the peer's beacon uni-stream closed or errored), `recv()` returns
         // `None` immediately on every poll — an always-ready future that would spin
@@ -939,7 +938,7 @@ impl LinkDriver {
                         Release::GameClosed => return Ok(()),
                         Release::GameStalled => return Err(DriverError::GameStalled),
                     }
-                    flush_delivered_cursors(link, &mut beacon_send, &mut last_beacon_sent, next_seq)
+                    flush_delivered_cursors(link, &mut beacon_send, &mut beacon_writer, next_seq)
                         .await;
                     if check_cap(link.payloads_in_flight()) {
                         return Err(DriverError::UnackedWindowExhausted {
@@ -1138,7 +1137,7 @@ impl LinkDriver {
                                 flush_delivered_cursors(
                                     link,
                                     &mut beacon_send,
-                                    &mut last_beacon_sent,
+                                    &mut beacon_writer,
                                     next_seq,
                                 )
                                 .await;
@@ -1544,21 +1543,22 @@ fn release_ready(
 
 /// Pushes each slot's delivered-through cursor to the peer so it can
 /// force-advance its unacked window past turns it now knows we received.
-/// `flush_beacon` pushes only cursors that advanced past `last_sent`, so a
+/// `BeaconWriter` pushes only cursors that advanced past its last-sent state, so a
 /// static cursor (a genuine forward gap) sends nothing — the cap handles that.
 async fn flush_delivered_cursors(
     link: &Link,
     beacon_send: &mut quinn::SendStream,
-    last_sent: &mut HashMap<SlotId, u64>,
+    beacon_writer: &mut BeaconWriter,
     next_seq: &HashMap<SlotId, u64>,
 ) {
-    let cursors: HashMap<SlotId, u64> = next_seq
-        .keys()
-        .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c)))
-        .collect();
-    if !cursors.is_empty() {
-        flush_beacon(beacon_send, last_sent, cursors).await;
-    }
+    beacon_writer
+        .flush(
+            beacon_send,
+            next_seq
+                .keys()
+                .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c))),
+        )
+        .await;
 }
 
 /// Returns `true` if the unacked window has crossed the hard cap — the

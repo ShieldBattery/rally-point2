@@ -101,6 +101,11 @@ color-eyre = "0.6"
 # handling. Guards held across `.await` stay on `tokio::sync`.
 parking_lot = "0.12"
 
+# Statistics-driven microbenchmarks for the transport and relay hot paths. Kept
+# dev-only in the member crates so it never enters the portable client or relay
+# production dependency graphs.
+criterion = { version = "0.8.2", default-features = false }
+
 # --- Observability ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

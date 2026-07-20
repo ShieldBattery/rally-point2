@@ -1,4 +1,4 @@
-//! The relay mesh: peer-relay links and session-level topological dedup.
+//! The relay mesh: peer-relay links and a session-level forward-once gate.
 //!
 //! A relay's client edge ([`routing`]) fans each validated turn out to the
 //! session's local slots. The mesh adds a second fan-out path: to connected peer
@@ -8,13 +8,13 @@
 //! connection shared across every game both relays jointly serve, with per-session
 //! transport state.
 //!
-//! Because a turn can reach a relay by more than one mesh path (A→B directly, and
-//! A→C→B), the relay dedups **topologically**: it forwards each turn to its local
-//! clients exactly once, on whichever copy arrives first. [`MeshSeen`] is that
-//! session-level dedup — distinct from the per-link `Dedup` on each mesh link,
-//! which drops redundant copies *within* one link. The origin `(slot, seq)`
-//! identity is stable across the mesh because no hop restamps it, so the two
-//! dedup layers collapse duplicates at different granularities without conflict.
+//! A locally originated turn is sent directly to every peer relay serving the
+//! session. A receiving relay delivers it to local clients and stops it there;
+//! turns are never re-forwarded relay-to-relay. [`MeshSeen`] is the defensive
+//! session-level dedup across ingress instances — link replacement, resume replay,
+//! and slot re-home overlap can still present the same `(slot, seq)` more than
+//! once. It is distinct from the per-link `Dedup`, which drops redundant copies
+//! within one connection.
 //!
 //! Mesh-link establishment uses a lower-id-dials-higher tie-break
 //! ([`should_dial_mesh`](rally_point_transport::should_dial_mesh)): each relay
@@ -49,9 +49,10 @@ fn mesh_session_key(key: &SessionKey) -> MeshSessionKey {
     MeshSessionKey::new(key.session, key.tenant.as_ref())
 }
 
-/// Session-level topological dedup: records which `(slot, seq)` turns have
+/// Session-level forward-once gate: records which `(slot, seq)` turns have
 /// already been forwarded to this session's local clients, so a turn arriving
-/// via a second mesh path is dropped rather than delivered twice.
+/// again through link replacement, resume replay, or re-home overlap is dropped
+/// rather than delivered twice.
 ///
 /// Mirrors the per-link `Dedup`'s structure (a contiguous delivered prefix plus
 /// an `ahead` set per slot) but serves a different purpose: `Dedup` is
@@ -86,7 +87,7 @@ pub struct MeshSeen {
 /// set to this many entries, independent of how far the seqs ahead of it climb.
 const SPARSE_SEEN_CAP: usize = 4096;
 
-/// One slot's topological-dedup state.
+/// One slot's forward-once state.
 struct SlotSeen {
     /// Top of the contiguous forwarded prefix; `None` until seq 0 is forwarded.
     forwarded_through: Option<u64>,
@@ -108,24 +109,46 @@ pub enum Seen {
 }
 
 impl MeshSeen {
-    /// Creates an empty topological-dedup set for one session.
+    /// Creates an empty forward-once set for one session.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Records `(slot, seq)` as forwarded and reports whether it's new or a
     /// duplicate. A duplicate is dropped silently — the turn already reached
-    /// this relay's local clients via an earlier mesh path.
+    /// this relay's local clients through an earlier ingress instance.
     pub fn mark_forwarded(&mut self, slot: SlotId, seq: u64) -> Seen {
         let state = self.slots.entry(slot).or_insert_with(|| SlotSeen {
             forwarded_through: None,
             ahead: BTreeSet::new(),
         });
 
-        let base = state.forwarded_through.map_or(0, |t| t + 1);
-
-        if seq < base {
+        if state
+            .forwarded_through
+            .is_some_and(|forwarded| seq <= forwarded)
+        {
             return Seen::Duplicate;
+        }
+        let base = match state.forwarded_through {
+            Some(through) => {
+                let Some(next) = through.checked_add(1) else {
+                    // Every u64 seq is at or below this prefix and the duplicate
+                    // check above normally returns first. Keep the ceiling safe
+                    // even if this code is rearranged later.
+                    return Seen::Duplicate;
+                };
+                next
+            }
+            None => 0,
+        };
+
+        // In-order delivery is the common case. Advance the prefix directly so
+        // it does not allocate a tree node only for the contiguous-run fold to
+        // remove that same node immediately.
+        if seq == base {
+            state.forwarded_through = Some(seq);
+            state.absorb_contiguous_run();
+            return Seen::New;
         }
         if !state.ahead.insert(seq) {
             return Seen::Duplicate;
@@ -146,10 +169,19 @@ impl SlotSeen {
     /// it closed the gap the prefix was stalled behind, the whole run above it
     /// becomes contiguous and the seqs below can be forgotten.
     fn absorb_contiguous_run(&mut self) {
-        let mut next = self.forwarded_through.map_or(0, |t| t + 1);
+        let mut next = match self.forwarded_through {
+            Some(through) => match through.checked_add(1) {
+                Some(next) => next,
+                None => return,
+            },
+            None => 0,
+        };
         while self.ahead.remove(&next) {
             self.forwarded_through = Some(next);
-            next += 1;
+            let Some(after) = next.checked_add(1) else {
+                return;
+            };
+            next = after;
         }
     }
 
@@ -160,12 +192,12 @@ impl SlotSeen {
     /// — is thereafter reported as seen, so a turn that later arrives in it reads
     /// as a `Duplicate`, never a fresh forward.
     ///
-    /// That is the safe failure direction for an echo guard. A gap left this far
+    /// That is the safe failure direction for a forward-once gate. A gap left this far
     /// below the highest seen seq never fills in normal operation — its turn is
     /// lost for good, or the only thing that would arrive there is a replay — and
     /// the two ways to be wrong about it are not symmetric: a false `Duplicate`
-    /// merely drops a re-forward, while a false `New` re-floods the mesh with an
-    /// already-delivered turn, a duplicate into a lockstep slot that desyncs it.
+    /// merely drops a late turn, while a false `New` re-delivers an
+    /// already-delivered turn to local lockstep slots and can desync them.
     /// Collapsing chooses the `Duplicate` side deliberately.
     fn collapse_to_cap(&mut self) {
         while self.ahead.len() > SPARSE_SEEN_CAP {
@@ -179,15 +211,14 @@ impl SlotSeen {
     }
 }
 
-/// Per-session topological-dedup registries: each `SessionKey` → the `MeshSeen`
+/// Per-session forward-once registries: each `SessionKey` → the `MeshSeen`
 /// for that session, shared across all slot links + mesh-link tasks so every
 /// ingress — local client or mesh peer — marks before forwarding to locals.
 ///
-/// This is the guard against echo loops: a turn relay A fanned out to relay B
-/// comes back to A via the mesh, and without a shared `MeshSeen` A would deliver
-/// it to its local clients a second time — a duplicate turn into a lockstep slot,
-/// a desync. With the registry, A's `run_slot_link` marked the turn when it
-/// validated it, so the mesh echo is caught as `Duplicate` and dropped.
+/// This is the forward-once gate across ingress instances. A connection
+/// replacement, resume replay, or slot re-home overlap can present a turn that
+/// was already delivered through another client or mesh task; the shared state
+/// drops that copy before it can duplicate a turn into a local lockstep slot.
 pub type SeenRegistries = Arc<Mutex<HashMap<SessionKey, MeshSeen>>>;
 
 /// Creates an empty seen-registry for a relay with no sessions yet.
@@ -200,6 +231,9 @@ pub fn new_seen_registries() -> SeenRegistries {
 /// `run_mesh_link` (mesh-peer ingress) before fanning out to local clients.
 pub fn mark_seen(registries: &SeenRegistries, key: &SessionKey, slot: SlotId, seq: u64) -> Seen {
     let mut roster = registries.lock();
+    if let Some(seen) = roster.get_mut(key) {
+        return seen.mark_forwarded(slot, seq);
+    }
     roster
         .entry(key.clone())
         .or_default()
@@ -230,6 +264,9 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
 /// any one mesh link's own transport state: a link dying and redialing never
 /// touches this registry, so the cursors it hands the fresh link on rejoin are
 /// unaffected by the death that made rejoining necessary in the first place.
+/// At the unreachable-in-practice `u64::MAX` ceiling there is no representable
+/// successor, so the cursor saturates at the ceiling. That can request one
+/// already-delivered payload again, which the same forward gate drops safely.
 pub fn resume_cursor_snapshot(registries: &SeenRegistries, key: &SessionKey) -> Vec<(SlotId, u64)> {
     let roster = registries.lock();
     let Some(seen) = roster.get(key) else {
@@ -237,7 +274,11 @@ pub fn resume_cursor_snapshot(registries: &SeenRegistries, key: &SessionKey) -> 
     };
     seen.slots
         .iter()
-        .filter_map(|(&slot, state)| state.forwarded_through.map(|through| (slot, through + 1)))
+        .filter_map(|(&slot, state)| {
+            state
+                .forwarded_through
+                .map(|through| (slot, through.saturating_add(1)))
+        })
         .collect()
 }
 
@@ -257,9 +298,8 @@ pub fn has_resumable_state(registries: &SeenRegistries, key: &SessionKey) -> boo
 
 /// Live mesh links for every session on this relay: each `SessionKey` → the
 /// channels that reach each connected peer-relay's mesh-link task for that
-/// session. A turn fanned out to the mesh goes to every peer relay serving that
-/// session — including the one it arrived from, which is why the sender marks
-/// `MeshSeen` before forwarding to locals: the echo is caught and dropped there.
+/// session. Only turns received from this relay's local clients are fanned out
+/// through this registry; mesh-origin turns stop after local delivery.
 ///
 /// Each link registers a [`MeshLinkTx`] bundling two senders into the same driver:
 /// the bounded per-turn forward channel and the unbounded control-frame channel
@@ -312,6 +352,10 @@ pub fn publish_conditions(
     conditions: SlotConditions,
 ) {
     let mut roster = registry.lock();
+    if let Some(slots) = roster.get_mut(key) {
+        slots.insert(slot, conditions);
+        return;
+    }
     roster
         .entry(key.clone())
         .or_default()
@@ -352,7 +396,7 @@ pub fn snapshot_conditions(
 }
 
 /// The three mesh-related registries a relay thread needs: the live mesh links
-/// (fan-out to peer relays), the session-level topological dedup (echo guard),
+/// (fan-out to peer relays), the session-level forward-once gate,
 /// and the per-client conditions the mesh attaches to outgoing datagrams.
 ///
 /// These are always created together, passed together, and used together, so
@@ -364,7 +408,7 @@ pub fn snapshot_conditions(
 pub struct MeshState {
     /// Channels to peer-relay mesh-link tasks, keyed by session.
     pub links: MeshLinks,
-    /// Session-level topological dedup (echo guard).
+    /// Session-level duplicate gate across client and mesh ingress instances.
     pub seen: SeenRegistries,
     /// Per-slot link conditions the mesh attaches to outgoing datagrams.
     pub conditions: ConditionsRegistry,
@@ -705,17 +749,10 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
     }
 }
 
-/// Delivers `payload` to every peer-relay mesh link serving `key`, without ever
-/// blocking on a slow peer. Mirrors `routing::fan_out` but for mesh links
-/// instead of local slots.
-///
-/// Fans out to **all** mesh links for the session — including the one a turn
-/// arrived on. The echo is caught not by excluding the ingress link (there's no
-/// link id in the registry to exclude) but by `MeshSeen`: every ingress — local
-/// client or mesh peer — marks `(slot, seq)` before forwarding to locals, so the
-/// echo arrives, is seen as `Duplicate`, and is dropped before it reaches local
-/// clients. This is why the flood-with-dedup model requires marking on *every*
-/// forward-to-local, not just mesh ingress.
+/// Delivers a locally originated `payload` to every peer-relay mesh link serving
+/// `key`, without ever blocking on a slow peer. Mirrors `routing::fan_out` but
+/// for mesh links instead of local slots. Callers must enforce the ingress
+/// boundary: a payload received from a mesh peer must never enter this function.
 ///
 /// A full forward queue is *not* the same recoverable case a full local slot
 /// queue is: a local client's own transport re-carries a dropped datagram from
@@ -1277,30 +1314,28 @@ fn chat_frame(session: SessionId, chat: GameChat) -> MeshControlFrame {
     }
 }
 
-/// Forwards one turn: topological dedup, buffer-directive stamping, then
-/// fan-out to local slots and peer relays. The single forward step shared by
-/// the client-edge path (`run_slot_link`) and the mesh path (`run_mesh_link`),
-/// so every path a turn can take treats the stamp identically.
+/// Forwards one turn received from a local client: session-level dedup,
+/// buffer-directive stamping, then fan-out to local slots and every peer relay
+/// serving the session.
 ///
-/// Marking `(slot, seq)` in the session's seen-set before fanning out is what
-/// catches the mesh echo: the mesh floods to all peers (no link-id exclusion),
-/// so the turn comes back via the mesh, is seen as `Duplicate`, and is dropped
-/// before it reaches local clients a second time — a duplicate turn into a
-/// lockstep slot is a desync.
+/// Mesh-origin turns use [`deliver_mesh_turn`] instead. Keeping the two ingress
+/// APIs separate makes the one-mesh-hop rule structural: a payload received
+/// from a peer relay can reach this relay's local clients, but cannot be handed
+/// back to the mesh.
 ///
 /// Stamping is stamp-or-preserve: when this relay's decision-maker has an
 /// active directive (it is the session's authority), the directive is set on
 /// the outgoing payload; when it has none — every non-authority relay, always
 /// — a stamp already on the turn is left untouched, so the authority's
 /// broadcast survives the hop across relays that merely forward it.
-// `turn_ring` is the 8th argument (the replay record, alongside the mesh flood's
+// `turn_ring` is the 8th argument (the replay record, alongside the mesh path's
 // existing registries); bundling into a struct would touch every call site
 // (production and test) for one more reference, so this follows the same
 // escape hatch already used elsewhere in the crate (`SyncTracker::record` in
 // `consensus.rs`, `connect_and_stream` in `coordinator_client.rs`) rather than
 // that churn.
 #[allow(clippy::too_many_arguments)]
-pub fn forward_turn(
+pub fn forward_client_turn(
     sessions: &routing::Sessions,
     mesh_links: &MeshLinks,
     seen: &SeenRegistries,
@@ -1309,7 +1344,6 @@ pub fn forward_turn(
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
-    home: crate::delivery::DeliveryHome,
 ) {
     if let Some(payload) = deliver_turn_to_locals(
         sessions,
@@ -1319,27 +1353,47 @@ pub fn forward_turn(
         key,
         slot,
         payload,
-        home,
+        crate::delivery::DeliveryHome::Local,
     ) {
         fan_out_to_mesh(mesh_links, key, payload);
     }
 }
 
-/// The local half of [`forward_turn`]: topological dedup, buffer-directive
-/// stamping, and fan-out to this relay's local slots — everything except the
-/// mesh flood. Returns the (possibly stamped) payload when it was fresh, so
-/// [`forward_turn`] can flood it onward, or `None` for a topological duplicate
-/// already delivered via an earlier path. `home` names where this specific
-/// delivery arrived from — this relay's own client edge, or a peer relay over
-/// the mesh — feeding both the delivery-tracking home stamp and the replay
-/// ring's [`crate::turn_ring::TurnOrigin`].
-///
-/// Also the whole receive step for an oversize turn arriving over the mesh
-/// control stream: the origin relay diverted a copy to *every* link serving the
-/// session itself, so the receiver delivers locally and deliberately does not
-/// re-flood — re-broadcasting would only produce the echo the dedup exists to
-/// drop (harmless, but pure waste on a reliable stream).
-// Same escape hatch as `forward_turn` just above (see its own comment): one
+/// Delivers one turn received from `peer` to this relay's local clients and
+/// stops it there. This function deliberately has no [`MeshLinks`] argument:
+/// relay-origin payloads are one mesh hop only and must never be re-forwarded
+/// to either their ingress peer or another relay.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_mesh_turn(
+    sessions: &routing::Sessions,
+    seen: &SeenRegistries,
+    decision_makers: &crate::consensus::DecisionMakers,
+    turn_ring: &crate::turn_ring::TurnRing,
+    key: &SessionKey,
+    slot: SlotId,
+    payload: Payload,
+    peer: RelayId,
+) {
+    let _ = deliver_turn_to_locals(
+        sessions,
+        seen,
+        decision_makers,
+        turn_ring,
+        key,
+        slot,
+        payload,
+        crate::delivery::DeliveryHome::Peer(peer),
+    );
+}
+
+/// The shared local-delivery half of [`forward_client_turn`] and
+/// [`deliver_mesh_turn`]: session-level dedup, buffer-directive stamping, and
+/// fan-out to this relay's local slots. Returns the possibly stamped payload
+/// when it was fresh so client ingress can send it to peer relays, or `None`
+/// for a duplicate already delivered through another ingress instance. `home`
+/// feeds both the delivery-tracking home stamp and the replay ring's
+/// [`crate::turn_ring::TurnOrigin`].
+// Same escape hatch as `forward_client_turn` just above (see its own comment): one
 // more reference (`home`) alongside its existing bundle-worthy set, not
 // worth the call-site churn of a struct.
 #[allow(clippy::too_many_arguments)]
@@ -1354,19 +1408,18 @@ fn deliver_turn_to_locals(
     home: crate::delivery::DeliveryHome,
 ) -> Option<Payload> {
     if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
-        // Only the duplicate (mesh-echo) branch touches the recorder's maps —
+        // Only the duplicate branch touches the recorder's maps —
         // the fresh-turn common path stays lock-free for the recorder.
         decision_makers.flight_recorder().note_dedup_drop(key, slot);
         return None;
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just
-    // below: the mesh legitimately delivers the same turn to a relay via more
-    // than one path, and while the per-slot frame max is a harmless monotone,
-    // the seq-keyed frame *history* behind the leave-frame clamp is a bounded
-    // append — duplicates walked twice would evict genuine history and shrink
-    // the clamp's window — and the delivery-tracking home stamp must follow
-    // the slot's true source, not whichever flooded copy raced in. Lobby turns
+    // below: link replacement, resume replay, and slot re-home overlap can
+    // present the same turn more than once. The per-slot frame max is a harmless
+    // monotone, but the seq-keyed frame *history* behind the leave-frame clamp
+    // is a bounded append — duplicates walked twice would evict genuine history
+    // and shrink the clamp's window. Lobby turns
     // carry no frame and don't move the consensus coordinate. Every turn here
     // was validated at its ingress client edge (the mesh never re-validates),
     // so only validated turns feed the coordinate.
@@ -1383,9 +1436,7 @@ fn deliver_turn_to_locals(
     // The desync comparator's one and only feed point. Every turn-delivery
     // path — client edge (datagram and oversize-control), mesh datagram, and
     // mesh oversize-control — funnels through here, and this is placed right
-    // after the `mark_seen` dedup above: the mesh legitimately delivers the
-    // same turn to the authority via more than one path (that's exactly what
-    // `mark_seen` exists to catch), and the comparator's per-slot ordinal
+    // after the `mark_seen` dedup above. The comparator's per-slot ordinal
     // count is not idempotent the way `observe_frame`'s monotone max is — a
     // duplicate walked twice would silently drift the count and misalign
     // every later comparison. A no-op unless this relay is the session
@@ -1399,8 +1450,9 @@ fn deliver_turn_to_locals(
     );
     match crate::consensus::active_directive(decision_makers, key) {
         Some(directive) => payload.buffer_directive = Some(directive),
-        // Preserving an upstream stamp also records its seq and buffer: every
-        // directive floods through every relay serving the session, so if this
+        // Preserving an upstream stamp also records its seq and buffer: an
+        // authority's locally originated turns carry its directive directly to
+        // every relay serving the session, so if this
         // relay is later promoted to authority, its own decisions number above
         // what clients already hold and baseline against the committed buffer
         // instead of restarting below it.
@@ -1419,7 +1471,7 @@ fn deliver_turn_to_locals(
     // and re-dials while its drop is undecided can be replayed what it missed. This is the one
     // choke point every turn-delivery path funnels through, placed right after the
     // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
-    // even when the mesh delivers it by more than one path. Buffered only once the
+    // even when ingress overlap presents a redundant copy. Buffered only once the
     // session has started: pre-start lobby traffic has its own ordered replay log
     // and must not be double-buffered here. The session's slot count rides along
     // so the ring's bounds fit the session's actual shape rather than assuming
@@ -1645,12 +1697,12 @@ async fn send_resume_replay(
 ///   join may simply be in flight on the command channel.
 /// - **No `validate_turn`** — the mesh trusts its peer relay. Validation
 ///   happened at the ingress client edge and is never repeated at a mesh hop.
-/// - **Marks `MeshSeen`** before fanning out to local clients, so an echo (the
-///   turn re-arriving via the mesh after being fanned out) is caught as
-///   `Duplicate` and dropped.
-/// - **Fans out** to both local slots and other mesh links, so a turn from a
-///   peer relay reaches this relay's local clients and any *other* connected
-///   peer relays.
+/// - **Marks `MeshSeen`** before fanning out to local clients, so reconnect,
+///   resume, or re-home overlap is caught as `Duplicate` and dropped.
+/// - **Stops peer turns locally**. A turn received from this peer reaches this
+///   relay's local clients and is never sent onto another mesh link. The
+///   driver's outbound queue carries only turns originated by this relay's
+///   local clients.
 ///
 /// One task owns the link: both `MeshLink::recv` and `send` need `&mut self`,
 /// so N sessions are multiplexed over one driver loop rather than N tasks
@@ -1838,23 +1890,19 @@ pub async fn run_mesh_link(
                         for payload in mesh_received.delivery.fresh {
                             let slot = SlotId(payload.slot as u8);
                             // NOTE: no frame-observation or desync-comparator
-                            // call here. This relay may also reach the same
-                            // turn via a different mesh path (or the client
-                            // edge, if it's local), so feeding consensus here
-                            // — before dedup — would double-count it.
-                            // `forward_turn` below funnels into
-                            // `deliver_turn_to_locals`, which feeds both
-                            // exactly once, right after its mark_seen check.
-                            forward_turn(
+                            // call here. Duplicate delivery can still occur
+                            // across a link replacement, resume replay, or slot
+                            // re-home, so consensus remains downstream of the
+                            // session-level dedup in `deliver_mesh_turn`.
+                            deliver_mesh_turn(
                                 &sessions,
-                                &mesh_links,
                                 &seen_registries,
                                 &decision_makers,
                                 &mesh_for_dispatch.turn_ring,
                                 &key,
                                 slot,
                                 payload,
-                                crate::delivery::DeliveryHome::Peer(peer_id),
+                                peer_id,
                             );
                         }
                         continue;
@@ -2308,8 +2356,8 @@ pub async fn run_mesh_link(
 ///   sent it to every relay — so there is no echo.
 /// - **`OversizeTurn`**: a turn too large for the peer's datagram path, folded
 ///   back into the normal turn path exactly as a datagram delivery would be —
-///   frame observation, topological dedup, buffer-directive stamping, local
-///   fan-out — trusting it like any mesh-carried turn (validated at the origin's
+///   frame observation, the session-level duplicate gate, buffer-directive
+///   stamping, and local fan-out — trusting it like any mesh-carried turn (validated at the origin's
 ///   client edge, never re-validated at a mesh hop). It too is not re-broadcast
 ///   to other mesh links: the origin diverted a copy to every link serving the
 ///   session itself.
@@ -2465,7 +2513,7 @@ fn dispatch_mesh_control(
             // for this stream-delivered seq already ran in the driver's own
             // select branch (`fold_oversize_into_link`), which has the link
             // access this dispatch doesn't.
-            let _ = deliver_turn_to_locals(
+            deliver_mesh_turn(
                 sessions,
                 &mesh.seen,
                 &mesh.decision_makers,
@@ -2473,7 +2521,7 @@ fn dispatch_mesh_control(
                 &key,
                 slot,
                 payload,
-                crate::delivery::DeliveryHome::Peer(peer_id),
+                peer_id,
             );
         }
         Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
@@ -2872,6 +2920,26 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_prefix_stops_cleanly_at_the_sequence_ceiling() {
+        let mut seen = MeshSeen::new();
+        seen.slots.insert(
+            SlotId(0),
+            SlotSeen {
+                forwarded_through: Some(u64::MAX - 2),
+                ahead: BTreeSet::from([u64::MAX]),
+            },
+        );
+
+        // Filling the last gap absorbs the waiting ceiling value without
+        // attempting to derive an unrepresentable successor.
+        assert_eq!(seen.mark_forwarded(SlotId(0), u64::MAX - 1), Seen::New);
+        let state = &seen.slots[&SlotId(0)];
+        assert_eq!(state.forwarded_through, Some(u64::MAX));
+        assert!(state.ahead.is_empty());
+        assert_eq!(seen.mark_forwarded(SlotId(0), u64::MAX), Seen::Duplicate);
+    }
+
+    #[test]
     fn keeps_slots_independent() {
         let mut seen = MeshSeen::new();
         // Two slots both have seq 0; both are new — identity is (slot, seq).
@@ -2987,7 +3055,7 @@ mod tests {
             assert_eq!(
                 seen.mark_forwarded(SlotId(0), seq),
                 Seen::Duplicate,
-                "a re-forward of already-seen seq {seq} must not re-flood",
+                "an already-seen seq {seq} must not be delivered again",
             );
         }
     }
@@ -2996,8 +3064,8 @@ mod tests {
     fn a_gap_seq_arriving_after_the_collapse_is_treated_as_a_duplicate() {
         // A seq in a gap the collapse has already swallowed reads as a duplicate
         // even though it was never actually forwarded — the safe direction: the
-        // echo guard would rather drop a lost/replayed gap turn than re-flood the
-        // mesh with what it can no longer prove is new.
+        // forward gate would rather drop a lost/replayed gap turn than deliver
+        // what it can no longer prove is new.
         let mut seen = MeshSeen::new();
         assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
         let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
@@ -3301,6 +3369,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_turn_enters_each_mesh_link_once() {
+        let sessions = routing::Sessions::default();
+        let links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
+        let key = control_key();
+        let (_registration, mut local) =
+            routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
+        let (mut peer_b_rx, _peer_b_control_rx) = register_link_channels(&links, &key);
+        let (mut peer_c_rx, _peer_c_control_rx) = register_link_channels(&links, &key);
+
+        forward_client_turn(
+            &sessions,
+            &links,
+            &seen,
+            &makers,
+            &turn_ring,
+            &key,
+            SlotId(0),
+            Payload {
+                seq: 7,
+                slot: 0,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            local
+                .try_recv_forward()
+                .expect("the local peer receives the turn")
+                .seq,
+            7,
+        );
+        for peer in [&mut peer_b_rx, &mut peer_c_rx] {
+            let (session, payload) = peer
+                .try_recv()
+                .expect("each session peer receives one direct copy");
+            assert_eq!(session, key.session);
+            assert_eq!(payload.seq, 7);
+            assert!(peer.try_recv().is_err(), "the peer receives only one copy");
+        }
+    }
+
+    #[test]
+    fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
+        use crate::consensus::{self, Authority};
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+
+        let sessions = routing::Sessions::default();
+        let links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let turn_ring = crate::turn_ring::TurnRing::new();
+        let key = control_key();
+        let _ = consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let (_registration, mut local) =
+            routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
+        let (mut peer_b_rx, mut peer_b_control_rx) = register_link_channels(&links, &key);
+        let (mut peer_c_rx, mut peer_c_control_rx) = register_link_channels(&links, &key);
+        let payload = Payload {
+            seq: 9,
+            slot: 0,
+            commands: vec![0x05].into(),
+            game_frame_count: Some(77),
+            ..Default::default()
+        };
+
+        deliver_mesh_turn(
+            &sessions,
+            &seen,
+            &makers,
+            &turn_ring,
+            &key,
+            SlotId(0),
+            payload.clone(),
+            RelayId(2),
+        );
+
+        let delivered = local
+            .try_recv_forward()
+            .expect("the peer turn reaches this relay's local player");
+        assert_eq!(delivered.seq, payload.seq);
+        assert_eq!(delivered.commands, payload.commands);
+        assert_eq!(
+            consensus::slot_frame(&makers, &key, SlotId(0)),
+            Some(GameFrameCount(77)),
+            "mesh ingress still feeds consensus",
+        );
+        assert_eq!(
+            mark_seen(&seen, &key, SlotId(0), payload.seq),
+            Seen::Duplicate,
+            "mesh ingress still passes the session-level dedup gate",
+        );
+        for peer in [&mut peer_b_rx, &mut peer_c_rx] {
+            assert!(
+                peer.try_recv().is_err(),
+                "a peer-origin turn is never sent to any mesh link",
+            );
+        }
+        assert!(peer_b_control_rx.try_recv().is_err());
+        assert!(peer_c_control_rx.try_recv().is_err());
+
+        // A redundant copy presented by a different peer during reconnect,
+        // resume, or re-home overlap is dropped locally and still cannot enter
+        // the mesh.
+        deliver_mesh_turn(
+            &sessions,
+            &seen,
+            &makers,
+            &turn_ring,
+            &key,
+            SlotId(0),
+            payload,
+            RelayId(3),
+        );
+        assert!(local.try_recv_forward().is_none());
+        assert!(peer_b_rx.try_recv().is_err());
+        assert!(peer_c_rx.try_recv().is_err());
+    }
+
     /// The bug this guards: a full mesh forward queue used to just drop the fresh
     /// turn (`let _ = tx.try_send(...)`) — a turn that never enters the link's
     /// `AckManager` has nothing for that link's redundancy to re-carry, so the
@@ -3522,6 +3723,26 @@ mod tests {
     }
 
     #[test]
+    fn resume_cursor_saturates_at_the_sequence_ceiling() {
+        let seen = new_seen_registries();
+        let key = control_key();
+        let mut session_seen = MeshSeen::new();
+        session_seen.slots.insert(
+            SlotId(0),
+            SlotSeen {
+                forwarded_through: Some(u64::MAX),
+                ahead: BTreeSet::new(),
+            },
+        );
+        seen.lock().insert(key.clone(), session_seen);
+
+        assert_eq!(
+            resume_cursor_snapshot(&seen, &key),
+            vec![(SlotId(0), u64::MAX)],
+        );
+    }
+
+    #[test]
     fn reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join() {
         // A session this relay has never forwarded anything for -- a first
         // Join, or a peer that predates this link entirely -- sends a frame
@@ -3600,9 +3821,9 @@ mod tests {
 
     #[test]
     fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
-        // The ring holds a mix of origins for the same slot (whichever copy won
-        // the topological dedup); a resume reply must carry only the `Local`
-        // ones -- the no-echo rule a mesh reply is not allowed to violate.
+        // The ring can hold both locally and remotely originated entries; a
+        // resume reply must carry only the `Local` ones so this relay never
+        // forwards a peer-origin payload to another relay.
         let mesh = new_mesh_state();
         let key = control_key();
         mesh.turn_ring.record(
@@ -3882,8 +4103,8 @@ mod tests {
 
     /// An oversize turn arriving over the mesh control stream folds back into
     /// the normal receive path — its frame feeds the consensus coordinate and
-    /// the topological dedup marks it delivered (so a copy arriving by any
-    /// other path is dropped) — and it is NOT re-broadcast to other mesh links:
+    /// the session-level gate marks it delivered (so reconnect, resume, or
+    /// re-home overlap is dropped) — and it is NOT re-broadcast to other mesh links:
     /// the origin relay diverted a copy to every link itself, so re-flooding
     /// would only echo. (Actual delivery to a local client link is covered by
     /// the end-to-end mesh test; the slot inbox is private to `routing`.)
@@ -3949,8 +4170,8 @@ mod tests {
             crate::consensus::slot_frame(&makers, &key, SlotId(0)),
             Some(GameFrameCount(7)),
         );
-        // The turn was marked in the topological dedup: a copy arriving by any
-        // other path is a duplicate now.
+        // The turn was marked in the session-level gate: an overlapping copy is
+        // a duplicate now.
         assert_eq!(
             mark_seen(&seen, &key, SlotId(0), 0),
             Seen::Duplicate,
@@ -4559,9 +4780,9 @@ mod tests {
             std::collections::HashSet::new(),
         );
 
-        // Slot 0's very first turn (seq 0, sync ordinal 0), delivered TWICE at
-        // the exact choke point every mesh path funnels through — simulating
-        // the legitimate multi-relay redundant flood, not a sender bug.
+        // Slot 0's very first turn (seq 0, sync ordinal 0), delivered twice at
+        // the exact choke point every ingress path funnels through — simulating
+        // link-replacement or resume overlap, not a sender bug.
         let value = [1, 2, 3, 4, 5];
         let first = sync_payload(0, 0, 0, value);
         assert!(
@@ -4639,9 +4860,8 @@ mod tests {
     }
 
     /// The leave-frame clamp's history must record each distinct `(slot, seq)`
-    /// turn exactly once, even though a multi-relay mesh legitimately delivers
-    /// the same turn to a relay via more than one path (a peer's direct copy
-    /// plus another peer's reflood). The history is a bounded append — unlike
+    /// turn exactly once even when a reconnect/resume overlap repeats a peer's
+    /// direct copy. The history is a bounded append — unlike
     /// the per-slot frame max, which is a harmless monotone — so duplicates
     /// walked twice would evict genuine low-seq history and leave
     /// `reachable_frame` with nothing at or below its threshold, pushing its
@@ -4669,9 +4889,9 @@ mod tests {
         );
 
         // The survivor's turns each arrive twice: the home peer's direct copy,
-        // then another peer's reflood of the same turn. Only the first passes
-        // the topological dedup; the reflood must leave no trace in the frame
-        // history.
+        // then the same copy replayed after a link replacement. Only the first
+        // passes the session-level dedup; the replay must leave no trace in the
+        // frame history.
         for seq in 0..=21u64 {
             let payload = Payload {
                 seq,
@@ -4703,10 +4923,10 @@ mod tests {
                     &key,
                     SlotId(0),
                     payload,
-                    crate::delivery::DeliveryHome::Peer(RelayId(3)),
+                    crate::delivery::DeliveryHome::Peer(RelayId(2)),
                 )
                 .is_none(),
-                "the reflood is a topological duplicate",
+                "the replacement-link replay is a session-level duplicate",
             );
         }
 

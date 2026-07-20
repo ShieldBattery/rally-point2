@@ -34,16 +34,56 @@ use rally_point_proto::messages::{Packet, Payload};
 
 use crate::sequence_buffer::SequenceBuffer;
 
-/// How many of the peer's most recent packets to remember. The ack bitfield is
-/// 32 bits wide, plus the most-recent `ack` itself, so remembering more than 33
-/// adds nothing to what we can acknowledge.
-const RECEIVED_PACKETS_SIZE: usize = 32 + 1;
-
 /// How many of our own recently-sent packets to remember so we can map an
 /// incoming ack back to the payloads that packet carried. Chosen large enough
 /// that any packet old enough to fall out of the buffer can safely be treated as
 /// lost (its payloads are still re-sent until separately acked).
 const SENT_PACKETS_SIZE: usize = 256;
+
+/// The peer packet history represented directly in the wire format's shape.
+///
+/// `most_recent` is the packet named by `Packet::ack`; bit `N` of `ack_bits`
+/// records `most_recent - (N + 1)`. Receiving a newer packet shifts the window
+/// forward, while a late packet sets its one bit if it is still insertable by
+/// the prior 33-entry [`SequenceBuffer`] semantics. Keeping this rolling form
+/// makes reading the outgoing ack state constant-time instead of probing a ring
+/// 32 times for every packet built.
+#[derive(Default)]
+struct ReceivedPacketHistory {
+    most_recent: Option<u32>,
+    ack_bits: u32,
+}
+
+impl ReceivedPacketHistory {
+    fn record(&mut self, seq: u32) {
+        let Some(most_recent) = self.most_recent else {
+            self.most_recent = Some(seq);
+            return;
+        };
+
+        match seq.cmp(&most_recent) {
+            std::cmp::Ordering::Greater => {
+                let advanced = seq - most_recent;
+                self.ack_bits = if advanced <= 32 {
+                    self.ack_bits.checked_shl(advanced).unwrap_or(0) | (1u32 << (advanced - 1))
+                } else {
+                    0
+                };
+                self.most_recent = Some(seq);
+            }
+            std::cmp::Ordering::Less => {
+                let behind = most_recent - seq;
+                // The old 33-entry SequenceBuffer's next-free cursor is one
+                // beyond `most_recent`, so a packet exactly 32 behind is already
+                // one full capacity behind that cursor and is not inserted.
+                if behind < 32 {
+                    self.ack_bits |= 1u32 << (behind - 1);
+                }
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+}
 
 /// Manages sending packets and processing acknowledgements for one link.
 ///
@@ -65,9 +105,14 @@ pub struct AckManager {
     /// `(slot, seq)` — the origin identity. Iterated per slot, oldest-seq-first
     /// within each slot, to refill each outgoing packet's redundancy budget.
     unacked_payloads: BTreeMap<(SlotId, u64), SentPayload>,
+    /// Sum of each unacked payload's encoded repeated-field element size.
+    /// Single-entry mutations keep it exact; bulk cursor retirement invalidates
+    /// it for one lazy refresh. This makes the common all-fit decision O(1),
+    /// without imposing a pre-scan on the constrained path.
+    unacked_payload_wire_len: Option<usize>,
     /// The peer's recently-received packets, keyed by their packet seq. Drives
     /// the `ack` / `ack_bits` we send back.
-    received_packets: SequenceBuffer<ReceivedPacket>,
+    received_packets: ReceivedPacketHistory,
 }
 
 impl AckManager {
@@ -76,7 +121,8 @@ impl AckManager {
             packet_seq: 0,
             sent_packets: SequenceBuffer::with_capacity(SENT_PACKETS_SIZE),
             unacked_payloads: BTreeMap::new(),
-            received_packets: SequenceBuffer::with_capacity(RECEIVED_PACKETS_SIZE),
+            unacked_payload_wire_len: Some(0),
+            received_packets: ReceivedPacketHistory::default(),
         }
     }
 
@@ -94,7 +140,7 @@ impl AckManager {
     pub fn reset_connection(&mut self) {
         self.packet_seq = 0;
         self.sent_packets = SequenceBuffer::with_capacity(SENT_PACKETS_SIZE);
-        self.received_packets = SequenceBuffer::with_capacity(RECEIVED_PACKETS_SIZE);
+        self.received_packets = ReceivedPacketHistory::default();
         // unacked_payloads intentionally preserved for re-carry over the new
         // connection.
     }
@@ -102,10 +148,7 @@ impl AckManager {
     /// The peer's most recently received packet seq, or `None` if we've seen
     /// nothing from the peer yet.
     fn last_seen_remote(&self) -> Option<u64> {
-        match self.received_packets.sequence() {
-            0 => None,
-            next => Some(next - 1),
-        }
+        self.received_packets.most_recent.map(u64::from)
     }
 
     /// Number of payloads sent at least once that are not yet acked.
@@ -146,23 +189,7 @@ impl AckManager {
     /// Builds the `ack_bits` field: bit `N` is set when the peer's packet
     /// `(most_recent - N - 1)` has been received.
     fn ack_bits(&self) -> u32 {
-        let Some(most_recent) = self.last_seen_remote() else {
-            return 0;
-        };
-
-        let mut bits: u32 = 0;
-        let mut mask: u32 = 1;
-        for i in 1u64..=32 {
-            if most_recent < i {
-                // Not enough history yet to fill the rest of the bitfield.
-                break;
-            }
-            if self.received_packets.exists(most_recent - i) {
-                bits |= mask;
-            }
-            mask <<= 1;
-        }
-        bits
+        self.received_packets.ack_bits
     }
 
     /// Builds the next outgoing [`Packet`].
@@ -174,7 +201,9 @@ impl AckManager {
     /// — the current turn is never dropped), and tracked for re-sending until
     /// acked. The remaining space up to `max_packet_len` is then filled with
     /// still-unacked payloads, oldest-seq-first within each slot, for redundancy.
-    /// If `payload` is `None`, the result is an ack-only packet with no payloads.
+    /// If `payload` is `None`, there is no fresh payload, but still-unacked
+    /// payloads are packed as redundancy when they fit. The result is truly
+    /// ack-only only when the unacked window is empty (or none of it fits).
     ///
     /// `max_packet_len` is the live datagram budget (e.g. quinn's
     /// `max_datagram_size()`); pass the current value each call so the bundle
@@ -243,41 +272,53 @@ impl AckManager {
             payload_keys.push((*slot, p.seq));
         }
 
-        // Refill with still-unacked payloads, least-resent-first: a run of
-        // packets where the budget fills before every unacked payload fits
-        // must not let the same subset starve everything ranked after it —
-        // `(slot, seq)` iteration order (a BTreeMap's natural order) would do
-        // exactly that, systematically favoring low slot numbers and low
-        // seqs over a long near-MTU stream. Sorting by `send_count` instead
-        // means whichever payloads got the least redundancy coverage so far
-        // are the ones a tight budget spends its room on next, spreading
-        // coverage fairly across every slot over time. The sort is stable,
-        // so payloads tied on `send_count` (the common case: a fresh burst,
-        // or right after every payload was just sent once) still refill in
-        // their underlying `(slot, seq)` order — oldest per slot first,
-        // exactly as before. The fresh payload isn't in `unacked_payloads`
-        // yet, so it can't double up.
-        let mut candidates: Vec<(&(SlotId, u64), &mut SentPayload)> =
-            self.unacked_payloads.iter_mut().collect();
-        candidates.sort_by_key(|(_, sent)| sent.send_count);
-        for (key, sent) in candidates {
-            let element = payload_element_len(sent.encoded_len);
-            if used + element > max_packet_len {
-                continue;
+        // When the whole unacked window fits, ranking cannot affect coverage:
+        // every candidate rides this packet. Check that case from the cached
+        // encoded lengths and refill directly in the BTreeMap's stable
+        // `(slot, seq)` order, avoiding both the temporary candidate allocation
+        // and its sort on the common small-window path.
+        let unacked_payload_wire_len = self.unacked_payload_wire_len();
+        let all_candidates_fit = max_packet_len
+            .checked_sub(used)
+            .is_some_and(|remaining| unacked_payload_wire_len <= remaining);
+        if all_candidates_fit {
+            packet.payloads.reserve(self.unacked_payloads.len());
+            payload_keys.reserve(self.unacked_payloads.len());
+            for (key, sent) in &mut self.unacked_payloads {
+                sent.send_count += 1;
+                packet.payloads.push(sent.payload.clone());
+                payload_keys.push(*key);
             }
-            sent.send_count += 1;
-            used += element;
-            packet.payloads.push(sent.payload.clone());
-            payload_keys.push(*key);
+        } else {
+            // A constrained packet refills least-resent-first: it must not let
+            // the same low `(slot, seq)` subset starve everything ranked after
+            // it. Sorting by `send_count` spreads redundancy coverage fairly
+            // across every slot. The stable sort keeps tied candidates in the
+            // BTreeMap's underlying `(slot, seq)` order, oldest per slot first.
+            // The fresh payload isn't in `unacked_payloads` yet, so it cannot
+            // double up.
+            let mut candidates: Vec<(&(SlotId, u64), &mut SentPayload)> =
+                self.unacked_payloads.iter_mut().collect();
+            candidates.sort_by_key(|(_, sent)| sent.send_count);
+            for (key, sent) in candidates {
+                let element = sent.wire_len;
+                if used + element > max_packet_len {
+                    continue;
+                }
+                sent.send_count += 1;
+                used += element;
+                packet.payloads.push(sent.payload.clone());
+                payload_keys.push(*key);
+            }
         }
 
         // Record the fresh payload as unacked only after the redundancy pass.
         if let Some((slot, p, len)) = fresh {
-            self.unacked_payloads.insert(
+            self.insert_unacked(
                 (slot, p.seq),
                 SentPayload {
                     send_count: 1,
-                    encoded_len: len,
+                    wire_len: payload_element_len(len),
                     payload: p,
                 },
             );
@@ -326,8 +367,7 @@ impl AckManager {
             }
         }
 
-        self.received_packets
-            .insert(u64::from(incoming.seq), ReceivedPacket);
+        self.received_packets.record(incoming.seq);
 
         if let Some(ack) = incoming.ack {
             let ack = u64::from(ack);
@@ -361,10 +401,21 @@ impl AckManager {
     /// `sent_packets` entries that still reference a retired payload are harmless:
     /// a later ack for them simply finds nothing left to remove.
     pub fn retire_payloads_through(&mut self, slot: SlotId, through_seq: u64) -> usize {
+        // BTreeMap has no range-drain operation. Repeatedly finding and removing
+        // the range front looks targeted, but pays a tree search/rebalance for
+        // every retired entry and measures no better than this single traversal.
         let before = self.unacked_payloads.len();
         self.unacked_payloads
-            .retain(|&(s, seq), _| s != slot || seq > through_seq);
-        before - self.unacked_payloads.len()
+            .retain(|&(candidate_slot, seq), _| candidate_slot != slot || seq > through_seq);
+        let retired = before - self.unacked_payloads.len();
+        if retired > 0 {
+            // Computing the removed range's exact encoded size inside `retain`
+            // measurably slows this cursor path. Invalidate instead; the next
+            // packet build refreshes the total once, and reliable-cursor
+            // retirement is only the fallback when ordinary packet acks missed.
+            self.unacked_payload_wire_len = None;
+        }
+        retired
     }
 
     /// Re-registers a payload as still-unacked so the redundancy pass re-carries
@@ -381,7 +432,6 @@ impl AckManager {
     /// left untouched, so a re-inject never resets its `send_count` or double-tracks
     /// it.
     pub fn reinject_unacked(&mut self, payload: Payload) {
-        use std::collections::btree_map::Entry;
         // The wire slot must fit a `SlotId` to be tracked without aliasing onto a
         // different slot's window: a truncating narrowing would map slot `256 + n`
         // onto slot `n`. A turn a client produced always names its own in-range
@@ -395,21 +445,60 @@ impl AckManager {
             return;
         };
         let key = (SlotId(raw), payload.seq);
-        if let Entry::Vacant(vacant) = self.unacked_payloads.entry(key) {
+        if !self.unacked_payloads.contains_key(&key) {
             let encoded_len = payload.encoded_len();
-            vacant.insert(SentPayload {
-                send_count: 0,
-                encoded_len,
-                payload,
-            });
+            self.insert_unacked(
+                key,
+                SentPayload {
+                    send_count: 0,
+                    wire_len: payload_element_len(encoded_len),
+                    payload,
+                },
+            );
         }
+    }
+
+    /// Inserts or replaces one unacked payload while keeping the aggregate wire
+    /// size exact. Replacement is defensive; normal origin seqs are unique.
+    fn insert_unacked(&mut self, key: (SlotId, u64), sent: SentPayload) {
+        let new_len = sent.wire_len;
+        if let Some(previous) = self.unacked_payloads.insert(key, sent)
+            && let Some(total) = self.unacked_payload_wire_len.as_mut()
+        {
+            *total = total.saturating_sub(previous.wire_len);
+        }
+        if let Some(total) = self.unacked_payload_wire_len.as_mut() {
+            *total = total.saturating_add(new_len);
+        }
+    }
+
+    fn remove_unacked(&mut self, key: &(SlotId, u64)) -> Option<SentPayload> {
+        let removed = self.unacked_payloads.remove(key)?;
+        if let Some(total) = self.unacked_payload_wire_len.as_mut() {
+            *total = total.saturating_sub(removed.wire_len);
+        }
+        Some(removed)
+    }
+
+    /// Returns the complete repeated-field wire cost of the unacked window,
+    /// refreshing it after a bulk cursor retirement invalidated the cache.
+    fn unacked_payload_wire_len(&mut self) -> usize {
+        if let Some(total) = self.unacked_payload_wire_len {
+            return total;
+        }
+        let total = self
+            .unacked_payloads
+            .values()
+            .fold(0usize, |total, sent| total.saturating_add(sent.wire_len));
+        self.unacked_payload_wire_len = Some(total);
+        total
     }
 
     /// Marks one of our sent packets as acked, retiring every payload it carried.
     fn retire_packet(&mut self, packet_seq: u64) {
         if let Some(packet) = self.sent_packets.remove(packet_seq) {
             for (slot, seq) in packet.payload_slots_seqs.iter() {
-                self.unacked_payloads.remove(&(*slot, *seq));
+                self.remove_unacked(&(*slot, *seq));
             }
         }
     }
@@ -456,15 +545,11 @@ struct SentPacket {
 struct SentPayload {
     /// How many packets this payload has been included in (diagnostics).
     send_count: u32,
-    /// Cached encoded size, so refilling a packet doesn't re-encode it.
-    encoded_len: usize,
+    /// Cached size of its complete repeated-field wire element, so refilling a
+    /// packet and maintaining the aggregate do not recalculate its varint.
+    wire_len: usize,
     payload: Payload,
 }
-
-/// Marker for a packet received from the peer; presence in the buffer is all the
-/// ack machinery needs.
-#[derive(Clone, Default)]
-struct ReceivedPacket;
 
 /// The per-connection packet sequence space is exhausted: every `u32` packet
 /// seq has been assigned, so [`AckManager::build_outgoing`] can mint no more.
@@ -531,6 +616,141 @@ mod tests {
             ack,
             ack_bits,
             payloads: Vec::new(),
+        }
+    }
+
+    fn assert_unacked_wire_len_is_exact(manager: &mut AckManager) {
+        let actual = manager
+            .unacked_payloads
+            .values()
+            .map(|sent| sent.wire_len)
+            .sum::<usize>();
+        assert_eq!(manager.unacked_payload_wire_len(), actual);
+    }
+
+    #[derive(Clone, Default)]
+    struct ModelReceivedPacket;
+
+    fn model_ack_state(history: &SequenceBuffer<ModelReceivedPacket>) -> (Option<u32>, u32) {
+        let Some(most_recent) = history.sequence().checked_sub(1) else {
+            return (None, 0);
+        };
+        let mut bits = 0u32;
+        for behind in 1u64..=32 {
+            if most_recent < behind {
+                break;
+            }
+            if history.exists(most_recent - behind) {
+                bits |= 1u32 << (behind - 1);
+            }
+        }
+        (Some(most_recent as u32), bits)
+    }
+
+    fn rolling_ack_state(history: &ReceivedPacketHistory) -> (Option<u32>, u32) {
+        (history.most_recent, history.ack_bits)
+    }
+
+    #[test]
+    fn rolling_ack_history_matches_sequence_buffer_for_exhaustive_short_traces() {
+        // Reset plus values chosen around the 32-bit history boundary and the
+        // u32 sequence ceiling. Exhausting every trace through length five
+        // covers in-order delivery, duplicates, arbitrary reordering, exact and
+        // beyond-window late arrivals, large forward jumps, and reset at every
+        // position.
+        const ACTIONS: [Option<u32>; 10] = [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(31),
+            Some(32),
+            Some(33),
+            Some(u32::MAX - 32),
+            Some(u32::MAX - 1),
+            Some(u32::MAX),
+        ];
+
+        for len in 0..=5u32 {
+            for case in 0..ACTIONS.len().pow(len) {
+                let mut rolling = ReceivedPacketHistory::default();
+                let mut model = SequenceBuffer::with_capacity(33);
+                let mut encoded = case;
+
+                for step in 0..len {
+                    let action = ACTIONS[encoded % ACTIONS.len()];
+                    encoded /= ACTIONS.len();
+                    match action {
+                        Some(seq) => {
+                            rolling.record(seq);
+                            let _ = model.insert(u64::from(seq), ModelReceivedPacket);
+                        }
+                        None => {
+                            rolling = ReceivedPacketHistory::default();
+                            model = SequenceBuffer::with_capacity(33);
+                        }
+                    }
+
+                    assert_eq!(
+                        rolling_ack_state(&rolling),
+                        model_ack_state(&model),
+                        "history diverged for len={len}, case={case}, step={step}, action={action:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_ack_history_matches_sequence_buffer_for_deterministic_randomized_traces() {
+        let mut rolling = ReceivedPacketHistory::default();
+        let mut model = SequenceBuffer::with_capacity(33);
+        let mut most_recent = None::<u32>;
+        let mut random = 0xD1B5_4A32_D192_ED03u64;
+        let boundaries = [
+            0,
+            1,
+            31,
+            32,
+            33,
+            u32::MAX - 33,
+            u32::MAX - 32,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+
+        for step in 0..100_000u32 {
+            // A fixed xorshift stream keeps the test deterministic while
+            // exercising far more interleavings than the short exhaustive set.
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+
+            if random.is_multiple_of(97) {
+                rolling = ReceivedPacketHistory::default();
+                model = SequenceBuffer::with_capacity(33);
+                most_recent = None;
+            } else {
+                let current = most_recent.unwrap_or(0);
+                let seq = match random % 7 {
+                    0 => random as u32,
+                    1 => current,
+                    2 => current.saturating_sub((random as u32) % 40),
+                    3 => current.saturating_add((random as u32) % 4_096),
+                    4 => boundaries[(random as usize) % boundaries.len()],
+                    5 => (random as u32) % 64,
+                    _ => current.saturating_sub(32 + (random as u32) % 4_096),
+                };
+                rolling.record(seq);
+                let _ = model.insert(u64::from(seq), ModelReceivedPacket);
+                most_recent = Some(most_recent.map_or(seq, |recent| recent.max(seq)));
+            }
+
+            assert_eq!(
+                rolling_ack_state(&rolling),
+                model_ack_state(&model),
+                "history diverged at deterministic randomized step {step}",
+            );
         }
     }
 
@@ -689,27 +909,38 @@ mod tests {
         // No redundancy, so each payload rides exactly one packet and none is
         // retired by datagram acks during this test.
         let mut manager = AckManager::new();
-        // Slot 0: seqs 0..=4, slot 1: seqs 0..=4 — independent seq spaces.
-        for i in 0..5u64 {
-            manager.build_outgoing(Some(test_payload(0, i)), 0).unwrap();
-            manager.build_outgoing(Some(test_payload(1, i)), 0).unwrap();
+        // Sparse seqs exercise cursors below, exactly at, and beyond the live
+        // range. Both slots carry the same seqs but remain independent.
+        for seq in [2u64, 4, 6, 8, 10] {
+            manager
+                .build_outgoing(Some(test_payload(0, seq)), 0)
+                .unwrap();
+            manager
+                .build_outgoing(Some(test_payload(1, seq)), 0)
+                .unwrap();
         }
         assert_eq!(manager.payloads_in_flight(), 10);
 
-        // A side-channel confirms delivery of slot 0 through payload seq 2.
-        // Only slot 0's seqs 0,1,2 retire; slot 1 is untouched.
-        let retired = manager.retire_payloads_through(SlotId(0), 2);
-        assert_eq!(retired, 3);
-        assert_eq!(manager.payloads_in_flight(), 7); // slot 1's 5 + slot 0's 2
+        // A cursor below the oldest live seq visits/removes nothing.
+        assert_eq!(manager.retire_payloads_through(SlotId(0), 1), 0);
+        assert_eq!(manager.payloads_in_flight(), 10);
+
+        // A cursor exactly at the oldest entry removes just that one. Slot 1's
+        // identical seq remains untouched.
+        assert_eq!(manager.retire_payloads_through(SlotId(0), 2), 1);
+        assert_eq!(manager.payloads_in_flight(), 9);
+        assert!(manager.unacked_payloads.contains_key(&(SlotId(1), 2)));
 
         // Idempotent: re-confirming an already-passed cursor retires nothing.
         assert_eq!(manager.retire_payloads_through(SlotId(0), 2), 0);
-        assert_eq!(manager.payloads_in_flight(), 7);
+        assert_eq!(manager.payloads_in_flight(), 9);
 
-        // Retiring slot 1 through 4 drops all of slot 1; slot 0's survivors stay.
-        let retired = manager.retire_payloads_through(SlotId(1), 4);
-        assert_eq!(retired, 5);
-        assert_eq!(manager.payloads_in_flight(), 2); // slot 0's seqs 3, 4
+        // A later cursor removes multiple entries from only the requested slot.
+        assert_eq!(manager.retire_payloads_through(SlotId(0), 8), 3);
+        assert_eq!(manager.payloads_in_flight(), 6); // slot 1's 5 + slot 0's seq 10
+        for seq in [2u64, 4, 6, 8, 10] {
+            assert!(manager.unacked_payloads.contains_key(&(SlotId(1), seq)));
+        }
 
         // A subsequent packet only repacks the payloads still in flight.
         let packet = manager.build_outgoing(None, MTU).unwrap();
@@ -718,7 +949,41 @@ mod tests {
             .iter()
             .map(|p| (p.slot as u8, p.seq))
             .collect();
-        assert_eq!(keys, vec![(0, 3), (0, 4)]);
+        assert_eq!(keys, vec![(0, 10), (1, 2), (1, 4), (1, 6), (1, 8), (1, 10)]);
+
+        // The ceiling removes the final slot-0 entry without touching slot 1.
+        assert_eq!(manager.retire_payloads_through(SlotId(0), u64::MAX), 1);
+        assert_eq!(manager.payloads_in_flight(), 5);
+    }
+
+    #[test]
+    fn cached_unacked_wire_len_tracks_every_window_mutation() {
+        let mut manager = AckManager::new();
+        assert_unacked_wire_len_is_exact(&mut manager);
+
+        manager
+            .build_outgoing(Some(test_payload(0, 0)), MTU)
+            .unwrap();
+        manager
+            .build_outgoing(Some(test_payload(0, 1)), MTU)
+            .unwrap();
+        assert_unacked_wire_len_is_exact(&mut manager);
+
+        manager.reinject_unacked(test_payload(1, 7));
+        manager.reinject_unacked(test_payload(1, 7));
+        assert_unacked_wire_len_is_exact(&mut manager);
+
+        assert_eq!(manager.retire_payloads_through(SlotId(0), 0), 1);
+        assert_unacked_wire_len_is_exact(&mut manager);
+
+        // Packet 1 carried seq 1 fresh (and seq 0 as redundancy). Acking it
+        // removes the surviving slot-0 payload but leaves the re-injected slot.
+        manager.handle_incoming(&incoming(0, Some(1), &[])).unwrap();
+        assert_unacked_wire_len_is_exact(&mut manager);
+        assert_eq!(manager.payloads_in_flight(), 1);
+
+        assert_eq!(manager.retire_payloads_through(SlotId(1), u64::MAX), 1);
+        assert_unacked_wire_len_is_exact(&mut manager);
     }
 
     #[test]
@@ -824,12 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn redundancy_repacks_unacked_payloads_within_a_slot() {
-        // With a real budget, each new packet should re-carry the earlier
-        // unacked payloads alongside the fresh one, least-resent-first: seq 0
-        // rode packet 2's redundancy already (send_count 2 by the time packet
-        // 3 builds) while seq 1 has only ever been sent once as its own fresh
-        // payload (send_count 1) -- so seq 1 refills before seq 0.
+    fn redundancy_repacks_all_unacked_payloads_within_a_slot() {
+        // With a generous budget, each new packet should re-carry every earlier
+        // unacked payload alongside the fresh one. Their serialization order is
+        // immaterial when every candidate fits; the fresh payload remains first.
         let mut manager = AckManager::new();
         manager
             .build_outgoing(Some(test_payload(0, 0)), MTU)
@@ -841,10 +1104,13 @@ mod tests {
             .build_outgoing(Some(test_payload(0, 2)), MTU)
             .unwrap();
 
-        // Fresh payload (seq 2) plus the two still-unacked ones, least-resent
-        // first (seq 1, then seq 0).
-        let seqs: Vec<u64> = third.payloads.iter().map(|p| p.seq).collect();
-        assert_eq!(seqs, vec![2, 1, 0]);
+        assert_eq!(third.payloads.first().map(|payload| payload.seq), Some(2));
+        let mut redundant_seqs: Vec<u64> = third.payloads[1..]
+            .iter()
+            .map(|payload| payload.seq)
+            .collect();
+        redundant_seqs.sort_unstable();
+        assert_eq!(redundant_seqs, vec![0, 1]);
     }
 
     #[test]
@@ -870,6 +1136,110 @@ mod tests {
         // Slot 0's seq 100 comes before slot 1's seq 5 because the key orders by
         // slot first — "oldest per slot", not "lowest seq globally".
         assert_eq!(keys, vec![(0, 100), (1, 5)]);
+    }
+
+    #[test]
+    fn all_fit_refill_carries_every_candidate_and_increments_each_once() {
+        let mut manager = AckManager::new();
+        let candidates = [test_payload(0, 7), test_payload(1, 3), test_payload(2, 11)];
+        for payload in &candidates {
+            manager.reinject_unacked(payload.clone());
+        }
+
+        // Give the candidates deliberately different coverage histories. When
+        // all fit, their ranking is immaterial: every one must be carried and
+        // incremented exactly once without constructing the sorted candidate
+        // list used by the constrained path.
+        let counts = [5, 1, 3];
+        for (payload, count) in candidates.iter().zip(counts) {
+            manager
+                .unacked_payloads
+                .get_mut(&(SlotId(payload.slot as u8), payload.seq))
+                .expect("candidate was re-injected")
+                .send_count = count;
+        }
+
+        let fresh = test_payload(3, 19);
+        let exact_budget = Packet {
+            seq: 0,
+            ack: None,
+            ack_bits: 0,
+            payloads: std::iter::once(fresh.clone())
+                .chain(candidates.iter().cloned())
+                .collect(),
+        }
+        .encoded_len();
+        let packet = manager
+            .build_outgoing(Some(fresh.clone()), exact_budget)
+            .unwrap();
+
+        assert_eq!(packet.encoded_len(), exact_budget);
+        assert_eq!(packet.payloads.first(), Some(&fresh));
+        let mut carried: Vec<(u8, u64)> = packet.payloads[1..]
+            .iter()
+            .map(|payload| (payload.slot as u8, payload.seq))
+            .collect();
+        carried.sort_unstable();
+        assert_eq!(carried, vec![(0, 7), (1, 3), (2, 11)]);
+        for (payload, old_count) in candidates.iter().zip(counts) {
+            assert_eq!(
+                manager
+                    .unacked_payloads
+                    .get(&(SlotId(payload.slot as u8), payload.seq))
+                    .expect("candidate stayed in flight")
+                    .send_count,
+                old_count + 1,
+            );
+        }
+        assert_eq!(
+            manager
+                .unacked_payloads
+                .get(&(SlotId(3), fresh.seq))
+                .expect("fresh payload entered the window")
+                .send_count,
+            1,
+        );
+
+        // The sent-packet record still contains every carried identity: one ack
+        // retires the fresh payload and all fast-path redundancy candidates.
+        manager.handle_incoming(&incoming(0, Some(0), &[])).unwrap();
+        assert_eq!(manager.payloads_in_flight(), 0);
+    }
+
+    #[test]
+    fn constrained_refill_keeps_least_sent_then_key_order() {
+        let mut manager = AckManager::new();
+        for slot in 0u8..4 {
+            manager.reinject_unacked(test_payload(slot, 0));
+        }
+        // Slot 1 is least covered; slots 2 and 3 tie and therefore retain key
+        // order; slot 0 is most covered and should be the one excluded.
+        for (slot, count) in [2, 0, 1, 1].into_iter().enumerate() {
+            manager
+                .unacked_payloads
+                .get_mut(&(SlotId(slot as u8), 0))
+                .expect("candidate was re-injected")
+                .send_count = count;
+        }
+
+        let header = Packet::default().encoded_len();
+        let exact_budget = header
+            + (1u8..=3)
+                .map(|slot| payload_element_len(test_payload(slot, 0).encoded_len()))
+                .sum::<usize>();
+        let packet = manager.build_outgoing(None, exact_budget).unwrap();
+        let keys: Vec<(u8, u64)> = packet
+            .payloads
+            .iter()
+            .map(|payload| (payload.slot as u8, payload.seq))
+            .collect();
+
+        assert_eq!(packet.encoded_len(), exact_budget);
+        assert_eq!(keys, vec![(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(manager.unacked_payloads[&(SlotId(0), 0)].send_count, 2);
+        assert_eq!(manager.unacked_payloads[&(SlotId(1), 0)].send_count, 1);
+        assert_eq!(manager.unacked_payloads[&(SlotId(2), 0)].send_count, 2);
+        assert_eq!(manager.unacked_payloads[&(SlotId(3), 0)].send_count, 2);
     }
 
     /// A tight, permanently-full budget must not let low slot numbers

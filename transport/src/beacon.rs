@@ -1,12 +1,11 @@
 //! The ack-beacon side-channel driver helpers, shared by the client and relay.
 //!
-//! [`spawn_beacon_reader`] and [`flush_beacon`] are free functions over a
-//! `quinn::Connection` / `quinn::SendStream` — they own no `Link` state, so they
-//! live here in the transport crate where both endpoints use one tested copy
-//! rather than two divergent duplicates. Cancel-safety is the whole reason this
-//! is a module: the reader task assembles complete frames off a dedicated
-//! read-loop (never a `read_exact` dropped mid-frame inside a `select!`), and
-//! `flush_beacon` pushes only on advance so a healthy link sends nothing.
+//! [`spawn_beacon_reader`] and [`BeaconWriter`] own no `Link` state, so they live
+//! here in the transport crate where both endpoints use one tested copy rather
+//! than two divergent duplicates. Cancel-safety is the whole reason this is a
+//! module: the reader task assembles complete frames off a dedicated read-loop
+//! (never a `read_exact` dropped mid-frame inside a `select!`), and
+//! [`BeaconWriter`] pushes only on advance so a healthy link sends nothing.
 //!
 //! See `proto::beacon` for the wire frame these helpers read and write.
 
@@ -81,6 +80,61 @@ impl BeaconCursors {
         let slot = *pending.keys().next()?;
         let cursor = pending.remove(&slot).expect("key was just read");
         Some((slot, cursor))
+    }
+}
+
+/// Push-on-advance beacon state for one link.
+///
+/// The writer owns both the per-slot last-sent cursors and a reusable wire
+/// buffer. One flush can accept any iterator of `(slot, delivered-through)`
+/// pairs; every advancing cursor is encoded into that buffer and the whole
+/// batch is written with one stream operation. Callers therefore do not need
+/// to allocate a temporary `HashMap`, and a multi-slot client update does not
+/// perform one write per twelve-byte frame.
+#[derive(Default)]
+pub struct BeaconWriter {
+    last_sent: HashMap<SlotId, u64>,
+    write_buf: Vec<u8>,
+}
+
+impl BeaconWriter {
+    /// Creates empty writer state for a new beacon stream.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pushes every cursor that advanced past the last value successfully sent
+    /// for its slot. `delivered_through` must contain at most one value per slot.
+    ///
+    /// A static receive prefix produces an empty batch and no write. A stream
+    /// failure leaves `last_sent` unchanged; the link is already failing, and
+    /// retaining the old cursor truth is the conservative state if its caller
+    /// gets another chance to flush before teardown.
+    pub async fn flush<I>(&mut self, beacon_send: &mut quinn::SendStream, delivered_through: I)
+    where
+        I: IntoIterator<Item = (SlotId, u64)>,
+    {
+        self.write_buf.clear();
+        for (slot, cursor) in delivered_through {
+            if matches!(self.last_sent.get(&slot), Some(prev) if *prev >= cursor) {
+                continue;
+            }
+            self.write_buf
+                .extend_from_slice(&beacon::encode_frame(slot, cursor));
+        }
+
+        if self.write_buf.is_empty() || beacon_send.write_all(&self.write_buf).await.is_err() {
+            return;
+        }
+
+        // The buffer contains only frames produced by `encode_frame` above, so
+        // every chunk has the exact valid width. Decode after the successful
+        // write so a failed write cannot advance `last_sent` prematurely.
+        for frame in self.write_buf.chunks_exact(beacon::BEACON_FRAME_LEN) {
+            let (slot, cursor) = beacon::decode_frame(frame)
+                .expect("BeaconWriter only buffers frames produced by encode_frame");
+            self.last_sent.insert(slot, cursor);
+        }
     }
 }
 
@@ -184,33 +238,6 @@ pub fn spawn_beacon_reader(connection: quinn::Connection) -> BeaconCursors {
     BeaconCursors { inner }
 }
 
-/// Pushes the per-slot delivered-through cursor to the peer over the beacon
-/// stream, but only when it advanced past the last value sent for that slot. A
-/// healthy link with a static receive prefix (the peer hasn't delivered anything
-/// new) sends nothing — the beacon is push-on-advance, not on a timer.
-///
-/// `last_sent` tracks the highest cursor pushed per slot so the caller can
-/// coalesce: pass the same `&mut` each call. A write failure (broken stream) is
-/// swallowed — a lost beacon push is recoverable: the cursor advances again on
-/// the next delivery, and the hard cap still bounds the window if the peer is
-/// truly stuck.
-pub async fn flush_beacon(
-    beacon_send: &mut quinn::SendStream,
-    last_sent: &mut HashMap<SlotId, u64>,
-    delivered_through: HashMap<SlotId, u64>,
-) {
-    for (slot, cursor) in delivered_through {
-        if matches!(last_sent.get(&slot), Some(prev) if *prev >= cursor) {
-            // Already pushed this or a later cursor for this slot; no-op.
-            continue;
-        }
-        let frame = beacon::encode_frame(slot, cursor);
-        if beacon_send.write_all(&frame).await.is_ok() {
-            last_sent.insert(slot, cursor);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -267,6 +294,57 @@ mod tests {
         let server_conn = accept.await.unwrap();
 
         (client_conn, server_conn, client, server)
+    }
+
+    #[tokio::test]
+    async fn writer_batches_advances_and_suppresses_static_cursors() {
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+        let mut rx = spawn_beacon_reader(reader_conn);
+        let mut send = writer_conn.open_uni().await.unwrap();
+        let mut writer = BeaconWriter::new();
+
+        writer
+            .flush(&mut send, [(SlotId(0), 3), (SlotId(1), 7)])
+            .await;
+        assert_eq!(
+            writer.write_buf.len(),
+            2 * beacon::BEACON_FRAME_LEN,
+            "both advancing cursors share one wire buffer",
+        );
+
+        let mut received = HashMap::new();
+        for _ in 0..2 {
+            let (slot, cursor) = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("both batched cursors must arrive")
+                .expect("the reader remains live");
+            received.insert(slot, cursor);
+        }
+        assert_eq!(received.get(&SlotId(0)), Some(&3));
+        assert_eq!(received.get(&SlotId(1)), Some(&7));
+
+        writer
+            .flush(&mut send, [(SlotId(0), 3), (SlotId(1), 6)])
+            .await;
+        assert!(
+            writer.write_buf.is_empty(),
+            "equal and regressing cursors produce no write batch",
+        );
+        assert!(
+            timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
+            "a static prefix stays quiet",
+        );
+
+        writer
+            .flush(&mut send, [(SlotId(0), 4), (SlotId(1), 7)])
+            .await;
+        assert_eq!(writer.write_buf.len(), beacon::BEACON_FRAME_LEN);
+        assert_eq!(
+            timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the later advance must arrive"),
+            Some((SlotId(0), 4)),
+        );
     }
 
     /// The final cursor before traffic stops must survive an arbitrarily slow

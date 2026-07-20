@@ -4,8 +4,8 @@
 //!
 //! Every turn the relay fans out to a session's slots is also recorded here, once
 //! per distinct `(slot, seq)` (the recording sits at the same single fan-out choke
-//! point, right after the topological dedup, so a turn delivered to the authority
-//! by more than one mesh path is recorded exactly once). On a re-register the
+//! point, right after the session-level dedup, so reconnect/resume or re-home
+//! overlap records a repeated turn exactly once). On a re-register the
 //! relay reads the reconnecting client's per-slot delivery cursors and replays,
 //! on the reliable control stream, every recorded turn the client had not yet
 //! received.
@@ -122,15 +122,14 @@ const fn max_bytes(slots: usize) -> usize {
 }
 
 /// Where a recorded turn reached this relay from — stamped once, at the
-/// moment it wins the topological dedup and is recorded here, rather than
+/// moment it wins the session-level dedup and is recorded here, rather than
 /// re-derived later from some other state. Re-deriving it later (e.g. from
 /// whether the origin slot is *currently* a locally-registered client) would
 /// get a genuinely mesh-delivered turn wrong in the window right around a
-/// re-home or a race between a client's own send and a redundant mesh copy of
-/// the same turn: the topological dedup keeps whichever copy of a `(slot,
-/// seq)` arrives first, and for a slot homed here that can legitimately be
-/// the mesh copy if it happens to win the race — so "is this slot local" is
-/// not the same question as "did THIS entry arrive locally". A resume reply
+/// re-home or a race between a client's own send and a stale peer replay of
+/// the same turn: the session-level dedup keeps whichever copy of a `(slot,
+/// seq)` arrives first, so "is this slot local now" is not the same question
+/// as "did THIS entry arrive locally". A resume reply
 /// must answer the second question, entry by entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOrigin {
@@ -211,9 +210,9 @@ impl TurnRing {
 
     /// Records one forwarded turn for `key`, tagged with where it came from
     /// (see [`TurnOrigin`]). Called once per distinct `(slot, seq)` — at the
-    /// single fan-out choke point, after the topological dedup — so a turn
-    /// the mesh delivers by more than one path is recorded exactly once,
-    /// under whichever origin the winning copy actually arrived by. The
+    /// single fan-out choke point, after the session-level dedup — so ingress
+    /// overlap records a repeated turn exactly once, under whichever origin
+    /// the winning copy actually arrived by. The
     /// caller gates this on the session having started; pre-start lobby
     /// traffic has its own replay log and must not be double-buffered here.
     ///
@@ -222,8 +221,12 @@ impl TurnRing {
     /// doc). Pass `0` when the shape is genuinely unknown; that sizes the ring
     /// for a maximum-slot game, since unknown must never under-retain.
     pub fn record(&self, key: &SessionKey, payload: &Payload, origin: TurnOrigin, slots: usize) {
-        self.sessions
-            .lock()
+        let mut sessions = self.sessions.lock();
+        if let Some(ring) = sessions.get_mut(key) {
+            ring.record(payload.clone(), origin, slots);
+            return;
+        }
+        sessions
             .entry(key.clone())
             .or_default()
             .record(payload.clone(), origin, slots);
@@ -237,8 +240,8 @@ impl TurnRing {
     /// not replayed (the client did not ask to resume it), so an empty map — a fresh
     /// dial — replays nothing. Oldest-first preserves each slot's seq order for the
     /// client's per-slot reorder buffer. Every origin qualifies: a reconnecting
-    /// client wants everything it missed regardless of which mesh path (if any)
-    /// first delivered it here.
+    /// client wants everything it missed regardless of whether its home client
+    /// edge or a direct peer link first delivered it here.
     ///
     /// A client's own inbound gaps have a second re-carrier besides this replay
     /// — its own unacked-window redundancy, riding its live home-relay link — so
@@ -595,9 +598,9 @@ mod tests {
 
     #[test]
     fn replay_local_excludes_mesh_delivered_entries() {
-        // A slot's turns can be recorded under either origin depending on which
-        // copy actually won the topological dedup, regardless of which slot they
-        // are for. `replay` (the client-facing form) doesn't care; `replay_local`
+        // A slot's turns can be recorded under either origin across a re-home,
+        // regardless of which slot they are for. `replay` (the client-facing
+        // form) doesn't care; `replay_local`
         // (the mesh resume-reply form) must only ever return the `Local` ones.
         let ring = TurnRing::new();
         let k = key();

@@ -232,6 +232,7 @@ mod tests {
         // forwarded bytes must be identical (the fixpoint the validator promises
         // when stripped_control is 0).
         use rally_point_proto::ids::SlotId;
+        use rally_point_proto::messages::Payload;
         use rally_point_relay::validation::validate_turn;
 
         let honest = TurnBuilder::new(0x99, 24);
@@ -239,7 +240,14 @@ mod tests {
         for ordinal in 0..64u64 {
             for builder in [&honest, &diverging] {
                 let commands = builder.turn(ordinal);
-                let validated = validate_turn(SlotId(0), 0, Some(ordinal as u32), &commands)
+                let payload = Payload {
+                    seq: 0,
+                    slot: u32::MAX,
+                    commands: commands.clone().into(),
+                    game_frame_count: Some(ordinal as u32),
+                    buffer_directive: None,
+                };
+                let validated = validate_turn(SlotId(0), payload)
                     .expect("a generated turn must validate on the relay");
                 assert_eq!(
                     validated.stripped_control, 0,

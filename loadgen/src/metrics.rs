@@ -11,6 +11,7 @@
 //! the same `(slot, frame)` coordinate — that difference is the fan-out latency.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -116,6 +117,18 @@ pub enum SessionReport {
 /// The whole run's summarized metrics, ready to print or serialize.
 #[derive(Debug, Serialize)]
 pub struct RunReport {
+    /// The offered workload that produced this report. Keeping it beside the
+    /// aggregates makes two saved JSON files self-describing: a latency or CPU
+    /// comparison is only meaningful when these inputs match.
+    pub workload: Workload,
+    /// Whole conductor wall time, including ramp-up and teardown.
+    pub elapsed_ms: u64,
+    /// Actual player turns emitted divided by whole conductor wall time. This is
+    /// a run-level throughput sanity check, not a steady-state rate (the elapsed
+    /// interval deliberately includes the arrival ramp).
+    pub turns_sent_per_sec: f64,
+    /// Actual per-player turn deliveries divided by whole conductor wall time.
+    pub turns_received_per_sec: f64,
     pub sessions_requested: usize,
     pub sessions_created: usize,
     pub sessions_create_failed: usize,
@@ -136,9 +149,25 @@ pub struct RunReport {
     pub inter_arrival_gap_us: Distribution,
 }
 
+/// Inputs that materially shape relay work during one load run.
+#[derive(Debug, Clone, Serialize)]
+pub struct Workload {
+    pub run_id: String,
+    pub sessions: usize,
+    pub arrival_rate: f64,
+    pub players_per_session: usize,
+    pub game_secs: u64,
+    pub turn_rate: u32,
+    pub turn_bytes: usize,
+    pub slot_regions: Vec<String>,
+    pub desync_fraction: f64,
+    pub ipv4_only: bool,
+}
+
 impl RunReport {
     /// Folds every session's raw report into the run summary.
-    pub fn aggregate(sessions_requested: usize, reports: Vec<SessionReport>) -> Self {
+    pub fn aggregate(workload: Workload, elapsed: Duration, reports: Vec<SessionReport>) -> Self {
+        let sessions_requested = workload.sessions;
         let mut sessions_created = 0;
         let mut sessions_create_failed = 0;
         let mut create_failures_by_status: BTreeMap<String, u64> = BTreeMap::new();
@@ -198,7 +227,22 @@ impl RunReport {
             }
         }
 
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_secs = elapsed.as_secs_f64();
+        let (turns_sent_per_sec, turns_received_per_sec) = if elapsed_secs > 0.0 {
+            (
+                turns_sent as f64 / elapsed_secs,
+                turns_received as f64 / elapsed_secs,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
         Self {
+            workload,
+            elapsed_ms,
+            turns_sent_per_sec,
+            turns_received_per_sec,
             sessions_requested,
             sessions_created,
             sessions_create_failed,
@@ -225,6 +269,24 @@ impl RunReport {
         use std::fmt::Write as _;
         let mut out = String::new();
         let _ = writeln!(out, "=== rally-point-loadgen run summary ===");
+        let _ = writeln!(
+            out,
+            "workload: run={} arrival={:.2}/s players/session={} game={}s turns={}Hz bytes={} regions={:?}",
+            self.workload.run_id,
+            self.workload.arrival_rate,
+            self.workload.players_per_session,
+            self.workload.game_secs,
+            self.workload.turn_rate,
+            self.workload.turn_bytes,
+            self.workload.slot_regions,
+        );
+        let _ = writeln!(
+            out,
+            "elapsed: {:.3}s; throughput: {:.1} turns sent/s, {:.1} deliveries/s",
+            self.elapsed_ms as f64 / 1_000.0,
+            self.turns_sent_per_sec,
+            self.turns_received_per_sec,
+        );
         let _ = writeln!(
             out,
             "sessions: {} requested, {} created, {} create-failed",
@@ -316,5 +378,40 @@ mod tests {
         assert_eq!(empty.count, 0);
         assert_eq!(empty.max, 0);
         assert_eq!(empty.mean, 0);
+    }
+
+    #[test]
+    fn run_report_keeps_workload_and_actual_wall_clock_rates() {
+        let workload = Workload {
+            run_id: "comparison-a".to_owned(),
+            sessions: 1,
+            arrival_rate: 2.0,
+            players_per_session: 2,
+            game_secs: 30,
+            turn_rate: 24,
+            turn_bytes: 16,
+            slot_regions: vec!["us-west".to_owned(), "us-east".to_owned()],
+            desync_fraction: 0.0,
+            ipv4_only: false,
+        };
+        let report = RunReport::aggregate(
+            workload,
+            Duration::from_secs(2),
+            vec![SessionReport::Created {
+                create_latency_us: 10,
+                provisioning_holds: 0,
+                players: vec![PlayerReport {
+                    turns_sent: 20,
+                    turns_received: 30,
+                    ending: Ending::Clean,
+                    ..PlayerReport::default()
+                }],
+            }],
+        );
+
+        assert_eq!(report.workload.run_id, "comparison-a");
+        assert_eq!(report.elapsed_ms, 2_000);
+        assert_eq!(report.turns_sent_per_sec, 10.0);
+        assert_eq!(report.turns_received_per_sec, 15.0);
     }
 }

@@ -881,10 +881,9 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     // MeshLink::recv → mesh-link driver → fan_out → client B.
     //
     // The client-side Dedup guarantees exactly-once delivery to each client
-    // regardless of MeshSeen — MeshSeen is a relay-side forward-once
-    // optimization (prevents O(N²) mesh amplification), not a client-visible
-    // correctness guard. So this test proves cross-relay delivery, not
-    // MeshSeen's dedup.
+    // regardless of MeshSeen. MeshSeen is the relay's session-level gate for
+    // reconnect/resume and re-home overlap, so this test proves direct
+    // cross-relay delivery rather than that defensive duplicate path.
     let received_b = tokio::time::timeout(Duration::from_secs(2), client_b.recv())
         .await
         .expect("client B did not receive the turn within 2s")
@@ -979,7 +978,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
         game_frame_count: Some(12),
         ..Default::default()
     };
-    mesh::forward_turn(
+    mesh::forward_client_turn(
         &relay_a.sessions,
         &relay_a.mesh.links,
         &relay_a.mesh.seen,
@@ -988,7 +987,6 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
         &key,
         SlotId(0),
         oversize.clone(),
-        rally_point_relay::delivery::DeliveryHome::Local,
     );
 
     // Client B receives the turn on its control stream: two divert hops (mesh

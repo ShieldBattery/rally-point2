@@ -63,3 +63,8 @@ zstd = { workspace = true }
 rally-point-coordinator = { path = "../coordinator" }
 # Serves that in-process coordinator's HTTP router in the test.
 axum = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hot_paths"
+harness = false

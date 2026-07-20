@@ -47,6 +47,11 @@ message Packet {
 // `MeshPacket` cannot produce one. Client ↔ relay datagrams are `Packet`;
 // relay ↔ relay datagrams are `MeshPacket`.
 //
+// A relay wraps only turns received from its own home clients and sends a
+// direct copy to every session peer. A receiving relay unwraps the payloads,
+// delivers them to its local clients, and never sends them onto another mesh
+// link. Every payload therefore crosses at most one relay-to-relay hop.
+//
 // `conditions` is an optional sidecar carrying the sender relay's home-client
 // link stats to the peer relay, so the latency-buffer decision-maker can see
 // the whole game's network conditions. It rides at the envelope level — never
@@ -193,11 +198,12 @@ message Payload {
   // command bytes stay exactly what the sending client produced. The transport
   // ignores it for delivery, dedup, and retirement — the carrying turn is
   // deduped by (slot, seq) as usual, and the directive rides along for the
-  // ride. A relay that is not the authority forwards an incoming stamp
-  // untouched; only the authority ever sets or replaces this field.
+  // ride. A relay that is not the authority preserves an incoming stamp while
+  // delivering the turn to its local clients; only the authority ever sets or
+  // replaces this field.
   //
   // Idempotent by design: copies of the same directive (a re-stamped turn, a
-  // redundant re-carry, a second mesh path) all carry the same `decision_seq`,
+  // redundant re-carry, or reconnect/resume overlap) all carry the same `decision_seq`,
   // and a client keeps only the highest `decision_seq` it has seen. Absent
   // outside the window between a decision and its apply frame — the vast
   // majority of turns.
@@ -662,9 +668,10 @@ message MeshControlFrame {
     // home client produced it — the same `Payload`, same `(slot, seq)` identity
     // as the client-edge `ControlFrame.oversize_turn`, validated at the origin's
     // client edge like every mesh-carried turn. The receiver folds it back into
-    // its normal turn path (topological dedup, then local fan-out) but does not
-    // re-broadcast it to other mesh links: the origin relay already diverted a
-    // copy to every link serving the session, so re-flooding would only echo.
+    // its normal turn path (session-level duplicate gate, then local fan-out)
+    // but does not re-broadcast it to other mesh links: the origin relay already
+    // diverted a copy to every link serving the session, so re-flooding would
+    // only echo.
     Payload oversize_turn = 4;
 
     // A lobby command one member authored, propagated to the other relays so
@@ -846,9 +853,10 @@ message MeshResumeCursor {
   uint32 origin_slot = 1;
 
   // The next seq the sender's forward-gate still needs from `origin_slot`.
-  // Every earlier seq has already reached the sender's locals by some path --
-  // this link, another mesh link, or, if `origin_slot` is the sender's own
-  // client, the client edge itself -- and must not be replayed again.
+  // Every earlier seq has already reached the sender's locals through a direct
+  // link from the origin's home (possibly this peer, or a previous home peer
+  // before re-home), or through the client edge while the slot was homed here,
+  // and must not be replayed again.
   uint64 next_seq = 2;
 }
 

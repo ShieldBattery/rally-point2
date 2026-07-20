@@ -1020,7 +1020,7 @@ async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
 /// the fill deterministic on this test's current-thread runtime) — none of
 /// those are recorded into any replay ring, so their own fate is irrelevant.
 /// The one turn this test actually tracks is forwarded through
-/// `mesh::forward_turn` right after the fill: its own `fan_out_to_mesh` call
+/// `mesh::forward_client_turn` right after the fill: its own `fan_out_to_mesh` call
 /// is the one that finds the queue full and fires the reset, so it is, by
 /// construction, the exact turn that tripped it — and it was already
 /// recorded into A's replay ring under [`TurnOrigin::Local`] before that
@@ -1036,7 +1036,6 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
 -> Result<(), AnyError> {
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus;
-    use rally_point_relay::delivery::DeliveryHome;
 
     let tenant = make_tenant();
     let session = SessionId(9);
@@ -1151,7 +1150,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     for _ in 0..FORWARD_CAPACITY {
         mesh::fan_out_to_mesh(&relay_a.mesh.links, &key, turn(0, 0));
     }
-    mesh::forward_turn(
+    mesh::forward_client_turn(
         &relay_a.sessions,
         &relay_a.mesh.links,
         &relay_a.mesh.seen,
@@ -1160,7 +1159,6 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         &key,
         SlotId(0),
         turn(0, triggering_seq),
-        DeliveryHome::Local,
     );
 
     // A's driver resets on the full queue and redials; B's real accept loop
@@ -1985,7 +1983,6 @@ async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(),
 async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
 -> Result<(), AnyError> {
     use rally_point_relay::consensus;
-    use std::collections::HashMap;
 
     let tenant = make_tenant();
     let session = SessionId(1);
@@ -2107,13 +2104,10 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     // The destination confirms final delivery up its ack-beacon stream, exactly
     // as the client driver does in production.
     let mut beacon_send = client_b.connection().open_uni().await?;
-    let mut last_sent: HashMap<SlotId, u64> = HashMap::new();
-    rally_point_transport::beacon::flush_beacon(
-        &mut beacon_send,
-        &mut last_sent,
-        [(SlotId(0), 5u64)].into(),
-    )
-    .await;
+    let mut beacon_writer = rally_point_transport::beacon::BeaconWriter::new();
+    beacon_writer
+        .flush(&mut beacon_send, std::iter::once((SlotId(0), 5u64)))
+        .await;
 
     // The authority's fold converges: relay B taps the beacon, ships the
     // cursors over the mesh control stream, relay A folds them — lag near zero

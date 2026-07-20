@@ -115,9 +115,9 @@ pub struct DeliveryTracking {
 impl DeliveryTracking {
     /// Records one observed origin turn: `origin` produced (and this relay saw)
     /// `seq`, arriving by `home`. Monotonic on the seq, and only a *strictly
-    /// fresher* seq re-stamps the home: the mesh legitimately delivers an
-    /// already-seen turn again (the flood's echo, which the topological dedup
-    /// drops downstream of this observation), and letting an echo rename a
+    /// fresher* seq re-stamps the home: link replacement, resume replay, or
+    /// re-home overlap can present an already-seen turn again (which the
+    /// session-level gate drops before this observation), and letting it rename a
     /// locally-homed origin as mesh-homed would misread every same-relay pair
     /// as cross-relay. The first path to carry each fresh seq is the slot's
     /// home — the source, by the never-re-forwarded rule — so home inference
@@ -356,9 +356,9 @@ mod tests {
     }
 
     #[test]
-    fn a_mesh_echo_of_a_seen_turn_does_not_re_stamp_the_origins_home() {
-        // The mesh flood re-delivers a locally-validated turn (the echo the
-        // topological dedup drops); observed pre-dedup with the same seq, it
+    fn a_redundant_seen_turn_does_not_re_stamp_the_origins_home() {
+        // A stale peer copy overlaps a locally validated turn during a re-home;
+        // observed pre-dedup with the same seq, it
         // must not rename the local origin as mesh-homed — that would misread
         // every same-relay pair as cross-relay.
         let mut tracking = DeliveryTracking::default();
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(
             tracking.max_relay_hops(),
             Some(1),
-            "the echo did not re-stamp the origin's home",
+            "the redundant copy did not re-stamp the origin's home",
         );
 
         // A strictly fresher seq by a new source DOES move the home — a

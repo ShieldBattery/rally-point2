@@ -182,7 +182,7 @@ pub struct SlotSample {
     pub turns_forwarded: u64,
     /// The newest transport seq validated from this slot.
     pub newest_seq: u64,
-    /// Topological duplicates of this slot's turns the mesh dedup dropped.
+    /// Duplicate deliveries of this slot's turns the session-level gate dropped.
     pub dedup_drops: u64,
     /// Turns to this slot's client too large for a datagram, diverted onto the
     /// reliable control stream.
@@ -508,6 +508,39 @@ impl SlotCounters {
     }
 }
 
+/// Relay-lifetime work totals used to normalize task CPU during load tests.
+///
+/// This is derived from the recorder's existing per-slot atomics at task-stats
+/// poll time. Closing a quiescent recording first folds its final totals into
+/// the retired aggregate, so normal steady-state snapshots remain cumulative
+/// when sessions end. The relaxed per-slot loads are suitable for interval
+/// telemetry, not a transactional accounting boundary; a forced shutdown drain
+/// can race a final counter update from a link that has not quiesced yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayWorkSnapshot {
+    /// Client-origin turns that passed validation on their home relay.
+    pub client_turns_validated: u64,
+    /// Turns dequeued for a locally connected destination, including reliable
+    /// oversize diverts. This measures local forwarding work, not confirmed
+    /// receipt by the client: the destination's send can still fail afterward.
+    pub local_turn_deliveries: u64,
+    /// Local deliveries too large for a datagram and diverted to the reliable
+    /// control stream.
+    pub oversize_diverts: u64,
+}
+
+impl RelayWorkSnapshot {
+    fn accumulate(&mut self, other: Self) {
+        self.client_turns_validated = self
+            .client_turns_validated
+            .saturating_add(other.client_turns_validated);
+        self.local_turn_deliveries = self
+            .local_turn_deliveries
+            .saturating_add(other.local_turn_deliveries);
+        self.oversize_diverts = self.oversize_diverts.saturating_add(other.oversize_diverts);
+    }
+}
+
 /// One session's live recording: the bounded rings plus the per-slot counters.
 struct SessionRecording {
     started_at_ms: u64,
@@ -546,6 +579,22 @@ impl SessionRecording {
             self.samples_dropped.fetch_add(1, Ordering::Relaxed);
         }
         samples.push_back(record);
+    }
+
+    /// The work counters already maintained for flight-recorder rows, folded
+    /// without adding another contended atomic update to the per-turn path.
+    fn work_snapshot(&self) -> RelayWorkSnapshot {
+        let counters = self.counters.lock();
+        counters
+            .values()
+            .fold(RelayWorkSnapshot::default(), |mut total, counter| {
+                total.accumulate(RelayWorkSnapshot {
+                    client_turns_validated: counter.turns_validated.load(Ordering::Relaxed),
+                    local_turn_deliveries: counter.turns_forwarded.load(Ordering::Relaxed),
+                    oversize_diverts: counter.oversize_diverts.load(Ordering::Relaxed),
+                });
+                total
+            })
     }
 
     /// Builds one sample row from the current counters plus the given
@@ -617,13 +666,25 @@ pub struct FlightRecorder {
 
 #[derive(Default)]
 struct RecorderInner {
-    sessions: Mutex<HashMap<SessionKey, Arc<SessionRecording>>>,
+    recordings: Mutex<RecorderState>,
     /// This relay's id, stamped into every blob header. Set once at startup;
     /// absent (a standalone relay with no `--relay-id`) blobs carry 0.
     relay_id: OnceLock<RelayId>,
     /// Where flushed blobs go. Set once at startup; absent, a flush is a
     /// logged discard (the recorder still records — cheap and bounded).
     sink: OnceLock<Arc<dyn FlightSink>>,
+}
+
+/// Live recordings plus work retired by terminal flushes. Keeping them behind
+/// one mutex makes moving a quiescent recording from the live set into the
+/// cumulative total atomic with respect to
+/// [`FlightRecorder::relay_work_snapshot`]. A forced drain may deliberately
+/// remove a recording while an outstanding counter handle is still winding
+/// down; that shutdown-tail race is described in `take_blob`.
+#[derive(Default)]
+struct RecorderState {
+    sessions: HashMap<SessionKey, Arc<SessionRecording>>,
+    retired_work: RelayWorkSnapshot,
 }
 
 impl FlightRecorder {
@@ -639,9 +700,10 @@ impl FlightRecorder {
     }
 
     fn recording(&self, key: &SessionKey) -> Arc<SessionRecording> {
-        let mut sessions = self.inner.sessions.lock();
+        let mut state = self.inner.recordings.lock();
         Arc::clone(
-            sessions
+            state
+                .sessions
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(SessionRecording::new())),
         )
@@ -665,10 +727,32 @@ impl FlightRecorder {
         Arc::clone(counters.entry(slot).or_default())
     }
 
-    /// Counts a topological duplicate the mesh dedup dropped for `key`/`slot`.
+    /// Cumulative relay work since process start. This scans only at the
+    /// task-stats cadence, reusing the per-slot atomics the recorder already
+    /// maintains instead of adding a second global atomic RMW to every turn.
+    /// Session removal and retired-total capture share one lock, so successive
+    /// snapshots can safely be differenced after the session's link tasks have
+    /// quiesced. A forced shutdown drain can race their final counter updates;
+    /// steady-state load-test intervals do not use that tail.
+    pub fn relay_work_snapshot(&self) -> RelayWorkSnapshot {
+        let (mut total, recordings): (RelayWorkSnapshot, Vec<Arc<SessionRecording>>) = {
+            let state = self.inner.recordings.lock();
+            (
+                state.retired_work,
+                state.sessions.values().map(Arc::clone).collect(),
+            )
+        };
+        for recording in recordings {
+            total.accumulate(recording.work_snapshot());
+        }
+        total
+    }
+
+    /// Counts a duplicate the session-level delivery gate dropped for `key`/`slot`.
     /// Takes the map locks — acceptable because the duplicate branch is off the
-    /// common per-turn path (only a multi-relay echo reaches it), which is why
-    /// this is not routed through a pre-fetched handle like the hot counters.
+    /// common per-turn path (normally only reconnect/resume or re-home overlap
+    /// reaches it), which is why this is not routed through a pre-fetched handle
+    /// like the hot counters.
     pub fn note_dedup_drop(&self, key: &SessionKey, slot: SlotId) {
         self.slot_counters(key, slot).note_dedup_drop();
     }
@@ -684,8 +768,9 @@ impl FlightRecorder {
         e2e_for: impl Fn(&SessionKey) -> (Option<u64>, Option<u32>),
     ) {
         let recordings: Vec<(SessionKey, Arc<SessionRecording>)> = {
-            let sessions = self.inner.sessions.lock();
-            sessions
+            let state = self.inner.recordings.lock();
+            state
+                .sessions
                 .iter()
                 .map(|(k, r)| (k.clone(), Arc::clone(r)))
                 .collect()
@@ -714,14 +799,21 @@ impl FlightRecorder {
 
     /// The sessions currently holding a recording, for the drain flush and logs.
     pub fn recorded_sessions(&self) -> Vec<SessionKey> {
-        self.inner.sessions.lock().keys().cloned().collect()
+        self.inner
+            .recordings
+            .lock()
+            .sessions
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// A snapshot of `key`'s recorded events, for tests and diagnostics.
     pub fn events(&self, key: &SessionKey) -> Vec<EventRecord> {
         self.inner
-            .sessions
+            .recordings
             .lock()
+            .sessions
             .get(key)
             .map(|r| r.events.lock().iter().cloned().collect())
             .unwrap_or_default()
@@ -731,7 +823,16 @@ impl FlightRecorder {
     /// recording exists. The removal is what makes a flush terminal: later
     /// events for the same key start a fresh recording.
     fn take_blob(&self, key: &SessionKey) -> Option<FlightBlob> {
-        let recording = self.inner.sessions.lock().remove(key)?;
+        let recording = {
+            let mut state = self.inner.recordings.lock();
+            let recording = state.sessions.remove(key)?;
+            // Production flushes happen after the slot links quiesce. A drain
+            // deadline can force this snapshot while a final link is winding
+            // down; that shutdown-tail race is acceptable for telemetry and is
+            // outside the steady-state intervals used for CPU comparisons.
+            state.retired_work.accumulate(recording.work_snapshot());
+            recording
+        };
         // Fold a final counter snapshot in, so a short session that never saw a
         // sampling tick still carries its turn-stream totals. Counters only —
         // the consensus state this flush races may already be gone, so the
@@ -986,6 +1087,58 @@ mod tests {
         assert_eq!(row.oversize_diverts, 1);
         assert_eq!(row.dedup_drops, 1);
         assert_eq!(row.rtt_us, None, "no published conditions for the slot");
+    }
+
+    #[test]
+    fn relay_work_totals_aggregate_across_slots_and_survive_session_flush() {
+        let recorder = FlightRecorder::default();
+        let first_key = key(1);
+        let second_key = key(2);
+        let first = recorder.slot_counters(&first_key, SlotId(0));
+        let second = recorder.slot_counters(&second_key, SlotId(3));
+
+        first.note_validated(1);
+        first.note_validated(2);
+        first.note_forwarded();
+        second.note_validated(7);
+        second.note_forwarded();
+        second.note_forwarded();
+        second.note_oversize_divert();
+
+        assert_eq!(
+            recorder.relay_work_snapshot(),
+            RelayWorkSnapshot {
+                client_turns_validated: 3,
+                local_turn_deliveries: 3,
+                oversize_diverts: 1,
+            }
+        );
+
+        // Removing the first session's recording (the synchronous core of a
+        // flush) does not remove its contribution from relay-lifetime totals.
+        let _ = recorder.take_blob(&first_key).expect("a recording exists");
+        assert_eq!(
+            recorder.relay_work_snapshot(),
+            RelayWorkSnapshot {
+                client_turns_validated: 3,
+                local_turn_deliveries: 3,
+                oversize_diverts: 1,
+            }
+        );
+
+        // Reusing the same session key creates new slot counters wired to the
+        // same relay-lifetime aggregate rather than restarting from zero.
+        recorder
+            .slot_counters(&first_key, SlotId(0))
+            .note_forwarded();
+        assert_eq!(
+            recorder.relay_work_snapshot(),
+            RelayWorkSnapshot {
+                client_turns_validated: 3,
+                local_turn_deliveries: 4,
+                oversize_diverts: 1,
+            }
+        );
     }
 
     #[test]
