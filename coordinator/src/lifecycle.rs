@@ -3164,9 +3164,9 @@ mod tests {
 
     #[tokio::test]
     async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() {
-        // A cross-region session on relays 1 (home, region-a) and 2 (region-b).
+        // A balanced cross-region session on relays 1 (region-a) and 2 (region-b).
         // Relay 2 asks to drain -- still a serving member, but excluded from the
-        // replacement pick -- so when the home dies the group moves onto the idle
+        // replacement pick -- so when relay 1 dies its group moves onto the idle
         // relay 3 instead, leaving BOTH 3 (the replacement) and 2 (the
         // drained-but-still-serving survivor) in the cached set. Both must report
         // closed before the session finishes.
@@ -3245,16 +3245,18 @@ mod tests {
         .unwrap()
         .response;
         let s = resp.session;
+        let original_order = setup.serving_relays(&tid(), s);
+        assert_eq!(original_order[0], resp.home_relay.relay_id);
         assert_eq!(
-            setup.serving_relays(&tid(), s),
-            vec![RelayId(1), RelayId(2)]
+            original_order.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([RelayId(1), RelayId(2)]),
         );
 
         let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
         lc.register_session(
             tid(),
             s,
-            setup.serving_relays(&tid(), s),
+            original_order.clone(),
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
         );
@@ -3272,10 +3274,17 @@ mod tests {
             RelayId(3),
             "the draining relay 2 is skipped for the idle live relay 3",
         );
-        assert_eq!(
-            setup.serving_relays(&tid(), s),
-            vec![RelayId(3), RelayId(2)],
-        );
+        let expected_order: Vec<RelayId> = original_order
+            .into_iter()
+            .map(|relay| {
+                if relay == RelayId(1) {
+                    RelayId(3)
+                } else {
+                    relay
+                }
+            })
+            .collect();
+        assert_eq!(setup.serving_relays(&tid(), s), expected_order);
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(3));
 
         close(&lc, tid(), s, RelayId(3));
