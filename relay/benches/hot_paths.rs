@@ -3,9 +3,10 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rally_point_proto::control::{BufferBounds, TenantId};
-use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
 use rally_point_relay::consensus::{Authority, ControlLaw, DecisionMaker};
+use rally_point_relay::delivery::DeliveryHome;
 use rally_point_relay::mesh::{MeshSeen, Seen, mark_seen, new_seen_registries};
 use rally_point_relay::routing::SessionKey;
 use rally_point_relay::turn_ring::{TurnOrigin, TurnRing};
@@ -96,35 +97,90 @@ fn mesh_dedup(c: &mut Criterion) {
     group.finish();
 }
 
-fn decision_maker(slots: u8) -> DecisionMaker {
+fn conditions(slots: std::ops::Range<u8>, sent_packets: u64) -> LinkConditions {
+    LinkConditions {
+        slots: slots
+            .map(|slot| SlotConditions {
+                slot: u32::from(slot),
+                rtt_us: 25_000 + u32::from(slot) * 7_000,
+                lost_packets: u64::from(slot) * 3,
+                sent_packets,
+            })
+            .collect(),
+    }
+}
+
+fn delivery_home(slot: u8, players: u8) -> DeliveryHome {
+    if slot < players / 2 {
+        DeliveryHome::Local
+    } else {
+        DeliveryHome::Peer(RelayId(2))
+    }
+}
+
+/// Builds a steady-state, evenly split two-relay session. Every ordered
+/// origin/destination pair has a healthy delivery cursor, so an authority's
+/// decision pass pays the same O(P^2) delivery-fold cost as production while a
+/// peer still takes its real early return after updating conditions.
+fn decision_maker(players: u8, authority: Authority) -> DecisionMaker {
     let mut maker = DecisionMaker::new(
         session_key(),
         BufferBounds::new(1, 12).expect("valid benchmark bounds"),
         ControlLaw::default(),
-        Authority::Peer,
+        authority,
         HashSet::new(),
     );
-    let conditions = LinkConditions {
-        slots: (0..slots)
-            .map(|slot| SlotConditions {
-                slot: u32::from(slot),
-                rtt_us: 25_000 + u32::from(slot) * 7_000,
-                lost_packets: u64::from(slot),
-                sent_packets: 10_000,
-            })
-            .collect(),
-    };
-    let _ = maker.ingest_local(&conditions);
-    // A second cumulative sample establishes a loss delta, exercising every
-    // target input rather than only the RTT half.
-    let _ = maker.ingest_local(&conditions);
+
+    let expected = (0..players).map(SlotId).collect();
+    maker.set_expected_slots(expected);
+    maker.set_session_shape(Some(70), false);
+    maker.mark_started();
+
+    let frontier = 50_000_u64;
+    for slot in 0..players {
+        maker.observe_turn_frame(
+            SlotId(slot),
+            frontier,
+            GameFrameCount(30_000 + u32::from(slot)),
+        );
+        maker.delivery_mut().observe_origin(
+            SlotId(slot),
+            frontier + u64::from(slot),
+            delivery_home(slot, players),
+        );
+    }
+    for dest in 0..players {
+        for origin in 0..players {
+            if origin == dest {
+                continue;
+            }
+            let newest = frontier + u64::from(origin);
+            let healthy_lag = 4 + u64::from((origin + dest) % 4);
+            maker.delivery_mut().observe_delivery(
+                SlotId(dest),
+                SlotId(origin),
+                newest.saturating_sub(healthy_lag),
+                delivery_home(dest, players),
+            );
+        }
+    }
+
+    let local_end = players / 2;
+    let local_baseline = conditions(0..local_end, 10_000);
+    let remote_baseline = conditions(local_end..players, 10_000);
+    let local_current = conditions(0..local_end, 10_024);
+    let remote_current = conditions(local_end..players, 10_024);
+    let _ = maker.ingest_local(&local_baseline);
+    let _ = maker.ingest_remote(&remote_baseline, 35_000);
+    let _ = maker.ingest_local(&local_current);
+    let _ = maker.ingest_remote(&remote_current, 35_000);
     maker
 }
 
 fn consensus(c: &mut Criterion) {
     let mut target_group = c.benchmark_group("consensus/target");
-    for slots in [2_u8, 8, 12] {
-        let maker = decision_maker(slots);
+    for slots in [2_u8, 4, 8, 12] {
+        let maker = decision_maker(slots, Authority::SelfRelay);
         target_group.throughput(Throughput::Elements(u64::from(slots)));
         target_group.bench_with_input(BenchmarkId::from_parameter(slots), &slots, |b, _| {
             b.iter(|| black_box(maker.target()))
@@ -132,20 +188,22 @@ fn consensus(c: &mut Criterion) {
     }
     target_group.finish();
 
-    let mut ingest_group = c.benchmark_group("consensus/ingest_one_local_condition");
-    ingest_group.throughput(Throughput::Elements(1));
+    // Preserve the allocation comparison that motivated the single-condition
+    // API separately from the authority-cost topology below.
+    let mut allocation_group = c.benchmark_group("consensus/ingest_one_local_condition");
+    allocation_group.throughput(Throughput::Elements(1));
     let sample = SlotConditions {
         slot: 3,
         rtt_us: 65_000,
         lost_packets: 2,
         sent_packets: 10_000,
     };
-    ingest_group.bench_function("single_slot", |b| {
-        let mut maker = decision_maker(8);
+    allocation_group.bench_function("single_slot", |b| {
+        let mut maker = decision_maker(8, Authority::Peer);
         b.iter(|| black_box(maker.ingest_local_condition(black_box(&sample))));
     });
-    ingest_group.bench_function("one_element_batch", |b| {
-        let mut maker = decision_maker(8);
+    allocation_group.bench_function("one_element_batch", |b| {
+        let mut maker = decision_maker(8, Authority::Peer);
         b.iter(|| {
             let batch = LinkConditions {
                 slots: vec![black_box(sample)],
@@ -153,7 +211,100 @@ fn consensus(c: &mut Criterion) {
             black_box(maker.ingest_local(black_box(&batch)))
         });
     });
-    ingest_group.finish();
+    allocation_group.finish();
+
+    let authorities = [
+        ("self_relay", Authority::SelfRelay),
+        ("peer", Authority::Peer),
+    ];
+
+    let mut local_group = c.benchmark_group("consensus/ingest_local_condition");
+    local_group.throughput(Throughput::Elements(1));
+    for players in [2_u8, 4, 8] {
+        for (label, authority) in authorities {
+            local_group.bench_function(BenchmarkId::new(format!("P{players}"), label), |b| {
+                let mut maker = decision_maker(players, authority);
+                let mut sample = conditions(0..1, 10_024).slots.remove(0);
+                b.iter(|| {
+                    // Local condition reports are fresh samples rather than
+                    // per-turn repeats, so advance the healthy sent counter.
+                    sample.sent_packets += 24;
+                    black_box(maker.ingest_local_condition(black_box(&sample)))
+                });
+            });
+        }
+    }
+    local_group.finish();
+
+    let mut remote_group = c.benchmark_group("consensus/ingest_remote_conditions");
+    for players in [2_u8, 4, 8] {
+        let remote_slots = players / 2;
+        remote_group.throughput(Throughput::Elements(u64::from(remote_slots)));
+        for (label, authority) in authorities {
+            remote_group.bench_function(BenchmarkId::new(format!("P{players}"), label), |b| {
+                let mut maker = decision_maker(players, authority);
+                let sidecar = conditions(remote_slots..players, 10_024);
+                b.iter(|| {
+                    // Mesh packets carry the latest complete snapshot on
+                    // every turn; most snapshots repeat between client
+                    // condition updates, which is the production hot case.
+                    black_box(maker.ingest_remote(black_box(&sidecar), 35_000))
+                });
+            });
+        }
+    }
+    remote_group.finish();
+}
+
+fn healthy_sync_command_streams() -> Vec<Vec<u8>> {
+    (0_u8..16)
+        .map(|ring| {
+            let kind = if ring.is_multiple_of(2) { 1 } else { 2 };
+            let mut commands = vec![0x05; 8];
+            commands.extend_from_slice(&[0x37, (ring << 4) | kind, 1, 2, 0, 0, 0]);
+            commands.extend_from_slice(&[0x05; 8]);
+            commands
+        })
+        .collect()
+}
+
+fn consensus_sync(c: &mut Criterion) {
+    let authorities = [
+        ("self_relay", Authority::SelfRelay),
+        ("peer", Authority::Peer),
+    ];
+    let commands = healthy_sync_command_streams();
+    let mut group = c.benchmark_group("consensus/observe_sync_healthy_round");
+
+    for players in [2_u8, 4, 8] {
+        group.throughput(Throughput::Elements(u64::from(players)));
+        for (label, authority) in authorities {
+            group.bench_function(BenchmarkId::new(format!("P{players}"), label), |b| {
+                let mut maker = decision_maker(players, authority);
+                // Establish every comparator member before measuring the
+                // steady stream. On a peer this remains the intended no-op.
+                for slot in 0..players {
+                    let result =
+                        maker.observe_sync(SlotId(slot), Some(30_000), black_box(&commands[0]));
+                    debug_assert!(result.is_none());
+                }
+
+                let mut ordinal = 1_u64;
+                b.iter(|| {
+                    let stream = &commands[(ordinal % 16) as usize];
+                    let frame = 30_000_u32.wrapping_add(ordinal as u32);
+                    for slot in 0..players {
+                        let result =
+                            maker.observe_sync(SlotId(slot), Some(frame), black_box(stream));
+                        debug_assert!(result.is_none());
+                        black_box(result);
+                    }
+                    ordinal += 1;
+                });
+            });
+        }
+    }
+    group.finish();
 }
 
 fn turn_ring(c: &mut Criterion) {
@@ -169,5 +320,12 @@ fn turn_ring(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, validation, mesh_dedup, turn_ring, consensus);
+criterion_group!(
+    benches,
+    validation,
+    mesh_dedup,
+    turn_ring,
+    consensus,
+    consensus_sync
+);
 criterion_main!(benches);
