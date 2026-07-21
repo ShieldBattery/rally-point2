@@ -1016,40 +1016,37 @@ fn fold_oversize_into_link(
     }
 }
 
-/// Pushes each joined session's mesh-link delivered-through cursors to the
-/// peer when they've advanced past what it last heard -- the mesh-link
-/// counterpart of the client edge's ack-beacon push. Riding the same flush
-/// tick [`reconcile_presence`] uses (rather than a dedicated timer) keeps this
-/// off the hot datagram path while staying prompt enough to rescue a window
-/// stuck only on lost reverse-path acks before [`MESH_UNACKED_WINDOW_CAP`]
-/// would otherwise trip. Push-on-advance: a slot with nothing new since the
-/// last push sends nothing, so a healthy link stays quiet.
+/// Pushes one joined session's mesh-link delivered-through cursors to the peer
+/// when they've advanced past what it last heard -- the mesh-link counterpart
+/// of the client edge's ack-beacon push. The caller invokes this inside the
+/// link-wide maintenance pass, alongside this session's flush/window/presence
+/// checks, so cursor recovery stays off the hot datagram path without another
+/// traversal of the joined-session map. Push-on-advance: a slot with nothing
+/// new since the last push sends nothing, so a healthy link stays quiet.
 fn reconcile_ack_cursors(
     link: &rally_point_transport::MeshLink,
     control_tx: &MeshControlTx,
     ack_cursors_sent: &mut HashMap<(SessionId, SlotId), u64>,
-    joined: &HashMap<SessionId, SessionState>,
+    state: &SessionState,
 ) {
-    for state in joined.values() {
-        let session_id = state.key.session;
-        let advanced: Vec<(SlotId, u64)> = link
-            .delivered_through_all(mesh_session_key(&state.key))
-            .into_iter()
-            .filter(|&(slot, cursor)| {
-                !matches!(
-                    ack_cursors_sent.get(&(session_id, slot)),
-                    Some(&prev) if prev >= cursor
-                )
-            })
-            .collect();
-        if advanced.is_empty() {
-            continue;
-        }
-        for &(slot, cursor) in &advanced {
-            ack_cursors_sent.insert((session_id, slot), cursor);
-        }
-        let _ = control_tx.send(ack_cursors_frame(session_id, advanced));
+    let session_id = state.key.session;
+    let advanced: Vec<(SlotId, u64)> = link
+        .delivered_through_all(mesh_session_key(&state.key))
+        .into_iter()
+        .filter(|&(slot, cursor)| {
+            !matches!(
+                ack_cursors_sent.get(&(session_id, slot)),
+                Some(&prev) if prev >= cursor
+            )
+        })
+        .collect();
+    if advanced.is_empty() {
+        return;
     }
+    for &(slot, cursor) in &advanced {
+        ack_cursors_sent.insert((session_id, slot), cursor);
+    }
+    let _ = control_tx.send(ack_cursors_frame(session_id, advanced));
 }
 
 /// Announces a departed slot to every peer relay serving `key`: the home relay
@@ -1568,10 +1565,13 @@ fn resume_replay_for_frame(
 /// (`"forward"` or `"resume replay"`); the send logic itself is identical
 /// either way.
 ///
-/// Returns whether the link is still good. `false` is the caller's cue to
-/// close it, exactly as a live send failure already does; a payload that
-/// slips past the divert pre-check as oversize is logged and treated as
-/// delivered (there is nothing to retry it with), not a link failure.
+/// Returns `Some(carried_redundancy)` while the link is still good. The
+/// redundancy bit lets the caller defer this session's maintenance flush just
+/// as the client edge does: a live stream already re-carrying unacked turns
+/// needs no extra packet. `None` is the caller's cue to close the link. A
+/// payload that slips past the divert pre-check as oversize is logged and
+/// treated as delivered (there is nothing to retry it with), not a link
+/// failure, and reports that it carried no redundancy.
 async fn send_turn_over_link(
     link: &mut rally_point_transport::MeshLink,
     control_send: &mut rally_point_transport::quinn::SendStream,
@@ -1579,13 +1579,13 @@ async fn send_turn_over_link(
     payload: Payload,
     conditions: Option<LinkConditions>,
     context: &'static str,
-) -> bool {
+) -> Option<bool> {
     let session_id = key.session;
     let fits = match link.payload_fits(&payload, conditions.as_ref(), Some(key.tenant.as_ref())) {
         Ok(fits) => fits,
         Err(error) => {
             tracing::info!(%error, context, "mesh send failed; closing link");
-            return false;
+            return None;
         }
     };
     if !fits {
@@ -1617,17 +1617,17 @@ async fn send_turn_over_link(
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::info!(%error, context, "mesh control send failed; closing link");
-                return false;
+                return None;
             }
             Err(_) => {
                 tracing::warn!(context, "mesh control send stalled; closing link");
-                return false;
+                return None;
             }
         }
-        return true;
+        return Some(false);
     }
     match link.send(mesh_session_key(key), Some(payload), conditions) {
-        Ok(_) => true,
+        Ok(redundant) => Some(redundant > 0),
         // The pre-check above diverts anything that can never ride a
         // datagram, so this arm is reachable only if the path budget moved
         // between the check and the send (no await separates them, so in
@@ -1642,11 +1642,11 @@ async fn send_turn_over_link(
                 context,
                 "oversize turn slipped past the divert pre-check; dropped",
             );
-            true
+            Some(false)
         }
         Err(error) => {
             tracing::info!(%error, context, "mesh send failed; closing link");
-            false
+            None
         }
     }
 }
@@ -1659,18 +1659,20 @@ async fn send_turn_over_link(
 /// trip the very full-queue reset this exists to recover from. Samples the
 /// outgoing conditions sidecar once for the whole batch — a backlog
 /// catch-up burst does not need per-turn-fresh telemetry — rather than
-/// resampling for each payload. Returns whether every payload sent (or was
-/// diverted) without a link-fatal error.
+/// resampling for each payload. Returns `Some(carried_redundancy)` when every
+/// payload sent (or was diverted), where the bit is true if any send in the
+/// replay re-carried an unacked turn; `None` means a link-fatal error.
 async fn send_resume_replay(
     link: &mut rally_point_transport::MeshLink,
     control_send: &mut rally_point_transport::quinn::SendStream,
     conditions: &ConditionsRegistry,
     key: &SessionKey,
     payloads: Vec<Payload>,
-) -> bool {
+) -> Option<bool> {
     let outgoing = snapshot_conditions(conditions, key);
+    let mut carried_redundancy = false;
     for payload in payloads {
-        if !send_turn_over_link(
+        let sent_redundancy = send_turn_over_link(
             link,
             control_send,
             key,
@@ -1678,12 +1680,55 @@ async fn send_resume_replay(
             outgoing.clone(),
             "resume replay",
         )
-        .await
-        {
-            return false;
+        .await?;
+        carried_redundancy |= sent_redundancy;
+    }
+    Some(carried_redundancy)
+}
+
+/// The one maintenance timer shared by every session multiplexed over a mesh
+/// link. It is armed when the first session joins, left unchanged by later
+/// joins, advanced once after each link-wide maintenance pass, and disarmed
+/// when the last session leaves. An unarmed timer has no Tokio sleep behind it,
+/// so a connected link with no joined sessions stays parked indefinitely.
+#[derive(Debug, Default)]
+struct MeshMaintenanceTimer {
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl MeshMaintenanceTimer {
+    fn arm(&mut self, now: tokio::time::Instant) {
+        if self.deadline.is_none() {
+            self.deadline = Some(now + routing::FLUSH_INTERVAL);
         }
     }
-    true
+
+    fn complete_tick(&mut self, now: tokio::time::Instant) {
+        debug_assert!(self.deadline.is_some());
+        self.deadline = Some(now + routing::FLUSH_INTERVAL);
+    }
+
+    fn disarm(&mut self) {
+        self.deadline = None;
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+}
+
+/// Defers one session's maintenance flush only when a normal datagram send
+/// already re-carried an unacked turn. A fresh-only or reliable-stream send
+/// leaves the deadline alone, so the maintenance pass still supplies the
+/// redundancy that send could not.
+fn defer_flush_after_send(
+    flush_deadline: &mut tokio::time::Instant,
+    carried_redundancy: bool,
+    now: tokio::time::Instant,
+) {
+    if carried_redundancy {
+        *flush_deadline = now + routing::FLUSH_INTERVAL;
+    }
 }
 
 /// Drives a shared [`MeshLink`](rally_point_transport::MeshLink) for every session both relays jointly serve on
@@ -1829,22 +1874,26 @@ pub async fn run_mesh_link(
     // binary holds its command sender for exactly this).
     let mut idle_since: Option<tokio::time::Instant> = None;
 
+    // One cadence for every per-session maintenance responsibility on this
+    // relay-pair link. It is armed by the first Join and disarmed by the last
+    // Leave, so an idle connection has no periodic wakeup. Per-session flush
+    // deadlines remain independent inside `SessionState`; the shared tick only
+    // decides when to scan them (along with presence, ack cursors, and the
+    // unacked-window safety cap) once as a batch.
+    let mut maintenance = MeshMaintenanceTimer::default();
+    // One persistent sleep backs that schedule. Hot turn/control events leave
+    // it in place instead of registering and cancelling a new timer on every
+    // trip through `select!`; the guard below stops polling it while the
+    // schedule is disarmed. Its initial deadline is irrelevant because the
+    // first Join resets it before arming the branch.
+    let maintenance_sleep = tokio::time::sleep_until(tokio::time::Instant::now());
+    tokio::pin!(maintenance_sleep);
+
     // Each break carries its `MeshLinkExit` inline, so a reconnect supervisor
     // can tell an intentional wind-down (Idle, CommandChannelClosed) from a
     // dropped connection (ConnectionFailed). Non-exit paths `continue` the
     // loop; the value a `break` carries becomes the function's return.
     let exit = loop {
-        // The earliest per-session flush deadline. `sleep` is cancel-safe, so
-        // the loop recomputes it on every wake. With a handful of games per
-        // relay-pair the O(N) scan is trivial; when no sessions are joined yet
-        // (the link is up, awaiting its first Join) it parks on a long sleep
-        // so the loop doesn't spin.
-        let next_flush = joined
-            .values()
-            .map(|s| s.flush_deadline)
-            .min()
-            .unwrap_or(tokio::time::Instant::now() + routing::FLUSH_INTERVAL);
-
         // The idle-teardown deadline. Only armed once the link has served at
         // least one session and is now empty (`idle_since` is Some); otherwise
         // the fallback (a day out) keeps the branch dormant. Cancel-safe like
@@ -1977,7 +2026,8 @@ pub async fn run_mesh_link(
                         apply_ack_cursors(&mut link, &frame, &joined);
                         if let Some((key, payloads)) =
                             resume_replay_for_frame(&frame, &joined, &mesh_for_dispatch)
-                            && !send_resume_replay(
+                        {
+                            let Some(carried_redundancy) = send_resume_replay(
                                 &mut link,
                                 &mut control_send,
                                 &conditions,
@@ -1985,8 +2035,16 @@ pub async fn run_mesh_link(
                                 payloads,
                             )
                             .await
-                        {
-                            break MeshLinkExit::ConnectionFailed;
+                            else {
+                                break MeshLinkExit::ConnectionFailed;
+                            };
+                            if let Some(state) = joined.get_mut(&key.session) {
+                                defer_flush_after_send(
+                                    &mut state.flush_deadline,
+                                    carried_redundancy,
+                                    tokio::time::Instant::now(),
+                                );
+                            }
                         }
                         // An oversize turn's transport-dedup fold also needs
                         // direct link access, so it too runs here. A copy the
@@ -2026,7 +2084,7 @@ pub async fn run_mesh_link(
                         };
                         let key = state.key.clone();
                         let outgoing = snapshot_conditions(&conditions, &key);
-                        if !send_turn_over_link(
+                        let Some(carried_redundancy) = send_turn_over_link(
                             &mut link,
                             &mut control_send,
                             &key,
@@ -2035,8 +2093,15 @@ pub async fn run_mesh_link(
                             "forward",
                         )
                         .await
-                        {
+                        else {
                             break MeshLinkExit::ConnectionFailed;
+                        };
+                        if let Some(state) = joined.get_mut(&session_id) {
+                            defer_flush_after_send(
+                                &mut state.flush_deadline,
+                                carried_redundancy,
+                                tokio::time::Instant::now(),
+                            );
                         }
                         continue;
                     }
@@ -2055,31 +2120,45 @@ pub async fn run_mesh_link(
                 tracing::info!("mesh forward queue was full; resetting link");
                 break MeshLinkExit::ConnectionFailed;
             }
-            _ = tokio::time::sleep_until(next_flush) => {
+            _ = &mut maintenance_sleep, if maintenance.deadline().is_some() => {
                 let now = tokio::time::Instant::now();
                 let mut failed = None;
                 let mut window_exhausted = false;
+                let mut presence_updates = Vec::new();
+
+                // One link-wide pass handles every periodic responsibility.
+                // Ordinary turn and control events can wake this select loop
+                // thousands of times a second; none of them scans `joined`.
                 for state in joined.values_mut() {
                     let key = mesh_session_key(&state.key);
-                    // Checked every tick, independent of this session's own
-                    // flush deadline: a stuck window is a safety-net condition
-                    // the driver must not sit on for up to a whole flush cycle
-                    // longer than necessary. See `MESH_UNACKED_WINDOW_CAP` for
-                    // why this reads per session, not summed across the link.
-                    if mesh_window_exhausted(link.payloads_in_flight(key.clone())) {
+                    let in_flight = link.payloads_in_flight(key.clone());
+                    // Checked every link-wide tick, independent of this
+                    // session's own flush deadline. See
+                    // `MESH_UNACKED_WINDOW_CAP` for why this reads per session,
+                    // not summed across the link.
+                    if mesh_window_exhausted(in_flight) {
                         window_exhausted = true;
                         break;
                     }
-                    if state.flush_deadline > now {
-                        continue;
+                    if state.flush_deadline <= now {
+                        if in_flight > 0 && let Err(error) = link.send(key, None, None) {
+                            failed = Some(error);
+                            break;
+                        }
+                        state.flush_deadline = now + routing::FLUSH_INTERVAL;
                     }
-                    if link.payloads_in_flight(key.clone()) > 0
-                        && let Err(error) = link.send(key, None, None)
-                    {
-                        failed = Some(error);
-                        break;
+
+                    let live = local_live_players(&sessions, &state.key);
+                    if presence_sent.get(&state.key.session) != Some(&live) {
+                        presence_updates.push((state.key.session, live));
                     }
-                    state.flush_deadline = now + routing::FLUSH_INTERVAL;
+
+                    reconcile_ack_cursors(
+                        &link,
+                        &control_forward_tx,
+                        &mut ack_cursors_sent,
+                        state,
+                    );
                 }
                 if window_exhausted {
                     // The ack-cursor beacon (`reconcile_ack_cursors`, below)
@@ -2110,7 +2189,11 @@ pub async fn run_mesh_link(
                 // `MESH_STREAM_WRITE_TIMEOUT`.
                 match tokio::time::timeout(
                     MESH_STREAM_WRITE_TIMEOUT,
-                    reconcile_presence(&mut presence_tx, &mut presence_sent, &sessions, &joined),
+                    push_presence_updates(
+                        &mut presence_tx,
+                        &mut presence_sent,
+                        &presence_updates,
+                    ),
                 )
                 .await
                 {
@@ -2120,11 +2203,12 @@ pub async fn run_mesh_link(
                         break MeshLinkExit::ConnectionFailed;
                     }
                 }
-                // Reconcile this link's own receive cursors on the same tick:
-                // push each session's per-slot delivered-through advance to
-                // the peer, so lost reverse-path acks alone can't grow its
-                // view of our unacked window without bound.
-                reconcile_ack_cursors(&link, &control_forward_tx, &mut ack_cursors_sent, &joined);
+                // Delay the next pass from completion rather than trying to
+                // catch up missed ticks back-to-back after a slow stream write.
+                maintenance.complete_tick(tokio::time::Instant::now());
+                maintenance_sleep
+                    .as_mut()
+                    .reset(maintenance.deadline().expect("active maintenance timer"));
                 continue;
             }
             // A presence report from the peer: how many live home clients it
@@ -2227,6 +2311,8 @@ pub async fn run_mesh_link(
                         if joined.contains_key(&session_id) {
                             continue;
                         }
+                        let first_session = joined.is_empty();
+                        let live_players = local_live_players(&sessions, &key);
                         link.open_session(mesh_session_key(&key));
                         // Anchor each slot's receive window at the seq this
                         // session actually still needs — its forwarded-to-locals
@@ -2263,14 +2349,21 @@ pub async fn run_mesh_link(
                             &control_forward_tx,
                             &key,
                         );
+                        let joined_at = tokio::time::Instant::now();
                         joined.insert(
                             session_id,
                             SessionState {
                                 key,
-                                flush_deadline: tokio::time::Instant::now() + routing::FLUSH_INTERVAL,
+                                flush_deadline: joined_at + routing::FLUSH_INTERVAL,
                                 _registration: registration,
                             },
                         );
+                        if first_session {
+                            maintenance.arm(joined_at);
+                            maintenance_sleep
+                                .as_mut()
+                                .reset(maintenance.deadline().expect("armed maintenance timer"));
+                        }
                         idle_since = None;
                         // Announce this session's presence right away rather
                         // than waiting a flush tick: a fresh join (or a
@@ -2280,11 +2373,10 @@ pub async fn run_mesh_link(
                         // stream write here — see `MESH_STREAM_WRITE_TIMEOUT`.
                         match tokio::time::timeout(
                             MESH_STREAM_WRITE_TIMEOUT,
-                            reconcile_presence(
+                            push_presence_updates(
                                 &mut presence_tx,
                                 &mut presence_sent,
-                                &sessions,
-                                &joined,
+                                &[(session_id, live_players)],
                             ),
                         )
                         .await
@@ -2318,6 +2410,7 @@ pub async fn run_mesh_link(
                             // so the driver tears the link down after
                             // `idle_timeout` of no further Joins.
                             if joined.is_empty() {
+                                maintenance.disarm();
                                 idle_since = Some(tokio::time::Instant::now());
                             }
                         }
@@ -2780,29 +2873,28 @@ fn reconcile_resume_cursors_on_join(
     let _ = control_tx.send(resume_cursors_frame(key.session, cursors, resuming));
 }
 
-/// Pushes each joined session's live home-client count to the peer when it
-/// differs from what the peer last heard, reading the truth straight from the
-/// slot roster. Push-on-change over a reliable stream: a stable roster writes
-/// nothing, and a transition (the handoff trigger) cannot be lost the way a
-/// datagram sidecar could — which matters precisely because the relay whose
-/// players just left has no datagrams left to ride.
+/// Reads one joined session's authoritative local-player count. Kept separate
+/// from the reliable-stream write so the short roster lock is never held over
+/// an await.
+fn local_live_players(sessions: &routing::Sessions, key: &SessionKey) -> u32 {
+    let roster = sessions.lock();
+    roster.get(key).map_or(0, |slots| slots.len() as u32)
+}
+
+/// Pushes the presence changes a link-wide maintenance pass collected, or the
+/// single initial report a Join produced. Push-on-change over a reliable stream
+/// means a stable roster writes nothing, while a transition cannot be lost the
+/// way a datagram sidecar could. `presence_sent` advances only after its frame
+/// was written successfully.
 ///
 /// An `Err` means the stream (and so the connection) is gone; the caller exits
 /// with `ConnectionFailed` like any other send failure.
-async fn reconcile_presence(
+async fn push_presence_updates(
     presence_tx: &mut rally_point_transport::quinn::SendStream,
-    presence_sent: &mut HashMap<rally_point_proto::ids::SessionId, u32>,
-    sessions: &routing::Sessions,
-    joined: &HashMap<rally_point_proto::ids::SessionId, SessionState>,
+    presence_sent: &mut HashMap<SessionId, u32>,
+    updates: &[(SessionId, u32)],
 ) -> Result<(), rally_point_transport::quinn::WriteError> {
-    for (&session_id, state) in joined {
-        let live = {
-            let roster = sessions.lock();
-            roster.get(&state.key).map_or(0, |slots| slots.len() as u32)
-        };
-        if presence_sent.get(&session_id) == Some(&live) {
-            continue;
-        }
+    for &(session_id, live) in updates {
         let frame = rally_point_proto::mesh::MeshPresence {
             session: session_id,
             live_players: live,
@@ -4949,6 +5041,120 @@ mod tests {
         assert!(mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP + 1));
     }
 
+    #[test]
+    fn mesh_maintenance_timer_is_link_wide_and_idle_aware() {
+        let start = tokio::time::Instant::now();
+        let mut timer = MeshMaintenanceTimer::default();
+
+        assert_eq!(timer.deadline(), None, "an idle link has no wakeup");
+
+        timer.arm(start);
+        let first_deadline = start + routing::FLUSH_INTERVAL;
+        assert_eq!(timer.deadline(), Some(first_deadline));
+
+        // Another session joining this active link must not move the shared
+        // cadence; otherwise a stream of Joins could postpone maintenance for
+        // sessions already on the link indefinitely.
+        timer.arm(start + std::time::Duration::from_millis(75));
+        assert_eq!(timer.deadline(), Some(first_deadline));
+
+        let completed_at = start + std::time::Duration::from_secs(1);
+        timer.complete_tick(completed_at);
+        assert_eq!(
+            timer.deadline(),
+            Some(completed_at + routing::FLUSH_INTERVAL),
+        );
+
+        timer.disarm();
+        assert_eq!(
+            timer.deadline(),
+            None,
+            "the last Leave removes the periodic wakeup",
+        );
+
+        let rejoined_at = start + std::time::Duration::from_secs(2);
+        timer.arm(rejoined_at);
+        assert_eq!(
+            timer.deadline(),
+            Some(rejoined_at + routing::FLUSH_INTERVAL),
+            "a later first Join starts a fresh cadence",
+        );
+    }
+
+    #[test]
+    fn redundancy_defers_only_the_session_whose_send_carried_it() {
+        let now = tokio::time::Instant::now();
+        let original = now + std::time::Duration::from_millis(10);
+        let mut redundant_session = original;
+        let mut fresh_only_session = original;
+
+        defer_flush_after_send(&mut redundant_session, true, now);
+        defer_flush_after_send(&mut fresh_only_session, false, now);
+
+        assert_eq!(
+            redundant_session,
+            now + routing::FLUSH_INTERVAL,
+            "the normal stream is already providing recovery",
+        );
+        assert_eq!(
+            fresh_only_session, original,
+            "a fresh-only send still needs its pending maintenance flush",
+        );
+    }
+
+    #[tokio::test]
+    async fn live_and_replay_sends_report_when_they_carry_redundancy() {
+        let (mut link, _peer, _client_ep, _server_ep) = connected_mesh_link_pair().await;
+        let live_key = control_key();
+        link.open_session(mesh_session_key(&live_key));
+        let mut control_send = link.connection().open_uni().await.unwrap();
+
+        assert_eq!(
+            send_turn_over_link(
+                &mut link,
+                &mut control_send,
+                &live_key,
+                turn_payload(0, 0),
+                None,
+                "test live forward",
+            )
+            .await,
+            Some(false),
+            "the first turn has no older unacked turn to re-carry",
+        );
+        assert_eq!(
+            send_turn_over_link(
+                &mut link,
+                &mut control_send,
+                &live_key,
+                turn_payload(0, 1),
+                None,
+                "test live forward",
+            )
+            .await,
+            Some(true),
+            "the next live turn reports its redundant re-carry",
+        );
+
+        let replay_key = SessionKey {
+            tenant: live_key.tenant.clone(),
+            session: SessionId(2),
+        };
+        link.open_session(mesh_session_key(&replay_key));
+        assert_eq!(
+            send_resume_replay(
+                &mut link,
+                &mut control_send,
+                &new_conditions_registry(),
+                &replay_key,
+                vec![turn_payload(0, 0), turn_payload(0, 1)],
+            )
+            .await,
+            Some(true),
+            "a replay batch propagates the redundancy carried by its later send",
+        );
+    }
+
     fn self_signed() -> (
         Vec<rally_point_transport::rustls::pki_types::CertificateDer<'static>>,
         rally_point_transport::rustls::pki_types::PrivateKeyDer<'static>,
@@ -5177,7 +5383,12 @@ mod tests {
         let mut joined = HashMap::new();
         joined.insert(session, bare_session_state(key.clone()));
 
-        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        reconcile_ack_cursors(
+            &receiver,
+            &control_tx,
+            &mut sent,
+            joined.get(&session).unwrap(),
+        );
         let frame = control_rx.try_recv().expect("the fresh cursor is pushed");
         match frame.kind {
             Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {
@@ -5190,7 +5401,12 @@ mod tests {
 
         // Nothing advanced: a second reconcile with no new receipt sends
         // nothing.
-        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        reconcile_ack_cursors(
+            &receiver,
+            &control_tx,
+            &mut sent,
+            joined.get(&session).unwrap(),
+        );
         assert!(
             control_rx.try_recv().is_err(),
             "no advance since the last push -- the beacon stays quiet",
@@ -5201,7 +5417,12 @@ mod tests {
             .send(mesh_session_key(&key), Some(turn_payload(0, 1)), None)
             .unwrap();
         receiver.recv().await.unwrap();
-        reconcile_ack_cursors(&receiver, &control_tx, &mut sent, &joined);
+        reconcile_ack_cursors(
+            &receiver,
+            &control_tx,
+            &mut sent,
+            joined.get(&session).unwrap(),
+        );
         let frame = control_rx.try_recv().expect("the advance is pushed");
         match frame.kind {
             Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {

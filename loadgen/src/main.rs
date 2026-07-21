@@ -15,6 +15,7 @@ mod session;
 mod signing;
 mod turn;
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -81,12 +82,22 @@ async fn main() -> Result<()> {
         reports,
     );
 
-    print!("{}", report.render());
-
     if let Some(path) = &cli.json_out {
         let json = serde_json::to_string_pretty(&report).wrap_err("serializing the run report")?;
         std::fs::write(path, json).wrap_err_with(|| format!("writing {}", path.display()))?;
         tracing::info!(path = %path.display(), "wrote JSON aggregates");
+    }
+
+    // Persist the machine-readable artifact before touching stdout. Remote
+    // benchmark runners commonly stream the human summary over SSH, and a
+    // dropped terminal must not discard an otherwise completed run. A closed
+    // pipe is an ordinary detached-run outcome; other stdout failures remain
+    // real errors.
+    let summary = report.render();
+    if let Err(error) = io::stdout().lock().write_all(summary.as_bytes())
+        && error.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(error).wrap_err("writing the run summary");
     }
 
     Ok(())
