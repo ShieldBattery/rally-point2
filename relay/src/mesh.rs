@@ -1318,7 +1318,7 @@ fn chat_frame(session: SessionId, chat: GameChat) -> MeshControlFrame {
 /// buffer-directive stamping, then fan-out to local slots and every peer relay
 /// serving the session.
 ///
-/// Mesh-origin turns use [`deliver_mesh_turn`] instead. Keeping the two ingress
+/// Mesh-origin turns use `deliver_mesh_turn` instead. Keeping the two ingress
 /// APIs separate makes the one-mesh-hop rule structural: a payload received
 /// from a peer relay can reach this relay's local clients, but cannot be handed
 /// back to the mesh.
