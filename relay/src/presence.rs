@@ -29,11 +29,12 @@
 //! empty) closes as soon as the first report arrives, and a *dead* relay (the
 //! link lost, no report ever coming) is failover's problem, not presence's.
 //!
-//! Reports only land on sessions that have an entry here, and entries are
-//! created exclusively by the descriptor path ([`set_order`]). A session run
-//! without descriptors — dev/loopback harnesses that inject their authority
-//! verdict by hand — has no entry, so the report hooks pass through without
-//! touching the verdict such a harness chose.
+//! Reports normally land after the descriptor path creates an entry
+//! ([`set_order`]). One admit-first exception retains a positive local report in
+//! an orderless placeholder when a client beats its descriptor; verdict reads
+//! that placeholder as `None`, so dev/loopback harnesses that inject authority by
+//! hand remain untouched. An initial zero or any pre-descriptor peer report is
+//! still dropped.
 
 use std::collections::HashMap;
 
@@ -59,8 +60,8 @@ pub enum Candidate {
 }
 
 /// One session's presence state: the authority priority order and the last
-/// reported live-player counts. `None` — never reported — is assumed live (see
-/// the module docs for why).
+/// reported live-player counts. An empty order is a positive-local-presence
+/// placeholder awaiting its descriptor; it carries no authority verdict.
 #[derive(Debug, Default)]
 pub struct SessionPresence {
     /// The authority priority order, most preferred first, self-position
@@ -70,6 +71,10 @@ pub struct SessionPresence {
     peer_reports: HashMap<RelayId, u32>,
     /// Last live-player count this relay's own roster reported.
     own_report: Option<u32>,
+    /// Whether any local or peer report has ever shown a connected player.
+    /// Initial mesh joins explicitly exchange zeroes, so an all-zero snapshot
+    /// alone is not evidence that a newly-created session became empty.
+    ever_live: bool,
 }
 
 /// Per-session presence state, shared between the descriptor path (which sets
@@ -116,21 +121,36 @@ pub fn record_peer(
     };
     let was_live = entry.peer_reports.get(&peer).is_none_or(|&c| c > 0);
     entry.peer_reports.insert(peer, live);
+    entry.ever_live |= live > 0;
     was_live != (live > 0)
 }
 
-/// Records this relay's own live-player count for `key` (from its slot
-/// roster). Same no-entry rule as [`record_peer`]: a session without a
-/// descriptor-set order is left untouched, so harnesses that inject their
-/// authority verdict by hand keep it.
+/// Records this relay's own live-player count for `key` (from its slot roster).
+/// A positive report that beats the descriptor creates an orderless placeholder
+/// so its activity is not forgotten; a zero creates nothing. [`verdict`] returns
+/// `None` for that placeholder, preserving descriptor-less harness authority.
 pub fn record_own(registry: &PresenceRegistry, key: &SessionKey, live: u32) -> bool {
     let mut sessions = registry.lock();
-    let Some(entry) = sessions.get_mut(key) else {
-        return false;
-    };
-    let was_live = entry.own_report.is_none_or(|c| c > 0);
-    entry.own_report = Some(live);
-    was_live != (live > 0)
+    match sessions.entry(key.clone()) {
+        std::collections::hash_map::Entry::Occupied(mut occupied) => {
+            let entry = occupied.get_mut();
+            let was_live = entry.own_report.is_none_or(|c| c > 0);
+            entry.own_report = Some(live);
+            entry.ever_live |= live > 0;
+            was_live != (live > 0)
+        }
+        std::collections::hash_map::Entry::Vacant(vacant) if live > 0 => {
+            vacant.insert(SessionPresence {
+                own_report: Some(live),
+                ever_live: true,
+                ..SessionPresence::default()
+            });
+            // Unknown is already assumed live, so this records activity without
+            // changing liveness or asking a descriptor-less maker to re-decide.
+            false
+        }
+        std::collections::hash_map::Entry::Vacant(_) => false,
+    }
 }
 
 /// Drops `key`'s presence state (the session ended). Idempotent.
@@ -149,6 +169,9 @@ pub fn forget(registry: &PresenceRegistry, key: &SessionKey) {
 pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authority> {
     let sessions = registry.lock();
     let entry = sessions.get(key)?;
+    if entry.order.is_empty() {
+        return None;
+    }
     for candidate in &entry.order {
         let live = match candidate {
             Candidate::SelfRelay => entry.own_report.is_none_or(|c| c > 0),
@@ -164,28 +187,37 @@ pub fn verdict(registry: &PresenceRegistry, key: &SessionKey) -> Option<Authorit
     Some(Authority::Peer)
 }
 
-/// Whether every relay serving `key` has explicitly reported zero live slots — the
-/// session is empty session-wide, nobody is connected anywhere. Read to decide
-/// whether to arm the abandoned-session timer.
+/// Whether this relay's authoritative roster is empty and every peer serving
+/// `key` has explicitly reported zero live slots — the session is empty
+/// session-wide, nobody is connected anywhere. Read to decide whether to arm the
+/// abandoned-session timer or close this relay's serving state.
 ///
-/// Uses the same accumulated live-slot knowledge as [`verdict`]: this relay's own
-/// roster count ([`record_own`]) plus each peer's reported count ([`record_peer`]).
-/// Unlike `verdict`, a candidate that has **never** reported is treated as *not*
-/// empty — the module's "assumed live until it says otherwise" rule — so this is
-/// deliberately conservative: it returns `true` only when every relay in the order
-/// has an explicit zero on record, never on the strength of silence. A session with
-/// no presence entry (no descriptor set an order — a harness that injects its
+/// `own_live` is read directly from this relay's roster by the caller. That roster
+/// is authoritative even when this relay has never served a slot and therefore
+/// never emitted an own-presence transition. Peers remain conservative: each one
+/// in the current order must have explicitly reported zero, never merely stayed
+/// silent. At least one local or peer report must previously have been live, so
+/// the initial zeroes exchanged when mesh sessions join cannot close a new game
+/// before its clients dial. Positive local activity that beat descriptor arrival
+/// is retained in the orderless placeholder described above. A session with no
+/// presence entry (no descriptor set an order — a harness that injects its
 /// verdict by hand) is never abandoned.
-pub fn all_empty(registry: &PresenceRegistry, key: &SessionKey) -> bool {
+pub fn all_empty(registry: &PresenceRegistry, key: &SessionKey, own_live: u32) -> bool {
+    if own_live != 0 {
+        return false;
+    }
     let sessions = registry.lock();
     let Some(entry) = sessions.get(key) else {
         return false;
     };
-    if entry.order.is_empty() {
+    if entry.order.is_empty() || !entry.ever_live {
         return false;
     }
     entry.order.iter().all(|candidate| match candidate {
-        Candidate::SelfRelay => entry.own_report == Some(0),
+        // The caller's roster snapshot already established that self is empty.
+        // Requiring `own_report == Some(0)` here would strand a relay that joined
+        // the session mesh but never had a local slot to report.
+        Candidate::SelfRelay => true,
         Candidate::Peer(id) => entry.peer_reports.get(id) == Some(&0),
     })
 }
@@ -428,27 +460,52 @@ mod tests {
     }
 
     #[test]
-    fn all_empty_is_true_only_when_every_relay_explicitly_reported_zero() {
+    fn positive_local_activity_before_the_descriptor_survives_until_order_arrives() {
+        let registry = new_presence_registry();
+
+        assert!(!record_own(&registry, &key(), 1));
+        assert_eq!(
+            verdict(&registry, &key()),
+            None,
+            "an orderless placeholder cannot override injected authority",
+        );
+        assert!(record_own(&registry, &key(), 0));
+
+        set_order(&registry, &key(), vec![Candidate::SelfRelay]);
+        assert!(
+            all_empty(&registry, &key(), 0),
+            "the later descriptor retains the observed live-to-empty history",
+        );
+    }
+
+    #[test]
+    fn all_empty_requires_an_empty_local_roster_and_explicit_peer_zeros() {
         let registry = new_presence_registry();
         // No entry yet: not abandoned.
-        assert!(!all_empty(&registry, &key()));
+        assert!(!all_empty(&registry, &key(), 0));
 
         set_order(&registry, &key(), order_self_then_peer(2));
-        // Nobody has reported: silence is assumed live, so not abandoned — a peer
-        // that never reported could still be serving players.
-        assert!(!all_empty(&registry, &key()));
+        // The local roster is authoritatively empty even if it never emitted an
+        // own report, but a silent peer could still be serving players.
+        assert!(!all_empty(&registry, &key(), 0));
 
-        // Only self reported zero; the peer is still silent (assumed live).
-        record_own(&registry, &key(), 0);
-        assert!(!all_empty(&registry, &key()));
-
-        // The peer reports zero too: now every relay is explicitly empty.
+        // Initial zeroes are exchanged as the mesh session joins. They must not
+        // close a new game before any client has dialed.
         record_peer(&registry, &key(), RelayId(2), 0);
-        assert!(all_empty(&registry, &key()));
+        assert!(!all_empty(&registry, &key(), 0));
+
+        // A live local roster is never empty, regardless of what peers reported.
+        record_own(&registry, &key(), 1);
+        assert!(!all_empty(&registry, &key(), 1));
+
+        // After observed activity, every relay explicitly reaching zero is an
+        // actual empty transition rather than the mesh's initial state.
+        record_own(&registry, &key(), 0);
+        assert!(all_empty(&registry, &key(), 0));
 
         // The peer's players return: no longer abandoned.
         record_peer(&registry, &key(), RelayId(2), 1);
-        assert!(!all_empty(&registry, &key()));
+        assert!(!all_empty(&registry, &key(), 0));
     }
 
     #[test]
@@ -456,8 +513,9 @@ mod tests {
         let registry = new_presence_registry();
         // A single-relay session: the order names only this relay.
         set_order(&registry, &key(), vec![Candidate::SelfRelay]);
+        record_own(&registry, &key(), 1);
         record_own(&registry, &key(), 0);
-        // Every relay in the order (just us) reported zero → abandoned.
-        assert!(all_empty(&registry, &key()));
+        // The authoritative local roster is empty and there are no peers.
+        assert!(all_empty(&registry, &key(), 0));
     }
 }

@@ -844,13 +844,24 @@ dispatch:** every webhook for one `(tenant, session)` drains from a single FIFO 
 delivered `sessionClosed` implies every earlier notice for the session was delivered or exhausted.
 **`sessionClosed`:** the coordinator assigned each session's serving-relay set, and when every one of them
 has reported `SessionClosed` (its last local slot deregistered), the final `sessionClosed` webhook fires
-and the session state is reaped. **Reaps:** two grace timers keep a session from dangling — a **holdout
-reap** (all-but-one player accounted, the last silent on a live link) and a **linger reap** (all accounted
-but links still open) — each closing the offending slot with a `CloseSlot` directive down the relay control
-connection, which then flows through the normal link-death path, so the reap is self-resolving rather than a
-second teardown mechanism. This state is in-memory: a coordinator restart forgets a session's accounting, so
-a departure/result webhook for a forgotten session still delivers (a webhook-only queue is created lazily)
-but its `sessionClosed` and reaps do not re-arm — the tenant's **batch liveness probe** (`POST
+and the session state is reaped. **Reaps:** two player-accounting timers keep a session from dangling — a
+**holdout reap** (all-but-one player accounted, the last silent on a live link) and a **linger reap** (all
+accounted but links still open) — each closing the offending slot with a `CloseSlot` directive down the
+relay control connection, which then flows through the normal link-death path. Two slower lifecycle bounds
+cover sessions that cannot enter that path: a never-started session is retired after 15 minutes, and a
+started session whose complete heartbeat rosters prove every assigned relay continuously empty is retired
+after the same grace. The latter is a defense-in-depth path for a lost close notice or an assigned relay
+whose own slot never connected; any occupied, partial, stale, re-homed, disconnected, or new-generation
+roster resets the proof. A positive roster or replacement process also reopens that relay's earlier
+`SessionClosed` evidence until the whole serving set has closed, preserving the relay's short reconnect
+window. A re-home reopens terminal evidence for both the departed assignment and the resumed target, and
+installs that lifecycle boundary under the assignment lock before publishing resumed descriptors. A close
+therefore belongs wholly to the old or new assignment, never an ambiguous gap. All four paths release
+session membership and therefore let an idle Fargate relay reach an empty descriptor set and scale to zero.
+This state is in-memory: a coordinator restart forgets a
+session's accounting, so a departure/result webhook for a forgotten session still delivers (a webhook-only
+queue is created lazily) but its `sessionClosed` and reaps do not re-arm — the tenant's **batch liveness
+probe** (`POST
 /sessions/alive`, asking which of a set of sessions the coordinator still holds) is the backstop that
 force-reconciles the ones it no longer does.
 
@@ -865,8 +876,10 @@ rather than standing up a new channel, because the beat is already the relay's p
 an off-hot-path connection, and piggybacking means presence can never be alive while liveness is dead (or
 vice versa). Each beat carries the **whole current roster** (declarative, like the descriptor sets going
 the other way): a lost or reordered beat is corrected by the next one, and the payload is bounded by the
-relay's live slots. An idle relay's beat is byte-identical to the historical payload-free ping, so version
-skew costs nothing.
+relay's live slots. A `roster_complete` marker distinguishes an authoritative full snapshot from a legacy
+or coordinator-truncated roster. Its absence decodes as false, so a rolling deploy can still consume
+positive presence from an older relay without treating omitted sessions as proof of emptiness; older
+coordinators ignore the additive marker.
 
 The coordinator's store maps `(tenant, session, slot)` to the reporting relay + connection **generation** +
 last-seen time. Applying a beat is a per-relay **replace** fenced by the same generation token that fences
@@ -962,10 +975,16 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
 - **Home-relay enforcement fails open for unknown sessions** (an empty homed set is unenforced) —
   this preserves the descriptor-arrival race's admit-first behavior; the fleet-amplification angle
   is closed by mesh peer auth.
-- **Never-started sessions close immediately on an emptied roster** (nothing force-decides their
-  holds, so deferral would be unbounded); their holds still survive a quick re-dial. A session
-  whose clients *never* connect reaps at a fixed 15-minute grace, not the token lifetime — the
-  token lifetime protects connected-then-dropped clients, who never hit that reap.
+- **Empty sessions cannot pin the relay fleet indefinitely.** After observing any local or peer player
+  live, a relay uses its authoritative local roster plus explicit zero reports from every peer, so even an
+  assigned relay whose own slot never connected runs the ordinary close once the session transitions to
+  globally empty. A positive local report that beats its descriptor is retained until the order arrives.
+  Requiring actual prior activity is load-bearing because mesh joins exchange initial zeroes before clients
+  dial. Never-fully-started sessions close immediately after that live-to-empty signal
+  (nothing force-decides their holds, so deferral would be unbounded), while their holds still survive a
+  quick re-dial. The coordinator independently retires a session after 15 minutes if clients never
+  connect, or if complete generation-fenced heartbeats prove every assigned
+  relay continuously empty. Silence and legacy/partial rosters are unknown, never evidence of emptiness.
 - **Player tokens are finite (default 6h) and checked only at (re)connect;** mid-game expiry is
   harmless. Escape hatch if marathon games ever matter: mint fresh tokens on the rehome response
   (noted, not built).

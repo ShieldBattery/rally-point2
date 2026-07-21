@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{SessionDescriptor, TenantId};
+use rally_point_proto::control::{DescriptorKey, SessionDescriptor, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::{mpsc, watch};
 
@@ -260,6 +260,26 @@ impl RelayDescriptors {
             .unwrap_or_default()
     }
 
+    /// The keys of the sessions currently assigned to `relay_id`, without
+    /// cloning their token- and topology-heavy descriptors. Used by control-plane
+    /// bookkeeping that needs to reconcile one relay's declarative assignment.
+    pub fn current_keys_for(&self, relay_id: RelayId) -> Vec<DescriptorKey> {
+        self.channels
+            .lock()
+            .get(&relay_id)
+            .map(|channel| {
+                channel
+                    .borrow()
+                    .iter()
+                    .map(|descriptor| DescriptorKey {
+                        tenant: descriptor.tenant.clone(),
+                        session: descriptor.session,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Drops `relay_id`'s whole channel — closing any subscriber still attached.
     ///
     /// Reserved for a relay id that has been **permanently** retired (a ledger
@@ -351,6 +371,13 @@ mod tests {
         let for_2 = outbox.current_for(RelayId(2));
         assert_eq!(for_2.len(), 1);
         assert_eq!(for_2[0].peers[0].relay_id, RelayId(1));
+        assert_eq!(
+            outbox.current_keys_for(RelayId(1)),
+            vec![DescriptorKey {
+                tenant: TenantId("sb-test".to_owned()),
+                session: SessionId(1),
+            }],
+        );
     }
 
     #[test]

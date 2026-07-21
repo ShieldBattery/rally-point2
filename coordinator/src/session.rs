@@ -557,6 +557,21 @@ impl SessionSetup {
             .unwrap_or_default()
     }
 
+    /// Installs authoritative membership for lifecycle tests that intentionally
+    /// bypass [`create_session`]. Keeping this seam test-only ensures production
+    /// close handling never fabricates membership from its cached lifecycle view.
+    #[cfg(test)]
+    pub(crate) fn set_session_membership_for_test(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        relays: Vec<RelayId>,
+    ) {
+        self.session_relays
+            .lock()
+            .insert((tenant.clone(), session), relays);
+    }
+
     /// The number of live sessions `relay` currently serves — how many recorded
     /// serving sets, across every tenant, name it. Zero means the relay homes no
     /// session's slots right now: a reconcile scale-down reads this to find a relay
@@ -743,7 +758,41 @@ pub fn rehome(
     dead_relay: RelayId,
     departed_slots: Vec<DepartedSlot>,
 ) -> RehomeOutcome {
-    rehome_inner(setup, tenant, session, dead_relay, departed_slots, || {})
+    rehome_inner(
+        setup,
+        tenant,
+        session,
+        dead_relay,
+        departed_slots,
+        || {},
+        |_| {},
+    )
+}
+
+/// [`rehome`] with a synchronous assignment-commit hook. The hook runs after the
+/// authoritative serving set and slot homes are updated but before resumed
+/// descriptors are published, while the outer assignment lock is still held.
+/// This lets lifecycle bookkeeping install the same assignment boundary before a
+/// replacement can report `SessionClosed`; close handling takes that lock too, so
+/// no terminal notice can observe one side of the mutation and commit on the
+/// other.
+pub fn rehome_with_assignment_commit(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+    dead_relay: RelayId,
+    departed_slots: Vec<DepartedSlot>,
+    assignment_committed: impl FnOnce(RelayId),
+) -> RehomeOutcome {
+    rehome_inner(
+        setup,
+        tenant,
+        session,
+        dead_relay,
+        departed_slots,
+        || {},
+        assignment_committed,
+    )
 }
 
 /// Whether `relay`'s currently-presented cert (`current_der`) still matches the
@@ -775,11 +824,12 @@ fn cert_matches_pin(
 /// the replacement pick (a registry read) and the descriptor re-staging are atomic
 /// against a relay's drain mark, exactly as [`create_session`]'s pick→commit is —
 /// then the `rehomes` lock across the middle section, and the `session_relays` lock
-/// *nested* inside that for the mutation. A full close ([`Lifecycle::on_session_closed`])
-/// touches `forget_rehomes` (the `rehomes` lock) and `forget_session_membership`
-/// (the `session_relays` lock) as two separate, non-nested acquisitions that take
-/// neither the assignment lock nor both fine locks at once, so it cannot deadlock
-/// against this nesting order.
+/// *nested* inside that for the mutation. A terminal `SessionClosed` takes the same
+/// assignment lock before lifecycle state, so it cannot cross the commit hook.
+/// Direct lifecycle reapers take the same assignment lock through retirement,
+/// then retire `session_relays` and `rehomes` as separate, non-nested
+/// acquisitions after releasing lifecycle state. They therefore cannot cross
+/// this body or invert its nested fine-lock order.
 fn rehome_inner(
     setup: &SessionSetup,
     tenant: &TenantId,
@@ -787,6 +837,7 @@ fn rehome_inner(
     dead_relay: RelayId,
     departed_slots: Vec<DepartedSlot>,
     before_mutation: impl FnOnce(),
+    assignment_committed: impl FnOnce(RelayId),
 ) -> RehomeOutcome {
     // The outermost assignment lock: this re-home's pick→re-stage span linearizes
     // against a relay's drain mark the same way `create_session` does.
@@ -982,6 +1033,12 @@ fn rehome_inner(
         refs.relay_regions.remove(&dead_relay);
         refs.relay_regions.insert(r_new, new_entry.region.clone());
     }
+
+    // Install any coupled lifecycle view before publishing the resumed
+    // descriptors. The assignment lock held across this function also gates
+    // terminal-close handling, so a replacement close can only run after this
+    // callback has completed.
+    assignment_committed(r_new);
 
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
     // seeding the departed slots, and push each. Record R_new's first so it is
@@ -3447,6 +3504,52 @@ mod tests {
     }
 
     #[test]
+    fn rehome_commit_hook_precedes_resumed_descriptor_publication() {
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+        let committed = std::cell::Cell::new(false);
+
+        let RehomeOutcome::NewTarget(endpoint) = rehome_with_assignment_commit(
+            &setup,
+            &tid(),
+            resp.session,
+            RelayId(1),
+            vec![],
+            |replacement| {
+                assert_eq!(replacement, RelayId(2));
+                assert_eq!(
+                    setup.serving_relays(&tid(), resp.session),
+                    vec![RelayId(2)],
+                    "authoritative membership is committed before the hook",
+                );
+                assert!(
+                    setup
+                        .descriptors()
+                        .current_for(RelayId(2))
+                        .iter()
+                        .all(|descriptor| descriptor.session != resp.session),
+                    "the target cannot observe its resumed descriptor before lifecycle commits",
+                );
+                committed.set(true);
+            },
+        ) else {
+            panic!("expected a NewTarget re-home decision");
+        };
+
+        assert_eq!(endpoint.relay_id, RelayId(2));
+        assert!(committed.get());
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(2))
+                .iter()
+                .any(|descriptor| descriptor.session == resp.session),
+            "descriptor publication follows the commit hook",
+        );
+    }
+
+    #[test]
     fn rehome_prefers_a_relay_already_serving_the_session() {
         // Relays 1 (home), 2 (region-b, already serving), and 3 (live but idle).
         // The home dies; the replacement must be relay 2 — already serving the
@@ -3878,13 +3981,21 @@ mod tests {
 
         let baseline_relay2 = setup.descriptors().current_for(RelayId(2));
 
-        let outcome = rehome_inner(&setup, &tid(), resp.session, RelayId(1), vec![], || {
-            // The concurrent full close clears the session's membership between the
-            // snapshot and the mutation (its forget_rehomes would block on the
-            // rehomes lock this rehome holds, so only membership is cleared here —
-            // faithfully modeling the race window).
-            setup.forget_session_membership(&tid(), resp.session);
-        });
+        let outcome = rehome_inner(
+            &setup,
+            &tid(),
+            resp.session,
+            RelayId(1),
+            vec![],
+            || {
+                // The concurrent full close clears the session's membership between the
+                // snapshot and the mutation (its forget_rehomes would block on the
+                // rehomes lock this rehome holds, so only membership is cleared here —
+                // faithfully modeling the race window).
+                setup.forget_session_membership(&tid(), resp.session);
+            },
+            |_| {},
+        );
 
         assert_eq!(
             outcome,

@@ -1896,6 +1896,7 @@ async fn a_heartbeats_region_rtts_are_served_on_the_regions_endpoint() {
     // Report a round-trip to region-b (the relay's own region-a is skipped by the pair
     // definition). The heartbeat is declarative, so one beat carries the whole set.
     let heartbeat = RelayToCoordinator::Heartbeat {
+        roster_complete: true,
         sessions: vec![],
         region_rtts: vec![RegionRttReport {
             region: RegionId("region-b".to_owned()),
@@ -1954,6 +1955,7 @@ async fn an_inbound_flood_does_not_delay_a_descriptor_push() {
     // Flood inbound heartbeats continuously from a side task.
     let flood = tokio::spawn(async move {
         let beat = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions: vec![],
             region_rtts: vec![],
         })
@@ -2130,6 +2132,7 @@ async fn a_relay_that_stops_reading_is_dropped_by_the_send_stall_bound_despite_h
     // liveness — while growing the descriptor set so the coordinator keeps re-pushing
     // an ever-larger full set to a peer that never reads it.
     let heartbeat = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+        roster_complete: true,
         sessions: vec![],
         region_rtts: vec![],
     })

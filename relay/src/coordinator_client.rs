@@ -1307,6 +1307,7 @@ async fn write_control_frames(
                 // one), bounded by the relay's live slots. A delta scheme is a
                 // scale option, not needed at these payload sizes.
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+                    roster_complete: true,
                     sessions: heartbeat_presence(&heartbeat.sessions),
                     region_rtts: heartbeat_region_rtts(&heartbeat.region_rtt_cache),
                 })
@@ -3151,6 +3152,7 @@ mod tests {
         assert_eq!(
             decoded,
             RelayToCoordinator::Heartbeat {
+                roster_complete: true,
                 sessions: vec![SessionPresence {
                     tenant: TenantId(TENANT.to_owned()),
                     session: SessionId(7),

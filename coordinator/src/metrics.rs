@@ -240,6 +240,7 @@ static RELAY_DRAINS: LabeledCounter<String> = LabeledCounter::new();
 static SESSIONS_CREATED: LabeledCounter<String> = LabeledCounter::new();
 static SESSION_HOLDS: LabeledCounter<String> = LabeledCounter::new();
 static SESSIONS_CLOSED: LabeledCounter<String> = LabeledCounter::new();
+static SESSION_REAPS: LabeledCounter<(String, String)> = LabeledCounter::new();
 static DESYNCS: LabeledCounter<String> = LabeledCounter::new();
 static WEBHOOK_DELIVERIES: LabeledCounter<(String, String)> = LabeledCounter::new();
 static WEBHOOK_ATTEMPT_FAILURES: LabeledCounter<String> = LabeledCounter::new();
@@ -308,6 +309,12 @@ pub(crate) fn session_held(tenant: &TenantId) {
 /// Records a session that has fully closed (every serving relay reported closed).
 pub(crate) fn session_closed(tenant: &TenantId) {
     SESSIONS_CLOSED.incr(tenant.as_ref().to_owned());
+}
+
+/// Records a coordinator backstop that retired a session. `reason` is a fixed,
+/// low-cardinality policy name such as `heartbeat_empty` or `never_started`.
+pub(crate) fn session_reaped(tenant: &TenantId, reason: &str) {
+    SESSION_REAPS.incr((tenant.as_ref().to_owned(), reason.to_owned()));
 }
 
 /// Records a distinct desync event (an at-least-once redelivery of the same
@@ -505,6 +512,14 @@ pub fn render(state: &CoordinatorState) -> String {
         &SESSIONS_CLOSED,
         "tenant",
     );
+    render_counter_2(
+        &mut out,
+        "rp2_session_reaps_total",
+        "Sessions retired by coordinator lifecycle backstops, by tenant and reason.",
+        &SESSION_REAPS,
+        "tenant",
+        "reason",
+    );
     render_counter_1(
         &mut out,
         "rp2_desyncs_total",
@@ -688,7 +703,7 @@ fn render_sessions_active(out: &mut String, census: &lifecycle::LifecycleMetrics
     write_meta(
         out,
         "rp2_sessions_active",
-        "Sessions with an assigned serving relay, by tenant and whether a client has been seen.",
+        "Sessions with an assigned serving relay, by tenant and lifecycle state.",
         "gauge",
     );
     let mut rows: Vec<(&TenantId, &lifecycle::SessionCensus)> = census.sessions.iter().collect();
@@ -708,6 +723,14 @@ fn render_sessions_active(out: &mut String, census: &lifecycle::LifecycleMetrics
                 "rp2_sessions_active",
                 &[("tenant", tenant.as_ref()), ("state", "started")],
                 counts.started,
+            );
+        }
+        if counts.empty_grace > 0 {
+            write_series(
+                out,
+                "rp2_sessions_active",
+                &[("tenant", tenant.as_ref()), ("state", "empty_grace")],
+                counts.empty_grace,
             );
         }
     }

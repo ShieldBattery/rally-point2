@@ -17,13 +17,13 @@
 //!   `sessionClosed` webhook is enqueued (and the session's state is reaped).
 //!
 //! - **Reap policies.** From the accounting it already holds — a player slot is
-//!   *accounted* once it has a result or a departure — two timers keep a session
-//!   from dangling: a **holdout reap** (all-but-one player accounted, the last one
-//!   silent on a live link → close its link after a grace) and a **linger reap**
-//!   (all players accounted but links remain → close the reported-but-still-linked
-//!   stragglers, observers included). Both close slots via a `CloseSlot` directive
-//!   down the relay control connection; the closed link then flows through the
-//!   normal link-death path, which is what makes the reap self-resolving.
+//!   *accounted* once it has a result or a departure — a **holdout reap** closes
+//!   the last silent player's link and a **linger reap** closes links left after
+//!   every player is accounted. Two slower bounds cover sessions that cannot
+//!   enter either path: one created but never joined, and one whose complete,
+//!   fresh relay heartbeats continuously prove every assigned roster empty. The
+//!   latter paths retire membership directly so stale descriptors cannot pin an
+//!   otherwise idle relay fleet above zero.
 //!
 //! Coordinator-restart amnesia is accepted: this state is in-memory, so a restart
 //! forgets a session's accounting and serving set. A departure/result webhook for
@@ -32,12 +32,13 @@
 //! probe is the backstop for those.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard};
-use rally_point_proto::control::{DepartedSlot, DepartureKind, TenantId};
+use rally_point_proto::control::{DepartedSlot, DepartureKind, SessionPresence, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -76,9 +77,10 @@ pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 /// forever.
 ///
 /// Deliberately NOT extended to the session's token lifetime. Tokens stay
-/// valid for hours so a client that connected and then dropped can redial
-/// across a long outage — but that client's session has *started* (its first
-/// presence permanently disarms this reap), so this window never governs it.
+/// valid for hours so an active session can authenticate a later reconnect, but
+/// a client that connected has *started* the session (its first presence
+/// permanently disarms this particular reap), so this window never governs it.
+/// A separate all-relays-empty grace bounds fully abandoned started sessions.
 /// A session nothing ever dialed has no such client to protect, and holding
 /// its state for the token lifetime instead would pin its descriptors (and
 /// keep its assigned relays looking busy, blocking their scale-down) for
@@ -87,6 +89,23 @@ pub const WEBHOOK_ONLY_REAP_GRACE: Duration = Duration::from_secs(300);
 /// and falls back to its caller's create path, exactly as if the create had
 /// never happened.
 pub const NEVER_STARTED_REAP_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// How long a session that previously started may remain continuously empty on
+/// every assigned relay before the coordinator retires it. Relays normally close
+/// an abandoned session themselves within seconds; this longer window is a
+/// defense-in-depth bound for a missed close notice or a relay whose assigned
+/// slot never connected and therefore never produced a local roster transition.
+///
+/// Emptiness is accepted only from complete, generation-fenced heartbeat rosters
+/// and is re-checked when this timer fires. A reconnect, a partial/legacy roster,
+/// a re-home, any occupied roster, or a stale heartbeat resets the proof.
+pub const EMPTY_SESSION_REAP_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// The longest gap between complete heartbeat rosters that may still count as
+/// continuous emptiness. This matches the active-presence freshness window and
+/// is comfortably above the relay's 10-second heartbeat cadence. Silence is
+/// unknown, never proof that a session is empty.
+pub const EMPTY_ROSTER_FRESHNESS: Duration = Duration::from_secs(35);
 
 /// One session's ordered dispatch queue's capacity. A session's genuine
 /// notice volume is small and bounded by its slot count: at most one
@@ -116,6 +135,32 @@ pub(crate) fn dropped_notice_count() -> u64 {
 
 /// A `(tenant, session)` key for the per-session lifecycle map.
 type SessionRef = (TenantId, SessionId);
+
+/// One assigned relay's continuous proof that a session is empty.
+#[derive(Debug, Clone, Copy)]
+struct EmptyRosterEvidence {
+    /// The control-connection generation that supplied the proof.
+    generation: u64,
+    /// When the most recent complete empty roster refreshed the proof.
+    last_seen: Instant,
+}
+
+/// The control connection epoch currently recognized by lifecycle bookkeeping.
+/// Enrollment, disconnect, heartbeat, and terminal-close handling serialize on
+/// the map's mutex so an old connection cannot cross a reconnect boundary between
+/// its registry check and its lifecycle mutation.
+#[derive(Debug, Clone, Copy)]
+struct RelayEpoch {
+    generation: u64,
+    connected: bool,
+}
+
+/// One armed globally-empty timer. `token` prevents an aborted task that already
+/// passed its sleep from consuming a newer timer's freshly-established evidence.
+struct EmptyTimer {
+    token: u64,
+    abort: AbortHandle,
+}
 
 /// One webhook ready to sign and POST — enqueued onto a session's ordered queue.
 struct WebhookJob {
@@ -149,8 +194,9 @@ struct SessionState {
     /// `departed`; the first classification for a slot wins (a slot never departs
     /// twice with a different kind).
     departed_kinds: HashMap<SlotId, DepartureKind>,
-    /// Serving relays that have reported `SessionClosed`.
-    closed_relays: HashSet<RelayId>,
+    /// Serving relays that have reported `SessionClosed`, scoped to the control
+    /// connection generation that supplied the terminal notice.
+    closed_relays: HashMap<RelayId, u64>,
     /// Whether the final `sessionClosed` webhook has been enqueued, so it fires
     /// exactly once.
     session_closed_enqueued: bool,
@@ -183,6 +229,13 @@ struct SessionState {
     /// becomes true. `None` once the session has started (or been reaped);
     /// never re-armed after that.
     never_started_timer: Option<AbortHandle>,
+    /// Per-serving-relay complete-roster evidence that this session is empty.
+    /// Missing means unknown or occupied. A relay that reported `SessionClosed`
+    /// is terminal evidence and need not appear here.
+    empty_relays: HashMap<RelayId, EmptyRosterEvidence>,
+    /// The armed globally-empty reap timer, if every serving relay currently has
+    /// fresh empty evidence (or has already reported `SessionClosed`).
+    empty_timer: Option<EmptyTimer>,
 }
 
 impl SessionState {
@@ -193,7 +246,7 @@ impl SessionState {
             && self
                 .serving_relays
                 .iter()
-                .all(|r| self.closed_relays.contains(r))
+                .all(|r| self.closed_relays.contains_key(r))
     }
 
     /// The player slots not yet accounted (no result and no departure).
@@ -203,6 +256,33 @@ impl SessionState {
             .filter(|s| !self.accounted.contains(s))
             .copied()
             .collect()
+    }
+
+    /// Whether every assigned relay is freshly known empty at `now`. A normal
+    /// `SessionClosed` is stronger than a heartbeat omission and remains valid
+    /// even after that relay disconnects.
+    fn all_relays_confirmed_empty(&self, now: Instant, freshness: Duration) -> bool {
+        !self.serving_relays.is_empty()
+            && self.serving_relays.iter().all(|relay| {
+                self.closed_relays.contains_key(relay)
+                    || self.empty_relays.get(relay).is_some_and(|evidence| {
+                        now.saturating_duration_since(evidence.last_seen) <= freshness
+                    })
+            })
+    }
+
+    /// Whether every heartbeat-based proof belongs to the still-current control
+    /// connection. Closed relays are terminal within an epoch and are cleared by
+    /// the next enrollment while the same epoch gate is held.
+    fn empty_evidence_matches_epochs(&self, epochs: &HashMap<RelayId, RelayEpoch>) -> bool {
+        self.serving_relays.iter().all(|relay| {
+            self.closed_relays.contains_key(relay)
+                || self.empty_relays.get(relay).is_some_and(|evidence| {
+                    epochs.get(relay).is_some_and(|epoch| {
+                        epoch.connected && epoch.generation == evidence.generation
+                    })
+                })
+        })
     }
 }
 
@@ -216,6 +296,12 @@ pub struct Lifecycle {
 struct Inner {
     setup: SessionSetup,
     sessions: Mutex<HashMap<SessionRef, SessionState>>,
+    /// Also serves as the connection-epoch linearization gate. Every production
+    /// registry enrollment/removal is committed while this lock is held.
+    relay_epochs: Mutex<HashMap<RelayId, RelayEpoch>>,
+    /// Process-wide timer identities prevent a callback from an already-retired
+    /// session key matching a timer on a later state with the same key.
+    next_empty_timer_token: AtomicU64,
     holdout_grace: Duration,
     linger_grace: Duration,
     webhook_grace: Duration,
@@ -228,6 +314,10 @@ struct Inner {
     /// in production; injectable ([`Lifecycle::with_test_tunables`]) for the
     /// same reason as `queue_capacity`.
     never_started_grace: Duration,
+    /// A started session's globally-empty grace and the maximum accepted gap
+    /// between the complete rosters proving that emptiness.
+    empty_session_grace: Duration,
+    empty_roster_freshness: Duration,
     /// The notice dedup sets to prune when a session's state is removed, wired in
     /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
     /// built without one (a test that never exercises dedup) simply skips pruning.
@@ -255,6 +345,15 @@ pub(crate) struct SessionCensus {
     pub(crate) loading: u64,
     /// Sessions a client has been observed to have dialed into.
     pub(crate) started: u64,
+    /// Started sessions currently inside the globally-confirmed-empty grace.
+    pub(crate) empty_grace: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct EmptyReapTunables {
+    grace: Duration,
+    freshness: Duration,
 }
 
 impl Lifecycle {
@@ -280,22 +379,26 @@ impl Lifecycle {
             inner: Arc::new(Inner {
                 setup,
                 sessions: Mutex::new(HashMap::new()),
+                relay_epochs: Mutex::new(HashMap::new()),
+                next_empty_timer_token: AtomicU64::new(1),
                 holdout_grace,
                 linger_grace,
                 webhook_grace,
                 queue_capacity: NOTICE_QUEUE_CAPACITY,
                 never_started_grace: NEVER_STARTED_REAP_GRACE,
+                empty_session_grace: EMPTY_SESSION_REAP_GRACE,
+                empty_roster_freshness: EMPTY_ROSTER_FRESHNESS,
                 dedup: OnceLock::new(),
             }),
         }
     }
 
     /// [`with_graces`](Self::with_graces) plus every other production
-    /// constant a test might need to shrink: the per-session queue capacity
-    /// and the never-started reap's grace. Each defaults to its production
-    /// value in [`with_graces`](Self::with_graces); this exists only so a
-    /// test can override the ones it actually cares about without waiting
-    /// out the real windows.
+    /// constant a test might need to shrink: the per-session queue capacity,
+    /// the never-started grace, and the empty-roster policy. Each defaults to
+    /// its production value in [`with_graces`](Self::with_graces); this exists
+    /// only so a test can override the ones it actually cares about without
+    /// waiting out the real windows.
     #[cfg(test)]
     fn with_test_tunables(
         setup: SessionSetup,
@@ -304,16 +407,21 @@ impl Lifecycle {
         webhook_grace: Duration,
         queue_capacity: usize,
         never_started_grace: Duration,
+        empty_reap: EmptyReapTunables,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 setup,
                 sessions: Mutex::new(HashMap::new()),
+                relay_epochs: Mutex::new(HashMap::new()),
+                next_empty_timer_token: AtomicU64::new(1),
                 holdout_grace,
                 linger_grace,
                 webhook_grace,
                 queue_capacity,
                 never_started_grace,
+                empty_session_grace: empty_reap.grace,
+                empty_roster_freshness: empty_reap.freshness,
                 dedup: OnceLock::new(),
             }),
         }
@@ -346,6 +454,7 @@ impl Lifecycle {
         state.serving_relays = serving_relays;
         state.player_slots = player_slots;
         state.observer_slots = observer_slots;
+        state.closed_relays.clear();
         // If this state existed only as a webhook-only entry (a departure/result
         // arrived before its registration), it now has the normal all-relays-
         // closed removal path, so its idle reap no longer applies.
@@ -365,6 +474,27 @@ impl Lifecycle {
             state.never_started_timer =
                 Some(self.arm_never_started(tenant, session, self.inner.never_started_grace));
         }
+        self.reset_empty_evidence(state);
+    }
+
+    /// Invalidates heartbeat-empty evidence before attempting a re-home. This is
+    /// deliberately separate from [`Self::on_rehome`]: the session registry is
+    /// mutated outside the lifecycle lock, so cancelling the old assignment's
+    /// timer first prevents it from firing in the gap between that mutation and
+    /// the lifecycle's cached serving-relay update.
+    ///
+    /// A failed or no-op re-home conservatively requires fresh complete rosters
+    /// before the empty grace may begin again.
+    pub fn prepare_rehome(&self, tenant: &TenantId, session: SessionId) {
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
+            return;
+        };
+        // `dead` is retained here because the re-home may return Stay or
+        // Unavailable, in which case no assignment boundary exists and its close
+        // remains legitimate. A successful under-lock `on_rehome` clears both
+        // endpoints before resumed descriptors are published.
+        self.reset_empty_evidence(state);
     }
 
     /// Swaps `dead` for `r_new` in the session's cached serving-relay set, so a
@@ -375,38 +505,49 @@ impl Lifecycle {
     /// queue task never retire.
     ///
     /// A same-id swap (`dead == r_new`, a relay that restarted in place under a
-    /// new cert) is a no-op: the id was never removed from the cached set, so
-    /// there is nothing to swap. Otherwise, if `r_new` is already present, `dead`
-    /// is simply dropped from the set rather than producing a duplicate entry. A
+    /// new cert) leaves the serving set unchanged but still clears old assignment
+    /// evidence. Otherwise, if `r_new` is already present, `dead` is simply dropped
+    /// from the set rather than producing a duplicate entry. A
     /// session with no cached state, or one whose cached set no longer names
     /// `dead` (an already-applied swap, or an id unrelated to this session), is
     /// left untouched — the call is idempotent, so a caller need not track
     /// whether it already applied a given swap.
     ///
-    /// After mutating the set, the all-relays-closed condition is re-evaluated:
-    /// a `SessionClosed` recorded before this swap was tested against the
-    /// pre-swap serving set — which still named the now-dead relay — so the
-    /// condition can first become satisfiable only once the swap lands, and no
-    /// later close is guaranteed to arrive to re-trigger the check. Dropping the
-    /// dead relay in the "`r_new` already present" branch can newly satisfy it
-    /// too, so the re-evaluation runs on every branch that changed the set.
+    /// Both endpoints' close evidence is cleared as part of a different-id swap:
+    /// the dead relay's notice belongs to the removed assignment, while the
+    /// target's resumed descriptor may now admit a different homed group. The API
+    /// invokes this under the assignment lock before publishing those descriptors,
+    /// so subsequent terminal notices are unambiguously scoped to the new set.
     pub fn on_rehome(&self, tenant: &TenantId, session: SessionId, dead: RelayId, r_new: RelayId) {
-        if dead == r_new {
-            return;
-        }
         let mut sessions = self.inner.sessions.lock();
         let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
             return;
         };
+        if dead == r_new {
+            // Membership is unchanged, but the resumed descriptor is still a new
+            // assignment boundary. Clear any close/empty evidence that landed
+            // after `prepare_rehome` and before the assignment lock was acquired.
+            self.reset_empty_evidence(state);
+            state.closed_relays.remove(&dead);
+            return;
+        }
         let Some(pos) = state.serving_relays.iter().position(|&id| id == dead) else {
             return;
         };
+        // Keep this reset as defense in depth for direct callers and tests. The
+        // API cancels the timer before mutating membership via `prepare_rehome`.
+        self.reset_empty_evidence(state);
+        // Assignment-scoped evidence leaves with the relay.
+        state.closed_relays.remove(&dead);
+        // A resumed descriptor changes what the target may serve, even when it was
+        // already a member. Drop its prior close evidence before the new descriptor
+        // is published; a later close then belongs to the resumed assignment.
+        state.closed_relays.remove(&r_new);
         if state.serving_relays.contains(&r_new) {
             state.serving_relays.remove(pos);
         } else {
             state.serving_relays[pos] = r_new;
         }
-        self.finish_if_all_closed(sessions, tenant.clone(), session);
     }
 
     /// Records a slot's departure: accounts the slot (if a player), notes it
@@ -498,6 +639,210 @@ impl Lifecycle {
         self.mark_started(state);
     }
 
+    /// Commits a registry enrollment and its lifecycle epoch as one serialized
+    /// operation. The callback performs the registry mutation and returns the new
+    /// generation; no stale close or heartbeat can land between that mutation and
+    /// the invalidation below.
+    pub fn enroll_relay_epoch<E>(
+        &self,
+        relay: RelayId,
+        enroll: impl FnOnce() -> Result<u64, E>,
+    ) -> Result<u64, E> {
+        let mut epochs = self.inner.relay_epochs.lock();
+        let generation = enroll()?;
+        self.apply_relay_enrolled(&mut epochs, relay, generation);
+        Ok(generation)
+    }
+
+    /// Test seam for lifecycle-only tests whose registry is intentionally absent.
+    #[cfg(test)]
+    pub(crate) fn on_relay_enrolled(&self, relay: RelayId, generation: u64) {
+        let mut epochs = self.inner.relay_epochs.lock();
+        self.apply_relay_enrolled(&mut epochs, relay, generation);
+    }
+
+    fn apply_relay_enrolled(
+        &self,
+        epochs: &mut HashMap<RelayId, RelayEpoch>,
+        relay: RelayId,
+        generation: u64,
+    ) {
+        // Generations are process-global and strictly increasing. A delayed
+        // callback for an older (or duplicate) connection cannot roll the epoch
+        // backward or reopen evidence from the connection that replaced it.
+        if epochs
+            .get(&relay)
+            .is_some_and(|epoch| epoch.generation >= generation)
+        {
+            return;
+        }
+        epochs.insert(
+            relay,
+            RelayEpoch {
+                generation,
+                connected: true,
+            },
+        );
+
+        // Enrollment is rare, so scan all lifecycle states. This deliberately
+        // clears a close left by an earlier assignment even when this relay is not
+        // currently in its descriptor set; the id may be selected for that
+        // session again by a later re-home.
+        let now = Instant::now();
+        let mut sessions = self.inner.sessions.lock();
+        for ((tenant, session), state) in sessions.iter_mut() {
+            let invalidated = state
+                .empty_relays
+                .get(&relay)
+                .is_some_and(|evidence| evidence.generation < generation);
+            let reopened = state.closed_relays.remove(&relay).is_some();
+            if invalidated || reopened {
+                state.empty_relays.remove(&relay);
+                self.invalidate_empty_timer(state);
+                self.reevaluate_empty_reap(tenant, *session, state, now);
+            }
+        }
+    }
+
+    /// Commits removal of the current registry entry and invalidates its
+    /// heartbeat omission under the same epoch gate. A `SessionClosed` accepted
+    /// before the removal remains terminal; only a later enrollment reopens it.
+    pub fn disconnect_relay_epoch(
+        &self,
+        relay: RelayId,
+        generation: u64,
+        remove: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut epochs = self.inner.relay_epochs.lock();
+        if !remove() {
+            return false;
+        }
+        self.apply_relay_disconnected(&mut epochs, relay, generation);
+        true
+    }
+
+    /// Test seam matching [`Self::on_relay_enrolled`].
+    #[cfg(test)]
+    pub(crate) fn on_relay_disconnected(&self, relay: RelayId, generation: u64) {
+        let mut epochs = self.inner.relay_epochs.lock();
+        self.apply_relay_disconnected(&mut epochs, relay, generation);
+    }
+
+    fn apply_relay_disconnected(
+        &self,
+        epochs: &mut HashMap<RelayId, RelayEpoch>,
+        relay: RelayId,
+        generation: u64,
+    ) {
+        let Some(epoch) = epochs.get(&relay) else {
+            return;
+        };
+        if epoch.generation != generation || !epoch.connected {
+            return;
+        }
+        // Provisioned relay ids are not reused after retirement. Drop disconnected
+        // epochs so fleet churn cannot grow this map forever; terminal close
+        // evidence carries its own generation and the next enrollment scans all
+        // session states before accepting new frames.
+        epochs.remove(&relay);
+
+        let now = Instant::now();
+        let mut sessions = self.inner.sessions.lock();
+        for ((tenant, session), state) in sessions.iter_mut() {
+            let invalidated = state
+                .empty_relays
+                .get(&relay)
+                .is_some_and(|evidence| evidence.generation == generation);
+            if invalidated {
+                state.empty_relays.remove(&relay);
+                self.invalidate_empty_timer(state);
+                self.reevaluate_empty_reap(tenant, *session, state, now);
+            }
+        }
+    }
+
+    /// Applies one relay's sanitized heartbeat roster to the stale-session
+    /// safeguard. Listed sessions with connected slots are positive evidence and
+    /// always cancel an empty proof. Only a `complete` roster may use omission as
+    /// evidence that an assigned session is empty; legacy, truncated, or otherwise
+    /// partial rosters turn omissions into unknown instead.
+    ///
+    /// `now` is injected so the continuity/freshness boundary can be tested without
+    /// wall-clock sleeps. The API calls this only after fencing the heartbeat to the
+    /// relay's current control-connection generation.
+    pub fn on_relay_heartbeat(
+        &self,
+        relay: RelayId,
+        generation: u64,
+        roster: &[SessionPresence],
+        complete: bool,
+        now: Instant,
+    ) {
+        let epochs = self.inner.relay_epochs.lock();
+        if !epochs
+            .get(&relay)
+            .is_some_and(|epoch| epoch.connected && epoch.generation == generation)
+        {
+            return;
+        }
+        // The descriptor outbox is the coordinator's declarative per-relay
+        // assignment index. Snapshot only its lightweight keys so each heartbeat
+        // is O(sessions served by this relay), not O(all active sessions).
+        let assigned = self.inner.setup.descriptors().current_keys_for(relay);
+        let occupied: HashSet<SessionRef> = roster
+            .iter()
+            .filter(|session| !session.slots.is_empty())
+            .map(|session| (session.tenant.clone(), session.session))
+            .collect();
+        let freshness = self.inner.empty_roster_freshness;
+        let mut sessions = self.inner.sessions.lock();
+        for descriptor in assigned {
+            let key = (descriptor.tenant, descriptor.session);
+            let Some(state) = sessions.get_mut(&key) else {
+                continue;
+            };
+            if !state.serving_relays.contains(&relay) {
+                continue;
+            }
+            let is_occupied = occupied.contains(&key);
+            let mut continuity_reset = false;
+            if is_occupied {
+                let was_empty = state.empty_relays.remove(&relay).is_some();
+                let was_closed = state.closed_relays.remove(&relay).is_some();
+                continuity_reset = was_empty || was_closed;
+                self.mark_started(state);
+            } else if complete {
+                match state.empty_relays.get_mut(&relay) {
+                    Some(evidence)
+                        if evidence.generation == generation
+                            && now.saturating_duration_since(evidence.last_seen) <= freshness =>
+                    {
+                        evidence.last_seen = now;
+                    }
+                    _ => {
+                        state.empty_relays.insert(
+                            relay,
+                            EmptyRosterEvidence {
+                                generation,
+                                last_seen: now,
+                            },
+                        );
+                        continuity_reset = true;
+                    }
+                }
+            } else {
+                // A partial snapshot cannot carry prior omission evidence forward.
+                // Positive entries above still prove their named sessions occupied.
+                continuity_reset = state.empty_relays.remove(&relay).is_some();
+            }
+
+            if continuity_reset {
+                self.invalidate_empty_timer(state);
+            }
+            self.reevaluate_empty_reap(&key.0, key.1, state, now);
+        }
+    }
+
     /// Marks `state` as started and cancels its never-started reap timer, if
     /// one is armed. Idempotent — called from every path that proves a real
     /// client has been present.
@@ -508,12 +853,31 @@ impl Lifecycle {
         }
     }
 
+    /// Drops all globally-empty evidence and its timer after an assignment-level
+    /// change (registration/re-home). The replacement must establish a fresh set of
+    /// complete post-change rosters before it can become a reap candidate.
+    fn reset_empty_evidence(&self, state: &mut SessionState) {
+        state.empty_relays.clear();
+        self.invalidate_empty_timer(state);
+    }
+
+    /// Cancels the current globally-empty timer. Removing its identity from the
+    /// slot is the part that remains effective if the task already woke and can no
+    /// longer be stopped by aborting its handle.
+    fn invalidate_empty_timer(&self, state: &mut SessionState) {
+        if let Some(timer) = state.empty_timer.take() {
+            timer.abort.abort();
+        }
+    }
+
     /// A scrape-time census of the lifecycle map for metrics: per tenant, how
     /// many sessions have an assigned serving relay (split by whether a client
     /// has been seen), and the total depth of that tenant's pending webhook
-    /// queues. Taken in one lock acquisition.
+    /// queues. The epoch gate makes the empty-grace slice agree with reconnects.
     pub(crate) fn metrics_census(&self) -> LifecycleMetrics {
+        let epochs = self.inner.relay_epochs.lock();
         let sessions = self.inner.sessions.lock();
+        let now = Instant::now();
         let mut out = LifecycleMetrics::default();
         for ((tenant, _session), state) in sessions.iter() {
             // Only sessions with an assigned serving-relay set count toward the
@@ -521,7 +885,12 @@ impl Lifecycle {
             // session but still contributes its queue depth below.
             if !state.serving_relays.is_empty() {
                 let census = out.sessions.entry(tenant.clone()).or_default();
-                if state.started {
+                if state.empty_timer.is_some()
+                    && state.all_relays_confirmed_empty(now, self.inner.empty_roster_freshness)
+                    && state.empty_evidence_matches_epochs(&epochs)
+                {
+                    census.empty_grace += 1;
+                } else if state.started {
                     census.started += 1;
                 } else {
                     census.loading += 1;
@@ -540,13 +909,46 @@ impl Lifecycle {
 
     /// Records a relay's `SessionClosed`. When every assigned serving relay has
     /// closed, enqueues the final `sessionClosed` webhook (behind every prior
-    /// notice in queue order) and reaps the session's state.
-    pub fn on_session_closed(&self, tenant: TenantId, session: SessionId, relay_id: RelayId) {
+    /// notice in queue order) and reaps the session's state. Until that global
+    /// close, positive presence or a replacement enrollment may reopen one
+    /// relay's mark because relays deliberately permit a quick reconnect.
+    pub fn on_session_closed(
+        &self,
+        tenant: TenantId,
+        session: SessionId,
+        relay_id: RelayId,
+        generation: u64,
+    ) {
+        // Re-home holds this same assignment lock across its authoritative
+        // membership mutation. Thus an old assignment's close is checked wholly
+        // before that mutation (and cleared by prepare/on_rehome), or wholly after
+        // it (and rejected); it cannot straddle the boundary.
+        let _assignment = self.inner.setup.lock_assignment();
+        let epochs = self.inner.relay_epochs.lock();
+        if !epochs
+            .get(&relay_id)
+            .is_some_and(|epoch| epoch.connected && epoch.generation == generation)
+        {
+            return;
+        }
+        let authoritative = self.inner.setup.serving_relays(&tenant, session);
+        if !authoritative.contains(&relay_id) {
+            return;
+        }
         let mut sessions = self.inner.sessions.lock();
         let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
             return; // an unknown session (restart amnesia): no serving set to close
         };
-        state.closed_relays.insert(relay_id);
+        if !state.serving_relays.contains(&relay_id) {
+            // Production re-home installs lifecycle membership under the same
+            // assignment lock before publishing descriptors. A mismatch here is
+            // therefore stale or unassigned evidence, never a future member.
+            return;
+        }
+        state.closed_relays.insert(relay_id, generation);
+        state.empty_relays.remove(&relay_id);
+        self.invalidate_empty_timer(state);
+        self.reevaluate_empty_reap(&tenant, session, state, Instant::now());
         self.finish_if_all_closed(sessions, tenant, session);
     }
 
@@ -600,15 +1002,13 @@ impl Lifecycle {
     /// timers, dedup entries, pending reap directives, relay membership and
     /// descriptors, and the rehome idempotency record.
     ///
-    /// Shared by the two paths that ever declare a session over: every
-    /// serving relay reporting closed (`on_session_closed`), and a session
-    /// whose never-started grace lapsed with no client ever having dialed in
-    /// (`fire_never_started`) — the tenant learns a session died unborn
-    /// exactly the same way it learns one closed normally. The caller has
-    /// already removed `state` from the session map and taken responsibility
-    /// for whatever gate decided the session is actually over (all relays
-    /// closed, or the never-started grace); this only ever performs the
-    /// retirement itself.
+    /// Shared by every path that declares a session over: all serving relays
+    /// reporting closed (`on_session_closed`), a session whose never-started
+    /// grace elapsed (`fire_never_started`), or a started session whose complete
+    /// heartbeat rosters remained globally empty (`fire_empty_session`). The
+    /// tenant learns about every case through the same terminal notice. The
+    /// caller has already removed `state` from the session map and taken
+    /// responsibility for the policy gate; this only performs the retirement.
     fn close_and_retire(&self, tenant: TenantId, session: SessionId, state: SessionState) {
         // Build the sessionClosed job and enqueue it behind everything already in
         // the queue: the queue's own sender lives on in the detached drain task,
@@ -835,7 +1235,7 @@ impl Lifecycle {
             accounted: HashSet::new(),
             departed: HashSet::new(),
             departed_kinds: HashMap::new(),
-            closed_relays: HashSet::new(),
+            closed_relays: HashMap::new(),
             session_closed_enqueued: false,
             queue: tx,
             holdout_timer: None,
@@ -843,6 +1243,8 @@ impl Lifecycle {
             webhook_timer: None,
             started: false,
             never_started_timer: None,
+            empty_relays: HashMap::new(),
+            empty_timer: None,
         }
     }
 
@@ -973,6 +1375,41 @@ impl Lifecycle {
         }
     }
 
+    /// Arms or cancels the started-session globally-empty backstop. The timer is
+    /// left running while the condition remains continuously true, so its grace is
+    /// measured from the last assigned relay first becoming confirmed empty rather
+    /// than being pushed out by every 10-second refresh.
+    fn reevaluate_empty_reap(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        state: &mut SessionState,
+        now: Instant,
+    ) {
+        let confirmed_empty = state.started
+            && !state.all_relays_closed()
+            && state.all_relays_confirmed_empty(now, self.inner.empty_roster_freshness);
+        if confirmed_empty {
+            if state.empty_timer.is_none() {
+                let token = self
+                    .inner
+                    .next_empty_timer_token
+                    .fetch_add(1, Ordering::Relaxed);
+                state.empty_timer = Some(EmptyTimer {
+                    token,
+                    abort: self.arm_empty_session(
+                        tenant.clone(),
+                        session,
+                        token,
+                        self.inner.empty_session_grace,
+                    ),
+                });
+            }
+        } else if state.empty_timer.is_some() {
+            self.invalidate_empty_timer(state);
+        }
+    }
+
     /// Spawns the holdout-reap timer: after `grace`, if the holdout is still
     /// unaccounted, close its link on every serving relay.
     fn arm_holdout(
@@ -1081,6 +1518,10 @@ impl Lifecycle {
     /// the session died unborn rather than simply vanishing.
     fn fire_never_started(&self, tenant: TenantId, session: SessionId) {
         let key = (tenant.clone(), session);
+        // Serialize the terminal retirement against re-home's membership and
+        // descriptor commit. Whichever takes the assignment lock first completes;
+        // the other then evaluates only the fully committed before/after state.
+        let _assignment = self.inner.setup.lock_assignment();
         let mut sessions = self.inner.sessions.lock();
         let Some(state) = sessions.get_mut(&key) else {
             return; // already retired some other way
@@ -1092,10 +1533,69 @@ impl Lifecycle {
         let state = sessions.remove(&key).expect("just held it");
         drop(sessions);
         self.close_and_retire(tenant.clone(), session, state);
+        crate::metrics::session_reaped(&tenant, "never_started");
         tracing::info!(
             tenant = tenant.as_ref(),
             session = session.0,
             "session reaped: created but never started within its grace window",
+        );
+    }
+
+    /// Spawns the globally-empty backstop timer. The firing path rechecks both
+    /// continuous complete-roster evidence and freshness under the lifecycle lock.
+    fn arm_empty_session(
+        &self,
+        tenant: TenantId,
+        session: SessionId,
+        token: u64,
+        grace: Duration,
+    ) -> AbortHandle {
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            this.fire_empty_session(tenant, session, token);
+        })
+        .abort_handle()
+    }
+
+    /// Retires a started session only if every assigned relay still has fresh,
+    /// complete empty-roster evidence (or already reported `SessionClosed`) when
+    /// the grace expires. Any reconnect, partial snapshot, occupancy, re-home, or
+    /// heartbeat gap makes the check fail closed and leaves the session alive.
+    fn fire_empty_session(&self, tenant: TenantId, session: SessionId, token: u64) {
+        let key = (tenant.clone(), session);
+        // Serialize retirement against re-home, then final epoch validation
+        // against registry enrollment and disconnect. An older timer/connection
+        // cannot cross either external mutation and consume newer evidence.
+        let _assignment = self.inner.setup.lock_assignment();
+        let epochs = self.inner.relay_epochs.lock();
+        let mut sessions = self.inner.sessions.lock();
+        let Some(state) = sessions.get_mut(&key) else {
+            return;
+        };
+        if !state
+            .empty_timer
+            .as_ref()
+            .is_some_and(|timer| timer.token == token)
+        {
+            return;
+        }
+        state.empty_timer = None;
+        if !state.started
+            || state.all_relays_closed()
+            || !state.all_relays_confirmed_empty(Instant::now(), self.inner.empty_roster_freshness)
+            || !state.empty_evidence_matches_epochs(&epochs)
+        {
+            return;
+        }
+        let state = sessions.remove(&key).expect("just held it");
+        drop(sessions);
+        self.close_and_retire(tenant.clone(), session, state);
+        crate::metrics::session_reaped(&tenant, "heartbeat_empty");
+        tracing::warn!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            "session reaped after every serving relay continuously reported an empty roster",
         );
     }
 
@@ -1134,6 +1634,9 @@ fn abort_timers(state: &SessionState) {
     if let Some(timer) = &state.never_started_timer {
         timer.abort();
     }
+    if let Some(timer) = &state.empty_timer {
+        timer.abort.abort();
+    }
 }
 
 /// Drains one session's ordered dispatch queue, delivering each webhook to
@@ -1154,7 +1657,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::post;
-    use rally_point_proto::control::BufferBounds;
+    use rally_point_proto::control::{BufferBounds, SessionDescriptor};
     use rally_point_proto::token::KeyId;
     use tokio::sync::{Notify as TokioNotify, mpsc as tokio_mpsc};
     use tokio::time::timeout;
@@ -1169,6 +1672,42 @@ mod tests {
 
     fn tid() -> TenantId {
         TenantId(TENANT.to_owned())
+    }
+
+    /// Records a terminal notice in lifecycle-only tests, explicitly installing
+    /// authoritative membership and a stable synthetic connection epoch when the
+    /// test intentionally bypassed normal session creation and enrollment.
+    fn close(lifecycle: &Lifecycle, tenant: TenantId, session: SessionId, relay: RelayId) {
+        if lifecycle
+            .inner
+            .setup
+            .serving_relays(&tenant, session)
+            .is_empty()
+        {
+            let cached = lifecycle
+                .inner
+                .sessions
+                .lock()
+                .get(&(tenant.clone(), session))
+                .map(|state| state.serving_relays.clone())
+                .unwrap_or_default();
+            lifecycle
+                .inner
+                .setup
+                .set_session_membership_for_test(&tenant, session, cached);
+        }
+        let existing = lifecycle
+            .inner
+            .relay_epochs
+            .lock()
+            .get(&relay)
+            .map(|epoch| epoch.generation);
+        let generation = existing.unwrap_or_else(|| {
+            let generation = relay.0.max(1);
+            lifecycle.on_relay_enrolled(relay, generation);
+            generation
+        });
+        lifecycle.on_session_closed(tenant, session, relay, generation);
     }
 
     /// A bare setup with a tenant enrolled (its signing key), no notify config —
@@ -1346,7 +1885,7 @@ mod tests {
         );
 
         // The first serving relay closes: no sessionClosed yet, and still alive.
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
         assert!(lc.is_alive(&tid(), s), "one relay closed is not the end");
         assert!(
             timeout(Duration::from_millis(300), rx.recv())
@@ -1357,7 +1896,7 @@ mod tests {
 
         // The last serving relay closes: sessionClosed fires, and it is no longer
         // alive (its state was reaped).
-        lc.on_session_closed(tid(), s, RelayId(2));
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("sessionClosed is delivered once every relay closed")
@@ -1396,7 +1935,7 @@ mod tests {
             "departure",
         );
         // The last (only) serving relay closes → sessionClosed enqueued behind it.
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
 
         // The departure request reaches the receiver and hangs; sessionClosed is
         // stuck behind it in the queue.
@@ -1432,7 +1971,18 @@ mod tests {
         let gate = StdArc::new(TokioNotify::new());
         let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
         let setup = setup_with_notify(url.clone());
-        let lc = Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, CAPACITY, HOUR);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: HOUR,
+                freshness: HOUR,
+            },
+        );
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -1492,7 +2042,7 @@ mod tests {
         // The terminal job still finds its reserved slot: the session's one
         // relay closing pushes sessionClosed successfully even with the
         // queue otherwise completely full of ordinary notices.
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
 
         // Release the gate and drain everything queued: each of the CAPACITY
         // - 1 ordinary notices arrives, in order, the dropped "overflow" one
@@ -1530,8 +2080,18 @@ mod tests {
         let setup = setup_with_notify(url);
         // Only the never-started grace is shrunk; every other grace stays at
         // production scale so nothing else in this test fires early.
-        let lc =
-            Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            SHORT,
+            EmptyReapTunables {
+                grace: HOUR,
+                freshness: HOUR,
+            },
+        );
 
         // Session A: registered and never touched again -- no presence, no
         // accounting -- so it must reap once its grace lapses.
@@ -1585,8 +2145,18 @@ mod tests {
     async fn the_never_started_reaper_cancels_on_late_presence() {
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
-        let lc =
-            Lifecycle::with_test_tunables(setup, HOUR, HOUR, HOUR, NOTICE_QUEUE_CAPACITY, SHORT);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            SHORT,
+            EmptyReapTunables {
+                grace: HOUR,
+                freshness: HOUR,
+            },
+        );
         let s = SessionId(1);
         lc.register_session(
             tid(),
@@ -1634,7 +2204,7 @@ mod tests {
         );
 
         // Fully closed reads as not alive.
-        lc.on_session_closed(tid(), live, RelayId(1));
+        close(&lc, tid(), live, RelayId(1));
         assert!(!lc.is_alive(&tid(), live), "a closed session is not alive");
     }
 
@@ -1761,15 +2331,15 @@ mod tests {
         // Arm and fire the holdout reap so a directive is pending for relay 1.
         lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped);
         let mut rx = reaps.subscribe(RelayId(1));
-        let close = timeout(SHORT * 4, rx.recv())
+        let directive = timeout(SHORT * 4, rx.recv())
             .await
             .expect("the holdout is reaped")
             .unwrap();
-        assert_eq!(close.slots, vec![SlotId(1)]);
+        assert_eq!(directive.slots, vec![SlotId(1)]);
 
         // The session fully closes → its pending reap is retired. A relay
         // reconnecting after the close gets no stale directive replayed.
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
         let mut reconnect = reaps.subscribe(RelayId(1));
         assert!(
             reconnect.try_recv().is_err(),
@@ -1801,7 +2371,7 @@ mod tests {
         // A different session's entry, which must survive.
         dedup.departures.lock().insert((tid(), other, SlotId(0)));
 
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
 
         assert!(!dedup.departures.lock().contains(&(tid(), s, SlotId(0))));
         assert!(!dedup.results.lock().contains(&(tid(), s, SlotId(0))));
@@ -1870,6 +2440,473 @@ mod tests {
         (setup, resp.session)
     }
 
+    fn heartbeat_session(session: SessionId, slots: &[u8]) -> SessionPresence {
+        SessionPresence {
+            tenant: tid(),
+            session,
+            slots: slots.iter().copied().map(SlotId).collect(),
+        }
+    }
+
+    fn stage_assignments(setup: &SessionSetup, session: SessionId, relays: &[RelayId]) {
+        for &relay in relays {
+            setup.descriptors().record(
+                relay,
+                SessionDescriptor {
+                    tenant: tid(),
+                    session,
+                    peers: vec![],
+                    bounds: BufferBounds::new(1, 6).unwrap(),
+                    authority_order: relays.to_vec(),
+                    external_id: None,
+                    slot_refs: vec![],
+                    observer_slots: vec![],
+                    expected_slots: vec![],
+                    homed_slots: vec![],
+                    resumed: false,
+                    departed_slots: vec![],
+                    latency_estimate_ms: None,
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_empty_heartbeats_reap_a_started_session_and_release_membership() {
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::with_test_tunables(
+            setup.clone(),
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        lc.on_relay_enrolled(RelayId(1), 7);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            7,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        lc.on_relay_heartbeat(RelayId(1), 7, &[], true, Instant::now());
+
+        let census = lc.metrics_census();
+        assert_eq!(census.sessions[&tid()].empty_grace, 1);
+        assert!(
+            !setup.serving_relays(&tid(), s).is_empty(),
+            "membership remains protected during the grace",
+        );
+        tokio::time::sleep(SHORT / 2).await;
+        assert!(lc.is_alive(&tid(), s), "nothing retires before the grace");
+
+        timeout(SHORT * 5, async {
+            while lc.contains_state(&tid(), s) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the continuously empty session is reaped");
+        assert!(
+            setup.serving_relays(&tid(), s).is_empty(),
+            "the reap releases the scale-down membership blocker",
+        );
+        assert!(
+            setup
+                .descriptors()
+                .current_for(RelayId(1))
+                .iter()
+                .all(|descriptor| descriptor.session != s),
+            "the stale descriptor is retired with membership",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_empty_timer_cannot_consume_a_rearmed_timers_evidence() {
+        let setup = bare_setup();
+        let s = SessionId(89);
+        stage_assignments(&setup, s, &[RelayId(1)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: HOUR,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 9);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            9,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        lc.on_relay_heartbeat(RelayId(1), 9, &[], true, Instant::now());
+        let old_token = lc.inner.sessions.lock()[&(tid(), s)]
+            .empty_timer
+            .as_ref()
+            .expect("first empty proof arms a timer")
+            .token;
+
+        // Occupancy cancels A, then a later empty roster establishes a fresh
+        // proof and timer B.
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            9,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        lc.on_relay_heartbeat(RelayId(1), 9, &[], true, Instant::now());
+        let new_token = lc.inner.sessions.lock()[&(tid(), s)]
+            .empty_timer
+            .as_ref()
+            .expect("the fresh empty proof arms a replacement timer")
+            .token;
+        assert_ne!(old_token, new_token);
+
+        // Simulate A already having passed its sleep before its AbortHandle was
+        // canceled. It may run, but cannot clear B or reap against B's evidence.
+        lc.fire_empty_session(tid(), s, old_token);
+        assert!(lc.contains_state(&tid(), s));
+        assert_eq!(
+            lc.inner.sessions.lock()[&(tid(), s)]
+                .empty_timer
+                .as_ref()
+                .map(|timer| timer.token),
+            Some(new_token),
+        );
+
+        // The matching callback still owns the slot and can retire the session.
+        lc.fire_empty_session(tid(), s, new_token);
+        assert!(!lc.contains_state(&tid(), s));
+    }
+
+    #[tokio::test]
+    async fn a_superseded_connection_cannot_restore_cleared_close_evidence() {
+        let setup = bare_setup();
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(88);
+        lc.inner
+            .setup
+            .set_session_membership_for_test(&tid(), s, vec![RelayId(1), RelayId(2)]);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 1);
+        lc.on_relay_enrolled(RelayId(2), 2);
+        lc.on_session_closed(tid(), s, RelayId(1), 1);
+
+        // The replacement epoch reopens relay 1. A delayed terminal notice from
+        // generation 1 arriving afterward must not restore the old mark.
+        lc.on_relay_enrolled(RelayId(1), 3);
+        lc.on_session_closed(tid(), s, RelayId(1), 1);
+        lc.on_session_closed(tid(), s, RelayId(2), 2);
+        assert!(lc.contains_state(&tid(), s));
+
+        lc.on_session_closed(tid(), s, RelayId(1), 3);
+        assert!(!lc.contains_state(&tid(), s));
+    }
+
+    #[tokio::test]
+    async fn an_empty_roster_that_stops_refreshing_cannot_reap_a_session() {
+        let setup = bare_setup();
+        let s = SessionId(90);
+        stage_assignments(&setup, s, &[RelayId(1)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT * 2,
+                freshness: SHORT / 2,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 10);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            10,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        lc.on_relay_heartbeat(RelayId(1), 10, &[], true, Instant::now());
+
+        tokio::time::sleep(SHORT * 3).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "silence is unknown once the complete empty roster becomes stale",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+    }
+
+    #[tokio::test]
+    async fn every_assigned_relay_must_report_empty_before_the_grace_begins() {
+        let setup = bare_setup();
+        let s = SessionId(91);
+        stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 11);
+        lc.on_relay_enrolled(RelayId(2), 22);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            11,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+
+        lc.on_relay_heartbeat(RelayId(1), 11, &[], true, Instant::now());
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "one empty relay and one unknown relay cannot retire a session",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+
+        lc.on_relay_heartbeat(RelayId(2), 22, &[], true, Instant::now());
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 1);
+        timeout(SHORT * 5, async {
+            while lc.contains_state(&tid(), s) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both complete empty rosters start and finish the grace");
+    }
+
+    #[tokio::test]
+    async fn positive_presence_reopens_a_relays_prior_close_evidence() {
+        let setup = bare_setup();
+        let s = SessionId(93);
+        stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 41);
+        lc.on_relay_enrolled(RelayId(2), 42);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            41,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+
+        close(&lc, tid(), s, RelayId(1));
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            41,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        lc.on_relay_heartbeat(RelayId(2), 42, &[], true, Instant::now());
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a relay serving a reconnected player is no longer closed or empty",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+
+        lc.on_relay_heartbeat(RelayId(1), 41, &[], true, Instant::now());
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 1);
+        timeout(SHORT * 5, async {
+            while lc.contains_state(&tid(), s) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a later live-to-empty transition may begin a fresh grace");
+    }
+
+    #[tokio::test]
+    async fn a_new_relay_enrollment_reopens_its_prior_close_evidence() {
+        let setup = bare_setup();
+        let s = SessionId(94);
+        stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 51);
+        lc.on_relay_enrolled(RelayId(2), 53);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            51,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+        close(&lc, tid(), s, RelayId(1));
+
+        lc.on_relay_enrolled(RelayId(1), 52);
+        lc.on_relay_heartbeat(RelayId(2), 53, &[], true, Instant::now());
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "the replacement process may reapply its descriptor and serve a reconnect",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_rosters_and_connection_changes_reset_empty_continuity() {
+        let setup = bare_setup();
+        let s = SessionId(92);
+        stage_assignments(&setup, s, &[RelayId(1)]);
+        let lc = Lifecycle::with_test_tunables(
+            setup,
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 31);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            31,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+
+        lc.on_relay_heartbeat(RelayId(1), 31, &[], true, Instant::now());
+        lc.on_relay_heartbeat(RelayId(1), 31, &[], false, Instant::now());
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a legacy/partial roster turns omission into unknown",
+        );
+
+        lc.on_relay_heartbeat(RelayId(1), 31, &[], true, Instant::now());
+        lc.on_relay_disconnected(RelayId(1), 31);
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a disconnect invalidates its heartbeat omission",
+        );
+
+        lc.on_relay_heartbeat(RelayId(1), 31, &[], true, Instant::now());
+        lc.on_relay_enrolled(RelayId(1), 32);
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a reconnect invalidates the predecessor's empty proof",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+
+        lc.on_relay_heartbeat(RelayId(1), 32, &[], true, Instant::now());
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 1);
+        lc.prepare_rehome(&tid(), s);
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a re-home attempt cancels old-assignment empty evidence before mutation",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+    }
+
     #[tokio::test]
     async fn closing_a_session_retires_membership_and_limiter_bucket() {
         // A full close must retire the session's relay membership and drop its
@@ -1903,7 +2940,7 @@ mod tests {
         );
 
         // The single serving relay reports closed → full close.
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
 
         assert!(
             setup.serving_relays(&tid(), s).is_empty(),
@@ -1948,7 +2985,7 @@ mod tests {
             "the session's descriptor is staged before the close",
         );
 
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
 
         // A relay reconnecting after the close subscribes to a set that no longer
         // carries the closed session's descriptor.
@@ -2060,7 +3097,7 @@ mod tests {
         // The replacement's own close satisfies all-relays-closed (the cached set
         // now names only relay 2) and reaps the state: the final webhook fires, and
         // the session is no longer alive or tracked at all.
-        lc.on_session_closed(tid(), s, RelayId(2));
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("sessionClosed is delivered once the swapped-in relay closes")
@@ -2105,7 +3142,7 @@ mod tests {
         assert_eq!(endpoint.relay_id, RelayId(2));
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
 
-        lc.on_session_closed(tid(), s, RelayId(1)); // the swapped-out dead relay's late report
+        close(&lc, tid(), s, RelayId(1)); // the swapped-out dead relay's late report
         assert!(
             lc.is_alive(&tid(), s),
             "a close from a relay no longer in the cached serving set does not finish the session",
@@ -2117,7 +3154,7 @@ mod tests {
             "no sessionClosed fires from the stale close alone",
         );
 
-        lc.on_session_closed(tid(), s, RelayId(2));
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("the real serving relay's close still finishes the session")
@@ -2241,10 +3278,10 @@ mod tests {
         );
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(3));
 
-        lc.on_session_closed(tid(), s, RelayId(3));
+        close(&lc, tid(), s, RelayId(3));
         assert!(lc.is_alive(&tid(), s), "relay 2 hasn't closed yet");
 
-        lc.on_session_closed(tid(), s, RelayId(2));
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("sessionClosed fires once both the replacement and the surviving relay close")
@@ -2253,15 +3290,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_close_recorded_before_a_rehome_swap_is_re_evaluated_when_the_swap_lands() {
-        // The exact window a re-home can strand: the replacement relay reports
-        // `SessionClosed` after `session::rehome` has published its resumed
-        // descriptor (so the relay is already serving) but before the lifecycle
-        // swaps it into the cached serving set. That close is recorded while the
-        // cached set still names only the dead relay, so all-relays-closed is
-        // false when it lands -- and no further close is coming. The swap itself
-        // must re-evaluate the condition, or the session's state and its terminal
-        // `sessionClosed` webhook are stranded for the process lifetime.
+    async fn an_unassigned_close_cannot_seed_a_future_assignment() {
+        // A relay id may have served this session in an earlier topology or may be
+        // selected by a future re-home. A terminal notice while it is not in the
+        // cached assignment must not be retained and reused later.
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
         let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
@@ -2274,20 +3306,26 @@ mod tests {
             HashSet::new(),
         );
 
-        // The replacement's close arrives first, evaluated against the pre-swap
-        // set [R1]; nothing finishes yet.
-        lc.on_session_closed(tid(), s, RelayId(2));
+        // R2 is not assigned yet, so its close is ignored.
+        close(&lc, tid(), s, RelayId(2));
         assert!(
             lc.is_alive(&tid(), s),
             "a close from a not-yet-swapped-in relay does not finish the session on its own",
         );
 
-        // The swap lands: [R1] becomes [R2], which is already closed. The
-        // re-evaluation must now recognize all-relays-closed and retire.
+        // The later swap cannot inherit that unassigned mark.
+        lc.inner
+            .setup
+            .set_session_membership_for_test(&tid(), s, vec![RelayId(2)]);
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+        assert!(lc.is_alive(&tid(), s));
+        assert!(rx.try_recv().is_err());
+
+        // A post-swap close is scoped to the installed assignment and retires it.
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
-            .expect("the swap re-evaluates the recorded close and delivers sessionClosed")
+            .expect("the replacement's post-swap close delivers sessionClosed")
             .unwrap();
         assert_eq!(got.event, "sessionClosed");
         assert!(
@@ -2301,13 +3339,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rehome_dropping_the_dead_relay_re_evaluates_when_the_target_already_serves() {
-        // A split session on [R1, R2] where R2 has already reported closed. When
-        // the home relay R1 dies and the group re-homes onto R2 -- already a
-        // serving member -- the swap drops R1 rather than adding a duplicate,
-        // leaving [R2], which is closed. That drop newly satisfies
-        // all-relays-closed, so the "target already present" branch must
-        // re-evaluate too.
+    async fn session_closed_requires_matching_authoritative_membership() {
+        let setup = bare_setup();
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(101);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 1);
+
+        // Cached lifecycle membership alone is insufficient. This is the state
+        // after authoritative membership has already been retired.
+        lc.on_session_closed(tid(), s, RelayId(1), 1);
+        assert!(lc.contains_state(&tid(), s));
+
+        // A nonempty authoritative set assigning the session elsewhere rejects
+        // the same unassigned close as well.
+        lc.inner
+            .setup
+            .set_session_membership_for_test(&tid(), s, vec![RelayId(2)]);
+        lc.on_session_closed(tid(), s, RelayId(1), 1);
+        assert!(lc.contains_state(&tid(), s));
+
+        // Both the authoritative and cached assignment now name the current
+        // connection, so its terminal notice is accepted and retires the state.
+        lc.inner
+            .setup
+            .set_session_membership_for_test(&tid(), s, vec![RelayId(1)]);
+        lc.on_session_closed(tid(), s, RelayId(1), 1);
+        assert!(!lc.contains_state(&tid(), s));
+    }
+
+    #[tokio::test]
+    async fn rehome_reopens_a_target_that_already_served_and_previously_closed() {
+        // A resumed descriptor can give an already-serving target a newly homed
+        // group. Its earlier close therefore belongs to the old assignment and
+        // must not retire the resumed one immediately.
         let (url, mut rx) = spawn_receiver(None).await;
         let setup = setup_with_notify(url);
         let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
@@ -2320,19 +3391,48 @@ mod tests {
             HashSet::new(),
         );
 
-        lc.on_session_closed(tid(), s, RelayId(2));
+        close(&lc, tid(), s, RelayId(2));
         assert!(lc.is_alive(&tid(), s), "R1 has not closed yet");
 
-        // Re-home R1 onto the already-serving R2: the set becomes [R2], all closed.
+        // Re-home R1 onto the already-serving R2. Its earlier mark is reopened.
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(2));
+        assert!(lc.is_alive(&tid(), s));
+        assert!(rx.try_recv().is_err());
+
+        close(&lc, tid(), s, RelayId(2));
         let got = timeout(Duration::from_secs(2), rx.recv())
             .await
-            .expect("dropping the dead relay leaves only closed relays and finishes the session")
+            .expect("the target's post-rehome close finishes the session")
             .unwrap();
         assert_eq!(got.event, "sessionClosed");
         assert!(
             !lc.is_alive(&tid(), s),
             "a fully-closed session is not alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rehome_preflight_without_a_commit_preserves_terminal_evidence() {
+        // Stay and Unavailable outcomes run the preflight reset but have no new
+        // assignment. A close recorded on the unchanged set must remain valid.
+        let setup = bare_setup();
+        let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+        let s = SessionId(2);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0)]),
+            HashSet::new(),
+        );
+
+        close(&lc, tid(), s, RelayId(1));
+        lc.prepare_rehome(&tid(), s);
+        close(&lc, tid(), s, RelayId(2));
+
+        assert!(
+            !lc.contains_state(&tid(), s),
+            "a failed/no-op rehome cannot discard an unchanged assignment's close",
         );
     }
 
@@ -2353,18 +3453,22 @@ mod tests {
             HashSet::new(),
         );
 
+        // A close can land after the preflight reset but before rehome acquires
+        // the assignment lock. The under-lock same-id commit must reopen it even
+        // though the serving vector itself does not change.
+        lc.prepare_rehome(&tid(), s);
+        close(&lc, tid(), s, RelayId(1));
         lc.on_rehome(&tid(), s, RelayId(1), RelayId(1));
 
-        // Close ONLY relay 2. If the same-id swap had wrongly dropped relay 1 from
-        // the cached set (treating it as removed rather than unchanged), this
-        // alone would satisfy all-relays-closed; it must not.
-        lc.on_session_closed(tid(), s, RelayId(2));
+        // Close ONLY relay 2. If the same-id swap had wrongly dropped relay 1, or
+        // retained its pre-commit close, this alone would finish the session.
+        close(&lc, tid(), s, RelayId(2));
         assert!(
             lc.is_alive(&tid(), s),
             "relay 1 hasn't closed yet -- the same-id swap did not drop it from the set",
         );
 
-        lc.on_session_closed(tid(), s, RelayId(1));
+        close(&lc, tid(), s, RelayId(1));
         assert!(
             !lc.is_alive(&tid(), s),
             "both original members closing finishes it"

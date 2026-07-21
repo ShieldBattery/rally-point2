@@ -25,6 +25,10 @@ use crate::ids::{RelayId, SessionId, SlotId};
 use crate::token::{ClientPublicKey, KeyId};
 use crate::version::ProtocolVersion;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ---------------------------------------------------------------------------
 // Tenancy
 // ---------------------------------------------------------------------------
@@ -1226,14 +1230,21 @@ pub enum RelayToCoordinator {
     /// connected right now, the whole current truth every time (declarative, so a
     /// lost or reordered beat is corrected by the next one). The coordinator feeds
     /// it into its active-player presence store, which tenant app servers query to
-    /// block an in-game player from re-queueing. An idle relay's beat carries no
-    /// entries and serializes exactly as the payload-free ping always did, so an
-    /// older coordinator reads it unchanged.
+    /// block an in-game player from re-queueing. `roster_complete` lets a newer
+    /// coordinator distinguish an authoritative empty roster from the payload-free
+    /// heartbeat emitted by a relay build that predates presence. Older
+    /// coordinators ignore the additive marker.
     ///
     /// The frame carries only tenant/session/slot — **never user identity**: the
     /// relay stays PII-free, and slots are resolved to the tenant's own user refs
     /// on the coordinator, which already holds them from session creation.
     Heartbeat {
+        /// Whether `sessions` is this relay's complete current roster. New relays
+        /// always send `true`; absence decodes as `false`, so an older relay's bare
+        /// heartbeat can provide liveness and positive entries without its
+        /// omissions being mistaken for proof of emptiness during a rolling deploy.
+        #[serde(default, skip_serializing_if = "is_false")]
+        roster_complete: bool,
         /// The relay's live roster: one entry per session it currently holds a
         /// connected slot for. Empty (and omitted from the wire) on an idle relay.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2241,6 +2252,7 @@ mod tests {
     #[test]
     fn relay_to_coordinator_heartbeat_roundtrips_json() {
         let message = RelayToCoordinator::Heartbeat {
+            roster_complete: false,
             sessions: vec![],
             region_rtts: vec![],
         };
@@ -2264,6 +2276,7 @@ mod tests {
         assert_eq!(
             back,
             RelayToCoordinator::Heartbeat {
+                roster_complete: false,
                 sessions: vec![],
                 region_rtts: vec![],
             },
@@ -2273,6 +2286,7 @@ mod tests {
     #[test]
     fn a_presence_bearing_heartbeat_roundtrips_json() {
         let message = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions: vec![SessionPresence {
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
@@ -2283,6 +2297,7 @@ mod tests {
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"heartbeat\""));
         assert!(json.contains("\"sessions\""));
+        assert!(json.contains("\"roster_complete\":true"));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
     }
@@ -2293,6 +2308,7 @@ mod tests {
         // beat with an empty set omits it entirely (byte-identical to a beat that
         // never measured anything), so an older coordinator reads either unchanged.
         let with_rtts = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions: vec![],
             region_rtts: vec![
                 RegionRttReport {
@@ -2311,6 +2327,7 @@ mod tests {
         assert_eq!(back, with_rtts);
 
         let empty = RelayToCoordinator::Heartbeat {
+            roster_complete: false,
             sessions: vec![],
             region_rtts: vec![],
         };
@@ -2338,6 +2355,7 @@ mod tests {
         }
 
         let json = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions: vec![],
             region_rtts: vec![RegionRttReport {
                 region: RegionId("us-west".to_owned()),
@@ -2366,9 +2384,17 @@ mod tests {
             #[allow(dead_code)]
             Unknown,
         }
-        let json =
-            r#"{"type":"heartbeat","sessions":[{"tenant":"sb-staging","session":42,"slots":[0]}]}"#;
-        let decoded: PrePresenceRelayToCoordinator = serde_json::from_str(json).unwrap();
+        let json = serde_json::to_string(&RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: vec![SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                slots: vec![SlotId(0)],
+            }],
+            region_rtts: vec![],
+        })
+        .unwrap();
+        let decoded: PrePresenceRelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, PrePresenceRelayToCoordinator::Heartbeat);
     }
 

@@ -586,21 +586,26 @@ async fn rehome_session(
     }
 
     let departed = state.lifecycle.departed_slots(&tenant, session);
-    let outcome = session::rehome(&state.setup, &tenant, session, dead_relay, departed);
-    // Keep the lifecycle's cached serving-relay set in step with the mutation
-    // `session::rehome` just committed, so a later `SessionClosed` from the
-    // replacement can still satisfy the all-relays-closed condition. Only the
-    // ask that actually performed (or replayed, via `rehome`'s own idempotency
-    // check) the mutation reaches here — the lock-free recorded-rehome fast path
-    // above returns before this point and never calls in, matching that its
-    // first application already applied the swap. `on_rehome` is itself
-    // idempotent (a second call for an already-swapped id is a no-op), so a
-    // repeat here from `rehome`'s internal idempotent branch is harmless.
-    if let RehomeOutcome::NewTarget(ref endpoint) = outcome {
-        state
-            .lifecycle
-            .on_rehome(&tenant, session, dead_relay, endpoint.relay_id);
-    }
+    // Cancel any globally-empty proof before the assignment mutation. Otherwise an
+    // already-expired reap task could retire the replacement assignment in the
+    // narrow interval before `on_rehome` updates the lifecycle's cached relay set.
+    state.lifecycle.prepare_rehome(&tenant, session);
+    // Commit lifecycle's cached serving set while `session::rehome` still holds
+    // the assignment lock and before it publishes resumed descriptors. Terminal
+    // notices take that same lock, so a replacement can never report closed in a
+    // gap where authoritative membership is new but lifecycle membership is old.
+    let outcome = session::rehome_with_assignment_commit(
+        &state.setup,
+        &tenant,
+        session,
+        dead_relay,
+        departed,
+        |replacement| {
+            state
+                .lifecycle
+                .on_rehome(&tenant, session, dead_relay, replacement);
+        },
+    );
     // Let the descriptor push reach R_new's control task before responding, so the
     // relay is likelier to hold the resumed descriptor before a client dials it
     // (the client's reconnect backoff absorbs whatever race remains).
@@ -1443,7 +1448,9 @@ async fn serve_relay_control(
     // connection redialing (its cert is stable across restarts of one instance)
     // and replaces the entry exactly as it always has. Proof of possession above
     // is what makes the fingerprint trustworthy to compare against.
-    let generation = match registry::try_enroll(registry, hello) {
+    let generation = match lifecycle
+        .enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello))
+    {
         Ok(generation) => generation,
         Err(registry::EnrollConflict) => {
             tracing::warn!(
@@ -1493,7 +1500,9 @@ async fn serve_relay_control(
     // connection has already reported — the same race `remove_if_current` closes
     // for the registry entry itself.
     presence::clear_connection(setup.presence(), relay_id, generation);
-    if registry::remove_if_current(registry, relay_id, generation) {
+    if lifecycle.disconnect_relay_epoch(relay_id, generation, || {
+        registry::remove_if_current(registry, relay_id, generation)
+    }) {
         tracing::info!(
             relay_id = relay_id.0,
             "relay deregistered on control disconnect"
@@ -2380,6 +2389,7 @@ fn note_inbound(
     };
     match serde_json::from_str::<RelayToCoordinator>(text) {
         Ok(RelayToCoordinator::Heartbeat {
+            roster_complete,
             mut sessions,
             mut region_rtts,
         }) => {
@@ -2391,6 +2401,7 @@ fn note_inbound(
             // Truncated rather than the whole beat rejected — the beat still
             // carries the relay's own liveness signal and whatever legitimate
             // entries precede the excess.
+            let mut complete_roster = roster_complete;
             if sessions.len() > MAX_HEARTBEAT_SESSIONS {
                 tracing::warn!(
                     relay_id = relay_id.0,
@@ -2399,6 +2410,10 @@ fn note_inbound(
                     "heartbeat session roster exceeds the per-beat cap; truncating",
                 );
                 sessions.truncate(MAX_HEARTBEAT_SESSIONS);
+                // Once the coordinator drops a suffix, omission is no longer an
+                // authoritative statement even if the sender marked its original
+                // snapshot complete. Positive entries remain useful below.
+                complete_roster = false;
             }
             for session in &mut sessions {
                 if session.slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
@@ -2462,14 +2477,13 @@ fn note_inbound(
                     &sessions,
                     std::time::Instant::now(),
                 );
-                // A session with at least one slot connected has a real
-                // client, wherever the roster came from -- the never-started
-                // reap's cancel signal (see `Lifecycle::on_presence_seen`).
-                for session in &sessions {
-                    if !session.slots.is_empty() {
-                        lifecycle.on_presence_seen(session.tenant.clone(), session.session);
-                    }
-                }
+                lifecycle.on_relay_heartbeat(
+                    relay_id,
+                    generation,
+                    &sessions,
+                    complete_roster,
+                    std::time::Instant::now(),
+                );
                 // Backbone RTTs fold in under the same generation fence as presence: a
                 // stale connection's beat describes a superseded view, so its measured
                 // pairs must not overwrite what the live connection reports. Unlike the
@@ -2545,7 +2559,16 @@ fn note_inbound(
             InboundAction::None
         }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
-            lifecycle.on_session_closed(tenant, session, relay_id);
+            if !registry::generation_is_current(setup.registry(), relay_id, generation) {
+                tracing::debug!(
+                    relay_id = relay_id.0,
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    "dropping SessionClosed from a stale control connection",
+                );
+                return InboundAction::None;
+            }
+            lifecycle.on_session_closed(tenant, session, relay_id, generation);
             InboundAction::None
         }
         Ok(RelayToCoordinator::FlightUploadRequest {
@@ -4178,6 +4201,7 @@ mod tests {
             })
             .collect();
         let heartbeat = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions: vec![],
             region_rtts,
         };
@@ -4190,6 +4214,7 @@ mod tests {
         sessions: Vec<rally_point_proto::control::SessionPresence>,
     ) -> Message {
         let heartbeat = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
             sessions,
             region_rtts: vec![],
         };
@@ -4300,6 +4325,83 @@ mod tests {
         assert_eq!(
             snap[0].rtt_ms, 90,
             "both directions fold in and average: (87 + 93) / 2 = 90",
+        );
+    }
+
+    #[tokio::test]
+    async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch() {
+        let (setup, notices, lifecycle, session) =
+            setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
+        let tenant = TenantId("sb-test".to_owned());
+        lifecycle.register_session(
+            tenant.clone(),
+            session,
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            std::collections::HashSet::new(),
+        );
+        let hello = RelayHello::new(
+            RelayId(1),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xC1; 4],
+        );
+        let stale_generation = registry::enroll(setup.registry(), hello.clone());
+        let current_generation = registry::enroll(setup.registry(), hello);
+        lifecycle.on_relay_enrolled(RelayId(1), current_generation);
+
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let occupied = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
+            tenant: tenant.clone(),
+            session,
+            slots: vec![SlotId(0)],
+        }]);
+        note_inbound_frame(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            current_generation,
+            &occupied,
+            &rtt,
+        );
+
+        let closed = Message::Text(
+            serde_json::to_string(&RelayToCoordinator::SessionClosed {
+                tenant: tenant.clone(),
+                session,
+            })
+            .unwrap()
+            .into(),
+        );
+        note_inbound_frame(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            stale_generation,
+            &closed,
+            &rtt,
+        );
+        assert!(
+            lifecycle.is_alive(&tenant, session),
+            "a late close from the predecessor cannot close the replacement",
+        );
+
+        note_inbound_frame(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            current_generation,
+            &closed,
+            &rtt,
+        );
+        assert!(
+            !lifecycle.is_alive(&tenant, session),
+            "the current connection's close still retires the session",
         );
     }
 

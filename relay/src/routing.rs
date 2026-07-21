@@ -2621,9 +2621,10 @@ fn report_own_presence(sessions: &Sessions, mesh: &crate::mesh::MeshState, key: 
     }
 }
 
-/// Arms or cancels `key`'s abandoned-session timer against the current presence and
-/// departure state. Called after every presence liveness change (this relay's own
-/// roster flip, or a peer's report), so the timer tracks session-wide emptiness.
+/// Reconciles a started session against its session-wide presence after every
+/// liveness change (this relay's own roster flip, or a peer's report). A globally
+/// empty session attempts the normal local close, and one whose departures still
+/// need deciding also arms the abandoned-session timer.
 ///
 /// A *started* session that is empty session-wide ([`crate::presence::all_empty`])
 /// with at least one undecided departure ([`consensus::has_undecided_departure`]) is
@@ -2638,8 +2639,18 @@ pub(crate) fn reconcile_abandon(
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
 ) {
-    let abandoned = consensus::session_started(&mesh.decision_makers, key)
-        && crate::presence::all_empty(&mesh.presence, key)
+    // The roster is the authoritative answer for this relay, including the
+    // important case where it never served a local slot and therefore never
+    // emitted an own-presence transition. Peers still have to explicitly report
+    // zero through `all_empty`; silence is never treated as absence.
+    let own_live = {
+        let roster = sessions.lock();
+        roster.get(key).map_or(0, |slots| slots.len() as u32)
+    };
+    let session_started = consensus::session_started(&mesh.decision_makers, key);
+    let globally_empty = crate::presence::all_empty(&mesh.presence, key, own_live);
+    let abandoned = session_started
+        && globally_empty
         && consensus::has_undecided_departure(&mesh.decision_makers, key);
     if abandoned {
         // Owned clones for the timer task: it fires after the window with no
@@ -2653,6 +2664,16 @@ pub(crate) fn reconcile_abandon(
         });
     } else {
         mesh.drop_holds.cancel_abandon(key);
+    }
+
+    // `end_slot_link` already evaluates the close when this relay's own last
+    // slot leaves. This symmetric peer-report path is what closes a serving
+    // relay that never had a local slot: once every peer has explicitly reported
+    // zero, no future local teardown exists to trigger the normal close. The
+    // close function retains the existing reconnect promise — a started session
+    // with a homed, held departure defers until the abandoned timer decides it.
+    if globally_empty {
+        maybe_close_emptied_session(sessions, mesh, key);
     }
 }
 
@@ -4053,6 +4074,7 @@ mod tests {
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
         consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
         crate::presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
+        crate::presence::record_own(&presence, &k, 1);
         (presence, sessions, mesh_links, makers, k)
     }
 
@@ -4074,6 +4096,109 @@ mod tests {
             LEAVE_REASON_DROPPED,
         );
         holds.hold(k.clone(), slot);
+    }
+
+    /// Regression for a relay assigned to a multi-relay session whose own client
+    /// never connected. The peer connected briefly but the full expected roster
+    /// never formed, so the relay session never reached `started`; once that peer
+    /// reports zero, this relay still has to run the ordinary close.
+    #[test]
+    fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
+        use crate::consensus::{self, Authority, RelayNotice};
+        use crate::presence::Candidate;
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::RelayId;
+
+        let k = key();
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+        let _ = consensus::sync_maker(
+            &mesh.decision_makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+            [SlotId(0)].into_iter().collect(),
+            std::collections::HashSet::new(),
+        );
+        assert!(
+            !consensus::session_started(&mesh.decision_makers, &k),
+            "only one peer ever connected, so the session never started",
+        );
+        crate::presence::set_order(
+            &mesh.presence,
+            &k,
+            vec![Candidate::SelfRelay, Candidate::Peer(RelayId(2))],
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mesh.decision_makers.set_notice_notifier(tx);
+
+        // No slot was ever inserted into `sessions`, and deliberately no
+        // `record_own(0)` call was made. The local roster itself is authoritative.
+        // The peer was briefly live, matching the incident: activity happened,
+        // but the full expected roster never formed on this relay.
+        assert!(
+            !crate::presence::record_peer(&mesh.presence, &k, RelayId(2), 1,),
+            "the unknown peer was already conservatively treated as live"
+        );
+        reconcile_abandon(&sessions, &mesh, &k);
+        assert!(
+            rx.try_recv().is_err(),
+            "a live peer keeps the serving state open",
+        );
+        assert!(crate::presence::record_peer(
+            &mesh.presence,
+            &k,
+            RelayId(2),
+            0,
+        ));
+        reconcile_abandon(&sessions, &mesh, &k);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(RelayNotice::SessionClosed {
+                tenant: k.tenant.clone(),
+                session: k.session,
+            }),
+        );
+        assert!(
+            !mesh.drop_holds.abandon_armed(&k),
+            "a clean empty session has no departures to time out",
+        );
+    }
+
+    /// A relay closes only after every named peer explicitly reports zero. Both
+    /// silence and a positive report keep the session open even when the local
+    /// roster is empty.
+    #[test]
+    fn unknown_or_live_peer_presence_blocks_the_empty_session_close() {
+        use crate::presence::Candidate;
+        use rally_point_proto::ids::RelayId;
+
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        crate::presence::set_order(
+            &presence,
+            &k,
+            vec![Candidate::SelfRelay, Candidate::Peer(RelayId(2))],
+        );
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_notice_notifier(tx);
+        let mesh = mesh_with(&holds, &makers, &mesh_links, &presence);
+
+        reconcile_abandon(&sessions, &mesh, &k);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unknown peer is assumed live and blocks close",
+        );
+
+        crate::presence::record_peer(&presence, &k, RelayId(2), 1);
+        reconcile_abandon(&sessions, &mesh, &k);
+        assert!(
+            rx.try_recv().is_err(),
+            "an explicitly live peer blocks close",
+        );
     }
 
     /// Every player dropping leaves the session empty session-wide with undecided
@@ -4148,6 +4273,8 @@ mod tests {
                 SlotId(0)
             ))
         );
+        let (_registration, _inbox) =
+            register(&sessions, &k, SlotId(0)).expect("the returning slot registers");
         crate::presence::record_own(&presence, &k, 1);
         reconcile_abandon(
             &sessions,
@@ -4183,6 +4310,8 @@ mod tests {
         let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
         drop_slot(&makers, &holds, &k, SlotId(1));
         // Slot 0 is still connected: the session is not empty session-wide.
+        let (_registration, _inbox) =
+            register(&sessions, &k, SlotId(0)).expect("the live slot registers");
         crate::presence::record_own(&presence, &k, 1);
 
         reconcile_abandon(
