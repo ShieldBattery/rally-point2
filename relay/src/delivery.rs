@@ -113,6 +113,32 @@ pub struct DeliveryTracking {
 }
 
 impl DeliveryTracking {
+    /// Folds the pair map once for the two summary values consumed together by
+    /// [`Self::cushion_turns`]. Keeping this uncached makes every answer reflect
+    /// the current maps while avoiding two identical hash-map traversals on the
+    /// authority's condition-ingest path.
+    fn pair_summary(&self) -> (Option<u32>, Option<u64>) {
+        let mut max_hops = None;
+        let mut worst_lag = None;
+        for (dest, (dest_home, cursors)) in &self.dests {
+            for (origin, pair) in cursors {
+                if origin == dest {
+                    continue;
+                }
+                let Some((newest, origin_home)) = self.origins.get(origin) else {
+                    continue;
+                };
+
+                let hops = if origin_home == dest_home { 1 } else { 2 };
+                max_hops = Some(max_hops.map_or(hops, |max: u32| max.max(hops)));
+
+                let lag = newest.saturating_sub(pair.delivered_seq);
+                worst_lag = Some(worst_lag.map_or(lag, |worst: u64| worst.max(lag)));
+            }
+        }
+        (max_hops, worst_lag)
+    }
+
     /// Records one observed origin turn: `origin` produced (and this relay saw)
     /// `seq`, arriving by `home`. Monotonic on the seq, and only a *strictly
     /// fresher* seq re-stamps the home: link replacement, resume replay, or
@@ -223,13 +249,12 @@ impl DeliveryTracking {
     /// exactly as before this input existed. See the module docs for the
     /// adversarial bound on the claim-based inputs.
     pub fn cushion_turns(&self) -> u32 {
-        let hop_term = self
-            .max_relay_hops()
+        let (max_relay_hops, worst_lag_turns) = self.pair_summary();
+        let hop_term = max_relay_hops
             .unwrap_or(1)
             .saturating_sub(1)
             .saturating_mul(EXTRA_HOP_CUSHION_TURNS);
-        let lag_term = self
-            .worst_lag_turns()
+        let lag_term = worst_lag_turns
             .map(|lag| {
                 let excess = lag.saturating_sub(E2E_LAG_SLACK_TURNS);
                 ((excess / E2E_LAG_TURNS_PER_CUSHION_TURN) as u32).min(E2E_LAG_CUSHION_CAP_TURNS)
@@ -413,6 +438,48 @@ mod tests {
             tracking.cushion_turns(),
             EXTRA_HOP_CUSHION_TURNS + E2E_LAG_CUSHION_CAP_TURNS,
             "an absurd understated cursor saturates at the cap",
+        );
+    }
+
+    #[test]
+    fn the_one_pass_cushion_matches_the_standalone_pair_summaries() {
+        fn from_standalone_summaries(tracking: &DeliveryTracking) -> u32 {
+            let hop_term = tracking
+                .max_relay_hops()
+                .unwrap_or(1)
+                .saturating_sub(1)
+                .saturating_mul(EXTRA_HOP_CUSHION_TURNS);
+            let lag_term = tracking
+                .worst_lag_turns()
+                .map(|lag| {
+                    let excess = lag.saturating_sub(E2E_LAG_SLACK_TURNS);
+                    ((excess / E2E_LAG_TURNS_PER_CUSHION_TURN) as u32)
+                        .min(E2E_LAG_CUSHION_CAP_TURNS)
+                })
+                .unwrap_or(0);
+            hop_term + lag_term
+        }
+
+        let mut tracking = DeliveryTracking::default();
+        assert_eq!(
+            tracking.cushion_turns(),
+            from_standalone_summaries(&tracking)
+        );
+
+        // Cursor evidence without a matching origin contributes to neither
+        // summary, while complete same-home and cross-home pairs contribute to
+        // both. The worst lag and max hop deliberately come from different
+        // pairs so the combined fold must retain each independent maximum.
+        tracking.observe_delivery(slot(1), slot(7), 3, DeliveryHome::Local);
+        tracking.observe_origin(slot(0), 100, DeliveryHome::Local);
+        tracking.observe_delivery(slot(1), slot(0), 0, DeliveryHome::Local);
+        tracking.observe_origin(slot(2), 50, DeliveryHome::Peer(RelayId(9)));
+        tracking.observe_delivery(slot(1), slot(2), 50, DeliveryHome::Local);
+        assert_eq!(tracking.max_relay_hops(), Some(2));
+        assert_eq!(tracking.worst_lag_turns(), Some(100));
+        assert_eq!(
+            tracking.cushion_turns(),
+            from_standalone_summaries(&tracking)
         );
     }
 
