@@ -1016,19 +1016,18 @@ fn fold_oversize_into_link(
     }
 }
 
-/// Pushes one joined session's mesh-link delivered-through cursors to the peer
-/// when they've advanced past what it last heard -- the mesh-link counterpart
-/// of the client edge's ack-beacon push. The caller invokes this inside the
-/// link-wide maintenance pass, alongside this session's flush/window/presence
-/// checks, so cursor recovery stays off the hot datagram path without another
-/// traversal of the joined-session map. Push-on-advance: a slot with nothing
-/// new since the last push sends nothing, so a healthy link stays quiet.
+/// Builds one joined session's mesh-link cursor frame when its
+/// delivered-through state has advanced past what the peer last heard -- the
+/// mesh-link counterpart of the client edge's ack-beacon push. The caller
+/// invokes this inside the link-wide maintenance pass, alongside this session's
+/// flush/window/presence checks, then writes every frame the pass produced as
+/// one control-stream batch. Push-on-advance: a slot with nothing new since the
+/// last push produces no frame, so a healthy link stays quiet.
 fn reconcile_ack_cursors(
     link: &rally_point_transport::MeshLink,
-    control_tx: &MeshControlTx,
     ack_cursors_sent: &mut HashMap<(SessionId, SlotId), u64>,
     state: &SessionState,
-) {
+) -> Option<MeshControlFrame> {
     let session_id = state.key.session;
     let advanced: Vec<(SlotId, u64)> = link
         .delivered_through_all(mesh_session_key(&state.key))
@@ -1041,12 +1040,12 @@ fn reconcile_ack_cursors(
         })
         .collect();
     if advanced.is_empty() {
-        return;
+        return None;
     }
     for &(slot, cursor) in &advanced {
         ack_cursors_sent.insert((session_id, slot), cursor);
     }
-    let _ = control_tx.send(ack_cursors_frame(session_id, advanced));
+    Some(ack_cursors_frame(session_id, advanced))
 }
 
 /// Announces a departed slot to every peer relay serving `key`: the home relay
@@ -1817,12 +1816,14 @@ pub async fn run_mesh_link(
         tx: mut control_send,
         rx: mut peer_control_rx,
     } = mesh_control_io;
-    // One merged outbound control channel for every session on this link:
-    // `fan_out_control` pushes a `MeshControlFrame` (self-describing via its
-    // session field) here, and the driver writes it on the shared control stream.
-    // One sender is cloned into the mesh-links registry per session (alongside the
-    // forward sender); the driver owns the receiver and holds the original sender
-    // for the loop's life, so `recv()` returns `None` only on a genuine shutdown.
+    // One merged outbound control channel for externally produced frames from
+    // every session on this link: `fan_out_control` pushes a self-describing
+    // `MeshControlFrame` here, and the driver writes it on the shared control
+    // stream. Maintenance-generated ack cursors bypass this self-channel and are
+    // written as one link-wide batch. One sender is cloned into the mesh-links
+    // registry per session (alongside the forward sender); the driver owns the
+    // receiver and holds the original sender for the loop's life, so `recv()`
+    // returns `None` only on a genuine shutdown.
     let (control_forward_tx, mut control_forward_rx) =
         mpsc::unbounded_channel::<MeshControlFrame>();
 
@@ -2125,6 +2126,7 @@ pub async fn run_mesh_link(
                 let mut failed = None;
                 let mut window_exhausted = false;
                 let mut presence_updates = Vec::new();
+                let mut ack_cursor_frames = Vec::with_capacity(joined.len());
 
                 // One link-wide pass handles every periodic responsibility.
                 // Ordinary turn and control events can wake this select loop
@@ -2153,12 +2155,13 @@ pub async fn run_mesh_link(
                         presence_updates.push((state.key.session, live));
                     }
 
-                    reconcile_ack_cursors(
+                    if let Some(frame) = reconcile_ack_cursors(
                         &link,
-                        &control_forward_tx,
                         &mut ack_cursors_sent,
                         state,
-                    );
+                    ) {
+                        ack_cursor_frames.push(frame);
+                    }
                 }
                 if window_exhausted {
                     // The ack-cursor beacon (`reconcile_ack_cursors`, below)
@@ -2200,6 +2203,32 @@ pub async fn run_mesh_link(
                     Ok(Ok(())) => {}
                     Ok(Err(_)) | Err(_) => {
                         tracing::info!("mesh presence push failed or stalled; closing link");
+                        break MeshLinkExit::ConnectionFailed;
+                    }
+                }
+                // Every cursor frame is still independently length-prefixed and
+                // decoded by the peer in this order; only the application write is
+                // coalesced. Keeping this direct and link-local avoids routing up to
+                // one frame per active session through our own control channel and
+                // revisiting each through the select loop. Deadline-bound like all
+                // other inline stream writes: a wedged peer resets the link rather
+                // than suspending every joined session.
+                match tokio::time::timeout(
+                    MESH_STREAM_WRITE_TIMEOUT,
+                    rally_point_transport::mesh_control_stream::send_mesh_control_frames(
+                        &mut control_send,
+                        &ack_cursor_frames,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::info!(%error, "mesh ack-cursor batch send failed; closing link");
+                        break MeshLinkExit::ConnectionFailed;
+                    }
+                    Err(_) => {
+                        tracing::warn!("mesh ack-cursor batch send stalled; closing link");
                         break MeshLinkExit::ConnectionFailed;
                     }
                 }
@@ -5378,18 +5407,12 @@ mod tests {
             .unwrap();
         receiver.recv().await.unwrap();
 
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let mut sent: HashMap<(SessionId, SlotId), u64> = HashMap::new();
         let mut joined = HashMap::new();
         joined.insert(session, bare_session_state(key.clone()));
 
-        reconcile_ack_cursors(
-            &receiver,
-            &control_tx,
-            &mut sent,
-            joined.get(&session).unwrap(),
-        );
-        let frame = control_rx.try_recv().expect("the fresh cursor is pushed");
+        let frame = reconcile_ack_cursors(&receiver, &mut sent, joined.get(&session).unwrap())
+            .expect("the fresh cursor is pushed");
         match frame.kind {
             Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {
                 assert_eq!(cursors.cursors.len(), 1);
@@ -5401,14 +5424,9 @@ mod tests {
 
         // Nothing advanced: a second reconcile with no new receipt sends
         // nothing.
-        reconcile_ack_cursors(
-            &receiver,
-            &control_tx,
-            &mut sent,
-            joined.get(&session).unwrap(),
-        );
+        let frame = reconcile_ack_cursors(&receiver, &mut sent, joined.get(&session).unwrap());
         assert!(
-            control_rx.try_recv().is_err(),
+            frame.is_none(),
             "no advance since the last push -- the beacon stays quiet",
         );
 
@@ -5417,13 +5435,8 @@ mod tests {
             .send(mesh_session_key(&key), Some(turn_payload(0, 1)), None)
             .unwrap();
         receiver.recv().await.unwrap();
-        reconcile_ack_cursors(
-            &receiver,
-            &control_tx,
-            &mut sent,
-            joined.get(&session).unwrap(),
-        );
-        let frame = control_rx.try_recv().expect("the advance is pushed");
+        let frame = reconcile_ack_cursors(&receiver, &mut sent, joined.get(&session).unwrap())
+            .expect("the advance is pushed");
         match frame.kind {
             Some(mesh_control_frame::Kind::MeshAckCursors(cursors)) => {
                 assert_eq!(cursors.cursors[0].delivered_through, 1);

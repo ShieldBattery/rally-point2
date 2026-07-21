@@ -30,6 +30,7 @@ use serde::Deserialize;
 
 use crate::flight_recorder::{FlightRecorder, RelayWorkSnapshot};
 use crate::routing::Sessions;
+use crate::turn_ring::RingTotals;
 
 /// Env var Fargate injects with the task metadata endpoint's base URL.
 /// Present only under Fargate (or ECS-on-EC2 in awsvpc mode); its absence is
@@ -60,6 +61,33 @@ struct ReporterContext {
     flight_recorder: FlightRecorder,
 }
 
+/// Relay-lifetime work counters sampled alongside one Docker resource sample.
+/// Local validation/delivery counters come from the flight recorder; distinct
+/// mesh-origin turns come from the replay ring's already-locked record path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkSnapshot {
+    client_turns_validated: u64,
+    local_turn_deliveries: u64,
+    oversize_diverts: u64,
+    mesh_ingress_turns: u64,
+}
+
+impl WorkSnapshot {
+    fn from_sources(relay: RelayWorkSnapshot, ring: RingTotals) -> Self {
+        Self {
+            client_turns_validated: relay.client_turns_validated,
+            local_turn_deliveries: relay.local_turn_deliveries,
+            oversize_diverts: relay.oversize_diverts,
+            mesh_ingress_turns: ring.mesh_origin_turns,
+        }
+    }
+
+    fn ingress_turns(self) -> u64 {
+        self.client_turns_validated
+            .saturating_add(self.mesh_ingress_turns)
+    }
+}
+
 /// Starts the periodic task-stats reporter if `interval_secs` is nonzero and
 /// this process is running as a Fargate task; otherwise logs one debug line
 /// and returns without spawning anything.
@@ -76,8 +104,10 @@ struct ReporterContext {
 /// queue depths (control-plane pressure) and its descriptor apply lag (how far
 /// descriptor delivery trailed staging) — and stays all-zero on a relay with no
 /// coordinator connection.
-/// `flight_recorder` supplies relay-lifetime work counters for CPU-efficiency
-/// denominators; its session flushes do not reset those totals.
+/// `flight_recorder` supplies relay-lifetime local work counters for
+/// CPU-efficiency denominators; its session flushes do not reset those totals.
+/// `turn_ring` also supplies the relay-lifetime count of distinct mesh-origin
+/// turns, collected under its existing record lock.
 pub fn spawn_if_enabled(
     interval_secs: u64,
     relay_id: Option<u64>,
@@ -131,7 +161,7 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, context: Reporte
         interval_secs = interval.as_secs(),
         "task-stats reporter started"
     );
-    let mut prev: Option<(Sample, RelayWorkSnapshot, std::time::Instant)> = None;
+    let mut prev: Option<(Sample, WorkSnapshot, std::time::Instant)> = None;
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -147,7 +177,8 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, context: Reporte
                 continue;
             }
         };
-        let work = context.flight_recorder.relay_work_snapshot();
+        let ring = context.turn_ring.totals();
+        let work = WorkSnapshot::from_sources(context.flight_recorder.relay_work_snapshot(), ring);
 
         let Some((prev_sample, prev_work, prev_at)) = prev else {
             tracing::debug!("task-stats reporter: baseline sample recorded");
@@ -158,7 +189,6 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, context: Reporte
         let derived = derive(Some(&prev_sample), &curr, elapsed);
         let work_derived = derive_work(&prev_work, &work, &prev_sample, &curr, elapsed);
         let sessions = crate::routing::session_count(&context.sessions);
-        let ring = context.turn_ring.totals();
         let control = context.control_stats.snapshot();
         tracing::info!(
             relay_id = context.relay_id,
@@ -168,11 +198,16 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, context: Reporte
             net_rx_mibps = ?derived.net_rx_mibps,
             net_tx_mibps = ?derived.net_tx_mibps,
             validated_turns_per_sec = ?work_derived.validated_turns_per_sec,
+            mesh_ingress_turns_per_sec = ?work_derived.mesh_ingress_turns_per_sec,
+            ingress_turns_per_sec = ?work_derived.ingress_turns_per_sec,
             local_deliveries_per_sec = ?work_derived.local_deliveries_per_sec,
             oversize_diverts_per_sec = ?work_derived.oversize_diverts_per_sec,
             cpu_ns_per_validated_turn = ?work_derived.cpu_ns_per_validated_turn,
+            cpu_ns_per_ingress_turn = ?work_derived.cpu_ns_per_ingress_turn,
             cpu_ns_per_local_delivery = ?work_derived.cpu_ns_per_local_delivery,
             validated_turns_total = work.client_turns_validated,
+            mesh_ingress_turns_total = work.mesh_ingress_turns,
+            ingress_turns_total = work.ingress_turns(),
             local_deliveries_total = work.local_turn_deliveries,
             oversize_diverts_total = work.oversize_diverts,
             sessions,
@@ -342,15 +377,20 @@ struct Derived {
 ///
 /// CPU time is Docker's cumulative `total_usage`, measured in nanoseconds and
 /// summed across the process's threads. It includes all relay work, not only
-/// turn handling. A local delivery also scales with roster placement and fanout,
-/// so these ratios are intended to compare identical load-generator topologies
-/// and traffic mixes, not unlike workloads with different player/session shapes.
+/// turn handling. Ingress is the sum of locally validated turns and distinct
+/// mesh-origin turns. A local delivery also scales with roster placement and
+/// fanout, so these ratios are intended to compare identical load-generator
+/// topologies and traffic mixes, not unlike workloads with different
+/// player/session shapes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorkDerived {
     validated_turns_per_sec: Option<f64>,
+    mesh_ingress_turns_per_sec: Option<f64>,
+    ingress_turns_per_sec: Option<f64>,
     local_deliveries_per_sec: Option<f64>,
     oversize_diverts_per_sec: Option<f64>,
     cpu_ns_per_validated_turn: Option<f64>,
+    cpu_ns_per_ingress_turn: Option<f64>,
     cpu_ns_per_local_delivery: Option<f64>,
 }
 
@@ -358,8 +398,8 @@ struct WorkDerived {
 /// Docker CPU samples. Pure and total so load-test interpretation is covered by
 /// unit tests without an ECS metadata endpoint.
 fn derive_work(
-    prev_work: &RelayWorkSnapshot,
-    curr_work: &RelayWorkSnapshot,
+    prev_work: &WorkSnapshot,
+    curr_work: &WorkSnapshot,
     prev_sample: &Sample,
     curr_sample: &Sample,
     elapsed: Duration,
@@ -373,10 +413,16 @@ fn derive_work(
     let oversize = curr_work
         .oversize_diverts
         .saturating_sub(prev_work.oversize_diverts);
+    let mesh_ingress = curr_work
+        .mesh_ingress_turns
+        .saturating_sub(prev_work.mesh_ingress_turns);
+    let ingress = validated.saturating_add(mesh_ingress);
 
     let elapsed_secs = elapsed.as_secs_f64();
     let rates = (elapsed_secs > 0.0).then_some((
         validated as f64 / elapsed_secs,
+        mesh_ingress as f64 / elapsed_secs,
+        ingress as f64 / elapsed_secs,
         deliveries as f64 / elapsed_secs,
         oversize as f64 / elapsed_secs,
     ));
@@ -386,10 +432,14 @@ fn derive_work(
 
     WorkDerived {
         validated_turns_per_sec: rates.map(|rates| rates.0),
-        local_deliveries_per_sec: rates.map(|rates| rates.1),
-        oversize_diverts_per_sec: rates.map(|rates| rates.2),
+        mesh_ingress_turns_per_sec: rates.map(|rates| rates.1),
+        ingress_turns_per_sec: rates.map(|rates| rates.2),
+        local_deliveries_per_sec: rates.map(|rates| rates.3),
+        oversize_diverts_per_sec: rates.map(|rates| rates.4),
         cpu_ns_per_validated_turn: cpu_delta
             .and_then(|cpu| (validated > 0).then_some(cpu as f64 / validated as f64)),
+        cpu_ns_per_ingress_turn: cpu_delta
+            .and_then(|cpu| (ingress > 0).then_some(cpu as f64 / ingress as f64)),
         cpu_ns_per_local_delivery: cpu_delta
             .and_then(|cpu| (deliveries > 0).then_some(cpu as f64 / deliveries as f64)),
     }
@@ -523,16 +573,35 @@ mod tests {
     // --- relay work efficiency ---
 
     #[test]
+    fn ingress_total_combines_local_and_mesh_without_overflow() {
+        let work = WorkSnapshot {
+            client_turns_validated: 7,
+            mesh_ingress_turns: 5,
+            ..Default::default()
+        };
+        assert_eq!(work.ingress_turns(), 12);
+
+        let saturated = WorkSnapshot {
+            client_turns_validated: u64::MAX,
+            mesh_ingress_turns: 1,
+            ..Default::default()
+        };
+        assert_eq!(saturated.ingress_turns(), u64::MAX);
+    }
+
+    #[test]
     fn work_rates_and_cpu_efficiency_difference_cumulative_snapshots() {
-        let prev_work = RelayWorkSnapshot {
+        let prev_work = WorkSnapshot {
             client_turns_validated: 100,
             local_turn_deliveries: 300,
             oversize_diverts: 4,
+            mesh_ingress_turns: 10,
         };
-        let curr_work = RelayWorkSnapshot {
+        let curr_work = WorkSnapshot {
             client_turns_validated: 140,
             local_turn_deliveries: 420,
             oversize_diverts: 10,
+            mesh_ingress_turns: 30,
         };
         let prev_sample = Sample {
             cpu_total_usage: 1_000_000_000,
@@ -551,18 +620,22 @@ mod tests {
             Duration::from_secs(2),
         );
         assert_eq!(derived.validated_turns_per_sec, Some(20.0));
+        assert_eq!(derived.mesh_ingress_turns_per_sec, Some(10.0));
+        assert_eq!(derived.ingress_turns_per_sec, Some(30.0));
         assert_eq!(derived.local_deliveries_per_sec, Some(60.0));
         assert_eq!(derived.oversize_diverts_per_sec, Some(3.0));
         assert_eq!(derived.cpu_ns_per_validated_turn, Some(15_000_000.0));
+        assert_eq!(derived.cpu_ns_per_ingress_turn, Some(10_000_000.0));
         assert_eq!(derived.cpu_ns_per_local_delivery, Some(5_000_000.0));
     }
 
     #[test]
     fn zero_work_denominators_report_zero_rates_without_fabricated_cpu_ratios() {
-        let work = RelayWorkSnapshot {
+        let work = WorkSnapshot {
             client_turns_validated: 100,
             local_turn_deliveries: 300,
             oversize_diverts: 4,
+            mesh_ingress_turns: 25,
         };
         let prev_sample = Sample {
             cpu_total_usage: 1_000_000_000,
@@ -581,19 +654,23 @@ mod tests {
             Duration::from_secs(2),
         );
         assert_eq!(derived.validated_turns_per_sec, Some(0.0));
+        assert_eq!(derived.mesh_ingress_turns_per_sec, Some(0.0));
+        assert_eq!(derived.ingress_turns_per_sec, Some(0.0));
         assert_eq!(derived.local_deliveries_per_sec, Some(0.0));
         assert_eq!(derived.oversize_diverts_per_sec, Some(0.0));
         assert_eq!(derived.cpu_ns_per_validated_turn, None);
+        assert_eq!(derived.cpu_ns_per_ingress_turn, None);
         assert_eq!(derived.cpu_ns_per_local_delivery, None);
     }
 
     #[test]
     fn work_rates_survive_a_cpu_counter_reset_but_cpu_ratios_do_not() {
-        let prev_work = RelayWorkSnapshot::default();
-        let curr_work = RelayWorkSnapshot {
+        let prev_work = WorkSnapshot::default();
+        let curr_work = WorkSnapshot {
             client_turns_validated: 10,
             local_turn_deliveries: 20,
             oversize_diverts: 0,
+            mesh_ingress_turns: 5,
         };
         let prev_sample = Sample {
             cpu_total_usage: 500,
@@ -612,9 +689,45 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(derived.validated_turns_per_sec, Some(10.0));
+        assert_eq!(derived.mesh_ingress_turns_per_sec, Some(5.0));
+        assert_eq!(derived.ingress_turns_per_sec, Some(15.0));
         assert_eq!(derived.local_deliveries_per_sec, Some(20.0));
         assert_eq!(derived.cpu_ns_per_validated_turn, None);
+        assert_eq!(derived.cpu_ns_per_ingress_turn, None);
         assert_eq!(derived.cpu_ns_per_local_delivery, None);
+    }
+
+    #[test]
+    fn mesh_only_work_still_has_an_ingress_cpu_denominator() {
+        let prev_work = WorkSnapshot {
+            mesh_ingress_turns: 100,
+            ..Default::default()
+        };
+        let curr_work = WorkSnapshot {
+            mesh_ingress_turns: 110,
+            ..Default::default()
+        };
+        let prev_sample = Sample {
+            cpu_total_usage: 1_000,
+            ..Default::default()
+        };
+        let curr_sample = Sample {
+            cpu_total_usage: 2_000,
+            ..Default::default()
+        };
+
+        let derived = derive_work(
+            &prev_work,
+            &curr_work,
+            &prev_sample,
+            &curr_sample,
+            Duration::from_secs(2),
+        );
+        assert_eq!(derived.validated_turns_per_sec, Some(0.0));
+        assert_eq!(derived.mesh_ingress_turns_per_sec, Some(5.0));
+        assert_eq!(derived.ingress_turns_per_sec, Some(5.0));
+        assert_eq!(derived.cpu_ns_per_validated_turn, None);
+        assert_eq!(derived.cpu_ns_per_ingress_turn, Some(100.0));
     }
 
     // --- memory working set ---

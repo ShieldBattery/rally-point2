@@ -184,22 +184,38 @@ impl SessionRing {
     }
 }
 
+/// Shared replay-ring state and relay-lifetime distinct-turn counts by ingress
+/// origin. Both are updated under the record path's existing lock.
+#[derive(Default)]
+struct TurnRingState {
+    sessions: HashMap<SessionKey, SessionRing>,
+    /// Counts record calls after the session-level duplicate gate. These never
+    /// decrement on ring eviction or session teardown, so task-stats snapshots
+    /// can difference them across the relay's whole lifetime.
+    local_origin_turns: u64,
+    mesh_origin_turns: u64,
+}
+
 /// Per-relay registry of every session's forwarded-turn ring, keyed by session.
-/// Cheap to clone (an `Arc` around the shared map), so it rides in
+/// Cheap to clone (an `Arc` around the shared state), so it rides in
 /// [`crate::mesh::MeshState`] alongside the other per-session registries and is
 /// handed to every task that forwards a turn.
 #[derive(Clone, Default)]
 pub struct TurnRing {
-    sessions: Arc<Mutex<HashMap<SessionKey, SessionRing>>>,
+    state: Arc<Mutex<TurnRingState>>,
 }
 
 /// One [`TurnRing::totals`] snapshot: ring count plus recorded-turn and
-/// command-byte totals across every session.
+/// command-byte occupancy across every session, and relay-lifetime distinct
+/// turn counts by ingress origin. Occupancy falls on eviction/teardown; origin
+/// counts do not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RingTotals {
     pub sessions: usize,
     pub turns: usize,
     pub command_bytes: usize,
+    pub local_origin_turns: u64,
+    pub mesh_origin_turns: u64,
 }
 
 impl TurnRing {
@@ -221,12 +237,21 @@ impl TurnRing {
     /// doc). Pass `0` when the shape is genuinely unknown; that sizes the ring
     /// for a maximum-slot game, since unknown must never under-retain.
     pub fn record(&self, key: &SessionKey, payload: &Payload, origin: TurnOrigin, slots: usize) {
-        let mut sessions = self.sessions.lock();
-        if let Some(ring) = sessions.get_mut(key) {
+        let mut state = self.state.lock();
+        match origin {
+            TurnOrigin::Local => {
+                state.local_origin_turns = state.local_origin_turns.saturating_add(1);
+            }
+            TurnOrigin::Mesh => {
+                state.mesh_origin_turns = state.mesh_origin_turns.saturating_add(1);
+            }
+        }
+        if let Some(ring) = state.sessions.get_mut(key) {
             ring.record(payload.clone(), origin, slots);
             return;
         }
-        sessions
+        state
+            .sessions
             .entry(key.clone())
             .or_default()
             .record(payload.clone(), origin, slots);
@@ -293,8 +318,8 @@ impl TurnRing {
         origin: Option<TurnOrigin>,
         replay_absent_from_zero: bool,
     ) -> Vec<Payload> {
-        let sessions = self.sessions.lock();
-        let Some(ring) = sessions.get(key) else {
+        let state = self.state.lock();
+        let Some(ring) = state.sessions.get(key) else {
             return Vec::new();
         };
         ring.turns
@@ -317,7 +342,7 @@ impl TurnRing {
     /// mirroring how the roster group and lobby/chat state are dropped then.
     /// Idempotent.
     pub fn end_session(&self, key: &SessionKey) {
-        self.sessions.lock().remove(key);
+        self.state.lock().sessions.remove(key);
     }
 
     /// A point-in-time occupancy snapshot across every session's ring, for the
@@ -327,12 +352,14 @@ impl TurnRing {
     /// also carries its fixed envelope — so for sessions of tiny turns the turn
     /// count is the primary footprint signal.
     pub fn totals(&self) -> RingTotals {
-        let sessions = self.sessions.lock();
+        let state = self.state.lock();
         let mut totals = RingTotals {
-            sessions: sessions.len(),
+            sessions: state.sessions.len(),
+            local_origin_turns: state.local_origin_turns,
+            mesh_origin_turns: state.mesh_origin_turns,
             ..Default::default()
         };
-        for ring in sessions.values() {
+        for ring in state.sessions.values() {
             totals.turns += ring.turns.len();
             totals.command_bytes += ring.bytes;
         }
@@ -343,8 +370,9 @@ impl TurnRing {
     /// count bound and drop-oldest behavior.
     #[cfg(test)]
     pub fn len(&self, key: &SessionKey) -> usize {
-        self.sessions
+        self.state
             .lock()
+            .sessions
             .get(key)
             .map_or(0, |ring| ring.turns.len())
     }
@@ -353,7 +381,11 @@ impl TurnRing {
     /// asserting the byte bound.
     #[cfg(test)]
     pub fn bytes(&self, key: &SessionKey) -> usize {
-        self.sessions.lock().get(key).map_or(0, |ring| ring.bytes)
+        self.state
+            .lock()
+            .sessions
+            .get(key)
+            .map_or(0, |ring| ring.bytes)
     }
 }
 
@@ -472,6 +504,11 @@ mod tests {
             record_local(&ring, &k, &turn(0, seq, 1));
         }
         assert_eq!(ring.len(&k), cap, "capped at the count bound");
+        assert_eq!(
+            ring.totals().local_origin_turns,
+            (cap + overflow) as u64,
+            "lifetime ingress counts are not reduced by occupancy eviction",
+        );
 
         // The lowest `overflow` seqs were evicted; the newest cap-worth remain.
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
@@ -551,8 +588,34 @@ mod tests {
                 sessions: 2,
                 turns: 3,
                 command_bytes: 27,
+                local_origin_turns: 3,
+                mesh_origin_turns: 0,
             },
         );
+    }
+
+    #[test]
+    fn origin_totals_are_distinct_record_counts_and_survive_session_teardown() {
+        let ring = TurnRing::new();
+        let first = key();
+        let second = SessionKey {
+            tenant: TenantId("t".to_owned()),
+            session: SessionId(2),
+        };
+
+        ring.record(&first, &turn(0, 0, 8), TurnOrigin::Local, 2);
+        ring.record(&first, &turn(1, 0, 8), TurnOrigin::Mesh, 2);
+        ring.record(&second, &turn(0, 1, 8), TurnOrigin::Mesh, 2);
+        assert_eq!(ring.totals().local_origin_turns, 1);
+        assert_eq!(ring.totals().mesh_origin_turns, 2);
+
+        ring.end_session(&first);
+        ring.end_session(&second);
+        assert_eq!(ring.totals().sessions, 0);
+        assert_eq!(ring.totals().turns, 0);
+        assert_eq!(ring.totals().command_bytes, 0);
+        assert_eq!(ring.totals().local_origin_turns, 1);
+        assert_eq!(ring.totals().mesh_origin_turns, 2);
     }
 
     #[test]

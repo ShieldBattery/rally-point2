@@ -104,18 +104,30 @@ target/release/rally-point-loadgen \
 
 The JSON includes the complete workload, wall time, actual sent/delivered rates,
 latency distributions, stalls, and connection outcomes. A relay task-stats line
-reports CPU and network rates plus actual validated-turn and local-delivery
-rates. Those work totals reuse the flight recorder's existing per-slot atomics
-and are summed only at the task-stats poll, so measurement adds no second
-contended atomic update to each turn. Its CPU-per-work fields are deliberately
-reported against both denominators:
+reports CPU and network rates plus actual validated-turn, distinct mesh-ingress,
+and local-delivery rates. Local validation and delivery totals reuse the flight
+recorder's existing per-slot atomics and are summed only at the task-stats poll.
+Distinct mesh ingress is counted immediately after session-level dedup, while
+the turn ring already holds its record lock. Measurement therefore adds neither
+a second per-turn atomic update nor a new lock acquisition. Its CPU-per-work
+fields are deliberately reported against three denominators:
 
 - CPU ns / validated turn is useful for identical client-ingress and topology
   runs;
+- CPU ns / ingress turn divides by locally validated plus distinct mesh-origin
+  turns, making it the all-ingress denominator for split-relay topologies;
 - CPU ns / local delivery captures fan-out work, but does not include mesh sends
   as a separate unit.
 
-Keep topology identical when comparing either value. A split two-relay game does
+`mesh_ingress_turns_per_sec` counts only the first mesh copy of each
+`(slot, seq)` that wins session dedup. Redundant or replayed copies rejected by
+that gate do not inflate it. `ingress_turns_per_sec` is the sum of that rate and
+`validated_turns_per_sec`. The corresponding `validated_turns_total`,
+`mesh_ingress_turns_total`, and `ingress_turns_total` fields expose the sampled
+cumulative counters, making a relay restart or counter reset visible when
+filtering steady-state plateaus.
+
+Keep topology identical when comparing any value. A split two-relay game does
 different work from a single-relay game even if both validate the same number of
 client turns.
 
