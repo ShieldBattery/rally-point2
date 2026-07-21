@@ -149,6 +149,7 @@ fn run(scenario: &Scenario) -> Vec<Row> {
                 rtt_us: sample.rtt_us,
                 lost_packets: cumulative_lost,
                 sent_packets: cumulative_sent,
+                connection_epoch: None,
             }],
         };
 

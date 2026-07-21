@@ -310,7 +310,7 @@ async fn serve_connection(
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
     let handshake = auth::authenticate(&connection, registry, unix_now());
-    let (authorized, resume_cursors, mut handshake_send) =
+    let (authorized, resume_cursors, connection_epoch, mut handshake_send) =
         match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
             Ok(result) => result?,
             Err(_elapsed) => {
@@ -411,23 +411,34 @@ async fn serve_connection(
         .map_err(AuthError::from)?;
     let _ = handshake_send.finish();
 
-    // Now decide this slot's admission against CURRENT state, not the
-    // pre-register snapshot above — reusing that snapshot here is exactly the bug
-    // this reorder fixes: a concurrent decide path (a survivor's `RequestDrop`
-    // honored, or the abandoned-session timer's force-decide) can honor the
-    // slot's drop in the gap between the snapshot and here, and a snapshot-keyed
-    // release+reinstate would blindly resurrect a slot the session has already
-    // moved on without — while a fresh hold, marked by this same slot's OLD link
-    // finally dying in that same gap, would never be released as this connection
-    // takes over. `take_if_pending` is the fix: it re-checks the hold and, if
-    // still pending, reinstates the slot — atomically, under one lock
-    // acquisition — so this reconnect and every decide path (an honored
-    // `RequestDrop`, the abandoned-session force-decide, a superseding clean
-    // leave) race the SAME linearization point, the hold's removal, and whichever
-    // side wins is the one, and only one, side that acts.
-    let reinstated = mesh.drop_holds.take_if_pending(&key, authorized.slot, || {
-        consensus::reinstate_slot(&mesh.decision_makers, &key, authorized.slot)
-    });
+    // Resolve this slot against CURRENT hold, departure, final-leave, and epoch
+    // state. The holds lock stays stable while one decision-maker lock restores
+    // any suspended game-progress state and activates this generation. An old
+    // teardown therefore lands wholly before this transition (and is claimed)
+    // or wholly after it (and is stale); it cannot re-land between reinstatement
+    // and activation. The no-hold path uses the same maker critical section, so
+    // a departure that won immediately beforehand is observed rather than raced.
+    let admission = consensus::admit_reconnect(
+        &mesh.decision_makers,
+        &mesh.drop_holds,
+        &key,
+        authorized.slot,
+        Some(connection_epoch),
+    );
+    let reinstated = match admission {
+        consensus::ReconnectAdmission::Admitted { reinstated } => reinstated,
+        consensus::ReconnectAdmission::Rejected => {
+            connection.close(
+                VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+                b"slot already departed",
+            );
+            return Err(ConnError::SlotDeparted {
+                tenant: key.tenant,
+                session: key.session,
+                slot: authorized.slot,
+            });
+        }
+    };
     if reinstated {
         tracing::info!(
             tenant = key.tenant.as_ref(),
@@ -435,27 +446,7 @@ async fn serve_connection(
             slot = authorized.slot.0,
             "client re-registered while its drop was undecided; claimed the hold and reinstated",
         );
-    } else if consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot) {
-        // Either there was no hold to claim (a clean leave already decided this
-        // slot with no hold ever marked) or a concurrent decide path won the
-        // claim moments ago (the hold was pending but `reinstate_slot` found the
-        // leave already committed) — either way the leave is final. Refuse
-        // without disarming `registration`: the guard frees the roster seat on
-        // drop exactly as the pre-register fast-fail's refusal would have, and
-        // the client sees the same terminal close either way.
-        connection.close(
-            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
-            b"slot already departed",
-        );
-        return Err(ConnError::SlotDeparted {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
     }
-    // Neither a hold nor a departure record: a plain fresh admission (or a
-    // resumed one whose hold and record another path already cleared) —
-    // proceed exactly as a first-time dial would.
 
     // Bound the admit-first race this connection just rode (`slot_homed`
     // above, admitted because no descriptor names this session yet): if the
@@ -483,6 +474,7 @@ async fn serve_connection(
         Link::with_ingress_slot(connection, authorized.slot),
         key,
         authorized.slot,
+        connection_epoch,
         resume_cursors,
         inbox,
         sessions,

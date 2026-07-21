@@ -398,15 +398,12 @@ async fn main() -> Result<()> {
     // The mesh-edge connection half. When a relay-id is configured, spawn the
     // accept drain (peer relays dialing us arrive on `mesh_accept`) and one
     // dial task per `--mesh-peer` (we dial the peers we're lower-id than).
-    // Each established link comes back on `links_rx` as `(peer id, MeshCommand
-    // sender)` — the peer id labels which relay the link reaches, so the Join
-    // source can target a session join at the right link.
+    // Each established link comes back on `links_rx` as `(peer id, local
+    // generation, MeshCommand sender)` — the peer id targets joins and the
+    // generation rejects late registration from an older physical link.
     let mesh_accept = if let Some(our_id) = cli.relay_id {
         let (mesh_accept_tx, mesh_accept_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(8);
-        let (links_tx, mut links_rx) = tokio::sync::mpsc::channel::<(
-            RelayId,
-            tokio::sync::mpsc::UnboundedSender<mesh::MeshCommand>,
-        )>(8);
+        let (links_tx, mut links_rx) = tokio::sync::mpsc::channel::<mesh::MeshLinkHandle>(8);
 
         // The fleet mesh-peer map: the coordinator pushes the currently-enrolled
         // fleet's cert fingerprints down the control connection, the subscriber
@@ -634,8 +631,8 @@ async fn main() -> Result<()> {
         }
 
         tokio::spawn(async move {
-            while let Some((peer_id, command_tx)) = links_rx.recv().await {
-                mesh_control.register_link(peer_id, command_tx);
+            while let Some((peer_id, generation, command_tx)) = links_rx.recv().await {
+                let _ = mesh_control.register_link(peer_id, generation, command_tx);
             }
         });
 

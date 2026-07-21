@@ -1148,7 +1148,7 @@ mod tests {
         let _counters = recorder.slot_counters(&k, SlotId(0));
 
         let conditions = crate::mesh::new_conditions_registry();
-        crate::mesh::publish_conditions(
+        crate::mesh::activate_conditions(
             &conditions,
             &k,
             SlotId(0),
@@ -1157,6 +1157,7 @@ mod tests {
                 rtt_us: 42_000,
                 lost_packets: 3,
                 sent_packets: 500,
+                connection_epoch: None,
             },
         );
         recorder.sample_now(&conditions, |_| (Some(17), Some(2)));

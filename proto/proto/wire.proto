@@ -142,6 +142,14 @@ message SlotConditions {
   // decision-maker computes `lost/sent` over the delta, never relying on a
   // separately-sampled denominator that could mismatch the numerator's window.
   uint64 sent_packets = 4;
+
+  // Identifies the home-client QUIC connection these cumulative counters came
+  // from. A reconnect starts a fresh QUIC counter namespace, so relays use this
+  // epoch together with the reliable `SlotConnectivity{connected: true}` frame
+  // to reject delayed datagrams from the previous connection. Absent only for a
+  // sender that predates connection-epoch fencing; receivers retain the legacy
+  // behavior until they observe a present epoch for this slot.
+  optional fixed64 connection_epoch = 5;
 }
 
 // One command packet from one slot — a unit of the lockstep command stream,
@@ -948,6 +956,12 @@ message SlotDeparted {
   // The reporting slot's own newest observed frame when the result arrived.
   // Absent when there is no result, or the report predated any framed turn.
   optional uint32 result_slot_frame = 8;
+
+  // The home-client connection that departed. This is the same epoch carried
+  // by that connection's `SlotConditions` and `SlotConnectivity` frames, so a
+  // delayed departure from an old connection cannot retire a newer reconnect's
+  // live decision-maker state. Absent for a legacy sender.
+  optional fixed64 connection_epoch = 9;
 }
 
 // A relay's directive that a session may begin: every slot the coordinator
@@ -1030,4 +1044,10 @@ message SlotConnectivity {
   // no ordering guarantee against the synced-leave path, so a client uses this
   // only for its own connectivity display.
   bool connected = 2;
+
+  // The home-client connection whose state changed. A `connected: true` frame
+  // establishes this epoch over the reliable control stream; condition
+  // sidecars and later teardown for any other epoch are stale. Absent for a
+  // legacy sender, preserving rolling compatibility.
+  optional fixed64 connection_epoch = 3;
 }

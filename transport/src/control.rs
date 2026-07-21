@@ -373,11 +373,13 @@ pub async fn send_control_connectivity(
     control_send: &mut quinn::SendStream,
     slot: u8,
     connected: bool,
+    connection_epoch: Option<u64>,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
             slot: u32::from(slot),
             connected,
+            connection_epoch,
         })),
     };
     let encoded = encode_frame(&frame)?;

@@ -233,6 +233,7 @@ mod tests {
                 result_arrival_ms: 0,
                 result_session_frame: None,
                 result_slot_frame: None,
+                connection_epoch: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -289,6 +290,7 @@ mod tests {
                 result_arrival_ms: 0,
                 result_session_frame: None,
                 result_slot_frame: None,
+                connection_epoch: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -316,6 +318,7 @@ mod tests {
                 result_arrival_ms: 1_700_000_000_000,
                 result_session_frame: Some(4200),
                 result_slot_frame: Some(4242),
+                connection_epoch: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -427,6 +430,7 @@ mod tests {
             kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
                 slot: 2,
                 connected: false,
+                connection_epoch: Some(17),
             })),
         };
         let encoded = encode_frame(&down).unwrap();
@@ -448,6 +452,7 @@ mod tests {
                 SlotConnectivity {
                     slot: 5,
                     connected: true,
+                    connection_epoch: Some(18),
                 },
             )),
         };

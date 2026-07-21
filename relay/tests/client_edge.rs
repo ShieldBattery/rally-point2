@@ -331,6 +331,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
             rtt_us: 150_000,
             lost_packets: 0,
             sent_packets: 100,
+            connection_epoch: None,
         }],
     };
     let decision = consensus::ingest_local_conditions(&makers, &key, &seed)

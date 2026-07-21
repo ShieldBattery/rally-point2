@@ -355,11 +355,14 @@ pub async fn run_mesh_accept(
     mut mesh_accept: mpsc::Receiver<quinn::Connection>,
     sessions: Sessions,
     mesh: MeshState,
-    links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    links: mpsc::Sender<mesh::MeshLinkHandle>,
     fleet_peers: FleetMeshPeersReader,
     require_peer_auth: bool,
 ) {
     while let Some(connection) = mesh_accept.recv().await {
+        // Mint provenance at dequeue, before permit/handshake awaits can let a
+        // slower older connection finish after its replacement.
+        let attempt = mesh::new_mesh_link_attempt();
         // Gate the handshake window behind the dedicated mesh-accept cap
         // BEFORE the connection gets a task of its own: acquiring here makes
         // this loop stop taking connections off the channel while every slot
@@ -486,9 +489,14 @@ pub async fn run_mesh_accept(
             // not when this task itself eventually ends.
             drop(accept_permit);
 
+            let Some(lease) = mesh::claim_mesh_link(&mesh, peer_id, &attempt) else {
+                connection.close(0u32.into(), b"superseded mesh link");
+                return;
+            };
+
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
-            let _ = links.send((peer_id, tx)).await;
+            let _ = links.send((peer_id, lease.generation(), tx)).await;
             let presence_io = presence::PresenceIo {
                 peer_id,
                 tx: presence_tx,
@@ -500,8 +508,11 @@ pub async fn run_mesh_accept(
             };
             mesh::run_mesh_link(
                 link,
-                presence_io,
-                control_io,
+                mesh::MeshLinkIo {
+                    presence: presence_io,
+                    control: control_io,
+                    lease,
+                },
                 rx,
                 sessions,
                 mesh,
@@ -545,7 +556,7 @@ pub async fn run_mesh_dial(
     dial: MeshDial,
     sessions: Sessions,
     mesh: MeshState,
-    links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    links: mpsc::Sender<mesh::MeshLinkHandle>,
 ) {
     run_mesh_dial_with(dial, sessions, mesh, links, MESH_REDIAL_DELAY).await
 }
@@ -556,7 +567,7 @@ pub async fn run_mesh_dial_with(
     dial: MeshDial,
     sessions: Sessions,
     mesh: MeshState,
-    links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    links: mpsc::Sender<mesh::MeshLinkHandle>,
     redial_delay: Duration,
 ) {
     let MeshDial {
@@ -686,8 +697,11 @@ async fn dial_and_serve(
     target: &DialTarget,
     sessions: &Sessions,
     mesh: &MeshState,
-    links: &mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    links: &mpsc::Sender<mesh::MeshLinkHandle>,
 ) -> DialOutcome {
+    // Mint before connect/handshake awaits so generation order reflects attempt
+    // creation, not whichever connection happens to authenticate last.
+    let attempt = mesh::new_mesh_link_attempt();
     let DialTarget {
         our_id,
         peer_id,
@@ -796,6 +810,11 @@ async fn dial_and_serve(
     let peer_control_rx =
         rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
 
+    let Some(lease) = mesh::claim_mesh_link(mesh, *peer_id, &attempt) else {
+        connection.close(0u32.into(), b"superseded mesh link");
+        return DialOutcome::Stop;
+    };
+
     // A cheap handle kept past the link's move below, so a driver exit can still
     // read the connection's close reason (naming a protocol-version refusal).
     let connection_for_exit = connection.clone();
@@ -804,7 +823,7 @@ async fn dial_and_serve(
     // Hand the fresh command sender to the Join source. On a redial this
     // re-registers under the same peer id, which re-syncs the sessions the peer
     // should serve onto the new link (the old, dead sender is replaced).
-    let _ = links.send((*peer_id, tx)).await;
+    let _ = links.send((*peer_id, lease.generation(), tx)).await;
 
     let presence_io = presence::PresenceIo {
         peer_id: *peer_id,
@@ -817,8 +836,11 @@ async fn dial_and_serve(
     };
     let exit = mesh::run_mesh_link(
         link,
-        presence_io,
-        control_io,
+        mesh::MeshLinkIo {
+            presence: presence_io,
+            control: control_io,
+            lease,
+        },
         rx,
         Arc::clone(sessions),
         mesh.clone(),
@@ -852,6 +874,13 @@ async fn dial_and_serve(
             tracing::info!(
                 peer_id = peer_id.0,
                 "mesh link command channel closed (relay wound it down); not redialing",
+            );
+            DialOutcome::Stop
+        }
+        mesh::MeshLinkExit::Superseded => {
+            tracing::info!(
+                peer_id = peer_id.0,
+                "mesh link superseded by a newer local generation; not redialing",
             );
             DialOutcome::Stop
         }

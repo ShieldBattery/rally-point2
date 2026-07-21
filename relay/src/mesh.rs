@@ -336,43 +336,197 @@ pub fn new_mesh_links() -> MeshLinks {
 /// so the lock is never held across a turn's delivery.
 pub type ConditionsRegistry = Arc<Mutex<HashMap<SessionKey, HashMap<SlotId, SlotConditions>>>>;
 
+/// Process-local provenance for the currently accepted physical connection to
+/// each peer relay. The generation never crosses the wire; it only prevents a
+/// superseded driver's already-decoded ingress from mutating shared relay
+/// state. Entries remain as high-water tombstones after a driver exits.
+pub(crate) type CurrentMeshLinks = Arc<Mutex<HashMap<RelayId, Arc<Mutex<CurrentMeshLink>>>>>;
+
+pub(crate) struct CurrentMeshLink {
+    generation: u64,
+    superseded: Arc<Notify>,
+}
+
+/// Identity minted when a connection attempt is created, before handshake
+/// completion can reorder attempts. The per-generation notification both wakes
+/// an old driver promptly and retains a permit if replacement wins before that
+/// driver starts waiting.
+pub struct MeshLinkAttempt {
+    generation: u64,
+    superseded: Arc<Notify>,
+}
+
+/// Stable per-peer provenance lease returned by a successful claim. Drivers
+/// retain this `Arc`, so every hot-path check takes only the peer's mutex and
+/// never re-enters the fleet-wide peer map.
+pub struct MeshLinkLease {
+    generation: u64,
+    current: Arc<Mutex<CurrentMeshLink>>,
+    superseded: Arc<Notify>,
+}
+
+fn next_mesh_link_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn new_mesh_link_attempt() -> MeshLinkAttempt {
+    MeshLinkAttempt {
+        generation: next_mesh_link_generation(),
+        superseded: Arc::new(Notify::new()),
+    }
+}
+
+impl MeshLinkAttempt {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Claims `attempt` as the locally current physical link to `peer_id`, returning
+/// the stable per-peer lease the driver uses thereafter. A slow older handshake
+/// can finish after its replacement; numeric comparison makes that late claim a
+/// no-op and preserves the newer driver's provenance.
+pub fn claim_mesh_link(
+    mesh: &MeshState,
+    peer_id: RelayId,
+    attempt: &MeshLinkAttempt,
+) -> Option<MeshLinkLease> {
+    let peer = {
+        let mut links = mesh.current_links.lock();
+        Arc::clone(links.entry(peer_id).or_insert_with(|| {
+            Arc::new(Mutex::new(CurrentMeshLink {
+                generation: 0,
+                superseded: Arc::new(Notify::new()),
+            }))
+        }))
+    };
+    let mut current = peer.lock();
+    if current.generation >= attempt.generation {
+        attempt.superseded.notify_one();
+        return None;
+    }
+    current.superseded.notify_one();
+    current.generation = attempt.generation;
+    current.superseded = Arc::clone(&attempt.superseded);
+    drop(current);
+    Some(MeshLinkLease {
+        generation: attempt.generation,
+        current: peer,
+        superseded: Arc::clone(&attempt.superseded),
+    })
+}
+
+impl MeshLinkLease {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn is_current(&self) -> bool {
+        self.current.lock().generation == self.generation
+    }
+
+    /// Runs one synchronous ingress or command mutation while holding the
+    /// per-peer provenance lock. A replacement claim therefore linearizes
+    /// either before this closure (and rejects it) or after all shared-state
+    /// effects, never halfway through.
+    fn with_current<T>(&self, dispatch: impl FnOnce() -> T) -> Option<T> {
+        let current = self.current.lock();
+        if current.generation != self.generation {
+            return None;
+        }
+        Some(dispatch())
+    }
+}
+
+enum LeaseAwait<T> {
+    Completed(T),
+    Superseded,
+}
+
+async fn await_while_current<T>(
+    lease: &MeshLinkLease,
+    future: impl std::future::Future<Output = T>,
+) -> LeaseAwait<T> {
+    tokio::select! {
+        biased;
+        _ = lease.superseded.notified() => LeaseAwait::Superseded,
+        result = future => LeaseAwait::Completed(result),
+    }
+}
+
 /// Creates an empty conditions registry for a relay with no sessions yet.
 pub fn new_conditions_registry() -> ConditionsRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
-/// Publishes `conditions` for `key`'s `slot`, replacing any prior sample for
-/// that slot. Called by `run_slot_link` after sampling its client's quinn path
+
+/// Activates `conditions` for `key`'s `slot`, replacing any prior connection
+/// generation. Called by `run_slot_link` after sampling its client's quinn path
 /// stats. Idempotent in the sense that a re-publish overwrites the stale
 /// sample — conditions are per-moment, and the latest is always what the
 /// mesh attaches.
-pub fn publish_conditions(
+pub fn activate_conditions(
     registry: &ConditionsRegistry,
     key: &SessionKey,
     slot: SlotId,
     conditions: SlotConditions,
 ) {
-    let mut roster = registry.lock();
-    if let Some(slots) = roster.get_mut(key) {
-        slots.insert(slot, conditions);
-        return;
-    }
-    roster
+    registry
+        .lock()
         .entry(key.clone())
         .or_default()
         .insert(slot, conditions);
 }
 
+/// Publishes a later sample only for the epoch currently active at this slot.
+/// Returns false when a superseded task tries to overwrite its replacement.
+pub fn publish_conditions(
+    registry: &ConditionsRegistry,
+    key: &SessionKey,
+    slot: SlotId,
+    conditions: SlotConditions,
+) -> bool {
+    let mut roster = registry.lock();
+    let Some(slots) = roster.get_mut(key) else {
+        return false;
+    };
+    if !slots
+        .get(&slot)
+        .is_some_and(|current| current.connection_epoch == conditions.connection_epoch)
+    {
+        return false;
+    }
+    slots.insert(slot, conditions);
+    true
+}
+
 /// Removes `slot` from `key`'s conditions (the client disconnected). Idempotent.
 /// Called by `run_slot_link` on exit so a departing client's stale stats don't
 /// outlive its connection.
-pub fn unpublish_conditions(registry: &ConditionsRegistry, key: &SessionKey, slot: SlotId) {
+pub fn unpublish_conditions(
+    registry: &ConditionsRegistry,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: Option<u64>,
+) -> bool {
     let mut roster = registry.lock();
     if let Some(slots) = roster.get_mut(key) {
+        if !slots
+            .get(&slot)
+            .is_some_and(|current| current.connection_epoch == connection_epoch)
+        {
+            return false;
+        }
         slots.remove(&slot);
         if slots.is_empty() {
             roster.remove(key);
         }
+        return true;
     }
+    // Nothing is published for the slot, so this teardown has no registry
+    // state to clobber. Treat the idempotent removal as successful; a live
+    // replacement would have activated its epoch-bearing first sample above.
+    true
 }
 
 /// Snapshots all slot conditions published for `key`, as the [`LinkConditions`]
@@ -408,6 +562,8 @@ pub fn snapshot_conditions(
 pub struct MeshState {
     /// Channels to peer-relay mesh-link tasks, keyed by session.
     pub links: MeshLinks,
+    /// Current process-local physical-link generation per peer relay.
+    pub(crate) current_links: CurrentMeshLinks,
     /// Session-level duplicate gate across client and mesh ingress instances.
     pub seen: SeenRegistries,
     /// Per-slot link conditions the mesh attaches to outgoing datagrams.
@@ -502,6 +658,7 @@ pub fn new_mesh_state_with_timings(
 ) -> MeshState {
     MeshState {
         links: new_mesh_links(),
+        current_links: Arc::new(Mutex::new(HashMap::new())),
         seen: new_seen_registries(),
         conditions: new_conditions_registry(),
         decision_makers: Arc::new(crate::consensus::new_decision_makers()),
@@ -700,6 +857,9 @@ pub enum MeshLinkExit {
     /// The command channel closed (the relay is tearing the link down — its
     /// `MeshCommand` sender was dropped). An intentional shutdown.
     CommandChannelClosed,
+    /// A newer physical connection to the same peer claimed local provenance.
+    /// Intentional: the old supervisor must not redial and compete with it.
+    Superseded,
 }
 
 /// Registers one peer-relay link's `(forward, control)` senders and its
@@ -1051,6 +1211,7 @@ fn reconcile_ack_cursors(
 /// Announces a departed slot to every peer relay serving `key`: the home relay
 /// tells its peers one of its clients left, so the session's authority can author
 /// the synced leave and every relay records the departure for handoff robustness.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fan_out_slot_departed(
     links: &MeshLinks,
     key: &SessionKey,
@@ -1059,6 +1220,7 @@ pub(crate) fn fan_out_slot_departed(
     reachable_frame: Option<u32>,
     result: Option<ResultEcho>,
     reason: u32,
+    connection_epoch: Option<u64>,
 ) {
     fan_out_control(
         links,
@@ -1070,6 +1232,7 @@ pub(crate) fn fan_out_slot_departed(
             reachable_frame,
             result,
             reason,
+            connection_epoch,
         ),
     );
 }
@@ -1140,11 +1303,12 @@ pub(crate) fn fan_out_slot_connectivity(
     key: &SessionKey,
     slot: SlotId,
     connected: bool,
+    connection_epoch: Option<u64>,
 ) {
     fan_out_control(
         links,
         key,
-        slot_connectivity_frame(key.session, slot, connected),
+        slot_connectivity_frame(key.session, slot, connected, connection_epoch),
     );
 }
 
@@ -1202,13 +1366,19 @@ fn session_start_frame(session: SessionId, initial_buffer_turns: Option<u32>) ->
 }
 
 /// Builds a `SlotConnectivity` mesh control frame for `session`.
-fn slot_connectivity_frame(session: SessionId, slot: SlotId, connected: bool) -> MeshControlFrame {
+fn slot_connectivity_frame(
+    session: SessionId,
+    slot: SlotId,
+    connected: bool,
+    connection_epoch: Option<u64>,
+) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SlotConnectivity(
             SlotConnectivity {
                 slot: u32::from(slot.0),
                 connected,
+                connection_epoch,
             },
         )),
     }
@@ -1260,6 +1430,7 @@ fn slot_departed_frame(
     reachable_frame: Option<u32>,
     result: Option<ResultEcho>,
     reason: u32,
+    connection_epoch: Option<u64>,
 ) -> MeshControlFrame {
     let (result_payload, result_arrival_ms, result_session_frame, result_slot_frame) = match result
     {
@@ -1282,6 +1453,7 @@ fn slot_departed_frame(
             result_arrival_ms,
             result_session_frame,
             result_slot_frame,
+            connection_epoch,
         })),
     }
 }
@@ -1504,6 +1676,11 @@ pub enum MeshCommand {
     /// an absent session is a no-op.
     Leave(SessionKey),
 }
+
+/// An established physical link surfaced to the descriptor-driven Join source:
+/// peer id, process-local generation, and its command sender.
+pub type MeshLinkHandle = (RelayId, u64, mpsc::UnboundedSender<MeshCommand>);
+
 /// The mesh control stream's I/O for one established link, handed to the link
 /// driver: the send half this relay writes its outbound `MeshControlFrame`s on,
 /// and the channel the peer's frames arrive over (fed by a
@@ -1515,6 +1692,19 @@ pub struct MeshControlIo {
     pub tx: rally_point_transport::quinn::SendStream,
     /// The peer's control frames, assembled off its recv half by a reader task.
     pub rx: mpsc::Receiver<MeshControlFrame>,
+}
+
+/// All side-channel I/O and process-local provenance for one physical mesh
+/// link. Keeping these together makes it hard to start a driver without the
+/// generation fence that authorizes its ingress.
+pub struct MeshLinkIo {
+    /// The peer presence stream.
+    pub presence: crate::presence::PresenceIo,
+    /// The peer mesh-control stream.
+    pub control: MeshControlIo,
+    /// The process-local per-peer provenance lease won after this link's
+    /// handshake.
+    pub lease: MeshLinkLease,
 }
 
 /// Whether `frame` is a resume-cursor ask, and if so, the local-origin turns
@@ -1784,13 +1974,20 @@ fn defer_flush_after_send(
 /// the first. This is fail-closed, not fail-open.
 pub async fn run_mesh_link(
     mut link: rally_point_transport::MeshLink,
-    presence_io: crate::presence::PresenceIo,
-    mesh_control_io: MeshControlIo,
+    link_io: MeshLinkIo,
     mut commands: mpsc::UnboundedReceiver<MeshCommand>,
     sessions: routing::Sessions,
     mesh: MeshState,
     idle_timeout: std::time::Duration,
 ) -> MeshLinkExit {
+    let MeshLinkIo {
+        presence: presence_io,
+        control: mesh_control_io,
+        lease,
+    } = link_io;
+    if !lease.is_current() {
+        return MeshLinkExit::Superseded;
+    }
     // Cloned (cheap — every field is an `Arc`) before the destructure below
     // pulls `mesh` apart, so `dispatch_mesh_control` can take the whole bundle
     // as one argument rather than a growing list of its individual registries
@@ -1901,6 +2098,9 @@ pub async fn run_mesh_link(
     // dropped connection (ConnectionFailed). Non-exit paths `continue` the
     // loop; the value a `break` carries becomes the function's return.
     let exit = loop {
+        if !lease.is_current() {
+            break MeshLinkExit::Superseded;
+        }
         // The idle-teardown deadline. Only armed once the link has served at
         // least one session and is now empty (`idle_since` is Some); otherwise
         // the fallback (a day out) keeps the branch dormant. Cancel-safe like
@@ -1910,60 +2110,66 @@ pub async fn run_mesh_link(
             .unwrap_or(tokio::time::Instant::now() + std::time::Duration::from_secs(86_400));
 
         tokio::select! {
+            biased;
+            _ = lease.superseded.notified() => {
+                break MeshLinkExit::Superseded;
+            }
             received = link.recv() => {
                 match received {
                     Ok(mesh_received) => {
-                        let Some(state) = joined.get(&mesh_received.session) else {
-                            tracing::warn!(
-                                session = mesh_received.session.0,
-                                "mesh datagram for unjoined session; dropping",
-                            );
-                            continue;
-                        };
-                        let key = state.key.clone();
-                        // Feed the peer relay's home-client conditions into this
-                        // session's decision-maker. The mesh hop is a property of
-                        // the relay-pair, sampled from this link's QUIC RTT, so a
-                        // remote slot's effective path includes the trip across
-                        // the backbone.
-                        if let Some(peer_conditions) = &mesh_received.conditions {
-                            tracing::trace!(
-                                tenant = key.tenant.as_ref(),
-                                session = key.session.0,
-                                slots = peer_conditions.slots.len(),
-                                "received peer-relay link conditions",
-                            );
-                            let mesh_rtt_us = mesh_rtt.get_or_refresh(
-                                link.connection(),
-                                tokio::time::Instant::now(),
-                            );
-                            // Any decision it fires is logged by the helper and
-                            // broadcast later, at fan-out.
-                            let _ = crate::consensus::ingest_remote_conditions(
-                                &decision_makers,
-                                &key,
-                                peer_conditions,
-                                mesh_rtt_us,
-                            );
-                        }
-                        for payload in mesh_received.delivery.fresh {
-                            let slot = SlotId(payload.slot as u8);
-                            // NOTE: no frame-observation or desync-comparator
-                            // call here. Duplicate delivery can still occur
-                            // across a link replacement, resume replay, or slot
-                            // re-home, so consensus remains downstream of the
-                            // session-level dedup in `deliver_mesh_turn`.
-                            deliver_mesh_turn(
-                                &sessions,
-                                &seen_registries,
-                                &decision_makers,
-                                &mesh_for_dispatch.turn_ring,
-                                &key,
-                                slot,
-                                payload,
-                                peer_id,
-                            );
-                        }
+                        let _ = lease.with_current(|| {
+                                let Some(state) = joined.get(&mesh_received.session) else {
+                                    tracing::warn!(
+                                        session = mesh_received.session.0,
+                                        "mesh datagram for unjoined session; dropping",
+                                    );
+                                    return;
+                                };
+                                let key = state.key.clone();
+                                // Feed the peer relay's home-client conditions into this
+                                // session's decision-maker. The mesh hop is a property of
+                                // the relay-pair, sampled from this link's QUIC RTT, so a
+                                // remote slot's effective path includes the trip across
+                                // the backbone.
+                                if let Some(peer_conditions) = &mesh_received.conditions {
+                                    tracing::trace!(
+                                        tenant = key.tenant.as_ref(),
+                                        session = key.session.0,
+                                        slots = peer_conditions.slots.len(),
+                                        "received peer-relay link conditions",
+                                    );
+                                    let mesh_rtt_us = mesh_rtt.get_or_refresh(
+                                        link.connection(),
+                                        tokio::time::Instant::now(),
+                                    );
+                                    // Any decision it fires is logged by the helper and
+                                    // broadcast later, at fan-out.
+                                    let _ = crate::consensus::ingest_remote_conditions(
+                                        &decision_makers,
+                                        &key,
+                                        peer_conditions,
+                                        mesh_rtt_us,
+                                    );
+                                }
+                                for payload in mesh_received.delivery.fresh {
+                                    let slot = SlotId(payload.slot as u8);
+                                    // NOTE: no frame-observation or desync-comparator
+                                    // call here. Duplicate delivery can still occur
+                                    // across a link replacement, resume replay, or slot
+                                    // re-home, so consensus remains downstream of the
+                                    // session-level dedup in `deliver_mesh_turn`.
+                                    deliver_mesh_turn(
+                                        &sessions,
+                                        &seen_registries,
+                                        &decision_makers,
+                                        &mesh_for_dispatch.turn_ring,
+                                        &key,
+                                        slot,
+                                        payload,
+                                        peer_id,
+                                    );
+                                }
+                            });
                         continue;
                     }
                     Err(rally_point_transport::MeshLinkError::UnknownSession(session)) => {
@@ -1992,21 +2198,25 @@ pub async fn run_mesh_link(
                         // suspend the whole loop here indefinitely while the
                         // unbounded forward channel keeps growing. See
                         // `MESH_STREAM_WRITE_TIMEOUT`.
-                        match tokio::time::timeout(
-                            MESH_STREAM_WRITE_TIMEOUT,
-                            rally_point_transport::mesh_control_stream::send_mesh_control_frame(
-                                &mut control_send,
-                                &frame,
+                        match await_while_current(
+                            &lease,
+                            tokio::time::timeout(
+                                MESH_STREAM_WRITE_TIMEOUT,
+                                rally_point_transport::mesh_control_stream::send_mesh_control_frame(
+                                    &mut control_send,
+                                    &frame,
+                                ),
                             ),
                         )
                         .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
+                            LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                            LeaseAwait::Completed(Ok(Ok(()))) => {}
+                            LeaseAwait::Completed(Ok(Err(error))) => {
                                 tracing::info!(%error, "mesh control send failed; closing link");
                                 break MeshLinkExit::ConnectionFailed;
                             }
-                            Err(_) => {
+                            LeaseAwait::Completed(Err(_)) => {
                                 tracing::warn!("mesh control send stalled; closing link");
                                 break MeshLinkExit::ConnectionFailed;
                             }
@@ -2023,6 +2233,9 @@ pub async fn run_mesh_link(
             received = peer_control_rx.recv() => {
                 match received {
                     Some(frame) => {
+                        if !lease.is_current() {
+                            continue;
+                        }
                         // A resume-cursor ask answers with turns THIS relay
                         // originated, sent straight out this link — computed
                         // and sent before the ordinary dispatch below, which
@@ -2037,16 +2250,23 @@ pub async fn run_mesh_link(
                         if let Some((key, payloads)) =
                             resume_replay_for_frame(&frame, &joined, &mesh_for_dispatch)
                         {
-                            let Some(carried_redundancy) = send_resume_replay(
-                                &mut link,
-                                &mut control_send,
-                                &conditions,
-                                &key,
-                                payloads,
+                            let carried_redundancy = match await_while_current(
+                                &lease,
+                                send_resume_replay(
+                                    &mut link,
+                                    &mut control_send,
+                                    &conditions,
+                                    &key,
+                                    payloads,
+                                ),
                             )
                             .await
-                            else {
-                                break MeshLinkExit::ConnectionFailed;
+                            {
+                                LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                                LeaseAwait::Completed(Some(carried)) => carried,
+                                LeaseAwait::Completed(None) => {
+                                    break MeshLinkExit::ConnectionFailed;
+                                }
                             };
                             if let Some(state) = joined.get_mut(&key.session) {
                                 defer_flush_after_send(
@@ -2059,15 +2279,17 @@ pub async fn run_mesh_link(
                         // An oversize turn's transport-dedup fold also needs
                         // direct link access, so it too runs here. A copy the
                         // link has already delivered stops before dispatch.
-                        if fold_oversize_into_link(&mut link, &frame, &joined) {
-                            dispatch_mesh_control(
-                                frame,
-                                peer_id,
-                                &joined,
-                                &sessions,
-                                &mesh_for_dispatch,
-                            );
-                        }
+                        let _ = lease.with_current(|| {
+                                if fold_oversize_into_link(&mut link, &frame, &joined) {
+                                    dispatch_mesh_control(
+                                        frame,
+                                        peer_id,
+                                        &joined,
+                                        &sessions,
+                                        &mesh_for_dispatch,
+                                    );
+                                }
+                            });
                     }
                     // The reader task ended: a one-sided stream reset, an
                     // over-cap frame, a decode failure, or a clean EOF. This
@@ -2094,17 +2316,24 @@ pub async fn run_mesh_link(
                         };
                         let key = state.key.clone();
                         let outgoing = snapshot_conditions(&conditions, &key);
-                        let Some(carried_redundancy) = send_turn_over_link(
-                            &mut link,
-                            &mut control_send,
-                            &key,
-                            payload,
-                            outgoing,
-                            "forward",
+                        let carried_redundancy = match await_while_current(
+                            &lease,
+                            send_turn_over_link(
+                                &mut link,
+                                &mut control_send,
+                                &key,
+                                payload,
+                                outgoing,
+                                "forward",
+                            ),
                         )
                         .await
-                        else {
-                            break MeshLinkExit::ConnectionFailed;
+                        {
+                            LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                            LeaseAwait::Completed(Some(carried)) => carried,
+                            LeaseAwait::Completed(None) => {
+                                break MeshLinkExit::ConnectionFailed;
+                            }
                         };
                         if let Some(state) = joined.get_mut(&session_id) {
                             defer_flush_after_send(
@@ -2199,18 +2428,22 @@ pub async fn run_mesh_link(
                 // presence stream is written inline here too, so a peer that
                 // stops reading it could suspend the whole loop. See
                 // `MESH_STREAM_WRITE_TIMEOUT`.
-                match tokio::time::timeout(
-                    MESH_STREAM_WRITE_TIMEOUT,
-                    push_presence_updates(
-                        &mut presence_tx,
-                        &mut presence_sent,
-                        &presence_updates,
+                match await_while_current(
+                    &lease,
+                    tokio::time::timeout(
+                        MESH_STREAM_WRITE_TIMEOUT,
+                        push_presence_updates(
+                            &mut presence_tx,
+                            &mut presence_sent,
+                            &presence_updates,
+                        ),
                     ),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => {
+                    LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                    LeaseAwait::Completed(Ok(Ok(()))) => {}
+                    LeaseAwait::Completed(Ok(Err(_)) | Err(_)) => {
                         tracing::info!("mesh presence push failed or stalled; closing link");
                         break MeshLinkExit::ConnectionFailed;
                     }
@@ -2222,21 +2455,25 @@ pub async fn run_mesh_link(
                 // revisiting each through the select loop. Deadline-bound like all
                 // other inline stream writes: a wedged peer resets the link rather
                 // than suspending every joined session.
-                match tokio::time::timeout(
-                    MESH_STREAM_WRITE_TIMEOUT,
-                    rally_point_transport::mesh_control_stream::send_mesh_control_frames(
-                        &mut control_send,
-                        &ack_cursor_frames,
+                match await_while_current(
+                    &lease,
+                    tokio::time::timeout(
+                        MESH_STREAM_WRITE_TIMEOUT,
+                        rally_point_transport::mesh_control_stream::send_mesh_control_frames(
+                            &mut control_send,
+                            &ack_cursor_frames,
+                        ),
                     ),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
+                    LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                    LeaseAwait::Completed(Ok(Ok(()))) => {}
+                    LeaseAwait::Completed(Ok(Err(error))) => {
                         tracing::info!(%error, "mesh ack-cursor batch send failed; closing link");
                         break MeshLinkExit::ConnectionFailed;
                     }
-                    Err(_) => {
+                    LeaseAwait::Completed(Err(_)) => {
                         tracing::warn!("mesh ack-cursor batch send stalled; closing link");
                         break MeshLinkExit::ConnectionFailed;
                     }
@@ -2257,11 +2494,12 @@ pub async fn run_mesh_link(
             received = presence_rx.recv() => {
                 match received {
                     Some(report) => {
+                        let _ = lease.with_current(|| {
                         // Tenant-scope the bare wire session id through the
                         // joined map, like a datagram; a report for an
                         // unjoined session has no key to record under.
                         let Some(state) = joined.get(&report.session) else {
-                            continue;
+                            return;
                         };
                         if crate::presence::record_peer(
                             &presence,
@@ -2301,6 +2539,7 @@ pub async fn run_mesh_link(
                             // cancelling it.
                             routing::reconcile_abandon(&sessions, &mesh_for_dispatch, &state.key);
                         }
+                        });
                     }
                     // The reader task ended: the peer's presence stream reset
                     // or closed while the connection lives on. Presence is the
@@ -2333,6 +2572,7 @@ pub async fn run_mesh_link(
             command = commands.recv() => {
                 match command {
                     Some(MeshCommand::Join(key)) => {
+                        let joined_presence = lease.with_current(|| {
                         let session_id = key.session;
                         if let Some(existing) = joined.get(&session_id)
                             && existing.key.tenant != key.tenant
@@ -2343,11 +2583,11 @@ pub async fn run_mesh_link(
                                 new_tenant = key.tenant.as_ref(),
                                 "session id collision across tenants; refusing second tenant",
                             );
-                            continue;
+                            return None;
                         }
                         // Already joined (same tenant): a re-announce is harmless.
                         if joined.contains_key(&session_id) {
-                            continue;
+                            return None;
                         }
                         let first_session = joined.is_empty();
                         let live_players = local_live_players(&sessions, &key);
@@ -2372,6 +2612,16 @@ pub async fn run_mesh_link(
                             forward_tx.clone(),
                             control_forward_tx.clone(),
                             Arc::clone(&shutdown),
+                        );
+                        // A redial starts with no knowledge of which physical
+                        // client generation each slot currently represents.
+                        // Replay level=true with the active epochs. Datagrams
+                        // may overtake this stream enqueue; the peer ignores an
+                        // unknown epoch sidecar until this barrier arrives.
+                        reconcile_connection_epochs_on_join(
+                            &conditions,
+                            &control_forward_tx,
+                            &key,
                         );
                         // Re-send this relay's known leave state for the session
                         // down the fresh registration, so a link that died and
@@ -2403,24 +2653,36 @@ pub async fn run_mesh_link(
                                 .reset(maintenance.deadline().expect("armed maintenance timer"));
                         }
                         idle_since = None;
+                        Some((session_id, live_players))
+                        });
+                        let Some(joined_presence) = joined_presence else {
+                            break MeshLinkExit::Superseded;
+                        };
+                        let Some((session_id, live_players)) = joined_presence else {
+                            continue;
+                        };
                         // Announce this session's presence right away rather
                         // than waiting a flush tick: a fresh join (or a
                         // rejoin on a redialed link, whose `presence_sent`
                         // starts empty) is exactly when the peer knows
                         // nothing yet. Deadline-bounded like every inline
                         // stream write here — see `MESH_STREAM_WRITE_TIMEOUT`.
-                        match tokio::time::timeout(
-                            MESH_STREAM_WRITE_TIMEOUT,
-                            push_presence_updates(
-                                &mut presence_tx,
-                                &mut presence_sent,
-                                &[(session_id, live_players)],
+                        match await_while_current(
+                            &lease,
+                            tokio::time::timeout(
+                                MESH_STREAM_WRITE_TIMEOUT,
+                                push_presence_updates(
+                                    &mut presence_tx,
+                                    &mut presence_sent,
+                                    &[(session_id, live_players)],
+                                ),
                             ),
                         )
                         .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) | Err(_) => {
+                            LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                            LeaseAwait::Completed(Ok(Ok(()))) => {}
+                            LeaseAwait::Completed(Ok(Err(_)) | Err(_)) => {
                                 tracing::info!(
                                     "mesh presence push failed or stalled; closing link"
                                 );
@@ -2430,6 +2692,7 @@ pub async fn run_mesh_link(
                         continue;
                     }
                     Some(MeshCommand::Leave(key)) => {
+                        let leave_current = lease.with_current(|| {
                         let session_id = key.session;
                         // Match the full SessionKey, not just the wire's bare
                         // session id. A colliding cross-tenant Join (same id,
@@ -2452,6 +2715,10 @@ pub async fn run_mesh_link(
                                 idle_since = Some(tokio::time::Instant::now());
                             }
                         }
+                        });
+                        if leave_current.is_none() {
+                            break MeshLinkExit::Superseded;
+                        }
                         continue;
                     }
                     // The command channel closed: the sender (the relay's
@@ -2461,6 +2728,15 @@ pub async fn run_mesh_link(
                 }
             }
         }
+    };
+
+    // A replacement can claim provenance in the same scheduler turn as an old
+    // connection error. Normalize that coincidence to Superseded so the old
+    // dial supervisor cannot redial and compete with the working replacement.
+    let exit = if lease.is_current() {
+        exit
+    } else {
+        MeshLinkExit::Superseded
     };
 
     // No explicit teardown here: each joined session's `SessionState` deregisters
@@ -2568,7 +2844,26 @@ fn dispatch_mesh_control(
                 session_frame: departed.result_session_frame,
                 slot_frame: departed.result_slot_frame,
             });
-            crate::consensus::record_departure(
+            let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
+                mesh.drop_holds.record_and_maybe_hold(&key, slot, || {
+                    let outcome = crate::consensus::record_departure_for_epoch_outcome(
+                        &mesh.decision_makers,
+                        &key,
+                        slot,
+                        departed
+                            .last_frame
+                            .map(rally_point_proto::ids::GameFrameCount),
+                        departed.reachable_frame,
+                        result,
+                        departed.reason,
+                        departed.connection_epoch,
+                    );
+                    (
+                        outcome,
+                        outcome == crate::consensus::DepartureRecordOutcome::Pending,
+                    )
+                })
+            } else if crate::consensus::record_departure_for_epoch(
                 &mesh.decision_makers,
                 &key,
                 slot,
@@ -2578,7 +2873,15 @@ fn dispatch_mesh_control(
                 departed.reachable_frame,
                 result,
                 departed.reason,
-            );
+                departed.connection_epoch,
+            ) {
+                crate::consensus::DepartureRecordOutcome::Pending
+            } else {
+                crate::consensus::DepartureRecordOutcome::Rejected
+            };
+            if outcome != crate::consensus::DepartureRecordOutcome::Pending {
+                return;
+            }
             // Turn the departure into the one synced leave — marking a *drop* as an
             // undecided hold (decided later only by an honored `RequestDrop`, or
             // never) and deciding a *clean* leave at once (which also releases any
@@ -2621,6 +2924,17 @@ fn dispatch_mesh_control(
             if !crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave) {
                 return;
             }
+            // A peer authority's final leave also resolves any older local drop
+            // hold for this subject. Keeping it would not permit resurrection --
+            // atomic admission rejects the decided leave -- but it would let the
+            // cheap handshake precheck report an avoidable provisional success.
+            let _ = mesh.drop_holds.release(&key, slot);
+            // A final leave can outrun the matching SlotDeparted on another
+            // peer link after this relay already admitted a replacement. The
+            // subject intentionally does not receive its own LeaveDirective,
+            // so explicitly stop any locally-homed link for it; survivors still
+            // receive the directive below and apply the coordinated leave.
+            routing::close_slots(sessions, &key, &[slot]);
             routing::fan_out_leave(sessions, &key, slot, leave);
             // A peer authority deciding a slot this relay homes may have been
             // the last undecided departure deferring this relay's
@@ -2731,7 +3045,6 @@ fn dispatch_mesh_control(
             // local slots so their connectivity displays reflect it. Deliberately
             // NOT re-broadcast across the mesh: the origin already sent a copy to
             // every peer, so re-flooding would only echo (mirroring chat above).
-            routing::fan_out_connectivity(sessions, &key, slot, change.connected);
             // A `connected` of true is a slot coming *back* — a client that
             // re-registered on the origin relay while its drop was still undecided.
             // This relay marked its own hold on the slot's earlier `SlotDeparted`, so
@@ -2740,22 +3053,37 @@ fn dispatch_mesh_control(
             // honored. A no-op when no hold is pending — a fresh connect, or a slot
             // this relay never held.
             //
-            // Claims and reinstates atomically (`take_if_pending`), mirroring the
-            // home relay's own re-register (`server.rs`), rather than the separate
-            // release-then-reinstate this used to be: this relay may itself be the
-            // session's authority, in which case a concurrent `RequestDrop` (or the
-            // abandoned-session force-decide) for the same slot races this exactly
-            // the way it races a re-register, and the hold's removal must be the
-            // one linearization point both sides claim against so only one of them
-            // ever acts. The claim's own success/failure needs no further handling
-            // here — this relay isn't making an admission decision, only mirroring
-            // the origin's; `reinstate_slot`'s effect (or lack of one, if a
-            // concurrent decide already won) is what matters.
+            // Hold claim, state restoration, and epoch activation are one
+            // Holds→Maker transition, mirroring the home relay's own re-register
+            // (`server.rs`). A failed admission is terminal for this frame: the
+            // hold may already have been decided, or a final leave may have
+            // arrived first, and fanning out true would resurrect that slot.
             if change.connected {
-                let _ = mesh.drop_holds.take_if_pending(&key, slot, || {
-                    crate::consensus::reinstate_slot(&mesh.decision_makers, &key, slot)
-                });
+                if crate::consensus::admit_reconnect(
+                    &mesh.decision_makers,
+                    &mesh.drop_holds,
+                    &key,
+                    slot,
+                    change.connection_epoch,
+                ) == crate::consensus::ReconnectAdmission::Rejected
+                {
+                    return;
+                }
+            } else if !crate::consensus::mark_connection_down(
+                &mesh.decision_makers,
+                &key,
+                slot,
+                change.connection_epoch,
+            ) {
+                return;
             }
+            routing::fan_out_connectivity(
+                sessions,
+                &key,
+                slot,
+                change.connected,
+                change.connection_epoch,
+            );
         }
         Some(mesh_control_frame::Kind::RequestDrop(request)) => {
             let Ok(target) = u8::try_from(request.slot).map(SlotId) else {
@@ -2857,7 +3185,7 @@ fn reconcile_leaves_on_join(
     let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
     // Unbounded send only fails on a closed channel; the driver we are
     // registering into is alive here, so these always enqueue.
-    for (slot, last_frame, reachable_frame, result, reason) in departures {
+    for (slot, last_frame, reachable_frame, result, reason, connection_epoch) in departures {
         let _ = control_tx.send(slot_departed_frame(
             key.session,
             slot,
@@ -2865,6 +3193,7 @@ fn reconcile_leaves_on_join(
             reachable_frame,
             result,
             reason,
+            connection_epoch,
         ));
     }
     for leave in directives {
@@ -2881,6 +3210,34 @@ fn reconcile_leaves_on_join(
         let initial_buffer_turns =
             crate::consensus::session_initial_buffer_turns(decision_makers, key);
         let _ = control_tx.send(session_start_frame(key.session, initial_buffer_turns));
+    }
+}
+
+/// Replays active home-client connection generations to a fresh mesh link.
+/// The registry lock remains held through synchronous channel enqueue so every
+/// publish/unpublish linearizes wholly before or after this snapshot. This does
+/// not claim cross-stream/datagram network priority; peers simply ignore an
+/// epoch-bearing sidecar until its reliable level=true frame arrives.
+fn reconcile_connection_epochs_on_join(
+    conditions: &ConditionsRegistry,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    let roster = conditions.lock();
+    let mut epochs: Vec<(SlotId, u64)> = roster
+        .get(key)
+        .into_iter()
+        .flat_map(|slots| slots.iter())
+        .filter_map(|(&slot, conditions)| conditions.connection_epoch.map(|epoch| (slot, epoch)))
+        .collect();
+    epochs.sort_by_key(|(slot, _)| *slot);
+    for (slot, epoch) in epochs {
+        let _ = control_tx.send(slot_connectivity_frame(
+            key.session,
+            slot,
+            true,
+            Some(epoch),
+        ));
     }
 }
 
@@ -3082,6 +3439,161 @@ pub struct SessionIdCollision {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn newer_mesh_link_generation_invalidates_and_tombstones_the_old_one() {
+        let mesh = new_mesh_state();
+        let peer = RelayId(9);
+        let old = new_mesh_link_attempt();
+        let replacement = new_mesh_link_attempt();
+
+        let old_lease = claim_mesh_link(&mesh, peer, &old).expect("old link claims first");
+        let replacement_lease =
+            claim_mesh_link(&mesh, peer, &replacement).expect("replacement claims next");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            old.superseded.notified(),
+        )
+        .await
+        .expect("replacement wakes the old generation");
+
+        let mut stale_dispatched = false;
+        assert!(
+            old_lease
+                .with_current(|| {
+                    stale_dispatched = true;
+                })
+                .is_none()
+        );
+        assert!(!stale_dispatched);
+        assert!(claim_mesh_link(&mesh, peer, &old).is_none());
+        assert!(replacement_lease.is_current());
+    }
+
+    #[test]
+    fn old_mesh_driver_cannot_dispatch_e1_after_e2_is_current() {
+        let sessions: routing::Sessions = Arc::default();
+        let links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        assert!(crate::consensus::activate_connection_epoch(
+            &makers,
+            &key,
+            SlotId(0),
+            22,
+        ));
+        let mesh = test_mesh_state(&links, &seen, &makers, &lobby, &chat);
+        let peer = RelayId(9);
+        let old = new_mesh_link_attempt();
+        let current = new_mesh_link_attempt();
+        let old_lease = claim_mesh_link(&mesh, peer, &old).expect("old link claims first");
+        let _current_lease =
+            claim_mesh_link(&mesh, peer, &current).expect("current link replaces old");
+
+        let (mut guard, mut inbox) =
+            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+        guard.disarm();
+        let joined = joined_state(&links, &key);
+        let stale_e1 = slot_connectivity_frame(key.session, SlotId(0), true, Some(11));
+        assert!(
+            old_lease
+                .with_current(|| {
+                    dispatch_mesh_control(stale_e1, peer, &joined, &sessions, &mesh);
+                })
+                .is_none()
+        );
+
+        assert_eq!(inbox.try_recv_connectivity(), None);
+        assert!(crate::consensus::connection_epoch_matches(
+            &makers,
+            &key,
+            SlotId(0),
+            Some(22),
+        ));
+    }
+
+    #[test]
+    fn mesh_link_claims_for_different_peers_do_not_share_the_dispatch_lock() {
+        let mesh = new_mesh_state();
+        let first = new_mesh_link_attempt();
+        assert!(claim_mesh_link(&mesh, RelayId(1), &first).is_some());
+        let first_state = mesh.current_links.lock()[&RelayId(1)].clone();
+        let _first_dispatch = first_state.lock();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other_mesh = mesh.clone();
+        std::thread::spawn(move || {
+            let other = new_mesh_link_attempt();
+            done_tx
+                .send(claim_mesh_link(&other_mesh, RelayId(2), &other).is_some())
+                .unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(true),
+            "peer 2 claim must not wait for peer 1's in-flight dispatch",
+        );
+    }
+
+    #[test]
+    fn queued_join_on_a_superseded_lease_cannot_register_the_session() {
+        let mesh = new_mesh_state();
+        let peer = RelayId(9);
+        let old = new_mesh_link_attempt();
+        let replacement = new_mesh_link_attempt();
+        let old_lease = claim_mesh_link(&mesh, peer, &old).expect("old link claims first");
+        let _replacement_lease =
+            claim_mesh_link(&mesh, peer, &replacement).expect("replacement wins");
+
+        let key = control_key();
+        let links = new_mesh_links();
+        let (forward_tx, _forward_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let shutdown = Arc::new(Notify::new());
+        let mut mutation_ran = false;
+        assert!(
+            old_lease
+                .with_current(|| {
+                    mutation_ran = true;
+                    let _registration =
+                        register_mesh_link(&links, key.clone(), forward_tx, control_tx, shutdown);
+                })
+                .is_none(),
+            "the queued command loses provenance before any shared mutation"
+        );
+        assert!(!mutation_ran);
+        assert!(links.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn supersession_cancels_an_inline_driver_wait_promptly() {
+        let mesh = new_mesh_state();
+        let peer = RelayId(9);
+        let old = new_mesh_link_attempt();
+        let replacement = new_mesh_link_attempt();
+        let old_lease = claim_mesh_link(&mesh, peer, &old).expect("old link claims first");
+
+        let wait = await_while_current(&old_lease, std::future::pending::<()>());
+        tokio::pin!(wait);
+        assert!(claim_mesh_link(&mesh, peer, &replacement).is_some());
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut wait)
+            .await
+            .expect("supersession wakes the inline wait");
+        assert!(matches!(result, LeaseAwait::Superseded));
+    }
+
     #[test]
     fn marks_first_delivery_new_and_redelivery_duplicate() {
         let mut seen = MeshSeen::new();
@@ -3270,8 +3782,8 @@ mod tests {
         // No local clients yet: no conditions.
         assert!(snapshot_conditions(&registry, &key).is_none());
 
-        // Publish two slots out of order; snapshot sorts them by slot.
-        publish_conditions(
+        // Activate two slots out of order; snapshot sorts them by slot.
+        activate_conditions(
             &registry,
             &key,
             SlotId(1),
@@ -3280,9 +3792,10 @@ mod tests {
                 rtt_us: 45_000,
                 lost_packets: 10,
                 sent_packets: 500,
+                connection_epoch: None,
             },
         );
-        publish_conditions(
+        activate_conditions(
             &registry,
             &key,
             SlotId(0),
@@ -3291,6 +3804,7 @@ mod tests {
                 rtt_us: 12_000,
                 lost_packets: 3,
                 sent_packets: 1000,
+                connection_epoch: None,
             },
         );
 
@@ -3300,15 +3814,49 @@ mod tests {
         assert_eq!(snap.slots[1].slot, 1, "sorted by slot");
 
         // Unpublish one: snapshot now has a single slot.
-        unpublish_conditions(&registry, &key, SlotId(0));
+        unpublish_conditions(&registry, &key, SlotId(0), None);
         let snap = snapshot_conditions(&registry, &key).expect("one slot remains");
         assert_eq!(snap.slots.len(), 1);
         assert_eq!(snap.slots[0].slot, 1);
 
         // Unpublish the last: snapshot is None again, and the session's entry
         // was removed (re-publishing a fresh slot starts clean, not appended).
-        unpublish_conditions(&registry, &key, SlotId(1));
+        unpublish_conditions(&registry, &key, SlotId(1), None);
         assert!(snapshot_conditions(&registry, &key).is_none());
+    }
+
+    #[test]
+    fn old_connection_cannot_publish_over_or_unpublish_its_replacement() {
+        let registry = new_conditions_registry();
+        let key = control_key();
+        let sample = |epoch, rtt_us| SlotConditions {
+            slot: 0,
+            rtt_us,
+            lost_packets: 0,
+            sent_packets: 1,
+            connection_epoch: Some(epoch),
+        };
+
+        activate_conditions(&registry, &key, SlotId(0), sample(11, 70_000));
+        activate_conditions(&registry, &key, SlotId(0), sample(22, 30_000));
+
+        assert!(!publish_conditions(
+            &registry,
+            &key,
+            SlotId(0),
+            sample(11, 900_000),
+        ));
+        assert!(!unpublish_conditions(&registry, &key, SlotId(0), Some(11),));
+        let current = snapshot_conditions(&registry, &key).expect("replacement stays published");
+        assert_eq!(current.slots[0].connection_epoch, Some(22));
+        assert_eq!(current.slots[0].rtt_us, 30_000);
+
+        assert!(unpublish_conditions(&registry, &key, SlotId(0), Some(22),));
+        assert!(snapshot_conditions(&registry, &key).is_none());
+        assert!(
+            !publish_conditions(&registry, &key, SlotId(0), sample(22, 40_000)),
+            "only activation may recreate an unpublished slot",
+        );
     }
 
     #[test]
@@ -3448,6 +3996,7 @@ mod tests {
     ) -> MeshState {
         MeshState {
             links: mesh_links.clone(),
+            current_links: Arc::new(Mutex::new(HashMap::new())),
             seen: seen.clone(),
             conditions: new_conditions_registry(),
             decision_makers: makers.clone(),
@@ -3761,7 +4310,7 @@ mod tests {
         let (_fwd1, mut ctl1) = register_link_channels(&links, &key);
         let (_fwd2, mut ctl2) = register_link_channels(&links, &key);
 
-        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), None, 3);
+        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), None, 3, None);
         for rx in [&mut ctl1, &mut ctl2] {
             let frame = rx.try_recv().expect("every link is told");
             assert_eq!(
@@ -3850,6 +4399,41 @@ mod tests {
             vec![leave],
             "the cached leave re-announced verbatim"
         );
+    }
+
+    #[test]
+    fn reconcile_connection_epochs_on_join_announces_each_active_generation() {
+        let conditions = new_conditions_registry();
+        let key = control_key();
+        for (slot, epoch) in [(SlotId(2), 22), (SlotId(0), 11)] {
+            activate_conditions(
+                &conditions,
+                &key,
+                slot,
+                SlotConditions {
+                    slot: u32::from(slot.0),
+                    rtt_us: 20_000,
+                    lost_packets: 0,
+                    sent_packets: 1,
+                    connection_epoch: Some(epoch),
+                },
+            );
+        }
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        reconcile_connection_epochs_on_join(&conditions, &control_tx, &key);
+
+        let mut announced = Vec::new();
+        while let Ok(frame) = control_rx.try_recv() {
+            match frame.kind {
+                Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
+                    assert!(change.connected);
+                    announced.push((change.slot, change.connection_epoch));
+                }
+                other => panic!("unexpected epoch reconcile frame {other:?}"),
+            }
+        }
+        assert_eq!(announced, vec![(0, Some(11)), (2, Some(22))]);
     }
 
     #[test]
@@ -4510,6 +5094,7 @@ mod tests {
                 SlotConnectivity {
                     slot: 0,
                     connected: false,
+                    connection_epoch: None,
                 },
             )),
         };
@@ -4527,6 +5112,92 @@ mod tests {
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }
 
+    #[test]
+    fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
+        use rally_point_proto::control::BufferBounds;
+
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
+
+        let (mut guard, mut inbox) =
+            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+        guard.disarm();
+        let mut joined = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+
+        let stale_down = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: false,
+                    connection_epoch: Some(11),
+                },
+            )),
+        };
+        dispatch_mesh_control(stale_down, RelayId(9), &joined, &sessions, &mesh_state);
+        assert_eq!(inbox.try_recv_connectivity(), None);
+
+        let stale_departure = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                slot: 0,
+                last_frame: Some(10),
+                reachable_frame: Some(9),
+                reason: 0x4000_0006,
+                result_payload: Vec::new().into(),
+                result_arrival_ms: 0,
+                result_session_frame: None,
+                result_slot_frame: None,
+                connection_epoch: Some(11),
+            })),
+        };
+        dispatch_mesh_control(stale_departure, RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(!crate::consensus::slot_departed(&makers, &key, SlotId(0),));
+        assert!(!mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+
+        let current_down = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: false,
+                    connection_epoch: Some(22),
+                },
+            )),
+        };
+        dispatch_mesh_control(current_down, RelayId(9), &joined, &sessions, &mesh_state);
+        assert_eq!(inbox.try_recv_connectivity(), Some((SlotId(0), false)));
+    }
+
     /// A mesh-received `LeaveDirective` that this relay's own consensus state
     /// accepts (a first insert for the slot) is fanned to local survivors; one
     /// that conflicts with what this relay already cached (a different
@@ -4535,8 +5206,8 @@ mod tests {
     /// Forwarding a rejected directive would hand survivors a decision this
     /// relay's own state just flagged as disagreeing with the one it already
     /// holds.
-    #[test]
-    fn a_leave_directive_dispatch_forwards_only_the_accepted_copy_never_a_rejected_conflict() {
+    #[tokio::test]
+    async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepted_copy() {
         let sessions: routing::Sessions = Arc::default();
         let mesh_links = new_mesh_links();
         let seen = new_seen_registries();
@@ -4564,6 +5235,10 @@ mod tests {
         let (mut guard, mut inbox) =
             routing::register(&sessions, &key, SlotId(5)).expect("slot 5 registers");
         guard.disarm();
+        let (mut subject_guard, mut subject_inbox) =
+            routing::register(&sessions, &key, SlotId(0)).expect("subject slot registers");
+        subject_guard.disarm();
+        let subject_shutdown = subject_inbox.shutdown_handle();
 
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
         joined.insert(
@@ -4590,6 +5265,17 @@ mod tests {
             kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
         };
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            subject_shutdown.notified(),
+        )
+        .await
+        .expect("the final leave closes a locally-live replacement subject");
+        assert_eq!(
+            subject_inbox.try_recv_leave(),
+            None,
+            "the subject closes; only survivors receive its leave directive"
+        );
         assert_eq!(
             inbox.try_recv_leave(),
             Some(first),
@@ -4646,6 +5332,17 @@ mod tests {
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
         let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        crate::consensus::record_departure(&makers, &key, SlotId(0), None, None, None, 0x4000_0006);
 
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
 
@@ -4679,6 +5376,7 @@ mod tests {
                 SlotConnectivity {
                     slot: 0,
                     connected: true,
+                    connection_epoch: None,
                 },
             )),
         };
@@ -4688,6 +5386,207 @@ mod tests {
             !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
             "the it's-back signal released the held drop",
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        assert!(crate::consensus::activate_connection_epoch(
+            &makers,
+            &key,
+            SlotId(0),
+            11,
+        ));
+        assert!(crate::consensus::record_departure_for_epoch(
+            &makers,
+            &key,
+            SlotId(0),
+            None,
+            None,
+            None,
+            0x4000_0006,
+            Some(11),
+        ));
+
+        let (mut guard, mut inbox) =
+            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+        guard.disarm();
+        let joined = joined_state(&mesh_links, &key);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+
+        let connected = |epoch| MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: true,
+                    connection_epoch: Some(epoch),
+                },
+            )),
+        };
+
+        dispatch_mesh_control(connected(11), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+        assert_eq!(inbox.try_recv_connectivity(), None);
+
+        // A decided leave makes reinstate fail even for a distinct epoch. The
+        // failed hold claim must stop both activation and local fan-out.
+        let _ = makers
+            .lock()
+            .get_mut(&key)
+            .expect("maker exists")
+            .force_decide_leave(SlotId(0), 0x4000_0006);
+        dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(!mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+        assert_eq!(inbox.try_recv_connectivity(), None);
+        assert!(!crate::consensus::connection_epoch_matches(
+            &makers,
+            &key,
+            SlotId(0),
+            Some(22),
+        ));
+    }
+
+    #[test]
+    fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
+        for true_before_leave in [false, true] {
+            let sessions: routing::Sessions = Arc::default();
+            let mesh_links = new_mesh_links();
+            let seen = new_seen_registries();
+            let makers = Arc::new(crate::consensus::new_decision_makers());
+            let lobby = crate::lobby::new_lobby_registry();
+            let chat = crate::chat::new_chat_registry();
+            let key = control_key();
+            let _ = crate::consensus::sync_maker(
+                &makers,
+                &key,
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            );
+            assert!(crate::consensus::activate_connection_epoch(
+                &makers,
+                &key,
+                SlotId(0),
+                11,
+            ));
+            let (mut guard, mut inbox) =
+                routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+            guard.disarm();
+            let joined = joined_state(&mesh_links, &key);
+            let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+
+            let connected = |epoch| MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                    SlotConnectivity {
+                        slot: 0,
+                        connected: true,
+                        connection_epoch: Some(epoch),
+                    },
+                )),
+            };
+            let leave = MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
+                    slot: 0,
+                    reason: crate::consensus::LEAVE_REASON_DROPPED,
+                    apply_at_frame: 41,
+                    leave_seq: 1,
+                })),
+            };
+            let departed = MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                    slot: 0,
+                    last_frame: Some(40),
+                    reachable_frame: None,
+                    reason: crate::consensus::LEAVE_REASON_DROPPED,
+                    result_payload: Vec::new().into(),
+                    result_arrival_ms: 0,
+                    result_session_frame: None,
+                    result_slot_frame: None,
+                    connection_epoch: Some(11),
+                })),
+            };
+
+            if true_before_leave {
+                dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+                assert_eq!(
+                    inbox.try_recv_connectivity(),
+                    Some((SlotId(0), true)),
+                    "a replacement is live before any final leave"
+                );
+            }
+            // Model a local E1 drop hold that the peer's final decision outran.
+            // The final leave must retire it immediately in either ordering.
+            mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+            dispatch_mesh_control(leave, RelayId(8), &joined, &sessions, &mesh_state);
+            assert!(inbox.try_recv_leave().is_some());
+            assert!(
+                !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+                "a final peer leave clears an older local reconnect hold"
+            );
+
+            if !true_before_leave {
+                dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+                assert_eq!(
+                    inbox.try_recv_connectivity(),
+                    None,
+                    "Leave(E1) makes true(E2) terminal"
+                );
+            }
+            dispatch_mesh_control(departed, RelayId(9), &joined, &sessions, &mesh_state);
+            assert!(
+                !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+                "a delayed departed frame may merge terminal metadata but cannot recreate a hold"
+            );
+            dispatch_mesh_control(connected(33), RelayId(9), &joined, &sessions, &mesh_state);
+            assert_eq!(
+                inbox.try_recv_connectivity(),
+                None,
+                "no true generation fans out after the final leave"
+            );
+
+            let mut guard = makers.lock();
+            let maker = guard.get_mut(&key).expect("maker exists");
+            maker.ingest_remote(
+                &LinkConditions {
+                    slots: vec![SlotConditions {
+                        slot: 0,
+                        rtt_us: 10_000,
+                        lost_packets: 0,
+                        sent_packets: 1,
+                        connection_epoch: Some(33),
+                    }],
+                },
+                5_000,
+            );
+            assert!(
+                !maker.has_slot_state(SlotId(0)),
+                "a sidecar cannot recreate conditions for the finally-left slot"
+            );
+        }
     }
 
     /// Registers a single joined-session state for a mesh dispatch test, resolving

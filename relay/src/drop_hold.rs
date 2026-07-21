@@ -209,6 +209,55 @@ impl DropHolds {
             .or_insert_with(Instant::now);
     }
 
+    /// Runs `record` and installs the corresponding drop hold only when the
+    /// callback's boolean requests it, all before releasing the holds lock. The
+    /// callback may take the decision-maker lock; every combined hold/consensus
+    /// transition follows this same `holds -> decision-maker` order.
+    ///
+    /// This makes a dropped departure linearizable. A reconnect sees either
+    /// neither the departure nor its hold, or both of them; it can never land
+    /// in the former record-then-hold gap and mistake an undecided drop for a
+    /// final leave.
+    pub(crate) fn record_and_maybe_hold<T>(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        record: impl FnOnce() -> (T, bool),
+    ) -> T {
+        let map_key = (key.clone(), slot);
+        let mut holds = self.holds.lock();
+        let (value, install_hold) = record();
+        if install_hold {
+            holds.entry(map_key).or_insert_with(Instant::now);
+        }
+        value
+    }
+
+    /// Resolves one reconnect while holding the drop-hold map stable. The
+    /// callback always runs, even when no hold is currently present, so its
+    /// consensus transition can atomically admit a fresh generation or reject
+    /// a departure that linearized first. It returns `(value, consume_hold)`;
+    /// `consume_hold` removes a present hold before this lock is released.
+    ///
+    /// The callback may take the decision-maker lock. It must not call back
+    /// into this registry, and all combined transitions use the same
+    /// `holds -> decision-maker` lock order.
+    pub(crate) fn resolve_reconnect<T>(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        resolve: impl FnOnce(bool) -> (T, bool),
+    ) -> T {
+        let map_key = (key.clone(), slot);
+        let mut holds = self.holds.lock();
+        let pending = holds.contains_key(&map_key);
+        let (value, consume_hold) = resolve(pending);
+        if pending && consume_hold {
+            holds.remove(&map_key);
+        }
+        value
+    }
+
     /// Releases the hold on `(key, slot)`, if one is pending, and reports whether
     /// it found one to release. Called when a clean-leave intent supersedes a
     /// drop (where the boolean is informational only — a clean leave decides

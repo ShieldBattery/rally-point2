@@ -382,8 +382,8 @@ pub fn verify_challenge(
 }
 
 /// Runs the full authorization handshake on `connection` and returns the
-/// authorized client, the per-slot resume cursors it presented, and the still-open
-/// send stream.
+/// authorized client, the per-slot resume cursors it presented, a connection
+/// epoch, and the still-open send stream.
 ///
 /// The caller writes [`HANDSHAKE_OK`] on the returned stream once it has wired the
 /// client into routing, so a client only learns it's accepted after its slot can
@@ -399,7 +399,15 @@ pub async fn authenticate(
     connection: &quinn::Connection,
     registry: &Registry,
     now_unix_secs: u64,
-) -> Result<(AuthorizedClient, HashMap<SlotId, u64>, quinn::SendStream), AuthError> {
+) -> Result<
+    (
+        AuthorizedClient,
+        HashMap<SlotId, u64>,
+        u64,
+        quinn::SendStream,
+    ),
+    AuthError,
+> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
     let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
@@ -416,6 +424,16 @@ pub async fn authenticate(
         .fill(&mut nonce)
         .map_err(|_| AuthError::Rng)?;
     let challenge = ConnectionChallenge(nonce);
+    // Reuse the challenge's CSPRNG output as this connection's lifecycle epoch.
+    // The epoch is an equality fence, not a secret or an ordering key: its job is
+    // to keep delayed mesh datagrams and teardown from an earlier QUIC connection
+    // from mutating a reconnect's state. `optional fixed64` on the mesh wire makes
+    // zero a valid present epoch, so all 64 random bits remain available.
+    let connection_epoch = u64::from_le_bytes(
+        nonce[..std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("a challenge nonce contains eight epoch bytes"),
+    );
     send.write_all(challenge.as_bytes()).await?;
 
     let mut response = [0u8; SIGNATURE_LEN];
@@ -437,7 +455,7 @@ pub async fn authenticate(
 
     let resume_cursors = read_resume_cursors(&mut recv).await?;
 
-    Ok((authorized, resume_cursors, send))
+    Ok((authorized, resume_cursors, connection_epoch, send))
 }
 
 /// Reads the client's resume-cursor frame off the authenticated handshake stream:

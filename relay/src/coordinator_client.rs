@@ -1875,7 +1875,7 @@ mod tests {
             std::sync::Arc::default(),
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         let applied = AppliedSessions::new();
 
         // First push: session 1 names peer 2 → Join.
@@ -1897,7 +1897,7 @@ mod tests {
             std::sync::Arc::default(),
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         let applied = AppliedSessions::new();
 
         reconcile(&control, &[descriptor(1, &[2])], &applied);
@@ -1916,7 +1916,7 @@ mod tests {
             std::sync::Arc::default(),
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         let applied = AppliedSessions::new();
 
         // Two sessions on the link to peer 2.
@@ -1946,8 +1946,8 @@ mod tests {
         );
         let (d2_tx, mut d2_rx) = mpsc::unbounded_channel();
         let (d3_tx, mut d3_rx) = mpsc::unbounded_channel();
-        delta_control.register_link(RelayId(2), d2_tx);
-        delta_control.register_link(RelayId(3), d3_tx);
+        let _ = delta_control.register_link(RelayId(2), 1, d2_tx);
+        let _ = delta_control.register_link(RelayId(3), 1, d3_tx);
         let delta_applied = AppliedSessions::new();
 
         // Connect-time full set: sessions 1 and 2 both mesh peer 2.
@@ -2177,7 +2177,7 @@ mod tests {
             std::sync::Arc::default(),
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         let applied = AppliedSessions::new();
 
         // A known message joins session 1.
@@ -2232,7 +2232,7 @@ mod tests {
             std::sync::Arc::default(),
         );
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         let applied = AppliedSessions::new();
         apply_message(&control, message, &applied, &ControlConnStats::new());
         assert!(rx2.try_recv().is_err());

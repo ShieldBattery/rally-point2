@@ -739,6 +739,24 @@ mod tests {
         }
     }
 
+    /// The largest conditions sidecar a real game can produce, using the same
+    /// field values as the relay hot-path benchmark. Each slot has a distinct,
+    /// stable physical-connection generation, matching production rather than
+    /// the legacy epoch-less rolling-upgrade shape.
+    fn full_epoch_conditions() -> LinkConditions {
+        LinkConditions {
+            slots: (0..8u32)
+                .map(|slot| rally_point_proto::messages::SlotConditions {
+                    slot,
+                    rtt_us: 25_000 + slot * 7_000,
+                    lost_packets: u64::from(slot) * 3,
+                    sent_packets: 10_024,
+                    connection_epoch: Some(0xC0DE_0000_0000_0000 | u64::from(slot)),
+                })
+                .collect(),
+        }
+    }
+
     /// Two sessions share one `MeshLink`. Both send `(slot=0, seq=0)` — identical
     /// identities. Each session's dedup treats the other's as new (not a
     /// duplicate), and a beacon cursor for one session's slot 0 retires only
@@ -1192,12 +1210,14 @@ mod tests {
                     rtt_us: 12_000,
                     lost_packets: 3,
                     sent_packets: 1000,
+                    connection_epoch: Some(0xC0DE_0000_0000_0000),
                 },
                 rally_point_proto::messages::SlotConditions {
                     slot: 1,
                     rtt_us: 45_000,
                     lost_packets: 10,
                     sent_packets: 500,
+                    connection_epoch: Some(0xC0DE_0000_0000_0001),
                 },
             ],
         };
@@ -1218,10 +1238,12 @@ mod tests {
         assert_eq!(got.slots[0].rtt_us, 12_000);
         assert_eq!(got.slots[0].lost_packets, 3);
         assert_eq!(got.slots[0].sent_packets, 1000);
+        assert_eq!(got.slots[0].connection_epoch, Some(0xC0DE_0000_0000_0000));
         assert_eq!(got.slots[1].slot, 1);
         assert_eq!(got.slots[1].rtt_us, 45_000);
         assert_eq!(got.slots[1].lost_packets, 10);
         assert_eq!(got.slots[1].sent_packets, 500);
+        assert_eq!(got.slots[1].connection_epoch, Some(0xC0DE_0000_0000_0001));
     }
 
     /// An ack-only flush carries no conditions, and the dynamic overhead probe
@@ -1296,16 +1318,7 @@ mod tests {
         // A conditions sidecar with all 8 slots filled — the largest a real
         // game (≤8 players) produces. Small enough that even with redundancy
         // packed alongside it, the datagram fits — which is what we assert.
-        let conditions = LinkConditions {
-            slots: (0..8u32)
-                .map(|slot| rally_point_proto::messages::SlotConditions {
-                    slot,
-                    rtt_us: 20_000,
-                    lost_packets: 5,
-                    sent_packets: 2000,
-                })
-                .collect(),
-        };
+        let conditions = full_epoch_conditions();
 
         // Send with conditions + sustained unacked redundancy (acks withheld).
         // The dynamic probe subtracts the sidecar's exact wire cost, so the
@@ -1350,6 +1363,7 @@ mod tests {
                 rtt_us: 12_000,
                 lost_packets: 3,
                 sent_packets: 1000,
+                connection_epoch: Some(0xC0DE_0000_0000_0000),
             }],
         };
         let body_len = conditions.encoded_len();
@@ -1360,6 +1374,28 @@ mod tests {
             conditions_element_len(&conditions),
             body_len + 2,
             "tag (1) + length-prefix varint (1) + body -- not the body alone",
+        );
+    }
+
+    /// A production P8 sidecar crosses protobuf's 127-byte boundary once its
+    /// eight fixed-width connection epochs are present. Lock in both the body
+    /// and complete embedded-field cost so the live datagram budget keeps
+    /// accounting for the two-byte length varint, not the legacy one-byte path.
+    #[test]
+    fn full_epoch_conditions_account_for_the_two_byte_length_prefix() {
+        let conditions = full_epoch_conditions();
+        let body_len = conditions.encoded_len();
+
+        assert_eq!(body_len, 172, "P8 production conditions wire body");
+        assert_eq!(
+            prost::encoding::encoded_len_varint(body_len as u64),
+            2,
+            "a 172-byte embedded message needs a two-byte length varint",
+        );
+        assert_eq!(
+            conditions_element_len(&conditions),
+            175,
+            "field tag (1) + length varint (2) + body (172)",
         );
     }
 
@@ -1378,16 +1414,7 @@ mod tests {
 
         // A full 8-slot conditions sidecar shrinks the budget but not enough to
         // evict a routine turn.
-        let conditions = LinkConditions {
-            slots: (0..8u32)
-                .map(|slot| rally_point_proto::messages::SlotConditions {
-                    slot,
-                    rtt_us: 20_000,
-                    lost_packets: 5,
-                    sent_packets: 2000,
-                })
-                .collect(),
-        };
+        let conditions = full_epoch_conditions();
         assert!(
             sender
                 .payload_fits(&small, Some(&conditions), None)

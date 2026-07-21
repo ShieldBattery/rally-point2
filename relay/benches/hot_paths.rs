@@ -105,6 +105,11 @@ fn conditions(slots: std::ops::Range<u8>, sent_packets: u64) -> LinkConditions {
                 rtt_us: 25_000 + u32::from(slot) * 7_000,
                 lost_packets: u64::from(slot) * 3,
                 sent_packets,
+                // Production samples always carry the authenticated physical
+                // connection generation. Keep it stable across the baseline
+                // and current samples for one slot so the benchmark measures
+                // steady-state epoch fencing rather than reconnect resets.
+                connection_epoch: Some(0xC0DE_0000_0000_0000 | u64::from(slot)),
             })
             .collect(),
     }
@@ -197,6 +202,7 @@ fn consensus(c: &mut Criterion) {
         rtt_us: 65_000,
         lost_packets: 2,
         sent_packets: 10_000,
+        connection_epoch: Some(0xC0DE_0000_0000_0003),
     };
     allocation_group.bench_function("single_slot", |b| {
         let mut maker = decision_maker(8, Authority::Peer);

@@ -114,6 +114,10 @@ pub struct MeshControl {
 struct Inner {
     /// The command sender for each established peer-relay link, keyed by peer id.
     links: HashMap<RelayId, mpsc::UnboundedSender<MeshCommand>>,
+    /// Highest process-local physical-link generation ever accepted per peer.
+    /// Kept after a dead sender is removed so a delayed older registration can
+    /// never become current again.
+    latest_generations: HashMap<RelayId, u64>,
     /// Coordinator intent: for each session, which peers should serve it.
     desired: HashMap<SessionKey, HashSet<RelayId>>,
     /// Delivered state: for each peer, the sessions its link has been
@@ -182,6 +186,7 @@ impl MeshControl {
             ),
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
+                latest_generations: HashMap::new(),
                 desired: HashMap::new(),
                 joined: HashMap::new(),
                 peer_contacts: HashMap::new(),
@@ -243,12 +248,27 @@ impl MeshControl {
     /// `Join` for every session the coordinator wants this peer to serve. A
     /// repeat registration for the same peer replaces the prior sender — the
     /// reconnect case — and resets its delivered state, re-sending its joins.
-    pub fn register_link(&self, peer_id: RelayId, sender: mpsc::UnboundedSender<MeshCommand>) {
+    #[must_use]
+    pub fn register_link(
+        &self,
+        peer_id: RelayId,
+        generation: u64,
+        sender: mpsc::UnboundedSender<MeshCommand>,
+    ) -> bool {
         let mut inner = self.inner.lock();
+        if inner
+            .latest_generations
+            .get(&peer_id)
+            .is_some_and(|current| *current >= generation)
+        {
+            return false;
+        }
+        inner.latest_generations.insert(peer_id, generation);
         inner.links.insert(peer_id, sender);
         // The link knows nothing yet; reconcile re-sends every desired join.
         inner.joined.insert(peer_id, HashSet::new());
         reconcile_peers(&mut inner, [peer_id]);
+        true
     }
 
     /// Applies a coordinator [`SessionDescriptor`]: the session's mesh peers
@@ -679,8 +699,8 @@ mod tests {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
-        control.register_link(RelayId(2), tx2);
-        control.register_link(RelayId(3), tx3);
+        let _ = control.register_link(RelayId(2), 1, tx2);
+        let _ = control.register_link(RelayId(3), 1, tx3);
 
         control.apply_descriptor(&descriptor(1, &[2, 3]));
 
@@ -693,8 +713,8 @@ mod tests {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
-        control.register_link(RelayId(2), tx2);
-        control.register_link(RelayId(3), tx3);
+        let _ = control.register_link(RelayId(2), 1, tx2);
+        let _ = control.register_link(RelayId(3), 1, tx3);
 
         // Session 1 names only peer 2 — peer 3 serves a different session.
         control.apply_descriptor(&descriptor(1, &[2]));
@@ -715,7 +735,7 @@ mod tests {
 
         // The link establishes — the deferred join fires now.
         let (tx2, mut rx2) = link();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
     }
 
@@ -724,8 +744,8 @@ mod tests {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
-        control.register_link(RelayId(2), tx2);
-        control.register_link(RelayId(3), tx3);
+        let _ = control.register_link(RelayId(2), 1, tx2);
+        let _ = control.register_link(RelayId(3), 1, tx3);
 
         control.apply_descriptor(&descriptor(1, &[2, 3]));
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
@@ -746,8 +766,8 @@ mod tests {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
         let (tx3, mut rx3) = link();
-        control.register_link(RelayId(2), tx2);
-        control.register_link(RelayId(3), tx3);
+        let _ = control.register_link(RelayId(2), 1, tx2);
+        let _ = control.register_link(RelayId(3), 1, tx3);
 
         control.apply_descriptor(&descriptor(1, &[2, 3]));
         assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
@@ -767,7 +787,7 @@ mod tests {
     fn end_session_on_an_unknown_session_is_a_no_op() {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
         // Never applied a descriptor for session 9.
         control.end_session(&key(9));
         assert!(rx2.try_recv().is_err());
@@ -777,15 +797,43 @@ mod tests {
     fn reconnect_replaces_sender_and_rejoins_desired_sessions() {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2_old, mut rx2_old) = link();
-        control.register_link(RelayId(2), tx2_old);
+        let _ = control.register_link(RelayId(2), 1, tx2_old);
         control.apply_descriptor(&descriptor(1, &[2]));
         assert_eq!(rx2_old.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
         // The link to peer 2 drops and reconnects: a new sender registers under
         // the same id, and the desired session re-joins on it.
         let (tx2_new, mut rx2_new) = link();
-        control.register_link(RelayId(2), tx2_new);
+        let _ = control.register_link(RelayId(2), 2, tx2_new);
         assert_eq!(rx2_new.try_recv().unwrap(), MeshCommand::Join(key(1)));
+    }
+
+    #[test]
+    fn late_older_registration_cannot_replace_or_resurrect_after_the_new_link_dies() {
+        let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+        control.apply_descriptor(&descriptor(1, &[2]));
+
+        let (old_tx, mut old_rx) = link();
+        assert!(control.register_link(RelayId(2), 10, old_tx));
+        assert_eq!(old_rx.try_recv().unwrap(), MeshCommand::Join(key(1)));
+
+        let (new_tx, mut new_rx) = link();
+        assert!(control.register_link(RelayId(2), 20, new_tx));
+        assert_eq!(new_rx.try_recv().unwrap(), MeshCommand::Join(key(1)));
+
+        let (late_tx, mut late_rx) = link();
+        assert!(!control.register_link(RelayId(2), 10, late_tx));
+        control.apply_descriptor(&descriptor(2, &[2]));
+        assert_eq!(new_rx.try_recv().unwrap(), MeshCommand::Join(key(2)));
+        assert!(late_rx.try_recv().is_err());
+
+        // Make the current sender fail so reconcile removes it, then prove the
+        // retained generation tombstone still rejects E1.
+        drop(new_rx);
+        control.apply_descriptor(&descriptor(3, &[2]));
+        let (resurrect_tx, mut resurrect_rx) = link();
+        assert!(!control.register_link(RelayId(2), 10, resurrect_tx));
+        assert!(resurrect_rx.try_recv().is_err());
     }
 
     #[test]
@@ -795,7 +843,7 @@ mod tests {
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx1, mut rx1) = link();
         // Even if a link were somehow registered under our own id, we don't join.
-        control.register_link(RelayId(1), tx1);
+        let _ = control.register_link(RelayId(1), 1, tx1);
         control.apply_descriptor(&descriptor(1, &[1, 2]));
         assert!(
             rx1.try_recv().is_err(),
@@ -810,7 +858,7 @@ mod tests {
         // unbounded channel absorbs the burst; the driver drains it in order.
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
 
         const BURST: u64 = 64; // well beyond the previous 32-deep bound
         for s in 1..=BURST {
@@ -830,7 +878,7 @@ mod tests {
         // undrained commands. With an unbounded channel it is durably queued.
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2, mut rx2) = link();
-        control.register_link(RelayId(2), tx2);
+        let _ = control.register_link(RelayId(2), 1, tx2);
 
         // Build a backlog of joins (beyond the old bound), none drained yet.
         const BACKLOG: u64 = 40;
@@ -857,7 +905,7 @@ mod tests {
         // scratch rather than the session being lost.
         let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
         let (tx2_dead, rx2_dead) = link();
-        control.register_link(RelayId(2), tx2_dead);
+        let _ = control.register_link(RelayId(2), 1, tx2_dead);
         drop(rx2_dead); // the driver exited; the channel is now closed
 
         // Applying a descriptor tries to join over the dead link and fails; the
@@ -867,7 +915,7 @@ mod tests {
         // The peer reconnects: a fresh link registers and the kept intent
         // re-joins on it.
         let (tx2_new, mut rx2_new) = link();
-        control.register_link(RelayId(2), tx2_new);
+        let _ = control.register_link(RelayId(2), 2, tx2_new);
         assert_eq!(rx2_new.try_recv().unwrap(), MeshCommand::Join(key(1)));
     }
 
@@ -1397,6 +1445,7 @@ mod tests {
                 rtt_us: 150_000,
                 lost_packets: 0,
                 sent_packets: 100,
+                connection_epoch: None,
             }],
         };
 
@@ -1485,6 +1534,7 @@ mod tests {
                 rtt_us: 150_000,
                 lost_packets: 0,
                 sent_packets: 100,
+                connection_epoch: None,
             }],
         };
         let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)

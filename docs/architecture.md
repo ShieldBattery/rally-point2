@@ -481,6 +481,35 @@ link stats to what it forwards across the mesh, and the decision-maker combines 
 picture (loss rate, latency, …) it decides on. The same conditions flow down to the clients, where they
 can drive an in-game netgraph or other debugging output.
 
+Those counters restart when a client reconnects, so every authenticated client link gets a random
+**connection epoch** derived from its challenge nonce. The epoch rides `SlotConditions`, the reliable
+`SlotConnectivity` level change, and `SlotDeparted`. Relays compare it for equality (it is deliberately not
+an ordered counter): a reliable `connected=true` activates a replacement generation and resets only that
+slot's RTT/loss window, while its validated game-frame history remains continuous; delayed condition
+datagrams, disconnects, departures, and teardown from any other generation are ignored. A `connected=false`
+or departure moves the generation to a terminal Down(E) state: a delayed true(E) cannot resurrect it, and
+only a previously unseen distinct epoch may reopen the slot after its pending reconnect hold is successfully
+claimed. The home relay also fences its conditions registry and decision-maker cleanup with the same epoch,
+closing the local race where an old task finishes after its replacement publishes. Once replaced, every opaque random
+epoch remains tombstoned for the rest of the session. The set is deliberately not age- or count-bounded:
+epochs have equality-only semantics and cross-channel delivery supplies no safe point after which an old
+reliable frame could be reinterpreted as a new generation.
+
+A fresh mesh link reliably replays every active `connected=true` epoch. Registry mutation and replay enqueue
+are serialized, so the link receives either the old replay followed by the new transition or the new replay;
+this is not a claim that QUIC streams arrive before datagrams. An epoch-bearing conditions sidecar whose
+reliable true has not arrived is ignored and a later sample recovers it naturally. The optional fields
+provide only one-way compatibility: a slot that has remained entirely unfenced accepts legacy epoch-less
+messages, but observing a present epoch permanently rejects later epoch-less messages. This is not a general
+live rolling-upgrade guarantee. Deployments must drain and promptly bounce the relay fleet so an
+epoch-enabled session can never rehome onto an older relay that emits no epoch.
+
+Physical relay-pair replacement has an additional **process-local link generation**. It is a monotonic id
+minted when a dial/accept attempt begins and is never sent on the wire. The current id is tracked per peer;
+claiming a replacement wakes the old driver and gates all of its datagram, control, and presence ingress.
+The same id fences registration into the descriptor-driven mesh control map, so an older slow handshake
+cannot finish late and replace the newer link's command sender.
+
 **The initial depth.** Left to the control law alone, a game *starts* at the tenant-minimum buffer and only
 gets its first correction once framed turns are flowing — roughly ten seconds in, past the opening worker
 split — because the law needs a consensus frame to schedule a directive against and there is none until the

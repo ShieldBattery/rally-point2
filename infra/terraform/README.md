@@ -125,7 +125,10 @@ Then:
   fleet converges — each still serves its own single-relay sessions, but new
   cross-relay sessions can't form across the version split. Bounce every
   region's tasks promptly (rather than letting old and new coexist for long)
-  when the image rolls.
+  when the image rolls. Connection-epoch compatibility is one-way: once a live
+  session observes an epoch-enabled relay, it rejects later epoch-less lifecycle
+  frames. Drain/bounce the fleet at this release boundary; do not let such a
+  session rehome onto an older relay image.
 
 ## 2. Apply a fleet environment
 

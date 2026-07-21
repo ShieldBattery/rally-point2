@@ -427,11 +427,11 @@ impl RttWindow {
 /// effective RTT (`rtt + mesh_rtt`) is what the path and loss formulas use,
 /// so cross-relay paths include the mesh hop automatically.
 ///
-/// The first sample establishes a baseline: `has_delta` stays false until the
-/// second sample arrives, so the decision-maker doesn't act on a loss rate
-/// computed from a single cumulative snapshot. A high RTT on the first sample
-/// can still raise the target -- RTT is instantaneous and doesn't need a
-/// baseline.
+/// The first sample establishes a baseline: `has_delta` stays false until a
+/// later sample reaches a strictly newer sent-packet endpoint, so the
+/// decision-maker doesn't act on a loss rate computed from one cumulative
+/// snapshot or its later loss refinements. A high RTT on the first sample can
+/// still raise the target -- RTT is instantaneous and doesn't need a baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SlotState {
     /// Ring buffer of recent RTT samples for jitter-aware sizing.
@@ -466,13 +466,56 @@ struct SlotState {
     curr_lost: u64,
     /// The current (latest) sample's cumulative `sent_packets`.
     curr_sent: u64,
-    /// Whether we have at least two samples (so a loss-rate delta is computable).
+    /// Whether we have two accepted, distinct sent-packet endpoints (so a
+    /// loss-rate delta is computable).
     has_delta: bool,
     /// Whether we've ingested at least one sample for this slot.
     seen: bool,
+    /// Last sender RTT admitted into `rtt_window`. Equal cumulative counters
+    /// can still carry a fresh RTT observation, but an exact duplicate must
+    /// not consume another position in the sample-count window.
+    last_sender_rtt_us: Option<u32>,
+}
+
+/// How one cumulative counter sample relates to the accepted loss baseline.
+/// RTT and the receiver-local mesh hop are handled separately because neither
+/// is a cumulative sender counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterUpdate {
+    /// The slot had no accepted cumulative baseline yet.
+    Baseline,
+    /// Sent packets advanced and lost packets did not move backward, so this
+    /// sample forms a new loss interval.
+    Advanced,
+    /// Loss detection advanced for the current sent-packet endpoint. Quinn may
+    /// declare an already-sent packet lost after the endpoint was sampled, so
+    /// this refines that endpoint without rotating it.
+    LossAdvanced,
+    /// The counters did not move backward, but sent packets did not advance.
+    /// There is no new denominator with which to form a loss interval.
+    NonAdvancing,
+    /// At least one counter moved backward relative to the accepted baseline.
+    /// This is an out-of-order or otherwise stale sample.
+    Stale,
 }
 
 impl SlotState {
+    /// Clears observations that belong to one physical client connection while
+    /// retaining the slot's game-progress history. A reconnect starts Quinn's
+    /// RTT and packet counters over, but it is still the same game participant:
+    /// its last validated frame remains part of the session coordinate.
+    fn reset_link_conditions(&mut self) {
+        self.rtt_window = RttWindow::default();
+        self.mesh_rtt_us = 0;
+        self.prev_lost = 0;
+        self.prev_sent = 0;
+        self.curr_lost = 0;
+        self.curr_sent = 0;
+        self.has_delta = false;
+        self.seen = false;
+        self.last_sender_rtt_us = None;
+    }
+
     /// The jitter-aware RTT: the recent max from the ring buffer. Returns `0`
     /// when no sample has been pushed (no measurement yet).
     fn rtt(&self) -> u32 {
@@ -480,17 +523,50 @@ impl SlotState {
     }
 
     /// The effective RTT: `rtt + mesh_rtt`. This is the full one-way path from
-    /// the client to the authority relay (client ->  -> home-relay + mesh-hop for
+    /// the client to the authority relay (client -> home-relay + mesh-hop for
     /// remote slots). The path and loss formulas use this so cross-relay paths
     /// are sized correctly.
     fn eff_rtt(&self) -> u32 {
         self.rtt().saturating_add(self.mesh_rtt_us)
     }
 
+    /// Rotates the accepted cumulative loss baseline only when a sample has a
+    /// strictly newer sent-packet count and a nondecreasing lost-packet count.
+    /// A later loss declaration may refine the current endpoint in place;
+    /// exact duplicates and stale samples leave the prior interval intact, so
+    /// a duplicate cannot erase it and an out-of-order sample cannot poison the
+    /// next delta.
+    fn update_counters(&mut self, lost_packets: u64, sent_packets: u64) -> CounterUpdate {
+        if !self.seen {
+            self.curr_lost = lost_packets;
+            self.curr_sent = sent_packets;
+            self.seen = true;
+            return CounterUpdate::Baseline;
+        }
+
+        if sent_packets < self.curr_sent || lost_packets < self.curr_lost {
+            return CounterUpdate::Stale;
+        }
+        if sent_packets == self.curr_sent {
+            if lost_packets > self.curr_lost {
+                self.curr_lost = lost_packets;
+                return CounterUpdate::LossAdvanced;
+            }
+            return CounterUpdate::NonAdvancing;
+        }
+
+        self.prev_lost = self.curr_lost;
+        self.prev_sent = self.curr_sent;
+        self.curr_lost = lost_packets;
+        self.curr_sent = sent_packets;
+        self.has_delta = true;
+        CounterUpdate::Advanced
+    }
+
     /// The interval loss rate (`delta_lost / delta_sent`), or `None` when no
-    /// prior sample exists (first sample) or the counters went backward (a
-    /// re-delivered stale sidecar). `saturating_sub` clamps to zero so a stale
-    /// sample can't produce a negative rate, and the result is clamped to 1.0:
+    /// prior sample exists (first sample) or no newer sent-packet count has been
+    /// accepted. Stale and duplicate samples never become the accepted baseline.
+    /// The result is clamped to 1.0:
     /// the counters are peer-reported, so nothing structural stops a claimed
     /// `delta_lost > delta_sent`, and a rate past certainty means nothing —
     /// unclamped it would only inflate the loss-risk product downstream.
@@ -505,6 +581,60 @@ impl SlotState {
         let delta_lost = self.curr_lost.saturating_sub(self.prev_lost);
         Some((delta_lost as f64 / delta_sent as f64).min(1.0))
     }
+}
+
+/// Current physical-link lifecycle for an epoch-aware slot. Absence from the
+/// map is the one-way legacy compatibility state. A down generation is a
+/// tombstone; once a previously unseen replacement opens, the old token moves
+/// to `retired_connection_epochs` and remains rejected for the session lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Up(u64),
+    Down(u64),
+}
+
+impl ConnectionState {
+    fn epoch(self) -> u64 {
+        match self {
+            Self::Up(epoch) | Self::Down(epoch) => epoch,
+        }
+    }
+}
+
+/// How a reliable `connected=true` frame relates to the locally known slot
+/// generation. The caller uses this before claiming a reconnect hold so a
+/// terminal current or retired replay cannot consume the hold it must not clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionActivation {
+    Current,
+    Replacement,
+    Rejected,
+}
+
+/// Result of atomically resolving a reliable connection-up event against the
+/// slot's departure and generation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconnectAdmission {
+    /// The generation is live. `reinstated` says an undecided departure was
+    /// consumed and its suspended game-progress state restored.
+    Admitted { reinstated: bool },
+    /// The generation is stale, terminal, or arrived after a final leave.
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectTransition {
+    admission: ReconnectAdmission,
+    consume_hold: bool,
+}
+
+/// Whether an epoch-fenced departure was rejected, recorded as an undecided
+/// drop that needs a hold, or merged after a final leave was already cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DepartureRecordOutcome {
+    Rejected,
+    Pending,
+    Terminal,
 }
 
 /// The latency-buffer decision-maker for one session.
@@ -531,6 +661,23 @@ pub struct DecisionMaker {
     buffer: BufferSize,
     /// Per-slot condition history and frame observations.
     slots: HashMap<SlotId, SlotState>,
+    /// The physical connection lifecycle for each epoch-aware slot. Epochs are
+    /// opaque random equality tokens, not ordered counters. Keeping this map
+    /// independently of `slots` makes a down generation a tombstone across
+    /// departure/removal, so delayed datagrams and teardown from an older
+    /// connection cannot recreate or erase the replacement's state.
+    ///
+    /// An absent entry is the rolling-upgrade legacy mode: wire messages with
+    /// no epoch remain admissible until this relay observes a present epoch for
+    /// the slot. Once fenced, absent messages cannot downgrade it back.
+    connection_states: HashMap<SlotId, ConnectionState>,
+    /// Every superseded random epoch for each slot, retained until this session's
+    /// decision-maker is destroyed. Epochs are equality-only tokens, so there is
+    /// no safe age/order cutoff: evicting even the oldest token would let an
+    /// arbitrarily delayed reliable `connected=true` resurrect that generation.
+    /// The current Down(E) tombstone remains in `connection_states`; it moves here
+    /// only when a distinct replacement becomes current.
+    retired_connection_epochs: HashMap<SlotId, HashSet<u64>>,
     /// The session frame at which the last decision was *made* (not applied).
     /// Used to gate lowers: a lower is suppressed until the session frame has
     /// advanced `min_dwell_turns` past it. Raises are never suppressed (you
@@ -719,6 +866,12 @@ pub struct DecisionMaker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Departure {
     last_frame: Option<GameFrameCount>,
+    /// The slot's complete game-progress state at departure. A reconnect
+    /// restores this state and resets only physical-link measurements, keeping
+    /// both the last frame and bounded seq/frame reachability history continuous
+    /// across connections. Duplicate departure observations never replace an
+    /// already-captured state.
+    slot_state: Option<SlotState>,
     /// The home-authored reachability ceiling for the leave's apply frame — the
     /// highest frame every survivor had provably executed when the home relay saw
     /// the departure (see [`DecisionMaker::reachable_frame`]). Single-sourced
@@ -736,6 +889,10 @@ struct Departure {
     /// which the departure closes), so once seeded it is final. Carried into the
     /// [`DepartureNotice`] so a departure webhook is atomic terminal truth.
     result: Option<ResultEcho>,
+    /// Physical connection generation that authored this departure. Stored on
+    /// the record itself so Join-time reconciliation cannot accidentally stamp
+    /// it with a newer generation from mutable live-link state.
+    connection_epoch: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1774,6 +1931,8 @@ impl DecisionMaker {
             law,
             authority,
             slots: HashMap::new(),
+            connection_states: HashMap::new(),
+            retired_connection_epochs: HashMap::new(),
             last_decision_frame: None,
             decision_seq: 0,
             decision_seq_tiebreak: None,
@@ -2180,14 +2339,15 @@ impl DecisionMaker {
     ///
     /// Local slots have `mesh_rtt = 0` (no mesh hop -- this relay). RTT
     /// samples are pushed into the per-slot ring buffer for jitter-aware
-    /// sizing. Cumulative loss counters are rotated so the next decision can
-    /// difference them.
+    /// sizing. Monotonic cumulative loss endpoints advance or refine the
+    /// accepted baseline so the next decision can difference them.
     ///
     /// Returns a [`Decision`] if the control law fires a change, `None` if it
     /// holds (target unchanged, or min-dwell suppressing a lower, or no framed
     /// turn observed yet, or this relay is not the authority). The caller
     /// translates a returned decision into a broadcast.
     pub fn ingest_local(&mut self, conditions: &LinkConditions) -> Option<Decision> {
+        self.activate_local_epochs(&conditions.slots);
         self.ingest_slots(&conditions.slots, 0)
     }
 
@@ -2196,6 +2356,7 @@ impl DecisionMaker {
     /// path; it shares the same slice-based state update and decision step as
     /// [`ingest_local`](Self::ingest_local).
     pub fn ingest_local_condition(&mut self, conditions: &SlotConditions) -> Option<Decision> {
+        self.activate_local_epochs(std::slice::from_ref(conditions));
         self.ingest_slots(std::slice::from_ref(conditions), 0)
     }
 
@@ -2218,8 +2379,9 @@ impl DecisionMaker {
         self.ingest_slots(&conditions.slots, mesh_rtt_us)
     }
 
-    /// Shared ingestion: pushes RTT samples, rotates loss counters, sets the
-    /// mesh hop, then runs `decide` if this relay is the authority.
+    /// Shared ingestion: admits current sender RTT observations, advances only
+    /// monotonic cumulative loss counters, sets the receiver-local mesh hop,
+    /// then runs `decide` if this relay is the authority.
     fn ingest_slots(
         &mut self,
         conditions: &[SlotConditions],
@@ -2240,28 +2402,50 @@ impl DecisionMaker {
             if self.departures.contains_key(&id) {
                 continue;
             }
-            let state = self.slots.entry(id).or_default();
-            // RTT goes into the ring buffer for jitter-aware sizing. A `0`
-            // (no measurement) is skipped by `push`. Clamped on the way in: the
-            // value is peer-reported (a remote relay's sidecar carries its own
-            // clients' claims), no playable link's RTT approaches the ceiling,
-            // and an unclamped near-u32::MAX claim would saturate every
-            // effective-RTT sum built on it.
-            state.rtt_window.push(slot.rtt_us.min(MAX_INGEST_RTT_US));
-            // The mesh hop is a property of the relay-pair, not the client's
-            // link, so it's set per-ingest (local = 0, remote = relay-pair RTT).
-            state.mesh_rtt_us = mesh_rtt_us;
-            // Rotate cumulative counters: old current becomes previous, so the
-            // next decision can difference them. On the first sample (seen=false)
-            // there's no prior to rotate.
-            if state.seen {
-                state.prev_lost = state.curr_lost;
-                state.prev_sent = state.curr_sent;
-                state.has_delta = true;
+            // An epoch-bearing remote sidecar is admitted only after the
+            // reliable connectivity stream established that exact generation.
+            // Datagrams and streams have no cross-channel order, so allowing an
+            // unknown sidecar to establish state could let E2 arrive first and
+            // then let a delayed reliable E1 switch the slot backward. Local
+            // samples are activated just above this method by the authenticated
+            // slot-link path.
+            match (
+                self.connection_states.get(&id).copied(),
+                slot.connection_epoch,
+            ) {
+                (Some(ConnectionState::Up(current)), Some(observed)) if current == observed => {}
+                (None, None) => {}
+                _ => continue,
             }
-            state.curr_lost = slot.lost_packets;
-            state.curr_sent = slot.sent_packets;
-            state.seen = true;
+            let state = self.slots.entry(id).or_default();
+            let counter_update = state.update_counters(slot.lost_packets, slot.sent_packets);
+
+            // Sender RTT is instantaneous rather than cumulative, but a
+            // counter-regressing sidecar is known to be stale as a whole and
+            // must not advance the sample-count-based window. Equal counters
+            // may still carry a changed RTT (Quinn updates smoothed RTT without
+            // necessarily sending another packet), but an exact duplicate must
+            // not age the window. A `0` (no measurement) is skipped by `push`.
+            // Clamp peer-reported values on ingress so an unclamped
+            // near-u32::MAX claim cannot saturate every effective-RTT sum.
+            let rtt_us = slot.rtt_us.min(MAX_INGEST_RTT_US);
+            let admit_sender_rtt = match counter_update {
+                CounterUpdate::Baseline | CounterUpdate::Advanced | CounterUpdate::LossAdvanced => {
+                    true
+                }
+                CounterUpdate::NonAdvancing => state.last_sender_rtt_us != Some(rtt_us),
+                CounterUpdate::Stale => false,
+            };
+            if admit_sender_rtt {
+                state.rtt_window.push(rtt_us);
+                state.last_sender_rtt_us = Some(rtt_us);
+            }
+
+            // The mesh hop is sampled locally by this receiving relay at
+            // ingestion time, so sender counter order does not make it stale.
+            // Refresh it for every sidecar, including one whose client counters
+            // are equal or backward (local ingestion supplies zero).
+            state.mesh_rtt_us = mesh_rtt_us;
         }
 
         if !self.is_authority() {
@@ -2269,6 +2453,213 @@ impl DecisionMaker {
         }
 
         self.decide()
+    }
+
+    /// Trusts epochs carried by samples measured on this relay's authenticated
+    /// home-client link. Unlike a mesh datagram, a local sample is an
+    /// authoritative activation barrier for a replacement connection.
+    fn activate_local_epochs(&mut self, conditions: &[SlotConditions]) {
+        for condition in conditions {
+            let (Ok(slot), Some(epoch)) = (
+                u8::try_from(condition.slot).map(SlotId),
+                condition.connection_epoch,
+            ) else {
+                continue;
+            };
+            if !self.departures.contains_key(&slot) && !self.decided_leaves.contains_key(&slot) {
+                let _ = self.activate_connection_epoch(slot, epoch);
+            }
+        }
+    }
+
+    /// Classifies a reliable level=true frame without mutating state. This is
+    /// intentionally separate from activation so callers can reject a terminal
+    /// same-generation replay before it consumes a reconnect hold.
+    pub(crate) fn connection_activation(
+        &self,
+        slot: SlotId,
+        observed: Option<u64>,
+    ) -> ConnectionActivation {
+        if self.decided_leaves.contains_key(&slot) {
+            return ConnectionActivation::Rejected;
+        }
+        if observed.is_some_and(|epoch| {
+            self.retired_connection_epochs
+                .get(&slot)
+                .is_some_and(|retired| retired.contains(&epoch))
+        }) {
+            return ConnectionActivation::Rejected;
+        }
+        if self.departures.contains_key(&slot)
+            && !self.connection_states.contains_key(&slot)
+            && observed.is_none()
+        {
+            return ConnectionActivation::Replacement;
+        }
+        match (self.connection_states.get(&slot).copied(), observed) {
+            (None, None) => ConnectionActivation::Current,
+            (None, Some(_)) => ConnectionActivation::Replacement,
+            (Some(ConnectionState::Up(current)), Some(epoch)) if current == epoch => {
+                ConnectionActivation::Current
+            }
+            (Some(ConnectionState::Down(current)), Some(epoch)) if current == epoch => {
+                ConnectionActivation::Rejected
+            }
+            (Some(_), Some(_)) => ConnectionActivation::Replacement,
+            (Some(_), None) => ConnectionActivation::Rejected,
+        }
+    }
+
+    /// Admits a reliable level=true frame after any departure/hold transition
+    /// has completed. A down generation is terminal: only a distinct epoch can
+    /// reopen it. Returns true when the requested generation is up afterward.
+    pub(crate) fn admit_connection_up(&mut self, slot: SlotId, observed: Option<u64>) -> bool {
+        if self.departures.contains_key(&slot) || self.decided_leaves.contains_key(&slot) {
+            return false;
+        }
+        match observed {
+            Some(epoch) => self.activate_connection_epoch(slot, epoch),
+            None => !self.connection_states.contains_key(&slot),
+        }
+    }
+
+    /// Activates one authenticated/reliably-announced epoch-aware generation.
+    /// A duplicate Up(E) is idempotent. Down(E) and every superseded epoch reject
+    /// that epoch forever; a previously unseen distinct epoch may replace the
+    /// current one once the departure record is gone.
+    #[must_use]
+    pub fn activate_connection_epoch(&mut self, slot: SlotId, epoch: u64) -> bool {
+        if self.departures.contains_key(&slot) || self.decided_leaves.contains_key(&slot) {
+            return false;
+        }
+        if self
+            .retired_connection_epochs
+            .get(&slot)
+            .is_some_and(|retired| retired.contains(&epoch))
+        {
+            return false;
+        }
+        match self.connection_states.get(&slot).copied() {
+            Some(ConnectionState::Up(current)) if current == epoch => return true,
+            Some(ConnectionState::Down(current)) if current == epoch => return false,
+            _ => {}
+        }
+        if let Some(superseded) = self.connection_states.get(&slot).copied() {
+            self.retired_connection_epochs
+                .entry(slot)
+                .or_default()
+                .insert(superseded.epoch());
+        }
+        self.connection_states
+            .insert(slot, ConnectionState::Up(epoch));
+        if let Some(state) = self.slots.get_mut(&slot) {
+            state.reset_link_conditions();
+        }
+        true
+    }
+
+    /// Resolves a reliable connection-up event in one decision-maker critical
+    /// section. If an undecided departure has a matching drop hold, its complete
+    /// slot state is restored and the new generation is activated without a gap
+    /// in which the old generation can record another departure.
+    #[cfg(test)]
+    fn resolve_reconnect(
+        &mut self,
+        slot: SlotId,
+        observed: Option<u64>,
+        hold_pending: bool,
+    ) -> ReconnectTransition {
+        self.resolve_reconnect_with(slot, observed, hold_pending, || {})
+    }
+
+    fn resolve_reconnect_with(
+        &mut self,
+        slot: SlotId,
+        observed: Option<u64>,
+        hold_pending: bool,
+        after_reinstate: impl FnOnce(),
+    ) -> ReconnectTransition {
+        if self.decided_leaves.contains_key(&slot) {
+            return ReconnectTransition {
+                admission: ReconnectAdmission::Rejected,
+                consume_hold: hold_pending,
+            };
+        }
+        if self.connection_activation(slot, observed) == ConnectionActivation::Rejected {
+            return ReconnectTransition {
+                admission: ReconnectAdmission::Rejected,
+                consume_hold: false,
+            };
+        }
+
+        let reinstated = self.departures.contains_key(&slot);
+        if reinstated && !hold_pending {
+            // A departure without a hold is a clean/final leave (or legacy
+            // inconsistent state), never authority to resurrect the slot.
+            return ReconnectTransition {
+                admission: ReconnectAdmission::Rejected,
+                consume_hold: false,
+            };
+        }
+        if reinstated {
+            let restored = self.reinstate_slot(slot);
+            debug_assert!(restored, "the undecided departure was checked above");
+            if !restored {
+                return ReconnectTransition {
+                    admission: ReconnectAdmission::Rejected,
+                    consume_hold: hold_pending,
+                };
+            }
+            after_reinstate();
+        }
+
+        let admitted = self.admit_connection_up(slot, observed);
+        debug_assert!(
+            admitted,
+            "a preclassified generation with no departure must be admissible"
+        );
+        ReconnectTransition {
+            admission: if admitted {
+                ReconnectAdmission::Admitted { reinstated }
+            } else {
+                ReconnectAdmission::Rejected
+            },
+            // A hold with no departure is stale bookkeeping. Once a generation
+            // is admitted it must not remain available for a later drop request.
+            consume_hold: hold_pending,
+        }
+    }
+
+    /// Moves the matching active generation to its terminal down state. A
+    /// duplicate Down(E) is idempotent; a stale generation and any legacy frame
+    /// after upgrade are rejected.
+    fn mark_connection_down(&mut self, slot: SlotId, observed: Option<u64>) -> bool {
+        match (self.connection_states.get(&slot).copied(), observed) {
+            (None, None) => true,
+            (None, Some(epoch)) => {
+                self.connection_states
+                    .insert(slot, ConnectionState::Down(epoch));
+                true
+            }
+            (Some(ConnectionState::Up(current)), Some(epoch)) if current == epoch => {
+                self.connection_states
+                    .insert(slot, ConnectionState::Down(epoch));
+                true
+            }
+            (Some(ConnectionState::Down(current)), Some(epoch)) if current == epoch => true,
+            _ => false,
+        }
+    }
+
+    /// Whether a generation-bearing operation belongs to the active physical
+    /// connection. `None` is accepted only while this slot remains in legacy,
+    /// unfenced mode; seeing an epoch is a one-way upgrade for the session.
+    pub fn connection_epoch_matches(&self, slot: SlotId, epoch: Option<u64>) -> bool {
+        match (self.connection_states.get(&slot).copied(), epoch) {
+            (Some(current), Some(observed)) => current.epoch() == observed,
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Computes the target buffer size from current conditions, without
@@ -2596,7 +2987,7 @@ impl DecisionMaker {
         // `slots`; the record is the single frame source from here on. Passing
         // `None` for the ceiling and the result preserves whatever the home
         // already authored.
-        self.note_departure(slot, None, None, None, reason);
+        self.note_departure(slot, None, None, None, reason, None);
 
         if self.authority != Authority::SelfRelay {
             return None;
@@ -2615,7 +3006,7 @@ impl DecisionMaker {
     /// when several relays' timers fire at once. Records the departure first, like
     /// [`decide_leave`].
     pub fn force_decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
-        self.note_departure(slot, None, None, None, reason);
+        self.note_departure(slot, None, None, None, reason, None);
         if let Some(directive) = self.commit_leave(slot, reason) {
             return Some(directive);
         }
@@ -2745,10 +3136,40 @@ impl DecisionMaker {
         result: Option<ResultEcho>,
         reason: u32,
     ) {
-        self.note_departure(slot, last_frame, reachable, result, reason);
+        self.note_departure(slot, last_frame, reachable, result, reason, None);
         // A departed slot's frozen cursors and newest-seq must not hold the
         // worst-lag view (and its buffer cushion) up forever.
         self.delivery.forget_slot(slot);
+    }
+
+    /// Epoch-fenced counterpart to [`record_departure`](Self::record_departure).
+    /// A departure from an older connection is a no-op. A present epoch may
+    /// establish a previously-unfenced slot directly in Down(E), because a
+    /// reliable departure can legitimately be the first generation-bearing
+    /// frame observed. An absent epoch is accepted only in legacy mode.
+    #[must_use]
+    pub fn record_departure_for_epoch(
+        &mut self,
+        slot: SlotId,
+        last_frame: Option<GameFrameCount>,
+        reachable: Option<u32>,
+        result: Option<ResultEcho>,
+        reason: u32,
+        connection_epoch: Option<u64>,
+    ) -> bool {
+        if !self.mark_connection_down(slot, connection_epoch) {
+            return false;
+        }
+        self.note_departure(
+            slot,
+            last_frame,
+            reachable,
+            result,
+            reason,
+            connection_epoch,
+        );
+        self.delivery.forget_slot(slot);
+        true
     }
 
     /// Seeds a coordinator-known departure as **already decided** on a rehome (see
@@ -2766,7 +3187,7 @@ impl DecisionMaker {
             DepartureKind::Dropped => LEAVE_REASON_DROPPED,
             DepartureKind::Left => LEAVE_REASON_LEFT,
         };
-        self.note_departure(slot, None, None, None, reason);
+        self.note_departure(slot, None, None, None, reason, None);
         if !self.decided_leaves.contains_key(&slot) {
             self.next_leave_seq += 1;
             let base = self.session_frame().map(|f| f.0).unwrap_or(0);
@@ -2899,6 +3320,19 @@ impl DecisionMaker {
         if leave.leave_seq > self.next_leave_seq {
             self.next_leave_seq = leave.leave_seq;
         }
+        if inserted {
+            // A final leave is terminal even when it outruns the corresponding
+            // SlotDeparted on another peer link. Retire the live slot now and
+            // leave a departure tombstone so frames/conditions cannot recreate
+            // it. The decided-leave guard rejects every later true generation.
+            if let Some(ConnectionState::Up(epoch)) = self.connection_states.get(&slot).copied() {
+                self.connection_states
+                    .insert(slot, ConnectionState::Down(epoch));
+            }
+            let retained_result = self.results.get(&slot).cloned();
+            self.note_departure(slot, None, None, retained_result, leave.reason, None);
+            self.delivery.forget_slot(slot);
+        }
         inserted
     }
 
@@ -2908,6 +3342,11 @@ impl DecisionMaker {
     /// trigger, before recording, to fill a `SlotDeparted`'s `last_frame`.
     pub fn slot_frame(&self, slot: SlotId) -> Option<GameFrameCount> {
         self.slots.get(&slot).and_then(|s| s.frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_slot_state(&self, slot: SlotId) -> bool {
+        self.slots.contains_key(&slot)
     }
 
     /// Whether a departure has been recorded for `slot` — its link ended (a drop or
@@ -2927,10 +3366,10 @@ impl DecisionMaker {
     /// slot's hold is already released, so the promotion's held-slot skip cannot
     /// protect it — clearing the record is what does).
     ///
-    /// Only the departure record is dropped; the slot's live frame state is
-    /// re-created from its resumed turns (the `observe_frame`/`ingest` guards stop
-    /// ignoring it the moment the record is gone), and its presence is re-asserted
-    /// by the register's own `note_slot_present`.
+    /// The departure's suspended slot state is restored, preserving game-frame
+    /// and bounded seq/frame reachability history across the reconnect while
+    /// resetting RTT/loss/mesh measurements that belong to the old physical
+    /// link. Presence is re-asserted by the register's own `note_slot_present`.
     ///
     /// A no-op — returns `false`, the departure record untouched — when the slot's
     /// leave is **already decided**. Ordinarily a re-register only reaches an
@@ -2950,7 +3389,18 @@ impl DecisionMaker {
         if self.decided_leaves.contains_key(&slot) {
             return false;
         }
-        self.departures.remove(&slot).is_some()
+        let Some(departure) = self.departures.remove(&slot) else {
+            return false;
+        };
+        let mut state = departure.slot_state.unwrap_or_default();
+        if let Some(last_frame) = departure.last_frame
+            && state.frame.is_none_or(|frame| last_frame > frame)
+        {
+            state.frame = Some(last_frame);
+        }
+        state.reset_link_conditions();
+        self.slots.insert(slot, state);
+        true
     }
 
     /// The slots whose leave this relay has already decided or cached for this
@@ -2981,6 +3431,7 @@ impl DecisionMaker {
             Option<u32>,
             Option<ResultEcho>,
             u32,
+            Option<u64>,
         )>,
         Vec<LeaveDirective>,
     ) {
@@ -2994,6 +3445,7 @@ impl DecisionMaker {
                     departure.reachable_frame,
                     departure.result.clone(),
                     departure.reason,
+                    departure.connection_epoch,
                 )
             })
             .collect();
@@ -3043,6 +3495,7 @@ impl DecisionMaker {
         reachable: Option<u32>,
         result: Option<ResultEcho>,
         reason: u32,
+        connection_epoch: Option<u64>,
     ) {
         use std::collections::hash_map::Entry;
         let result = result.filter(|echo| {
@@ -3059,11 +3512,17 @@ impl DecisionMaker {
             }
             valid
         });
-        let own = self.slots.remove(&slot).and_then(|s| s.frame);
-        let merged = match (last_frame, own) {
+        let mut slot_state = self.slots.remove(&slot);
+        let own_frame = slot_state.as_ref().and_then(|state| state.frame);
+        let merged = match (last_frame, own_frame) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
+        if let (Some(state), Some(frame)) = (&mut slot_state, merged)
+            && state.frame.is_none_or(|current| frame > current)
+        {
+            state.frame = Some(frame);
+        }
         match self.departures.entry(slot) {
             Entry::Occupied(mut existing) => {
                 let record = existing.get_mut();
@@ -3071,16 +3530,30 @@ impl DecisionMaker {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
+                // Preserve the first captured full state. A duplicate may fill
+                // an initially absent state, but never replaces frame history
+                // already suspended by the first observation.
+                if record.slot_state.is_none() {
+                    record.slot_state = slot_state;
+                }
+                if let (Some(state), Some(frame)) = (&mut record.slot_state, record.last_frame)
+                    && state.frame.is_none_or(|current| frame > current)
+                {
+                    state.frame = Some(frame);
+                }
                 // First non-`None` wins — single-sourced from the home.
                 record.reachable_frame = record.reachable_frame.or(reachable);
                 record.result = record.result.take().or(result);
+                record.connection_epoch = record.connection_epoch.or(connection_epoch);
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(Departure {
                     last_frame: merged,
+                    slot_state,
                     reachable_frame: reachable,
                     result,
                     reason,
+                    connection_epoch,
                 });
             }
         }
@@ -3107,6 +3580,18 @@ impl DecisionMaker {
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
         self.delivery.forget_slot(slot);
+    }
+
+    /// Removes live per-slot state only when teardown belongs to the active
+    /// connection generation. The epoch tombstone itself is retained so late
+    /// datagrams and a second stale teardown stay fenced afterward.
+    #[must_use]
+    pub fn remove_slot_for_epoch(&mut self, slot: SlotId, epoch: Option<u64>) -> bool {
+        if !self.connection_epoch_matches(slot, epoch) {
+            return false;
+        }
+        self.remove_slot(slot);
+        true
     }
 
     /// Replaces the session's observer slots (from the coordinator descriptor)
@@ -3207,6 +3692,12 @@ impl DecisionMaker {
     /// `false`.
     #[must_use]
     pub fn note_slot_present(&mut self, slot: SlotId) -> bool {
+        // Presence and final-leave frames can arrive over different peer links.
+        // A delayed present must not resurrect a terminal slot or satisfy start
+        // coverage after its departure/leave already linearized here.
+        if self.departures.contains_key(&slot) || self.decided_leaves.contains_key(&slot) {
+            return false;
+        }
         self.live_slots.insert(slot);
         self.maybe_start()
     }
@@ -4067,6 +4558,176 @@ pub fn record_departure(
     }
 }
 
+/// Epoch-fenced form of [`record_departure`]. Returns `false` when the frame
+/// belongs to a stale/legacy generation that cannot match the slot's current
+/// fence; callers must then skip every associated hold and fan-out side effect.
+/// A missing maker preserves [`record_departure`]'s historical no-op admission:
+/// there is no local consensus state with which the frame could conflict.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn record_departure_for_epoch(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    last_frame: Option<GameFrameCount>,
+    reachable: Option<u32>,
+    result: Option<ResultEcho>,
+    reason: u32,
+    connection_epoch: Option<u64>,
+) -> bool {
+    record_departure_for_epoch_outcome(
+        registry,
+        key,
+        slot,
+        last_frame,
+        reachable,
+        result,
+        reason,
+        connection_epoch,
+    ) != DepartureRecordOutcome::Rejected
+}
+
+/// Records the same epoch-fenced departure while distinguishing an undecided
+/// drop from a terminal metadata merge. Callers use this distinction to install
+/// a reconnect hold only for the former; a delayed `SlotDeparted` after the
+/// final `LeaveDirective` may still enrich the retained record but must never
+/// recreate a drop hold.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_departure_for_epoch_outcome(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    last_frame: Option<GameFrameCount>,
+    reachable: Option<u32>,
+    result: Option<ResultEcho>,
+    reason: u32,
+    connection_epoch: Option<u64>,
+) -> DepartureRecordOutcome {
+    let mut makers = registry.lock();
+    let Some(maker) = makers.get_mut(key) else {
+        return DepartureRecordOutcome::Pending;
+    };
+    if maker.decided_leaves.contains_key(&slot) {
+        // A final leave is stronger than the physical-link generation fence.
+        // Its SlotDeparted may arrive afterward on a different reliable peer
+        // stream, including after a newer generation was already marked down.
+        // Merge only its terminal metadata; do not let that stale generation
+        // mutate the current connection tombstone or recreate a drop hold.
+        maker.note_departure(slot, last_frame, reachable, result, reason, None);
+        maker.delivery.forget_slot(slot);
+        return DepartureRecordOutcome::Terminal;
+    }
+    if !maker.record_departure_for_epoch(
+        slot,
+        last_frame,
+        reachable,
+        result,
+        reason,
+        connection_epoch,
+    ) {
+        return DepartureRecordOutcome::Rejected;
+    }
+    DepartureRecordOutcome::Pending
+}
+
+/// Activates an authenticated or reliably-announced connection generation.
+/// Returns whether that generation is Up afterward. A duplicate Up(E) returns
+/// true; the terminal Down(E), a pending departure, and a missing maker return
+/// false.
+#[must_use]
+pub fn activate_connection_epoch(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: u64,
+) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch))
+}
+
+/// Atomically resolves a reliable connection-up event against both the drop
+/// hold and the decision-maker's departure/generation state. The hold map stays
+/// locked while the maker is acquired, and reinstatement plus activation happen
+/// under that single maker lock. Thus an old departure can linearize only wholly
+/// before this operation (and be claimed here) or wholly after the new epoch is
+/// active (and be rejected as stale).
+pub(crate) fn admit_reconnect(
+    registry: &DecisionMakers,
+    drop_holds: &crate::drop_hold::DropHolds,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: Option<u64>,
+) -> ReconnectAdmission {
+    admit_reconnect_with(registry, drop_holds, key, slot, epoch, || {})
+}
+
+fn admit_reconnect_with(
+    registry: &DecisionMakers,
+    drop_holds: &crate::drop_hold::DropHolds,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: Option<u64>,
+    after_reinstate: impl FnOnce(),
+) -> ReconnectAdmission {
+    drop_holds.resolve_reconnect(key, slot, |hold_pending| {
+        let transition = registry.lock().get_mut(key).map_or(
+            ReconnectTransition {
+                admission: ReconnectAdmission::Admitted { reinstated: false },
+                consume_hold: hold_pending,
+            },
+            |maker| maker.resolve_reconnect_with(slot, epoch, hold_pending, after_reinstate),
+        );
+        (transition.admission, transition.consume_hold)
+    })
+}
+
+/// Commits a reliable level=false frame. A duplicate Down(E) is idempotent;
+/// stale generations and legacy downgrades are rejected.
+#[must_use]
+pub(crate) fn mark_connection_down(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: Option<u64>,
+) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_none_or(|maker| maker.mark_connection_down(slot, epoch))
+}
+
+/// Checks a generation-bearing mesh/local teardown operation against the
+/// current fence. A missing maker admits the informational frame, preserving
+/// legacy behavior when the mesh session arrives ahead of its descriptor.
+pub fn connection_epoch_matches(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: Option<u64>,
+) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_none_or(|maker| maker.connection_epoch_matches(slot, epoch))
+}
+
+/// Epoch-fenced live-state removal for a connection teardown.
+#[must_use]
+pub fn remove_slot_for_epoch(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    epoch: Option<u64>,
+) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_some_and(|maker| maker.remove_slot_for_epoch(slot, epoch))
+}
+
 /// Seeds a coordinator-known departure into a session's decision-maker on a
 /// **rehome**: a fresh relay taking over a running session has no mesh peer to
 /// replay a `SlotDeparted` from, so the coordinator carries the already-decided
@@ -4298,6 +4959,7 @@ pub fn leave_reconcile(
         Option<u32>,
         Option<ResultEcho>,
         u32,
+        Option<u64>,
     )>,
     Vec<LeaveDirective>,
 ) {
@@ -4437,7 +5099,7 @@ pub fn ingest_local_conditions(
     key: &SessionKey,
     conditions: &LinkConditions,
 ) -> Option<Decision> {
-    ingest_conditions(registry, key, &conditions.slots, 0)
+    ingest_conditions(registry, key, &conditions.slots, 0, true)
 }
 
 /// The allocation-free single-slot counterpart to [`ingest_local_conditions`].
@@ -4449,7 +5111,7 @@ pub fn ingest_local_condition(
     key: &SessionKey,
     conditions: &SlotConditions,
 ) -> Option<Decision> {
-    ingest_conditions(registry, key, std::slice::from_ref(conditions), 0)
+    ingest_conditions(registry, key, std::slice::from_ref(conditions), 0, true)
 }
 
 fn ingest_conditions(
@@ -4457,10 +5119,14 @@ fn ingest_conditions(
     key: &SessionKey,
     conditions: &[SlotConditions],
     mesh_rtt_us: u32,
+    local: bool,
 ) -> Option<Decision> {
     let (decision, directive) = {
         let mut makers = registry.lock();
         let maker = makers.get_mut(key)?;
+        if local {
+            maker.activate_local_epochs(conditions);
+        }
         let decision = maker.ingest_slots(conditions, mesh_rtt_us)?;
         // The queued broadcast carries the decision seq the Decision lacks;
         // read it under the same lock so the recorded event matches exactly
@@ -4501,7 +5167,7 @@ pub fn ingest_remote_conditions(
     conditions: &LinkConditions,
     mesh_rtt_us: u32,
 ) -> Option<Decision> {
-    ingest_conditions(registry, key, &conditions.slots, mesh_rtt_us)
+    ingest_conditions(registry, key, &conditions.slots, mesh_rtt_us, false)
 }
 
 /// The buffer directive to stamp onto a turn forwarded for this session, if
@@ -4713,6 +5379,8 @@ fn log_desync(key: &SessionKey, divergence: &SyncDivergence) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use rally_point_proto::control::TenantId;
     use rally_point_proto::ids::SessionId;
     use rally_point_proto::messages::SlotConditions;
@@ -4739,8 +5407,15 @@ mod tests {
                 rtt_us,
                 lost_packets: lost,
                 sent_packets: sent,
+                connection_epoch: None,
             }],
         }
+    }
+
+    fn epoch_conditions(slot: u8, epoch: u64, rtt_us: u32, lost: u64, sent: u64) -> LinkConditions {
+        let mut conditions = conditions(slot, rtt_us, lost, sent);
+        conditions.slots[0].connection_epoch = Some(epoch);
+        conditions
     }
 
     fn multi_conditions(slots: &[(u8, u32, u64, u64)]) -> LinkConditions {
@@ -4752,6 +5427,7 @@ mod tests {
                     rtt_us: rtt,
                     lost_packets: lost,
                     sent_packets: sent,
+                    connection_epoch: None,
                 })
                 .collect(),
         }
@@ -4877,24 +5553,28 @@ mod tests {
                 rtt_us: 0,
                 lost_packets: 0,
                 sent_packets: 0,
+                connection_epoch: None,
             },
             SlotConditions {
                 slot: 0,
                 rtt_us: 150_000,
                 lost_packets: 0,
                 sent_packets: 100,
+                connection_epoch: None,
             },
             SlotConditions {
                 slot: 0,
                 rtt_us: 200_000,
                 lost_packets: 20,
                 sent_packets: 200,
+                connection_epoch: None,
             },
             SlotConditions {
                 slot: 0,
                 rtt_us: 100_000,
                 lost_packets: 20,
                 sent_packets: 300,
+                connection_epoch: None,
             },
         ];
 
@@ -5378,13 +6058,17 @@ mod tests {
         // Flush the 300ms spike from the ring buffer (32 samples) so the
         // recent max drops to 50ms. Frames 4--35.
         for frame in 4..=35 {
-            let _ = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), frame);
+            let _ = ingest_at(
+                &mut maker,
+                &conditions(0, 50_000, 0, 100 + u64::from(frame)),
+                frame,
+            );
         }
         // Now the target is 2 (50ms), but we're still within the dwell.
         assert_eq!(maker.target(), Some(2));
 
         // After the dwell (frame 2 + 120 = 122, so frame 123). Lower fires.
-        let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 123);
+        let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 1_000), 123);
         assert!(d4.is_some(), "lower should fire after dwell");
         assert_eq!(maker.buffer(), BufferSize(7));
     }
@@ -5563,6 +6247,597 @@ mod tests {
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 50), 2);
         assert_eq!(maker.target(), Some(4));
         assert_eq!(d, None);
+    }
+
+    /// A late cumulative sample is ignored as a counter baseline. The next
+    /// forward sample must difference from the newest accepted sample, not the
+    /// stale packet that happened to arrive in between.
+    #[test]
+    fn stale_counter_sample_does_not_poison_the_next_loss_interval() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+
+        // Counter pairs are written as sent/lost: 100/0 -> 120/10.
+        maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
+        maker.ingest_remote(&conditions(0, 160_000, 10, 120), 20_000);
+        assert_eq!(
+            maker.slots[&SlotId(0)].loss_rate(),
+            Some(0.5),
+            "the accepted interval is 10 lost out of 20 sent",
+        );
+
+        // 110/0 is older than the accepted 120/10 sample. Its sender RTT is
+        // stale too, but the mesh hop was sampled locally on receipt and stays
+        // current even when the sender counters regress.
+        maker.ingest_remote(&conditions(0, 900_000, 0, 110), 30_000);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
+        assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
+        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!(state.rtt(), 160_000, "stale RTT does not age the window");
+        assert_eq!(state.mesh_rtt_us, 30_000, "the local mesh sample is fresh");
+
+        maker.ingest_remote(&conditions(0, 140_000, 10, 130), 40_000);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
+        assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
+        assert_eq!(
+            (
+                state.curr_lost - state.prev_lost,
+                state.curr_sent - state.prev_sent,
+            ),
+            (0, 10),
+            "the final interval is the true 0/10 since the newest sample",
+        );
+        assert_eq!(state.loss_rate(), Some(0.0));
+    }
+
+    /// Exact re-delivery is idempotent for both the loss baseline and the
+    /// sample-count RTT window. Equal counters with a changed RTT remain a
+    /// fresh latency observation.
+    #[test]
+    fn duplicate_counters_neither_erase_nor_reapply_the_loss_interval() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
+        maker.ingest_remote(&conditions(0, 160_000, 10, 120), 10_000);
+        let rtt_samples = maker.slots[&SlotId(0)].rtt_window.len;
+
+        maker.ingest_remote(&conditions(0, 160_000, 10, 120), 20_000);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
+        assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
+        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!(state.rtt_window.len, rtt_samples);
+        assert_eq!(state.mesh_rtt_us, 20_000);
+
+        // Same cumulative point, new instantaneous RTT: update latency only.
+        maker.ingest_remote(&conditions(0, 180_000, 10, 120), 30_000);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(state.rtt(), 180_000);
+        assert_eq!(state.rtt_window.len, rtt_samples + 1);
+        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!((state.prev_sent, state.curr_sent), (100, 120));
+
+        maker.ingest_remote(&conditions(0, 170_000, 10, 130), 40_000);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
+        assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
+        assert_eq!(state.loss_rate(), Some(0.0));
+    }
+
+    /// Quinn can declare a packet lost after the sent-packet endpoint containing
+    /// it was sampled. A higher lost count at the same sent count refines that
+    /// interval immediately rather than waiting for (and attributing it wholly
+    /// to) a later send interval.
+    #[test]
+    fn late_loss_declaration_refines_the_current_interval_without_rotating_it() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&conditions(0, 150_000, 0, 100));
+        maker.ingest_local(&conditions(0, 150_000, 0, 120));
+        assert_eq!(maker.slots[&SlotId(0)].loss_rate(), Some(0.0));
+
+        maker.ingest_local(&conditions(0, 150_000, 10, 120));
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
+        assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
+        assert_eq!(state.loss_rate(), Some(0.5));
+
+        // The refined endpoint becomes the baseline for the next interval, so
+        // the already-accounted loss is not re-applied.
+        maker.ingest_local(&conditions(0, 150_000, 10, 130));
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
+        assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
+        assert_eq!(state.loss_rate(), Some(0.0));
+    }
+
+    /// Loss detection may advance before a second sent endpoint has established
+    /// any interval. It still refines the first endpoint: otherwise the next
+    /// interval would falsely attribute that already-sent loss to new packets.
+    #[test]
+    fn late_loss_declaration_refines_the_first_baseline() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&conditions(0, 150_000, 0, 100));
+        maker.ingest_local(&conditions(0, 150_000, 10, 100));
+
+        let baseline = &maker.slots[&SlotId(0)];
+        assert_eq!((baseline.curr_sent, baseline.curr_lost), (100, 10));
+        assert!(!baseline.has_delta);
+        assert_eq!(baseline.loss_rate(), None);
+
+        maker.ingest_local(&conditions(0, 150_000, 10, 110));
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (100, 10));
+        assert_eq!((state.curr_sent, state.curr_lost), (110, 10));
+        assert_eq!(state.loss_rate(), Some(0.0));
+    }
+
+    /// Counter admission is per slot, not per sidecar: one stale entry cannot
+    /// prevent another slot in the same batch from advancing normally.
+    #[test]
+    fn mixed_stale_and_fresh_batch_updates_each_slot_independently() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_remote(
+            &multi_conditions(&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]),
+            10_000,
+        );
+        maker.ingest_remote(
+            &multi_conditions(&[(0, 110_000, 10, 120), (1, 210_000, 5, 120)]),
+            20_000,
+        );
+
+        maker.ingest_remote(
+            &multi_conditions(&[(0, 900_000, 0, 110), (1, 190_000, 5, 130)]),
+            30_000,
+        );
+
+        let stale = &maker.slots[&SlotId(0)];
+        assert_eq!((stale.prev_sent, stale.prev_lost), (100, 0));
+        assert_eq!((stale.curr_sent, stale.curr_lost), (120, 10));
+        assert_eq!(stale.loss_rate(), Some(0.5));
+        assert_eq!(stale.rtt(), 110_000);
+        assert_eq!(stale.mesh_rtt_us, 30_000);
+
+        let fresh = &maker.slots[&SlotId(1)];
+        assert_eq!((fresh.prev_sent, fresh.prev_lost), (120, 5));
+        assert_eq!((fresh.curr_sent, fresh.curr_lost), (130, 5));
+        assert_eq!(fresh.loss_rate(), Some(0.0));
+        assert_eq!(fresh.mesh_rtt_us, 30_000);
+    }
+
+    /// A reconnect's lower QUIC counters are legitimate only after the existing
+    /// departure/reinstatement lifecycle has retired the old `SlotState`. Its
+    /// first new sample establishes a baseline; the following sample forms the
+    /// first interval of the new connection.
+    #[test]
+    fn reinstated_slot_accepts_reset_counters_as_a_fresh_baseline() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&conditions(0, 150_000, 0, 100));
+        maker.ingest_local(&conditions(0, 160_000, 10, 120));
+
+        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+        assert!(!maker.slots.contains_key(&SlotId(0)));
+        assert!(maker.reinstate_slot(SlotId(0)));
+
+        maker.ingest_local(&conditions(0, 50_000, 0, 3));
+        let baseline = &maker.slots[&SlotId(0)];
+        assert_eq!((baseline.curr_sent, baseline.curr_lost), (3, 0));
+        assert!(!baseline.has_delta);
+        assert_eq!(baseline.loss_rate(), None);
+        assert_eq!(baseline.rtt(), 50_000, "the old RTT window was retired");
+
+        maker.ingest_local(&conditions(0, 60_000, 1, 13));
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (3, 0));
+        assert_eq!((state.curr_sent, state.curr_lost), (13, 1));
+        assert!((state.loss_rate().expect("new interval") - 0.1).abs() < f64::EPSILON);
+    }
+
+    /// A replacement connection is a fresh RTT/counter namespace but not a new
+    /// game participant. Its activation resets only link observations, keeps the
+    /// validated frame, and permanently rejects a delayed sidecar from the old
+    /// epoch even when that stale sidecar carries much larger counters.
+    #[test]
+    fn reconnect_epoch_resets_link_conditions_and_rejects_the_old_sidecar() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.observe_frame(SlotId(0), GameFrameCount(77));
+        maker.ingest_local(&epoch_conditions(0, 11, 150_000, 0, 100));
+        maker.ingest_local(&epoch_conditions(0, 11, 160_000, 10, 120));
+        assert_eq!(maker.slots[&SlotId(0)].loss_rate(), Some(0.5));
+
+        maker.ingest_local(&epoch_conditions(0, 22, 50_000, 0, 3));
+        let replacement = &maker.slots[&SlotId(0)];
+        assert_eq!(replacement.frame, Some(GameFrameCount(77)));
+        assert_eq!((replacement.curr_sent, replacement.curr_lost), (3, 0));
+        assert_eq!(replacement.loss_rate(), None);
+        assert_eq!(replacement.rtt(), 50_000);
+
+        maker.ingest_remote(&epoch_conditions(0, 11, 900_000, 900, 10_000), 80_000);
+        let still_replacement = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            (still_replacement.curr_sent, still_replacement.curr_lost),
+            (3, 0)
+        );
+        assert_eq!(still_replacement.rtt(), 50_000);
+        assert_eq!(still_replacement.mesh_rtt_us, 0);
+
+        maker.ingest_local(&epoch_conditions(0, 22, 60_000, 1, 13));
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.prev_sent, state.prev_lost), (3, 0));
+        assert_eq!((state.curr_sent, state.curr_lost), (13, 1));
+        assert!((state.loss_rate().expect("replacement interval") - 0.1).abs() < f64::EPSILON);
+    }
+
+    /// Epoch absence is rolling-upgrade compatibility only. Once a present
+    /// epoch has fenced the slot, a delayed sample from an older binary cannot
+    /// downgrade it back to the unfenced counter namespace.
+    #[test]
+    fn epoch_aware_slot_rejects_a_later_epochless_sidecar() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&epoch_conditions(0, 44, 40_000, 0, 5));
+        maker.ingest_remote(&conditions(0, 800_000, 100, 1_000), 90_000);
+
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!((state.curr_sent, state.curr_lost), (5, 0));
+        assert_eq!(state.rtt(), 40_000);
+        assert_eq!(state.mesh_rtt_us, 0);
+    }
+
+    /// Both destructive lifecycle operations use the same generation tombstone:
+    /// an old teardown can neither record a departure nor erase the replacement's
+    /// live state, while the current epoch still can.
+    #[test]
+    fn stale_epoch_cannot_depart_or_remove_a_reconnected_slot() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&epoch_conditions(0, 1, 70_000, 0, 10));
+        maker.ingest_local(&epoch_conditions(0, 2, 30_000, 0, 1));
+
+        assert!(!maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(1),));
+        assert!(!maker.remove_slot_for_epoch(SlotId(0), Some(1)));
+        assert!(maker.slots.contains_key(&SlotId(0)));
+        assert!(!maker.has_departure(SlotId(0)));
+
+        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(2),));
+        assert!(maker.has_departure(SlotId(0)));
+        assert!(!maker.slots.contains_key(&SlotId(0)));
+    }
+
+    #[test]
+    fn down_epoch_is_terminal_until_a_distinct_generation_is_reinstated() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
+        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+
+        assert_eq!(
+            maker.connection_activation(SlotId(0), Some(11)),
+            ConnectionActivation::Rejected,
+        );
+        assert!(!maker.activate_connection_epoch(SlotId(0), 11));
+        maker.ingest_local(&epoch_conditions(0, 11, 900_000, 100, 1_000));
+        assert!(!maker.slots.contains_key(&SlotId(0)));
+        assert!(
+            !maker.activate_connection_epoch(SlotId(0), 22),
+            "a new generation cannot bypass the pending departure",
+        );
+
+        assert!(maker.reinstate_slot(SlotId(0)));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
+        assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
+
+        // Retention is a set for the whole maker lifetime, not just the one
+        // immediately previous generation.
+        assert!(maker.mark_connection_down(SlotId(0), Some(22)));
+        assert!(maker.activate_connection_epoch(SlotId(0), 33));
+        for retired in [11, 22] {
+            assert_eq!(
+                maker.connection_activation(SlotId(0), Some(retired)),
+                ConnectionActivation::Rejected,
+            );
+            assert!(!maker.activate_connection_epoch(SlotId(0), retired));
+        }
+        assert_eq!(
+            maker.connection_states.get(&SlotId(0)),
+            Some(&ConnectionState::Up(33)),
+        );
+    }
+
+    #[test]
+    fn delayed_retired_true_cannot_replace_the_live_relay_epoch() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(maker.mark_connection_down(SlotId(0), Some(11)));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+
+        assert_eq!(
+            maker.connection_activation(SlotId(0), Some(11)),
+            ConnectionActivation::Rejected,
+            "a delayed true(E1) is stale after E2 supersedes Down(E1)",
+        );
+        assert!(!maker.activate_connection_epoch(SlotId(0), 11));
+        assert_eq!(
+            maker.connection_states.get(&SlotId(0)),
+            Some(&ConnectionState::Up(22)),
+            "rejecting E1 must leave E2 current",
+        );
+
+        assert_eq!(
+            maker.connection_activation(SlotId(0), Some(22)),
+            ConnectionActivation::Current,
+        );
+        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
+        assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
+    }
+
+    #[test]
+    fn decided_departure_rejects_reinstate_activation() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
+        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        assert!(maker.force_decide_leave(SlotId(0), DROPPED).is_some());
+
+        assert!(!maker.reinstate_slot(SlotId(0)));
+        assert!(!maker.activate_connection_epoch(SlotId(0), 22));
+    }
+
+    #[test]
+    fn legacy_departure_requires_reinstate_before_legacy_true() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&conditions(0, 70_000, 0, 10));
+        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+
+        assert_eq!(
+            maker.connection_activation(SlotId(0), None),
+            ConnectionActivation::Replacement,
+        );
+        assert!(!maker.admit_connection_up(SlotId(0), None));
+        assert!(maker.reinstate_slot(SlotId(0)));
+        assert!(maker.admit_connection_up(SlotId(0), None));
+        maker.ingest_remote(&conditions(0, 30_000, 0, 1), 10_000);
+        assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
+    }
+
+    #[test]
+    fn remote_epoch_sidecar_waits_for_reliable_generation_activation() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
+        assert!(!maker.slots.contains_key(&SlotId(0)));
+
+        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
+        assert!(maker.slots.contains_key(&SlotId(0)));
+    }
+
+    #[test]
+    fn departure_reconcile_uses_the_epoch_stored_on_the_departure() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
+        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        // Model unrelated mutable lifecycle state changing after the record was
+        // authored. Reconcile must still stamp the record's original E1.
+        maker
+            .connection_states
+            .insert(SlotId(0), ConnectionState::Up(22));
+
+        let (departures, _) = maker.leave_reconcile();
+        assert_eq!(departures[0].5, Some(11));
+    }
+
+    #[test]
+    fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        feed_turns(&mut maker, 0, 0..=15);
+        maker.ingest_local(&epoch_conditions(0, 11, 150_000, 3, 20));
+        let history = maker.slots[&SlotId(0)].frame_history.clone();
+        let last = maker.slot_frame(SlotId(0));
+        assert_eq!(last, Some(GameFrameCount(115)));
+        assert!(maker.record_departure_for_epoch(SlotId(0), last, None, None, DROPPED, Some(11),));
+
+        let transition = maker.resolve_reconnect(SlotId(0), Some(22), true);
+        assert_eq!(
+            transition.admission,
+            ReconnectAdmission::Admitted { reinstated: true }
+        );
+        let restored = &maker.slots[&SlotId(0)];
+        assert_eq!(restored.frame, last);
+        assert_eq!(restored.frame_history, history);
+        assert_eq!(restored.rtt(), 0, "new physical link has fresh RTT state");
+        assert!(!restored.seen, "new physical link has fresh counters");
+
+        // E2 dies before producing another framed turn. Its departure and final
+        // leave must still use the E1 progress basis rather than falling back to
+        // an unframed/late apply point.
+        let redrop_last = maker.slot_frame(SlotId(0));
+        assert_eq!(redrop_last, Some(GameFrameCount(115)));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            redrop_last,
+            None,
+            None,
+            DROPPED,
+            Some(22),
+        ));
+        let leave = maker
+            .decide_leave(SlotId(0), DROPPED)
+            .expect("authority decides the immediate redrop");
+        assert_eq!(leave.apply_at_frame, 116);
+    }
+
+    #[test]
+    fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
+        let makers = Arc::new(new_decision_makers());
+        let session = key();
+        makers.lock().insert(
+            session.clone(),
+            DecisionMaker::new(
+                session.clone(),
+                bounds(0, 20),
+                law(),
+                Authority::Peer,
+                HashSet::new(),
+            ),
+        );
+        let holds = crate::drop_hold::DropHolds::new(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        );
+        assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11));
+
+        // The old departure linearizes first: reconnect observes and claims the
+        // complete departure+hold transition, restores state, and opens E2.
+        assert!(holds.record_and_maybe_hold(&session, SlotId(0), || {
+            let recorded = record_departure_for_epoch(
+                &makers,
+                &session,
+                SlotId(0),
+                None,
+                None,
+                None,
+                DROPPED,
+                Some(11),
+            );
+            (recorded, recorded)
+        }));
+        assert_eq!(
+            admit_reconnect(&makers, &holds, &session, SlotId(0), Some(22)),
+            ReconnectAdmission::Admitted { reinstated: true }
+        );
+        assert!(!holds.is_pending(&session, SlotId(0)));
+        assert!(!slot_departed(&makers, &session, SlotId(0)));
+
+        // The reconnect linearizes first: a later E1 record is stale and cannot
+        // install either a departure or an orphan hold against live E3.
+        assert_eq!(
+            admit_reconnect(&makers, &holds, &session, SlotId(0), Some(33)),
+            ReconnectAdmission::Admitted { reinstated: false }
+        );
+        assert!(!holds.record_and_maybe_hold(&session, SlotId(0), || {
+            let recorded = record_departure_for_epoch(
+                &makers,
+                &session,
+                SlotId(0),
+                None,
+                None,
+                None,
+                DROPPED,
+                Some(22),
+            );
+            (recorded, recorded)
+        }));
+        assert!(!holds.is_pending(&session, SlotId(0)));
+        assert!(!slot_departed(&makers, &session, SlotId(0)));
+        assert!(connection_epoch_matches(
+            &makers,
+            &session,
+            SlotId(0),
+            Some(33)
+        ));
+    }
+
+    #[test]
+    fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
+        let makers = Arc::new(new_decision_makers());
+        let session = key();
+        let mut maker = DecisionMaker::new(
+            session.clone(),
+            bounds(0, 20),
+            law(),
+            Authority::Peer,
+            HashSet::new(),
+        );
+        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        makers.lock().insert(session.clone(), maker);
+        let holds = crate::drop_hold::DropHolds::new(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        );
+        holds.hold(session.clone(), SlotId(0));
+
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reconnect_makers = Arc::clone(&makers);
+        let reconnect_holds = holds.clone();
+        let reconnect_key = session.clone();
+        let reconnect = std::thread::spawn(move || {
+            admit_reconnect_with(
+                &reconnect_makers,
+                &reconnect_holds,
+                &reconnect_key,
+                SlotId(0),
+                Some(22),
+                || {
+                    inside_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )
+        });
+        inside_rx
+            .recv()
+            .expect("reconnect paused after restore with maker lock held");
+
+        let stale_makers = Arc::clone(&makers);
+        let stale_key = session.clone();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (stale_tx, stale_rx) = std::sync::mpsc::channel();
+        let stale = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            let recorded = record_departure_for_epoch(
+                &stale_makers,
+                &stale_key,
+                SlotId(0),
+                None,
+                None,
+                None,
+                DROPPED,
+                Some(11),
+            );
+            stale_tx.send(recorded).unwrap();
+        });
+        attempting_rx.recv().expect("stale teardown started");
+        assert!(
+            stale_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "stale teardown must wait for the reconnect's maker critical section"
+        );
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            reconnect.join().unwrap(),
+            ReconnectAdmission::Admitted { reinstated: true }
+        );
+        assert!(!stale_rx.recv().expect("stale teardown completed"));
+        stale.join().unwrap();
+        assert!(!slot_departed(&makers, &session, SlotId(0)));
+        assert!(connection_epoch_matches(
+            &makers,
+            &session,
+            SlotId(0),
+            Some(22)
+        ));
     }
 
     /// Regression: lossy interval THEN clean interval must drop the target.
@@ -7737,6 +9012,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn final_leave_is_terminal_across_true_and_departure_orderings() {
+        for true_before_leave in [false, true] {
+            let mut maker =
+                DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+            assert!(maker.activate_connection_epoch(SlotId(0), 11));
+            maker.observe_frame(SlotId(0), GameFrameCount(40));
+            let _ = maker.note_slot_present(SlotId(0));
+            let retained_result = ResultEcho {
+                payload: vec![0xAA],
+                arrival_ms: 7,
+                session_frame: Some(40),
+                slot_frame: Some(40),
+            };
+            assert!(maker.record_result(SlotId(0), retained_result.clone()));
+
+            if true_before_leave {
+                assert_eq!(
+                    maker
+                        .resolve_reconnect(SlotId(0), Some(22), false)
+                        .admission,
+                    ReconnectAdmission::Admitted { reinstated: false }
+                );
+            }
+
+            let leave = LeaveDirective {
+                slot: 0,
+                reason: DROPPED,
+                apply_at_frame: 41,
+                leave_seq: 1,
+            };
+            assert!(maker.observe_leave(&leave));
+
+            if !true_before_leave {
+                assert_eq!(
+                    maker
+                        .resolve_reconnect(SlotId(0), Some(22), false)
+                        .admission,
+                    ReconnectAdmission::Rejected,
+                    "Leave(E1) must make a later true(E2) terminal"
+                );
+            }
+            let stale_departure = maker.record_departure_for_epoch(
+                SlotId(0),
+                Some(GameFrameCount(40)),
+                None,
+                None,
+                DROPPED,
+                Some(11),
+            );
+            assert_eq!(stale_departure, !true_before_leave);
+
+            assert!(maker.has_departure(SlotId(0)));
+            assert_eq!(
+                maker.departures[&SlotId(0)].result,
+                Some(retained_result),
+                "a leave-first terminal notice retains the home-authored result"
+            );
+            assert!(!maker.slots.contains_key(&SlotId(0)));
+            assert!(!maker.live_slots.contains(&SlotId(0)));
+            assert!(!maker.note_slot_present(SlotId(0)));
+            assert!(!maker.live_slots.contains(&SlotId(0)));
+            assert!(!maker.activate_connection_epoch(SlotId(0), 33));
+            maker.ingest_local(&epoch_conditions(0, 33, 10_000, 0, 1));
+            assert!(
+                !maker.slots.contains_key(&SlotId(0)),
+                "conditions cannot recreate a finally-left slot"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_departure_metadata_merges_without_weakening_the_epoch_fence() {
+        let makers = new_decision_makers();
+        let session = key();
+        makers.lock().insert(
+            session.clone(),
+            DecisionMaker::new(
+                session.clone(),
+                bounds(0, 20),
+                law(),
+                Authority::Peer,
+                HashSet::new(),
+            ),
+        );
+        assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11,));
+        assert!(activate_connection_epoch(&makers, &session, SlotId(0), 22,));
+        assert!(observe_leave(
+            &makers,
+            &session,
+            &LeaveDirective {
+                slot: 0,
+                reason: DROPPED,
+                apply_at_frame: 41,
+                leave_seq: 1,
+            },
+        ));
+
+        let result = ResultEcho {
+            payload: vec![0xAA],
+            arrival_ms: 7,
+            session_frame: Some(40),
+            slot_frame: Some(40),
+        };
+        assert_eq!(
+            record_departure_for_epoch_outcome(
+                &makers,
+                &session,
+                SlotId(0),
+                Some(GameFrameCount(40)),
+                Some(39),
+                Some(result.clone()),
+                DROPPED,
+                Some(11),
+            ),
+            DepartureRecordOutcome::Terminal,
+            "a final leave still accepts late home-authored terminal metadata",
+        );
+
+        let makers_guard = makers.lock();
+        let maker = &makers_guard[&session];
+        assert_eq!(
+            maker.connection_states.get(&SlotId(0)),
+            Some(&ConnectionState::Down(22)),
+            "the stale E1 departure cannot rewrite the current E2 tombstone",
+        );
+        let departure = &maker.departures[&SlotId(0)];
+        assert_eq!(departure.last_frame, Some(GameFrameCount(40)));
+        assert_eq!(departure.reachable_frame, Some(39));
+        assert_eq!(departure.result, Some(result));
+    }
+
     /// Two relays independently force-deciding the same fully-abandoned slot (see
     /// `force_decide_leave`) agree on `reason` and `apply_at_frame` — the decision
     /// itself — but assign `leave_seq` from their own local counters, so the two
@@ -8181,6 +9588,7 @@ mod tests {
                 rtt_us: 999_999,
                 lost_packets: 0,
                 sent_packets: 1,
+                connection_epoch: None,
             });
 
         let _ = maker.ingest_local(&batch);

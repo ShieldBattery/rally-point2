@@ -60,7 +60,7 @@
 //! re-dial and resume from the last delivered turn — or when the game stalls (stops
 //! draining, so the inbound buffer fills) or hands over an undeliverable turn.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -751,6 +751,8 @@ impl LinkDriver {
             retention,
             retention_bytes,
             pending_control_redivert,
+            connectivity_states,
+            terminal_connectivity_slots,
         } = state;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -966,14 +968,28 @@ impl LinkDriver {
                         // flows. Correctness-critical: a lost leave strands lockstep
                         // on a slot that will never send another turn, so a game
                         // that stopped draining these is a stall, not a skip.
-                        Some(ControlInbound::Leave(leave)) => match push_to_game(leaves, leave) {
-                            GamePush::Sent => {}
-                            GamePush::Full => {
-                                tracing::warn!("game stopped draining synced leaves");
-                                return Err(DriverError::GameStalled);
+                        Some(ControlInbound::Leave(leave)) => {
+                            // A final leave dominates every physical-link update,
+                            // including a delayed true from a replacement epoch.
+                            // Latch the tombstone before forwarding the directive
+                            // so it also survives a game-channel stall/reconnect.
+                            let Ok(slot_id) = u8::try_from(leave.slot) else {
+                                tracing::warn!(
+                                    slot = leave.slot,
+                                    "leave directive names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            terminal_connectivity_slots.insert(SlotId(slot_id));
+                            match push_to_game(leaves, leave) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::warn!("game stopped draining synced leaves");
+                                    return Err(DriverError::GameStalled);
+                                }
+                                GamePush::Closed => return Ok(()),
                             }
-                            GamePush::Closed => return Ok(()),
-                        },
+                        }
                         // A client only ever *sends* a leave intent up; it never
                         // receives one back (the relay is the only recipient).
                         // Ignore a stray one, mirroring how the relay edge
@@ -1100,7 +1116,17 @@ impl LinkDriver {
                                 );
                                 continue;
                             };
-                            match push_to_game(connectivity, (SlotId(slot_id), change.connected)) {
+                            let subject = SlotId(slot_id);
+                            if !admit_connectivity_epoch(
+                                connectivity_states,
+                                terminal_connectivity_slots,
+                                subject,
+                                change.connected,
+                                change.connection_epoch,
+                            ) {
+                                continue;
+                            }
+                            match push_to_game(connectivity, (subject, change.connected)) {
                                 GamePush::Sent => {}
                                 GamePush::Full => {
                                     tracing::debug!(
@@ -1701,6 +1727,16 @@ struct LoopState {
     /// oversize turn takes when first sent. Empty on a same-relay resume (which
     /// keeps the old relay's reliable-stream state) and after each drain.
     pending_control_redivert: Vec<Payload>,
+    /// Relay-stamped physical connection lifecycle per member. Kept across this
+    /// client's own reconnect so a delayed connectivity frame from another
+    /// member's superseded link cannot regress the game's display.
+    /// Missing entries retain rolling-upgrade compatibility with relays that do
+    /// not stamp epochs; once present, an epoch-less frame cannot downgrade it.
+    connectivity_states: ConnectivityEpochStates,
+    /// Slots for which a final synced leave has reached this client. A leave is
+    /// terminal game state, so no later physical-link generation may make its
+    /// subject appear connected again. Kept across this client's reconnects.
+    terminal_connectivity_slots: HashSet<SlotId>,
 }
 
 impl LoopState {
@@ -1715,7 +1751,72 @@ impl LoopState {
             retention: VecDeque::new(),
             retention_bytes: 0,
             pending_control_redivert: Vec::new(),
+            connectivity_states: ConnectivityEpochStates::default(),
+            terminal_connectivity_slots: HashSet::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectivityState {
+    epoch: u64,
+    connected: bool,
+}
+
+#[derive(Debug, Default)]
+struct ConnectivityEpochStates {
+    current: HashMap<SlotId, ConnectivityState>,
+    /// Superseded random epochs are retained for the whole session. They cannot
+    /// be bounded safely: epochs have equality semantics, and a delayed reliable
+    /// frame has no age after which it becomes safe to accept again.
+    retired: HashSet<(SlotId, u64)>,
+}
+
+/// Applies the same lifecycle fence the relays use to connectivity changes.
+/// Down(E) is terminal, a previously unseen level=true epoch opens a replacement,
+/// and epoch-less compatibility ends permanently once an epoch is observed.
+fn admit_connectivity_epoch(
+    states: &mut ConnectivityEpochStates,
+    terminal_slots: &HashSet<SlotId>,
+    slot: SlotId,
+    connected: bool,
+    observed: Option<u64>,
+) -> bool {
+    if terminal_slots.contains(&slot) {
+        return false;
+    }
+    if observed.is_some_and(|epoch| states.retired.contains(&(slot, epoch))) {
+        return false;
+    }
+    match (states.current.get(&slot).copied(), observed) {
+        (Some(current), Some(epoch)) if current.epoch == epoch => {
+            if !current.connected && connected {
+                return false;
+            }
+            states
+                .current
+                .insert(slot, ConnectivityState { epoch, connected });
+            true
+        }
+        (Some(current), Some(epoch)) if connected => {
+            states.retired.insert((slot, current.epoch));
+            states.current.insert(
+                slot,
+                ConnectivityState {
+                    epoch,
+                    connected: true,
+                },
+            );
+            true
+        }
+        (Some(_), _) => false,
+        (None, Some(epoch)) => {
+            states
+                .current
+                .insert(slot, ConnectivityState { epoch, connected });
+            true
+        }
+        (None, None) => true,
     }
 }
 
@@ -2512,6 +2613,228 @@ mod tests {
     use rally_point_transport::{quinn, rustls};
 
     use super::*;
+
+    #[test]
+    fn connectivity_epoch_fence_makes_down_terminal_until_a_new_epoch_opens() {
+        let slot = SlotId(3);
+        let mut states = ConnectivityEpochStates::default();
+        let terminal = HashSet::new();
+
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(11),
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(11),
+        ));
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(11),
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(22),
+        ));
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(11),
+        ));
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            None,
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(22),
+        ));
+    }
+
+    #[test]
+    fn delayed_retired_true_cannot_replace_the_live_client_epoch() {
+        let slot = SlotId(3);
+        let mut states = ConnectivityEpochStates::default();
+        let terminal = HashSet::new();
+
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(11),
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(11),
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(22),
+        ));
+
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(11),
+        ));
+        assert_eq!(
+            states.current.get(&slot),
+            Some(&ConnectivityState {
+                epoch: 22,
+                connected: true,
+            }),
+            "a delayed true(E1) must not replace live E2 in the game display",
+        );
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(22),
+        ));
+
+        // A second replacement does not evict E1: every superseded token stays
+        // fenced for the full client-session lifetime.
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(22),
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(33),
+        ));
+        for retired in [11, 22] {
+            assert!(!admit_connectivity_epoch(
+                &mut states,
+                &terminal,
+                slot,
+                true,
+                Some(retired),
+            ));
+        }
+        assert_eq!(
+            states.current.get(&slot),
+            Some(&ConnectivityState {
+                epoch: 33,
+                connected: true,
+            }),
+        );
+    }
+
+    #[test]
+    fn connectivity_epoch_fence_accepts_legacy_only_before_upgrade() {
+        let slot = SlotId(3);
+        let mut states = ConnectivityEpochStates::default();
+        let terminal = HashSet::new();
+
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            None,
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            None,
+        ));
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(11),
+        ));
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn final_leave_tombstone_rejects_every_later_connectivity_epoch() {
+        let slot = SlotId(3);
+        let mut states = ConnectivityEpochStates::default();
+        let mut terminal = HashSet::new();
+
+        // A replacement generation is live until the synced leave arrives.
+        assert!(admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(22),
+        ));
+        terminal.insert(slot);
+
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            false,
+            Some(22),
+        ));
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            slot,
+            true,
+            Some(33),
+        ));
+
+        // Leave-first ordering is equally terminal, even without prior epoch
+        // state and even for a legacy frame.
+        let leave_first = SlotId(4);
+        terminal.insert(leave_first);
+        assert!(!admit_connectivity_epoch(
+            &mut states,
+            &terminal,
+            leave_first,
+            true,
+            None,
+        ));
+    }
 
     fn self_signed() -> (
         Vec<CertificateDer<'static>>,

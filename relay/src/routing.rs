@@ -103,6 +103,10 @@ const FORWARD_BYTE_BUDGET: usize = MAX_OVERSIZE_TURN_COMMANDS_LEN * FORWARD_CAPA
 /// player, and only on a departure), so a small buffer is ample.
 const LEAVE_PUSH_CAPACITY: usize = 16;
 
+/// One relay-authored member-connectivity level change: subject slot, level,
+/// and the physical connection generation the level describes.
+type ConnectivityChange = (SlotId, bool, Option<u64>);
+
 /// QUIC application close code for a connection dropped because its client sent a
 /// turn that failed validation.
 const INVALID_TURN_CLOSE: u32 = 0x01;
@@ -400,8 +404,8 @@ pub struct SlotEntry {
     /// (re)registers; drained by this slot's link task, which writes a
     /// `SlotConnectivity` frame. Rides the reliable stream like a leave so it
     /// still reaches a client whose datagram turn flow has stalled behind the
-    /// very disconnect being reported. Carries `(slot, connected)`.
-    conn_push: mpsc::Sender<(SlotId, bool)>,
+    /// very disconnect being reported. Carries `(slot, connected, epoch)`.
+    conn_push: mpsc::Sender<ConnectivityChange>,
     shutdown: Arc<Notify>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
@@ -422,7 +426,7 @@ pub struct SlotInbox {
     start_push_rx: mpsc::Receiver<Option<u32>>,
     /// Slot-connectivity changes to push down this client's control stream (see
     /// [`SlotEntry::conn_push`]).
-    conn_push_rx: mpsc::Receiver<(SlotId, bool)>,
+    conn_push_rx: mpsc::Receiver<ConnectivityChange>,
     shutdown: Arc<Notify>,
     /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
     provisional_reap: Arc<Notify>,
@@ -457,7 +461,10 @@ impl SlotInbox {
     /// slot. `None` when nothing is queued.
     #[cfg(test)]
     pub(crate) fn try_recv_connectivity(&mut self) -> Option<(SlotId, bool)> {
-        self.conn_push_rx.try_recv().ok()
+        self.conn_push_rx
+            .try_recv()
+            .ok()
+            .map(|(slot, connected, _)| (slot, connected))
     }
 
     /// Non-blockingly pulls the next synced leave pushed to this slot, for a
@@ -803,8 +810,9 @@ pub(crate) fn fan_out_connectivity(
     key: &SessionKey,
     slot: SlotId,
     connected: bool,
+    connection_epoch: Option<u64>,
 ) {
-    let targets: Vec<(SlotId, mpsc::Sender<(SlotId, bool)>)> = {
+    let targets: Vec<(SlotId, mpsc::Sender<ConnectivityChange>)> = {
         let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => slots
@@ -815,7 +823,7 @@ pub(crate) fn fan_out_connectivity(
         }
     };
     for (target, tx) in targets {
-        match tx.try_send((slot, connected)) {
+        match tx.try_send((slot, connected, connection_epoch)) {
             Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
@@ -843,9 +851,10 @@ pub(crate) fn broadcast_connectivity(
     key: &SessionKey,
     slot: SlotId,
     connected: bool,
+    connection_epoch: Option<u64>,
 ) {
-    fan_out_connectivity(sessions, key, slot, connected);
-    crate::mesh::fan_out_slot_connectivity(mesh_links, key, slot, connected);
+    fan_out_connectivity(sessions, key, slot, connected, connection_epoch);
+    crate::mesh::fan_out_slot_connectivity(mesh_links, key, slot, connected, connection_epoch);
 }
 
 /// Pushes the session-start directive down a single slot's control stream — the
@@ -937,12 +946,12 @@ pub fn announce_slot_present(
 }
 
 /// Fires the shutdown signal for each of `slots` in the `key` routing group, so
-/// each named slot's link task closes its connection and leaves — the coordinator's
-/// reap directive. A slot this relay does not currently hold (never homed it, or it
-/// already departed) is simply absent from the roster and skipped, so the
-/// coordinator can name every slot of a session without tracking which relay holds
-/// which. The closed link then flows through the ordinary link-death path (a synced
-/// leave, a departure notice), which is what makes the reap self-resolving.
+/// each named slot's link task closes its connection and leaves. This serves both
+/// coordinator reaps and a final mesh leave that outran the subject's local link.
+/// A slot this relay does not currently hold (never homed it, or already departed)
+/// is simply absent from the roster and skipped. The closed link then flows through
+/// the ordinary link-death path (a synced leave, a departure notice), making either
+/// terminal path self-resolving.
 ///
 /// Signals rather than yanking the roster entry, exactly like `fan_out`'s lagging-
 /// peer path: the slot stays occupied until its own task acts on the signal and
@@ -958,7 +967,7 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
                 slot = slot.0,
-                "coordinator reap: closing slot link",
+                "closing slot link after terminal directive",
             );
             entry.shutdown.notify_one();
         }
@@ -994,10 +1003,12 @@ pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
 /// Because deregistration happens here, on exit, the slot stays occupied for this
 /// connection's whole life — a lagging peer is asked to leave via the shutdown
 /// signal, not by yanking its roster entry out from under it.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_slot_link(
     mut link: Link,
     key: SessionKey,
     slot: SlotId,
+    connection_epoch: u64,
     mut resume_cursors: std::collections::HashMap<SlotId, u64>,
     inbox: SlotInbox,
     sessions: Sessions,
@@ -1062,8 +1073,8 @@ pub async fn run_slot_link(
     // can emit no directive — `decide` bails until a framed turn gives it a
     // consensus coordinate — so this only accumulates state. Publishing it also
     // seeds the mesh sidecar for this slot.
-    let handshake_sample = sample_slot_conditions(link.connection(), slot);
-    crate::mesh::publish_conditions(&conditions, &key, slot, handshake_sample);
+    let handshake_sample = sample_slot_conditions(link.connection(), slot, connection_epoch);
+    crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
     let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
 
     // Announce this slot's presence to the mesh and record it into the session's
@@ -1081,7 +1092,14 @@ pub async fn run_slot_link(
     // client ignores connectivity until it cares — and a re-register (a later
     // reconnect feature) reuses this same signal. Independent of the session-start
     // and leave paths.
-    broadcast_connectivity(&sessions, &mesh_links, &key, slot, true);
+    broadcast_connectivity(
+        &sessions,
+        &mesh_links,
+        &key,
+        slot,
+        true,
+        Some(connection_epoch),
+    );
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -1100,7 +1118,14 @@ pub async fn run_slot_link(
             // nothing — still run the full departure/close protocol below so
             // peers and the coordinator hear about it now rather than only
             // after the coordinator's holdout reap.
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                false,
+            );
             return;
         }
     };
@@ -1118,7 +1143,14 @@ pub async fn run_slot_link(
             // Same rationale as the open_uni failure above: the beacon stream
             // came up but the control stream didn't, so this slot still never
             // forwarded a turn and gets the same full teardown.
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                false,
+            );
             return;
         }
     };
@@ -1228,7 +1260,14 @@ pub async fn run_slot_link(
                 VarInt::from_u32(RESUME_ANCHOR_INVALID_CLOSE),
                 b"resume anchor out of range",
             );
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, false);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                false,
+            );
             return;
         }
         link.anchor_receive_window(slot, anchor);
@@ -1255,7 +1294,14 @@ pub async fn run_slot_link(
                 %error,
                 "replaying a missed turn to a reconnecting client failed; closing slot link",
             );
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                leave_announced,
+            );
             return;
         }
     }
@@ -1276,7 +1322,7 @@ pub async fn run_slot_link(
     // and a reconnect for a slot whose own leave was decided was refused at
     // admission). Empty on a fresh dial: no session history, nothing missed.
     let (departures, directives) = consensus::leave_reconcile(&decision_makers, &key);
-    for (departed, ..) in departures {
+    for (departed, _, _, _, _, departed_epoch) in departures {
         if departed == slot {
             continue;
         }
@@ -1284,6 +1330,7 @@ pub async fn run_slot_link(
             &mut control_send,
             departed.0,
             false,
+            departed_epoch,
         )
         .await
         {
@@ -1294,7 +1341,14 @@ pub async fn run_slot_link(
                 %error,
                 "replaying a departure to a reconnecting client failed; closing slot link",
             );
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                leave_announced,
+            );
             return;
         }
     }
@@ -1312,7 +1366,14 @@ pub async fn run_slot_link(
                 %error,
                 "replaying a decided leave to a reconnecting client failed; closing slot link",
             );
-            end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+            end_slot_link(
+                &sessions,
+                &mesh_for_teardown,
+                &key,
+                slot,
+                connection_epoch,
+                leave_announced,
+            );
             return;
         }
     }
@@ -1343,16 +1404,20 @@ pub async fn run_slot_link(
                 // per packet (not per payload) is enough — all fresh payloads in
                 // one packet share the same connection path.
                 if should_sample_active_conditions(&received) {
-                    let sample = sample_slot_conditions(link.connection(), slot);
-                    crate::mesh::publish_conditions(&conditions, &key, slot, sample);
+                    let sample =
+                        sample_slot_conditions(link.connection(), slot, connection_epoch);
+                    let sample_is_current =
+                        crate::mesh::publish_conditions(&conditions, &key, slot, sample);
                     // The decision it may fire schedules against frames observed
                     // off validated turns below — never off raw packet claims —
                     // and is broadcast later at fan-out.
-                    let _ = consensus::ingest_local_condition(
-                        &decision_makers,
-                        &key,
-                        &sample,
-                    );
+                    if sample_is_current {
+                        let _ = consensus::ingest_local_condition(
+                            &decision_makers,
+                            &key,
+                            &sample,
+                        );
+                    }
                 }
                 for payload in received.fresh {
                     match validate_turn(slot, payload) {
@@ -1481,12 +1546,13 @@ pub async fn run_slot_link(
             // control-stream write here.
             pushed = conn_push_rx.recv(), if conn_push_alive => {
                 match pushed {
-                    Some((subject, connected)) => {
+                    Some((subject, connected, subject_epoch)) => {
                         if let Err(error) =
                             rally_point_transport::control::send_control_connectivity(
                                 &mut control_send,
                                 subject.0,
                                 connected,
+                                subject_epoch,
                             )
                             .await
                         {
@@ -1713,6 +1779,17 @@ pub async fn run_slot_link(
                             slot = slot.0,
                             "client announced clean leave",
                         );
+                        // Retire the active generation before its terminal
+                        // SlotDeparted is enqueued. A concurrently joining mesh
+                        // link snapshots this same registry, so it now observes
+                        // either true(E) before the departure or no active E at
+                        // all â€” never departure followed by a stale replay-true.
+                        let _ = crate::mesh::unpublish_conditions(
+                            &conditions,
+                            &key,
+                            slot,
+                            Some(connection_epoch),
+                        );
                         announce_departure(
                             &drop_holds,
                             &decision_makers,
@@ -1721,6 +1798,7 @@ pub async fn run_slot_link(
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
+                            Some(connection_epoch),
                         );
                         leave_announced = true;
                         // The client's driver never expects an ack for the
@@ -1997,9 +2075,12 @@ pub async fn run_slot_link(
                 if consensus::session_started(&decision_makers, &key) {
                     pre_start_sampling = false;
                 } else {
-                    let sample = sample_slot_conditions(link.connection(), slot);
-                    crate::mesh::publish_conditions(&conditions, &key, slot, sample);
-                    let _ = consensus::ingest_local_condition(&decision_makers, &key, &sample);
+                    let sample =
+                        sample_slot_conditions(link.connection(), slot, connection_epoch);
+                    if crate::mesh::publish_conditions(&conditions, &key, slot, sample) {
+                        let _ =
+                            consensus::ingest_local_condition(&decision_makers, &key, &sample);
+                    }
                     pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
                 }
             }
@@ -2051,7 +2132,14 @@ pub async fn run_slot_link(
     // own idle timeout instead of freeing promptly.
     link.connection()
         .close(VarInt::from_u32(0), b"slot link ended");
-    end_slot_link(&sessions, &mesh_for_teardown, &key, slot, leave_announced);
+    end_slot_link(
+        &sessions,
+        &mesh_for_teardown,
+        &key,
+        slot,
+        connection_epoch,
+        leave_announced,
+    );
 }
 
 /// Runs the full departure/close protocol for a slot link that has ended,
@@ -2071,6 +2159,7 @@ fn end_slot_link(
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     slot: SlotId,
+    connection_epoch: u64,
     leave_announced: bool,
 ) {
     mesh.decision_makers.flight_recorder().record(
@@ -2087,7 +2176,8 @@ fn end_slot_link(
     // a reconnect can't clobber this connection's cleanup.
     crate::chat::deregister_member(&mesh.chat, key, slot);
     let session_emptied = deregister(sessions, key, slot);
-    crate::mesh::unpublish_conditions(&mesh.conditions, key, slot);
+    let retired_connection =
+        crate::mesh::unpublish_conditions(&mesh.conditions, key, slot, Some(connection_epoch));
     // Trigger A (synced player-leave): this client's link ended, so it has left
     // the game. Announce the departure — unless a clean leave-intent already did,
     // with the "left" reason — as a "dropped" one: record it, tell the peer relays
@@ -2102,13 +2192,12 @@ fn end_slot_link(
     // the roster from `deregister` above, so `fan_out_leave` targets only
     // survivors) and across the mesh to peer survivors — the turn stream has
     // stopped for them, so the reliable stream is the only channel that unstalls.
-    if !leave_announced {
+    if retired_connection && !leave_announced {
         // The link died without a clean leave — a disconnect. Tell every slot
         // (local and across the mesh) this one is no longer connected, immediately
         // and independent of the hold below, so survivors' displays reflect the
         // disconnect ~at once even while their turn stream stalls waiting on it.
-        broadcast_connectivity(sessions, &mesh.links, key, slot, false);
-        announce_departure(
+        if announce_departure(
             &mesh.drop_holds,
             &mesh.decision_makers,
             sessions,
@@ -2116,7 +2205,17 @@ fn end_slot_link(
             key,
             slot,
             LEAVE_REASON_DROPPED,
-        );
+            Some(connection_epoch),
+        ) {
+            broadcast_connectivity(
+                sessions,
+                &mesh.links,
+                key,
+                slot,
+                false,
+                Some(connection_epoch),
+            );
+        }
     }
     // Forget this slot's condition history in the decision-maker so a departed
     // client's stale stats don't outlive its connection — a no-op when the
@@ -2124,8 +2223,24 @@ fn end_slot_link(
     // where no maker-side departure applies. The maker itself lives until the
     // session ends (the coordinator drops the descriptor); the departure record
     // and any cached leave are kept, so a promotion can still re-derive the leave.
-    if let Some(maker) = mesh.decision_makers.lock().get_mut(key) {
-        maker.remove_slot(slot);
+    if retired_connection {
+        // Keep the roster lock across the reoccupation check and maker cleanup,
+        // matching `announce_departure`'s race fence. A replacement can register
+        // after this old task deregisters but before it reaches cleanup; if it
+        // won that race, even a maker whose new epoch has not been activated yet
+        // belongs to the live replacement and must not be erased here.
+        let roster = sessions.lock();
+        let reoccupied = roster
+            .get(key)
+            .is_some_and(|slots| slots.contains_key(&slot));
+        if !reoccupied {
+            let _ = consensus::remove_slot_for_epoch(
+                &mesh.decision_makers,
+                key,
+                slot,
+                Some(connection_epoch),
+            );
+        }
     }
     // This client leaving may hand the session's buffer authority to the next
     // relay in the order — the presence-driven half of the handoff. The local
@@ -2278,6 +2393,7 @@ pub(crate) fn maybe_close_emptied_session(
 /// racing it, and its own decide path (`decide_and_broadcast_leave` →
 /// `fan_out_leave`) needs the roster lock itself — holding it here too would
 /// deadlock.
+#[allow(clippy::too_many_arguments)]
 fn announce_departure(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
@@ -2286,7 +2402,8 @@ fn announce_departure(
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
-) {
+    connection_epoch: Option<u64>,
+) -> bool {
     let roster_guard = (reason == LEAVE_REASON_DROPPED).then(|| sessions.lock());
     if let Some(roster) = &roster_guard
         && roster
@@ -2296,7 +2413,7 @@ fn announce_departure(
         // A reconnect already reclaimed this seat; its own post-register
         // admission (current state, not a stale snapshot) is the sole authority
         // on this slot now.
-        return;
+        return false;
     }
 
     // Read the last observed frame, the reachability ceiling, and the slot's
@@ -2309,7 +2426,27 @@ fn announce_departure(
     let last_frame = consensus::slot_frame(decision_makers, key, slot);
     let reachable = consensus::reachable_frame(decision_makers, key, slot);
     let result = consensus::result_for(decision_makers, key, slot);
-    consensus::record_departure(
+    let outcome = if reason == LEAVE_REASON_DROPPED {
+        // A dropped departure and its reconnect hold are one transition. The
+        // hold lock stays held while `record` takes the maker lock, then the
+        // hold is installed before either becomes externally observable.
+        drop_holds.record_and_maybe_hold(key, slot, || {
+            let outcome = consensus::record_departure_for_epoch_outcome(
+                decision_makers,
+                key,
+                slot,
+                last_frame,
+                reachable,
+                result.clone(),
+                reason,
+                connection_epoch,
+            );
+            (
+                outcome,
+                outcome == consensus::DepartureRecordOutcome::Pending,
+            )
+        })
+    } else if consensus::record_departure_for_epoch(
         decision_makers,
         key,
         slot,
@@ -2317,7 +2454,15 @@ fn announce_departure(
         reachable,
         result.clone(),
         reason,
-    );
+        connection_epoch,
+    ) {
+        consensus::DepartureRecordOutcome::Pending
+    } else {
+        consensus::DepartureRecordOutcome::Rejected
+    };
+    if outcome != consensus::DepartureRecordOutcome::Pending {
+        return false;
+    }
     crate::mesh::fan_out_slot_departed(
         mesh_links,
         key,
@@ -2326,6 +2471,7 @@ fn announce_departure(
         reachable,
         result,
         reason,
+        connection_epoch,
     );
     // Turn the recorded departure into the synced leave — but a *drop* is only
     // marked as an undecided hold, never decided here: survivors are removed on a
@@ -2343,6 +2489,7 @@ fn announce_departure(
         slot,
         reason,
     );
+    true
 }
 
 /// Turns a recorded departure into the one synced leave — but only for a *clean*
@@ -2784,6 +2931,7 @@ fn should_sample_active_conditions(received: &Received) -> bool {
 fn sample_slot_conditions(
     connection: &rally_point_transport::quinn::Connection,
     slot: SlotId,
+    connection_epoch: u64,
 ) -> SlotConditions {
     let path = connection.stats().path;
     SlotConditions {
@@ -2791,6 +2939,7 @@ fn sample_slot_conditions(
         rtt_us: crate::mesh::rtt_us(path.rtt),
         lost_packets: path.lost_packets,
         sent_packets: path.sent_packets,
+        connection_epoch: Some(connection_epoch),
     }
 }
 #[cfg(test)]
@@ -2897,7 +3046,7 @@ mod tests {
 
         // Slot 1's link dies without a clean leave; slot 0 remains, so the
         // session stays open and the recording keeps accumulating.
-        end_slot_link(&sessions, &mesh, &k, SlotId(1), false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(1), 0, false);
         let events: Vec<_> = flight.events(&k).into_iter().map(|r| r.event).collect();
         assert!(
             events.contains(&crate::flight_recorder::FlightEvent::SlotDisconnected { slot: 1 }),
@@ -2910,7 +3059,7 @@ mod tests {
 
         // The last slot leaves: the close event seals the recording and the
         // detached flush retires it (discarded — no sink configured).
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
         for _ in 0..100 {
             if flight.recorded_sessions().is_empty() {
                 break;
@@ -2944,7 +3093,7 @@ mod tests {
         );
 
         // The only local slot leaves: the session-emptying teardown fires.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
         assert!(
             !mesh.seen.lock().contains_key(&k),
             "the emptied session's seen-registry entry must not survive its teardown",
@@ -2988,7 +3137,7 @@ mod tests {
 
         // The only local slot's link dies without a clean leave — the emptying
         // that must NOT close the session while the drop is held.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
 
         assert!(
             mesh.drop_holds.is_pending(&k, SlotId(0)),
@@ -3068,7 +3217,7 @@ mod tests {
             SlotId(0),
             LEAVE_REASON_LEFT,
         );
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), true);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, true);
 
         assert!(
             !mesh.seen.lock().contains_key(&k),
@@ -3397,6 +3546,7 @@ mod tests {
                     rtt_us: 150_000,
                     lost_packets: 0,
                     sent_packets: 100,
+                    connection_epoch: None,
                 }],
             },
         )
@@ -3824,6 +3974,7 @@ mod tests {
             &k,
             SlotId(1),
             LEAVE_REASON_DROPPED,
+            None,
         );
 
         assert!(
@@ -3835,6 +3986,56 @@ mod tests {
             "no departure record was written against the already-reconnected slot -- \
              an orphaned record would wrongly refuse every later reconnect for the slot",
         );
+    }
+
+    #[test]
+    fn old_link_teardown_cannot_erase_a_replacement_epoch() {
+        use crate::consensus::Authority;
+        use rally_point_proto::control::BufferBounds;
+        use rally_point_proto::ids::GameFrameCount;
+        use rally_point_proto::messages::SlotConditions;
+
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        let k = key();
+        let _ = consensus::sync_maker(
+            &mesh.decision_makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let replacement = SlotConditions {
+            slot: 0,
+            rtt_us: 30_000,
+            lost_packets: 0,
+            sent_packets: 1,
+            connection_epoch: Some(22),
+        };
+        crate::mesh::activate_conditions(&mesh.conditions, &k, SlotId(0), replacement);
+        let _ = consensus::ingest_local_condition(&mesh.decision_makers, &k, &replacement);
+        consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(40));
+
+        // The old task has already freed its roster seat and is finishing its
+        // cleanup after the replacement published epoch 22.
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 11, false);
+
+        let published = crate::mesh::snapshot_conditions(&mesh.conditions, &k)
+            .expect("replacement conditions survive stale teardown");
+        assert_eq!(published.slots[0].connection_epoch, Some(22));
+        assert_eq!(
+            consensus::slot_frame(&mesh.decision_makers, &k, SlotId(0)),
+            Some(GameFrameCount(40)),
+        );
+        assert!(!consensus::slot_departed(
+            &mesh.decision_makers,
+            &k,
+            SlotId(0),
+        ));
+        assert!(!mesh.drop_holds.is_pending(&k, SlotId(0)));
     }
 
     /// The reconnection race caught live: on a single relay, both clients' links
@@ -3905,6 +4106,7 @@ mod tests {
             &k,
             SlotId(0),
             LEAVE_REASON_DROPPED,
+            None,
         );
         report_own_presence(
             &sessions,
@@ -3920,6 +4122,7 @@ mod tests {
             &k,
             SlotId(1),
             LEAVE_REASON_DROPPED,
+            None,
         );
         report_own_presence(
             &sessions,
@@ -4005,12 +4208,12 @@ mod tests {
         g0.disarm();
         g1.disarm();
 
-        fan_out_connectivity(&sessions, &k, SlotId(3), false);
+        fan_out_connectivity(&sessions, &k, SlotId(3), false, None);
 
         let a = inbox0.conn_push_rx.try_recv().expect("slot 0 hears it");
-        assert_eq!(a, (SlotId(3), false));
+        assert_eq!(a, (SlotId(3), false, None));
         let b = inbox1.conn_push_rx.try_recv().expect("slot 3 hears it too");
-        assert_eq!(b, (SlotId(3), false));
+        assert_eq!(b, (SlotId(3), false, None));
     }
 
     // -- fully-abandoned session teardown --

@@ -228,6 +228,9 @@ fn spawn_mesh_link_timed(
     tokio::task::JoinHandle<mesh::MeshLinkExit>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let attempt = mesh::new_mesh_link_attempt();
+    let lease = mesh::claim_mesh_link(&mesh, RelayId(0), &attempt)
+        .expect("raw test driver claims its peer lease");
     // These raw link pairs skip the hello exchange, so build the presence
     // streams the production edge would have set up: an outbound uni-stream
     // and a reader accepting the peer's. Presence isn't the subject here; the
@@ -267,8 +270,11 @@ fn spawn_mesh_link_timed(
         };
         mesh::run_mesh_link(
             link,
-            presence_io,
-            control_io,
+            mesh::MeshLinkIo {
+                presence: presence_io,
+                control: control_io,
+                lease,
+            },
             rx,
             sessions,
             mesh,

@@ -302,7 +302,7 @@ fn relay_one_with_peer_link() -> (MeshControl, mpsc::UnboundedReceiver<MeshComma
         std::sync::Arc::default(),
     );
     let (tx2, rx2) = mpsc::unbounded_channel::<MeshCommand>();
-    control.register_link(RelayId(2), tx2);
+    let _ = control.register_link(RelayId(2), 1, tx2);
     (control, rx2)
 }
 

@@ -59,7 +59,7 @@ fn empty_fleet_peers() -> FleetMeshPeersReader {
 
 /// What an established mesh link surfaces on the `links` channel: the peer's id and
 /// the command sender that drives `Join`/`Leave` on that link.
-type LinkHandle = (RelayId, mpsc::UnboundedSender<mesh::MeshCommand>);
+type LinkHandle = mesh::MeshLinkHandle;
 
 struct Keypair {
     pair: Ed25519KeyPair,
@@ -275,8 +275,7 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
 
     // B's accept drain: spawns a `run_mesh_link` driver for each peer relay
     // that dials in, returning `(peer id, command sender)` on `links_b_rx`.
-    let (links_b_tx, mut links_b_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -289,8 +288,7 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     // A dials B. The dial establishes the connection and spawns a
     // `run_mesh_link` driver, returning `(peer id, command sender)` on
     // `links_a_rx`.
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let dial = mesh_edge::MeshDial {
@@ -312,11 +310,11 @@ async fn cross_relay_turn_through_production_mesh_connection_half() -> Result<()
     // Collect each side's link, labeled with the peer it reaches. A dialed B,
     // so A's link is labeled with B's id; B read the dialer's identity hello,
     // so B's link is labeled with A's id.
-    let (peer_a, cmds_a) = links_a_rx
+    let (peer_a, _generation_a, cmds_a) = links_a_rx
         .recv()
         .await
         .ok_or("dial side did not produce a link")?;
-    let (peer_b, cmds_b) = links_b_rx
+    let (peer_b, _generation_b, cmds_b) = links_b_rx
         .recv()
         .await
         .ok_or("accept side did not produce a link")?;
@@ -384,8 +382,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     let control_a = mesh_control::MeshControl::new(RelayId(1), Arc::default(), Arc::default());
     let control_b = mesh_control::MeshControl::new(RelayId(2), Arc::default(), Arc::default());
 
-    let (links_b_tx, mut links_b_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -395,8 +392,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         false,
     ));
 
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -419,16 +415,16 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     // Register each established link in its relay's control, keyed by the peer
     // id the connection half labeled it with. Awaiting the link makes this
     // deterministic — no sleeping to hope the link came up.
-    let (peer_a, cmds_a) = links_a_rx
+    let (peer_a, generation_a, cmds_a) = links_a_rx
         .recv()
         .await
         .ok_or("dial side did not produce a link")?;
-    control_a.register_link(peer_a, cmds_a);
-    let (peer_b, cmds_b) = links_b_rx
+    let _ = control_a.register_link(peer_a, generation_a, cmds_a);
+    let (peer_b, generation_b, cmds_b) = links_b_rx
         .recv()
         .await
         .ok_or("accept side did not produce a link")?;
-    control_b.register_link(peer_b, cmds_b);
+    let _ = control_b.register_link(peer_b, generation_b, cmds_b);
 
     // The coordinator pushes each relay its descriptor: A's only peer is B, and
     // B's only peer is A. Applying it emits the targeted Join on the link the
@@ -532,8 +528,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         relay_b.mesh.presence.clone(),
     );
 
-    let (links_b_tx, mut links_b_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -542,8 +537,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         empty_fleet_peers(),
         false,
     ));
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -562,16 +556,16 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         links_a_tx,
     ));
 
-    let (peer_a, cmds_a) = links_a_rx
+    let (peer_a, generation_a, cmds_a) = links_a_rx
         .recv()
         .await
         .ok_or("dial side did not produce a link")?;
-    control_a.register_link(peer_a, cmds_a);
-    let (peer_b, cmds_b) = links_b_rx
+    let _ = control_a.register_link(peer_a, generation_a, cmds_a);
+    let (peer_b, generation_b, cmds_b) = links_b_rx
         .recv()
         .await
         .ok_or("accept side did not produce a link")?;
-    control_b.register_link(peer_b, cmds_b);
+    let _ = control_b.register_link(peer_b, generation_b, cmds_b);
 
     // The coordinator ranked A first (the session's home relay).
     let descriptor_for = |peers: Vec<RelayPeer>| SessionDescriptor {
@@ -678,8 +672,7 @@ async fn equal_relay_ids_do_not_dial() -> Result<(), AnyError> {
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 1);
 
-    let (links_tx, mut links_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_tx, mut links_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -716,8 +709,7 @@ async fn higher_id_relay_does_not_dial_lower_id_peer() -> Result<(), AnyError> {
     let relay_a = Relay::start(&tenant, 2); // higher id
     let relay_b = Relay::start(&tenant, 1); // lower id (would dial A)
 
-    let (links_tx, mut links_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_tx, mut links_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -762,8 +754,7 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
     let relay_a = Relay::start(&tenant, 1);
     let mut relay_b = Relay::start(&tenant, 2);
 
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -791,10 +782,11 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
         .await
         .map_err(|_| "B did not accept A's first dial within 2s")?
         .ok_or("B's accept channel closed")?;
-    let (peer1, _cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface its first link within 2s")?
-        .ok_or("A's links channel closed")?;
+    let (peer1, _generation1, _cmds1) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface its first link within 2s")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer1, RelayId(2), "A's first link reaches B");
 
     // The link's connection fails: B application-closes it, so A's driver exits
@@ -807,10 +799,11 @@ async fn dial_redials_after_the_link_connection_fails() -> Result<(), AnyError> 
         .await
         .map_err(|_| "A did not redial after the connection failed")?
         .ok_or("B's accept channel closed")?;
-    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface a link after redialing")?
-        .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface a link after redialing")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
 
     drop(relay_a);
@@ -835,8 +828,7 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
     let relay_a = Relay::start(&tenant, 1);
     let mut relay_b = Relay::start(&tenant, 2);
 
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -866,10 +858,11 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
         .await
         .map_err(|_| "B did not accept A's first dial within 2s")?
         .ok_or("B's accept channel closed")?;
-    let (peer1, _cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface its first link within 2s")?
-        .ok_or("A's links channel closed")?;
+    let (peer1, _generation1, _cmds1) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface its first link within 2s")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer1, RelayId(2), "A's first link reaches B");
 
     // The mesh control stream is one bidirectional stream the dialer (A) opens
@@ -888,10 +881,11 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
         .await
         .map_err(|_| "A did not redial after its peer's control stream died")?
         .ok_or("B's accept channel closed")?;
-    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface a link after redialing")?
-        .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface a link after redialing")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
 
     drop(relay_a);
@@ -928,8 +922,7 @@ async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
     let relay_a = Relay::start(&tenant, 1);
     let mut relay_b = Relay::start(&tenant, 2);
 
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -957,10 +950,11 @@ async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
         .await
         .map_err(|_| "B did not accept A's first dial within 2s")?
         .ok_or("B's accept channel closed")?;
-    let (peer1, cmds_a) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface its first link within 2s")?
-        .ok_or("A's links channel closed")?;
+    let (peer1, _generation1, cmds_a) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface its first link within 2s")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer1, RelayId(2), "A's first link reaches B");
 
     // Join the session so `fan_out_to_mesh` finds a registered target, then let
@@ -993,10 +987,11 @@ async fn dial_redials_after_the_forward_queue_fills() -> Result<(), AnyError> {
         .await
         .map_err(|_| "A did not redial after its forward queue filled")?
         .ok_or("B's accept channel closed")?;
-    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface a link after redialing")?
-        .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface a link after redialing")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer2, RelayId(2), "A's redialed link reaches B");
 
     drop(relay_a);
@@ -1049,8 +1044,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 2);
 
-    let (links_b_tx, mut links_b_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -1060,8 +1054,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         false,
     ));
 
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
@@ -1083,14 +1076,16 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         Duration::from_millis(50),
     ));
 
-    let (peer_a1, cmds_a1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface its first link within 2s")?
-        .ok_or("A's links channel closed")?;
-    let (peer_b1, cmds_b1) = tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-        .await
-        .map_err(|_| "B did not surface its first link within 2s")?
-        .ok_or("B's links channel closed")?;
+    let (peer_a1, _generation_a1, cmds_a1) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface its first link within 2s")?
+            .ok_or("A's links channel closed")?;
+    let (peer_b1, _generation_b1, cmds_b1) =
+        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
+            .await
+            .map_err(|_| "B did not surface its first link within 2s")?
+            .ok_or("B's links channel closed")?;
     assert_eq!(peer_a1, RelayId(2));
     assert_eq!(peer_b1, RelayId(1));
 
@@ -1163,14 +1158,16 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
 
     // A's driver resets on the full queue and redials; B's real accept loop
     // takes the fresh connection and surfaces a new link.
-    let (peer_a2, cmds_a2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "A did not surface a link after redialing")?
-        .ok_or("A's links channel closed")?;
-    let (peer_b2, cmds_b2) = tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-        .await
-        .map_err(|_| "B did not surface a link after A redialed")?
-        .ok_or("B's links channel closed")?;
+    let (peer_a2, _generation_a2, cmds_a2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "A did not surface a link after redialing")?
+            .ok_or("A's links channel closed")?;
+    let (peer_b2, _generation_b2, cmds_b2) =
+        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
+            .await
+            .map_err(|_| "B did not surface a link after A redialed")?
+            .ok_or("B's links channel closed")?;
     assert_eq!(peer_a2, RelayId(2));
     assert_eq!(peer_b2, RelayId(1));
 
@@ -1223,8 +1220,7 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
     // A (id 1) dials; B (id 2) accepts via the production accept drain.
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 2);
-    let (links_b_tx, _links_b_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_b_tx, _links_b_rx) = mpsc::channel::<LinkHandle>(8);
     tokio::spawn(mesh_edge::run_mesh_accept(
         relay_b.mesh_accept_rx,
         Arc::clone(&relay_b.sessions),
@@ -1239,8 +1235,7 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
     // the desired peer carries — the production two-relay shape, where each
     // relay self-signs at startup and only the coordinator-relayed cert links
     // them.
-    let (links_a_tx, mut links_a_rx) =
-        mpsc::channel::<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>(8);
+    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
     let (peers_tx, peers_rx) = watch::channel(Vec::<RelayPeer>::new());
     let (dial_chain, dial_key, _) = self_signed();
     let config = mesh_dialer::DialerConfig {
@@ -1264,19 +1259,21 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
         cert_der: relay_b.ca.to_vec(),
         relay_addrs: vec![],
     }])?;
-    let (peer1, cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer did not establish a link to the desired peer")?
-        .ok_or("A's links channel closed")?;
+    let (peer1, _generation1, cmds1) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer did not establish a link to the desired peer")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer1, RelayId(2), "the dialed link reaches B");
 
     // The link winds down (its command sender is dropped). B is still desired, so
     // the dialer re-establishes the link.
     drop(cmds1);
-    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer did not re-establish the link after it ended")?
-        .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer did not re-establish the link after it ended")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer2, RelayId(2), "the re-established link reaches B");
 
     drop(relay_a);
@@ -1356,18 +1353,20 @@ async fn dialer_retargets_a_link_when_a_peer_moves_to_a_new_address() -> Result<
     // Peer 2 at B's address: the dialer dials B. Waiting for the link before moving
     // the peer synchronizes on the dialer having applied the first address.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
-    let (peer1, _cmds1) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer did not dial the peer at its first address")?
-        .ok_or("A's links channel closed")?;
+    let (peer1, _generation1, _cmds1) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer did not dial the peer at its first address")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer1, RelayId(2));
 
     // Peer 2 moves to C's address: the dialer retargets and a fresh link forms.
     peers_tx.send(vec![peer_at(2, relay_c.addr)])?;
-    let (peer2, _cmds2) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer did not retarget to the peer's new address")?
-        .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer did not retarget to the peer's new address")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer2, RelayId(2));
 
     drop(relay_a);
@@ -1409,10 +1408,11 @@ async fn dialer_retargets_away_from_an_unreachable_address() -> Result<(), AnyEr
     // Peer 2 reappears at B's live address: the stuck supervisor must be cancelled
     // and a fresh dial started, or the dedup keeps it stuck on the dead address.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
-    let (peer, _cmds) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer stayed stuck on the dead address after the peer moved")?
-        .ok_or("A's links channel closed")?;
+    let (peer, _generation, _cmds) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer stayed stuck on the dead address after the peer moved")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer, RelayId(2));
 
     drop(relay_a);
@@ -1433,10 +1433,11 @@ async fn removing_a_serving_peer_cleans_up_its_mesh_forwarding_state() -> Result
     // Dial B, then join a session on the established link (standing in for a
     // descriptor-driven Join); the join registers a mesh forward channel.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
-    let (_peer, cmds) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dialer did not establish the link")?
-        .ok_or("A's links channel closed")?;
+    let (_peer, _generation, cmds) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dialer did not establish the link")?
+            .ok_or("A's links channel closed")?;
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(1),
@@ -1627,10 +1628,11 @@ async fn an_empty_fleet_map_admits_any_peer_certificate() -> Result<(), AnyError
         links_a_tx,
     ));
 
-    let (peer_id, _cmds) = tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-        .await
-        .map_err(|_| "the link should establish with enforcement off")?
-        .ok_or("accept side did not produce a link")?;
+    let (peer_id, _generation, _cmds) =
+        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
+            .await
+            .map_err(|_| "the link should establish with enforcement off")?
+            .ok_or("accept side did not produce a link")?;
     assert_eq!(peer_id, RelayId(1));
     drop(relay_a);
     Ok(())
@@ -1959,15 +1961,17 @@ async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(),
     // The link establishes on the second candidate — well within one attempt
     // (the 2s bound is far under the supervisor's redial delay would allow for
     // a second attempt to even begin mattering here).
-    let (peer_a, _cmds_a) = tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-        .await
-        .map_err(|_| "the dial did not fall back to the reachable candidate")?
-        .ok_or("A's links channel closed")?;
+    let (peer_a, _generation_a, _cmds_a) =
+        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
+            .await
+            .map_err(|_| "the dial did not fall back to the reachable candidate")?
+            .ok_or("A's links channel closed")?;
     assert_eq!(peer_a, RelayId(2));
-    let (peer_b, _cmds_b) = tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-        .await
-        .map_err(|_| "the acceptor did not surface the link")?
-        .ok_or("B's links channel closed")?;
+    let (peer_b, _generation_b, _cmds_b) =
+        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
+            .await
+            .map_err(|_| "the acceptor did not surface the link")?
+            .ok_or("B's links channel closed")?;
     assert_eq!(peer_b, RelayId(1));
 
     drop(relay_a);
@@ -2036,10 +2040,10 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
         relay_a.mesh.clone(),
         links_a_tx,
     ));
-    let (peer_a, cmds_a) = links_a_rx.recv().await.ok_or("no dial-side link")?;
-    control_a.register_link(peer_a, cmds_a);
-    let (peer_b, cmds_b) = links_b_rx.recv().await.ok_or("no accept-side link")?;
-    control_b.register_link(peer_b, cmds_b);
+    let (peer_a, generation_a, cmds_a) = links_a_rx.recv().await.ok_or("no dial-side link")?;
+    let _ = control_a.register_link(peer_a, generation_a, cmds_a);
+    let (peer_b, generation_b, cmds_b) = links_b_rx.recv().await.ok_or("no accept-side link")?;
+    let _ = control_b.register_link(peer_b, generation_b, cmds_b);
 
     // The coordinator's descriptors: each relay names the other as its peer,
     // with A ranked first (the authority).

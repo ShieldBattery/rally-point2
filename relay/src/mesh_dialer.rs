@@ -98,9 +98,9 @@ pub struct DialerConfig {
     pub sessions: Sessions,
     /// The relay's mesh state, shared into each link driver.
     pub mesh: MeshState,
-    /// Where each established link surfaces its `(peer id, command sender)`, the
-    /// same collector that registers links into the Join source.
-    pub links: mpsc::Sender<(RelayId, mpsc::UnboundedSender<mesh::MeshCommand>)>,
+    /// Where each established link surfaces its peer id, local generation, and
+    /// command sender to the Join-source collector.
+    pub links: mpsc::Sender<mesh::MeshLinkHandle>,
     /// How long a supervisor waits before redialing after a failed connection.
     pub redial_delay: Duration,
 }
