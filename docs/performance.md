@@ -112,6 +112,14 @@ the turn ring already holds its record lock. Measurement therefore adds neither
 a second per-turn atomic update nor a new lock acquisition. Its CPU-per-work
 fields are deliberately reported against three denominators:
 
+Use `cpu_cores_used` as the primary capacity numerator. It is the container's
+CPU-time delta divided by monotonic wall time (`1.0` is one fully occupied core),
+so it remains comparable when two Fargate tasks land on different hosts.
+`cpu_pct` is retained as Docker's conventional host-system-counter formula, but
+that host-relative counter is noticeably noisier across Fargate placements.
+For a 0.5-vCPU task, divide `cpu_cores_used` by `0.5` (or multiply by 200) to get
+task-allotment utilization; for a 1-vCPU task, multiply by 100.
+
 - CPU ns / validated turn is useful for identical client-ingress and topology
   runs;
 - CPU ns / ingress turn divides by locally validated plus distinct mesh-origin

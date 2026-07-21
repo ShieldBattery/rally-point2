@@ -193,6 +193,7 @@ async fn run(client: StatsClient, uri: Uri, interval: Duration, context: Reporte
         tracing::info!(
             relay_id = context.relay_id,
             cpu_pct = ?derived.cpu_pct,
+            cpu_cores_used = ?derived.cpu_cores_used,
             mem_mib = derived.mem_working_set_mib,
             mem_limit_mib = derived.mem_limit_mib,
             net_rx_mibps = ?derived.net_rx_mibps,
@@ -365,6 +366,10 @@ struct Derived {
     /// `None` with no previous sample, or when the system-time counter didn't
     /// advance (a non-positive delta) — never a fabricated rate.
     cpu_pct: Option<f64>,
+    /// Container CPU nanoseconds divided by wall-clock nanoseconds. Unlike
+    /// `cpu_pct`, this does not depend on the host-wide system CPU counter: 1.0
+    /// means one full core and 0.5 means half a core.
+    cpu_cores_used: Option<f64>,
     mem_working_set_mib: f64,
     mem_limit_mib: f64,
     /// `None` with no previous sample, or a non-positive elapsed time.
@@ -456,9 +461,12 @@ fn derive_work(
 /// both cumulative counters, so a non-advancing or reversed system counter
 /// (the delta is zero or would underflow) makes CPU% unknowable for this tick
 /// rather than a divide-by-zero or a nonsensical value — `cpu_pct` is `None`
-/// in that case. The same shape governs the network rates: a byte counter
-/// that doesn't advance, or an elapsed time of zero, yields `None` rather than
-/// a fabricated rate.
+/// in that case. `cpu_cores_used` instead divides the container's CPU-time
+/// delta directly by this reporter's monotonic elapsed time, avoiding
+/// host-counter noise and making it the preferred capacity metric across
+/// different Fargate placements. The same elapsed-time guard governs the
+/// network rates: zero elapsed time yields `None` rather than a fabricated
+/// rate.
 fn derive(prev: Option<&Sample>, curr: &Sample, elapsed: Duration) -> Derived {
     let cpu_pct = prev.and_then(|prev| {
         let system_delta = curr.cpu_system_usage.checked_sub(prev.cpu_system_usage)?;
@@ -468,6 +476,17 @@ fn derive(prev: Option<&Sample>, curr: &Sample, elapsed: Duration) -> Derived {
         let cpu_delta = curr.cpu_total_usage.saturating_sub(prev.cpu_total_usage);
         Some((cpu_delta as f64 / system_delta as f64) * curr.online_cpus as f64 * 100.0)
     });
+
+    let elapsed_nanos = elapsed.as_nanos();
+    let cpu_cores_used = if elapsed_nanos > 0 {
+        prev.and_then(|prev| {
+            curr.cpu_total_usage
+                .checked_sub(prev.cpu_total_usage)
+                .map(|delta| delta as f64 / elapsed_nanos as f64)
+        })
+    } else {
+        None
+    };
 
     let mem_working_set = curr.mem_usage.saturating_sub(curr.mem_inactive_file);
 
@@ -487,6 +506,7 @@ fn derive(prev: Option<&Sample>, curr: &Sample, elapsed: Duration) -> Derived {
 
     Derived {
         cpu_pct,
+        cpu_cores_used,
         mem_working_set_mib: mem_working_set as f64 / MIB,
         mem_limit_mib: curr.mem_limit as f64 / MIB,
         net_rx_mibps: net_rates.map(|(rx, _)| rx),
@@ -510,6 +530,7 @@ mod tests {
         };
         let derived = derive(None, &curr, Duration::from_secs(2));
         assert_eq!(derived.cpu_pct, None);
+        assert_eq!(derived.cpu_cores_used, None);
     }
 
     #[test]
@@ -530,6 +551,7 @@ mod tests {
         };
         let derived = derive(Some(&prev), &curr, Duration::from_secs(2));
         assert_eq!(derived.cpu_pct, Some(100.0));
+        assert_eq!(derived.cpu_cores_used, Some(0.25));
     }
 
     #[test]
@@ -568,6 +590,31 @@ mod tests {
         };
         let derived = derive(Some(&prev), &curr, Duration::from_secs(2));
         assert_eq!(derived.cpu_pct, None);
+    }
+
+    #[test]
+    fn cpu_cores_used_is_none_on_zero_elapsed_or_a_reset_container_counter() {
+        let prev = Sample {
+            cpu_total_usage: 1_000,
+            ..Default::default()
+        };
+        let advanced = Sample {
+            cpu_total_usage: 2_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            derive(Some(&prev), &advanced, Duration::ZERO).cpu_cores_used,
+            None,
+        );
+
+        let reset = Sample {
+            cpu_total_usage: 500,
+            ..Default::default()
+        };
+        assert_eq!(
+            derive(Some(&prev), &reset, Duration::from_secs(1)).cpu_cores_used,
+            None,
+        );
     }
 
     // --- relay work efficiency ---
