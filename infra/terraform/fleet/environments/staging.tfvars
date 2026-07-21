@@ -7,11 +7,10 @@ coordinator_url = "https://staging-rp2-coordinator.shieldbattery.net"
 # whatever `latest` currently points at.
 relay_image_tag = "latest"
 
-# Half the production size: staging's day-to-day sessions never approach the
-# ~300-connected-player allowance ceiling measured for this class (prod runs
-# 1 vCPU, whose ceiling sits near 1000+). A load-test round that needs the
-# production ceiling bumps these to match prod.tfvars for the run and drops
-# them back after.
+# Half the production size: staging's day-to-day sessions stay below the
+# topology-dependent load-test targets for this class. A load-test round that
+# needs the production envelope bumps these to match prod.tfvars for the run
+# and drops them back afterward.
 task_cpu    = 512
 task_memory = 1024
 

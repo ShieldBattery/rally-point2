@@ -14,6 +14,11 @@ Neither harness changes the transport model. In particular, benchmark results
 must never be used to justify ordered delivery, timeout retransmission, or
 relay-side turn reordering; those would measure a different protocol.
 
+The first staging capacity sweep and its interpretation are recorded in
+[`staging-load-baseline-2026-07.md`](staging-load-baseline-2026-07.md). Treat it
+as a planning baseline, not a substitute for repeating the matrix after a
+material hot-path, runtime, or infrastructure change.
+
 ## Microbenchmarks
 
 The suites live in `transport/benches/hot_paths.rs` and
