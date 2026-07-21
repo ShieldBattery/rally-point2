@@ -649,6 +649,11 @@ authenticated **relay registry** (relays enroll over their control connection), 
 per-tenant app server; the coordinator only finds and spins up relays. Production runs its own isolated
 coordinator, signing key, and relay fleet; staging and external developers share a separate one.
 
+For a session spanning multiple relays, the relay homing the most slots is the primary home and heads the
+authority order. If several relays tie for that maximum, the coordinator rotates the primary among them by
+session id. This leaves every player's regional home unchanged while distributing decision-maker work
+across the fleet; replays return the originally cached topology rather than rotating it again.
+
 ### The control connection (coordinator ↔ relay)
 
 Each relay holds **one persistent control connection** open to its coordinator — a WebSocket on the

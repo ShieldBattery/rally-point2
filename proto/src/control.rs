@@ -711,8 +711,9 @@ pub struct SessionDescriptor {
     /// players is the session's decision-maker, and authority falls to the
     /// next as relays' players leave — a presence-driven handoff the relays
     /// run among themselves, with no coordinator round-trip. The coordinator
-    /// only *ranks* the relays (home relay first, since it was chosen for the
-    /// session's latency profile); it plays no part in the live verdict.
+    /// only *ranks* the relays (home relay first: the unique plurality home, or
+    /// a session-id rotation among equally populated homes); it plays no part
+    /// in the live verdict.
     ///
     /// Defaults empty for descriptors from a coordinator that predates the
     /// field; a relay falls back to relay-id order over the session's relay

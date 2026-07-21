@@ -1093,6 +1093,17 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
     SessionId(setup.next_session.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The id the next successful create will receive, without consuming it.
+///
+/// A create holds [`SessionSetup::lock_assignment`] while peeking and later
+/// assigning the id, so another create cannot advance the counter between the
+/// two operations. Placement uses this candidate to balance authority across
+/// otherwise-equivalent home relays while still leaving the id available when
+/// placement fails.
+fn candidate_session_id(setup: &SessionSetup) -> SessionId {
+    SessionId(setup.next_session.load(Ordering::Relaxed))
+}
+
 /// Creates a game session from an app-server request: assigns relays, mints
 /// tokens, and returns the response the app server hands to its clients.
 ///
@@ -1101,6 +1112,9 @@ fn next_session_id(setup: &SessionSetup) -> SessionId {
 /// falling back to the lowest-id available relay when it named no region or its
 /// region has no live relay. A request with no per-slot regions at all falls back
 /// for every slot, so it homes as a single-relay session on the lowest-id relay.
+/// In a multi-relay session, the relay homing the most slots is primary; ties
+/// rotate deterministically by session id so balanced sessions spread authority
+/// work across their equally populated relays without changing any slot's home.
 /// Each player gets a token signed by its tenant's key, binding the client pubkey
 /// to the slot and session. The bounds come from the tenant's enrolled policy.
 ///
@@ -1306,14 +1320,21 @@ fn create_body(
     // Placement: each slot homes on a relay in the region it requested when one
     // is live, else the region-blind fallback (the lowest-id available relay). A
     // request with no per-slot regions at all falls back for every slot, landing
-    // everyone on that single relay.
-    let placement = place_by_region(&setup.registry, &request)?;
+    // everyone on that single relay. Peek rather than consume the id: balanced
+    // placements use it to rotate the primary home, but a placement failure must
+    // leave the same id available to the next successful create.
+    let candidate_session = candidate_session_id(setup);
+    let placement = place_by_region(&setup.registry, &request, candidate_session)?;
 
     if !tenant::is_enrolled(&setup.tenants, &request.tenant) {
         return Err(SessionSetupError::TenantNotFound(request.tenant));
     }
 
     let session = next_session_id(setup);
+    debug_assert_eq!(
+        session, candidate_session,
+        "the assignment lock keeps the session-id candidate stable through placement",
+    );
     let bounds = tenant::bounds(&setup.tenants, &request.tenant).expect("checked enrollment above");
 
     let Placement {
@@ -1501,10 +1522,11 @@ pub fn build_descriptor(
         peers,
         bounds,
         // The recorded membership is already the authority priority order:
-        // `create_session` lists the primary home relay first, then any
-        // secondary home. The primary was chosen for the session's latency
-        // profile, so it decides the buffer while its players are present, and
-        // authority falls down this list as relays' players leave.
+        // `create_session` lists the primary home relay first, then the other
+        // homes. A unique plurality is primary; equal-population ties rotate by
+        // session id so authority load spreads across balanced sessions. It
+        // decides the buffer while its players are present, and authority falls
+        // down this list as relays' players leave.
         authority_order: relay_ids,
         external_id: refs.external_id,
         slot_refs: refs
@@ -1588,7 +1610,7 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
 /// [`place_by_region`].
 struct Placement {
     /// The session's primary home relay — the response's `home_relay`, where the
-    /// most slots home (ties broken by lowest relay id).
+    /// most slots home (ties rotate deterministically by session id).
     home: RelayEndpoint,
     /// Per-slot overrides for the slots homing on a relay other than `home`.
     slot_homes: Vec<SlotHome>,
@@ -1688,13 +1710,15 @@ fn now_unix_secs_fail_closed() -> u64 {
 /// game stays single-relay while a cross-region game produces the meshed
 /// `slot_homes` shape.
 ///
-/// The response's `home_relay` is the relay assigned the most slots (ties broken
-/// by lowest relay id); `slot_homes` overrides every slot assigned elsewhere. By
-/// construction the serving set is exactly the distinct assigned homes and every
-/// serving relay homes at least one slot.
+/// The response's `home_relay` is the relay assigned the most slots. When several
+/// relays tie for that maximum, the would-be session id rotates the primary among
+/// them; `slot_homes` still records the exact same per-slot assignment regardless
+/// of which tied relay is primary. By construction the serving set is exactly the
+/// distinct assigned homes and every serving relay homes at least one slot.
 fn place_by_region(
     registry: &RelayRegistry,
     request: &SessionRequest,
+    session: SessionId,
 ) -> Result<Placement, SessionSetupError> {
     let mut entries = registry::available_entries(registry);
     if entries.is_empty() {
@@ -1728,18 +1752,25 @@ fn place_by_region(
         })
         .collect();
 
-    // The home relay is the one assigned the most slots; a lowest-id tie-break
-    // keeps the pick deterministic. Counting through a `BTreeMap` iterates ids
-    // ascending, so `Reverse(id)` in the key makes the smallest id win a tie.
+    // The home relay is the one assigned the most slots. A unique plurality or
+    // majority always wins; among equal maxima, rotate deterministically by the
+    // would-be session id so consecutive balanced sessions do not concentrate all
+    // authority work on the same relay. The map orders candidates by relay id,
+    // making the modulo selection stable across coordinator processes.
     let mut counts: std::collections::BTreeMap<RelayId, usize> = std::collections::BTreeMap::new();
     for (_, entry) in &slot_relay {
         *counts.entry(entry.relay_id).or_insert(0) += 1;
     }
-    let home_id = *counts
-        .iter()
-        .max_by_key(|(id, count)| (**count, std::cmp::Reverse(**id)))
-        .map(|(id, _)| id)
+    let max_count = counts
+        .values()
+        .copied()
+        .max()
         .expect("a non-empty player list always assigns at least one slot");
+    let home_candidates: Vec<RelayId> = counts
+        .iter()
+        .filter_map(|(&id, &count)| (count == max_count).then_some(id))
+        .collect();
+    let home_id = home_candidates[(session.0 % home_candidates.len() as u64) as usize];
 
     // Serving relays in authority order: home first, then the rest ascending
     // (`counts` keys are already ascending).
@@ -1906,6 +1937,35 @@ mod tests {
         ]
     }
 
+    /// Resolves a slot's effective home from the response's primary-plus-overrides
+    /// representation.
+    fn response_home_for_slot(response: &SessionResponse, slot: SlotId) -> RelayId {
+        response
+            .slot_homes
+            .iter()
+            .find(|home| home.slot == slot)
+            .map(|home| home.relay.relay_id)
+            .unwrap_or(response.home_relay.relay_id)
+    }
+
+    /// Finds one serving relay's endpoint in the response's
+    /// primary-plus-overrides representation.
+    fn response_endpoint_for_relay(
+        response: &SessionResponse,
+        relay_id: RelayId,
+    ) -> &RelayEndpoint {
+        if response.home_relay.relay_id == relay_id {
+            &response.home_relay
+        } else {
+            &response
+                .slot_homes
+                .iter()
+                .find(|home| home.relay.relay_id == relay_id)
+                .expect("every serving relay appears in the response topology")
+                .relay
+        }
+    }
+
     #[test]
     fn create_session_assigns_relays_and_mints_tokens() {
         let setup = setup_with_two_relays_and_tenant();
@@ -2059,9 +2119,10 @@ mod tests {
     }
 
     #[test]
-    fn region_override_homes_a_slot_on_the_secondary_relay() {
-        // The slot naming region-b homes on the relay tagged for it, the others
-        // fall back to the primary, so both relays serve one meshed session.
+    fn region_override_preserves_each_slots_assigned_home() {
+        // The slot naming region-b homes on the relay tagged for it, while the
+        // other falls back to relay 1. Which equally populated relay is represented
+        // as the primary rotates, but the per-slot assignment does not.
         let setup = setup_with_two_relays_region_b_and_tenant();
         let resp = create_session(
             &setup,
@@ -2076,19 +2137,16 @@ mod tests {
         .unwrap()
         .response;
 
-        assert_eq!(resp.home_relay.relay_id, RelayId(1));
+        assert_eq!(response_home_for_slot(&resp, SlotId(0)), RelayId(1));
+        assert_eq!(response_home_for_slot(&resp, SlotId(1)), RelayId(2));
+        assert_eq!(resp.slot_homes.len(), 1, "one slot differs from primary");
         assert_eq!(
-            resp.slot_homes,
-            vec![SlotHome {
-                slot: SlotId(1),
-                relay: RelayEndpoint {
-                    relay_id: RelayId(2),
-                    relay_addr: resp.slot_homes[0].relay.relay_addr,
-                    cert_der: fake_cert(2),
-                    relay_addrs: vec![],
-                },
-            }],
-            "only the region-b slot homes on the secondary relay, with its pinned cert",
+            response_endpoint_for_relay(&resp, RelayId(1)).cert_der,
+            fake_cert(1),
+        );
+        assert_eq!(
+            response_endpoint_for_relay(&resp, RelayId(2)).cert_der,
+            fake_cert(2),
         );
 
         // The session serves exactly the distinct home relays of its slots.
@@ -2215,19 +2273,32 @@ mod tests {
     }
 
     #[test]
-    fn no_relays_available_fails() {
+    fn no_relays_available_fails_without_consuming_the_session_id() {
         let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
-        let result = create_session(
-            &setup,
-            SessionRequest {
-                tenant: TenantId("sb-test".to_owned()),
-                players: two_players(),
-                external_id: None,
-                latency_estimate_ms: None,
-            },
-            ExpiresAt(u64::MAX),
-        );
+        let request = SessionRequest {
+            tenant: TenantId("sb-test".to_owned()),
+            players: two_players(),
+            external_id: None,
+            latency_estimate_ms: None,
+        };
+        let candidate = candidate_session_id(&setup);
+        let result = create_session(&setup, request.clone(), ExpiresAt(u64::MAX));
         assert_eq!(result.unwrap_err(), SessionSetupError::NoRelaysAvailable);
+        assert_eq!(candidate_session_id(&setup), candidate);
+
+        enroll_relay(setup.registry(), 1, 14900);
+        tenant::enroll(
+            setup.tenants(),
+            KeyId("test-key-1".to_owned()),
+            request.tenant.clone(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let created = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+        assert_eq!(
+            created.response.session, candidate,
+            "the next successful create receives the id the failed placement peeked",
+        );
     }
 
     #[test]
@@ -2401,7 +2472,7 @@ mod tests {
             &setup,
             SessionRequest {
                 tenant: TenantId("sb-test".to_owned()),
-                // Slot 1 names region-b so it homes on the secondary relay,
+                // Slot 1 names region-b so it homes on relay 2,
                 // giving both relays a slot to serve and mesh — the only way a
                 // session spans two relays.
                 players: two_players_slot_1_in_region_b(),
@@ -2442,17 +2513,23 @@ mod tests {
         assert_eq!(desc2.peers[0].relay_id, RelayId(1));
         assert_eq!(desc2.peers[0].cert_der, fake_cert(1));
 
-        // Both descriptors carry the same buffer-authority order, home relay
-        // (relay 1) first — every relay must rank the candidates identically
-        // or the presence-driven handoff would crown different authorities.
-        assert_eq!(desc.authority_order, vec![RelayId(1), RelayId(2)]);
+        // Both descriptors carry the same buffer-authority order, with this
+        // session's rotated primary home first. Every relay must rank the
+        // candidates identically or the presence-driven handoff would crown
+        // different authorities.
+        let other = if resp.home_relay.relay_id == RelayId(1) {
+            RelayId(2)
+        } else {
+            RelayId(1)
+        };
+        assert_eq!(desc.authority_order, vec![resp.home_relay.relay_id, other],);
         assert_eq!(desc2.authority_order, desc.authority_order);
 
         // Each relay's descriptor names only the slots the coordinator
         // actually assigned to it, not the whole session's slot set -- a relay
         // uses this to refuse a client whose token authorizes a slot homed
-        // elsewhere. Slot 0 stayed on the primary (relay 1); slot 1 split onto
-        // the secondary (relay 2).
+        // elsewhere. Slot 0 stays on relay 1 and slot 1 stays on relay 2,
+        // independently of which tied relay is represented as the primary.
         assert_eq!(desc.homed_slots, vec![SlotId(0)]);
         assert_eq!(desc2.homed_slots, vec![SlotId(1)]);
     }
@@ -2693,7 +2770,7 @@ mod tests {
         .unwrap()
         .response;
 
-        // Home=1, secondary=2. Relay 3 is registered but not in the session.
+        // Relays 1 and 2 serve the session. Relay 3 is registered but unused.
         let desc = descriptor_for(
             &setup,
             &TenantId("sb-test".to_owned()),
@@ -3580,7 +3657,7 @@ mod tests {
         )
         .unwrap()
         .response;
-        // serving == {1, 2}; kill the home relay 1.
+        // serving == {1, 2}; kill serving relay 1.
         registry::remove(setup.registry(), RelayId(1));
 
         let RehomeOutcome::NewTarget(endpoint) =
@@ -3775,7 +3852,7 @@ mod tests {
         assert_eq!(
             refs.relay_certs.get(&RelayId(1)),
             Some(&cert_fingerprint(&fake_cert(1))),
-            "the primary home's cert is recorded",
+            "relay 1's client-pinned cert is recorded",
         );
         assert_eq!(
             refs.relay_certs.get(&RelayId(2)),
@@ -3943,10 +4020,10 @@ mod tests {
                 .current_for(RelayId(1))
                 .iter()
                 .any(|d| d.session == resp.session),
-            "the home relay has a descriptor before it dies",
+            "the serving relay has a descriptor before it dies",
         );
 
-        // The home relay 1 dies; the group re-homes onto the already-serving relay 2.
+        // Serving relay 1 dies; its group re-homes onto already-serving relay 2.
         registry::remove(setup.registry(), RelayId(1));
         assert!(matches!(
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
@@ -4131,11 +4208,16 @@ mod tests {
         .unwrap()
         .response;
 
-        // The session response's endpoints carry the set, primary unchanged.
-        assert_eq!(resp.home_relay.relay_addr, v4_1);
-        assert_eq!(resp.home_relay.relay_addrs, vec![v4_1, v6_1]);
-        assert_eq!(resp.home_relay.addr_for_family(true), Some(v6_1));
-        assert_eq!(resp.slot_homes[0].relay.relay_addrs, vec![v4_2, v6_2]);
+        // The session response's endpoints carry each relay's set unchanged,
+        // whichever tied relay this session rotates into the primary position.
+        let relay_1 = response_endpoint_for_relay(&resp, RelayId(1));
+        assert_eq!(relay_1.relay_addr, v4_1);
+        assert_eq!(relay_1.relay_addrs, vec![v4_1, v6_1]);
+        assert_eq!(relay_1.addr_for_family(true), Some(v6_1));
+        let relay_2 = response_endpoint_for_relay(&resp, RelayId(2));
+        assert_eq!(relay_2.relay_addr, v4_2);
+        assert_eq!(relay_2.relay_addrs, vec![v4_2, v6_2]);
+        assert_eq!(relay_2.addr_for_family(true), Some(v6_2));
 
         // The descriptor's peer carries the other relay's full set.
         let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
@@ -4144,7 +4226,7 @@ mod tests {
         assert_eq!(desc.peers[0].relay_addrs, vec![v4_2, v6_2]);
         assert_eq!(desc.peers[0].addrs(), vec![v4_2, v6_2]);
 
-        // The home relay dies; the rehome's NewTarget carries the survivor's set.
+        // Serving relay 1 dies; the rehome's NewTarget carries the survivor's set.
         registry::remove(setup.registry(), RelayId(1));
         let RehomeOutcome::NewTarget(endpoint) =
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
@@ -4484,13 +4566,20 @@ mod tests {
             ],
         );
 
-        // One slot each is a tie, so the home is the lowest-id relay (region-a's 1).
-        assert_eq!(resp.home_relay.relay_id, RelayId(1));
-        // Slot 1 (region-b) is overridden onto relay 2, with its pinned cert.
+        // One slot each is a tie, so either relay may be the rotated primary. The
+        // response's primary-plus-override representation must still resolve each
+        // slot to its requested region and carry both pinned certificates.
+        assert_eq!(response_home_for_slot(&resp, SlotId(0)), RelayId(1));
+        assert_eq!(response_home_for_slot(&resp, SlotId(1)), RelayId(2));
         assert_eq!(resp.slot_homes.len(), 1);
-        assert_eq!(resp.slot_homes[0].slot, SlotId(1));
-        assert_eq!(resp.slot_homes[0].relay.relay_id, RelayId(2));
-        assert_eq!(resp.slot_homes[0].relay.cert_der, fake_cert(2));
+        assert_eq!(
+            response_endpoint_for_relay(&resp, RelayId(1)).cert_der,
+            fake_cert(1),
+        );
+        assert_eq!(
+            response_endpoint_for_relay(&resp, RelayId(2)).cert_der,
+            fake_cert(2),
+        );
         // Both relays serve the meshed session.
         let serving: std::collections::HashSet<_> = setup
             .serving_relays(&tid(), resp.session)
@@ -4499,6 +4588,80 @@ mod tests {
         assert_eq!(
             serving,
             std::collections::HashSet::from([RelayId(1), RelayId(2)]),
+        );
+    }
+
+    #[test]
+    fn tied_home_relays_rotate_and_every_descriptor_matches_the_response_home() {
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let players = || {
+            vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ]
+        };
+
+        let responses: Vec<SessionResponse> = (0..4)
+            .map(|_| create_region_session(&setup, players()))
+            .collect();
+
+        for pair in responses.windows(2) {
+            assert_ne!(
+                pair[0].home_relay.relay_id, pair[1].home_relay.relay_id,
+                "consecutive balanced sessions alternate their primary home",
+            );
+        }
+
+        for response in &responses {
+            let expected_home = if response.session.0 % 2 == 0 {
+                RelayId(1)
+            } else {
+                RelayId(2)
+            };
+            assert_eq!(response.home_relay.relay_id, expected_home);
+            assert_eq!(response_home_for_slot(response, SlotId(0)), RelayId(1));
+            assert_eq!(response_home_for_slot(response, SlotId(1)), RelayId(2));
+
+            let authority_order = setup.serving_relays(&tid(), response.session);
+            assert_eq!(authority_order[0], response.home_relay.relay_id);
+            for relay_id in [RelayId(1), RelayId(2)] {
+                let descriptor =
+                    descriptor_for(&setup, &tid(), response.session, relay_id).unwrap();
+                assert_eq!(descriptor.authority_order, authority_order);
+            }
+        }
+    }
+
+    #[test]
+    fn replaying_a_balanced_create_keeps_its_exact_rotated_home() {
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let request = |external_id: &str| SessionRequest {
+            tenant: tid(),
+            players: vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ],
+            external_id: Some(external_id.to_owned()),
+            latency_estimate_ms: None,
+        };
+
+        let first = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+        let candidate_after_first = candidate_session_id(&setup);
+        let replay = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.response, first.response);
+        assert_eq!(
+            candidate_session_id(&setup),
+            candidate_after_first,
+            "a replay neither re-places nor consumes a session id",
+        );
+
+        let next = create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap();
+        assert_ne!(
+            next.response.home_relay.relay_id, first.response.home_relay.relay_id,
+            "the next fresh balanced session receives the next rotation",
         );
     }
 
@@ -4550,6 +4713,17 @@ mod tests {
         assert_eq!(resp.slot_homes.len(), 1);
         assert_eq!(resp.slot_homes[0].slot, SlotId(2));
         assert_eq!(resp.slot_homes[0].relay.relay_id, RelayId(1));
+
+        let expected_order = vec![RelayId(2), RelayId(1)];
+        assert_eq!(setup.serving_relays(&tid(), resp.session), expected_order);
+        for relay_id in [RelayId(1), RelayId(2)] {
+            let descriptor = descriptor_for(&setup, &tid(), resp.session, relay_id).unwrap();
+            assert_eq!(
+                descriptor.authority_order,
+                vec![RelayId(2), RelayId(1)],
+                "the unique plurality remains first in every descriptor",
+            );
+        }
     }
 
     #[test]
