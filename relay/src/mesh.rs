@@ -1890,6 +1890,12 @@ pub async fn run_mesh_link(
     let maintenance_sleep = tokio::time::sleep_until(tokio::time::Instant::now());
     tokio::pin!(maintenance_sleep);
 
+    // One relay-pair RTT serves every session on this connection. Sample it
+    // lazily on the first received conditions sidecar, then reuse it briefly;
+    // a never-used or long-idle link therefore cannot feed consensus a stale
+    // handshake-time value when traffic eventually arrives.
+    let mut mesh_rtt = MeshRttCache::default();
+
     // Each break carries its `MeshLinkExit` inline, so a reconnect supervisor
     // can tell an intentional wind-down (Idle, CommandChannelClosed) from a
     // dropped connection (ConnectionFailed). Non-exit paths `continue` the
@@ -1927,7 +1933,10 @@ pub async fn run_mesh_link(
                                 slots = peer_conditions.slots.len(),
                                 "received peer-relay link conditions",
                             );
-                            let mesh_rtt_us = link_rtt_us(link.connection());
+                            let mesh_rtt_us = mesh_rtt.get_or_refresh(
+                                link.connection(),
+                                tokio::time::Instant::now(),
+                            );
                             // Any decision it fires is logged by the helper and
                             // broadcast later, at fan-out.
                             let _ = crate::consensus::ingest_remote_conditions(
@@ -2983,6 +2992,48 @@ pub(crate) fn rtt_us(rtt: std::time::Duration) -> u32 {
 /// effective path in the decision-maker.
 fn link_rtt_us(connection: &rally_point_transport::quinn::Connection) -> u32 {
     rtt_us(connection.stats().path.rtt)
+}
+
+/// Maximum age of the relay-pair RTT used to ingest remote conditions. RTT is
+/// link-wide, so one sample can serve all sessions and sidecars on the same
+/// connection for 150ms without making consensus meaningfully less current.
+const MESH_RTT_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// A timestamped, on-use cache for the relay-pair RTT. An empty cache always
+/// samples; an old cache refreshes immediately before the next sidecar is
+/// ingested. No timer drives it, so a dormant connection neither wakes nor
+/// returns a value retained from before the idle period.
+#[derive(Debug, Default)]
+struct MeshRttCache {
+    rtt_us: u32,
+    sampled_at: Option<tokio::time::Instant>,
+}
+
+impl MeshRttCache {
+    fn get_or_refresh(
+        &mut self,
+        connection: &rally_point_transport::quinn::Connection,
+        now: tokio::time::Instant,
+    ) -> u32 {
+        self.get_or_refresh_with(now, || link_rtt_us(connection))
+    }
+
+    /// The cache policy separated from the quinn stats read so deterministic
+    /// tests can advance an explicit clock and count samples.
+    fn get_or_refresh_with(
+        &mut self,
+        now: tokio::time::Instant,
+        sample: impl FnOnce() -> u32,
+    ) -> u32 {
+        if self
+            .sampled_at
+            .is_none_or(|sampled_at| now.duration_since(sampled_at) >= MESH_RTT_CACHE_TTL)
+        {
+            self.rtt_us = sample();
+            self.sampled_at = Some(now);
+        }
+        self.rtt_us
+    }
 }
 
 /// Validates a list of sessions for a mesh link, refusing if two tenants share
@@ -5068,6 +5119,60 @@ mod tests {
         assert!(!mesh_window_exhausted(0));
         assert!(!mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP));
         assert!(mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP + 1));
+    }
+
+    #[test]
+    fn mesh_rtt_cache_samples_on_first_use() {
+        let now = tokio::time::Instant::now();
+        let samples = std::cell::Cell::new(0);
+        let mut cache = MeshRttCache::default();
+
+        let rtt = cache.get_or_refresh_with(now, || {
+            samples.set(samples.get() + 1);
+            12_000
+        });
+
+        assert_eq!(rtt, 12_000);
+        assert_eq!(samples.get(), 1);
+    }
+
+    #[test]
+    fn mesh_rtt_cache_reuses_a_sample_within_the_window() {
+        let start = tokio::time::Instant::now();
+        let samples = std::cell::Cell::new(0);
+        let mut cache = MeshRttCache::default();
+        let sample = || {
+            samples.set(samples.get() + 1);
+            samples.get() * 10_000
+        };
+
+        assert_eq!(cache.get_or_refresh_with(start, sample), 10_000);
+        assert_eq!(
+            cache.get_or_refresh_with(
+                start + MESH_RTT_CACHE_TTL - std::time::Duration::from_nanos(1),
+                sample,
+            ),
+            10_000,
+        );
+        assert_eq!(samples.get(), 1, "the within-window closure is not run");
+    }
+
+    #[test]
+    fn mesh_rtt_cache_refreshes_at_the_window_boundary() {
+        let start = tokio::time::Instant::now();
+        let samples = std::cell::Cell::new(0);
+        let mut cache = MeshRttCache::default();
+        let sample = || {
+            samples.set(samples.get() + 1);
+            samples.get() * 10_000
+        };
+
+        assert_eq!(cache.get_or_refresh_with(start, sample), 10_000);
+        assert_eq!(
+            cache.get_or_refresh_with(start + MESH_RTT_CACHE_TTL, sample),
+            20_000,
+        );
+        assert_eq!(samples.get(), 2);
     }
 
     #[test]
