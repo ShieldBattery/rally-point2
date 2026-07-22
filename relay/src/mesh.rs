@@ -24,7 +24,7 @@
 //! coordinator (Phase 3); this increment has no auth token.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2029,6 +2029,15 @@ pub async fn run_mesh_link(
     // flush tick and on each Join), so a stable roster sends nothing.
     let mut presence_sent: HashMap<rally_point_proto::ids::SessionId, u32> = HashMap::new();
 
+    // Sessions for which this link has received at least one peer-presence
+    // report since joining. The peer sends its first report only after its own
+    // Join is installed, making that report a one-shot rendezvous barrier for
+    // replaying state that may have raced ahead of the peer's Join. Cleared on
+    // Leave, so Leave -> Join reuse on the same physical link is safe; a redial
+    // gets a fresh driver and therefore a fresh set. Deliberately do not buffer
+    // pre-Join reports or frames: their wire session id has no tenant scope.
+    let mut peer_presence_seen: HashSet<SessionId> = HashSet::new();
+
     // The last delivered-through cursor pushed to the peer per (session, slot)
     // -- the mesh-link ack-beacon's own "last_sent", mirroring the client
     // edge's `flush_beacon`. Tracked here (rather than inside `MeshLink`,
@@ -2494,52 +2503,89 @@ pub async fn run_mesh_link(
             received = presence_rx.recv() => {
                 match received {
                     Some(report) => {
-                        let _ = lease.with_current(|| {
-                        // Tenant-scope the bare wire session id through the
-                        // joined map, like a datagram; a report for an
-                        // unjoined session has no key to record under.
-                        let Some(state) = joined.get(&report.session) else {
-                            return;
-                        };
-                        if crate::presence::record_peer(
-                            &presence,
-                            &state.key,
-                            peer_id,
-                            report.live_players,
-                        ) {
-                            // A promotion here (the peer's players all left, and
-                            // this relay is next in the order) yields any synced
-                            // leave the departed authority never delivered; push
-                            // each to local survivors and across the mesh.
-                            // Skip slots whose drop is still held on this relay: a
-                            // promotion here must not decide a departure a
-                            // reconnecting client could still return from, and a held
-                            // drop is only ever decided by a manual request.
-                            let held = drop_holds.pending_slots(&state.key);
-                            let leaves = crate::presence::recompute(
+                        let handshake_presence = lease.with_current(|| {
+                            // Tenant-scope the bare wire session id through the
+                            // joined map, like a datagram; a report for an
+                            // unjoined session has no key to record under.
+                            let state = joined.get(&report.session)?;
+                            let key = state.key.clone();
+                            let first_peer_presence = peer_presence_seen.insert(report.session);
+                            if first_peer_presence {
+                                reconcile_local_slots_on_join(
+                                    &conditions,
+                                    &control_forward_tx,
+                                    &key,
+                                );
+                            }
+                            if crate::presence::record_peer(
                                 &presence,
-                                &decision_makers,
-                                &state.key,
-                                &held,
-                            );
-                            broadcast_leaves(&sessions, &mesh_links, &state.key, leaves);
-                            // A promotion here may also make this relay the one to
-                            // observe full slot presence: re-evaluate and fire the
-                            // session-start directive if it now covers the expected
-                            // set (idempotent for already-started sessions).
-                            routing::maybe_start_session(
-                                &sessions,
-                                &decision_makers,
-                                &mesh_links,
-                                &state.key,
-                            );
-                            // The peer's report may have emptied the session
-                            // session-wide (the last live relay reporting zero),
-                            // arming the abandoned-session timer — or refilled it,
-                            // cancelling it.
-                            routing::reconcile_abandon(&sessions, &mesh_for_dispatch, &state.key);
-                        }
+                                &key,
+                                peer_id,
+                                report.live_players,
+                            ) {
+                                // A promotion here (the peer's players all left, and
+                                // this relay is next in the order) yields any synced
+                                // leave the departed authority never delivered; push
+                                // each to local survivors and across the mesh.
+                                // Skip slots whose drop is still held on this relay: a
+                                // promotion here must not decide a departure a
+                                // reconnecting client could still return from, and a held
+                                // drop is only ever decided by a manual request.
+                                let held = drop_holds.pending_slots(&key);
+                                let leaves = crate::presence::recompute(
+                                    &presence,
+                                    &decision_makers,
+                                    &key,
+                                    &held,
+                                );
+                                broadcast_leaves(&sessions, &mesh_links, &key, leaves);
+                                // A promotion here may also make this relay the one to
+                                // observe full slot presence: re-evaluate and fire the
+                                // session-start directive if it now covers the expected
+                                // set (idempotent for already-started sessions).
+                                routing::maybe_start_session(
+                                    &sessions,
+                                    &decision_makers,
+                                    &mesh_links,
+                                    &key,
+                                );
+                                // The peer's report may have emptied the session
+                                // session-wide (the last live relay reporting zero),
+                                // arming the abandoned-session timer — or refilled it,
+                                // cancelling it.
+                                routing::reconcile_abandon(&sessions, &mesh_for_dispatch, &key);
+                            }
+                            first_peer_presence
+                                .then(|| (report.session, local_live_players(&sessions, &key)))
                         });
+                        let Some(handshake_presence) = handshake_presence else {
+                            break MeshLinkExit::Superseded;
+                        };
+                        if let Some(update) = handshake_presence {
+                            match await_while_current(
+                                &lease,
+                                tokio::time::timeout(
+                                    MESH_STREAM_WRITE_TIMEOUT,
+                                    push_presence_updates(
+                                        &mut presence_tx,
+                                        &mut presence_sent,
+                                        std::slice::from_ref(&update),
+                                    ),
+                                ),
+                            )
+                            .await
+                            {
+                                LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                                LeaseAwait::Completed(Ok(Ok(()))) => {}
+                                LeaseAwait::Completed(Ok(Err(_)) | Err(_)) => {
+                                    tracing::info!(
+                                        "mesh presence rendezvous reply failed or stalled; closing link"
+                                    );
+                                    break MeshLinkExit::ConnectionFailed;
+                                }
+                            }
+                        }
+                        continue;
                     }
                     // The reader task ended: the peer's presence stream reset
                     // or closed while the connection lives on. Presence is the
@@ -2613,12 +2659,11 @@ pub async fn run_mesh_link(
                             control_forward_tx.clone(),
                             Arc::clone(&shutdown),
                         );
-                        // A redial starts with no knowledge of which physical
-                        // client generation each slot currently represents.
-                        // Replay level=true with the active epochs. Datagrams
-                        // may overtake this stream enqueue; the peer ignores an
-                        // unknown epoch sidecar until this barrier arrives.
-                        reconcile_connection_epochs_on_join(
+                        // Replay every currently-active local slot after the
+                        // link registration. This closes the race where a
+                        // client's original announcement ran before the Join.
+                        // The same snapshot carries active connection epochs.
+                        reconcile_local_slots_on_join(
                             &conditions,
                             &control_forward_tx,
                             &key,
@@ -2653,6 +2698,7 @@ pub async fn run_mesh_link(
                                 .reset(maintenance.deadline().expect("armed maintenance timer"));
                         }
                         idle_since = None;
+                        peer_presence_seen.remove(&session_id);
                         Some((session_id, live_players))
                         });
                         let Some(joined_presence) = joined_presence else {
@@ -2707,6 +2753,7 @@ pub async fn run_mesh_link(
                             joined.remove(&session_id);
                             link.close_session(mesh_session_key(&key));
                             presence_sent.remove(&session_id);
+                            peer_presence_seen.remove(&session_id);
                             // Arm the idle timer when the last session leaves,
                             // so the driver tears the link down after
                             // `idle_timeout` of no further Joins.
@@ -3213,31 +3260,39 @@ fn reconcile_leaves_on_join(
     }
 }
 
-/// Replays active home-client connection generations to a fresh mesh link.
-/// The registry lock remains held through synchronous channel enqueue so every
-/// publish/unpublish linearizes wholly before or after this snapshot. This does
-/// not claim cross-stream/datagram network priority; peers simply ignore an
-/// epoch-bearing sidecar until its reliable level=true frame arrives.
-fn reconcile_connection_epochs_on_join(
+/// Replays every active home-client slot and connection generation to a mesh
+/// peer after Join, or after that peer proves its own Join via initial presence.
+///
+/// The conditions registry is the linearization point deliberately: a slot is
+/// activated there immediately before its live `SlotPresent`, and retired there
+/// before its terminal departure is announced. Holding its lock through these
+/// synchronous enqueues means a concurrent slot transition falls wholly before
+/// or after the replay, never departure-then-stale-present. A slot whose setup
+/// has not activated yet will announce normally after this link registration.
+/// Duplicate replays are harmless because peer slot presence is set-valued.
+fn reconcile_local_slots_on_join(
     conditions: &ConditionsRegistry,
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
     let roster = conditions.lock();
-    let mut epochs: Vec<(SlotId, u64)> = roster
+    let mut slots: Vec<(SlotId, Option<u64>)> = roster
         .get(key)
         .into_iter()
         .flat_map(|slots| slots.iter())
-        .filter_map(|(&slot, conditions)| conditions.connection_epoch.map(|epoch| (slot, epoch)))
+        .map(|(&slot, conditions)| (slot, conditions.connection_epoch))
         .collect();
-    epochs.sort_by_key(|(slot, _)| *slot);
-    for (slot, epoch) in epochs {
-        let _ = control_tx.send(slot_connectivity_frame(
-            key.session,
-            slot,
-            true,
-            Some(epoch),
-        ));
+    slots.sort_by_key(|(slot, _)| *slot);
+    for (slot, epoch) in slots {
+        let _ = control_tx.send(slot_present_frame(key.session, slot));
+        if let Some(epoch) = epoch {
+            let _ = control_tx.send(slot_connectivity_frame(
+                key.session,
+                slot,
+                true,
+                Some(epoch),
+            ));
+        }
     }
 }
 
@@ -3276,10 +3331,11 @@ fn local_live_players(sessions: &routing::Sessions, key: &SessionKey) -> u32 {
     roster.get(key).map_or(0, |slots| slots.len() as u32)
 }
 
-/// Pushes the presence changes a link-wide maintenance pass collected, or the
-/// single initial report a Join produced. Push-on-change over a reliable stream
-/// means a stable roster writes nothing, while a transition cannot be lost the
-/// way a datagram sidecar could. `presence_sent` advances only after its frame
+/// Pushes the presence changes a link-wide maintenance pass collected, the
+/// initial report a Join produced, or a one-shot Join-rendezvous reply. Regular
+/// maintenance is push-on-change over a reliable stream, so a stable roster
+/// writes nothing; the rendezvous deliberately repeats the current value after
+/// the peer proves it has joined. `presence_sent` advances only after its frame
 /// was written successfully.
 ///
 /// An `Err` means the stream (and so the connection) is gone; the caller exits
@@ -4402,10 +4458,14 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_connection_epochs_on_join_announces_each_active_generation() {
+    fn join_reconcile_replays_each_active_slot_and_generation_every_time() {
         let conditions = new_conditions_registry();
         let key = control_key();
-        for (slot, epoch) in [(SlotId(2), 22), (SlotId(0), 11)] {
+        for (slot, epoch) in [
+            (SlotId(2), Some(22)),
+            (SlotId(0), Some(11)),
+            (SlotId(1), None),
+        ] {
             activate_conditions(
                 &conditions,
                 &key,
@@ -4415,25 +4475,34 @@ mod tests {
                     rtt_us: 20_000,
                     lost_packets: 0,
                     sent_packets: 1,
-                    connection_epoch: Some(epoch),
+                    connection_epoch: epoch,
                 },
             );
         }
 
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        reconcile_connection_epochs_on_join(&conditions, &control_tx, &key);
+        reconcile_local_slots_on_join(&conditions, &control_tx, &key);
+        reconcile_local_slots_on_join(&conditions, &control_tx, &key);
 
-        let mut announced = Vec::new();
+        let mut present = Vec::new();
+        let mut connected = Vec::new();
         while let Ok(frame) = control_rx.try_recv() {
             match frame.kind {
+                Some(mesh_control_frame::Kind::SlotPresent(slot)) => {
+                    present.push(slot.slot);
+                }
                 Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
                     assert!(change.connected);
-                    announced.push((change.slot, change.connection_epoch));
+                    connected.push((change.slot, change.connection_epoch));
                 }
-                other => panic!("unexpected epoch reconcile frame {other:?}"),
+                other => panic!("unexpected local-slot reconcile frame {other:?}"),
             }
         }
-        assert_eq!(announced, vec![(0, Some(11)), (2, Some(22))]);
+        assert_eq!(present, vec![0, 1, 2, 0, 1, 2]);
+        assert_eq!(
+            connected,
+            vec![(0, Some(11)), (2, Some(22)), (0, Some(11)), (2, Some(22))]
+        );
     }
 
     #[test]
