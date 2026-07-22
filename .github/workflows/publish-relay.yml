@@ -60,12 +60,57 @@ jobs:
         with:
           context: .
           file: relay/Dockerfile
-          push: true
+          # Fargate supports OCI zstd layers directly. Recompress the base
+          # image too so every layer benefits rather than only layers created
+          # by this Dockerfile.
+          outputs: type=registry,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true
           # Arch-suffixed tag only; the manifest job below owns the SHA and
           # `latest` tags so they are always complete two-arch lists.
           tags: ${{ steps.login-ecr.outputs.registry }}/rp2-relay:${{ github.sha }}-${{ matrix.arch }}
           cache-from: type=gha,scope=relay-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=relay-${{ matrix.arch }}
+      - name: Verify zstd image layers
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/rp2-relay:${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          document="$(docker buildx imagetools inspect --raw "$IMAGE")"
+          media_type="$(jq -r '.mediaType // empty' <<< "$document")"
+
+          case "$media_type" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
+              digest="$(
+                jq -er --arg arch "$ARCH" '
+                  [.manifests[] | select(
+                    .platform.os == "linux" and
+                    .platform.architecture == $arch
+                  )] |
+                  if length == 1 then .[0].digest
+                  else error("expected exactly one runnable linux/" + $arch + " manifest")
+                  end
+                ' <<< "$document"
+              )"
+              document="$(docker buildx imagetools inspect --raw "$IMAGE@$digest")"
+              ;;
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
+              ;;
+            *)
+              echo "Unexpected image media type: $media_type" >&2
+              exit 1
+              ;;
+          esac
+
+          jq -e '
+            (.layers | length > 0) and
+            all(.layers[];
+              .mediaType == "application/vnd.oci.image.layer.v1.tar+zstd"
+            )
+          ' <<< "$document" > /dev/null || {
+            echo "Expected every $ARCH image layer to use OCI zstd compression; found:" >&2
+            jq -r '.layers[]?.mediaType' <<< "$document" >&2
+            exit 1
+          }
 
   manifest:
     name: stitch multi-arch manifest
