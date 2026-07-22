@@ -40,6 +40,8 @@ futures-util = { workspace = true }
 serde_json = { workspace = true }
 # Serialize/Deserialize derives for the flight recorder's blob envelope.
 serde = { workspace = true }
+# RFC 3339 parsing for the ECS stats provider's `read`/`preread` sample clock.
+time = { workspace = true }
 # The task-stats reporter's client for the ECS Task Metadata endpoint
 # (link-local, plain HTTP). Same hyper + hyper-util stack the coordinator's webhook
 # client and the loadgen's create client already build on. hyper-rustls adds the

@@ -84,10 +84,28 @@ pub struct PlayerReport {
     pub stalls: u64,
     pub turns_sent: u64,
     pub turns_received: u64,
+    /// Distinct expected `(origin slot, frame)` deliveries observed by this
+    /// player during the measured frame range.
+    pub turn_deliveries_distinct: u64,
+    /// Repeated `(origin slot, frame)` deliveries. The client transport normally
+    /// deduplicates these; a non-zero value exposes an accounting or identity
+    /// regression rather than increasing the distinct-delivery total.
+    pub turn_deliveries_duplicate: u64,
     /// Time from session-create completion to this player's session-start
     /// receipt, if it saw one.
     pub time_to_session_start_us: Option<u64>,
     pub ending: Ending,
+}
+
+/// Exact end-to-end delivery accounting for one created session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeliveryReport {
+    pub expected: u64,
+    pub distinct: u64,
+    pub missing: u64,
+    pub duplicate: u64,
+    pub complete: bool,
+    pub timed_out: bool,
 }
 
 impl PlayerReport {
@@ -108,6 +126,7 @@ pub enum SessionReport {
         create_latency_us: u64,
         provisioning_holds: u64,
         players: Vec<PlayerReport>,
+        delivery: DeliveryReport,
     },
     /// The create request failed. `status` is the HTTP status if the coordinator
     /// answered, or `None` for a transport-level failure.
@@ -142,6 +161,13 @@ pub struct RunReport {
     pub endings_no_session_start: usize,
     pub turns_sent: u64,
     pub turns_received: u64,
+    pub turn_deliveries_expected: u64,
+    pub turn_deliveries_distinct: u64,
+    pub turn_deliveries_missing: u64,
+    pub turn_deliveries_duplicate: u64,
+    pub sessions_delivery_complete: usize,
+    pub sessions_delivery_timed_out: usize,
+    pub sessions_delivery_incomplete: usize,
     pub stalls: u64,
     pub create_latency_us: Distribution,
     pub time_to_session_start_us: Distribution,
@@ -180,6 +206,13 @@ impl RunReport {
         let mut endings_no_session_start = 0;
         let mut turns_sent = 0;
         let mut turns_received = 0;
+        let mut turn_deliveries_expected = 0u64;
+        let mut turn_deliveries_distinct = 0u64;
+        let mut turn_deliveries_missing = 0u64;
+        let mut turn_deliveries_duplicate = 0u64;
+        let mut sessions_delivery_complete = 0;
+        let mut sessions_delivery_timed_out = 0;
+        let mut sessions_delivery_incomplete = 0;
         let mut stalls = 0;
 
         let mut create_latency_us = Vec::new();
@@ -193,10 +226,27 @@ impl RunReport {
                     create_latency_us: latency,
                     provisioning_holds: holds,
                     players,
+                    delivery,
                 } => {
                     sessions_created += 1;
                     provisioning_holds += holds;
                     create_latency_us.push(latency);
+                    turn_deliveries_expected =
+                        turn_deliveries_expected.saturating_add(delivery.expected);
+                    turn_deliveries_distinct =
+                        turn_deliveries_distinct.saturating_add(delivery.distinct);
+                    turn_deliveries_missing =
+                        turn_deliveries_missing.saturating_add(delivery.missing);
+                    turn_deliveries_duplicate =
+                        turn_deliveries_duplicate.saturating_add(delivery.duplicate);
+                    if delivery.complete {
+                        sessions_delivery_complete += 1;
+                    } else {
+                        sessions_delivery_incomplete += 1;
+                    }
+                    if delivery.timed_out {
+                        sessions_delivery_timed_out += 1;
+                    }
                     for player in players {
                         players_total += 1;
                         turns_sent += player.turns_sent;
@@ -256,6 +306,13 @@ impl RunReport {
             endings_no_session_start,
             turns_sent,
             turns_received,
+            turn_deliveries_expected,
+            turn_deliveries_distinct,
+            turn_deliveries_missing,
+            turn_deliveries_duplicate,
+            sessions_delivery_complete,
+            sessions_delivery_timed_out,
+            sessions_delivery_incomplete,
             stalls,
             create_latency_us: Distribution::from_samples(create_latency_us),
             time_to_session_start_us: Distribution::from_samples(time_to_session_start_us),
@@ -317,6 +374,21 @@ impl RunReport {
             out,
             "turns: {} sent, {} received; stalls: {}",
             self.turns_sent, self.turns_received, self.stalls
+        );
+        let _ = writeln!(
+            out,
+            "deliveries: {} expected, {} distinct, {} missing, {} duplicate",
+            self.turn_deliveries_expected,
+            self.turn_deliveries_distinct,
+            self.turn_deliveries_missing,
+            self.turn_deliveries_duplicate,
+        );
+        let _ = writeln!(
+            out,
+            "delivery sessions: {} complete, {} incomplete, {} timed-out",
+            self.sessions_delivery_complete,
+            self.sessions_delivery_incomplete,
+            self.sessions_delivery_timed_out,
         );
         let _ = writeln!(out, "-- latencies (microseconds) --");
         render_distribution(&mut out, "create", &self.create_latency_us);
@@ -406,6 +478,14 @@ mod tests {
                     ending: Ending::Clean,
                     ..PlayerReport::default()
                 }],
+                delivery: DeliveryReport {
+                    expected: 30,
+                    distinct: 29,
+                    missing: 1,
+                    duplicate: 2,
+                    complete: false,
+                    timed_out: true,
+                },
             }],
         );
 
@@ -413,5 +493,24 @@ mod tests {
         assert_eq!(report.elapsed_ms, 2_000);
         assert_eq!(report.turns_sent_per_sec, 10.0);
         assert_eq!(report.turns_received_per_sec, 15.0);
+        assert_eq!(report.turn_deliveries_expected, 30);
+        assert_eq!(report.turn_deliveries_distinct, 29);
+        assert_eq!(report.turn_deliveries_missing, 1);
+        assert_eq!(report.turn_deliveries_duplicate, 2);
+        assert_eq!(report.sessions_delivery_complete, 0);
+        assert_eq!(report.sessions_delivery_incomplete, 1);
+        assert_eq!(report.sessions_delivery_timed_out, 1);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["turn_deliveries_expected"], 30);
+        assert_eq!(json["turn_deliveries_distinct"], 29);
+        assert_eq!(json["turn_deliveries_missing"], 1);
+        assert_eq!(json["turn_deliveries_duplicate"], 2);
+        assert_eq!(json["sessions_delivery_complete"], 0);
+        assert_eq!(json["sessions_delivery_timed_out"], 1);
+
+        let rendered = report.render();
+        assert!(rendered.contains("deliveries: 30 expected, 29 distinct, 1 missing, 2 duplicate"));
+        assert!(rendered.contains("delivery sessions: 0 complete, 1 incomplete, 1 timed-out"));
     }
 }

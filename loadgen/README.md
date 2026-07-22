@@ -38,9 +38,13 @@ if a test needs them.
 Per session: create latency (and provisioning holds), time from create to the relay's
 `SessionStart` directive (all slots connected), clean-close success. Per turn stream: fan-out
 latency (send→receive across players, measured against the process's own clock, correlated by the
-turn's frame coordinate), inbound inter-arrival gaps, stall counts. Global: session success/failure
-counts by cause, error log. Summary percentiles (p50/p90/p99/max) print at the end; `--json-out`
-writes the raw aggregates for comparison across runs.
+turn's frame coordinate), inbound inter-arrival gaps, stall counts, and exact end-to-end delivery.
+Players rendezvous after every slot has observed `SessionStart`, each emits exactly
+`game-secs * turn-rate` measured frames, and every link remains live through one shared bounded
+drain phase before the players leave together. The summary and `--json-out` therefore report
+expected, distinct, missing, and duplicate `(origin slot, destination slot, frame)` deliveries,
+plus complete and timed-out session counts. Global metrics also include session success/failure
+counts by cause and the error log; latency percentiles (p50/p90/p99/max) print at the end.
 
 Relay/coordinator-side numbers (CPU, memory, packets, per-session state) come from the target
 processes themselves — Prometheus metrics on the coordinator, OS accounting on the relays — not

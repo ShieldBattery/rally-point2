@@ -15,7 +15,8 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use crate::create::{self, CreateOutcome, HttpClient};
-use crate::metrics::{Ending, PlayerReport, SessionReport};
+use crate::lifecycle::{LifecycleOutcome, SessionLifecycle};
+use crate::metrics::{DeliveryReport, Ending, PlayerReport, SessionReport};
 use crate::player::{self, PlayerConfig, SendTimes};
 use crate::turn::{DESYNC_FROM_ORDINAL, TurnBuilder};
 
@@ -117,12 +118,48 @@ pub async fn run_session(config: SessionConfig) -> SessionReport {
     };
     let create_done = Instant::now();
 
-    let players = run_players(&config, &response, &pkcs8_by_slot, create_done).await;
+    let (players, lifecycle) = run_players(&config, &response, &pkcs8_by_slot, create_done).await;
+    let measured_turns = config.game_secs.saturating_mul(u64::from(config.turn_rate));
+    let expected = (config.players as u64)
+        .saturating_mul(config.players.saturating_sub(1) as u64)
+        .saturating_mul(measured_turns);
+    let distinct = players.iter().fold(0u64, |total, player| {
+        total.saturating_add(player.turn_deliveries_distinct)
+    });
+    let duplicate = players.iter().fold(0u64, |total, player| {
+        total.saturating_add(player.turn_deliveries_duplicate)
+    });
+    let missing = expected.saturating_sub(distinct);
+    let exact_workload_sent = players.len() == config.players
+        && players
+            .iter()
+            .all(|player| player.turns_sent == measured_turns);
+    let delivery = DeliveryReport {
+        expected,
+        distinct,
+        missing,
+        duplicate,
+        complete: lifecycle.complete && exact_workload_sent && missing == 0 && duplicate == 0,
+        timed_out: lifecycle.timed_out,
+    };
+    if !delivery.complete {
+        tracing::warn!(
+            session_index = config.session_index,
+            expected = delivery.expected,
+            distinct = delivery.distinct,
+            missing = delivery.missing,
+            duplicate = delivery.duplicate,
+            timed_out = delivery.timed_out,
+            lifecycle_aborted = lifecycle.aborted,
+            "session ended without exact delivery completeness"
+        );
+    }
 
     SessionReport::Created {
         create_latency_us: latency_us,
         provisioning_holds,
         players,
+        delivery,
     }
 }
 
@@ -132,8 +169,10 @@ async fn run_players(
     response: &SessionResponse,
     pkcs8_by_slot: &HashMap<SlotId, Vec<u8>>,
     create_done: Instant,
-) -> Vec<PlayerReport> {
+) -> (Vec<PlayerReport>, LifecycleOutcome) {
     let send_times: SendTimes = Arc::new(Mutex::new(HashMap::new()));
+    let lifecycle = SessionLifecycle::new(config.players);
+    let measured_turns = config.game_secs.saturating_mul(u64::from(config.turn_rate));
     // The one player chosen to diverge in a desync session — the highest slot, so
     // it is distinct from slot 0's home-relay authority.
     let desyncer = config.players.saturating_sub(1);
@@ -160,12 +199,26 @@ async fn run_players(
             server_name: config.server_name.clone(),
             ipv4_only: config.ipv4_only,
             turn_rate: config.turn_rate,
-            game_secs: config.game_secs,
+            measured_turns,
+            players: config.players,
             builder,
             send_times: Arc::clone(&send_times),
             create_done,
+            lifecycle: lifecycle.clone(),
         };
         handles.push(tokio::spawn(player::run_player(player_config)));
+    }
+
+    // A malformed create response or a missing local keypair means no complete
+    // rendezvous is possible. Release every task rather than leaving the players
+    // that did receive tokens parked at the readiness gate.
+    if handles.len() != config.players {
+        tracing::warn!(
+            expected = config.players,
+            spawned = handles.len(),
+            "created session did not yield one runnable token per player"
+        );
+        lifecycle.abort();
     }
 
     let mut reports = Vec::with_capacity(handles.len());
@@ -181,7 +234,7 @@ async fn run_players(
             }
         }
     }
-    reports
+    (reports, lifecycle.outcome())
 }
 
 /// The relay a slot homes on: its `slot_homes` override, else the primary home relay.

@@ -9,6 +9,7 @@
 
 mod cli;
 mod create;
+mod lifecycle;
 mod metrics;
 mod player;
 mod session;
@@ -30,6 +31,18 @@ use crate::session::{SessionConfig, run_session};
 
 /// Multiplier that spreads per-session seeds apart (the odd 64-bit golden ratio).
 const SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Session validation accepts slots 0 through 11.
+const MAX_PLAYERS: usize = 12;
+/// Keep the synthetic scheduler at cadences of at least one microsecond.
+const MAX_TURN_RATE: u32 = 1_000_000;
+/// Conservative retained size of one `(slot, frame) -> Instant` hash entry.
+const SEND_TIME_ENTRY_ESTIMATE_BYTES: u128 = 64;
+/// Fan-out latency and inter-arrival gap each retain one `u64` per delivery.
+const DELIVERY_SAMPLE_BYTES: u128 = 2 * size_of::<u64>() as u128;
+/// Bound retained exact-accounting state if every requested session overlaps.
+/// This covers send-time entries, raw delivery samples, and exact-delivery bits;
+/// it is intentionally conservative rather than a claim about total process RSS.
+const MAX_EXACT_ACCOUNTING_BYTES: u128 = 512 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -168,8 +181,44 @@ fn validate(cli: &Cli) -> Result<()> {
     if cli.players == 0 {
         bail!("--players must be at least 1");
     }
+    if cli.players > MAX_PLAYERS {
+        bail!("--players must be at most {MAX_PLAYERS}");
+    }
     if cli.turn_rate == 0 {
         bail!("--turn-rate must be at least 1");
+    }
+    if cli.turn_rate > MAX_TURN_RATE {
+        bail!("--turn-rate must be at most {MAX_TURN_RATE}");
+    }
+    let measured_turns = cli
+        .game_secs
+        .checked_mul(u64::from(cli.turn_rate))
+        .ok_or_else(|| eyre!("--game-secs multiplied by --turn-rate is too large"))?;
+    if measured_turns > u64::from(u32::MAX) {
+        bail!("--game-secs multiplied by --turn-rate must fit the 32-bit game frame range");
+    }
+    let sessions = cli.sessions as u128;
+    let players = cli.players as u128;
+    let measured_turns = u128::from(measured_turns);
+    let sent_frames = sessions
+        .saturating_mul(players)
+        .saturating_mul(measured_turns);
+    let expected_deliveries = sent_frames.saturating_mul(players.saturating_sub(1));
+    let ledger_bits = sessions
+        .saturating_mul(cli.players as u128)
+        .saturating_mul(cli.players as u128)
+        .saturating_mul(measured_turns);
+    let ledger_bytes = ledger_bits.saturating_add(7) / 8;
+    let accounting_bytes = sent_frames
+        .saturating_mul(SEND_TIME_ENTRY_ESTIMATE_BYTES)
+        .saturating_add(expected_deliveries.saturating_mul(DELIVERY_SAMPLE_BYTES))
+        .saturating_add(ledger_bytes);
+    if accounting_bytes > MAX_EXACT_ACCOUNTING_BYTES {
+        bail!(
+            "exact delivery accounting would retain about {} MiB; reduce sessions, players, game duration, or turn rate (maximum {} MiB)",
+            accounting_bytes.div_ceil(1024 * 1024),
+            MAX_EXACT_ACCOUNTING_BYTES / (1024 * 1024),
+        );
     }
     if !(0.0..=1.0).contains(&cli.desync_fraction) {
         bail!("--desync-fraction must be between 0 and 1");
@@ -209,4 +258,73 @@ fn fnv1a64(input: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_cli() -> Cli {
+        Cli {
+            coordinator_url: "http://127.0.0.1:14910".to_owned(),
+            tenant: "test".to_owned(),
+            client_key: "00".repeat(32),
+            sessions: 10,
+            arrival_rate: 2.0,
+            players: 2,
+            game_secs: 120,
+            turn_rate: 24,
+            turn_bytes: 16,
+            slot_regions: Vec::new(),
+            desync_fraction: 0.0,
+            json_out: None,
+            run_id: None,
+            relay_server_name: "localhost".to_owned(),
+            ipv4_only: true,
+        }
+    }
+
+    #[test]
+    fn normal_capacity_matrix_fits_exact_delivery_tracking() {
+        assert!(validate(&valid_cli()).is_ok());
+    }
+
+    #[test]
+    fn rejects_players_outside_the_supported_session_slot_range() {
+        let mut cli = valid_cli();
+        cli.players = MAX_PLAYERS + 1;
+        assert!(
+            validate(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--players must be at most 12")
+        );
+    }
+
+    #[test]
+    fn rejects_a_cadence_finer_than_one_microsecond() {
+        let mut cli = valid_cli();
+        cli.turn_rate = MAX_TURN_RATE + 1;
+        assert!(
+            validate(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--turn-rate must be at most")
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_exact_accounting_that_could_oom_the_harness() {
+        let mut cli = valid_cli();
+        cli.sessions = 1;
+        cli.players = MAX_PLAYERS;
+        cli.game_secs = 15;
+        cli.turn_rate = MAX_TURN_RATE;
+        assert!(
+            validate(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("exact delivery accounting would retain")
+        );
+    }
 }

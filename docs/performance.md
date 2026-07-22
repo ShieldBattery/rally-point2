@@ -108,29 +108,52 @@ target/release/rally-point-loadgen \
 ```
 
 The JSON includes the complete workload, wall time, actual sent/delivered rates,
-latency distributions, stalls, and connection outcomes. A relay task-stats line
+exact expected/distinct/missing/duplicate delivery counts, complete/timed-out
+session counts, latency distributions, stalls, and connection outcomes. Players
+start from one session-wide rendezvous, emit exactly `game_secs * turn_rate`
+frames each, and remain connected through a shared bounded delivery drain, so a
+missing terminal suffix cannot be hidden by independently timed leaves. A relay
+task-stats line
 reports CPU and network rates plus actual validated-turn, distinct mesh-ingress,
 and local-delivery rates. Local validation and delivery totals reuse the flight
 recorder's existing per-slot atomics and are summed only at the task-stats poll.
 Distinct mesh ingress is counted immediately after session-level dedup, while
 the turn ring already holds its record lock. Measurement therefore adds neither
-a second per-turn atomic update nor a new lock acquisition. Its CPU-per-work
-fields are deliberately reported against three denominators:
+a second per-turn atomic update nor a new lock acquisition.
 
 Use `cpu_cores_used` as the primary capacity numerator. It is the container's
-CPU-time delta divided by monotonic wall time (`1.0` is one fully occupied core),
-so it remains comparable when two Fargate tasks land on different hosts.
+CPU-time delta divided by the ECS stats provider's own sample-clock delta (`1.0`
+is one fully occupied core), so a cached metadata response is omitted rather
+than appearing as a false zero followed by a false catch-up spike. The log also
+includes `cpu_total_usage_ns` and `provider_read_unix_ns`; use their first-to-last
+deltas for the most robust whole-window result. Those cumulative CPU and work
+totals are the canonical measurements.
 `cpu_pct` is retained as Docker's conventional host-system-counter formula, but
 that host-relative counter is noticeably noisier across Fargate placements.
 For a 0.5-vCPU task, divide `cpu_cores_used` by `0.5` (or multiply by 200) to get
 task-allotment utilization; for a 1-vCPU task, multiply by 100.
 
-- CPU ns / validated turn is useful for identical client-ingress and topology
-  runs;
-- CPU ns / ingress turn divides by locally validated plus distinct mesh-origin
-  turns, making it the all-ingress denominator for split-relay topologies;
-- CPU ns / local delivery captures fan-out work, but does not include mesh sends
-  as a separate unit.
+The `estimated_cpu_ns_per_*` fields pair independently sampled CPU and relay-work
+counters, so they are explicitly estimates. They are emitted only when the ECS
+provider interval and local work interval are within 20%; check
+`cpu_work_intervals_aligned` and use the cumulative totals directly when it is
+false. The original `cpu_ns_per_*` keys remain as compatibility aliases with the
+same values and should not be interpreted as exact. The three estimates use
+these denominators:
+
+- `estimated_cpu_ns_per_validated_turn` is useful for identical client-ingress
+  and topology runs;
+- `estimated_cpu_ns_per_ingress_turn` divides by locally validated plus distinct
+  mesh-origin turns, making it the all-ingress denominator for split-relay
+  topologies;
+- `estimated_cpu_ns_per_local_delivery` captures fan-out work, but does not
+  include mesh sends as a separate unit.
+
+`mem_limit_mib` remains numeric for structured-log consumers. When task metadata
+has not yet supplied a valid limit and the container reports the cgroup
+unlimited sentinel, it is `0` and `mem_limit_known` is false. The reporter
+retries task metadata until both CPU and memory allocations are valid, then
+caches them for the task's lifetime.
 
 `mesh_ingress_turns_per_sec` counts only the first mesh copy of each
 `(slot, seq)` that wins session dedup. Redundant or replayed copies rejected by
@@ -160,8 +183,10 @@ Use this minimum matrix to reveal where a change helps:
 | Turn size | 16, 256, 1024 bytes | fixed bookkeeping from encode/copy/bandwidth cost |
 | Concurrency | increase sessions to roughly 50%, 70%, then 90% CPU | low-load latency from saturation behavior |
 
-For each point, run at least three repetitions. Compare the median steady-state
-task samples after the ramp and before teardown; also require that p99 fan-out
+For each point, run at least three repetitions. Compute steady-state CPU from
+the first-to-last cumulative CPU and provider-time deltas after the ramp and
+before teardown, deduplicating repeated provider timestamps. Compare medians of
+fresh interval samples as a secondary noise check; also require that p99 fan-out
 latency, stalls, clean endings, and delivery counts do not regress. CPU is not a
 win if the change merely drops or delays work.
 

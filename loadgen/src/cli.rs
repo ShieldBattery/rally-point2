@@ -36,7 +36,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     pub players: usize,
 
-    /// How long each session pumps turns, in seconds.
+    /// Nominal game duration in seconds. Each player emits exactly this value
+    /// multiplied by `--turn-rate` measured turns.
     #[arg(long, default_value_t = 30)]
     pub game_secs: u64,
 

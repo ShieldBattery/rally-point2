@@ -24,11 +24,52 @@ Fargate platform, or workload change.
 - CPU is median steady-state container CPU time divided by monotonic wall time.
   `1.0` means one fully occupied core; utilization of a 0.5-vCPU task is
   `cpu_cores / 0.5`.
-- A point is "clean" only when every client connected and ended cleanly, no turn
-  deliveries were lost, and no stalls were reported. A sharp p99 latency rise is
-  treated as the saturation knee even if all games eventually finish.
+- The historical sweep called a point "clean" when every client connected and
+  ended cleanly and no stalls were reported. Its loadgen independently timed each
+  player's leave and did not retain exact per-frame delivery coordinates, so the
+  old artifacts cannot prove terminal delivery completeness. Re-establish exact
+  completeness with the synchronized/draining harness before treating these
+  points as correctness baselines. A sharp p99 latency rise is still treated as
+  the saturation knee even if all games eventually finish.
 
-## 0.5-vCPU results
+## Current-platform rerun (`da47bc7`)
+
+AWS replaced the Fargate platform revision used by newly launched tasks between
+the historical sweep and this rerun. These results therefore describe the
+current platform plus relay commit `da47bc7`; differences from the historical
+tables cannot be attributed to the code change alone. Each point below is one
+120-second repetition on a 0.5-vCPU/1-GiB ARM64 task.
+
+The running image's ten-second CPU reporter aliased with the ECS stats cache at
+some points, producing compensating zero/catch-up samples. CPU here is the
+arithmetic mean of every evenly spaced steady-state sample, including both
+halves of those pairs. The updated reporter records provider timestamps and raw
+cumulative CPU so future sweeps can use first-to-last deltas directly.
+
+| Players/game | Topology | Conservative planning point | Highest zero-stall point | Observed boundary |
+| --- | --- | ---: | ---: | --- |
+| 2 | one relay | 96 clients | 108 clients, 0.378 cores, 4.63 ms p99 | 120 clients had 17 stalls; 144 had 90 stalls and 10.49 ms p99 |
+| 2 | two relays | 48 clients/relay (96 total) | 48/relay, 0.381 east / 0.371 west, 69.06 ms p99 | 60/relay had no stalls under the old lifecycle accounting; 72/relay had 11 stalls |
+| 4 | one relay | 80 clients (headroom below the sampled point) | 96 clients, 0.479 cores, 5.72 ms p99 | 112 clients used 0.526 cores, had 317 stalls, and reached 17.34 ms p99 |
+| 8 | one relay | 56 clients (headroom below the sampled point) | 64 clients, 0.467 cores, 4.06 ms p99 | 72 clients used 0.510 cores, had 274 stalls, and reached 20.98 ms p99 |
+
+The 80- and 56-client planning values are conservative interpolations, not
+separately sampled points. They keep useful CPU margin below clean measurements
+that already consumed 96% and 93% of the nominal half-core allocation.
+
+The final two-relay 96-client run used the synchronized exact-accounting
+harness: all 48 sessions completed, with 276,480 expected and distinct
+deliveries, zero missing, zero duplicate, and zero stalls. At the same total
+client count, the one-relay run used 0.346 cores; the split run used 0.752 cores
+in aggregate, about 2.17 times as much. The inter-region mesh hop also raised
+p99 fan-out from 2.32 ms to 69.06 ms.
+
+After the final session ended at 04:44:27 UTC, the coordinator retired both
+relay tasks at 04:55:12/04:55:23 UTC with reason `coordinator scale-down` and
+container exit code 0. All three regional clusters then had zero running tasks;
+no manual stop was required.
+
+## Historical 0.5-vCPU results
 
 | Players/game | Topology | Practical planning point | Highest clean point sampled | Observed boundary |
 | --- | --- | ---: | ---: | --- |
@@ -56,7 +97,7 @@ clients per 1-vCPU relay is the defensible point from this sweep: it retains
 about 29% CPU headroom. Six hundred clients is a demonstrated clean near-ceiling
 point, not the recommended steady allocation.
 
-## Matched one-relay versus two-relay topology
+## Historical matched one-relay versus two-relay topology
 
 The fair comparison holds total clients constant. It compares 288 clients on
 one relay with 288 clients split as 144 on each of two relays.
@@ -83,7 +124,8 @@ of slot pairs; that remains to be measured.
 
 Use the workflow and acceptance rules in [`performance.md`](performance.md).
 Keep the workload, topology, task size, architecture, arrival ramp, and relay
-image digest fixed; run at least three repetitions per point; and compare the
-median steady-state `cpu_cores_used` samples alongside p99 latency, stalls,
-delivery totals, and clean endings. Preserve each load generator JSON result and
-the corresponding relay task-stat window so a later comparison is auditable.
+image digest fixed; run at least three repetitions per point; and compare
+first-to-last cumulative CPU/provider-time deltas alongside p99 latency, stalls,
+exact delivery totals, and clean endings. Preserve each load generator JSON
+result and the corresponding relay task-stat window so a later comparison is
+auditable.
