@@ -69,6 +69,64 @@ relay tasks at 04:55:12/04:55:23 UTC with reason `coordinator scale-down` and
 container exit code 0. All three regional clusters then had zero running tasks;
 no manual stop was required.
 
+## Promoted-image validation (`4455b99`)
+
+The first run after promoting the mesh-Join rendezvous fix and zstd-compressed
+relay image repeated the exact 96-client comparison on 2026-07-22. Both relay
+tasks were 0.5-vCPU/1-GiB Linux/ARM64 Fargate tasks. The split run began with
+the east and west clusters at zero; the single-relay control reused the warm
+east task immediately afterward. Both used 48 two-player sessions, a five
+session/second arrival rate, 120-second games, 24 turns/second/player, and
+16-byte turn payloads.
+
+The running tasks both reported image index digest
+`sha256:5898bea6785e1114c84f0ab6b3a234a3dc49f385712a169dcc07039c61afd005`.
+All 19 layers of its ARM64 child were zstd-compressed and totaled 25,834,666
+bytes, 9.80% smaller than the previous image's 28,642,250 compressed layer
+bytes.
+
+| Topology | Clients/relay | CPU cores/relay | Aggregate relay cores | Fan-out p99 | Players seeing `SessionStart` | Exact delivery | Stalls |
+| --- | ---: | --- | ---: | ---: | ---: | --- | ---: |
+| one warm relay | 96 east | 0.312 east | 0.312 | 0.973 ms | 96/96 | 276,480/276,480, 0 missing/duplicate | 0 |
+| two cold relays | 48 east / 48 west | 0.348 east / 0.346 west | 0.694 | 72.201 ms | 96/96 | 276,480/276,480, 0 missing/duplicate | 0 |
+
+CPU is the first-to-last cumulative CPU/provider-time delta across each full
+steady-state plateau. Split topology consumed 2.22 times the aggregate relay
+CPU of the same-total-client single-relay control. That is consistent with the
+earlier topology result: each split relay handles client ingress plus mesh
+ingress even though it homes only half the clients.
+
+The preceding cold split had stranded one whole session at 94/96 clients
+observing `SessionStart`. This first cold run with the rendezvous fix reached
+96/96 and completed every delivery exactly once, directly exercising the race
+that motivated the fix. The split and single CPU results were respectively
+7.7% and 9.8% below the preceding current-platform measurements, but each is
+only one repetition on fresh Fargate placements; treat that as encouraging
+variance, not a demonstrated CPU improvement.
+
+Cold launch timing remained dominated by Fargate work before image pull:
+
+| Region | create -> connectivity | create -> pull start | image pull | create -> task started | task started -> control connected |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| us-east-1 | 5.984 s | 14.109 s | 9.458 s | 24.204 s | 0.096 s |
+| us-west-2 | 5.598 s | 14.221 s | 2.205 s | 16.965 s | 0.488 s |
+
+The west pull was faster than the earlier 3--7-second examples, while the east
+pull was slower. One launch pair cannot isolate compression from regional
+cache and placement noise. It does show that the smaller zstd image is accepted
+by Fargate, while the roughly 14 seconds before either pull began remains the
+larger cold-start floor. The load generator observed 626 provisioning holds,
+30.287 seconds p99 create latency, and 314 milliseconds p99 from successful
+create to `SessionStart` in the cold split.
+
+Scale-down also completed without operator intervention. West began stopping at
+07:46:43 UTC, about ten minutes after the split run ended; east began stopping
+at 07:50:53 UTC, exactly ten minutes after the later single-relay run ended.
+Both ECS tasks stopped with reason `coordinator scale-down` and container exit
+code 0, all three staging clusters returned to zero running and pending tasks,
+and the load-generator instance was stopped immediately after its artifacts
+were copied.
+
 ## Historical 0.5-vCPU results
 
 | Players/game | Topology | Practical planning point | Highest clean point sampled | Observed boundary |
