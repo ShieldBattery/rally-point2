@@ -209,6 +209,36 @@ mod tests {
     }
 
     #[test]
+    fn player_skin_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::PlayerSkin;
+
+        // A player-skin blob rides the client-edge control frame with its author
+        // slot and opaque bytes intact.
+        let frame = ControlFrame {
+            kind: Some(control_frame::Kind::PlayerSkin(PlayerSkin {
+                slot: 3,
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+            })),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
+
+        // And it rides the mesh control frame the same way, for cross-relay
+        // fan-out.
+        let mesh = MeshControlFrame {
+            session: 7,
+            kind: Some(mesh_control_frame::Kind::PlayerSkin(PlayerSkin {
+                slot: 3,
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+            })),
+        };
+        let encoded = encode_frame(&mesh).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, mesh);
+    }
+
+    #[test]
     fn an_unknown_frame_kind_decodes_with_the_oneof_unset() {
         // A frame kind a newer peer added: field 15, some bytes. It must
         // decode (kind = None) so the reader can skip it, not a stream-fatal

@@ -31,8 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
-    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, RequestDrop,
-    SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
+    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, PlayerSkin,
+    RequestDrop, SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent,
+    mesh_control_frame,
 };
 use rally_point_transport::MeshSessionKey;
 use tokio::sync::{Notify, mpsc};
@@ -596,6 +597,13 @@ pub struct MeshState {
     /// but the same per-session lifecycle and task-threading as `lobby`. See
     /// [`crate::chat`].
     pub chat: crate::chat::ChatRegistry,
+    /// Per-session cosmetic-skin fan-out and its latest-blob-per-slot replay map.
+    /// The slot-link tasks deliver their clients' skin blobs into it (and register
+    /// each member to receive others' and replay the stored map), and the
+    /// mesh-link drivers deliver peers' blobs into it. Bundled here for the same
+    /// reason as `lobby` and `chat` — the same per-session lifecycle and
+    /// task-threading, not because it is a mesh concern. See [`crate::skin`].
+    pub skins: crate::skin::SkinRegistry,
     /// Per-relay holds on dropped slots' synced-leave decisions, plus the
     /// per-requester rate cap on the manual drop requests that resolve them. A slot
     /// that dropped (its link died) has its departure recorded and announced
@@ -665,6 +673,7 @@ pub fn new_mesh_state_with_timings(
         presence: Arc::new(crate::presence::new_presence_registry()),
         lobby: crate::lobby::new_lobby_registry(),
         chat: crate::chat::new_chat_registry(),
+        skins: crate::skin::new_skin_registry(),
         drop_holds: crate::drop_hold::DropHolds::new(unlock, abandon_timeout),
         turn_ring: crate::turn_ring::TurnRing::new(),
         provisional: crate::provisional::ProvisionalSessions::new(
@@ -1264,6 +1273,17 @@ pub(crate) fn fan_out_chat(links: &MeshLinks, key: &SessionKey, chat: GameChat) 
     fan_out_control(links, key, chat_frame(key.session, chat));
 }
 
+/// Propagates one member's cosmetic-skin blob to every peer relay serving `key`,
+/// so each stores it and fans it out to its own local members. The origin relay
+/// stamps the authoring slot onto `skin` before this call, so a peer copy already
+/// carries the authoritative author. A relay that receives this stores and
+/// locally fans it out but does not re-broadcast it — no echo — mirroring
+/// [`fan_out_lobby_command`] (a peer stores it for its own late joiners, as with
+/// the lobby log) rather than [`fan_out_chat`] (which keeps nothing).
+pub(crate) fn fan_out_skin(links: &MeshLinks, key: &SessionKey, skin: PlayerSkin) {
+    fan_out_control(links, key, skin_frame(key.session, skin));
+}
+
 /// Announces a freshly registered slot to every peer relay serving `key`, so
 /// each accumulates it into the session's live-slot set and the authority can
 /// decide when every expected slot has connected. A duplicate (a re-announce) is
@@ -1479,6 +1499,14 @@ fn chat_frame(session: SessionId, chat: GameChat) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::GameChat(chat)),
+    }
+}
+
+/// Builds a `PlayerSkin` mesh control frame for `session`.
+fn skin_frame(session: SessionId, skin: PlayerSkin) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::PlayerSkin(skin)),
     }
 }
 
@@ -1991,9 +2019,10 @@ pub async fn run_mesh_link(
     // Cloned (cheap — every field is an `Arc`) before the destructure below
     // pulls `mesh` apart, so `dispatch_mesh_control` can take the whole bundle
     // as one argument rather than a growing list of its individual registries
-    // (mirroring `run_slot_link`'s `mesh_for_teardown`). `lobby` and `chat` are
-    // used only inside that dispatch, via the clone, so this destructure omits
-    // them (`..`) rather than binding two names this function never reads.
+    // (mirroring `run_slot_link`'s `mesh_for_teardown`). `lobby`, `chat`, and
+    // `skins` are used only inside that dispatch, via the clone, so this
+    // destructure omits them (`..`) rather than binding names this function
+    // never reads.
     let mesh_for_dispatch = mesh.clone();
     let MeshState {
         links: mesh_links,
@@ -2824,6 +2853,12 @@ pub async fn run_mesh_link(
 ///   slot-stamped by the origin. Delivered to this relay's local members — no
 ///   log to append to, chat is ephemeral — and, like the lobby command, not
 ///   re-broadcast across the mesh.
+/// - **`PlayerSkin`**: a cosmetic-skin blob a peer relay's member authored,
+///   already slot-stamped by the origin. Stored in this relay's latest-per-slot
+///   map and fanned to its local members — so a late-dialing or reconnecting
+///   local member still replays it on register (as the lobby command is appended
+///   to this relay's log) — but, like the chat message, not re-broadcast across
+///   the mesh: the origin already sent a copy to every link serving the session.
 /// - **`RequestDrop`**: a manual drop request a peer relay's member authored,
 ///   already `requester`-stamped by the origin. Honored only if this relay is the
 ///   session authority and the target slot's drop has stood past the unlock floor;
@@ -2842,8 +2877,9 @@ pub async fn run_mesh_link(
 ///
 /// Takes the whole `mesh` bundle rather than its individual registries so this
 /// signature doesn't grow a new parameter every time a control-frame kind needs
-/// another per-session registry (`seen`, `lobby`, and `chat` all live inside it
-/// already); `sessions` stays separate because it is not part of `MeshState`.
+/// another per-session registry (`seen`, `lobby`, `chat`, and `skins` all live
+/// inside it already); `sessions` stays separate because it is not part of
+/// `MeshState`.
 fn dispatch_mesh_control(
     frame: MeshControlFrame,
     peer_id: RelayId,
@@ -3033,6 +3069,20 @@ fn dispatch_mesh_control(
             // No log to append to; deliberately NOT re-broadcast across the
             // mesh, exactly as the lobby command and oversize turn above.
             crate::chat::deliver(&mesh.chat, &key, chat_msg);
+        }
+        Some(mesh_control_frame::Kind::PlayerSkin(skin)) => {
+            // A cosmetic-skin blob a peer relay's member authored, already
+            // slot-stamped by the origin — its size and rate caps already applied
+            // there, so a mesh copy is trusted, not re-checked. Store it in this
+            // relay's latest-per-slot map (so its own late-dialing or reconnecting
+            // local members still replay it on register — like the lobby command
+            // appending to this relay's log) and fan it to local members.
+            // Deliberately NOT re-broadcast across the mesh: the origin already
+            // sent a copy to every link serving the session, so re-flooding would
+            // only echo. `deliver`'s return is ignored here — the map cap only
+            // gates whether this relay stores/fans the blob, and there is nothing
+            // to re-broadcast either way.
+            crate::skin::deliver(&mesh.skins, &key, skin);
         }
         Some(mesh_control_frame::Kind::SlotPresent(present)) => {
             let Ok(slot) = u8::try_from(present.slot).map(SlotId) else {
@@ -3533,6 +3583,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -3550,7 +3601,7 @@ mod tests {
             SlotId(0),
             22,
         ));
-        let mesh = test_mesh_state(&links, &seen, &makers, &lobby, &chat);
+        let mesh = test_mesh_state(&links, &seen, &makers, &lobby, &chat, &skins);
         let peer = RelayId(9);
         let old = new_mesh_link_attempt();
         let current = new_mesh_link_attempt();
@@ -4049,6 +4100,7 @@ mod tests {
         makers: &Arc<crate::consensus::DecisionMakers>,
         lobby: &crate::lobby::LobbyRegistry,
         chat: &crate::chat::ChatRegistry,
+        skins: &crate::skin::SkinRegistry,
     ) -> MeshState {
         MeshState {
             links: mesh_links.clone(),
@@ -4059,6 +4111,7 @@ mod tests {
             presence: Arc::new(crate::presence::new_presence_registry()),
             lobby: lobby.clone(),
             chat: chat.clone(),
+            skins: skins.clone(),
             // A zero unlock floor so a held drop is "past the floor" from the first
             // instant, letting a `RequestDrop` dispatch test drive the honor path
             // without a real wait. Tests that only hold and release a drop are
@@ -4986,7 +5039,8 @@ mod tests {
         };
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let skins = crate::skin::new_skin_registry();
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The remote slot's frame fed the consensus coordinate, exactly as a
@@ -5021,6 +5075,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
 
         // A local member on this relay (slot 5) that must receive the mesh command.
@@ -5050,7 +5105,7 @@ mod tests {
                 payload: vec![0xAB].into(),
             })),
         };
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local member received the command with the origin's authoritative slot.
@@ -5075,6 +5130,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
 
         // A local member on this relay (slot 5) that must receive the mesh message.
@@ -5106,7 +5162,7 @@ mod tests {
                 text: "hi from relay A".to_owned(),
             })),
         };
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local member received the message with the origin's authoritative
@@ -5115,6 +5171,67 @@ mod tests {
         assert_eq!(delivered.slot, 0);
         assert_eq!(delivered.target_kind, 2);
         assert_eq!(delivered.text, "hi from relay A");
+        // No echo back out to the mesh on either path.
+        assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
+        assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
+    }
+
+    /// A cosmetic-skin blob arriving over the mesh control stream is folded into
+    /// this relay's local delivery — fanned to local members AND stored in the
+    /// latest-per-slot map so a later local joiner replays it — and NOT
+    /// re-broadcast to other mesh links: the origin relay already sent a copy to
+    /// every link serving the session, so re-flooding would only echo. Mirrors the
+    /// game-chat dispatch test, plus the store-and-replay the map adds over chat.
+    #[test]
+    fn a_player_skin_dispatch_delivers_locally_stores_and_never_echoes() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let key = control_key();
+
+        // A local member on this relay (slot 5) that must receive the mesh blob.
+        let mut member = crate::skin::register_member(&skins, &key, SlotId(5));
+        // A peer mesh link that must NOT hear an echo of the received blob.
+        let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        // A blob a remote member (slot 0) authored, already slot-stamped.
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::PlayerSkin(PlayerSkin {
+                slot: 0,
+                payload: vec![0xDE, 0xAD].into(),
+            })),
+        };
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+
+        // The local member received the blob with the origin's authoritative slot.
+        let delivered = member.try_recv().expect("the local member received it");
+        assert_eq!(delivered.slot, 0);
+        assert_eq!(delivered.payload.as_ref(), &[0xDE, 0xAD]);
+        // It was also stored, so a local member joining afterwards replays it.
+        let mut late = crate::skin::register_member(&skins, &key, SlotId(6));
+        let replayed = late.try_recv().expect("the late joiner replayed the blob");
+        assert_eq!(replayed.slot, 0);
+        assert_eq!(replayed.payload.as_ref(), &[0xDE, 0xAD]);
         // No echo back out to the mesh on either path.
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
@@ -5133,6 +5250,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
 
         // A local routing slot (slot 5) that must receive the fanned change.
@@ -5167,7 +5285,7 @@ mod tests {
                 },
             )),
         };
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         // The local slot heard the change, naming the disconnected subject slot.
@@ -5191,6 +5309,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -5220,7 +5339,7 @@ mod tests {
                 },
             },
         );
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
 
         let stale_down = MeshControlFrame {
             session: key.session.0,
@@ -5283,8 +5402,9 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         // A maker for the session -- `observe_leave` (a Peer-relay concern:
         // only a non-authority relay observes a leave off the mesh) is a
         // no-op with no maker to cache into, so one must exist first.
@@ -5400,6 +5520,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -5413,7 +5534,7 @@ mod tests {
         );
         crate::consensus::record_departure(&makers, &key, SlotId(0), None, None, None, 0x4000_0006);
 
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
 
         // This relay observed slot 0 drop and marked a hold on its leave. A hold
         // never fires on its own — the release is what clears it.
@@ -5465,6 +5586,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -5497,7 +5619,7 @@ mod tests {
             routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
         guard.disarm();
         let joined = joined_state(&mesh_links, &key);
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         mesh_state.drop_holds.hold(key.clone(), SlotId(0));
 
         let connected = |epoch| MeshControlFrame {
@@ -5542,6 +5664,7 @@ mod tests {
             let makers = Arc::new(crate::consensus::new_decision_makers());
             let lobby = crate::lobby::new_lobby_registry();
             let chat = crate::chat::new_chat_registry();
+            let skins = crate::skin::new_skin_registry();
             let key = control_key();
             let _ = crate::consensus::sync_maker(
                 &makers,
@@ -5563,7 +5686,7 @@ mod tests {
                 routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
             guard.disarm();
             let joined = joined_state(&mesh_links, &key);
-            let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+            let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
 
             let connected = |epoch| MeshControlFrame {
                 session: key.session.0,
@@ -5692,6 +5815,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -5717,7 +5841,7 @@ mod tests {
             0x4000_0006,
         );
 
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         mesh_state.drop_holds.hold(key.clone(), SlotId(0));
 
         // A peer mesh link, to observe the decided leave broadcast and prove the
@@ -5772,6 +5896,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let lobby = crate::lobby::new_lobby_registry();
         let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
         let key = control_key();
         let _ = crate::consensus::sync_maker(
             &makers,
@@ -5794,7 +5919,7 @@ mod tests {
             0x4000_0006,
         );
 
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat);
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         mesh_state.drop_holds.hold(key.clone(), SlotId(0));
 
         let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);

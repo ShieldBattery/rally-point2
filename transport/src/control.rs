@@ -25,7 +25,7 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    RequestDrop, SessionStart, SlotConnectivity, control_frame,
+    PlayerSkin, RequestDrop, SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -33,16 +33,17 @@ use tokio::sync::mpsc;
 ///
 /// The stream carries more than one kind now, so the reader hands back a tagged
 /// value rather than a bare payload. On the client edge `OversizeTurn`, `Leave`,
-/// `Lobby`, and `Chat` arrive (the relay forwards oversize turns, pushes leaves
-/// down, and fans lobby commands and chat messages from other members down), but
-/// never `LeaveIntent` — a client never receives its own intent back, so the
-/// client edge ignores one, mirroring how the relay edge ignores a stray `Leave`.
-/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`, `Lobby`, and
-/// `Chat` arrive (a client sends all five up); a relay never receives a `Leave`
-/// from another relay on this stream, so the relay edge ignores one. Unlike
-/// every other kind, `Lobby` and `Chat` are legitimate in *both* directions —
-/// their `slot` field's authority just flips with direction (see
-/// [`LobbyCommand`] and [`GameChat`]'s docs).
+/// `Lobby`, `Chat`, and `Skin` arrive (the relay forwards oversize turns, pushes
+/// leaves down, and fans lobby commands, chat messages, and skin blobs from other
+/// members down), but never `LeaveIntent` — a client never receives its own intent
+/// back, so the client edge ignores one, mirroring how the relay edge ignores a
+/// stray `Leave`.
+/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`, `Lobby`,
+/// `Chat`, and `Skin` arrive (a client sends all six up); a relay never receives
+/// a `Leave` from another relay on this stream, so the relay edge ignores one.
+/// Unlike every other kind, `Lobby`, `Chat`, and `Skin` are legitimate in *both*
+/// directions — their `slot` field's authority just flips with direction (see
+/// [`LobbyCommand`], [`GameChat`], and [`PlayerSkin`]'s docs).
 #[derive(Debug)]
 pub enum ControlInbound {
     /// An oversize turn to fold back into the ordered turn stream.
@@ -74,6 +75,15 @@ pub enum ControlInbound {
     /// surfaced so both directions can read `slot`, `target_kind`, and
     /// `target_slot`.
     Chat(GameChat),
+    /// One member's opaque cosmetic-skin blob, in both directions — like `Lobby`
+    /// and `Chat`. Client → relay carries this client's own blob (the relay
+    /// ignores the frame's `slot` and stamps the authenticated one); relay →
+    /// client carries another member's blob with the relay's authoritative `slot`
+    /// naming which member it describes, either fanned live or replayed from the
+    /// relay's latest-per-slot map when this stream comes up after the blob
+    /// flowed. The whole message is surfaced so both directions can read `slot`
+    /// and the opaque `payload`.
+    Skin(PlayerSkin),
     /// The relay-driven session-start directive (relay → client only): every
     /// expected slot has connected, so the game may begin. A relay never receives
     /// this from a client, so the relay edge ignores a stray one just as it does a
@@ -200,6 +210,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::GameChat(chat)),
                 } => ControlInbound::Chat(chat),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::PlayerSkin(skin)),
+                } => ControlInbound::Skin(skin),
                 ControlFrame {
                     kind:
                         Some(control_frame::Kind::SessionStart(SessionStart {
@@ -334,6 +347,28 @@ pub async fn send_control_chat(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameChat(chat)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a cosmetic-skin blob on the control stream, in either direction: a
+/// client pushes its own authored blob up (leaving `slot` at 0 — the relay
+/// stamps the authenticated slot and never trusts a client value), and a relay
+/// fans a member's blob down with `slot` stamped to the author (a live send or a
+/// replay from the relay's latest-per-slot map). Like a chat message, a failed
+/// send here is not correctness-critical for the caller to treat as a link
+/// failure — a skin is cosmetic, non-synced, and best-effort, so a lost blob
+/// costs only a wrong cosmetic — so the client-edge driver logs and continues on
+/// an `Err` here rather than propagating it as a fatal error, the same treatment
+/// it gives a failed `GameChat` send.
+pub async fn send_control_skin(
+    control_send: &mut quinn::SendStream,
+    skin: PlayerSkin,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::PlayerSkin(skin)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

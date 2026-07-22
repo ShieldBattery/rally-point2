@@ -16,6 +16,10 @@
 //! - **chat** ([`chat`]) — fan in-game chat messages out to a session's local
 //!   members. The mid-game counterpart to `lobby`: no replay log (chat is
 //!   ephemeral), plus a per-slot size and rate cap enforced at the relay.
+//! - **skin** ([`skin`]) — fan members' opaque cosmetic-skin blobs out to a
+//!   session's local members and replay them on register. One-shot state, not
+//!   events: a latest-blob-per-slot map (a re-send replaces) replayed to late or
+//!   reconnecting members, with the same size and rate caps `chat` enforces.
 //! - **server** ([`server`]) — the client-facing accept loop tying the three
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, direct origin-relay
@@ -95,6 +99,7 @@ pub mod provisional;
 pub mod region_ping;
 pub mod routing;
 pub mod server;
+pub mod skin;
 pub mod task_stats;
 pub mod turn_ring;
 pub mod validation;

@@ -620,6 +620,119 @@ async fn a_burst_of_game_chat_past_the_rate_cap_is_dropped_then_recovers() {
     let _ = task1.await;
 }
 
+#[tokio::test]
+async fn player_skins_reach_other_members_with_the_relay_stamped_slot() {
+    use rally_point_client::LinkDriver;
+
+    // The full production path for a cosmetic-skin broadcast: a member hands its
+    // blob to its `skin_out` seam, the driver sends it up its control stream, the
+    // relay stamps the authoring slot and fans it down every other member's
+    // control stream, and each driver surfaces it on `skin_in` tagged with the
+    // author's slot. Three members (A sends, B and C receive) proves the fan-out,
+    // and the relay-stamp proof mirrors the chat/lobby tests: the driver always
+    // sends `slot: 0` regardless of which client it wraps, so the different
+    // authoritative slots each peer sees can only come from the relay's own stamp.
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(63);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+    let id2 = identity_for(&tenant, session, SlotId(2));
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let link2 = endpoint.connect(addr, "localhost", &id2).await.unwrap();
+    let (driver0, chan0) = LinkDriver::new(link0);
+    let (driver1, mut chan1) = LinkDriver::new(link1);
+    let (driver2, mut chan2) = LinkDriver::new(link2);
+    let task0 = tokio::spawn(driver0.run());
+    let task1 = tokio::spawn(driver1.run());
+    let task2 = tokio::spawn(driver2.run());
+
+    // Slot 0 broadcasts its blob; slots 1 and 2 both receive it, tagged with the
+    // author's slot, and the opaque bytes pass through verbatim.
+    chan0
+        .skin_out
+        .send(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        .await
+        .unwrap();
+    for chan in [&mut chan1, &mut chan2] {
+        let (author, bytes) = tokio::time::timeout(Duration::from_secs(5), chan.skin_in.recv())
+            .await
+            .expect("member never received the skin blob")
+            .expect("driver closed early");
+        assert_eq!(author, SlotId(0));
+        assert_eq!(bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    drop(chan0.outbound);
+    drop(chan1.outbound);
+    drop(chan2.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+    let _ = task2.await;
+}
+
+#[tokio::test]
+async fn a_player_skin_is_replayed_to_a_late_joining_client() {
+    use rally_point_client::LinkDriver;
+
+    // The load-bearing difference from chat: a member dialing in after other
+    // members already broadcast their blobs still receives each one — the relay's
+    // per-session latest-blob-per-slot map replays it on register. Two members
+    // broadcast before the third joins; the third replays both, stamped with each
+    // author's slot.
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(64);
+
+    // Slots 0 and 1 connect and broadcast their blobs before the peer exists, so
+    // a plain fan-out would lose them.
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
+    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
+    let (driver0, chan0) = LinkDriver::new(link0);
+    let (driver1, chan1) = LinkDriver::new(link1);
+    let task0 = tokio::spawn(driver0.run());
+    let task1 = tokio::spawn(driver1.run());
+    chan0.skin_out.send(vec![0x00, 0xA0]).await.unwrap();
+    chan1.skin_out.send(vec![0x01, 0xB1]).await.unwrap();
+    // Let the drivers send them up and the relay store them in its map.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The peer dials late and replays both stored blobs, each stamped with its
+    // author's slot (the replay is unordered — a map, not a sequence — so collect
+    // and compare as a set).
+    let id2 = identity_for(&tenant, session, SlotId(2));
+    let link2 = endpoint.connect(addr, "localhost", &id2).await.unwrap();
+    let (driver2, mut chan2) = LinkDriver::new(link2);
+    let task2 = tokio::spawn(driver2.run());
+
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let (author, bytes) = tokio::time::timeout(Duration::from_secs(5), chan2.skin_in.recv())
+            .await
+            .expect("the late-joining peer's replay stalled")
+            .expect("driver 2 closed early");
+        got.push((author, bytes));
+    }
+    got.sort_by_key(|(author, _)| author.0);
+    assert_eq!(
+        got,
+        vec![(SlotId(0), vec![0x00, 0xA0]), (SlotId(1), vec![0x01, 0xB1]),],
+    );
+
+    drop(chan0.outbound);
+    drop(chan1.outbound);
+    drop(chan2.outbound);
+    let _ = task0.await;
+    let _ = task1.await;
+    let _ = task2.await;
+}
+
 /// Awaits one forwarded turn on `inbound`, bounded so a stall fails rather than
 /// hangs.
 async fn recv_turn(inbound: &mut tokio::sync::mpsc::Receiver<Payload>) -> Payload {

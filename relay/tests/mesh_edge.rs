@@ -16,7 +16,7 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::mesh::{MESH_PRESENCE_LEN, MeshPresence};
-use rally_point_proto::messages::{GameChat, LobbyCommand, Payload};
+use rally_point_proto::messages::{GameChat, LobbyCommand, Payload, PlayerSkin};
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ClientPublicKey,
     ConnectionChallenge, ExpiresAt, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, Signature, SignedToken,
@@ -413,6 +413,20 @@ async fn next_chat(
             (chat.slot, chat.target_kind, chat.target_slot, chat.text)
         }
         other => panic!("expected a chat message, got {other:?}"),
+    }
+}
+
+/// Reads the next player-skin blob off a client's control reader within a short
+/// timeout, returning `(slot, payload_bytes)` — panicking on any other frame kind
+/// or on timeout. Mirrors [`next_lobby`] and [`next_chat`].
+async fn next_skin(
+    rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
+) -> (u32, Vec<u8>) {
+    match next_non_connectivity(rx).await {
+        rally_point_transport::control::ControlInbound::Skin(skin) => {
+            (skin.slot, skin.payload.to_vec())
+        }
+        other => panic!("expected a player-skin blob, got {other:?}"),
     }
 }
 
@@ -949,6 +963,66 @@ async fn game_chat_reaches_a_cross_relay_peer_through_the_mesh() -> Result<(), A
     assert_eq!(
         next_chat(&mut peer_b_rx).await,
         (0, 1, 4, "flanking from the north".to_owned()),
+    );
+
+    Ok(())
+}
+
+/// A cosmetic-skin blob a member broadcasts on relay A reaches a cross-relay peer
+/// on relay B, stamped with the author's slot — and, unlike chat, is stored in
+/// relay B's per-session map, so a client that dials into B *after* the blob
+/// arrived still replays it on register. The full skin fan-out-plus-replay path
+/// across the mesh, mirroring the game-chat cross-relay test with the store its
+/// latest-per-slot map adds.
+#[tokio::test]
+async fn player_skin_reaches_a_cross_relay_peer_and_replays_to_a_late_joiner()
+-> Result<(), AnyError> {
+    let tenant = make_tenant();
+    let session = SessionId(3);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant);
+    let mut relay_b = Relay::start(&tenant);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+
+    // The sender (slot 0) is on A; the first receiver (slot 1) is on B.
+    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+
+    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+
+    // Let the mesh drivers open their sessions and both slot links register.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The host broadcasts its blob (the wire slot is ignored — the relay stamps
+    // the authenticated slot 0).
+    rally_point_transport::control::send_control_skin(
+        &mut host_send,
+        PlayerSkin {
+            slot: 99,
+            payload: vec![0xCA, 0xFE, 0xBA, 0xBE].into(),
+        },
+    )
+    .await?;
+
+    // The cross-relay peer receives it, stamped with the host's authoritative slot.
+    assert_eq!(
+        next_skin(&mut peer_b_rx).await,
+        (0, vec![0xCA, 0xFE, 0xBA, 0xBE]),
+    );
+
+    // A client dialing into relay B after the blob already crossed the mesh still
+    // gets it — proof relay B stored the mesh-received blob in its own map and
+    // replays it on register.
+    let (late_b, _ep2) = connect_client(&relay_b, &tenant, session, SlotId(2)).await?;
+    let (_late_send, mut late_rx) = open_lobby_streams(&late_b).await;
+    assert_eq!(
+        next_skin(&mut late_rx).await,
+        (0, vec![0xCA, 0xFE, 0xBA, 0xBE])
     );
 
     Ok(())

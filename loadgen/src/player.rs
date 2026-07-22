@@ -424,6 +424,7 @@ async fn pump_turns(
             maybe = channels.connectivity.recv() => if maybe.is_none() { return false },
             maybe = channels.chat_in.recv() => if maybe.is_none() { return false },
             maybe = channels.lobby_in.recv() => if maybe.is_none() { return false },
+            maybe = channels.skin_in.recv() => if maybe.is_none() { return false },
         }
     }
     true
@@ -483,6 +484,10 @@ async fn drain_delivery_phase(
                 return DrainResolution::Aborted;
             },
             maybe = channels.lobby_in.recv() => if maybe.is_none() {
+                lifecycle.abort();
+                return DrainResolution::Aborted;
+            },
+            maybe = channels.skin_in.recv() => if maybe.is_none() {
                 lifecycle.abort();
                 return DrainResolution::Aborted;
             },
@@ -547,6 +552,7 @@ async fn drain_until_driver_ends(
             maybe = channels.connectivity.recv() => { let _ = maybe; }
             maybe = channels.chat_in.recv() => { let _ = maybe; }
             maybe = channels.lobby_in.recv() => { let _ = maybe; }
+            maybe = channels.skin_in.recv() => { let _ = maybe; }
         }
     }
 }

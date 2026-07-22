@@ -49,6 +49,12 @@
 //! treating it as a link failure, the same best-effort treatment the result
 //! report gets.
 //!
+//! The same best-effort control-stream path carries each member's cosmetic-skin
+//! blob: the game hands its own blob up on [`TurnChannels::skin_out`] and other
+//! members' blobs arrive on [`TurnChannels::skin_in`], tagged with the author's
+//! slot. Unlike chat the relay replays these on register, so a blob can arrive
+//! again after a reconnect — the game applies each idempotently.
+//!
 //! Delivery to the game is **in seq order**. The link dedups and orders within a
 //! datagram but follows arrival order across datagrams, so the driver buffers
 //! received turns by transport seq and releases only the contiguous prefix — the
@@ -69,11 +75,12 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payload};
+use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payload, PlayerSkin};
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
-    send_control_lobby, send_control_request_drop, send_control_turn, spawn_control_reader,
+    send_control_lobby, send_control_request_drop, send_control_skin, send_control_turn,
+    spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::mpsc;
@@ -113,6 +120,12 @@ const LOBBY_CHANNEL_CAPACITY: usize = 256;
 /// bursty but small (a human typing), so a generous backstop against a
 /// scheduling hiccup is ample here too; it is not a tuned buffer.
 const CHAT_CHANNEL_CAPACITY: usize = 256;
+
+/// Depth of each skin channel between the game thread and the driver. A session
+/// sends at most one blob per member plus the relay's replays on reconnect, so
+/// this generous backstop against a scheduling hiccup is ample; it is not a tuned
+/// buffer.
+const SKIN_CHANNEL_CAPACITY: usize = 32;
 
 /// Depth of the manual-drop-request channel from the game thread to the driver.
 /// A human clicks the drop button a handful of times at most; the relay
@@ -251,6 +264,24 @@ pub struct TurnChannels {
     /// a member whose stream comes up after a message already flowed simply
     /// never sees it.
     pub chat_in: mpsc::Receiver<(SlotId, ChatOut)>,
+    /// This game's own cosmetic-skin blob, to broadcast to the other members near
+    /// game start. The driver wraps the bytes in a `PlayerSkin` and writes it up
+    /// the reliable control stream at once — no drain to wait behind, unlike a
+    /// turn — and the relay stamps the authoring slot, so the caller leaves that
+    /// to the relay and just hands over the opaque bytes. Like
+    /// [`chat_out`](Self::chat_out) a send failure is best-effort: the driver logs
+    /// it and continues rather than surfacing a [`DriverError`], since a skin is
+    /// cosmetic and non-synced — a lost blob costs only a wrong cosmetic.
+    pub skin_out: mpsc::Sender<Vec<u8>>,
+    /// Cosmetic-skin blobs other members authored, as the relay fanned them down
+    /// the reliable control stream, each tagged with its authoring slot. Unlike
+    /// [`chat_in`](Self::chat_in) the relay keeps a latest-blob-per-slot map and
+    /// replays it when this client registers, so a member whose stream comes up
+    /// late or that reconnects still receives every other member's current blob —
+    /// which also means a blob can arrive more than once (a replay overlapping a
+    /// live one across a reconnect), so the game applies each idempotently. The
+    /// relay never echoes this client's own blob back (the game already has it).
+    pub skin_in: mpsc::Receiver<(SlotId, Vec<u8>)>,
     /// Manual drop requests this game authored: the game submits the `SlotId` of a
     /// disconnected member it wants dropped, and the driver writes a `RequestDrop`
     /// up the reliable control stream naming that slot (the relay binds the
@@ -335,6 +366,11 @@ pub struct LinkDriver {
     /// Chat messages other members authored (relay-stamped with their author
     /// slot), to hand to the game thread.
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    /// The game's own cosmetic-skin blob, to send up the control stream.
+    skin_out: mpsc::Receiver<Vec<u8>>,
+    /// Skin blobs other members authored (relay-stamped with their author slot),
+    /// to hand to the game thread.
+    skin_in: mpsc::Sender<(SlotId, Vec<u8>)>,
     /// Manual drop requests the game authored, to send up the control stream as
     /// `RequestDrop` frames.
     request_drop: mpsc::Receiver<SlotId>,
@@ -379,8 +415,8 @@ pub enum DriverError {
     /// command, the session-start directive). The driver surfaces this instead
     /// of blocking on the handoff — parking there would also stall its acks and
     /// outbound turns — so the caller can tear down or resync. Best-effort
-    /// deliveries (chat, connectivity display changes) never trip this: a full
-    /// buffer just drops them.
+    /// deliveries (chat, skin blobs, connectivity display changes) never trip
+    /// this: a full buffer just drops them.
     #[error("game stopped draining a correctness-critical channel; its buffer is full")]
     GameStalled,
     /// The unacked window crossed `UNACKED_WINDOW_CAP` even after the beacon
@@ -445,6 +481,10 @@ impl LinkDriver {
         // Chat flows in both directions for the whole game, unlike lobby.
         let (chat_out_tx, chat_out_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
         let (chat_in_tx, chat_in_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        // Skin blobs flow in both directions near game start (and again on the
+        // relay's reconnect replays), like chat.
+        let (skin_out_tx, skin_out_rx) = mpsc::channel(SKIN_CHANNEL_CAPACITY);
+        let (skin_in_tx, skin_in_rx) = mpsc::channel(SKIN_CHANNEL_CAPACITY);
         // Manual drop requests flow game → driver only, for the whole game.
         let (request_drop_tx, request_drop_rx) = mpsc::channel(REQUEST_DROP_CHANNEL_CAPACITY);
         // The session-start directive arrives at most a handful of times (the
@@ -465,6 +505,8 @@ impl LinkDriver {
             lobby_in: lobby_in_tx,
             chat_out: chat_out_rx,
             chat_in: chat_in_tx,
+            skin_out: skin_out_rx,
+            skin_in: skin_in_tx,
             request_drop: request_drop_rx,
             session_start: session_start_tx,
             connectivity: connectivity_tx,
@@ -480,6 +522,8 @@ impl LinkDriver {
             lobby_in: lobby_in_rx,
             chat_out: chat_out_tx,
             chat_in: chat_in_rx,
+            skin_out: skin_out_tx,
+            skin_in: skin_in_rx,
             request_drop: request_drop_tx,
             session_start: session_start_rx,
             connectivity: connectivity_rx,
@@ -505,6 +549,8 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -519,6 +565,8 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -601,6 +649,8 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -615,6 +665,8 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -734,6 +786,8 @@ impl LinkDriver {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -883,6 +937,12 @@ impl LinkDriver {
         // rule is the same: only on the sender dropping (a `None`), after which
         // `recv()` is an always-ready `None` that would spin the loop.
         let mut chat_out_alive = true;
+
+        // Whether the game's skin sender is still live. Skin blobs flow near game
+        // start (and on the relay's reconnect replays), with the same disarm rule
+        // as chat: only on the sender dropping (a `None`), after which `recv()` is
+        // an always-ready `None` that would spin the loop.
+        let mut skin_out_alive = true;
 
         // Whether the game's drop-request sender is still live. Like chat it
         // streams for the whole game, with the same disarm rule: only on the
@@ -1071,6 +1131,34 @@ impl LinkDriver {
                                 GamePush::Full => {
                                     tracing::debug!(
                                         "dropping game-chat message; the game is not draining chat"
+                                    );
+                                }
+                                GamePush::Closed => return Ok(()),
+                            }
+                        }
+                        // A cosmetic-skin blob another member authored,
+                        // relay-stamped with the author's slot. The relay may
+                        // deliver it more than once (a replay overlapping a live
+                        // one across a reconnect), so the game applies it
+                        // idempotently. Best-effort: a full buffer just drops the
+                        // blob — a skin is cosmetic, non-synced state, so a lost
+                        // one costs only a wrong cosmetic and it must never stall
+                        // the turns.
+                        Some(ControlInbound::Skin(skin)) => {
+                            // As above: a slot id past `u8` range names no real
+                            // member; drop it rather than misattribute it.
+                            let Ok(slot_id) = u8::try_from(skin.slot) else {
+                                tracing::warn!(
+                                    slot = skin.slot,
+                                    "player-skin blob names a slot id out of range; dropping it",
+                                );
+                                continue;
+                            };
+                            match push_to_game(skin_in, (SlotId(slot_id), skin.payload.to_vec())) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::debug!(
+                                        "dropping player-skin blob; the game is not draining skins"
                                     );
                                 }
                                 GamePush::Closed => return Ok(()),
@@ -1406,6 +1494,33 @@ impl LinkDriver {
                         None => chat_out_alive = false,
                     }
                 }
+                // A cosmetic-skin blob the game authored — broadcast to the other
+                // members near game start. Sent at once, same as a chat message:
+                // there is no turn barrier or drain to wait behind. The relay
+                // stamps this client's authenticated slot (the `0` here is ignored)
+                // and fans it to the other members. A send failure is best-effort
+                // like a chat send — a skin is cosmetic and non-synced, so a lost
+                // blob costs only a wrong cosmetic — so log it and keep the driver
+                // running rather than tearing the session down. Disarmed only when
+                // the game drops its sender.
+                bytes = skin_out.recv(), if skin_out_alive => {
+                    match bytes {
+                        Some(bytes) => {
+                            let skin = PlayerSkin {
+                                slot: 0,
+                                payload: bytes.into(),
+                            };
+                            if let Err(error) = send_control_skin(&mut control_send, skin).await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    "player-skin send failed; dropping the blob"
+                                );
+                            }
+                        }
+                        None => skin_out_alive = false,
+                    }
+                }
                 // A manual drop request the game authored: the survivor asked to
                 // drop a disconnected member. Send it up the reliable control stream
                 // at once — no drain to wait behind, like chat — naming the target
@@ -1676,6 +1791,8 @@ struct GameSeam {
     lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
     chat_out: mpsc::Receiver<ChatOut>,
     chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    skin_out: mpsc::Receiver<Vec<u8>>,
+    skin_in: mpsc::Sender<(SlotId, Vec<u8>)>,
     request_drop: mpsc::Receiver<SlotId>,
     session_start: mpsc::Sender<Option<u32>>,
     connectivity: mpsc::Sender<(SlotId, bool)>,
@@ -3275,11 +3392,11 @@ mod tests {
 
     #[tokio::test]
     async fn undrained_best_effort_channels_drop_instead_of_stalling_turns() {
-        // Chat and connectivity are best-effort: a receiver that is retained
-        // but never drained costs only the overflowing messages — the turn
-        // stream (and the driver's acks with it) must keep flowing.
-        use rally_point_proto::messages::GameChat;
-        use rally_point_transport::control::send_control_chat;
+        // Chat, skins, and connectivity are best-effort: a receiver that is
+        // retained but never drained costs only the overflowing messages — the
+        // turn stream (and the driver's acks with it) must keep flowing.
+        use rally_point_proto::messages::{GameChat, PlayerSkin};
+        use rally_point_transport::control::{send_control_chat, send_control_skin};
 
         let (link_a, mut link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
@@ -3296,6 +3413,8 @@ mod tests {
             lobby_in: _lobby_in,
             chat_out: _chat_out,
             chat_in: _chat_in,
+            skin_out: _skin_out,
+            skin_in: _skin_in,
             request_drop: _request_drop,
             session_start: _session_start,
             connectivity: _connectivity,
@@ -3311,6 +3430,19 @@ mod tests {
                     target_kind: 0,
                     target_slot: 0,
                     text: format!("m{i}"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Flood skins far past their buffer too, with nothing draining them.
+        for i in 0..(SKIN_CHANNEL_CAPACITY + 50) {
+            send_control_skin(
+                &mut ctrl_send,
+                PlayerSkin {
+                    slot: 1,
+                    payload: vec![i as u8].into(),
                 },
             )
             .await
@@ -3527,6 +3659,8 @@ mod tests {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,
@@ -3541,6 +3675,8 @@ mod tests {
             lobby_in,
             chat_out,
             chat_in,
+            skin_out,
+            skin_in,
             request_drop,
             session_start,
             connectivity,

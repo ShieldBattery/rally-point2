@@ -1048,6 +1048,7 @@ pub async fn run_slot_link(
         decision_makers,
         lobby,
         chat,
+        skins,
         drop_holds,
         turn_ring,
         ..
@@ -1188,6 +1189,19 @@ pub async fn run_slot_link(
     // registry until its own teardown drops it, so a `None` is unreachable
     // during the loop; the flag disarms the branch defensively.
     let mut chat_alive = true;
+    // Register this member for cosmetic-skin fan-out too. Like the lobby log,
+    // the per-session latest-blob-per-slot map is snapshotted into `skin_rx`
+    // under the skin lock right here, so a member that dialed in after other
+    // members already broadcast their blobs replays each one (before any live
+    // blob); unlike the lobby log the replay is unordered (a map, not a
+    // sequence). The exactly-once handoff is the skin module's (store + fan-out
+    // and register + snapshot share one lock); this task drains `skin_rx` in the
+    // branch below and writes each blob down its own control stream.
+    let mut skin_rx = crate::skin::register_member(&skins, &key, slot);
+    // Mirrors `chat_alive`: this member's skin sender lives in the skin registry
+    // until its own teardown drops it, so a `None` is unreachable during the
+    // loop; the flag disarms the branch defensively.
+    let mut skin_alive = true;
     // Pushes only advancing cursors and reuses one batch buffer for the life of
     // this link.
     let mut beacon_writer = BeaconWriter::new();
@@ -1633,6 +1647,40 @@ pub async fn run_slot_link(
                     None => chat_alive = false,
                 }
             }
+            // A cosmetic-skin blob another member authored (or a mesh-forwarded
+            // one), or the replay of an earlier stored blob, to push down this
+            // client's reliable control stream. Like the lobby branch this drains
+            // the per-session replay the skin `register_member` snapshotted here,
+            // so a stored blob and a live one write down the stream on one path;
+            // like the chat branch the `slot` is the relay-stamped author and a
+            // write failure ends the link exactly as every other control-stream
+            // write in this loop does — the underlying stream is dead regardless
+            // of which frame kind hit it (a different call than the client-edge
+            // driver makes for its own *outbound* skin sends, which are
+            // best-effort: there the link may still be healthy; here the failure
+            // *is* evidence it is not).
+            pushed = skin_rx.recv(), if skin_alive => {
+                match pushed {
+                    Some(skin) => {
+                        if let Err(error) = rally_point_transport::control::send_control_skin(
+                            &mut control_send,
+                            skin,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "skin control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => skin_alive = false,
+                }
+            }
             forwarded = forward_rx.recv() => {
                 match forwarded {
                     Some(payload) => {
@@ -1945,6 +1993,28 @@ pub async fn run_slot_link(
                             crate::mesh::fan_out_chat(&mesh_links, &key, chat_msg);
                         }
                     }
+                    // The client's cosmetic-skin blob. Admit it against the
+                    // relay's size and rate caps first — either failure drops the
+                    // blob without closing the link, since a lost skin is cosmetic,
+                    // not correctness-critical the way a turn or lobby command is.
+                    // An admitted blob is bound to the authenticated slot — never
+                    // the client-asserted `slot` on the wire, exactly as a lobby
+                    // command or chat message is — then delivered to local members
+                    // (stored in the latest-per-slot map and fanned to every other
+                    // local member; the author is not echoed) and, only if that
+                    // delivery was itself admitted (the session's distinct-slot cap
+                    // can still refuse a brand-new slot), forwarded once across each
+                    // mesh link serving the session so peer relays store and fan it
+                    // to their locals. The bytes are opaque; the relay frames
+                    // nothing of its own around them.
+                    Some(ControlInbound::Skin(mut skin)) => {
+                        if crate::skin::admit(&skins, &key, slot, skin.payload.len()) {
+                            skin.slot = u32::from(slot.0);
+                            if crate::skin::deliver(&skins, &key, skin.clone()) {
+                                crate::mesh::fan_out_skin(&mesh_links, &key, skin);
+                            }
+                        }
+                    }
                     // The client's manual request to drop a disconnected slot. The
                     // requester is this authenticated connection's slot, never a
                     // value from the wire. Reject silently (log at info, never close
@@ -2175,6 +2245,10 @@ fn end_slot_link(
     // Same rationale for chat: deregister before the roster frees the slot, so
     // a reconnect can't clobber this connection's cleanup.
     crate::chat::deregister_member(&mesh.chat, key, slot);
+    // Same for skins: deregister the member before the roster frees the slot. The
+    // session's blob map is left intact (like the lobby log), so a remaining or
+    // reconnecting member still replays it.
+    crate::skin::deregister_member(&mesh.skins, key, slot);
     let session_emptied = deregister(sessions, key, slot);
     let retired_connection =
         crate::mesh::unpublish_conditions(&mesh.conditions, key, slot, Some(connection_epoch));
@@ -2262,9 +2336,9 @@ fn end_slot_link(
 
 /// Closes out this relay's serving state for a session whose local roster is
 /// empty — the coordinator `SessionClosed` notice plus the per-session
-/// registries (lobby log, chat, forwarded-turn replay ring, session-level dedup,
-/// decided drop holds) — unless a still-held, undecided departure of a homed
-/// slot promises a reconnect.
+/// registries (lobby log, chat, skin map, forwarded-turn replay ring,
+/// session-level dedup, decided drop holds) — unless a still-held, undecided
+/// departure of a homed slot promises a reconnect.
 ///
 /// While such a departure is undecided, its drop hold is the admission token a
 /// re-dial claims on this relay (`server.rs`), and the retained registries are
@@ -2296,7 +2370,7 @@ fn end_slot_link(
 /// and then have its lobby log and replay state erased underneath it while a
 /// premature `SessionClosed` retires the session coordinator-side. Every call
 /// inside the held section touches only its own module's lock (consensus,
-/// lobby, chat, turn ring, seen, drop holds, provisional), never this
+/// lobby, chat, skin, turn ring, seen, drop holds, provisional), never this
 /// roster's, so holding it across them cannot deadlock or reenter — the same
 /// discipline `announce_departure` documents for its own roster-lock hold.
 pub(crate) fn maybe_close_emptied_session(
@@ -2331,6 +2405,9 @@ pub(crate) fn maybe_close_emptied_session(
     crate::lobby::end_session(&mesh.lobby, key);
     // Same for chat's (log-free) per-session state.
     crate::chat::end_session(&mesh.chat, key);
+    // Same for the skin blob map and member set: no local member remains to
+    // replay it to, so the whole per-session state can be dropped.
+    crate::skin::end_session(&mesh.skins, key);
     // Same for the forwarded-turn replay ring: no local slot remains to resume,
     // so nothing more will be replayed from it.
     mesh.turn_ring.end_session(key);
