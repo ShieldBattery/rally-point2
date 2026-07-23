@@ -81,6 +81,12 @@
 //!   are in flight during the burst window, so more consecutive re-carries
 //!   can be lost. The term scales with both loss rate and effective RTT,
 //!   capturing that 5% loss on a 300ms link is more dangerous than 5% on 50ms.
+//!   The rate itself is the worse of two windows over the slot's cumulative
+//!   counters -- a short *attack* window (~1s) that reacts to a fresh burst,
+//!   and a long *memory* window (~8s) that keeps pricing the loss in after it
+//!   subsides. Random loss produces loss-free stretches many times longer
+//!   than its mean gap; an instantaneous rate would zero the term in every
+//!   such gap and the target (and with it the buffer) would flap.
 //! - **`turn_duration`** -- one game step at 24 turns/sec == ~41.7ms. Each
 //!   buffer turn adds one step of dispatch delay, so the buffer is measured
 //!   in turns.
@@ -124,12 +130,23 @@
 //! When the target exceeds the current buffer, the decision-maker **jumps to
 //! the target immediately, with no dwell** -- a player hurting now needs the
 //! right buffer, and you can't dwell through a stall. When the target drops
-//! below the current buffer, it **decrements by one turn per decision, gated
-//! by a long min-dwell** (120 turns ~ 5s at 24/sec) -- a conservative shrink so
-//! a momentary improvement doesn't flap the buffer down and right back up.
-//! A long lower-dwell ensures shrinks are infrequent and well-validated -- at
-//! least 120 RTT samples confirm the improvement is stable before the buffer
-//! shrinks. Raises, by contrast, fire on the first worsening sample.
+//! below the current buffer, a shrink must be both **paced** and **earned**.
+//! Paced: at least `min_dwell_turns` (120 ~ 5s at 24/sec) since the last
+//! decision, so a multi-step descent walks down gradually. Earned: a shrink
+//! never takes the buffer below the target's **trailing high-water mark**
+//! (its maximum over the last `shrink_lookback_turns`, ~25s). The floor is
+//! what actually prevents flapping: noisy conditions make the target *recur*
+//! at its peak rather than sit on it, so a dwell alone still shrinks at every
+//! dwell boundary (the target is momentarily below when it expires) and is
+//! re-raised at the next peak -- changing the buffer on exactly the dwell
+//! cadence, the worst outcome for players trying to acclimate to the game's
+//! input latency. Parking at the high-water instead keeps the buffer still
+//! for as long as the noise keeps recurring, and once conditions genuinely
+//! improve the peaks age out of the lookback and the buffer walks down one
+//! dwell per step -- deliberately biased toward "a little too high for a
+//! little too long" over micro-stutter, but bounded (lookback + a dwell per
+//! step), never stuck. Raises, by contrast, fire on the first worsening
+//! sample.
 //!
 //! # Application at an agreed future turn
 //!
@@ -287,6 +304,20 @@ struct TargetInputs {
 /// spikes that cause lockstep stalls while retaining bounded, inline storage.
 const RTT_WINDOW_SIZE: usize = 32;
 
+/// How many decimated loss-counter snapshots each slot retains. The ring spans
+/// [`ControlLaw::loss_memory_samples`] of history, so each snapshot covers
+/// `loss_memory_samples / LOSS_SNAPSHOT_COUNT` conditions samples; 16 keeps the
+/// per-slot footprint small (a few hundred bytes) while making the memory
+/// window's decay reasonably smooth (~0.5s steps at the default horizon).
+const LOSS_SNAPSHOT_COUNT: usize = 16;
+
+/// Minimum sent-packet delta a loss window needs before it reports a rate. A
+/// window over fewer packets quantizes brutally -- one loss in two packets
+/// reads as 50% -- and a single such reading, multiplied by a high-latency
+/// link's RTT, would swing the target by several turns on what is statistically
+/// noise. Below this floor the window reports "no estimate" instead.
+const MIN_LOSS_WINDOW_SENT: u64 = 8;
+
 /// Ceiling on any single ingested RTT sample, in microseconds (10 seconds).
 /// RTTs arrive as claims — a remote relay's conditions sidecar carries values
 /// its own clients influenced — and no playable link approaches this. The
@@ -310,13 +341,39 @@ pub struct ControlLaw {
     /// the buffer down and back up. Raising jumps to the target immediately;
     /// lowering steps down.
     pub lower_step: u32,
-    /// Minimum number of turns between *lower* decisions. Raises fire
-    /// immediately (no dwell) -- you can't dwell through a stall. The dwell
-    /// gates only shrinks: every buffer-size change alters the game feel for
-    /// every player, so shrinks should be infrequent and well-validated.
-    /// 120 turns ~ 5s-- enough samples (120) to be confident the
-    /// improvement is stable before the buffer shrinks.
+    /// Minimum number of turns between *lower* decisions -- and the span for
+    /// which the target must have stayed *strictly below* the buffer before a
+    /// lower fires (see [`DecisionMaker::decide`]). Raises fire immediately
+    /// (no dwell) -- you can't dwell through a stall. The dwell gates only
+    /// shrinks: every buffer-size change alters the game feel for every
+    /// player, so shrinks should be infrequent and well-validated. 120 turns
+    /// ~ 5s -- enough samples (120) to be confident the improvement is stable
+    /// before the buffer shrinks.
     pub min_dwell_turns: u32,
+    /// The short loss window: how many recent conditions samples (samples
+    /// arrive roughly once per turn) the fast-reacting loss estimate covers.
+    /// Long enough that its packet denominator makes the rate statistically
+    /// meaningful, short enough that a fresh loss burst moves the target
+    /// within about a second. 24 samples ~ 1s at 24/sec.
+    pub loss_attack_samples: u32,
+    /// The long loss window: how many recent conditions samples the
+    /// slow-decaying loss estimate covers. This is the buffer's loss
+    /// *memory* -- how long after packet loss subsides the target keeps
+    /// pricing it in. Random loss produces loss-free stretches many times
+    /// longer than its mean gap, so this must dwarf the attack window or the
+    /// target collapses (and the buffer flaps) between drops. 192 samples
+    /// ~ 8s at 24/sec.
+    pub loss_memory_samples: u32,
+    /// How many turns of session-frame progress the shrink floor looks back
+    /// over: a lower never takes the buffer below the target's maximum in this
+    /// trailing window. This is the knob for how long the buffer stays
+    /// cautious after conditions improve. Too short and noise whose peaks
+    /// recur less often than the window flaps the buffer (shrink into the
+    /// recurrence, re-raise on the next peak); too long and the buffer is the
+    /// SC:R stuck-high complaint. 600 turns ~ 25s at 24/sec rides out
+    /// realistic burst spacing while a genuine improvement still shows up
+    /// well under a minute (the lookback, then one dwell per step down).
+    pub shrink_lookback_turns: u32,
 }
 
 impl Default for ControlLaw {
@@ -324,8 +381,78 @@ impl Default for ControlLaw {
         Self {
             turn_duration_us: 1_000_000 / 24, // ~41,667us at 24 turns/sec
             lower_step: 1,
-            min_dwell_turns: 120, // ~5s at 24/sec
+            min_dwell_turns: 120,       // ~5s at 24/sec
+            loss_attack_samples: 24,    // ~1s at 24/sec
+            loss_memory_samples: 192,   // ~8s at 24/sec
+            shrink_lookback_turns: 600, // ~25s at 24/sec
         }
+    }
+}
+
+impl ControlLaw {
+    /// How many conditions samples elapse between loss-counter snapshots: the
+    /// memory window spread across the fixed snapshot ring.
+    fn loss_snapshot_interval(&self) -> u32 {
+        (self.loss_memory_samples / LOSS_SNAPSHOT_COUNT as u32).max(1)
+    }
+
+    /// The width of one target-high-water bucket in frames: the shrink
+    /// lookback spread across the fixed bucket count.
+    fn high_water_bucket_span(&self) -> u32 {
+        (self.shrink_lookback_turns / TARGET_HIGH_WATER_BUCKETS as u32).max(1)
+    }
+}
+
+/// How many buckets the target high-water tracker spreads its lookback
+/// across. More buckets forget the past more smoothly (the effective window
+/// is `lookback * (BUCKETS-1)/BUCKETS` to `lookback`); 8 keeps the tracker a
+/// few dozen bytes with O(1) updates.
+const TARGET_HIGH_WATER_BUCKETS: usize = 8;
+
+/// A trailing maximum of the control-law target over a sliding frame window,
+/// kept as per-bucket maxima so old peaks age out in bucket-sized steps
+/// instead of requiring a full sample history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TargetHighWater {
+    buckets: [u32; TARGET_HIGH_WATER_BUCKETS],
+    /// Index of the bucket currently accumulating.
+    head: usize,
+    /// The session frame at which the head bucket began, `None` until the
+    /// first observation.
+    head_start: Option<u32>,
+}
+
+impl TargetHighWater {
+    /// Folds one target observation at `frame` into the window. `bucket_span`
+    /// is the width of one bucket in frames (the lookback divided by the
+    /// bucket count).
+    fn observe(&mut self, frame: u32, target: u32, bucket_span: u32) {
+        let bucket_span = bucket_span.max(1);
+        match self.head_start {
+            None => self.head_start = Some(frame),
+            Some(start) => {
+                let elapsed = frame.saturating_sub(start);
+                let advance = elapsed / bucket_span;
+                if advance as usize >= TARGET_HIGH_WATER_BUCKETS {
+                    // The whole window slid past every bucket (a long stall or
+                    // frame jump): nothing observed in it survives.
+                    self.buckets = [0; TARGET_HIGH_WATER_BUCKETS];
+                    self.head_start = Some(frame);
+                } else {
+                    for _ in 0..advance {
+                        self.head = (self.head + 1) % TARGET_HIGH_WATER_BUCKETS;
+                        self.buckets[self.head] = 0;
+                    }
+                    self.head_start = Some(start + advance * bucket_span);
+                }
+            }
+        }
+        self.buckets[self.head] = self.buckets[self.head].max(target);
+    }
+
+    /// The window's maximum observed target -- the floor a shrink must respect.
+    fn floor(&self) -> u32 {
+        self.buckets.iter().copied().max().unwrap_or(0)
     }
 }
 
@@ -416,10 +543,26 @@ impl RttWindow {
     }
 }
 
+/// One accepted cumulative-counter endpoint, retained so a later sample can be
+/// differenced against it for a loss rate over the intervening packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LossSnapshot {
+    /// Cumulative `lost_packets` at the time of the snapshot.
+    lost: u64,
+    /// Cumulative `sent_packets` at the time of the snapshot.
+    sent: u64,
+    /// The slot's `advancing_samples` count when the snapshot was taken --
+    /// its age coordinate.
+    at_sample: u32,
+}
+
 /// One slot's condition history. RTT samples go into a ring buffer for
 /// jitter-aware sizing (the recent max, not the smoothed mean). The cumulative
-/// `lost_packets`/`sent_packets` counters are differenced between consecutive
-/// samples to get an interval loss rate.
+/// `lost_packets`/`sent_packets` counters are differenced against a ring of
+/// decimated snapshots to get loss rates over two windows: a short one that
+/// reacts to a fresh burst within about a second, and a long one that keeps
+/// remembering the loss for several seconds after it subsides (see
+/// [`windowed_loss_rate`](Self::windowed_loss_rate)).
 ///
 /// `mesh_rtt_us` is the one-way mesh hop from the authority relay to this
 /// slot's home relay -- `0` for local slots (home clients on this relay), or the
@@ -427,11 +570,12 @@ impl RttWindow {
 /// effective RTT (`rtt + mesh_rtt`) is what the path and loss formulas use,
 /// so cross-relay paths include the mesh hop automatically.
 ///
-/// The first sample establishes a baseline: `has_delta` stays false until a
-/// later sample reaches a strictly newer sent-packet endpoint, so the
-/// decision-maker doesn't act on a loss rate computed from one cumulative
-/// snapshot or its later loss refinements. A high RTT on the first sample can
-/// still raise the target -- RTT is instantaneous and doesn't need a baseline.
+/// The first sample establishes a baseline snapshot: no loss rate is reported
+/// until a later sample reaches a strictly newer sent-packet endpoint (and the
+/// window's packet count clears [`MIN_LOSS_WINDOW_SENT`]), so the
+/// decision-maker doesn't act on a rate computed from one cumulative snapshot
+/// or its later loss refinements. A high RTT on the first sample can still
+/// raise the target -- RTT is instantaneous and doesn't need a baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SlotState {
     /// Ring buffer of recent RTT samples for jitter-aware sizing.
@@ -456,19 +600,26 @@ struct SlotState {
     /// (the seq-aware production path); the seq-less
     /// [`observe_frame`](DecisionMaker::observe_frame) leaves it empty (tests).
     frame_history: VecDeque<(u64, u32)>,
-    /// The prior sample's cumulative `lost_packets`. Meaningful only when
-    /// `has_delta` is true.
-    prev_lost: u64,
-    /// The prior sample's cumulative `sent_packets`. Meaningful only when
-    /// `has_delta` is true.
-    prev_sent: u64,
     /// The current (latest) sample's cumulative `lost_packets`.
     curr_lost: u64,
     /// The current (latest) sample's cumulative `sent_packets`.
     curr_sent: u64,
-    /// Whether we have two accepted, distinct sent-packet endpoints (so a
-    /// loss-rate delta is computable).
-    has_delta: bool,
+    /// Decimated history of accepted `(lost, sent)` counter endpoints, oldest
+    /// overwritten first. Differencing the current counters against an entry
+    /// gives the loss rate over everything sent since it; entries are stamped
+    /// with `advancing_samples` so a window of any sample depth can pick its
+    /// anchor. Seeded with the baseline sample, then extended every
+    /// [`ControlLaw::loss_snapshot_interval`] advancing samples.
+    loss_snapshots: [LossSnapshot; LOSS_SNAPSHOT_COUNT],
+    /// Next write position in `loss_snapshots` (== oldest entry once full).
+    loss_snapshot_head: usize,
+    /// How many `loss_snapshots` entries are populated.
+    loss_snapshot_len: usize,
+    /// Count of accepted samples that advanced the sent-packet endpoint. The
+    /// snapshot decimation clock and the age coordinate snapshots are stamped
+    /// with; samples arrive roughly once per turn, so ages measured in it are
+    /// approximately turns.
+    advancing_samples: u32,
     /// Whether we've ingested at least one sample for this slot.
     seen: bool,
     /// Last sender RTT admitted into `rtt_window`. Equal cumulative counters
@@ -507,11 +658,12 @@ impl SlotState {
     fn reset_link_conditions(&mut self) {
         self.rtt_window = RttWindow::default();
         self.mesh_rtt_us = 0;
-        self.prev_lost = 0;
-        self.prev_sent = 0;
         self.curr_lost = 0;
         self.curr_sent = 0;
-        self.has_delta = false;
+        self.loss_snapshots = [LossSnapshot::default(); LOSS_SNAPSHOT_COUNT];
+        self.loss_snapshot_head = 0;
+        self.loss_snapshot_len = 0;
+        self.advancing_samples = 0;
         self.seen = false;
         self.last_sender_rtt_us = None;
     }
@@ -530,17 +682,27 @@ impl SlotState {
         self.rtt().saturating_add(self.mesh_rtt_us)
     }
 
-    /// Rotates the accepted cumulative loss baseline only when a sample has a
-    /// strictly newer sent-packet count and a nondecreasing lost-packet count.
-    /// A later loss declaration may refine the current endpoint in place;
-    /// exact duplicates and stale samples leave the prior interval intact, so
-    /// a duplicate cannot erase it and an out-of-order sample cannot poison the
-    /// next delta.
-    fn update_counters(&mut self, lost_packets: u64, sent_packets: u64) -> CounterUpdate {
+    /// Advances the accepted cumulative counters only when a sample has a
+    /// strictly newer sent-packet count and a nondecreasing lost-packet count,
+    /// maintaining the snapshot ring as endpoints are accepted. A later loss
+    /// declaration may refine the current endpoint in place; exact duplicates
+    /// and stale samples change nothing, so a duplicate cannot erase history
+    /// and an out-of-order sample cannot poison a window.
+    ///
+    /// `snapshot_interval` is the decimation clock: a snapshot is retained
+    /// every that-many advancing samples (plus the baseline), spreading the
+    /// ring across the law's loss-memory horizon.
+    fn update_counters(
+        &mut self,
+        lost_packets: u64,
+        sent_packets: u64,
+        snapshot_interval: u32,
+    ) -> CounterUpdate {
         if !self.seen {
             self.curr_lost = lost_packets;
             self.curr_sent = sent_packets;
             self.seen = true;
+            self.push_loss_snapshot();
             return CounterUpdate::Baseline;
         }
 
@@ -550,36 +712,114 @@ impl SlotState {
         if sent_packets == self.curr_sent {
             if lost_packets > self.curr_lost {
                 self.curr_lost = lost_packets;
+                // A loss declared late still belongs to packets sent at (or
+                // before) this endpoint. Any snapshot recorded at this same
+                // endpoint under-reported that loss; left alone, a window
+                // anchored there would attribute the whole refinement to the
+                // few packets sent *after* it, spiking the rate. Refine such
+                // snapshots in place (there is at most one in practice: the
+                // baseline, or a decimation snapshot that happened to land on
+                // this endpoint).
+                for age in 0..self.loss_snapshot_len {
+                    let index = (self.loss_snapshot_head + LOSS_SNAPSHOT_COUNT - 1 - age)
+                        % LOSS_SNAPSHOT_COUNT;
+                    if self.loss_snapshots[index].sent != self.curr_sent {
+                        break;
+                    }
+                    self.loss_snapshots[index].lost = lost_packets;
+                }
                 return CounterUpdate::LossAdvanced;
             }
             return CounterUpdate::NonAdvancing;
         }
 
-        self.prev_lost = self.curr_lost;
-        self.prev_sent = self.curr_sent;
         self.curr_lost = lost_packets;
         self.curr_sent = sent_packets;
-        self.has_delta = true;
+        self.advancing_samples = self.advancing_samples.saturating_add(1);
+        if self.advancing_samples.is_multiple_of(snapshot_interval) {
+            self.push_loss_snapshot();
+        }
         CounterUpdate::Advanced
     }
 
-    /// The interval loss rate (`delta_lost / delta_sent`), or `None` when no
-    /// prior sample exists (first sample) or no newer sent-packet count has been
-    /// accepted. Stale and duplicate samples never become the accepted baseline.
-    /// The result is clamped to 1.0:
-    /// the counters are peer-reported, so nothing structural stops a claimed
-    /// `delta_lost > delta_sent`, and a rate past certainty means nothing —
-    /// unclamped it would only inflate the loss-risk product downstream.
-    fn loss_rate(&self) -> Option<f64> {
-        if !self.has_delta {
+    /// Appends the current counter endpoint to the snapshot ring, overwriting
+    /// the oldest entry once full.
+    fn push_loss_snapshot(&mut self) {
+        self.loss_snapshots[self.loss_snapshot_head] = LossSnapshot {
+            lost: self.curr_lost,
+            sent: self.curr_sent,
+            at_sample: self.advancing_samples,
+        };
+        self.loss_snapshot_head = (self.loss_snapshot_head + 1) % LOSS_SNAPSHOT_COUNT;
+        if self.loss_snapshot_len < LOSS_SNAPSHOT_COUNT {
+            self.loss_snapshot_len += 1;
+        }
+    }
+
+    /// The loss rate since `snapshot`: `delta_lost / delta_sent` over
+    /// everything sent after it. `None` when fewer than
+    /// [`MIN_LOSS_WINDOW_SENT`] packets span the window (too few to be
+    /// meaningful). Clamped to 1.0: the counters are peer-reported, so nothing
+    /// structural stops a claimed `delta_lost > delta_sent`, and a rate past
+    /// certainty means nothing -- unclamped it would only inflate the
+    /// loss-risk product downstream.
+    fn loss_rate_since(&self, snapshot: &LossSnapshot) -> Option<f64> {
+        let delta_sent = self.curr_sent.saturating_sub(snapshot.sent);
+        if delta_sent < MIN_LOSS_WINDOW_SENT {
             return None;
         }
-        let delta_sent = self.curr_sent.saturating_sub(self.prev_sent);
-        if delta_sent == 0 {
-            return None;
-        }
-        let delta_lost = self.curr_lost.saturating_sub(self.prev_lost);
+        let delta_lost = self.curr_lost.saturating_sub(snapshot.lost);
         Some((delta_lost as f64 / delta_sent as f64).min(1.0))
+    }
+
+    /// The slot's loss estimate for the control law: the worse of two windowed
+    /// rates over the snapshot ring.
+    ///
+    /// - **Attack** (short window): the rate since the newest snapshot at
+    ///   least `attack_samples` old, so a fresh burst raises the estimate
+    ///   within about a second of onset -- while still spanning enough packets
+    ///   that one drop can't read as tens of percent.
+    /// - **Memory** (long window): the rate since the oldest retained
+    ///   snapshot, so the estimate decays over the ring's whole horizon after
+    ///   loss subsides instead of collapsing at the first loss-free stretch.
+    ///   Random loss produces gaps far longer than its mean spacing; without
+    ///   the memory the target dips in every gap and the buffer flaps.
+    ///
+    /// Taking the max gives fast attack *and* slow decay. `None` until a
+    /// window spans [`MIN_LOSS_WINDOW_SENT`] packets.
+    fn windowed_loss_rate(&self, attack_samples: u32) -> Option<f64> {
+        if self.loss_snapshot_len == 0 {
+            return None;
+        }
+
+        let oldest_index = if self.loss_snapshot_len == LOSS_SNAPSHOT_COUNT {
+            self.loss_snapshot_head
+        } else {
+            0
+        };
+        let memory = self.loss_rate_since(&self.loss_snapshots[oldest_index]);
+
+        // The attack anchor: newest snapshot already `attack_samples` old.
+        // Snapshots are decimated, so this walk exits within a step or two;
+        // when even the oldest snapshot is younger than the horizon (early
+        // session), the oldest anchors a shorter-than-nominal window and the
+        // packet-count floor in `loss_rate_since` guards its significance.
+        let mut attack_anchor = &self.loss_snapshots[oldest_index];
+        for age in 0..self.loss_snapshot_len {
+            let index =
+                (self.loss_snapshot_head + LOSS_SNAPSHOT_COUNT - 1 - age) % LOSS_SNAPSHOT_COUNT;
+            let snapshot = &self.loss_snapshots[index];
+            if self.advancing_samples.saturating_sub(snapshot.at_sample) >= attack_samples {
+                attack_anchor = snapshot;
+                break;
+            }
+        }
+        let attack = self.loss_rate_since(attack_anchor);
+
+        match (attack, memory) {
+            (Some(a), Some(m)) => Some(a.max(m)),
+            (one, other) => one.or(other),
+        }
     }
 }
 
@@ -683,6 +923,16 @@ pub struct DecisionMaker {
     /// advanced `min_dwell_turns` past it. Raises are never suppressed (you
     /// can't dwell through a stall).
     last_decision_frame: Option<GameFrameCount>,
+    /// Trailing high-water mark of the control law's target, over the last
+    /// [`ControlLaw::shrink_lookback_turns`] of session-frame progress. A
+    /// shrink never takes the buffer below this floor: noisy conditions make
+    /// the target *recur* at its high-water rather than sit on it, and a
+    /// buffer lowered into that recurrence is immediately re-raised --
+    /// flapping on the shrink-dwell cadence. Parking at the high-water (and
+    /// shrinking only as it ages out of the window) is what keeps the buffer
+    /// still through sustained noise while still coming down, boundedly, once
+    /// conditions genuinely improve.
+    target_high_water: TargetHighWater,
     /// Orders this session's decisions on the wire. Incremented for every
     /// broadcast directive, so clients receiving copies out of order (or a
     /// superseded directive after its replacement) keep only the newest. Also
@@ -1934,6 +2184,7 @@ impl DecisionMaker {
             connection_states: HashMap::new(),
             retired_connection_epochs: HashMap::new(),
             last_decision_frame: None,
+            target_high_water: TargetHighWater::default(),
             decision_seq: 0,
             decision_seq_tiebreak: None,
             pending_directive: None,
@@ -2256,6 +2507,14 @@ impl DecisionMaker {
             // Trace the new authority's control inputs promptly rather than
             // waiting out the interval from the previous authority's cadence.
             self.last_trace_frame = None;
+            // A promoted authority has no target history, so its shrink floor
+            // would read zero and allow an instant shrink on the first
+            // post-handoff sample. Seed the floor with the buffer it inherited;
+            // real observations take over from there.
+            if let Some(frame) = self.session_frame() {
+                let span = self.law.high_water_bucket_span();
+                self.target_high_water.observe(frame.0, self.buffer.0, span);
+            }
             self.drain_handoff_leaves(held_slots)
         } else {
             (Vec::new(), Vec::new())
@@ -2387,6 +2646,7 @@ impl DecisionMaker {
         conditions: &[SlotConditions],
         mesh_rtt_us: u32,
     ) -> Option<Decision> {
+        let snapshot_interval = self.law.loss_snapshot_interval();
         for slot in conditions {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's tracked RTT/loss state, corrupting that
@@ -2418,7 +2678,8 @@ impl DecisionMaker {
                 _ => continue,
             }
             let state = self.slots.entry(id).or_default();
-            let counter_update = state.update_counters(slot.lost_packets, slot.sent_packets);
+            let counter_update =
+                state.update_counters(slot.lost_packets, slot.sent_packets, snapshot_interval);
 
             // Sender RTT is instantaneous rather than cumulative, but a
             // counter-regressing sidecar is known to be stale as a whole and
@@ -2717,7 +2978,7 @@ impl DecisionMaker {
             // Burst loss on high-latency links is worse because more packets
             // are in flight during the burst window. Reuse the effective RTT
             // already computed for the pairwise-path calculation.
-            if let Some(loss_rate) = state.loss_rate() {
+            if let Some(loss_rate) = state.windowed_loss_rate(self.law.loss_attack_samples) {
                 let loss_risk = loss_rate * f64::from(eff_rtt);
                 if loss_risk > worst_loss_risk {
                     worst_loss_risk = loss_risk;
@@ -2843,24 +3104,32 @@ impl DecisionMaker {
         // its own game (see `crate::delivery`).
         if let Some(inputs) = &inputs {
             let target = inputs.target.saturating_add(self.delivery.cushion_turns());
+            self.target_high_water
+                .observe(frame.0, target, self.law.high_water_bucket_span());
             let new_buffer = if target > self.buffer.0 {
                 // Raise fast: jump to the target immediately. No dwell -- a
                 // too-small buffer stalls, and you can't wait through a stall.
                 Some(target)
             } else if target < self.buffer.0 {
-                // Lower slow: check the dwell first. Every buffer-size change
-                // alters the game feel, so shrinks are gated -- at least
-                // `min_dwell_turns` must have elapsed since the last decision
-                // before the buffer shrinks. A raise resets the dwell clock
-                // (it set `last_decision_frame`), so a raise followed by a
-                // would-be lower still waits the full dwell.
-                if let Some(last) = self.last_decision_frame
-                    && frame.0.saturating_sub(last.0) < self.law.min_dwell_turns
-                {
-                    None
-                } else {
-                    Some(self.buffer.0.saturating_sub(self.law.lower_step))
-                }
+                // Lower slow: every buffer-size change alters the game feel,
+                // so a shrink must be both paced and earned. Paced: at least
+                // `min_dwell_turns` since the last decision, so a multi-turn
+                // descent steps down gradually. Earned: the shrink may not
+                // take the buffer below the target's trailing high-water mark.
+                // Noisy conditions make the target *recur* at its peak rather
+                // than sit on it -- an instantaneous dip at the moment the
+                // dwell expires is not evidence the cushion is oversized, and
+                // a buffer lowered into the recurrence is re-raised at its
+                // next peak, flapping on the dwell cadence. Parking at the
+                // high-water (and following it down only as peaks age out of
+                // the lookback) keeps the buffer still through sustained
+                // noise, while a genuine improvement still walks it down one
+                // dwell per step.
+                let dwell_elapsed = self
+                    .last_decision_frame
+                    .is_none_or(|last| frame.0.saturating_sub(last.0) >= self.law.min_dwell_turns);
+                let lowered = self.buffer.0.saturating_sub(self.law.lower_step);
+                (dwell_elapsed && lowered >= self.target_high_water.floor()).then_some(lowered)
             } else {
                 None
             };
@@ -2907,6 +3176,7 @@ impl DecisionMaker {
             game_frame = frame.0,
             buffer = self.buffer.0,
             target = inputs.target,
+            shrink_floor = self.target_high_water.floor(),
             path_us = inputs.path_us,
             worst_loss_risk = inputs.worst_loss_risk,
             eff_rtts = ?self
@@ -5433,6 +5703,12 @@ mod tests {
         }
     }
 
+    /// The slot's loss estimate as the control law sees it (the windowed rate
+    /// under the maker's own attack horizon).
+    fn slot_loss_rate(maker: &DecisionMaker, slot: u8) -> Option<f64> {
+        maker.slots[&SlotId(slot)].windowed_loss_rate(maker.law.loss_attack_samples)
+    }
+
     /// One slot-link packet's worth of input: frames observed off the packet's
     /// validated turns, then the sampled conditions ingested.
     fn ingest_at(maker: &mut DecisionMaker, c: &LinkConditions, frame: u32) -> Option<Decision> {
@@ -5480,7 +5756,7 @@ mod tests {
             .values()
             .filter_map(|state| {
                 state
-                    .loss_rate()
+                    .windowed_loss_rate(maker.law.loss_attack_samples)
                     .map(|rate| rate * f64::from(state.eff_rtt()))
             })
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -6064,12 +6340,14 @@ mod tests {
                 frame,
             );
         }
-        // Now the target is 2 (50ms), but we're still within the dwell.
+        // Now the target is 2 (50ms), but the shrink floor still remembers the
+        // spike-era target of 8.
         assert_eq!(maker.target(), Some(2));
 
-        // After the dwell (frame 2 + 120 = 122, so frame 123). Lower fires.
-        let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 1_000), 123);
-        assert!(d4.is_some(), "lower should fire after dwell");
+        // Once the spike has aged out of the shrink lookback (~25s after the
+        // last frame that observed a target of 8), the lower fires.
+        let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 1_000), 700);
+        assert!(d4.is_some(), "lower fires once the high-water ages out");
         assert_eq!(maker.buffer(), BufferSize(7));
     }
 
@@ -6249,11 +6527,11 @@ mod tests {
         assert_eq!(d, None);
     }
 
-    /// A late cumulative sample is ignored as a counter baseline. The next
-    /// forward sample must difference from the newest accepted sample, not the
-    /// stale packet that happened to arrive in between.
+    /// A late cumulative sample is ignored as a counter endpoint. The windowed
+    /// rate keeps differencing from the accepted history, not the stale packet
+    /// that happened to arrive in between.
     #[test]
-    fn stale_counter_sample_does_not_poison_the_next_loss_interval() {
+    fn stale_counter_sample_does_not_poison_the_loss_windows() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
 
@@ -6261,9 +6539,9 @@ mod tests {
         maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
         maker.ingest_remote(&conditions(0, 160_000, 10, 120), 20_000);
         assert_eq!(
-            maker.slots[&SlotId(0)].loss_rate(),
+            slot_loss_rate(&maker, 0),
             Some(0.5),
-            "the accepted interval is 10 lost out of 20 sent",
+            "10 lost out of the 20 sent since the baseline",
         );
 
         // 110/0 is older than the accepted 120/10 sample. Its sender RTT is
@@ -6271,32 +6549,26 @@ mod tests {
         // current even when the sender counters regress.
         maker.ingest_remote(&conditions(0, 900_000, 0, 110), 30_000);
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
         assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
-        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5), "stale sample ignored");
         assert_eq!(state.rtt(), 160_000, "stale RTT does not age the window");
         assert_eq!(state.mesh_rtt_us, 30_000, "the local mesh sample is fresh");
 
         maker.ingest_remote(&conditions(0, 140_000, 10, 130), 40_000);
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
         assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
-        assert_eq!(
-            (
-                state.curr_lost - state.prev_lost,
-                state.curr_sent - state.prev_sent,
-            ),
-            (0, 10),
-            "the final interval is the true 0/10 since the newest sample",
-        );
-        assert_eq!(state.loss_rate(), Some(0.0));
+        // Exactly as if the stale sample never arrived: 10 lost of the 30
+        // sent since the baseline. Had the stale 110/0 been accepted as an
+        // endpoint, the loss would instead read as 10 of the 20 packets after
+        // it -- the same 0.5 as before, poisoned against ever declining.
+        assert_eq!(slot_loss_rate(&maker, 0), Some(10.0 / 30.0));
     }
 
-    /// Exact re-delivery is idempotent for both the loss baseline and the
+    /// Exact re-delivery is idempotent for both the loss windows and the
     /// sample-count RTT window. Equal counters with a changed RTT remain a
     /// fresh latency observation.
     #[test]
-    fn duplicate_counters_neither_erase_nor_reapply_the_loss_interval() {
+    fn duplicate_counters_neither_erase_nor_reapply_the_loss_windows() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
@@ -6305,9 +6577,9 @@ mod tests {
 
         maker.ingest_remote(&conditions(0, 160_000, 10, 120), 20_000);
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
         assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
-        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!(state.advancing_samples, 1, "a duplicate does not advance");
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5));
         assert_eq!(state.rtt_window.len, rtt_samples);
         assert_eq!(state.mesh_rtt_us, 20_000);
 
@@ -6316,48 +6588,48 @@ mod tests {
         let state = &maker.slots[&SlotId(0)];
         assert_eq!(state.rtt(), 180_000);
         assert_eq!(state.rtt_window.len, rtt_samples + 1);
-        assert_eq!(state.loss_rate(), Some(0.5));
-        assert_eq!((state.prev_sent, state.curr_sent), (100, 120));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5));
+        assert_eq!(state.curr_sent, 120);
 
         maker.ingest_remote(&conditions(0, 170_000, 10, 130), 40_000);
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
         assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
-        assert_eq!(state.loss_rate(), Some(0.0));
+        // The 10 lost packets count once against the 30 sent since the
+        // baseline -- the duplicates neither erased them nor doubled them.
+        assert_eq!(slot_loss_rate(&maker, 0), Some(10.0 / 30.0));
     }
 
     /// Quinn can declare a packet lost after the sent-packet endpoint containing
-    /// it was sampled. A higher lost count at the same sent count refines that
-    /// interval immediately rather than waiting for (and attributing it wholly
-    /// to) a later send interval.
+    /// it was sampled. A higher lost count at the same sent count refines the
+    /// current endpoint immediately, and the loss then counts exactly once in
+    /// the windows -- it declines as clean packets accumulate rather than
+    /// re-spiking on later samples.
     #[test]
-    fn late_loss_declaration_refines_the_current_interval_without_rotating_it() {
+    fn late_loss_declaration_refines_the_current_endpoint_without_advancing_it() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&conditions(0, 150_000, 0, 100));
         maker.ingest_local(&conditions(0, 150_000, 0, 120));
-        assert_eq!(maker.slots[&SlotId(0)].loss_rate(), Some(0.0));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
 
         maker.ingest_local(&conditions(0, 150_000, 10, 120));
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (100, 0));
         assert_eq!((state.curr_sent, state.curr_lost), (120, 10));
-        assert_eq!(state.loss_rate(), Some(0.5));
+        assert_eq!(state.advancing_samples, 1, "a refinement does not advance");
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5));
 
-        // The refined endpoint becomes the baseline for the next interval, so
-        // the already-accounted loss is not re-applied.
         maker.ingest_local(&conditions(0, 150_000, 10, 130));
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (120, 10));
         assert_eq!((state.curr_sent, state.curr_lost), (130, 10));
-        assert_eq!(state.loss_rate(), Some(0.0));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(10.0 / 30.0));
     }
 
     /// Loss detection may advance before a second sent endpoint has established
-    /// any interval. It still refines the first endpoint: otherwise the next
-    /// interval would falsely attribute that already-sent loss to new packets.
+    /// any window. It must refine the baseline snapshot too: otherwise the
+    /// window anchored there would attribute that already-sent loss to the few
+    /// packets sent after it, reading tens-of-percent loss on a clean link.
     #[test]
-    fn late_loss_declaration_refines_the_first_baseline() {
+    fn late_loss_declaration_refines_the_baseline_snapshot() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&conditions(0, 150_000, 0, 100));
@@ -6365,14 +6637,18 @@ mod tests {
 
         let baseline = &maker.slots[&SlotId(0)];
         assert_eq!((baseline.curr_sent, baseline.curr_lost), (100, 10));
-        assert!(!baseline.has_delta);
-        assert_eq!(baseline.loss_rate(), None);
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            None,
+            "no packets span the window"
+        );
 
+        // The 10 packets sent after the refined baseline arrived intact, and
+        // that is exactly what the window reports.
         maker.ingest_local(&conditions(0, 150_000, 10, 110));
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (100, 10));
         assert_eq!((state.curr_sent, state.curr_lost), (110, 10));
-        assert_eq!(state.loss_rate(), Some(0.0));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
     }
 
     /// Counter admission is per slot, not per sidecar: one stale entry cannot
@@ -6396,16 +6672,16 @@ mod tests {
         );
 
         let stale = &maker.slots[&SlotId(0)];
-        assert_eq!((stale.prev_sent, stale.prev_lost), (100, 0));
         assert_eq!((stale.curr_sent, stale.curr_lost), (120, 10));
-        assert_eq!(stale.loss_rate(), Some(0.5));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5));
+        let stale = &maker.slots[&SlotId(0)];
         assert_eq!(stale.rtt(), 110_000);
         assert_eq!(stale.mesh_rtt_us, 30_000);
 
         let fresh = &maker.slots[&SlotId(1)];
-        assert_eq!((fresh.prev_sent, fresh.prev_lost), (120, 5));
         assert_eq!((fresh.curr_sent, fresh.curr_lost), (130, 5));
-        assert_eq!(fresh.loss_rate(), Some(0.0));
+        assert_eq!(slot_loss_rate(&maker, 1), Some(5.0 / 30.0));
+        let fresh = &maker.slots[&SlotId(1)];
         assert_eq!(fresh.mesh_rtt_us, 30_000);
     }
 
@@ -6427,15 +6703,17 @@ mod tests {
         maker.ingest_local(&conditions(0, 50_000, 0, 3));
         let baseline = &maker.slots[&SlotId(0)];
         assert_eq!((baseline.curr_sent, baseline.curr_lost), (3, 0));
-        assert!(!baseline.has_delta);
-        assert_eq!(baseline.loss_rate(), None);
+        assert_eq!(slot_loss_rate(&maker, 0), None);
+        let baseline = &maker.slots[&SlotId(0)];
         assert_eq!(baseline.rtt(), 50_000, "the old RTT window was retired");
 
         maker.ingest_local(&conditions(0, 60_000, 1, 13));
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (3, 0));
         assert_eq!((state.curr_sent, state.curr_lost), (13, 1));
-        assert!((state.loss_rate().expect("new interval") - 0.1).abs() < f64::EPSILON);
+        assert!(
+            (slot_loss_rate(&maker, 0).expect("new window") - 0.1).abs() < f64::EPSILON,
+            "1 lost of the 10 sent since the fresh baseline",
+        );
     }
 
     /// A replacement connection is a fresh RTT/counter namespace but not a new
@@ -6449,13 +6727,14 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(77));
         maker.ingest_local(&epoch_conditions(0, 11, 150_000, 0, 100));
         maker.ingest_local(&epoch_conditions(0, 11, 160_000, 10, 120));
-        assert_eq!(maker.slots[&SlotId(0)].loss_rate(), Some(0.5));
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.5));
 
         maker.ingest_local(&epoch_conditions(0, 22, 50_000, 0, 3));
         let replacement = &maker.slots[&SlotId(0)];
         assert_eq!(replacement.frame, Some(GameFrameCount(77)));
         assert_eq!((replacement.curr_sent, replacement.curr_lost), (3, 0));
-        assert_eq!(replacement.loss_rate(), None);
+        assert_eq!(slot_loss_rate(&maker, 0), None);
+        let replacement = &maker.slots[&SlotId(0)];
         assert_eq!(replacement.rtt(), 50_000);
 
         maker.ingest_remote(&epoch_conditions(0, 11, 900_000, 900, 10_000), 80_000);
@@ -6469,9 +6748,10 @@ mod tests {
 
         maker.ingest_local(&epoch_conditions(0, 22, 60_000, 1, 13));
         let state = &maker.slots[&SlotId(0)];
-        assert_eq!((state.prev_sent, state.prev_lost), (3, 0));
         assert_eq!((state.curr_sent, state.curr_lost), (13, 1));
-        assert!((state.loss_rate().expect("replacement interval") - 0.1).abs() < f64::EPSILON);
+        assert!(
+            (slot_loss_rate(&maker, 0).expect("replacement window") - 0.1).abs() < f64::EPSILON
+        );
     }
 
     /// Epoch absence is rolling-upgrade compatibility only. Once a present
@@ -6840,10 +7120,76 @@ mod tests {
         ));
     }
 
-    /// Regression: lossy interval THEN clean interval must drop the target.
-    /// Raises fire immediately; the lower waits for the dwell.
+    /// A lossy stretch followed by clean traffic must not snap the target
+    /// straight back down: the memory window keeps pricing the loss in until
+    /// it ages out of the snapshot ring, and only then does the (dwell-gated,
+    /// sustained) lower fire. An instantaneous estimator would read 0% in the
+    /// first loss-free stretch, collapse the target, and flap the buffer.
     #[test]
-    fn lossy_then_clean_interval_drops_target() {
+    fn loss_memory_holds_the_target_through_clean_stretches_then_releases() {
+        // A short memory (32 samples, snapshot every 2) and shrink lookback so
+        // the test can age the loss out with a handful of samples.
+        let law = ControlLaw {
+            loss_attack_samples: 4,
+            loss_memory_samples: 32,
+            shrink_lookback_turns: 120,
+            ..ControlLaw::default()
+        };
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law,
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // Clean baseline: 150ms -> target 4, raise.
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        // 50 of the next 100 packets lost: loss_risk = 0.5 * 150000 = 75000us
+        // -> +2 turns. Raise fires immediately.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 50, 200), 2);
+        assert_eq!(d.unwrap().buffer, BufferSize(6));
+
+        // Clean traffic from here on. The loss stays inside the memory window,
+        // so the target declines gradually instead of snapping to 4 -- and no
+        // decision fires.
+        let mut sent = 200;
+        for frame in 3..=20 {
+            sent += 10;
+            let d = ingest_at(&mut maker, &conditions(0, 150_000, 50, sent), frame);
+            assert_eq!(d, None, "held while the loss is in memory (frame {frame})");
+        }
+        assert!(
+            maker.target().unwrap() > 4,
+            "the memory window still prices the loss in",
+        );
+
+        // Enough further clean samples to push every lossy snapshot out of the
+        // ring: the loss term goes to zero and the target returns to 4.
+        for frame in 21..=60 {
+            sent += 10;
+            ingest_at(&mut maker, &conditions(0, 150_000, 50, sent), frame);
+        }
+        assert_eq!(maker.target(), Some(4), "the memory aged out");
+
+        // With the improvement sustained well past the dwell, the shrink fires.
+        sent += 10;
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 50, sent), 200);
+        assert_eq!(
+            d.unwrap().buffer,
+            BufferSize(5),
+            "one earned step down after sustained improvement",
+        );
+    }
+
+    /// Regression for buffer flapping under sustained noisy conditions: a
+    /// target that keeps *recurring* at the buffer level must never shrink at
+    /// a dwell expiry just because it happened to dip at that instant --
+    /// under an instantaneous rule that shrink is immediately re-raised at
+    /// the next peak, changing the buffer on exactly the dwell cadence. The
+    /// shrink floor (the target's trailing high-water) parks the buffer
+    /// instead, then releases it once the peaks age out of the lookback.
+    #[test]
+    fn recurring_target_peaks_park_the_buffer_until_they_age_out() {
         let mut maker = DecisionMaker::new(
             key(),
             bounds(0, 20),
@@ -6851,23 +7197,43 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        // Baseline at frame 1 (raises to 4, sets the dwell clock).
-        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        // 250ms -> target 7, raise.
+        let d = ingest_at(&mut maker, &conditions(0, 250_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(7));
 
-        // 50% loss at frame 22 (raise fires immediately -- no dwell on raises).
-        // loss_risk = 0.5 ** 150000 = 75000. Target = 4 + 2 = 6.
-        let d1 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 200), 2);
-        assert_eq!(d1.unwrap().buffer, BufferSize(6));
+        // The RTT sits at 200ms (target 5) but spikes back to 250ms every two
+        // seconds -- the shape sustained jitter takes. The dwell expires many
+        // times over; no shrink may fire, because the peaks keep the floor at
+        // the buffer.
+        let mut sent = 100;
+        for frame in 2..=600 {
+            sent += 5;
+            let rtt = if frame % 48 == 0 { 250_000 } else { 200_000 };
+            let d = ingest_at(&mut maker, &conditions(0, rtt, 0, sent), frame);
+            assert_eq!(d, None, "no decision while spikes recur (frame {frame})");
+        }
+        assert_eq!(maker.buffer(), BufferSize(7));
 
-        // Clean interval at frame 3 (loss_risk = 0, target = 4). But this is a
-        // lower, and we're within the 120-turn dwell from the raise at frame 2.
-        let d2 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 300), 3);
-        assert_eq!(d2, None, "lower suppressed within dwell");
-        assert_eq!(maker.target(), Some(4));
-
-        // After the dwell (frame 2 + 120 = 122, so frame 123). Lower fires.
-        let d3 = ingest_at(&mut maker, &conditions(0, 150_000, 50, 300), 123);
-        assert!(d3.is_some(), "lower should fire after dwell");
+        // Once the spikes genuinely stop, the peak has to age out of the
+        // shrink lookback (~25s) before the descent begins; the buffer then
+        // walks down to the new target one dwell per step -- monotonically,
+        // no oscillation on the way.
+        let mut decisions = Vec::new();
+        for frame in 601..=1500 {
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 200_000, 0, sent), frame) {
+                decisions.push((frame, d.buffer));
+            }
+        }
+        assert!(
+            decisions.iter().all(|&(frame, _)| frame >= 1150),
+            "the descent must wait out the lookback: {decisions:?}",
+        );
+        assert_eq!(
+            decisions.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
+            vec![BufferSize(6), BufferSize(5)],
+            "a monotonic two-step descent: {decisions:?}",
+        );
         assert_eq!(maker.buffer(), BufferSize(5));
     }
 

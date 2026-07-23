@@ -106,6 +106,9 @@ pub mod validation;
 
 pub mod consensus;
 
+#[cfg(test)]
+mod buffer_law_sim;
+
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
 // TODO: reconcile with the Fargate task def + per-game IP rotation.
 pub const DEFAULT_PORT: u16 = 14_900;
