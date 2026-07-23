@@ -129,13 +129,23 @@ impl ClientEndpoint {
     ///
     /// The socket is dual-stack so this default constructor reaches the
     /// IPv6-primary, dual-stack relay deployment: IPv6 relays directly and IPv4
-    /// ones via their IPv4-mapped form (handled in [`connect`](Self::connect)). A
-    /// caller that needs a specific socket — a fixed port, an IPv4-only host, a
-    /// shared endpoint — builds its own and uses
-    /// [`from_endpoint`](Self::from_endpoint).
+    /// ones via their IPv4-mapped form (handled in [`connect`](Self::connect)).
     ///
     /// Must be called from within a tokio runtime, which drives the endpoint.
     pub fn bind(roots: rustls::RootCertStore) -> Result<Self, EndpointError> {
+        Self::bind_on_port(roots, 0)
+    }
+
+    /// [`bind`](Self::bind) on a caller-chosen local UDP port instead of an
+    /// ephemeral one — the same dual-stack socket, only the port differs. A known
+    /// per-client port lets tooling that filters traffic by port (clumsy,
+    /// WinDivert, tc) single out one client among several on a machine. Port `0`
+    /// binds ephemerally, exactly like [`bind`](Self::bind). A caller whose needs
+    /// go beyond the port — an IPv4-only host, a shared endpoint — still builds
+    /// its own socket and uses [`from_endpoint`](Self::from_endpoint).
+    ///
+    /// Must be called from within a tokio runtime, which drives the endpoint.
+    pub fn bind_on_port(roots: rustls::RootCertStore, port: u16) -> Result<Self, EndpointError> {
         let config = quic::client_config(roots)?;
 
         // std's UdpSocket can't clear IPV6_V6ONLY (set by default on Windows), and
@@ -143,7 +153,7 @@ impl ClientEndpoint {
         // by hand and hand it to quinn.
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_only_v6(false)?;
-        let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, 0).into();
+        let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, port).into();
         socket.bind(&bind.into())?;
 
         let runtime = quinn::default_runtime().ok_or(EndpointError::NoRuntime)?;
@@ -363,6 +373,24 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[tokio::test]
+    async fn bind_on_port_uses_the_requested_port() {
+        // Find a port the OS considers free, then request it explicitly.
+        let probe = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let endpoint = ClientEndpoint::bind_on_port(rustls::RootCertStore::empty(), port).unwrap();
+        assert_eq!(endpoint.endpoint().local_addr().unwrap().port(), port);
+
+        // While that endpoint lives, the port is taken: a second request for it
+        // must surface as a bind error, not silently bind somewhere else.
+        assert!(matches!(
+            ClientEndpoint::bind_on_port(rustls::RootCertStore::empty(), port),
+            Err(EndpointError::Bind(_))
+        ));
+    }
 
     #[test]
     fn maps_ipv4_targets_only_when_dialing_from_an_ipv6_endpoint() {
