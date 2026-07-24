@@ -126,6 +126,21 @@ impl Weather {
             burst_end: 0.12,   // mean burst length ~8 turns (~350ms)
         }
     }
+
+    /// Clumsy-style throttle+drop: short *full* blackouts (~1-2 turns, near
+    /// 100% loss inside) recurring several times a second. Correlated loss at
+    /// a modest mean rate -- the shape real congestion/wifi loss usually
+    /// takes, and the one a mean-rate term under-provisions.
+    fn throttled(turns: u32, rtt_us: u32) -> Self {
+        Self {
+            turns,
+            rtt_us,
+            jitter: 0.15,
+            loss: 0.95,
+            burst_start: 0.10,
+            burst_end: 0.70,
+        }
+    }
 }
 
 /// One simulated client link: cumulative counters plus the loss/spike state
@@ -218,10 +233,14 @@ struct SimResult {
 }
 
 impl SimResult {
-    /// Shrinks that were re-raised within `window` turns -- the flap
-    /// signature. A healthy law produces none: a shrink it cannot sustain is
-    /// a shrink it should not have made.
-    fn reversals_within(&self, window: u32) -> usize {
+    /// Shrinks that were re-raised within `window` turns -- probe *dips* into
+    /// a level conditions still demanded. The law is allowed a bounded number
+    /// of these: an edge whose peaks recur just past the lookback can only be
+    /// discovered by probing it, but each disproven probe burns the edge, so
+    /// dips must never become a cadence. The window distinguishes a dip
+    /// (re-raised at the next peak, seconds later) from a real descent that
+    /// much later greets new weather.
+    fn dips_within(&self, window: u32) -> usize {
         let mut count = 0;
         let mut prev_buffer = SIM_BOUNDS_MIN;
         for (index, change) in self.changes.iter().enumerate() {
@@ -364,7 +383,7 @@ mod tests {
                 "seed {seed}: a clean network churned past its adaptation: {:?}",
                 result.changes,
             );
-            assert_eq!(result.reversals_within(seconds(3)), 0, "seed {seed}");
+            assert_eq!(result.dips_within(seconds(20)), 0, "seed {seed}");
         }
     }
 
@@ -381,19 +400,22 @@ mod tests {
             ];
             let result = run(ControlLaw::default(), &phases, seed);
 
-            assert_eq!(
-                result.reversals_within(seconds(3)),
-                0,
+            // One probe dip is the price of discovering an edge whose peaks
+            // recur past the lookback; the burn it earns must keep it from
+            // ever becoming a cadence.
+            assert!(
+                result.dips_within(seconds(20)) <= 1,
                 "seed {seed}: the buffer flapped: {:?}",
                 result.changes,
             );
             // Once the loss phase has been running a few seconds, the buffer
             // is adapted; from there it must be effectively parked. Allow a
-            // couple of late escalations (loss keeps randomly clustering) but
-            // nothing like the one-change-per-dwell flap this replaces.
+            // couple of late escalations (loss keeps randomly clustering) and
+            // the single probe pair, but nothing like the one-change-per-dwell
+            // flap this replaces (~22 for this window).
             let settled = result.changes_between(seconds(30), seconds(140));
             assert!(
-                settled.len() <= 2,
+                settled.len() <= 4,
                 "seed {seed}: churn while parked: {settled:?}",
             );
             // The parked buffer actually covers the weather. The proxy counts
@@ -432,16 +454,16 @@ mod tests {
             );
 
             // The descent is bounded: the shrink lookback (~25s) has to age the
-            // loss-era peaks out, then one dwell (~5s) per step down. 55s
-            // covers the ~5 steps this weather needs with margin. The endpoint
+            // loss-era peaks out, then one dwell (~5s) per step down. 65s
+            // covers the ~6 steps this weather needs with margin. The endpoint
             // is the clean steady state the first phase found.
             let clean_buffer = result.buffer_at(seconds(19));
-            let recovered = result.buffer_at(recovery_start + seconds(55));
+            let recovered = result.buffer_at(recovery_start + seconds(65));
             assert!(
                 recovered <= clean_buffer + 1,
                 "seed {seed}: stuck high after recovery: {recovered} vs clean {clean_buffer}",
             );
-            assert_eq!(result.reversals_within(seconds(3)), 0, "seed {seed}");
+            assert!(result.dips_within(seconds(20)) <= 1, "seed {seed}");
         }
     }
 
@@ -457,23 +479,80 @@ mod tests {
             ];
             let result = run(ControlLaw::default(), &phases, seed);
 
-            assert_eq!(
-                result.reversals_within(seconds(3)),
-                0,
+            // Probe dips are capped by the burn budget; past that the edge is
+            // parked for good.
+            assert!(
+                result.dips_within(seconds(20)) <= 2,
                 "seed {seed}: flapped between bursts: {:?}",
                 result.changes,
             );
-            // The first ~40s cover adaptation (legitimate escalating raises as
-            // burst clusters reveal the weather). After that the buffer must
-            // be near-parked: bursty weather may still earn an occasional
-            // escalation or a step of descent, but nothing like the dwell
-            // cadence's worst case (a change every ~5s would be ~22 for this
-            // window).
+            // Bursty weather is genuinely non-stationary at the target level
+            // -- burst clusters of different depths keep re-pricing it -- so
+            // raises tracking it are correct, not churn. Bound the total well
+            // below the dwell cadence's worst case (a change every ~5s would
+            // be ~22 for this window).
             let settled = result.changes_between(seconds(60), seconds(170));
             assert!(
-                settled.len() <= 4,
+                settled.len() <= 8,
                 "seed {seed}: churn while settled: {settled:?}",
             );
+        }
+    }
+
+    /// The clumsy shape that motivated the burst term: short full blackouts
+    /// recurring several times a second. The mean loss rate alone
+    /// under-provisions this weather; with the burst term the parked buffer
+    /// must actually cover it (rare underruns), and stay parked.
+    #[test]
+    fn throttle_blackouts_are_covered_and_parked() {
+        for seed in [5, 42, 777] {
+            let phases = [
+                Weather::clean(seconds(20), 150_000),
+                Weather::throttled(seconds(120), 150_000),
+            ];
+            let result = run(ControlLaw::default(), &phases, seed);
+
+            assert!(
+                result.dips_within(seconds(20)) <= 2,
+                "seed {seed}: flapped: {:?}",
+                result.changes,
+            );
+            let settled = result.changes_between(seconds(45), seconds(140));
+            assert!(settled.len() <= 6, "seed {seed}: churn: {settled:?}");
+            // Blackouts here run ~1-2 turns; a buffer sized by the burst term
+            // rides out nearly all of them. 1% of the lossy stretch is a
+            // couple of brief hiccups, not recurring micro-stutter.
+            let lossy_turns = seconds(120);
+            assert!(
+                result.underrun_turns <= lossy_turns / 100,
+                "seed {seed}: {} underrun turns of {lossy_turns}",
+                result.underrun_turns,
+            );
+        }
+    }
+
+    /// Peaks recurring just *past* the base lookback -- the exact bait for an
+    /// edge dip (shrink at lookback expiry, disproven by the next peak).
+    /// Probation limits the law to at most one dip per episode.
+    #[test]
+    fn peaks_just_past_the_lookback_dip_at_most_once() {
+        for seed in [9, 314, 2718] {
+            // A 1s 260ms RTT spike every 30s riding on a 200ms base: the
+            // target peaks 1 turn above its resting level, with the peaks
+            // spaced wider than the base shrink lookback.
+            let mut phases = vec![Weather::clean(seconds(5), 200_000)];
+            for _ in 0..7 {
+                phases.push(Weather::clean(seconds(1), 260_000));
+                phases.push(Weather::clean(seconds(29), 200_000));
+            }
+            let result = run(ControlLaw::default(), &phases, seed);
+
+            // The one allowed probe: shrink at lookback expiry, disproven by
+            // the next spike, burned -- and then parked for the remaining
+            // cycles.
+            assert!(result.dips_within(seconds(20)) <= 1, "seed {seed}");
+            let settled = result.changes_between(seconds(40), seconds(215));
+            assert!(settled.len() <= 2, "seed {seed}: edge churn: {settled:?}");
         }
     }
 
@@ -483,7 +562,7 @@ mod tests {
     #[test]
     #[ignore = "manual tuning aid, prints traces"]
     fn dump_traces() {
-        let scenarios: [(&str, Vec<Weather>); 3] = [
+        let scenarios: [(&str, Vec<Weather>); 4] = [
             (
                 "uniform 10% loss @150ms",
                 vec![
@@ -501,6 +580,14 @@ mod tests {
                 ],
             ),
             ("clean 300ms", vec![Weather::clean(seconds(120), 300_000)]),
+            (
+                "clumsy throttle @150ms",
+                vec![
+                    Weather::clean(seconds(20), 150_000),
+                    Weather::throttled(seconds(120), 150_000),
+                    Weather::clean(seconds(60), 150_000),
+                ],
+            ),
         ];
 
         for (name, phases) in &scenarios {

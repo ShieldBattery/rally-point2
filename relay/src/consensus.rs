@@ -87,6 +87,14 @@
 //!   subsides. Random loss produces loss-free stretches many times longer
 //!   than its mean gap; an instantaneous rate would zero the term in every
 //!   such gap and the target (and with it the buffer) would flap.
+//! - **`burst_turns`** -- the longest observed link *blackout* (consecutive
+//!   sample intervals that lost every packet) within the loss memory, capped
+//!   at a few turns. Real loss is mostly bursty -- queue overflows and wifi
+//!   fades drop runs of consecutive packets -- and the mean-rate term
+//!   structurally understates it: a 30ms blackout every 300ms is ~10% loss
+//!   but delays the turns inside it by the blackout's whole duration in
+//!   re-carries. The run length *is* that duration in turns, so it joins the
+//!   sum directly.
 //! - **`turn_duration`** -- one game step at 24 turns/sec == ~41.7ms. Each
 //!   buffer turn adds one step of dispatch delay, so the buffer is measured
 //!   in turns.
@@ -147,6 +155,16 @@
 //! little too long" over micro-stutter, but bounded (lookback + a dwell per
 //! step), never stuck. Raises, by contrast, fire on the first worsening
 //! sample.
+//!
+//! One lookback cannot fit every noise pattern: peaks recurring just *past*
+//! it would still bait a shrink that the next peak disproves. That gets
+//! **edge probation**: a shrink landing exactly on the floor whose departed
+//! level is promptly re-raised burns the edge, and the next floor-level
+//! shrink must then clear a 4x-lookback peak-free window (~100s). One
+//! strike -- the law may be wrong about a noisy edge once per episode before
+//! it parks. Probation never gates shrinks landing safely *below* the floor
+//! (the target regime falling outright), so genuine recovery stays fast; the
+//! burn itself expires only after a long burn-free stretch.
 //!
 //! # Application at an agreed future turn
 //!
@@ -250,6 +268,16 @@ pub enum Authority {
     Peer,
 }
 
+/// One shrink decision, retained until the next decision so a prompt re-raise
+/// can be recognized as disproving it (see `DecisionMaker::edge_burned`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShrinkRecord {
+    /// The buffer level the shrink departed.
+    from: u32,
+    /// The session frame the shrink fired at.
+    frame: u32,
+}
+
 /// A pending buffer-size change the decision-maker has decided to apply.
 ///
 /// The change targets a future `game_frame_count` -- every client applies it at
@@ -292,11 +320,13 @@ const BUFFER_TRACE_INTERVAL_TURNS: u32 = 600;
 /// The control law's target buffer size together with the intermediates it was
 /// derived from, so the diagnostic trace can report *why* a target came out where
 /// it did without recomputing the formula. `path_us` is the worst pairwise path,
-/// `worst_loss_risk` the highest per-slot `loss_rate * eff_rtt`.
+/// `worst_loss_risk` the highest per-slot `loss_rate * eff_rtt`, `burst_turns`
+/// the worst per-slot capped blackout-run length.
 struct TargetInputs {
     target: u32,
     path_us: u32,
     worst_loss_risk: f64,
+    burst_turns: u32,
 }
 
 /// How many recent RTT samples to keep per slot for jitter-aware sizing.
@@ -396,63 +426,108 @@ impl ControlLaw {
         (self.loss_memory_samples / LOSS_SNAPSHOT_COUNT as u32).max(1)
     }
 
-    /// The width of one target-high-water bucket in frames: the shrink
-    /// lookback spread across the fixed bucket count.
-    fn high_water_bucket_span(&self) -> u32 {
-        (self.shrink_lookback_turns / TARGET_HIGH_WATER_BUCKETS as u32).max(1)
+    /// The width of one target-peak bucket in frames: the base shrink
+    /// lookback spread across its bucket slice (the whole tracker spans 4x
+    /// the lookback for the probation windows).
+    fn target_floor_bucket_span(&self) -> u32 {
+        (self.shrink_lookback_turns / TARGET_FLOOR_BASE_BUCKETS as u32).max(1)
+    }
+
+    /// The width of one blackout-run bucket in conditions samples: the
+    /// loss-memory horizon spread across the run tracker.
+    fn blackout_run_bucket_span(&self) -> u32 {
+        (self.loss_memory_samples / BLACKOUT_RUN_BUCKETS as u32).max(1)
     }
 }
 
-/// How many buckets the target high-water tracker spreads its lookback
-/// across. More buckets forget the past more smoothly (the effective window
-/// is `lookback * (BUCKETS-1)/BUCKETS` to `lookback`); 8 keeps the tracker a
-/// few dozen bytes with O(1) updates.
-const TARGET_HIGH_WATER_BUCKETS: usize = 8;
+/// How many buckets the target-peak tracker holds. Its bucket span is the
+/// base shrink lookback divided by [`TARGET_FLOOR_BASE_BUCKETS`], so the whole
+/// structure spans 4x the lookback -- room for the edge-probation windows
+/// (base, 2x, 4x) to be read as progressively longer slices of one tracker.
+const TARGET_FLOOR_BUCKETS: usize = 32;
 
-/// A trailing maximum of the control-law target over a sliding frame window,
-/// kept as per-bucket maxima so old peaks age out in bucket-sized steps
-/// instead of requiring a full sample history.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TargetHighWater {
-    buckets: [u32; TARGET_HIGH_WATER_BUCKETS],
+/// How many trailing buckets make up the *base* shrink floor -- the slice
+/// spanning one `shrink_lookback_turns`.
+const TARGET_FLOOR_BASE_BUCKETS: usize = 8;
+
+/// How many buckets the per-slot blackout-run tracker holds; it spans the
+/// loss-memory window, so an observed blackout keeps its length in the burst
+/// term for the same horizon the loss rate itself is remembered.
+const BLACKOUT_RUN_BUCKETS: usize = 8;
+
+/// Ceiling on the burst term: however long an observed blackout ran, it never
+/// adds more than this many turns to the target. Blackouts longer than this
+/// are rare-tail weather that a buffer shouldn't chase -- covering them costs
+/// every turn of input latency permanently, while riding them out costs one
+/// brief stall.
+const BURST_TURNS_CAP: u32 = 4;
+
+/// The evidence window a *burned* edge shrink must clear, as trailing
+/// target-peak buckets: the tracker's whole span, 4x the base lookback
+/// (~100s). One strike is all an edge gets -- a second dip into a level the
+/// last dip already proved stuttery is exactly the feel this law exists to
+/// avoid -- but the window is still finite, so recovery is bounded, never
+/// stuck.
+const EDGE_PROBATION_BUCKETS: usize = TARGET_FLOOR_BUCKETS;
+
+/// A trailing maximum over a sliding coordinate window (session frames or
+/// sample counts), kept as per-bucket maxima so old peaks age out in
+/// bucket-sized steps instead of requiring a full sample history. Reads are
+/// slices of trailing buckets, so one tracker serves nested windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BucketedMax<const N: usize> {
+    buckets: [u32; N],
     /// Index of the bucket currently accumulating.
     head: usize,
-    /// The session frame at which the head bucket began, `None` until the
-    /// first observation.
+    /// The coordinate at which the head bucket began, `None` until the first
+    /// observation.
     head_start: Option<u32>,
 }
 
-impl TargetHighWater {
-    /// Folds one target observation at `frame` into the window. `bucket_span`
-    /// is the width of one bucket in frames (the lookback divided by the
-    /// bucket count).
-    fn observe(&mut self, frame: u32, target: u32, bucket_span: u32) {
+impl<const N: usize> Default for BucketedMax<N> {
+    fn default() -> Self {
+        Self {
+            buckets: [0; N],
+            head: 0,
+            head_start: None,
+        }
+    }
+}
+
+impl<const N: usize> BucketedMax<N> {
+    /// Folds one observation at coordinate `at` into the window.
+    /// `bucket_span` is the width of one bucket in coordinate units.
+    fn observe(&mut self, at: u32, value: u32, bucket_span: u32) {
         let bucket_span = bucket_span.max(1);
         match self.head_start {
-            None => self.head_start = Some(frame),
+            None => self.head_start = Some(at),
             Some(start) => {
-                let elapsed = frame.saturating_sub(start);
+                let elapsed = at.saturating_sub(start);
                 let advance = elapsed / bucket_span;
-                if advance as usize >= TARGET_HIGH_WATER_BUCKETS {
+                if advance as usize >= N {
                     // The whole window slid past every bucket (a long stall or
-                    // frame jump): nothing observed in it survives.
-                    self.buckets = [0; TARGET_HIGH_WATER_BUCKETS];
-                    self.head_start = Some(frame);
+                    // coordinate jump): nothing observed in it survives.
+                    self.buckets = [0; N];
+                    self.head_start = Some(at);
                 } else {
                     for _ in 0..advance {
-                        self.head = (self.head + 1) % TARGET_HIGH_WATER_BUCKETS;
+                        self.head = (self.head + 1) % N;
                         self.buckets[self.head] = 0;
                     }
                     self.head_start = Some(start + advance * bucket_span);
                 }
             }
         }
-        self.buckets[self.head] = self.buckets[self.head].max(target);
+        self.buckets[self.head] = self.buckets[self.head].max(value);
     }
 
-    /// The window's maximum observed target -- the floor a shrink must respect.
-    fn floor(&self) -> u32 {
-        self.buckets.iter().copied().max().unwrap_or(0)
+    /// The maximum over the trailing `n_buckets` buckets (clamped to the
+    /// tracker's size), including the currently accumulating one.
+    fn max_over_last(&self, n_buckets: usize) -> u32 {
+        (0..n_buckets.min(N))
+            .map(|age| self.buckets[(self.head + N - age) % N])
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -620,6 +695,15 @@ struct SlotState {
     /// with; samples arrive roughly once per turn, so ages measured in it are
     /// approximately turns.
     advancing_samples: u32,
+    /// How many consecutive advancing samples (so far) lost *every* packet
+    /// they covered -- an ongoing link blackout, measured in roughly turns.
+    blackout_run: u32,
+    /// Windowed maximum of blackout-run lengths over the loss-memory horizon.
+    /// A blackout of N turns delays a turn's delivery by up to N whole
+    /// re-carry turns, which the mean loss rate structurally understates for
+    /// bursty loss -- so the target gets this as its own term (capped at
+    /// [`BURST_TURNS_CAP`]; see [`burst_turns`](Self::burst_turns)).
+    blackout_runs: BucketedMax<BLACKOUT_RUN_BUCKETS>,
     /// Whether we've ingested at least one sample for this slot.
     seen: bool,
     /// Last sender RTT admitted into `rtt_window`. Equal cumulative counters
@@ -664,6 +748,8 @@ impl SlotState {
         self.loss_snapshot_head = 0;
         self.loss_snapshot_len = 0;
         self.advancing_samples = 0;
+        self.blackout_run = 0;
+        self.blackout_runs = BucketedMax::default();
         self.seen = false;
         self.last_sender_rtt_us = None;
     }
@@ -691,12 +777,14 @@ impl SlotState {
     ///
     /// `snapshot_interval` is the decimation clock: a snapshot is retained
     /// every that-many advancing samples (plus the baseline), spreading the
-    /// ring across the law's loss-memory horizon.
+    /// ring across the law's loss-memory horizon. `run_bucket_span` is the
+    /// blackout-run tracker's bucket width in advancing samples.
     fn update_counters(
         &mut self,
         lost_packets: u64,
         sent_packets: u64,
         snapshot_interval: u32,
+        run_bucket_span: u32,
     ) -> CounterUpdate {
         if !self.seen {
             self.curr_lost = lost_packets;
@@ -733,9 +821,31 @@ impl SlotState {
             return CounterUpdate::NonAdvancing;
         }
 
+        // A sample interval that lost *every* packet it covered is a link
+        // blackout: nothing sent in it -- including every re-carry -- got
+        // through, so consecutive such intervals stack whole turns of delivery
+        // delay. Track the run length (>= rather than == because the counters
+        // are peer-reported and a claimed lost > sent must still read as a
+        // blackout, not wrap around it). Late loss declarations refine totals
+        // but arrive without a sent-delta to compare against, so runs are
+        // built from advancing samples only -- a slight undercount when loss
+        // detection lags, which the rate terms still cover.
+        let delta_sent = sent_packets - self.curr_sent;
+        let delta_lost = lost_packets.saturating_sub(self.curr_lost);
+        if delta_lost >= delta_sent {
+            self.blackout_run = self.blackout_run.saturating_add(1);
+        } else {
+            self.blackout_run = 0;
+        }
+
         self.curr_lost = lost_packets;
         self.curr_sent = sent_packets;
         self.advancing_samples = self.advancing_samples.saturating_add(1);
+        // Observing the (possibly zero) run every advancing sample is what
+        // slides the run tracker's window; a stale burst must age out even
+        // when no new blackout occurs.
+        self.blackout_runs
+            .observe(self.advancing_samples, self.blackout_run, run_bucket_span);
         if self.advancing_samples.is_multiple_of(snapshot_interval) {
             self.push_loss_snapshot();
         }
@@ -820,6 +930,19 @@ impl SlotState {
             (Some(a), Some(m)) => Some(a.max(m)),
             (one, other) => one.or(other),
         }
+    }
+
+    /// The burst term this slot contributes to the target: the longest link
+    /// blackout observed within the loss-memory horizon, in turns, capped at
+    /// [`BURST_TURNS_CAP`]. The `loss_rate * eff_RTT` term prices how *much*
+    /// is lost; this prices how *long* delivery goes dark -- for bursty loss
+    /// (queue overflows, wifi fades: how real loss usually arrives) the mean
+    /// rate can read low while a blackout still delays a turn by its whole
+    /// duration in re-carries.
+    fn burst_turns(&self) -> u32 {
+        self.blackout_runs
+            .max_over_last(BLACKOUT_RUN_BUCKETS)
+            .min(BURST_TURNS_CAP)
     }
 }
 
@@ -923,16 +1046,37 @@ pub struct DecisionMaker {
     /// advanced `min_dwell_turns` past it. Raises are never suppressed (you
     /// can't dwell through a stall).
     last_decision_frame: Option<GameFrameCount>,
-    /// Trailing high-water mark of the control law's target, over the last
-    /// [`ControlLaw::shrink_lookback_turns`] of session-frame progress. A
-    /// shrink never takes the buffer below this floor: noisy conditions make
-    /// the target *recur* at its high-water rather than sit on it, and a
-    /// buffer lowered into that recurrence is immediately re-raised --
-    /// flapping on the shrink-dwell cadence. Parking at the high-water (and
-    /// shrinking only as it ages out of the window) is what keeps the buffer
-    /// still through sustained noise while still coming down, boundedly, once
-    /// conditions genuinely improve.
-    target_high_water: TargetHighWater,
+    /// Trailing peaks of the control law's target, spanning 4x
+    /// [`ControlLaw::shrink_lookback_turns`] of session-frame progress. The
+    /// base slice ([`TARGET_FLOOR_BASE_BUCKETS`]) is the shrink floor: a
+    /// shrink never takes the buffer below the target's maximum over one
+    /// lookback, because noisy conditions make the target *recur* at its
+    /// high-water rather than sit on it, and a buffer lowered into that
+    /// recurrence is immediately re-raised -- flapping on the shrink-dwell
+    /// cadence. The full span serves edge probation (`edge_burned`): once a
+    /// floor-level shrink has been disproven, the next one must clear the
+    /// whole 4x window. Parking at the high-water (and shrinking only as
+    /// peaks age out) keeps the buffer still through sustained noise while
+    /// still coming down, boundedly, once conditions genuinely improve.
+    target_peaks: BucketedMax<TARGET_FLOOR_BUCKETS>,
+    /// The most recent shrink decision: the buffer level it left and the
+    /// session frame it fired at. A raise arriving within two lookbacks that
+    /// returns to (or passes) the departed level *disproves* that shrink --
+    /// the cushion it removed was still needed -- and burns the edge.
+    last_shrink: Option<ShrinkRecord>,
+    /// Whether a floor-level ("edge") shrink has been disproven: the next
+    /// edge shrink must then clear the full [`EDGE_PROBATION_BUCKETS`]
+    /// peak-free window (~4x the lookback) instead of the base slice. One
+    /// strike: on a noisy edge, the law gets to be wrong about dipping once
+    /// per episode before it parks -- dips into a stuttery buffer are exactly
+    /// the feel this law exists to avoid. Expires only after a long burn-free
+    /// stretch: probation never gates shrinks landing *above* the floor, so
+    /// keeping the burn through a genuine recovery costs nothing, while
+    /// clearing it on one that merely looks genuine re-arms the edge for
+    /// another dip.
+    edge_burned: bool,
+    /// The session frame of the most recent burn, for the long-quiet reset.
+    last_burn_frame: Option<u32>,
     /// Orders this session's decisions on the wire. Incremented for every
     /// broadcast directive, so clients receiving copies out of order (or a
     /// superseded directive after its replacement) keep only the newest. Also
@@ -2184,7 +2328,10 @@ impl DecisionMaker {
             connection_states: HashMap::new(),
             retired_connection_epochs: HashMap::new(),
             last_decision_frame: None,
-            target_high_water: TargetHighWater::default(),
+            target_peaks: BucketedMax::default(),
+            last_shrink: None,
+            edge_burned: false,
+            last_burn_frame: None,
             decision_seq: 0,
             decision_seq_tiebreak: None,
             pending_directive: None,
@@ -2512,8 +2659,8 @@ impl DecisionMaker {
             // post-handoff sample. Seed the floor with the buffer it inherited;
             // real observations take over from there.
             if let Some(frame) = self.session_frame() {
-                let span = self.law.high_water_bucket_span();
-                self.target_high_water.observe(frame.0, self.buffer.0, span);
+                let span = self.law.target_floor_bucket_span();
+                self.target_peaks.observe(frame.0, self.buffer.0, span);
             }
             self.drain_handoff_leaves(held_slots)
         } else {
@@ -2647,6 +2794,7 @@ impl DecisionMaker {
         mesh_rtt_us: u32,
     ) -> Option<Decision> {
         let snapshot_interval = self.law.loss_snapshot_interval();
+        let run_bucket_span = self.law.blackout_run_bucket_span();
         for slot in conditions {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's tracked RTT/loss state, corrupting that
@@ -2678,8 +2826,12 @@ impl DecisionMaker {
                 _ => continue,
             }
             let state = self.slots.entry(id).or_default();
-            let counter_update =
-                state.update_counters(slot.lost_packets, slot.sent_packets, snapshot_interval);
+            let counter_update = state.update_counters(
+                slot.lost_packets,
+                slot.sent_packets,
+                snapshot_interval,
+                run_bucket_span,
+            );
 
             // Sender RTT is instantaneous rather than cumulative, but a
             // counter-regressing sidecar is known to be stale as a whole and
@@ -2960,6 +3112,7 @@ impl DecisionMaker {
         let mut highest = 0;
         let mut second_highest = 0;
         let mut worst_loss_risk = 0.0;
+        let mut burst_turns = 0;
 
         for state in self.slots.values() {
             // Effective RTT is the full one-way path from the client to the
@@ -2984,6 +3137,8 @@ impl DecisionMaker {
                     worst_loss_risk = loss_risk;
                 }
             }
+
+            burst_turns = burst_turns.max(state.burst_turns());
         }
 
         if measured == 0 {
@@ -3010,13 +3165,16 @@ impl DecisionMaker {
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
 
         Some(TargetInputs {
-            // Saturating: both terms derive from client-influenced inputs, and
+            // Saturating: the terms derive from client-influenced inputs, and
             // an absurd target is clamped to the session bounds at `decide`
             // anyway — overflow here would only trade that clamp for a
             // debug-build panic.
-            target: path_turns.saturating_add(loss_turns),
+            target: path_turns
+                .saturating_add(loss_turns)
+                .saturating_add(burst_turns),
             path_us,
             worst_loss_risk,
+            burst_turns,
         })
     }
 
@@ -3104,11 +3262,35 @@ impl DecisionMaker {
         // its own game (see `crate::delivery`).
         if let Some(inputs) = &inputs {
             let target = inputs.target.saturating_add(self.delivery.cushion_turns());
-            self.target_high_water
-                .observe(frame.0, target, self.law.high_water_bucket_span());
+            self.target_peaks
+                .observe(frame.0, target, self.law.target_floor_bucket_span());
+
+            // Edge burns go stale: after a long stretch with no shrink being
+            // disproven, the weather that burned the edge is gone.
+            if let Some(burned) = self.last_burn_frame
+                && frame.0.saturating_sub(burned) > self.law.shrink_lookback_turns.saturating_mul(8)
+            {
+                self.edge_burned = false;
+                self.last_burn_frame = None;
+            }
+
             let new_buffer = if target > self.buffer.0 {
                 // Raise fast: jump to the target immediately. No dwell -- a
                 // too-small buffer stalls, and you can't wait through a stall.
+                //
+                // A raise that promptly returns to (or passes) the level the
+                // last shrink departed *disproves* that shrink -- the cushion
+                // it removed was still needed, and every frame spent below it
+                // was stutter risk. Burn the edge so the next floor-level
+                // shrink needs a longer peak-free window.
+                if let Some(shrink) = self.last_shrink.take()
+                    && target >= shrink.from
+                    && frame.0.saturating_sub(shrink.frame)
+                        <= self.law.shrink_lookback_turns.saturating_mul(2)
+                {
+                    self.edge_burned = true;
+                    self.last_burn_frame = Some(frame.0);
+                }
                 Some(target)
             } else if target < self.buffer.0 {
                 // Lower slow: every buffer-size change alters the game feel,
@@ -3125,11 +3307,40 @@ impl DecisionMaker {
                 // the lookback) keeps the buffer still through sustained
                 // noise, while a genuine improvement still walks it down one
                 // dwell per step.
+                //
+                // A shrink landing exactly ON the floor is an *edge* shrink --
+                // riding the boundary the noise oscillates across -- and once
+                // one has been disproven, the next must clear the full 4x
+                // peak window. Shrinks landing safely above the floor (the
+                // target regime falling outright) are never probation-gated,
+                // so a burn costs genuine recovery nothing; it expires only
+                // by the long-quiet decay above, because a mid-episode lull
+                // that merely *looks* like a regime drop must not re-arm the
+                // edge for another dip.
                 let dwell_elapsed = self
                     .last_decision_frame
                     .is_none_or(|last| frame.0.saturating_sub(last.0) >= self.law.min_dwell_turns);
                 let lowered = self.buffer.0.saturating_sub(self.law.lower_step);
-                (dwell_elapsed && lowered >= self.target_high_water.floor()).then_some(lowered)
+                let base_floor = self.target_peaks.max_over_last(TARGET_FLOOR_BASE_BUCKETS);
+                let allowed = if lowered == base_floor {
+                    let probation_buckets = if self.edge_burned {
+                        EDGE_PROBATION_BUCKETS
+                    } else {
+                        TARGET_FLOOR_BASE_BUCKETS
+                    };
+                    lowered >= self.target_peaks.max_over_last(probation_buckets)
+                } else {
+                    lowered >= base_floor
+                };
+                if dwell_elapsed && allowed {
+                    self.last_shrink = Some(ShrinkRecord {
+                        from: self.buffer.0,
+                        frame: frame.0,
+                    });
+                    Some(lowered)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -3176,9 +3387,11 @@ impl DecisionMaker {
             game_frame = frame.0,
             buffer = self.buffer.0,
             target = inputs.target,
-            shrink_floor = self.target_high_water.floor(),
+            shrink_floor = self.target_peaks.max_over_last(TARGET_FLOOR_BASE_BUCKETS),
+            edge_burned = self.edge_burned,
             path_us = inputs.path_us,
             worst_loss_risk = inputs.worst_loss_risk,
+            burst_turns = inputs.burst_turns,
             eff_rtts = ?self
                 .slots
                 .iter()
@@ -5761,14 +5974,23 @@ mod tests {
             })
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(0.0);
+        let burst_turns = maker
+            .slots
+            .values()
+            .map(SlotState::burst_turns)
+            .max()
+            .unwrap_or(0);
         let turn_us = f64::from(maker.law.turn_duration_us);
         let path_turns = (f64::from(path_us) / turn_us).ceil() as u32;
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
 
         Some(TargetInputs {
-            target: path_turns.saturating_add(loss_turns),
+            target: path_turns
+                .saturating_add(loss_turns)
+                .saturating_add(burst_turns),
             path_us,
             worst_loss_risk,
+            burst_turns,
         })
     }
 
@@ -5910,14 +6132,19 @@ mod tests {
         let inputs = maker.target_inputs().unwrap();
         assert_eq!(inputs.path_us, 300_000, "the two top RTTs are tied");
         assert_eq!(inputs.worst_loss_risk, 60_000.0);
-        assert_eq!(inputs.target, 10);
+        // Slot 3 lost all 100 packets of its interval: a 1-turn blackout, so
+        // the burst term contributes even though its RTT (and with it its
+        // loss *risk*) is unmeasured -- a fully dark link stalls lockstep
+        // regardless of how short its path is.
+        assert_eq!(inputs.burst_turns, 1);
+        assert_eq!(inputs.target, 11);
 
         maker.record_departure(SlotId(1), None, None, None, DROPPED);
         assert_target_inputs_match_reference(&maker);
         let inputs = maker.target_inputs().unwrap();
         assert_eq!(inputs.path_us, 200_000);
         assert_eq!(inputs.worst_loss_risk, 15_000.0);
-        assert_eq!(inputs.target, 6);
+        assert_eq!(inputs.target, 7);
 
         maker.record_departure(SlotId(2), None, None, None, DROPPED);
         assert_target_inputs_match_reference(&maker);
@@ -7178,6 +7405,193 @@ mod tests {
             d.unwrap().buffer,
             BufferSize(5),
             "one earned step down after sustained improvement",
+        );
+    }
+
+    /// A stretch of sample intervals that lost *every* packet is a link
+    /// blackout, and its length joins the target as whole turns (capped):
+    /// delivery inside it is dark for exactly that many re-carries, which the
+    /// mean loss rate understates for bursty loss.
+    #[test]
+    fn a_full_blackout_adds_its_duration_to_the_target() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // Clean baseline at 150ms: path 4 turns.
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // Three consecutive intervals lose all 10 of their packets: a ~3-turn
+        // blackout. The windowed rate also saturates (30 lost of the 30 sent
+        // since baseline -> 1.0 * 150ms -> 4 turns), and the burst term adds
+        // the observed 3-turn duration on top.
+        ingest_at(&mut maker, &conditions(0, 150_000, 10, 110), 2);
+        ingest_at(&mut maker, &conditions(0, 150_000, 20, 120), 3);
+        ingest_at(&mut maker, &conditions(0, 150_000, 30, 130), 4);
+        assert_eq!(maker.target(), Some(4 + 4 + 3));
+
+        // Partial loss is not a blackout: re-carries still get through, so
+        // the run resets and the burst term stops growing.
+        ingest_at(&mut maker, &conditions(0, 150_000, 31, 150), 5);
+        let partial_burst = maker.target_inputs().unwrap().burst_turns;
+        assert_eq!(partial_burst, 3, "the remembered burst, not a longer one");
+    }
+
+    /// However long a blackout runs, the burst term is capped: covering a
+    /// rare many-turn outage would cost every turn of input latency
+    /// permanently, while riding it out costs one brief stall.
+    #[test]
+    fn the_burst_term_is_capped() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 30),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        for step in 1..=10u32 {
+            let moved = u64::from(step) * 10;
+            ingest_at(
+                &mut maker,
+                &conditions(0, 150_000, moved, 100 + moved),
+                step + 1,
+            );
+        }
+        assert_eq!(maker.target_inputs().unwrap().burst_turns, BURST_TURNS_CAP);
+    }
+
+    /// Edge probation: a floor-level shrink that gets promptly disproven
+    /// (the target re-reaches the departed level) burns the edge, and the
+    /// next floor-level shrink must clear the full 4x-lookback peak-free
+    /// window -- so on an edge whose peaks recur past the base lookback, the
+    /// law dips at most once before parking.
+    #[test]
+    fn a_disproven_edge_shrink_quadruples_the_next_ones_evidence_window() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // 230ms -> target 6, raise.
+        let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(6));
+
+        // Quiet at 200ms (target 5) long enough for the 6-peak to age out of
+        // the base lookback; the edge shrink to 5 fires.
+        let mut sent = 100;
+        let mut shrink_frame = 0;
+        for frame in 2..=700 {
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 200_000, 0, sent), frame) {
+                assert_eq!(d.buffer, BufferSize(5), "the edge shrink");
+                assert_eq!(shrink_frame, 0, "exactly one shrink");
+                shrink_frame = frame;
+            }
+        }
+        assert!(shrink_frame > 600, "shrink waited out the base lookback");
+
+        // A 230ms peak recurs shortly after: the shrink is disproven, the
+        // buffer re-raised, the edge burned.
+        sent += 5;
+        let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, sent), 710);
+        assert_eq!(d.unwrap().buffer, BufferSize(6), "the disproving re-raise");
+
+        // Quiet again for well past the base lookback: the burned edge is
+        // still under probation (the 4x window covers the 710 peak), so no
+        // shrink fires...
+        for frame in 711..=2900 {
+            sent += 5;
+            let d = ingest_at(&mut maker, &conditions(0, 200_000, 0, sent), frame);
+            assert_eq!(d, None, "probation holds the edge (frame {frame})");
+        }
+        // ...until the 4x window has genuinely aged the peak out.
+        let mut second_shrink = None;
+        for frame in 2901..=3400 {
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 200_000, 0, sent), frame) {
+                second_shrink = Some((frame, d.buffer));
+                break;
+            }
+        }
+        let (frame, buffer) = second_shrink.expect("probation is bounded, not forever");
+        assert_eq!(buffer, BufferSize(5));
+        // Bucket granularity makes the 4x window effectively 31-32 buckets
+        // (2325-2400 frames) past the bucket holding the peak.
+        assert!(
+            frame >= 710 + 2325,
+            "the second edge shrink cleared the 4x window (frame {frame})",
+        );
+    }
+
+    /// Probation never gates shrinks landing above the floor, so a burned
+    /// edge costs a genuine regime drop nothing: the descent runs at plain
+    /// dwell cadence while the burn is still armed.
+    #[test]
+    fn a_burned_edge_does_not_slow_a_genuine_regime_drop() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // Burn the edge: raise to 6, edge-shrink to 5, disprove it.
+        let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(6));
+        let mut sent = 100;
+        let mut frame = 1;
+        loop {
+            frame += 1;
+            sent += 5;
+            if ingest_at(&mut maker, &conditions(0, 200_000, 0, sent), frame).is_some() {
+                break; // the edge shrink to 5
+            }
+        }
+        sent += 5;
+        frame += 10;
+        let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, sent), frame);
+        assert_eq!(d.unwrap().buffer, BufferSize(6));
+        assert!(maker.edge_burned);
+
+        // The RTT then drops to 50ms (target 2): far below the edge. The
+        // descent's steps land *above* the new floor, so probation -- still
+        // armed -- gates none of them: once eligible they come one dwell
+        // (120 turns) apart. Only the final step, which lands ON the new
+        // resting target (an edge shrink), waits out the burned 4x window --
+        // the bounded biased-high tail after proven-flappy weather.
+        let mut descent = Vec::new();
+        let descent_start = frame;
+        while frame < descent_start + 3000 {
+            frame += 1;
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 50_000, 0, sent), frame) {
+                descent.push((frame, d.buffer));
+            }
+        }
+        assert!(maker.edge_burned, "the burn persists through the descent");
+        let buffers: Vec<_> = descent.iter().map(|&(_, b)| b).collect();
+        assert_eq!(
+            buffers,
+            vec![BufferSize(5), BufferSize(4), BufferSize(3), BufferSize(2)],
+            "the full descent ran: {descent:?}",
+        );
+        for pair in descent.windows(2).take(2) {
+            assert_eq!(
+                pair[1].0 - pair[0].0,
+                120,
+                "the non-edge steps are dwell-paced, not probation-delayed: {descent:?}",
+            );
+        }
+        let last_gap = descent[3].0 - descent[2].0;
+        assert!(
+            last_gap > 1000,
+            "the final (edge) step waited out probation: {descent:?}",
         );
     }
 
