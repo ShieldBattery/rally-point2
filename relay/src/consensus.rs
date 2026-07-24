@@ -373,7 +373,7 @@ pub struct ControlLaw {
     pub lower_step: u32,
     /// Minimum number of turns between *lower* decisions -- and the span for
     /// which the target must have stayed *strictly below* the buffer before a
-    /// lower fires (see [`DecisionMaker::decide`]). Raises fire immediately
+    /// lower fires (see `DecisionMaker::decide`). Raises fire immediately
     /// (no dwell) -- you can't dwell through a stall. The dwell gates only
     /// shrinks: every buffer-size change alters the game feel for every
     /// player, so shrinks should be infrequent and well-validated. 120 turns
