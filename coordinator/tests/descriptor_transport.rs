@@ -363,6 +363,7 @@ fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
         resumed: false,
         departed_slots: vec![],
         latency_estimate_ms: None,
+        relay_regions: Vec::new(),
     }
 }
 

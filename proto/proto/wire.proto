@@ -340,6 +340,18 @@ message ControlFrame {
     // `GameChat` carries, both dropping the frame rather than closing the link.
     // See `PlayerSkin`.
     PlayerSkin player_skin = 10;
+
+    // The session's relay → region-label map (relay → client only), released
+    // only after a stretch of real gameplay has elapsed. Every serving relay
+    // learns the map from its own session descriptor and holds it back until
+    // its own clock says the release delay has passed since it latched the
+    // session started; before that no client can obtain it at all. It is
+    // declarative and idempotent — each frame carries the complete map, so a
+    // client keeps whatever the newest frame says — and delivered at least once
+    // per client: fanned to every local slot when the gate opens, pushed
+    // straight to a slot that connects afterwards, and re-fanned if a later
+    // descriptor changes the map. See `RegionLabels`.
+    RegionLabels region_labels = 11;
   }
 }
 
@@ -706,6 +718,51 @@ message PlayerSkin {
   // relay parses. Bounded by the relay's own size cap (well under the control
   // frame's own cap).
   bytes payload = 2;
+}
+
+// The session's relay → region-label map, as one serving relay releases it to
+// its own local clients. The labels place every member geographically (a client
+// can tell which relay each player homes on from the turn stream's origin
+// slots, so a relay's region is that player's region), which is why they are
+// withheld rather than sent at dial: a client that could read them before real
+// gameplay had elapsed could see its opponents' regions and abandon the match
+// while the game had barely begun. Every relay serving a session receives the
+// whole map on its own `SessionDescriptor`, so no relay ↔ relay exchange
+// carries it and there is no mesh counterpart to this frame.
+//
+// **The release is timed on the sending relay's own clock**, measured from when
+// that relay latched the session started, and reads nothing a client sends. A
+// turn's `game_frame_count` is a client-asserted claim that propagates to every
+// relay serving the session, so keying the release on one would let a single
+// client unseal the labels fleet-wide — including at its opponents' home relays.
+//
+// Declarative, not incremental: each frame carries the complete map as the
+// sending relay currently knows it, so a receiver replaces rather than merges
+// and a repeat costs nothing. Delivery is at least once per client — fanned to
+// every local slot when the relay's gate opens, pushed directly to a slot that
+// connects after it opened, and re-fanned when a later descriptor changes the
+// map (a re-home names a different relay) — so a client applies it
+// idempotently. A session that ends before its relay's delay elapses simply
+// never receives one, which is the intended outcome, not a failure.
+message RegionLabels {
+  // Every relay the sending relay has a region label for, in the order its
+  // descriptor listed them. A relay the coordinator never tagged with a region
+  // is absent rather than present with an empty string, so "unlabeled" and
+  // "labeled with nothing" are not confusable.
+  repeated RegionLabel labels = 1;
+}
+
+// One relay's region label within a `RegionLabels` frame.
+message RegionLabel {
+  // The relay's coordinator-assigned id — the same id a client already knows
+  // for its own home relay, and the join key against the origin relay of the
+  // turns a client receives.
+  uint64 relay_id = 1;
+
+  // The coordinator-assigned region the relay enrolled in, an opaque display
+  // label (e.g. `us-east`). The relay never interprets it; it carries the
+  // string its descriptor named verbatim.
+  string region = 2;
 }
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a

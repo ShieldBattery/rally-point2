@@ -1028,3 +1028,27 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   rollout would be costly.
 - **Downlink coalescing (if ever built) must define its recovery-window vs byte budget at
   implementation time** — low-stakes: the window is small and coalescing is weak-downlink-only.
+- **Relay regions reach clients, but only after real play has elapsed, and the gate is wall-clock.**
+  Regions are placement state the control plane also publishes: the coordinator carries the whole
+  session's relay → region map down every serving relay's descriptor, and each relay releases it to
+  its own local clients as a `RegionLabels` control frame — but not until `REGION_LABEL_RELEASE_DELAY`
+  (10s) has elapsed **on that relay's own clock**, measured from when it latched the session started.
+  The gate is the entire point, not an optimization: the labels place every member geographically,
+  so a modified client able to read them earlier could see its opponents' regions and abandon the
+  match while it had barely begun. Nothing a client receives at dial or during lobby setup carries
+  a region.
+  **The gate must not be openable by any client-controllable input, which is why it is not measured
+  in game frames.** A turn's `game_frame_count` is a client-asserted claim, and the relay evaluates
+  the gate where it delivers turns — including turns that arrived over the mesh from *other* relays.
+  A frame-based gate would therefore let one client inflating its own claim unseal the labels on
+  every relay serving the session, its opponents' home relays included. It also would not be
+  rescued by assuming a fast departure gets scored: that is the app server's reconciliation policy,
+  not this repo's, and the gate exists to hold up even where an instant quit reconciles as a void.
+  Time-since-start on each relay's own clock has neither weakness, and is equally proof against the
+  opposite abuse — it is not tied to the session's slowest slot, so no one slot can withhold the
+  labels longer than it can withhold the visibly-stalled game.
+  Accepted trade-off: a re-home replacement relay latches started when it adopts the session, so it
+  re-conceals for one delay period. Clients keep the map they already hold, so the only cost is that
+  a map *changed* by the re-home lands one delay later — cheaper than trusting an inherited start
+  time a fresh relay cannot verify. No mesh frame carries the map: every serving relay already has
+  it from its own descriptor.

@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    DepartedSlot, PlayerToken, RegionId, RelayEndpoint, RelayEntry, RelayPeer, SessionDescriptor,
-    SessionRequest, SessionResponse, SlotExternalRef, SlotHome, TenantId,
+    DepartedSlot, PlayerToken, RegionId, RelayEndpoint, RelayEntry, RelayPeer, RelayRegionLabel,
+    SessionDescriptor, SessionRequest, SessionResponse, SlotExternalRef, SlotHome, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
@@ -1552,6 +1552,21 @@ pub fn build_descriptor(
         // into the initial buffer depth. Present on a rehome-rebuilt descriptor too
         // (harmless: a resumed relay never re-stamps a depth).
         latency_estimate_ms: refs.latency_estimate_ms,
+        // Every serving relay's region — the whole session's map, not just this
+        // descriptor's relay, since a relay releases the complete map to its
+        // clients once its own release delay has elapsed in-game. Untagged
+        // relays are dropped rather than carried with an empty label, so an absent
+        // entry unambiguously means "no region recorded". Iterating a `BTreeMap`
+        // yields ascending relay-id order, so this is deterministic without a
+        // sort. Rebuilt on every push, so a re-home's replacement relay and its
+        // region reach every serving relay with the peer set.
+        relay_regions: refs
+            .relay_regions
+            .into_iter()
+            .filter_map(|(relay_id, region)| {
+                region.map(|region| RelayRegionLabel { relay_id, region })
+            })
+            .collect(),
     })
 }
 
@@ -4747,6 +4762,66 @@ mod tests {
         assert_eq!(
             refs.relay_regions.get(&RelayId(2)),
             Some(&Some(RegionId("region-b".to_owned()))),
+        );
+    }
+
+    #[test]
+    fn every_descriptor_carries_the_whole_sessions_region_labels() {
+        // A relay releases the *session's* map to its clients, not just its own
+        // entry, so both relays' descriptors carry both labels.
+        let setup =
+            setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, Some("region-a")),
+                player_in_region(1, Some("region-b")),
+            ],
+        );
+
+        let expected = vec![
+            RelayRegionLabel {
+                relay_id: RelayId(1),
+                region: RegionId("region-a".to_owned()),
+            },
+            RelayRegionLabel {
+                relay_id: RelayId(2),
+                region: RegionId("region-b".to_owned()),
+            },
+        ];
+        for relay_id in [RelayId(1), RelayId(2)] {
+            let descriptor = descriptor_for(&setup, &tid(), resp.session, relay_id).unwrap();
+            assert_eq!(
+                descriptor.relay_regions, expected,
+                "relay {relay_id:?}'s descriptor carries every serving relay's label, in relay-id order",
+            );
+        }
+    }
+
+    #[test]
+    fn an_untagged_relay_is_omitted_from_the_descriptors_region_labels() {
+        // A relay the coordinator never tagged has no label to release. It is left
+        // out of the map entirely rather than carried with an empty region, so a
+        // client can tell "no region recorded" from "recorded as nothing".
+        let setup = setup_with_region_relays(&[(1, 14900, None), (2, 14901, Some("region-b"))]);
+        let resp = create_region_session(
+            &setup,
+            vec![
+                player_in_region(0, None),
+                player_in_region(1, Some("region-b")),
+            ],
+        );
+
+        // Both relays serve the session, but only the tagged one has a region.
+        let refs = session_refs(&setup, &tid(), resp.session).unwrap();
+        assert_eq!(refs.relay_regions.get(&RelayId(1)), Some(&None));
+        let descriptor = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
+        assert_eq!(
+            descriptor.relay_regions,
+            vec![RelayRegionLabel {
+                relay_id: RelayId(2),
+                region: RegionId("region-b".to_owned()),
+            }],
         );
     }
 

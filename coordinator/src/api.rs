@@ -3262,6 +3262,7 @@ mod tests {
             resumed: false,
             departed_slots: vec![],
             latency_estimate_ms: None,
+            relay_regions: Vec::new(),
         }
     }
 

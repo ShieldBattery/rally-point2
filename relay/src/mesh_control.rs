@@ -58,13 +58,14 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rally_point_proto::control::{RelayPeer, SessionDescriptor};
 use rally_point_proto::ids::{RelayId, SlotId};
+use rally_point_proto::messages::RegionLabel;
 use tokio::sync::{mpsc, watch};
 
 use crate::consensus::{self, Authority, DecisionMakers};
 use crate::drop_hold::DropHolds;
 use crate::mesh::{self, MeshCommand, MeshLinks};
 use crate::presence::{self, Candidate, PresenceRegistry};
-use crate::routing::{SessionKey, Sessions};
+use crate::routing::{self, SessionKey, Sessions};
 
 /// Drives the mesh links' `Join`/`Leave` commands from coordinator session
 /// descriptors. Clone it cheaply (the state is behind one `Arc`) to hand a copy
@@ -198,10 +199,12 @@ impl MeshControl {
     /// Wires the turn-path handles so a descriptor-driven authority *promotion*
     /// can re-broadcast a synced leave the demoted authority never delivered —
     /// pushing it to local survivors (`sessions`) and peer survivors
-    /// (`mesh_links`). The production relay calls this with the same registries
-    /// the turn path holds; a control plane with no turn path leaves the empty
-    /// defaults from [`new`](Self::new), where the re-broadcast is a harmless
-    /// no-op against empty registries.
+    /// (`mesh_links`) — and so a descriptor that changes an already-released
+    /// region-label map can correct the local slots still holding the superseded
+    /// one. The production relay calls this with the same registries the turn
+    /// path holds; a control plane with no turn path leaves the empty defaults
+    /// from [`new`](Self::new), where both pushes are harmless no-ops against
+    /// empty registries.
     pub fn with_broadcast(mut self, sessions: Sessions, mesh_links: MeshLinks) -> Self {
         self.sessions = sessions;
         self.mesh_links = mesh_links;
@@ -393,6 +396,26 @@ impl MeshControl {
             descriptor.latency_estimate_ms,
             new_peers.is_empty(),
         );
+        // Record the session's relay → region labels. They go no further until the
+        // session's release gate opens on the turn path; the only thing that can
+        // send from here is a *changed* map on a session whose gate is already
+        // open (a re-home named a different relay), where the clients holding the
+        // superseded map must be corrected.
+        let relabelled = consensus::set_region_labels(
+            &self.decision_makers,
+            &key,
+            descriptor
+                .relay_regions
+                .iter()
+                .map(|label| RegionLabel {
+                    relay_id: label.relay_id.0,
+                    region: label.region.0.clone(),
+                })
+                .collect(),
+        );
+        if let Some(labels) = relabelled {
+            routing::fan_out_region_labels(&self.sessions, &key, &labels);
+        }
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
         // A rehome descriptor (coordinator-mediated failover) resumes an
         // already-running session onto this relay. Seed the departures the
@@ -682,6 +705,7 @@ mod tests {
             resumed: false,
             departed_slots: vec![],
             latency_estimate_ms: None,
+            relay_regions: Vec::new(),
         }
     }
 

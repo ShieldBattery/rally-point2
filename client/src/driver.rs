@@ -332,6 +332,26 @@ pub struct TurnChannels {
     ///   a peer's by comparing against its local slot. This keeps the channel's
     ///   `(SlotId, bool)` shape unchanged.
     pub connectivity: mpsc::Receiver<(SlotId, bool)>,
+    /// The session's relay → region labels, each entry pairing a relay id with
+    /// the region that relay serves from. A game that knows which relay each
+    /// member homes on can name that member's region from this — which is why the
+    /// relay does not send it at dial: the labels place every member
+    /// geographically, so a client holding them early could read its opponents'
+    /// regions and abandon the match while it had barely begun. The relay withholds
+    /// them until a stretch of real gameplay has elapsed on its own clock, and this
+    /// channel simply stays silent until then. A game that ends sooner never
+    /// receives them at all, which is the intended outcome. Nothing this client
+    /// sends brings the release forward, so an embedder cannot ask for them early.
+    ///
+    /// Each message is the **complete** map as the relay currently knows it, so
+    /// the game replaces whatever it held rather than merging. It can arrive more
+    /// than once — the release fan-out, a direct push when this client connects
+    /// after the release, a re-send when a re-home changes which relays serve the
+    /// session — so the game applies each idempotently. Best-effort like
+    /// [`connectivity`](Self::connectivity): a full buffer drops the map rather
+    /// than stalling the turn stream, and a later map carries the whole thing
+    /// again.
+    pub region_labels: mpsc::Receiver<Vec<(u64, String)>>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -382,6 +402,9 @@ pub struct LinkDriver {
     /// Slot-connectivity changes, to hand to the game thread when the relay
     /// pushes a `SlotConnectivity` down the control stream.
     connectivity: mpsc::Sender<(SlotId, bool)>,
+    /// The session's relay → region labels, to hand to the game thread when the
+    /// relay releases a `RegionLabels` down the control stream.
+    region_labels: mpsc::Sender<Vec<(u64, String)>>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -493,6 +516,10 @@ impl LinkDriver {
         // Connectivity changes are rare (a slot flips a small number of times over
         // a game); the leave-sized channel is ample.
         let (connectivity_tx, connectivity_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Region labels arrive at most a handful of times (the release, plus any
+        // re-send on reconnect or a re-home that changes the map); the leave-sized
+        // channel is ample.
+        let (region_labels_tx, region_labels_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
         let driver = Self {
             link,
             outbound: outbound_rx,
@@ -510,6 +537,7 @@ impl LinkDriver {
             request_drop: request_drop_rx,
             session_start: session_start_tx,
             connectivity: connectivity_tx,
+            region_labels: region_labels_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -527,6 +555,7 @@ impl LinkDriver {
             request_drop: request_drop_tx,
             session_start: session_start_rx,
             connectivity: connectivity_rx,
+            region_labels: region_labels_rx,
         };
         (driver, channels)
     }
@@ -554,6 +583,7 @@ impl LinkDriver {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         } = self;
         let mut seam = GameSeam {
             outbound,
@@ -570,6 +600,7 @@ impl LinkDriver {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         };
         let mut state = LoopState::new(result_expected);
         // The no-reconnect entry has no token to read a slot from, and it never
@@ -654,6 +685,7 @@ impl LinkDriver {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         } = self;
         let mut seam = GameSeam {
             outbound,
@@ -670,6 +702,7 @@ impl LinkDriver {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         };
         let mut state = LoopState::new(result_expected);
         let mut backoff = Backoff::new();
@@ -791,6 +824,7 @@ impl LinkDriver {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         } = seam;
         // The reorder/dedup cursors, the outbound seq counter, the leave announcer,
         // and any turns buffered during a prior outage all persist across a
@@ -1219,6 +1253,31 @@ impl LinkDriver {
                                 GamePush::Full => {
                                     tracing::debug!(
                                         "dropping connectivity change; the game is not draining them"
+                                    );
+                                }
+                                GamePush::Closed => return Ok(()),
+                            }
+                        }
+                        // The session's relay → region labels, released by the
+                        // relay once a stretch of real gameplay elapsed on its own
+                        // clock. Hand the complete map to the game thread, which replaces
+                        // whatever it held; a repeat (the release racing this
+                        // client's own connect push, a re-send after a re-home)
+                        // is idempotent. Best-effort — a full buffer just drops
+                        // the map, since a missing display label must never stall
+                        // the turns, and a later map carries the whole thing
+                        // again.
+                        Some(ControlInbound::RegionLabels(map)) => {
+                            let labels = map
+                                .labels
+                                .into_iter()
+                                .map(|label| (label.relay_id, label.region))
+                                .collect();
+                            match push_to_game(region_labels, labels) {
+                                GamePush::Sent => {}
+                                GamePush::Full => {
+                                    tracing::debug!(
+                                        "dropping region labels; the game is not draining them"
                                     );
                                 }
                                 GamePush::Closed => return Ok(()),
@@ -1796,6 +1855,7 @@ struct GameSeam {
     request_drop: mpsc::Receiver<SlotId>,
     session_start: mpsc::Sender<Option<u32>>,
     connectivity: mpsc::Sender<(SlotId, bool)>,
+    region_labels: mpsc::Sender<Vec<(u64, String)>>,
 }
 
 /// The driver state that must persist across a reconnect so a re-dialed session
@@ -3391,6 +3451,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_region_labels_surface_on_the_game_channel() {
+        // The relay releases the whole map at once; the driver hands the game the
+        // complete `(relay_id, region)` list off the reliable control stream.
+        use rally_point_proto::messages::RegionLabel;
+        use rally_point_transport::control::send_control_region_labels;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, mut chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        send_control_region_labels(
+            &mut peer_control_send,
+            vec![
+                RegionLabel {
+                    relay_id: 3,
+                    region: "us-east".to_owned(),
+                },
+                RegionLabel {
+                    relay_id: 8,
+                    region: "eu-central".to_owned(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let labels = tokio::time::timeout(Duration::from_secs(5), chan_a.region_labels.recv())
+            .await
+            .expect("the region labels arrive before the timeout")
+            .expect("the channel stays open");
+        assert_eq!(
+            labels,
+            vec![(3, "us-east".to_owned()), (8, "eu-central".to_owned()),],
+        );
+
+        // A re-send (the relay's re-fan after a re-home changes the map) replaces
+        // rather than accumulates: the game reads the second frame's whole map.
+        send_control_region_labels(
+            &mut peer_control_send,
+            vec![RegionLabel {
+                relay_id: 11,
+                region: "ap-southeast".to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
+        let labels = tokio::time::timeout(Duration::from_secs(5), chan_a.region_labels.recv())
+            .await
+            .expect("the re-sent map arrives before the timeout")
+            .expect("the channel stays open");
+        assert_eq!(labels, vec![(11, "ap-southeast".to_owned())]);
+
+        drop(chan_a);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops once the game seam closes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_control_frame_kind_this_build_predates_is_skipped_without_ending_the_stream() {
+        // A relay running ahead of this client sends a frame kind it has no arm
+        // for. The reader must skip it and keep reading, so a rolling deploy never
+        // costs a client the frames it *does* understand.
+        use rally_point_transport::control::send_control_session_start;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, mut chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        // A hand-built `ControlFrame` body carrying only an unknown oneof arm
+        // (field 99, length-delimited, empty) — a tag no arm of this build claims.
+        let body: &[u8] = &[0x9A, 0x06, 0x00];
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(body);
+        peer_control_send.write_all(&framed).await.unwrap();
+
+        // A kind this build does know, written straight after on the same stream:
+        // it arrives, proving the unknown frame neither desynced the framing nor
+        // tore the stream down.
+        send_control_session_start(&mut peer_control_send, Some(3))
+            .await
+            .unwrap();
+        let start = tokio::time::timeout(Duration::from_secs(5), chan_a.session_start.recv())
+            .await
+            .expect("the frame after the unknown one arrives before the timeout")
+            .expect("the channel stays open");
+        assert_eq!(start, Some(3));
+
+        drop(chan_a);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops once the game seam closes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn undrained_best_effort_channels_drop_instead_of_stalling_turns() {
         // Chat, skins, and connectivity are best-effort: a receiver that is
         // retained but never drained costs only the overflowing messages — the
@@ -3418,6 +3579,7 @@ mod tests {
             request_drop: _request_drop,
             session_start: _session_start,
             connectivity: _connectivity,
+            region_labels: _region_labels,
         } = chan_a;
 
         // Flood chat far past its buffer with nothing draining it.
@@ -3664,6 +3826,7 @@ mod tests {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         } = driver;
         let seam = GameSeam {
             outbound,
@@ -3680,6 +3843,7 @@ mod tests {
             request_drop,
             session_start,
             connectivity,
+            region_labels,
         };
         let state = LoopState::new(result_expected);
         (link, seam, state)

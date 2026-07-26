@@ -193,7 +193,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
@@ -202,11 +202,42 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
-    BufferDirective, LeaveDirective, LinkConditions, SlotConditions,
+    BufferDirective, LeaveDirective, LinkConditions, RegionLabel, SlotConditions,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::routing::SessionKey;
+
+/// How long a relay withholds the session's relay → region labels from its
+/// clients, measured on the relay's own clock from the moment it latched the
+/// session started.
+///
+/// The labels place every member geographically, so a client that held them
+/// early could see its opponents' regions and abandon the match while the game
+/// had barely begun. Withholding them for a stretch of real gameplay is what
+/// makes reading them cost something.
+///
+/// **Measured in wall-clock, never in game frames.** A turn's
+/// `game_frame_count` is a client-asserted claim, and this relay delivers turns
+/// that originated at *other* relays, so a single client inflating its own claim
+/// would otherwise open this gate on every relay serving the session — its
+/// opponents' home relays included. Nothing a client sends can advance a relay's
+/// clock, so the gate has no client-controllable input at all. It is equally
+/// proof against the opposite abuse: the gate is not tied to the session's
+/// slowest slot, so no one slot can hold the labels back any longer than it can
+/// hold back the visibly-stalled game itself.
+///
+/// Ten seconds sits comfortably past any "misclicked ready" moment and far short
+/// of a game whose outcome is decided.
+///
+/// The clock is per-relay, and a relay that takes over a running session
+/// (a re-home replacement) latches started when it adopts the session, so it
+/// waits this out again before releasing anything. That is a deliberate
+/// trade-off, not an oversight: clients keep the map they already hold, so the
+/// only cost is that a map *changed* by the re-home reaches them one delay
+/// later, and the alternative — trusting an inherited start time a fresh relay
+/// cannot verify — would reintroduce an input the session's clients influence.
+pub const REGION_LABEL_RELEASE_DELAY: Duration = Duration::from_secs(10);
 
 /// The native `pending_leave_reason` value for an unclean drop
 /// (`strPLAYER_WAS_DROPPED`). Any other nonzero reason renders as "player left".
@@ -1248,6 +1279,27 @@ pub struct DecisionMaker {
     /// latches started without sizing a depth). A peer relay adopts the
     /// authority's value here via [`adopt_session_start`](Self::adopt_session_start).
     initial_buffer_turns: Option<u32>,
+    /// The session's relay → region labels, in the order the coordinator
+    /// descriptor listed them. Every relay serving the session receives the whole
+    /// session's map on its own descriptor, so nothing is exchanged across the
+    /// mesh to build it. Empty for a session whose descriptor carried no labels
+    /// (a standalone relay, a dev-injected descriptor, an untagged fleet), which
+    /// simply means this relay has nothing to release. Descriptor-driven like
+    /// `expected_slots`, so it follows a re-push rather than accumulating.
+    region_labels: Vec<RegionLabel>,
+    /// Whether [`REGION_LABEL_RELEASE_DELAY`] has elapsed since `started_at` —
+    /// the one-way latch that permits `region_labels` to leave this relay. Never
+    /// cleared: the gameplay that had to elapse already has, so there is nothing
+    /// left to conceal, and a slot connecting afterwards must still be told.
+    region_labels_released: bool,
+    /// When this relay latched the session started, on its own monotonic clock.
+    /// The region-label release gate measures from here. Set exactly once, by
+    /// [`latch_started`](Self::latch_started) — every path that starts a session
+    /// funnels through it — so a re-delivered start directive (an authority
+    /// handoff re-firing, a late slot's re-push) cannot push the clock forward
+    /// and defer the release indefinitely. `None` until the session starts,
+    /// which holds the gate shut.
+    started_at: Option<Instant>,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -2353,6 +2405,9 @@ impl DecisionMaker {
             latency_hint_ms: None,
             single_relay: true,
             initial_buffer_turns: None,
+            region_labels: Vec::new(),
+            region_labels_released: false,
+            started_at: None,
         }
     }
 
@@ -4111,6 +4166,75 @@ impl DecisionMaker {
         self.homed_slots = homed;
     }
 
+    /// Replaces the session's relay → region labels from the coordinator
+    /// descriptor, returning the map to (re)send when the release gate is already
+    /// open and the new map differs from what clients were last told — a re-home
+    /// names a different relay, and a client still holding the old map would
+    /// label a member by a relay that no longer serves it.
+    ///
+    /// Returns `None` while the gate is shut, so a descriptor push can never be
+    /// the thing that leaks a label early: the labels are recorded and go nowhere
+    /// until [`maybe_release_region_labels`](Self::maybe_release_region_labels)
+    /// opens the gate. Descriptor-driven like
+    /// [`set_expected_slots`](Self::set_expected_slots) — a later push replaces
+    /// the map wholesale rather than accumulating.
+    #[must_use]
+    pub fn set_region_labels(&mut self, labels: Vec<RegionLabel>) -> Option<Vec<RegionLabel>> {
+        if self.region_labels == labels {
+            return None;
+        }
+        self.region_labels = labels;
+        self.released_region_labels()
+    }
+
+    /// Opens the region-label release gate once `delay` has elapsed since this
+    /// relay latched the session started, returning the map to fan out on the one
+    /// call that opens it.
+    ///
+    /// `Some` comes back on that single transition only, and only when there is
+    /// actually a map to send; every later call returns `None`, so a caller on the
+    /// turn path fans the labels out exactly once. A session that never starts, or
+    /// that ends inside the delay, never opens its gate and never sends labels —
+    /// the intended outcome, not a failure.
+    ///
+    /// Reads nothing but this relay's own clock and its own start latch. In
+    /// particular it does **not** read the turns being delivered: a turn's
+    /// `game_frame_count` is a client-asserted claim, and a relay delivers turns
+    /// that originated at other relays, so keying on one would let a single client
+    /// open the gate across every relay serving the session. `delay` is a caller
+    /// parameter rather than a direct read of [`REGION_LABEL_RELEASE_DELAY`] so a
+    /// relay can be built with a shortened one for testing without a second
+    /// gate-evaluating path existing at all.
+    #[must_use]
+    pub fn maybe_release_region_labels(&mut self, delay: Duration) -> Option<Vec<RegionLabel>> {
+        if self.region_labels_released {
+            return None;
+        }
+        if self.started_at?.elapsed() < delay {
+            return None;
+        }
+        self.region_labels_released = true;
+        self.released_region_labels()
+    }
+
+    /// Moves this session's recorded start instant `by` further into the past, so
+    /// a test can drive the region-label gate's elapsed-time condition without
+    /// sleeping out a real delay. A no-op on a session that has not started —
+    /// there is no clock to move, and the gate stays shut either way.
+    #[cfg(test)]
+    fn backdate_session_start(&mut self, by: Duration) {
+        self.started_at = self.started_at.and_then(|at| at.checked_sub(by));
+    }
+
+    /// The session's relay → region labels when the release gate is open and
+    /// there are labels to send, else `None`. Read for the direct push a slot
+    /// gets when it connects after the gate has already opened, so a late or
+    /// reconnecting client is not left without them.
+    pub fn released_region_labels(&self) -> Option<Vec<RegionLabel>> {
+        (self.region_labels_released && !self.region_labels.is_empty())
+            .then(|| self.region_labels.clone())
+    }
+
     /// Records this relay's own id, stamped onto every `BufferDirective` this
     /// maker queues from here on (see `queue_directive`).
     /// Idempotent — the caller's own id never changes for a running relay
@@ -4148,7 +4272,7 @@ impl DecisionMaker {
     /// initial depth must never resize a live game. The depth is bounds-clamped
     /// defensively, though the authority already clamped it before stamping.
     pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
-        self.started = true;
+        self.latch_started();
         if let Some(depth) = initial_buffer_turns {
             let clamped = self.bounds.clamp(depth);
             self.buffer = BufferSize(clamped);
@@ -4202,7 +4326,23 @@ impl DecisionMaker {
     /// that receives the directive fans it to its current local slots separately;
     /// this only records that the session has begun.
     pub fn mark_started(&mut self) {
+        self.latch_started();
+    }
+
+    /// The one place the session-started latch is set, so the start instant the
+    /// region-label release gate measures from can never be missed by a path that
+    /// only remembers the boolean. Every way a session starts funnels through
+    /// here: the authority's own coverage latch, a peer relay adopting the
+    /// authority's directive off the mesh, and a relay resuming an already-running
+    /// session from a rehome descriptor.
+    ///
+    /// The instant is recorded only on the first latch. A start directive can be
+    /// delivered more than once (an authority handoff re-firing it, a late slot's
+    /// re-push), and re-stamping the clock on each would let a session that keeps
+    /// re-announcing its start defer the region-label release without bound.
+    fn latch_started(&mut self) {
         self.started = true;
+        self.started_at.get_or_insert_with(Instant::now);
     }
 
     /// Whether the session-start directive has already been emitted — the guard a
@@ -4243,7 +4383,7 @@ impl DecisionMaker {
             return false;
         }
         if self.expected_slots.is_subset(&self.live_slots) {
-            self.started = true;
+            self.latch_started();
             let depth = self.compute_initial_depth();
             self.buffer = BufferSize(depth);
             self.initial_buffer_turns = Some(depth);
@@ -4551,6 +4691,12 @@ pub struct DecisionMakers {
     /// paths in this module, `MeshControl`, and the binary. Always present
     /// (recording is cheap and bounded); the *sink* is what's optional.
     flight: crate::flight_recorder::FlightRecorder,
+    /// How long this relay withholds a session's region labels after latching it
+    /// started — [`REGION_LABEL_RELEASE_DELAY`] for a production relay. Held here
+    /// rather than read directly at the gate so the whole relay can be built with
+    /// a shortened delay (see [`new_decision_makers_with_region_delay`]) instead
+    /// of the gate growing a second, test-only evaluation path.
+    region_release_delay: Duration,
 }
 
 impl DecisionMakers {
@@ -4632,6 +4778,12 @@ impl DecisionMakers {
         self.refs.lock().get(key).cloned()
     }
 
+    /// How long this relay withholds a session's region labels after latching it
+    /// started (see the field's doc).
+    pub fn region_release_delay(&self) -> Duration {
+        self.region_release_delay
+    }
+
     /// The end-of-game result embedded in `slot`'s departure record for `key`, if
     /// the relay has a maker holding a departure that carried one. Read while
     /// building a [`DepartureNotice`] so the notice embeds the same result every
@@ -4648,11 +4800,20 @@ impl DecisionMakers {
 /// and no notice notifier installed (a standalone relay, or before startup
 /// wiring calls [`DecisionMakers::set_notice_notifier`]).
 pub fn new_decision_makers() -> DecisionMakers {
+    new_decision_makers_with_region_delay(REGION_LABEL_RELEASE_DELAY)
+}
+
+/// [`new_decision_makers`] with an explicit region-label release delay, so a test
+/// can drive the release path without waiting out the production
+/// [`REGION_LABEL_RELEASE_DELAY`]. Production builds the registry through
+/// [`new_decision_makers`] with the real constant.
+pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> DecisionMakers {
     DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
         notices: OnceLock::new(),
         refs: parking_lot::Mutex::new(HashMap::new()),
         flight: crate::flight_recorder::FlightRecorder::default(),
+        region_release_delay,
     }
 }
 
@@ -4956,6 +5117,47 @@ pub fn session_initial_buffer_turns(registry: &DecisionMakers, key: &SessionKey)
         .lock()
         .get(key)
         .and_then(DecisionMaker::initial_buffer_turns)
+}
+
+/// Records `key`'s relay → region labels from a coordinator descriptor, returning
+/// the map to (re)send to this relay's local slots when the release gate is
+/// already open and the map changed (see
+/// [`DecisionMaker::set_region_labels`]). `None` when no maker exists — a session
+/// with no maker has no gate, and therefore nothing that may be released.
+#[must_use]
+pub fn set_region_labels(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    labels: Vec<RegionLabel>,
+) -> Option<Vec<RegionLabel>> {
+    registry.lock().get_mut(key)?.set_region_labels(labels)
+}
+
+/// Evaluates `key`'s region-label release gate against this relay's clock,
+/// returning the map to fan out on the single call that opens it (see
+/// [`DecisionMaker::maybe_release_region_labels`]). `None` on every other call,
+/// and when no maker exists. The delay comes from the registry, so every session
+/// on a relay is gated by the same one.
+#[must_use]
+pub fn maybe_release_region_labels(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+) -> Option<Vec<RegionLabel>> {
+    let delay = registry.region_release_delay();
+    registry
+        .lock()
+        .get_mut(key)?
+        .maybe_release_region_labels(delay)
+}
+
+/// `key`'s relay → region labels when its release gate is already open, for the
+/// direct push a slot gets on connecting after the gate opened. `None` when the
+/// gate is shut, when there are no labels, or when no maker exists.
+pub fn released_region_labels(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+) -> Option<Vec<RegionLabel>> {
+    registry.lock().get(key)?.released_region_labels()
 }
 
 /// Adopts an authority's mesh `SessionStart` onto a peer relay's maker: latches
@@ -6181,6 +6383,220 @@ mod tests {
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
         let _ = ingest_at(&mut maker, &conditions(0, 150_000, 5, 200), 2);
         assert_eq!(maker.target(), Some(5));
+    }
+
+    fn region_labels(labels: &[(u64, &str)]) -> Vec<RegionLabel> {
+        labels
+            .iter()
+            .map(|(relay_id, region)| RegionLabel {
+                relay_id: *relay_id,
+                region: (*region).to_owned(),
+            })
+            .collect()
+    }
+
+    /// Builds a maker holding the given relay → region labels on a session that
+    /// has NOT started — the state a descriptor push alone leaves behind.
+    fn maker_with_labels(labels: &[(u64, &str)]) -> DecisionMaker {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        assert_eq!(
+            maker.set_region_labels(region_labels(labels)),
+            None,
+            "recording labels never releases them on its own",
+        );
+        maker
+    }
+
+    #[test]
+    fn region_labels_stay_shut_in_until_the_release_delay_has_elapsed() {
+        let mut maker = maker_with_labels(&[(1, "us-east"), (2, "eu-central")]);
+
+        // A session that has not started has no clock to measure from, so the
+        // gate cannot open however many turns are delivered.
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+            "a session that never started never releases labels",
+        );
+
+        // Starting it begins the clock, but the delay has not elapsed.
+        maker.mark_started();
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+        );
+        assert_eq!(maker.released_region_labels(), None);
+
+        // Just short of the delay is still shut — the boundary that matters, since
+        // a client whose game ends there has never been able to obtain a label.
+        maker.backdate_session_start(REGION_LABEL_RELEASE_DELAY - Duration::from_millis(1));
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+            "one millisecond short of the delay keeps the gate shut",
+        );
+
+        // Crossing it opens the gate and yields the whole map, once.
+        maker.backdate_session_start(Duration::from_millis(1));
+        let released = maker
+            .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
+            .expect("the elapsed delay opens the gate");
+        assert_eq!(
+            released.iter().map(|l| l.relay_id).collect::<Vec<_>>(),
+            vec![1, 2],
+        );
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+            "the gate opens once; later turns fan nothing out again",
+        );
+        assert_eq!(
+            maker.released_region_labels(),
+            Some(released),
+            "a slot connecting afterwards still reads the map",
+        );
+    }
+
+    #[test]
+    fn a_forged_game_frame_cannot_open_the_region_label_gate() {
+        // The gate takes no input a client controls. A turn claiming an enormous
+        // `game_frame_count` the instant the session starts is the exact forgery
+        // the wall-clock measure exists to defeat: `observe_turn_frame` accepts the
+        // claim (it is the consensus coordinate's own input, defended by taking the
+        // per-session minimum), and the gate stays shut regardless.
+        let mut maker = maker_with_labels(&[(1, "us-east")]);
+        maker.mark_started();
+        maker.observe_frame(SlotId(0), GameFrameCount(u32::MAX));
+        maker.observe_turn_frame(SlotId(0), 0, GameFrameCount(u32::MAX));
+
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+            "no claimed frame, however large, advances the relay's clock",
+        );
+        assert_eq!(maker.released_region_labels(), None);
+    }
+
+    #[test]
+    fn every_session_start_path_starts_the_region_label_clock() {
+        // The gate measures from the session-started latch, so a path that latched
+        // `started` without recording the instant would leave that relay's labels
+        // sealed for the whole game. All three latch paths must arm the clock.
+        let backdated_release = |mut maker: DecisionMaker| {
+            maker.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
+            maker
+                .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
+                .is_some()
+        };
+
+        // The authority's own coverage latch, via `maybe_start`.
+        let mut authority = maker_with_labels(&[(1, "us-east")]);
+        authority.set_expected_slots([SlotId(0)].into_iter().collect());
+        assert!(authority.note_slot_present(SlotId(0)), "coverage latches");
+        assert!(backdated_release(authority));
+
+        // A peer relay adopting the authority's directive off the mesh.
+        let mut peer = maker_with_labels(&[(1, "us-east")]);
+        peer.adopt_session_start(Some(4));
+        assert!(backdated_release(peer));
+
+        // A relay resuming an already-running session from a rehome descriptor.
+        let mut resumed = maker_with_labels(&[(1, "us-east")]);
+        resumed.mark_started();
+        assert!(backdated_release(resumed));
+    }
+
+    #[test]
+    fn a_re_delivered_session_start_does_not_defer_the_region_label_release() {
+        // A start directive can arrive more than once (an authority handoff
+        // re-firing it, a late slot's re-push). Re-stamping the clock on each would
+        // let a session that keeps re-announcing its start hold the labels back
+        // without bound, so only the first latch arms it.
+        let mut maker = maker_with_labels(&[(1, "us-east")]);
+        maker.mark_started();
+        maker.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
+
+        maker.mark_started();
+        maker.adopt_session_start(Some(4));
+        assert!(
+            maker
+                .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
+                .is_some(),
+            "a re-delivered start leaves the original clock untouched",
+        );
+    }
+
+    #[test]
+    fn a_replacement_relay_waits_out_its_own_release_delay() {
+        // A relay taking over a running session latches started when it adopts the
+        // session, so its clock is fresh and it conceals the labels again for a
+        // full delay. Clients keep the map they already hold, so the cost is only
+        // that a map CHANGED by the re-home reaches them one delay later — the
+        // accepted trade for a gate no inherited, unverifiable start time can move.
+        let mut replacement = maker_with_labels(&[(3, "ap-southeast")]);
+        replacement.mark_started();
+        assert_eq!(
+            replacement.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+            "the replacement does not inherit the original relay's elapsed time",
+        );
+
+        replacement.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
+        assert!(
+            replacement
+                .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
+                .is_some(),
+            "once its own delay elapses it releases normally",
+        );
+    }
+
+    #[test]
+    fn a_label_map_that_changes_after_release_is_re_sent_but_an_identical_one_is_not() {
+        let mut maker = maker_with_labels(&[(1, "us-east")]);
+        maker.mark_started();
+        maker.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
+        assert!(
+            maker
+                .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
+                .is_some()
+        );
+
+        // A re-push of the same descriptor changes nothing, so nothing is re-sent.
+        assert_eq!(
+            maker.set_region_labels(region_labels(&[(1, "us-east")])),
+            None
+        );
+
+        // A re-home names a different relay: the clients holding the superseded
+        // map must be corrected, so the new map comes back to be re-sent.
+        let moved = region_labels(&[(4, "eu-central")]);
+        assert_eq!(maker.set_region_labels(moved.clone()), Some(moved));
+    }
+
+    #[test]
+    fn a_session_with_no_region_labels_releases_nothing() {
+        // An untagged fleet, a dev-injected descriptor, or a coordinator that
+        // predates the map: the gate still opens, but there is nothing to send,
+        // so no frame is ever produced.
+        let mut maker = maker_with_labels(&[]);
+        maker.mark_started();
+        maker.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
+        assert_eq!(
+            maker.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
+            None,
+        );
+        assert_eq!(maker.released_region_labels(), None);
+
+        // A descriptor arriving after the gate opened still reaches the clients:
+        // the gate is open, so recording a non-empty map returns it to be sent.
+        let late = region_labels(&[(6, "us-west")]);
+        assert_eq!(maker.set_region_labels(late.clone()), Some(late));
     }
 
     #[test]

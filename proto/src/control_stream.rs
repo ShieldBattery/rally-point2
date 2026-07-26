@@ -499,6 +499,50 @@ mod tests {
     }
 
     #[test]
+    fn a_region_label_frame_round_trips_through_the_shared_framing() {
+        use crate::messages::{RegionLabel, RegionLabels};
+
+        // The whole-session label map rides the client-edge control frame only
+        // (relay → its local slots): every relay gets the map from its own
+        // descriptor, so there is no mesh counterpart to exchange.
+        let frame = ControlFrame {
+            kind: Some(control_frame::Kind::RegionLabels(RegionLabels {
+                labels: vec![
+                    RegionLabel {
+                        relay_id: 7,
+                        region: "us-east".to_owned(),
+                    },
+                    RegionLabel {
+                        relay_id: 9,
+                        region: "eu-central".to_owned(),
+                    },
+                ],
+            })),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
+        match decoded.kind {
+            Some(control_frame::Kind::RegionLabels(map)) => {
+                assert_eq!(map.labels.len(), 2);
+                assert_eq!(map.labels[0].relay_id, 7);
+                assert_eq!(map.labels[1].region, "eu-central");
+            }
+            other => panic!("expected RegionLabels, got {other:?}"),
+        }
+
+        // An empty map is a valid frame that decodes back to an empty map, not
+        // to an unset oneof — "the relay has no labels" and "this build predates
+        // the kind" stay distinguishable.
+        let empty = ControlFrame {
+            kind: Some(control_frame::Kind::RegionLabels(RegionLabels::default())),
+        };
+        let encoded = encode_frame(&empty).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, empty);
+    }
+
+    #[test]
     fn delivery_cursor_frames_round_trip_through_the_shared_framing() {
         use crate::messages::{DeliveryCursor, DeliveryCursors};
 

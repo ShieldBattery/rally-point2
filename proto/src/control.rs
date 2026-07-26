@@ -280,11 +280,20 @@ pub struct RelayEntry {
     /// The region this relay enrolled tagged with (from [`RelayHello::region`]),
     /// or `None` for an untagged relay. The coordinator reads it when placing a
     /// session's slots — a slot requesting this region homes here — and when a
-    /// re-home prefers the dead relay's region for the replacement pick. It is
-    /// deliberately *not* propagated into the [`RelayPeer`]/[`RelayEndpoint`] a
-    /// descriptor or session response carries: a relay never needs to know its
-    /// peers' regions, and a client never needs its relay's, so the region stays
-    /// coordinator-side placement state.
+    /// re-home prefers the dead relay's region for the replacement pick.
+    ///
+    /// It is deliberately *not* on the [`RelayPeer`]/[`RelayEndpoint`] a
+    /// descriptor or session response carries. Regions reach a session's relays
+    /// only as the whole-session label map in
+    /// [`SessionDescriptor::relay_regions`], and reach a *client* only as the
+    /// [`RegionLabels`](crate::messages::RegionLabels) frame its home relay
+    /// releases once that relay's own clock says a stretch of real gameplay has
+    /// elapsed. That ordering is the point: the labels place every member
+    /// geographically, so a client able to read them before the game was properly
+    /// underway could see its opponents' regions and abandon the match while it
+    /// had barely begun. Nothing a client receives at dial or during lobby setup
+    /// carries a region, and nothing a client sends can bring the release
+    /// forward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionId>,
 }
@@ -810,6 +819,36 @@ pub struct SessionDescriptor {
     /// predates the field. Additive, so an old descriptor still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_estimate_ms: Option<u32>,
+    /// Every relay serving this session paired with the region it enrolled in —
+    /// the whole session's map, not just this relay's own entry, since a relay
+    /// releases the complete map to its clients. Relays the coordinator never
+    /// tagged with a region are omitted entirely, so an absent entry means
+    /// "unlabeled" rather than "labeled with nothing".
+    ///
+    /// This is the only path a region takes out of the coordinator's placement
+    /// state. A relay holds the map until its own clock says a stretch of real
+    /// gameplay has elapsed, then releases it to its local clients as a
+    /// [`RegionLabels`](crate::messages::RegionLabels) frame — see
+    /// [`RelayEntry::region`] for why the labels are withheld until gameplay has
+    /// genuinely elapsed. Re-issued on every descriptor push, so a re-home's
+    /// replacement relay and its new region reach every serving relay through
+    /// the same rebuild that updates the peer set. Defaults empty for a
+    /// descriptor from a coordinator that predates the field, which simply means
+    /// the relay has no labels to release.
+    #[serde(default)]
+    pub relay_regions: Vec<RelayRegionLabel>,
+}
+
+/// One relay's region label within a [`SessionDescriptor::relay_regions`] map.
+/// Mirrors [`SlotExternalRef`]'s shape (an id plus one datum) rather than a bare
+/// tuple, so the wire form stays a self-describing JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRegionLabel {
+    /// The relay the label describes.
+    pub relay_id: RelayId,
+    /// The region that relay enrolled in. Only relays the coordinator tagged
+    /// appear in the map at all, so this is never an empty placeholder.
+    pub region: RegionId,
 }
 
 /// One slot the coordinator has recorded as departed, carried in a rehome-rebuilt
@@ -1898,6 +1937,7 @@ mod tests {
                 resumed: false,
                 departed_slots: vec![],
                 latency_estimate_ms: Some(45),
+                relay_regions: Vec::new(),
             }],
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -1970,6 +2010,7 @@ mod tests {
                 resumed: false,
                 departed_slots: vec![],
                 latency_estimate_ms: Some(45),
+                relay_regions: Vec::new(),
             }],
             removals: vec![DescriptorKey {
                 tenant: TenantId("sb-staging".to_owned()),
@@ -2586,10 +2627,45 @@ mod tests {
                 kind: DepartureKind::Dropped,
             }],
             latency_estimate_ms: Some(30),
+            relay_regions: vec![RelayRegionLabel {
+                relay_id: RelayId(2),
+                region: RegionId("us-east".to_owned()),
+            }],
         };
         let json = serde_json::to_string(&desc).unwrap();
         let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(back, desc);
+    }
+
+    #[test]
+    fn session_descriptor_without_region_labels_decodes_to_an_empty_map() {
+        // A descriptor from a coordinator that predates the region-label map must
+        // still decode, leaving the relay with nothing to release — the labels are
+        // additive, so an older control plane simply produces a session whose
+        // clients never receive any.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6}
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert!(back.relay_regions.is_empty());
+    }
+
+    #[test]
+    fn session_descriptor_ignores_fields_it_does_not_know() {
+        // The mirror of the case above: a relay running behind the coordinator
+        // must still parse a descriptor carrying fields it has never heard of,
+        // rather than refusing the whole session. This is what makes every
+        // descriptor addition safe to roll out to the coordinator first.
+        let json = r#"{
+            "tenant":"sb-staging","session":42,
+            "peers":[],
+            "bounds":{"min":1,"max":6},
+            "some_field_from_a_newer_coordinator":[{"relay_id":2,"region":"us-east"}]
+        }"#;
+        let back: SessionDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(back.session, SessionId(42));
     }
 
     #[test]
@@ -2659,6 +2735,7 @@ mod tests {
             resumed: false,
             departed_slots: vec![],
             latency_estimate_ms: None,
+            relay_regions: Vec::new(),
         };
         let json = serde_json::to_string(&desc).unwrap();
         assert!(!json.contains("external_id"));

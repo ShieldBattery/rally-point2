@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::{LeaveDirective, Payload, SlotConditions};
+use rally_point_proto::messages::{LeaveDirective, Payload, RegionLabel, SlotConditions};
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::ControlInbound;
 use rally_point_transport::quinn::VarInt;
@@ -406,6 +406,14 @@ pub struct SlotEntry {
     /// still reaches a client whose datagram turn flow has stalled behind the
     /// very disconnect being reported. Carries `(slot, connected, epoch)`.
     conn_push: mpsc::Sender<ConnectivityChange>,
+    /// The session's relay → region-label map to push down THIS client's
+    /// reliable control stream. Fed by [`fan_out_region_labels`] when the
+    /// session's release gate opens (or a later descriptor changes the map), and
+    /// by [`deliver_region_labels_to_slot`] for a slot that connects after the
+    /// gate opened; drained by this slot's link task, which writes a
+    /// `RegionLabels` frame. Each message is the complete map, so a client
+    /// replaces rather than merges and a repeat is idempotent.
+    region_push: mpsc::Sender<Vec<RegionLabel>>,
     shutdown: Arc<Notify>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
@@ -427,6 +435,9 @@ pub struct SlotInbox {
     /// Slot-connectivity changes to push down this client's control stream (see
     /// [`SlotEntry::conn_push`]).
     conn_push_rx: mpsc::Receiver<ConnectivityChange>,
+    /// Region-label maps to push down this client's control stream (see
+    /// [`SlotEntry::region_push`]).
+    region_push_rx: mpsc::Receiver<Vec<RegionLabel>>,
     shutdown: Arc<Notify>,
     /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
     provisional_reap: Arc<Notify>,
@@ -483,6 +494,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn try_recv_start(&mut self) -> Option<Option<u32>> {
         self.start_push_rx.try_recv().ok()
+    }
+
+    /// Non-blockingly pulls the next region-label map pushed to this slot, for a
+    /// cross-module test asserting whether (or that nothing) the release gate
+    /// sent. `None` when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_region_labels(&mut self) -> Option<Vec<RegionLabel>> {
+        self.region_push_rx.try_recv().ok()
     }
 }
 
@@ -562,6 +581,10 @@ pub fn register(
     // Connectivity changes are rare (a slot flips a small number of times over a
     // game); the same small channel suits them.
     let (conn_tx, conn_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    // Region labels arrive at most a handful of times (the gate opening, a direct
+    // push on connecting after it opened, a re-fan when a re-home changes the
+    // map); the same small channel suits them.
+    let (region_tx, region_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     let provisional_reap = Arc::new(Notify::new());
     {
@@ -580,6 +603,7 @@ pub fn register(
                 leave_push: leave_tx,
                 start_push: start_tx,
                 conn_push: conn_tx,
+                region_push: region_tx,
                 shutdown: Arc::clone(&shutdown),
                 provisional_reap: Arc::clone(&provisional_reap),
             },
@@ -599,6 +623,7 @@ pub fn register(
         leave_push_rx: leave_rx,
         start_push_rx: start_rx,
         conn_push_rx: conn_rx,
+        region_push_rx: region_rx,
         shutdown,
         provisional_reap,
     };
@@ -795,6 +820,64 @@ pub(crate) fn fan_out_session_start(
             Err(mpsc::error::TrySendError::Closed(_)) => {}
             Ok(()) => {}
         }
+    }
+}
+
+/// Pushes the session's relay → region-label map down every currently-registered
+/// local slot's control stream in the `key` group, with no exclusion — the map
+/// describes the whole session, so every member gets the same one. Called only
+/// once the session's release gate has opened (the gate's own fan-out, and again
+/// when a later descriptor changes the map); before that there is nothing to
+/// call it with. Senders are cloned under the lock and the lock dropped before
+/// delivery, as in [`fan_out`]. A full queue is logged rather than dropped
+/// silently, though a lost map costs only a missing display label — a later map
+/// (or the slot's own reconnect push) carries the whole thing again.
+pub(crate) fn fan_out_region_labels(sessions: &Sessions, key: &SessionKey, labels: &[RegionLabel]) {
+    let targets: Vec<(SlotId, mpsc::Sender<Vec<RegionLabel>>)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => slots
+                .iter()
+                .map(|(slot, entry)| (*slot, entry.region_push.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for (slot, tx) in targets {
+        match tx.try_send(labels.to_vec()) {
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                "region-label queue full; the label map may be delayed for this slot",
+            ),
+            // The slot's task already ended; it needs no labels.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Pushes the session's relay → region-label map down a single slot's control
+/// stream — the push a slot gets when it connects after the session's release
+/// gate already opened, so a late or reconnecting client is not left without the
+/// labels every other member already has. A slot absent from the roster (already
+/// gone) is skipped.
+pub(crate) fn deliver_region_labels_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    labels: Vec<RegionLabel>,
+) {
+    let sender = {
+        let roster = sessions.lock();
+        roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .map(|entry| entry.region_push.clone())
+    };
+    if let Some(tx) = sender {
+        let _ = tx.try_send(labels);
     }
 }
 
@@ -1019,6 +1102,7 @@ pub async fn run_slot_link(
         mut leave_push_rx,
         mut start_push_rx,
         mut conn_push_rx,
+        mut region_push_rx,
         shutdown,
         provisional_reap,
     } = inbox;
@@ -1168,6 +1252,20 @@ pub async fn run_slot_link(
     // Mirrors `leave_push_alive` for the connectivity push channel, disarmed
     // defensively the same way.
     let mut conn_push_alive = true;
+    // Mirrors `leave_push_alive` for the region-label push channel, disarmed
+    // defensively the same way.
+    let mut region_push_alive = true;
+    // A session whose release gate opened before this slot's link came up has
+    // labels every other member already holds, and no later gate opening will
+    // fire for it — so push the map straight down this slot. The gate's own
+    // fan-out may also have reached this slot (the roster seats it before this
+    // task runs), which costs a duplicate frame at worst: each carries the
+    // complete map, so a client applies it idempotently. A session whose gate is
+    // still shut pushes nothing, and this slot picks the labels up from the
+    // fan-out when the gate opens.
+    if let Some(labels) = consensus::released_region_labels(&decision_makers, &key) {
+        deliver_region_labels_to_slot(&sessions, &key, slot, labels);
+    }
     // Register this member for lobby fan-out now that its control stream is up:
     // it starts receiving other members' lobby commands, and — crucially — the
     // per-session replay log is snapshotted into `lobby_rx` under the lobby lock
@@ -1583,6 +1681,37 @@ pub async fn run_slot_link(
                     None => conn_push_alive = false,
                 }
             }
+            // The session's relay → region-label map, to push down this client's
+            // reliable control stream. Only ever queued once the session's release
+            // gate has opened, so nothing this branch writes can reach a client
+            // before enough gameplay elapsed that departing scores as a result.
+            // Each message is the complete map, so a repeat (the gate's fan-out
+            // racing this slot's own connect push, a re-fan after a re-home) costs
+            // only a frame. A write failure ends the link like every other
+            // control-stream write here.
+            pushed = region_push_rx.recv(), if region_push_alive => {
+                match pushed {
+                    Some(labels) => {
+                        if let Err(error) =
+                            rally_point_transport::control::send_control_region_labels(
+                                &mut control_send,
+                                labels,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "region-label control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => region_push_alive = false,
+                }
+            }
             // A lobby command another member authored (or the replay of an earlier
             // one), to push down this client's reliable control stream. Like a
             // leave, it rides the reliable stream because a lobby has no datagram
@@ -1790,6 +1919,18 @@ pub async fn run_slot_link(
                             session = key.session.0,
                             slot = slot.0,
                             "ignoring unexpected client-sent connectivity control frame",
+                        );
+                    }
+                    // Region labels are relay → client only, and the relay's own
+                    // copy comes from its coordinator descriptor — a client-sent
+                    // map is never a source of truth for anything. Ignore a stray
+                    // one, mirroring the cases above.
+                    Some(ControlInbound::RegionLabels(_)) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent region-label control frame",
                         );
                     }
                     // The client announcing its own clean departure. The

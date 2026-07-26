@@ -25,7 +25,8 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    PlayerSkin, RequestDrop, SessionStart, SlotConnectivity, control_frame,
+    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity,
+    control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -107,6 +108,15 @@ pub enum ControlInbound {
     /// (the relay is the only recipient), so the client edge ignores a stray one
     /// just as it does a `LeaveIntent`.
     RequestDrop(u32),
+    /// The session's relay → region-label map (relay → client only), released
+    /// once a stretch of real gameplay has elapsed on the sending relay's own
+    /// clock. A relay never receives one from a client, so the relay edge
+    /// ignores a stray one just as it does a `Leave`. The whole message is
+    /// surfaced because it is declarative — the complete map, replacing whatever
+    /// the consumer held — and may arrive more than once (the gate's fan-out, a
+    /// direct push on connecting after the gate opened, a re-fan when a later
+    /// descriptor changes the map), so the consumer applies it idempotently.
+    RegionLabels(RegionLabels),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -227,6 +237,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                     // never trusted (the relay stamps the authenticated slot).
                     kind: Some(control_frame::Kind::RequestDrop(RequestDrop { slot, .. })),
                 } => ControlInbound::RequestDrop(slot),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::RegionLabels(labels)),
+                } => ControlInbound::RegionLabels(labels),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -440,6 +453,25 @@ pub async fn send_control_request_drop(
             slot,
             requester: 0,
         })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Pushes the session's relay → region-label map down the control stream (relay
+/// → client). Sent only once the relay's release gate has opened, and then
+/// possibly several times per client (the gate's fan-out, a direct push to a slot
+/// that connected afterwards, a re-fan when a later descriptor changes the map);
+/// every frame carries the complete map, so a repeat is idempotent for the
+/// client. An error means the stream is gone, which the caller treats as that
+/// client having left, exactly like a leave or session-start push.
+pub async fn send_control_region_labels(
+    control_send: &mut quinn::SendStream,
+    labels: Vec<RegionLabel>,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::RegionLabels(RegionLabels { labels })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;
