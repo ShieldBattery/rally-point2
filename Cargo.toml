@@ -265,3 +265,6 @@ unsafe_code = "deny"
 # Keep line tables in release builds for usable prod stack traces / flight
 # recorder symbolication (matches `shieldbattery/game` + `server-rs`).
 debug = 1
+# Release builds can afford slower compilation in exchange for giving LLVM the
+# whole crate at once, improving its opportunities to optimize and deduplicate.
+codegen-units = 1

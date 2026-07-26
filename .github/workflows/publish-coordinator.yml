@@ -35,7 +35,9 @@ jobs:
         with:
           context: .
           file: coordinator/Dockerfile
-          push: true
+          # Recompress the base image too, so every layer benefits from zstd
+          # rather than only the layer created by this Dockerfile.
+          outputs: type=registry,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true
           tags: |
             ghcr.io/shieldbattery/rp2-coordinator:${{ github.sha }}
             ghcr.io/shieldbattery/rp2-coordinator:latest
@@ -44,3 +46,44 @@ jobs:
             org.opencontainers.image.source=https://github.com/ShieldBattery/rally-point2
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Verify zstd image layers
+        shell: bash
+        env:
+          IMAGE: ghcr.io/shieldbattery/rp2-coordinator:${{ github.sha }}
+        run: |
+          document="$(docker buildx imagetools inspect --raw "$IMAGE")"
+          media_type="$(jq -r '.mediaType // empty' <<< "$document")"
+
+          case "$media_type" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
+              digest="$(
+                jq -er '
+                  [.manifests[] | select(
+                    .platform.os == "linux" and
+                    .platform.architecture == "amd64"
+                  )] |
+                  if length == 1 then .[0].digest
+                  else error("expected exactly one runnable linux/amd64 manifest")
+                  end
+                ' <<< "$document"
+              )"
+              document="$(docker buildx imagetools inspect --raw "$IMAGE@$digest")"
+              ;;
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
+              ;;
+            *)
+              echo "Unexpected image media type: $media_type" >&2
+              exit 1
+              ;;
+          esac
+
+          jq -e '
+            (.layers | length > 0) and
+            all(.layers[];
+              .mediaType == "application/vnd.oci.image.layer.v1.tar+zstd"
+            )
+          ' <<< "$document" > /dev/null || {
+            echo "Expected every coordinator image layer to use OCI zstd compression; found:" >&2
+            jq -r '.layers[]?.mediaType' <<< "$document" >&2
+            exit 1
+          }
