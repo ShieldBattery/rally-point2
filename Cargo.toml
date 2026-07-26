@@ -7,7 +7,7 @@ members = ["proto", "transport", "client", "relay", "coordinator", "dev-beacon",
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["ShieldBattery"]
 repository = "https://github.com/ShieldBattery/rally-point2"
@@ -184,13 +184,13 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 ] }
 # Standard (padded) base64 for the webhook's `x-rp2-signature` header, and
 # URL-safe base64 (no padding) for the coordinator's minted enroll tokens.
-base64 = "0.22"
+base64 = "0.23"
 # The coordinator's provisioned-relay ledger: a small local SQLite store of
 # minted relay identities + one-time enroll tokens. `bundled` compiles SQLite
 # from source so no system libsqlite3 is needed. Coordinator-only — the game
 # DLL's `rally-point-client` must keep building for `i686-pc-windows-msvc`
 # without a C/SQLite dependency, so this stays out of that crate's tree.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # WebSocket client for the relay's persistent control connection to the
 # coordinator. `rustls-tls-webpki-roots` enables wss:// over rustls; the crate
 # brings rustls/tokio-rustls with default-features off, so it rides this
@@ -244,7 +244,7 @@ aws-sdk-ec2 = { version = "1.208", default-features = false, features = [
 # reuses the workspace's single crypto backend and the tree grows no aws-lc-rs path.
 # Pinned exactly so adding it leaves the shared `aws-smithy-*` versions the other SDK
 # clients resolved untouched. Coordinator-only.
-aws-sdk-s3 = { version = "=1.119.0", default-features = false, features = [
+aws-sdk-s3 = { version = "=1.140.0", default-features = false, features = [
   "rt-tokio",
   "behavior-version-latest",
 ] }
