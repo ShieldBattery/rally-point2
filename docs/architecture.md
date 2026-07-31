@@ -579,7 +579,26 @@ plus settle), and the client-side slew clamp. The loop is closed-loop and self-c
 phases already include whatever delay each client applies, so the controller needs no knowledge of
 client state (a rehomed or disobedient client just keeps showing up misaligned and only its own
 correction keeps moving), and an aligned population inside the dead-band is never touched — which
-also kills any ratchet from common-mode drift. Scope is deliberately per-relay: only a slot's home
+also kills any ratchet from common-mode drift.
+
+The stability caveat that makes or breaks this controller: a phase is only quasi-static while the
+session actually runs at the nominal turn period. A game client's *production* schedule couples to
+its peers' arrivals — a stalling client produces, and therefore sends, its own turns later — so in
+a stall-bound session, commanded delays feed straight into every peer's production time, the
+effective period stretches past nominal, and residuals measured against the nominal period become
+drifting noise. A controller that keeps correcting in that state chases its own wake (observed
+live before the guards existed: ~42 ms turns inflated to ~70 ms with the sim stalled most of the
+time, corrections re-issuing every dwell, commanded delays ratcheting around the cycle). Synthetic
+load clients never reproduce this — their tickers are rigid, the plant holds still — which is why
+the guards are structural, not tuning: a **health gate** (no evaluation while any active slot's
+inter-arrival interval deviates from the turn interval beyond a small tolerance — churn a
+correction itself causes closes the gate until the session relaxes), a **per-round change cap**
+(bounded steps toward the target, delay-reducing direction preferred when the zero floor allows,
+never a wrap-around slew — large misalignments converge over several gated rounds), and a
+**give-up latch** (repeated correcting rounds that never measure inside the dead-band mean the
+phases are not quasi-static; the controller disables itself for the session rather than stir it).
+
+Scope is deliberately per-relay: only a slot's home
 relay sees its wire arrivals first-hand, controllers on different relays touch disjoint slots with
 disjoint sensors (no distributed chasing), and cross-relay pairs stay unaligned — that would need a
 shared clock across relays, and mesh sessions carry a hop cushion that keeps them off depth one

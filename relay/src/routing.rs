@@ -5032,8 +5032,8 @@ mod tests {
         };
         assert_eq!(corrected, SlotId(0));
         assert!(
-            (13_000..=17_000).contains(&delay_us),
-            "slot 0 delays ~15 ms onto slot 1's phase, got {delay_us}"
+            (6_000..=8_000).contains(&delay_us),
+            "slot 0 takes a capped first step toward slot 1's phase, got {delay_us}"
         );
 
         // Fan-out reaches exactly the corrected slot, carrying the delay.
