@@ -126,19 +126,24 @@ impl LeaveAnnouncer {
     }
 
     /// Writes the `LeaveIntent` frame if the game has signaled its departure
-    /// *and* both the outbound queue and unacked window have drained (and any
-    /// expected result has been sent) — every produced turn sent, every sent turn
-    /// acked, so the relay's view of our last frame is final. A no-op before the
-    /// game has signaled or once the frame has already gone out, so the driver
-    /// can call it unconditionally after anything that might have changed drain
-    /// state. Transitions to `Sent` on the write.
+    /// *and* the outbound queue, the send-phase hold, and the unacked window
+    /// have all drained (and any expected result has been sent) — every
+    /// produced turn sent, every sent turn acked, so the relay's view of our
+    /// last frame is final. `held_empty` is the driver's send-phase hold
+    /// queue: a turn waiting out its phase delay has not reached the wire, and
+    /// announcing over it would let the relay stop forwarding this slot before
+    /// its final turns went out. A no-op before the game has signaled or once
+    /// the frame has already gone out, so the driver can call it
+    /// unconditionally after anything that might have changed drain state.
+    /// Transitions to `Sent` on the write.
     pub(crate) async fn maybe_send(
         &mut self,
         control_send: &mut quinn::SendStream,
         outbound: &mpsc::Receiver<Payload>,
+        held_empty: bool,
         link: &Link,
     ) -> Result<(), ControlSendError> {
-        if self.ready_to_send(outbound.is_empty(), link.payloads_in_flight()) {
+        if self.ready_to_send(outbound.is_empty() && held_empty, link.payloads_in_flight()) {
             send_control_leave_intent(control_send).await?;
             self.state = LeaveState::Sent;
         }

@@ -50,6 +50,7 @@ mod driver;
 mod identity;
 mod leave;
 mod leave_announcer;
+mod phase;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
@@ -59,3 +60,4 @@ pub use driver::{
 };
 pub use identity::{Identity, IdentityError};
 pub use leave::LeaveTracker;
+pub use phase::PhaseStatus;

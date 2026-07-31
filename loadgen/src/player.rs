@@ -70,6 +70,9 @@ pub struct PlayerConfig {
     /// The instant session-create completed, the baseline for time-to-session-start.
     pub create_done: Instant,
     pub lifecycle: SessionLifecycle,
+    /// How far after the session's shared start this player anchors its turn
+    /// ticker — a deliberate send-phase offset (see `Cli::phase_spread_ms`).
+    pub phase_offset: Duration,
 }
 
 /// Aborts the shared phase machine if a player task fails or panics before it
@@ -181,6 +184,7 @@ pub async fn run_player(config: PlayerConfig) -> PlayerReport {
         send_times,
         create_done,
         lifecycle,
+        phase_offset,
     } = config;
     let mut participant = LifecycleParticipant::new(lifecycle.clone());
 
@@ -293,7 +297,10 @@ pub async fn run_player(config: PlayerConfig) -> PlayerReport {
             &send_times,
             own_slot,
             turn_interval,
-            common_start,
+            // The deliberate send-phase stagger rides the ticker anchor, so
+            // every turn this player emits sits `phase_offset` later in the
+            // cycle than slot 0's.
+            common_start + phase_offset,
             measured_turns,
             stall_threshold_us,
             &mut last_recv,

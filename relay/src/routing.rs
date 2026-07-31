@@ -58,7 +58,9 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::{LeaveDirective, Payload, RegionLabel, SlotConditions};
+use rally_point_proto::messages::{
+    LeaveDirective, Payload, PhaseDirective, RegionLabel, SlotConditions,
+};
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::ControlInbound;
 use rally_point_transport::quinn::VarInt;
@@ -414,6 +416,15 @@ pub struct SlotEntry {
     /// `RegionLabels` frame. Each message is the complete map, so a client
     /// replaces rather than merges and a repeat is idempotent.
     region_push: mpsc::Sender<Vec<RegionLabel>>,
+    /// THIS client's send-phase directive to push down its reliable control
+    /// stream. Fed by [`fan_out_phase_directives`] when the session's phase
+    /// controller issues corrections, and by the connect-time re-push for a
+    /// slot that registers after one was issued; drained by this slot's link
+    /// task, which writes a `PhaseDirective` frame. Unlike the region-label
+    /// push, each slot's value is its own — corrections are per-slot, so
+    /// there is no session-wide map to share. Each message carries the whole
+    /// commanded delay (absolute, newest wins), so a repeat is idempotent.
+    phase_push: mpsc::Sender<PhaseDirective>,
     shutdown: Arc<Notify>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
@@ -438,6 +449,9 @@ pub struct SlotInbox {
     /// Region-label maps to push down this client's control stream (see
     /// [`SlotEntry::region_push`]).
     region_push_rx: mpsc::Receiver<Vec<RegionLabel>>,
+    /// Send-phase directives to push down this client's control stream (see
+    /// [`SlotEntry::phase_push`]).
+    phase_push_rx: mpsc::Receiver<PhaseDirective>,
     shutdown: Arc<Notify>,
     /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
     provisional_reap: Arc<Notify>,
@@ -502,6 +516,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn try_recv_region_labels(&mut self) -> Option<Vec<RegionLabel>> {
         self.region_push_rx.try_recv().ok()
+    }
+
+    /// Non-blockingly pulls the next send-phase directive pushed to this slot,
+    /// for a cross-module test asserting whether (or that nothing) the phase
+    /// controller sent. `None` when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_phase_directive(&mut self) -> Option<PhaseDirective> {
+        self.phase_push_rx.try_recv().ok()
     }
 }
 
@@ -585,6 +607,10 @@ pub fn register(
     // push on connecting after it opened, a re-fan when a re-home changes the
     // map); the same small channel suits them.
     let (region_tx, region_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    // Send-phase directives are similarly sparse (the controller dwells for
+    // seconds between corrections, plus a connect-time re-push); the same small
+    // channel suits them.
+    let (phase_tx, phase_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     let provisional_reap = Arc::new(Notify::new());
     {
@@ -604,6 +630,7 @@ pub fn register(
                 start_push: start_tx,
                 conn_push: conn_tx,
                 region_push: region_tx,
+                phase_push: phase_tx,
                 shutdown: Arc::clone(&shutdown),
                 provisional_reap: Arc::clone(&provisional_reap),
             },
@@ -624,6 +651,7 @@ pub fn register(
         start_push_rx: start_rx,
         conn_push_rx: conn_rx,
         region_push_rx: region_rx,
+        phase_push_rx: phase_rx,
         shutdown,
         provisional_reap,
     };
@@ -881,6 +909,75 @@ pub(crate) fn deliver_region_labels_to_slot(
     }
 }
 
+/// Pushes each corrected slot's new send-phase delay down that slot's own
+/// control stream. Per-slot targeted, unlike [`fan_out_region_labels`] — a
+/// phase correction names one client's delay, so only that client receives it.
+/// Senders are cloned under the lock and the lock dropped before delivery, as
+/// in [`fan_out`]. Best-effort: a full queue is logged rather than treated as
+/// fatal (an unaligned phase costs micro-stall exposure, never correctness),
+/// a slot that already left needs no correction, and the connect-time re-push
+/// restates the current delay to a slot that reconnects.
+pub(crate) fn fan_out_phase_directives(
+    sessions: &Sessions,
+    key: &SessionKey,
+    corrections: &[(SlotId, u32)],
+) {
+    let targets: Vec<(SlotId, u32, mpsc::Sender<PhaseDirective>)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => corrections
+                .iter()
+                .filter_map(|&(slot, delay_us)| {
+                    slots
+                        .get(&slot)
+                        .map(|entry| (slot, delay_us, entry.phase_push.clone()))
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for (slot, delay_us, tx) in targets {
+        let directive = PhaseDirective {
+            delay_us,
+            slew_us_per_s: crate::phase::SLEW_US_PER_S,
+        };
+        match tx.try_send(directive) {
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                "send-phase directive queue full; the correction may be delayed for this slot",
+            ),
+            // The slot's task already ended; it needs no correction.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Pushes the current commanded send-phase delay down a single slot's control
+/// stream — the re-push a slot gets when it connects after the session's phase
+/// controller already issued it a correction, so a reconnecting client resumes
+/// the delay its peers' alignment was computed against. A slot absent from the
+/// roster (already gone) is skipped.
+pub(crate) fn deliver_phase_directive_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    directive: PhaseDirective,
+) {
+    let sender = {
+        let roster = sessions.lock();
+        roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .map(|entry| entry.phase_push.clone())
+    };
+    if let Some(tx) = sender {
+        let _ = tx.try_send(directive);
+    }
+}
+
 /// Pushes a slot-connectivity change down every currently-registered local
 /// slot's control stream in the `key` group, with no exclusion — a connectivity
 /// change is informational for everyone, and a client receiving its own slot's
@@ -1103,6 +1200,7 @@ pub async fn run_slot_link(
         mut start_push_rx,
         mut conn_push_rx,
         mut region_push_rx,
+        mut phase_push_rx,
         shutdown,
         provisional_reap,
     } = inbox;
@@ -1255,6 +1353,9 @@ pub async fn run_slot_link(
     // Mirrors `leave_push_alive` for the region-label push channel, disarmed
     // defensively the same way.
     let mut region_push_alive = true;
+    // Mirrors `leave_push_alive` for the send-phase push channel, disarmed
+    // defensively the same way.
+    let mut phase_push_alive = true;
     // A session whose release gate opened before this slot's link came up has
     // labels every other member already holds, and no later gate opening will
     // fire for it — so push the map straight down this slot. The gate's own
@@ -1265,6 +1366,21 @@ pub async fn run_slot_link(
     // fan-out when the gate opens.
     if let Some(labels) = consensus::released_region_labels(&decision_makers, &key) {
         deliver_region_labels_to_slot(&sessions, &key, slot, labels);
+    }
+    // A slot connecting after the phase controller already issued it a delay
+    // picks that delay back up, so a reconnecting client resumes the send
+    // phase its peers' alignment was computed against instead of snapping back
+    // to its natural one. A slot never corrected gets nothing.
+    if let Some(delay_us) = consensus::commanded_phase_delay(&decision_makers, &key, slot) {
+        deliver_phase_directive_to_slot(
+            &sessions,
+            &key,
+            slot,
+            PhaseDirective {
+                delay_us,
+                slew_us_per_s: crate::phase::SLEW_US_PER_S,
+            },
+        );
     }
     // Register this member for lobby fan-out now that its control stream is up:
     // it starts receiving other members' lobby commands, and — crucially — the
@@ -1531,6 +1647,15 @@ pub async fn run_slot_link(
                         );
                     }
                 }
+                // A packet that first-delivers exactly one turn times the
+                // sender's phase; a catch-up burst (several previously-unseen
+                // turns at once) times the recovery instead, so it is skipped.
+                // Captured before the loop below moves the payloads, fed after
+                // it so only a validated turn's arrival is ever measured.
+                let solo_fresh_seq = match received.fresh.as_slice() {
+                    [only] => Some(only.seq),
+                    _ => None,
+                };
                 for payload in received.fresh {
                     match validate_turn(slot, payload) {
                         Ok(turn) => {
@@ -1570,6 +1695,19 @@ pub async fn run_slot_link(
                                 .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"invalid turn");
                             break 'serve;
                         }
+                    }
+                }
+                // Feed the send-phase controller from this relay's own client
+                // edge — the only vantage that sees this slot's wire arrivals
+                // first-hand (a mesh-forwarded copy would time another relay's
+                // hop). The controller evaluates on its own sparse schedule,
+                // so this almost always returns nothing; when it does issue
+                // corrections, each named slot gets its own directive.
+                if let Some(seq) = solo_fresh_seq {
+                    let corrections =
+                        consensus::ingest_arrival_phase(&decision_makers, &key, slot, seq);
+                    if !corrections.is_empty() {
+                        fan_out_phase_directives(&sessions, &key, &corrections);
                     }
                 }
                 // Push the advanced delivered-through cursor to the client so it can
@@ -1710,6 +1848,35 @@ pub async fn run_slot_link(
                         }
                     }
                     None => region_push_alive = false,
+                }
+            }
+            // THIS client's send-phase directive, to push down its reliable
+            // control stream. Sparse (the controller dwells for seconds
+            // between corrections) and absolute — each frame carries the whole
+            // commanded delay, so a repeat (a correction racing this slot's
+            // own connect re-push) is idempotent. A write failure ends the
+            // link like every other control-stream write here.
+            pushed = phase_push_rx.recv(), if phase_push_alive => {
+                match pushed {
+                    Some(directive) => {
+                        if let Err(error) =
+                            rally_point_transport::control::send_control_phase_directive(
+                                &mut control_send,
+                                directive,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "send-phase control-stream push failed; closing slot link",
+                            );
+                            break 'serve;
+                        }
+                    }
+                    None => phase_push_alive = false,
                 }
             }
             // A lobby command another member authored (or the replay of an earlier
@@ -1931,6 +2098,18 @@ pub async fn run_slot_link(
                             session = key.session.0,
                             slot = slot.0,
                             "ignoring unexpected client-sent region-label control frame",
+                        );
+                    }
+                    // Send-phase directives are relay → client only — the relay
+                    // computes them from its own arrival measurements, and a
+                    // client-sent one is never an input to anything. Ignore a
+                    // stray one, mirroring the region-label case above.
+                    Some(ControlInbound::PhaseDirective(_)) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent send-phase control frame",
                         );
                     }
                     // The client announcing its own clean departure. The
@@ -4787,6 +4966,111 @@ mod tests {
         assert!(
             again.is_empty(),
             "a duplicate abandoned-decide finds nothing left to decide",
+        );
+    }
+
+    /// Drives the send-phase control loop end to end across the module seams a
+    /// real session crosses: client-edge arrivals fold into the session's
+    /// controller, the correction it issues is fanned to exactly the slot it
+    /// names, the connect-time re-push reads the same value back, and nothing
+    /// at all happens before the session starts.
+    #[test]
+    fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
+        use rally_point_proto::control::BufferBounds;
+        use std::time::{Duration, Instant};
+
+        let sessions: Sessions = Arc::default();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let k = key();
+        let _ = consensus::sync_maker(
+            &makers,
+            &k,
+            BufferBounds::new(1, 6).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0)).unwrap();
+        let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1)).unwrap();
+
+        let turn_us: u64 = 41_667;
+        let base = Instant::now();
+        let feed = |makers: &consensus::DecisionMakers, slot: u8, seq: u64, offset_us: u64| {
+            let at = base + Duration::from_micros(seq * turn_us + offset_us);
+            makers
+                .lock()
+                .get_mut(&k)
+                .unwrap()
+                .ingest_arrival_phase(SlotId(slot), seq, at)
+        };
+
+        // Before the session starts nothing is recorded, however long the flow.
+        for seq in 0..400u64 {
+            assert!(feed(&makers, 0, seq, 0).is_empty());
+            assert!(feed(&makers, 1, seq, 15_000).is_empty());
+        }
+        consensus::mark_session_started(&makers, &k);
+
+        // Steady post-start flow: slot 0 at the cycle's base phase, slot 1
+        // fifteen milliseconds later. The controller evaluates on its own
+        // schedule and eventually asks slot 0 (the early one) to delay onto
+        // slot 1's phase; slot 1, already the latest, is left alone.
+        let mut corrections = Vec::new();
+        for seq in 400..900u64 {
+            corrections = feed(&makers, 0, seq, 0);
+            assert!(corrections.is_empty() || corrections[0].0 == SlotId(0));
+            if !corrections.is_empty() {
+                break;
+            }
+            corrections = feed(&makers, 1, seq, 15_000);
+            assert!(corrections.is_empty(), "the latest slot is never corrected");
+        }
+        let &[(corrected, delay_us)] = corrections.as_slice() else {
+            panic!("expected exactly one correction, got {corrections:?}");
+        };
+        assert_eq!(corrected, SlotId(0));
+        assert!(
+            (13_000..=17_000).contains(&delay_us),
+            "slot 0 delays ~15 ms onto slot 1's phase, got {delay_us}"
+        );
+
+        // Fan-out reaches exactly the corrected slot, carrying the delay.
+        fan_out_phase_directives(&sessions, &k, &corrections);
+        let directive = inbox0
+            .try_recv_phase_directive()
+            .expect("the corrected slot receives its directive");
+        assert_eq!(directive.delay_us, delay_us);
+        assert!(directive.slew_us_per_s > 0);
+        assert_eq!(
+            inbox1.try_recv_phase_directive(),
+            None,
+            "an uncorrected slot receives nothing",
+        );
+
+        // The commanded value survives on the maker for the connect-time
+        // re-push a reconnecting slot gets.
+        assert_eq!(
+            consensus::commanded_phase_delay(&makers, &k, SlotId(0)),
+            Some(delay_us),
+        );
+        assert_eq!(
+            consensus::commanded_phase_delay(&makers, &k, SlotId(1)),
+            None
+        );
+        deliver_phase_directive_to_slot(
+            &sessions,
+            &k,
+            SlotId(0),
+            PhaseDirective {
+                delay_us,
+                slew_us_per_s: crate::phase::SLEW_US_PER_S,
+            },
+        );
+        assert_eq!(
+            inbox0.try_recv_phase_directive().map(|d| d.delay_us),
+            Some(delay_us),
         );
     }
 }

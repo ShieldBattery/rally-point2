@@ -352,6 +352,19 @@ message ControlFrame {
     // straight to a slot that connects afterwards, and re-fanned if a later
     // descriptor changes the map. See `RegionLabels`.
     RegionLabels region_labels = 11;
+
+    // A relay-authored instruction to shift this client's send phase (relay →
+    // client only): hold each outbound turn's *wire* handoff by a fixed delay so
+    // the client's turns arrive at the relay in phase with the other slots'.
+    // Aligning arrival phases is what makes a one-turn latency buffer actually
+    // stall-free — with zero slack, a peer whose sends sit a few milliseconds
+    // later in the turn cycle than a client's own poll boundary costs that
+    // client a micro-stall nearly every turn, even though every slot's send
+    // *rate* is identical. Absolute and idempotent: each frame carries the
+    // client's entire commanded delay (not an increment), the newest frame
+    // wins, and the relay re-pushes the current value to a slot that connects
+    // after one was issued. See `PhaseDirective`.
+    PhaseDirective phase_directive = 12;
   }
 }
 
@@ -763,6 +776,54 @@ message RegionLabel {
   // label (e.g. `us-east`). The relay never interprets it; it carries the
   // string its descriptor named verbatim.
   string region = 2;
+}
+
+// A relay-authored instruction to shift one client's send phase: delay every
+// outbound turn's wire handoff by `delay_us` before it leaves for the relay.
+//
+// Why this exists: lockstep clients all send at the same *rate* (one turn per
+// turn interval) but at uncorrelated *phases* within the interval. At a
+// one-turn latency buffer there is zero slack, so a client stalls on whichever
+// peer's turns arrive just after its own poll boundary — a rotating ring of
+// micro-stalls that per-slot arrival *pacing* can never reveal, because every
+// slot's pacing is individually clean. The client's home relay measures each
+// local slot's arrival phase within the turn cycle and issues these directives
+// to pull the phases together; once arrival phases align at the relay, a
+// buffer of one turn is stall-free whenever each client's own relay round trip
+// fits inside one turn interval — a per-client condition the relay's buffer
+// law already measures. Measurement is exclusively relay-side arrival timing:
+// no client-asserted input feeds another client's correction.
+//
+// The delay applies to the network handoff only. A client keeps consuming its
+// own commands locally on its own schedule — this shifts when turns *leave*
+// for the wire, never when the game runs — and the commanded delay is bounded
+// under one turn interval, so a turn is always sent before the next one is
+// produced. The client moves toward a newly commanded delay gradually (a
+// bounded slew, never a step) so its arrival pacing at the relay stays smooth
+// while the shift is underway.
+//
+// Absolute and idempotent, like `RegionLabels`: each frame carries the whole
+// commanded delay, a newer frame replaces an older one, a repeat is harmless,
+// and the relay re-pushes the current value to a slot that connects after one
+// was issued. Best-effort: a lost frame costs an unaligned phase (some
+// micro-stall exposure), never correctness. Additive on the `ControlFrame`
+// oneof — a client that predates it skips the frame, keeps its natural send
+// phase, and simply doesn't benefit.
+message PhaseDirective {
+  // The total delay to hold each outbound turn's wire handoff by, in
+  // microseconds from the moment the game hands the turn over. Always under
+  // one turn interval — the issuing relay works modulo the turn cycle, so a
+  // larger shift is expressed as its in-cycle equivalent. A client clamps
+  // defensively rather than trusting the bound.
+  uint32 delay_us = 1;
+
+  // How fast the client may move from its currently applied delay toward
+  // `delay_us`, in microseconds of delay change per second of wall clock. The
+  // cap keeps the client's inter-send gaps within a fraction of a percent of
+  // the turn interval during the shift, so the relay's own pacing statistics
+  // (and its buffer law) never see the slew as jitter. Zero means "use the
+  // client's own default".
+  uint32 slew_us_per_s = 2;
 }
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a

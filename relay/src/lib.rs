@@ -94,6 +94,7 @@ pub mod mesh;
 pub mod mesh_control;
 pub mod mesh_dialer;
 pub mod mesh_edge;
+pub mod phase;
 pub mod presence;
 pub mod provisional;
 pub mod region_ping;

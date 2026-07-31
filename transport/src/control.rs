@@ -25,8 +25,8 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity,
-    control_frame,
+    PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart,
+    SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -117,6 +117,16 @@ pub enum ControlInbound {
     /// direct push on connecting after the gate opened, a re-fan when a later
     /// descriptor changes the map), so the consumer applies it idempotently.
     RegionLabels(RegionLabels),
+    /// A relay-authored send-phase directive (relay → client only): the total
+    /// delay this client should hold each outbound turn's wire handoff by, so
+    /// its arrival phase at the relay aligns with the other slots'. A relay
+    /// never receives one from a client, so the relay edge ignores a stray one
+    /// just as it does a `Leave`. The whole message is surfaced because it is
+    /// absolute — the entire commanded delay plus the slew-rate cap, replacing
+    /// whatever the consumer held — and may arrive more than once (a
+    /// correction racing the connect-time re-push), so the consumer applies it
+    /// idempotently, newest wins.
+    PhaseDirective(PhaseDirective),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -240,6 +250,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::RegionLabels(labels)),
                 } => ControlInbound::RegionLabels(labels),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::PhaseDirective(directive)),
+                } => ControlInbound::PhaseDirective(directive),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -472,6 +485,24 @@ pub async fn send_control_region_labels(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::RegionLabels(RegionLabels { labels })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Writes a send-phase directive down a client's control stream (relay →
+/// client). Absolute and idempotent — the frame carries the client's whole
+/// commanded delay, so a repeat (a correction racing the connect-time re-push)
+/// costs a frame and nothing else. An error means the stream is gone, which
+/// the caller treats as that client having left, exactly like a leave or
+/// session-start push.
+pub async fn send_control_phase_directive(
+    control_send: &mut quinn::SendStream,
+    directive: PhaseDirective,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::PhaseDirective(directive)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

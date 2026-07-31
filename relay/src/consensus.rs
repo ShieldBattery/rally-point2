@@ -1053,6 +1053,14 @@ pub struct DecisionMaker {
 
     /// The current buffer size, clamped to bounds. Starts at `bounds.min`.
     buffer: BufferSize,
+    /// The send-phase controller for this relay's own home slots: client-edge
+    /// arrival phases in, per-slot delay corrections out (see [`crate::phase`]).
+    /// A sibling of the buffer law, not an input to it — the law keeps sizing
+    /// the buffer from pacing and loss exactly as before, while this aligns the
+    /// phases that pacing is blind to. Fed only from this relay's client edge,
+    /// so on every relay (authority or not) it covers exactly the slots whose
+    /// wire arrivals this relay observes first-hand.
+    phase: crate::phase::PhaseController,
     /// Per-slot condition history and frame observations.
     slots: HashMap<SlotId, SlotState>,
     /// The physical connection lifecycle for each epoch-aware slot. Epochs are
@@ -2374,6 +2382,7 @@ impl DecisionMaker {
             key,
             buffer: BufferSize(bounds.min),
             bounds,
+            phase: crate::phase::PhaseController::new(law.turn_duration_us),
             law,
             authority,
             slots: HashMap::new(),
@@ -4118,6 +4127,9 @@ impl DecisionMaker {
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
         self.delivery.forget_slot(slot);
+        // The phase estimate describes the torn-down connection; the commanded
+        // delay survives inside the controller for the reconnect re-push.
+        self.phase.remove_slot(slot);
     }
 
     /// Removes live per-slot state only when teardown belongs to the active
@@ -4233,6 +4245,48 @@ impl DecisionMaker {
     pub fn released_region_labels(&self) -> Option<Vec<RegionLabel>> {
         (self.region_labels_released && !self.region_labels.is_empty())
             .then(|| self.region_labels.clone())
+    }
+
+    /// Folds one client-edge arrival into the send-phase controller and runs a
+    /// control iteration if one is due, returning the slots whose commanded
+    /// delay changed (usually none — the controller self-gates on its own
+    /// schedule). Arrivals before the session starts are ignored: pre-start
+    /// traffic flows at setup cadence, not the turn cadence a phase lives in.
+    ///
+    /// The caller must feed only this relay's own client-edge receipts, and
+    /// only packets that first-delivered exactly one turn — a mesh-forwarded
+    /// copy times another relay's hop, and a catch-up burst times the
+    /// recovery, neither the sender's phase (see
+    /// [`PhaseController::note_arrival`](crate::phase::PhaseController::note_arrival)).
+    #[must_use]
+    pub fn ingest_arrival_phase(
+        &mut self,
+        slot: SlotId,
+        seq: u64,
+        now: Instant,
+    ) -> Vec<(SlotId, u32)> {
+        if !self.started {
+            return Vec::new();
+        }
+        self.phase.note_arrival(slot, seq, now);
+        let corrections = self.phase.evaluate(now);
+        if !corrections.is_empty() {
+            tracing::info!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                corrections = corrections.len(),
+                span_us = self.phase.last_span_us(),
+                issued_total = self.phase.corrections_issued(),
+                "issuing send-phase corrections",
+            );
+        }
+        corrections
+    }
+
+    /// The send-phase delay `slot` was last commanded, if corrections were
+    /// ever issued for it — the value to re-push when it (re)connects.
+    pub fn commanded_phase_delay(&self, slot: SlotId) -> Option<u32> {
+        self.phase.commanded(slot)
     }
 
     /// Records this relay's own id, stamped onto every `BufferDirective` this
@@ -5158,6 +5212,37 @@ pub fn released_region_labels(
     key: &SessionKey,
 ) -> Option<Vec<RegionLabel>> {
     registry.lock().get(key)?.released_region_labels()
+}
+
+/// Folds one client-edge arrival into `key`'s send-phase controller and runs a
+/// control iteration if one is due, returning the slots whose commanded delay
+/// changed — for the caller to fan out as `PhaseDirective`s (see
+/// [`DecisionMaker::ingest_arrival_phase`]). Empty on almost every call: the
+/// controller evaluates on its own sparse schedule, before the session starts
+/// nothing is recorded, and when no maker exists there is nothing to do.
+#[must_use]
+pub fn ingest_arrival_phase(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    seq: u64,
+) -> Vec<(SlotId, u32)> {
+    let now = Instant::now();
+    match registry.lock().get_mut(key) {
+        Some(maker) => maker.ingest_arrival_phase(slot, seq, now),
+        None => Vec::new(),
+    }
+}
+
+/// The send-phase delay `key`'s controller last commanded for `slot`, for the
+/// direct re-push a slot gets on (re)connecting after corrections were issued.
+/// `None` when none was ever issued, or when no maker exists.
+pub fn commanded_phase_delay(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+) -> Option<u32> {
+    registry.lock().get(key)?.commanded_phase_delay(slot)
 }
 
 /// Adopts an authority's mesh `SessionStart` onto a peer relay's maker: latches

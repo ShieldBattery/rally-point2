@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rally_point_proto::control::{
@@ -44,6 +44,9 @@ pub struct SessionConfig {
     /// Whether this session should deliberately diverge (one player perturbs its
     /// sync hashes).
     pub is_desync: bool,
+    /// Milliseconds of send-phase stagger across the session's players (see
+    /// `Cli::phase_spread_ms`).
+    pub phase_spread_ms: f64,
 }
 
 /// Runs one session end to end, returning its metrics contribution.
@@ -205,6 +208,11 @@ async fn run_players(
             send_times: Arc::clone(&send_times),
             create_done,
             lifecycle: lifecycle.clone(),
+            // Slot i of n starts its ticker spread * i / n after the shared
+            // start, spreading send phases evenly across the configured span.
+            phase_offset: Duration::from_secs_f64(
+                (config.phase_spread_ms / 1_000.0) * (f64::from(slot.0) / config.players as f64),
+            ),
         };
         handles.push(tokio::spawn(player::run_player(player_config)));
     }

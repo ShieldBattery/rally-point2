@@ -60,6 +60,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0)]
     pub desync_fraction: f64,
 
+    /// Stagger each session's players across this many milliseconds of send
+    /// phase: slot `i` of `n` anchors its turn ticker `spread * i / n` after
+    /// the shared start. Zero (the default) keeps the harness's synchronized
+    /// start. Set it near one turn interval to model the uncorrelated phases
+    /// of real clients and exercise the relay's send-phase alignment.
+    #[arg(long, default_value_t = 0.0)]
+    pub phase_spread_ms: f64,
+
     /// Write the run's aggregate metrics as JSON to this path.
     #[arg(long)]
     pub json_out: Option<PathBuf>,

@@ -540,6 +540,51 @@ almost no traffic to lose yet) and the last slot to connect is seen only through
 is a *good opening guess*, not the law's steady-state truth — the in-game law's fast-raise still closes any
 remaining gap within the first turns, just from a much better starting point than the tenant minimum.
 
+### Send-phase alignment
+
+The buffer law has a blind spot that is structural, not a bug: lockstep clients all send at the same
+*rate* (one turn per interval) but at uncorrelated *phases* within the interval, and at a one-turn
+buffer there is zero slack — each client micro-stalls a few milliseconds on whichever peer's turns
+land just after its own poll boundary, in a rotating blame ring, while every slot's arrival *pacing*
+looks individually perfect from the relay. The law correctly sees a network that can sustain depth
+one and sits there; the stalls are a phase phenomenon its inputs cannot express. Holding depth two
+would hide them at the cost of a full turn of latency, which is backwards — so phase gets its own
+controller, a sibling of the law, never an input to it.
+
+The fix is relay-side measurement with client-side actuation. Each relay timestamps its **own home
+slots'** turn arrivals at the client edge (packets that first-deliver exactly one turn; catch-up
+bursts time the recovery, mesh copies time another relay's hop, so both are excluded), folds them
+into per-slot **arrival-phase** estimates (an EWMA of the arrival residual against the turn
+interval, kept unwrapped and reduced modulo the interval only at evaluation), and periodically finds
+the tightest cluster of phases on the circle. Everyone is pulled onto the cluster's *latest* phase —
+delay-only, so no client is ever asked to send earlier than its game produced the data, and the
+largest-gap choice minimizes the biggest delay anyone is asked to add. Corrections go down each
+corrected client's reliable control stream as an **absolute** `PhaseDirective` (whole commanded
+delay, newest wins, re-pushed on reconnect), and the client's driver holds each outbound turn's
+*wire handoff* by the applied delay — the game's local echo has already happened, so nothing about
+when the game runs changes — slewing toward a new target at a bounded rate (~2 ms/s, relay-tunable
+per directive, client-clamped) so the relay's pacing statistics never see the shift as jitter.
+
+Why aligning arrival phases *at the relay* is the right objective and not a proxy: the depth-one
+stall-free condition per ordered pair (P feeding C) is `(t_P − t_C) + d_P_up + d_C_down ≤ T`.
+Rewritten against relay-observed arrival phases `a = t + d_up`, it collapses to
+`(a_P − a_C) + d_C_up + d_C_down ≤ T` — so once arrival phases are equal, what remains is each
+client's **own** relay round trip fitting inside one turn, a per-client, phase-free condition that
+is exactly the regime where the law legitimately holds depth one. Heterogeneous path delays drop out
+entirely, which is also why no client-side measurement is needed or wanted: corrections are computed
+from relay-side arrival timestamps alone, no client-asserted value feeds a decision that reaches
+other clients, and a client can drag the shared target only with its actual wire behavior, rate-
+limited by the dead-band (no corrections under a ~3 ms span), the re-evaluation dwell (slew time
+plus settle), and the client-side slew clamp. The loop is closed-loop and self-correcting: measured
+phases already include whatever delay each client applies, so the controller needs no knowledge of
+client state (a rehomed or disobedient client just keeps showing up misaligned and only its own
+correction keeps moving), and an aligned population inside the dead-band is never touched — which
+also kills any ratchet from common-mode drift. Scope is deliberately per-relay: only a slot's home
+relay sees its wire arrivals first-hand, controllers on different relays touch disjoint slots with
+disjoint sensors (no distributed chasing), and cross-relay pairs stay unaligned — that would need a
+shared clock across relays, and mesh sessions carry a hop cushion that keeps them off depth one
+anyway.
+
 ### Relay-side desync detection
 
 SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the command
@@ -974,6 +1019,14 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   alerting until production baselines exist.
 - **No auto-drop of disconnected players.** Holds are decided only by a survivor's `RequestDrop`
   (30s relay floor) or the 45s abandoned-session force-decide.
+- **Buffer-one micro-stalls are fixed by send-phase alignment, not buffer depth.** Holding depth
+  two costs a full turn of latency to hide a few-millisecond phase artifact; the phase controller
+  (see "Send-phase alignment") removes the artifact at depth one. The buffer law's inputs are
+  deliberately unchanged — client stall telemetry stays local diagnostics, never a law input (no
+  client-asserted value may feed a relay decision that affects other clients). Phase scope is
+  per-relay by design: only the home relay sees a slot's wire arrivals first-hand, and cross-relay
+  alignment would need a shared inter-relay clock for a regime (mesh sessions, hop-cushioned off
+  depth one) that barely benefits — don't re-chase it without that clock.
 - **Game clients never talk to the coordinator.** Re-home is app-server-mediated (the client
   authenticates to its app server exactly as for result submission; the app server makes the
   tenant-signed coordinator call).

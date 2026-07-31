@@ -155,6 +155,7 @@ async fn conduct(
             server_name: cli.relay_server_name.clone(),
             ipv4_only: cli.ipv4_only,
             is_desync,
+            phase_spread_ms: cli.phase_spread_ms,
         };
         set.spawn(run_session(config));
     }
@@ -277,6 +278,7 @@ mod tests {
             turn_bytes: 16,
             slot_regions: Vec::new(),
             desync_fraction: 0.0,
+            phase_spread_ms: 0.0,
             json_out: None,
             run_id: None,
             relay_server_name: "localhost".to_owned(),

@@ -83,12 +83,13 @@ use rally_point_transport::control::{
     spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 
 use crate::dial::{ClientEndpoint, DialError};
 use crate::identity::Identity;
 use crate::leave_announcer::LeaveAnnouncer;
+use crate::phase::{PhaseSlew, PhaseStatus};
 
 /// Default depth of each turn channel between the game thread and the driver.
 /// Turns are small and drained every tick, so this is a generous backstop against
@@ -352,6 +353,18 @@ pub struct TurnChannels {
     /// than stalling the turn stream, and a later map carries the whole thing
     /// again.
     pub region_labels: mpsc::Receiver<Vec<(u64, String)>>,
+    /// The driver's current send-phase state: the wire-handoff delay it is
+    /// applying to outbound turns under the relay's `PhaseDirective`s, and the
+    /// target it is slewing toward. Purely informational — the driver applies
+    /// directives on its own and the game cannot influence them from here —
+    /// but a netstat-style overlay can read this to show that (and how far)
+    /// the client's sends are currently being held. A watch channel rather
+    /// than a queue: the newest state is the only interesting one, so the
+    /// game samples `borrow()` whenever it redraws and never needs to drain.
+    /// Both fields sit at zero until a directive first arrives (most sessions:
+    /// phases already aligned within the relay's dead-band are never
+    /// corrected).
+    pub phase_status: watch::Receiver<PhaseStatus>,
 }
 
 /// Carries turns over one authorized home-relay [`Link`] until it closes.
@@ -405,6 +418,9 @@ pub struct LinkDriver {
     /// The session's relay → region labels, to hand to the game thread when the
     /// relay releases a `RegionLabels` down the control stream.
     region_labels: mpsc::Sender<Vec<(u64, String)>>,
+    /// The send-phase state to publish to the game thread as directives arrive
+    /// and the applied delay slews (see [`TurnChannels::phase_status`]).
+    phase_status: watch::Sender<PhaseStatus>,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -520,6 +536,9 @@ impl LinkDriver {
         // re-send on reconnect or a re-home that changes the map); the leave-sized
         // channel is ample.
         let (region_labels_tx, region_labels_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Send-phase state is latest-wins display information; a watch cell
+        // holds exactly the newest value with nothing to drain.
+        let (phase_status_tx, phase_status_rx) = watch::channel(PhaseStatus::default());
         let driver = Self {
             link,
             outbound: outbound_rx,
@@ -538,6 +557,7 @@ impl LinkDriver {
             session_start: session_start_tx,
             connectivity: connectivity_tx,
             region_labels: region_labels_tx,
+            phase_status: phase_status_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -556,6 +576,7 @@ impl LinkDriver {
             session_start: session_start_rx,
             connectivity: connectivity_rx,
             region_labels: region_labels_rx,
+            phase_status: phase_status_rx,
         };
         (driver, channels)
     }
@@ -584,6 +605,7 @@ impl LinkDriver {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         } = self;
         let mut seam = GameSeam {
             outbound,
@@ -601,6 +623,7 @@ impl LinkDriver {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         };
         let mut state = LoopState::new(result_expected);
         // The no-reconnect entry has no token to read a slot from, and it never
@@ -686,6 +709,7 @@ impl LinkDriver {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         } = self;
         let mut seam = GameSeam {
             outbound,
@@ -703,6 +727,7 @@ impl LinkDriver {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         };
         let mut state = LoopState::new(result_expected);
         let mut backoff = Backoff::new();
@@ -825,6 +850,7 @@ impl LinkDriver {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         } = seam;
         // The reorder/dedup cursors, the outbound seq counter, the leave announcer,
         // and any turns buffered during a prior outage all persist across a
@@ -841,6 +867,8 @@ impl LinkDriver {
             pending_control_redivert,
             connectivity_states,
             terminal_connectivity_slots,
+            phase_slew,
+            held,
         } = state;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
@@ -915,34 +943,53 @@ impl LinkDriver {
         // intent it was the last thing holding. `next_outbound_seq`, the reorder
         // cursors, and the announcer all live in the persistent `state`, so a
         // resumed session continues the seq stream rather than rewinding it.
-        for mut buffered in std::mem::take(outbound_buffer) {
-            buffered.seq = *next_outbound_seq;
-            buffered.slot = u32::from(own_slot.0);
-            *next_outbound_seq += 1;
-            // Retain a copy for a possible re-home re-injection before the turn is
-            // handed to the link (which moves it).
-            retain_sent(retention, retention_bytes, &buffered);
-            if link.payload_fits(&buffered)? {
-                match send_packet(link, Some(buffered)) {
-                    Ok(carried_redundancy) => {
-                        if carried_redundancy {
-                            flush_deadline = Instant::now() + FLUSH_INTERVAL;
-                        }
-                    }
-                    Err(error) => return announcer.absorb_link_close(Err(error)),
-                }
-                acks_owed = false;
-                if check_cap(link.payloads_in_flight()) {
-                    return Err(DriverError::UnackedWindowExhausted {
-                        in_flight: link.payloads_in_flight(),
-                        cap: UNACKED_WINDOW_CAP,
-                    });
-                }
-            } else if let Err(error) = send_control_turn(&mut control_send, buffered).await {
-                return announcer.absorb_link_close(Err(DriverError::from(error)));
+        for (_, payload) in std::mem::take(held) {
+            // Turns still waiting out a send-phase delay when the last link
+            // ended go first: their deadlines are long past (any outage dwarfs
+            // a sub-turn phase delay) and they predate everything buffered
+            // during the outage, so sending them immediately keeps production
+            // order and re-holds nothing.
+            match send_game_turn(
+                link,
+                &mut control_send,
+                announcer,
+                next_outbound_seq,
+                retention,
+                retention_bytes,
+                own_slot,
+                &mut flush_deadline,
+                &mut acks_owed,
+                payload,
+            )
+            .await
+            {
+                OutboundSend::Sent => {}
+                OutboundSend::EndSession(result) => return result,
             }
             announcer
-                .maybe_send(&mut control_send, outbound, link)
+                .maybe_send(&mut control_send, outbound, held.is_empty(), link)
+                .await?;
+        }
+        for buffered in std::mem::take(outbound_buffer) {
+            match send_game_turn(
+                link,
+                &mut control_send,
+                announcer,
+                next_outbound_seq,
+                retention,
+                retention_bytes,
+                own_slot,
+                &mut flush_deadline,
+                &mut acks_owed,
+                buffered,
+            )
+            .await
+            {
+                OutboundSend::Sent => {}
+                OutboundSend::EndSession(result) => return result,
+            }
+            announcer
+                .maybe_send(&mut control_send, outbound, held.is_empty(), link)
                 .await?;
         }
         // Mirrors `beacon_alive`: the game signals at most once, so this disarms
@@ -990,6 +1037,13 @@ impl LinkDriver {
             // and the type checker satisfied, otherwise.
             let leave_deadline = announcer
                 .deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            // Armed only while a turn is held for its send-phase delay; the
+            // day-out fallback keeps the branch dormant, and the type checker
+            // satisfied, otherwise — mirroring `leave_deadline`.
+            let held_due = held
+                .front()
+                .map(|&(due, _)| due)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
 
             tokio::select! {
@@ -1044,7 +1098,7 @@ impl LinkDriver {
                     }
                     // An ack folded into the manager above may be the last one
                     // a pending leave intent was waiting on.
-                    announcer.maybe_send(&mut control_send, outbound, link).await?;
+                    announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                 }
                 // An oversize turn from the relay, delivered over the reliable
                 // control stream because no datagram could carry it. Folding it
@@ -1283,6 +1337,29 @@ impl LinkDriver {
                                 GamePush::Closed => return Ok(()),
                             }
                         }
+                        // A relay send-phase directive: the total delay to hold
+                        // each outbound turn's wire handoff by, so this
+                        // client's arrival phase at the relay aligns with the
+                        // other slots'. Applied entirely inside the driver —
+                        // the game is not involved (its local echo already ran
+                        // by the time a turn gets here) and only observes the
+                        // state through the `phase_status` watch. Absolute and
+                        // newest-wins; a repeat (a correction racing the
+                        // connect-time re-push) is idempotent, and the relay's
+                        // next measurement cycle corrects any residue.
+                        Some(ControlInbound::PhaseDirective(directive)) => {
+                            phase_slew.retarget(
+                                directive.delay_us,
+                                directive.slew_us_per_s,
+                                Instant::now(),
+                            );
+                            let _ = phase_status.send_replace(phase_slew.status());
+                            tracing::debug!(
+                                delay_us = directive.delay_us,
+                                slew_us_per_s = directive.slew_us_per_s,
+                                "applying send-phase directive",
+                            );
+                        }
                         Some(ControlInbound::OversizeTurn(payload)) => {
                             // As on the datagram path: a slot id past `u8` range
                             // names no real slot, and a truncating cast would alias
@@ -1342,72 +1419,83 @@ impl LinkDriver {
                 }
                 outgoing = outbound.recv() => {
                     match outgoing {
-                        // A turn the game produced. It goes out carrying our acks; if it
-                        // also re-carried unacked turns, recovery is riding the stream,
-                        // so push the flush out. If it carried none (a near-MTU turn that
-                        // filled the datagram), leave the timer so the flush retransmits.
-                        Some(mut payload) => {
-                            // Assign this turn its origin seq and slot — the client
-                            // is the sole authority for both its own slot's identity
-                            // and its production order. The embedder leaves `slot` at
-                            // 0 on every outbound turn (as it does `seq`); stamping
-                            // our authorized slot here keys the AckManager's unacked
-                            // window under the same `own_slot` the resume anchor and
-                            // ack-beacon retirement use, so an in-flight turn is not
-                            // stranded under a phantom slot-0 key across a reconnect.
-                            payload.seq = *next_outbound_seq;
-                            payload.slot = u32::from(own_slot.0);
-                            *next_outbound_seq += 1;
-                            // Retain a copy for a possible re-home re-injection before
-                            // the turn is handed to the link (which moves it).
-                            retain_sent(retention, retention_bytes, &payload);
-                            if link.payload_fits(&payload)? {
-                                let carried_redundancy = match send_packet(link, Some(payload)) {
-                                    Ok(carried_redundancy) => carried_redundancy,
-                                    // The connection went down while sending this
-                                    // turn. If we already announced our leave, the
-                                    // relay closing the link out from under this
-                                    // send is the expected confirmation, not a
-                                    // failure.
-                                    Err(error) => {
-                                        return announcer.absorb_link_close(Err(error));
-                                    }
-                                };
-                                acks_owed = false;
-                                if carried_redundancy {
-                                    flush_deadline = Instant::now() + FLUSH_INTERVAL;
-                                }
-                                if check_cap(link.payloads_in_flight()) {
-                                    return Err(DriverError::UnackedWindowExhausted {
-                                        in_flight: link.payloads_in_flight(),
-                                        cap: UNACKED_WINDOW_CAP,
-                                    });
-                                }
-                            } else {
-                                // Too large for any datagram: divert to the
-                                // reliable control stream, whose QUIC-level
-                                // reliability replaces redundancy for this turn
-                                // — it never enters the unacked window and no
-                                // ack retires it. A write failure is normally
-                                // fatal (nothing re-carries this turn, and
-                                // dropping it would desync lockstep) — but once
-                                // the leave intent is out, the relay closing the
-                                // stream under this write is the expected
-                                // confirmation, not a failure.
-                                if let Err(error) = send_control_turn(&mut control_send, payload).await
+                        // A turn the game produced. Its local echo already ran
+                        // on the game side; only the wire handoff happens here.
+                        // With no send-phase delay in effect it goes out
+                        // immediately, exactly as if the hold queue did not
+                        // exist. Under a delay it waits in the hold queue for
+                        // its deadline instead — and once anything is held,
+                        // every later turn queues behind it even at delay
+                        // zero, so wire order always matches production order.
+                        Some(payload) => {
+                            let now = Instant::now();
+                            let delay_us = phase_slew.advance(now);
+                            let _ = phase_status.send_replace(phase_slew.status());
+                            if delay_us == 0 && held.is_empty() {
+                                match send_game_turn(
+                                    link,
+                                    &mut control_send,
+                                    announcer,
+                                    next_outbound_seq,
+                                    retention,
+                                    retention_bytes,
+                                    own_slot,
+                                    &mut flush_deadline,
+                                    &mut acks_owed,
+                                    payload,
+                                )
+                                .await
                                 {
-                                    return announcer
-                                        .absorb_link_close(Err(DriverError::from(error)));
+                                    OutboundSend::Sent => {}
+                                    OutboundSend::EndSession(result) => return result,
                                 }
+                                // The turn just sent may have been the last one
+                                // outstanding, in which case a pending leave intent
+                                // is now ready to go out.
+                                announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
+                            } else {
+                                let due = now + Duration::from_micros(delay_us);
+                                // Never due ahead of an already-held turn: a
+                                // delay slewing downward must not reorder the
+                                // wire against production order.
+                                let due = held.back().map_or(due, |&(prev, _)| due.max(prev));
+                                held.push_back((due, payload));
                             }
-                            // The turn just sent may have been the last one
-                            // outstanding, in which case a pending leave intent
-                            // is now ready to go out.
-                            announcer.maybe_send(&mut control_send, outbound, link).await?;
                         }
                         // The game dropped its sender: a clean stop.
                         None => return Ok(()),
                     }
+                }
+                // A held turn's send-phase delay expired: hand it, and any
+                // other turn now due behind it, to the wire. This is the only
+                // branch that drains the hold queue mid-session, so the
+                // announcer check runs after it — the last held turn going out
+                // may release a pending leave intent.
+                () = sleep_until(held_due), if !held.is_empty() => {
+                    let now = Instant::now();
+                    while held.front().is_some_and(|&(due, _)| due <= now) {
+                        let Some((_, payload)) = held.pop_front() else {
+                            break;
+                        };
+                        match send_game_turn(
+                            link,
+                            &mut control_send,
+                            announcer,
+                            next_outbound_seq,
+                            retention,
+                            retention_bytes,
+                            own_slot,
+                            &mut flush_deadline,
+                            &mut acks_owed,
+                            payload,
+                        )
+                        .await
+                        {
+                            OutboundSend::Sent => {}
+                            OutboundSend::EndSession(result) => return result,
+                        }
+                    }
+                    announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                 }
                 // The game signaling its own clean departure (F10 quit, game
                 // over). This branch only arms the announcer — it never sends the
@@ -1426,7 +1514,7 @@ impl LinkDriver {
                     leave_intent_alive = false;
                     if signal.is_some() {
                         announcer.arm(LEAVE_INTENT_TIMEOUT);
-                        announcer.maybe_send(&mut control_send, outbound, link).await?;
+                        announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                     }
                     // A `None` (the game dropped its sender without ever
                     // signaling — an unclean teardown) needs no further action:
@@ -1473,7 +1561,7 @@ impl LinkDriver {
                                 announcer.note_result_sent();
                                 // Sending the result may have been the last thing
                                 // a pending leave intent was holding for.
-                                announcer.maybe_send(&mut control_send, outbound, link).await?;
+                                announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                             }
                         }
                         // The game dropped its result sender without ever handing
@@ -1638,7 +1726,7 @@ impl LinkDriver {
                             // The beacon force-retiring turns may have just
                             // emptied the unacked window a pending leave intent
                             // was waiting on.
-                            announcer.maybe_send(&mut control_send, outbound, link).await?;
+                            announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                         }
                         // The reader task ended (peer's beacon stream closed or
                         // errored). Stop polling it: the real link failure, if any,
@@ -1674,6 +1762,92 @@ impl LinkDriver {
             }
         }
     }
+}
+
+/// The outcome of one turn's wire handoff: sent (keep looping), or the session
+/// must end with the given result — an absorbed post-leave close (`Ok`) or a
+/// real failure, exactly as if the send site had returned it inline.
+enum OutboundSend {
+    Sent,
+    EndSession(Result<(), DriverError>),
+}
+
+/// One game-produced turn's wire handoff, shared by every path that sends one
+/// (the live outbound arm, the send-phase hold drain, and the reconnect
+/// flush): stamp the origin seq and slot, retain a re-home copy, and send — on
+/// the datagram path when it fits, diverted to the reliable control stream
+/// when it cannot. Stamping happens here, at actual send, so however a turn
+/// reached this point the seq stream is assigned in wire order.
+#[allow(clippy::too_many_arguments)]
+async fn send_game_turn(
+    link: &mut Link,
+    control_send: &mut quinn::SendStream,
+    announcer: &LeaveAnnouncer,
+    next_outbound_seq: &mut u64,
+    retention: &mut VecDeque<Payload>,
+    retention_bytes: &mut usize,
+    own_slot: SlotId,
+    flush_deadline: &mut Instant,
+    acks_owed: &mut bool,
+    mut payload: Payload,
+) -> OutboundSend {
+    // Assign this turn its origin seq and slot — the client is the sole
+    // authority for both its own slot's identity and its production order. The
+    // embedder leaves `slot` at 0 on every outbound turn (as it does `seq`);
+    // stamping our authorized slot here keys the AckManager's unacked window
+    // under the same `own_slot` the resume anchor and ack-beacon retirement
+    // use, so an in-flight turn is not stranded under a phantom slot-0 key
+    // across a reconnect.
+    payload.seq = *next_outbound_seq;
+    payload.slot = u32::from(own_slot.0);
+    *next_outbound_seq += 1;
+    // Retain a copy for a possible re-home re-injection before the turn is
+    // handed to the link (which moves it).
+    retain_sent(retention, retention_bytes, &payload);
+    let fits = match link.payload_fits(&payload) {
+        Ok(fits) => fits,
+        Err(error) => return OutboundSend::EndSession(Err(DriverError::from(error))),
+    };
+    if fits {
+        // It goes out carrying our acks; if it also re-carried unacked turns,
+        // recovery is riding the stream, so push the flush out. If it carried
+        // none (a near-MTU turn that filled the datagram), leave the timer so
+        // the flush retransmits.
+        match send_packet(link, Some(payload)) {
+            Ok(carried_redundancy) => {
+                *acks_owed = false;
+                if carried_redundancy {
+                    *flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                }
+                if check_cap(link.payloads_in_flight()) {
+                    return OutboundSend::EndSession(Err(DriverError::UnackedWindowExhausted {
+                        in_flight: link.payloads_in_flight(),
+                        cap: UNACKED_WINDOW_CAP,
+                    }));
+                }
+            }
+            // The connection went down while sending this turn. If we already
+            // announced our leave, the relay closing the link out from under
+            // this send is the expected confirmation, not a failure.
+            Err(error) => {
+                return OutboundSend::EndSession(announcer.absorb_link_close(Err(error)));
+            }
+        }
+    } else {
+        // Too large for any datagram: divert to the reliable control stream,
+        // whose QUIC-level reliability replaces redundancy for this turn — it
+        // never enters the unacked window and no ack retires it. A write
+        // failure is normally fatal (nothing re-carries this turn, and
+        // dropping it would desync lockstep) — but once the leave intent is
+        // out, the relay closing the stream under this write is the expected
+        // confirmation, not a failure.
+        if let Err(error) = send_control_turn(control_send, payload).await {
+            return OutboundSend::EndSession(
+                announcer.absorb_link_close(Err(DriverError::from(error))),
+            );
+        }
+    }
+    OutboundSend::Sent
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -1856,6 +2030,7 @@ struct GameSeam {
     session_start: mpsc::Sender<Option<u32>>,
     connectivity: mpsc::Sender<(SlotId, bool)>,
     region_labels: mpsc::Sender<Vec<(u64, String)>>,
+    phase_status: watch::Sender<PhaseStatus>,
 }
 
 /// The driver state that must persist across a reconnect so a re-dialed session
@@ -1914,6 +2089,20 @@ struct LoopState {
     /// terminal game state, so no later physical-link generation may make its
     /// subject appear connected again. Kept across this client's reconnects.
     terminal_connectivity_slots: HashSet<SlotId>,
+    /// The send-phase delay this client is applying under the relay's
+    /// `PhaseDirective`s: the newest commanded target and the applied value
+    /// slewing toward it. Persisted across a reconnect — the delay is part of
+    /// the session's phase alignment, not the connection's state — and the
+    /// relay restates the current directive on register anyway.
+    phase_slew: PhaseSlew,
+    /// Outbound turns held for their send-phase delay, oldest first, each with
+    /// the deadline its wire handoff waits for. Deadlines are monotonic (a
+    /// turn never overtakes an earlier one, even across a delay decrease), and
+    /// turns here are unstamped — seq assignment happens at actual send, so
+    /// the seq stream stays in production order. Persisted so a link failure
+    /// cannot drop a held turn: the next session flushes these first, before
+    /// any outage-buffered turns, keeping that order.
+    held: VecDeque<(Instant, Payload)>,
 }
 
 impl LoopState {
@@ -1930,6 +2119,8 @@ impl LoopState {
             pending_control_redivert: Vec::new(),
             connectivity_states: ConnectivityEpochStates::default(),
             terminal_connectivity_slots: HashSet::new(),
+            phase_slew: PhaseSlew::new(Instant::now()),
+            held: VecDeque::new(),
         }
     }
 }
@@ -3513,6 +3704,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_phase_directive_holds_the_wire_handoff_without_reordering() {
+        // The relay commands a 30 ms send-phase delay. The driver must adopt
+        // it (visible on the status watch), slew into it rather than stepping,
+        // and keep every held turn in production order on the wire.
+        use rally_point_proto::messages::PhaseDirective;
+        use rally_point_transport::control::send_control_phase_directive;
+
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        // An absurd slew rate proves the client clamps rather than trusts it.
+        send_control_phase_directive(
+            &mut peer_control_send,
+            PhaseDirective {
+                delay_us: 30_000,
+                slew_us_per_s: 1_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The directive lands: the status watch shows the adopted target.
+        let mut status_rx = chan_a.phase_status.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status_rx.wait_for(|status| status.target_us == 30_000),
+        )
+        .await
+        .expect("the directive reaches the driver before the timeout")
+        .expect("the status watch stays open");
+
+        // Let the slew accumulate a few milliseconds of real delay, then send
+        // a burst. Every turn takes the hold-queue path and must still leave
+        // in production order with contiguous driver-stamped seqs.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for i in 0..3u8 {
+            chan_a.outbound.send(turn(0, &[i])).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            let received = tokio::time::timeout(Duration::from_secs(5), link_b.recv())
+                .await
+                .expect("the held turns reach the wire before the timeout")
+                .expect("the peer link stays up");
+            for payload in received.fresh {
+                seen.push((payload.seq, payload.commands[0]));
+            }
+        }
+        assert_eq!(seen, vec![(0, 0), (1, 1), (2, 2)]);
+
+        // The applied delay really slewed: nonzero (the burst was held, not
+        // sent instantly) yet nowhere near the target a step would have hit —
+        // the clamped maximum rate can only cover a fraction of 30 ms so far.
+        let status = *status_rx.borrow();
+        assert!(
+            status.applied_us > 0 && status.applied_us < 30_000,
+            "applied delay mid-slew, got {status:?}"
+        );
+
+        drop(chan_a);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops once the game seam closes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn a_control_frame_kind_this_build_predates_is_skipped_without_ending_the_stream() {
         // A relay running ahead of this client sends a frame kind it has no arm
         // for. The reader must skip it and keep reading, so a rolling deploy never
@@ -3580,6 +3841,7 @@ mod tests {
             session_start: _session_start,
             connectivity: _connectivity,
             region_labels: _region_labels,
+            phase_status: _phase_status,
         } = chan_a;
 
         // Flood chat far past its buffer with nothing draining it.
@@ -3827,6 +4089,7 @@ mod tests {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         } = driver;
         let seam = GameSeam {
             outbound,
@@ -3844,6 +4107,7 @@ mod tests {
             session_start,
             connectivity,
             region_labels,
+            phase_status,
         };
         let state = LoopState::new(result_expected);
         (link, seam, state)
