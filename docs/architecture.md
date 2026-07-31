@@ -474,6 +474,25 @@ can only *understate its own* delivery — the same bounded push-the-buffer-up l
 link loss — and the cap plus bounds contain it; it can never stall anyone or frame another player. The
 same per-session worst-lag and hop-count view rides the flight recorder's sample rows.
 
+A second additive term rides the target the same way: **sustained arrival-interval stretch**, the
+relay-measured form of "the clients are stalling anyway." A stall-bound client produces — and
+therefore sends — turns slower than the turn rate, so persistent client-side misery shows up at the
+relay as its home slots' arrival intervals running past the turn interval, evidence the per-link
+RTT/loss inputs cannot express (the network can look pristine while the sims limp). When the stretch
+has held continuously past a sustain window (a single long hiccup decays out of the interval
+estimate well before it), the target gets one extra turn, releasing when the cadence recovers; the
+shrink floor and edge probation below hold and, if the shrink is disproven, stop re-trying the
+lowered depth exactly as for any other raise. It is capped at one turn on purpose — a client that
+fundamentally cannot produce at the turn rate is not fixed by any depth, so escalating would chase
+an unfixable client into unbounded latency — and it is the automatic replacement for the retired
+user-facing latency setting: the one party that can actually see the evidence makes the call. It is
+computed from the phase controller's estimates (see "Send-phase alignment") but is deliberately
+independent of that controller's give-up latch — a latched session keeps folding estimates, because
+the sessions where alignment gave up are exactly the ones this backstop exists for; and because the
+stretch boundary is the same tolerance as the alignment health gate, the two mechanisms tile the
+severity axis without overlap (a session stretched enough to press is one alignment already refuses
+to touch).
+
 To decide well the decision-maker needs the **whole game's** network conditions, but each relay directly
 observes only its *own* home clients' links — loss, RTT, and the like, which QUIC already measures per
 connection. So those per-client conditions travel **with the turns**: a relay attaches its home clients'
@@ -1040,12 +1059,14 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   (30s relay floor) or the 45s abandoned-session force-decide.
 - **Buffer-one micro-stalls are fixed by send-phase alignment, not buffer depth.** Holding depth
   two costs a full turn of latency to hide a few-millisecond phase artifact; the phase controller
-  (see "Send-phase alignment") removes the artifact at depth one. The buffer law's inputs are
-  deliberately unchanged — client stall telemetry stays local diagnostics, never a law input (no
-  client-asserted value may feed a relay decision that affects other clients). Phase scope is
-  per-relay by design: only the home relay sees a slot's wire arrivals first-hand, and cross-relay
-  alignment would need a shared inter-relay clock for a regime (mesh sessions, hop-cushioned off
-  depth one) that barely benefits — don't re-chase it without that clock.
+  (see "Send-phase alignment") removes the artifact at depth one. Client stall telemetry stays
+  local diagnostics, never a law input (no client-asserted value may feed a relay decision that
+  affects other clients) — the law's backstop for persistent stalls alignment cannot fix is the
+  relay-measured arrival-interval stretch term (additive on the target like the delivery cushion,
+  capped at one turn; see "Latency buffer"), which replaced the user-facing latency setting. Phase
+  scope is per-relay by design: only the home relay sees a slot's wire arrivals first-hand, and
+  cross-relay alignment would need a shared inter-relay clock for a regime (mesh sessions,
+  hop-cushioned off depth one) that barely benefits — don't re-chase it without that clock.
 - **Game clients never talk to the coordinator.** Re-home is app-server-mediated (the client
   authenticates to its app server exactly as for result submission; the app server makes the
   tenant-signed coordinator call).

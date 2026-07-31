@@ -3325,7 +3325,23 @@ impl DecisionMaker {
         // the bounds clamp bound that lever to a few turns of extra buffer in
         // its own game (see `crate::delivery`).
         if let Some(inputs) = &inputs {
-            let target = inputs.target.saturating_add(self.delivery.cushion_turns());
+            // Sustained arrival-interval stretch rides the target the same way
+            // the delivery cushion does: a clamped ADDITIVE term, the law
+            // itself untouched. It is the relay-measured form of "the clients
+            // are stalling anyway" — persistent client-side stalls slow their
+            // turn production, which per-link RTT/loss cannot see — and it is
+            // the automatic replacement for the retired user-facing latency
+            // setting (see `PhaseController::stretch_turns` for the term's
+            // shape, sustain, and one-turn cap). Folded before the peak
+            // observation below, so the shrink floor and edge probation hold
+            // a stretch-raised buffer exactly as they hold any other raise —
+            // a lowered buffer that re-triggers the stretch burns the edge
+            // and stops being retried.
+            let stretch_turns = self.phase.stretch_turns(Instant::now());
+            let target = inputs
+                .target
+                .saturating_add(self.delivery.cushion_turns())
+                .saturating_add(stretch_turns);
             self.target_peaks
                 .observe(frame.0, target, self.law.target_floor_bucket_span());
 
@@ -6993,6 +7009,54 @@ mod tests {
     // -- Raise fast, lower slow (asymmetric dwell) --
 
     /// Raise jumps to the target immediately, not incrementally.
+    #[test]
+    fn sustained_arrival_stretch_presses_the_buffer_target() {
+        // Clean tiny RTT sizes the law's own target at the minimum; a session
+        // whose arrival cadence then sits stretched past the sustain window is
+        // raised one extra turn — the relay-measured "clients are stalling
+        // anyway" backstop — and the raise routes through the ordinary
+        // directive machinery.
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(1, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.mark_started();
+        // First ingest: the initial broadcast at the held minimum, no raise.
+        let d = ingest_at(&mut maker, &conditions(0, 5_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(1));
+
+        // Two slots stuck at a 50 ms cadence against the ~41.7 ms turn.
+        let start = std::time::Instant::now();
+        let cadence = 50_000u64;
+        for seq in 0..300u64 {
+            let at = start + Duration::from_micros(seq * cadence);
+            let _ = maker.ingest_arrival_phase(SlotId(0), seq, at);
+            let _ = maker.ingest_arrival_phase(SlotId(1), seq, at + Duration::from_millis(3));
+        }
+
+        // Stretched but not yet sustained: the onset latches, nothing raises.
+        let d = ingest_at(&mut maker, &conditions(0, 5_000, 0, 200), 2);
+        assert!(
+            d.is_none(),
+            "stretch below the sustain window must not raise"
+        );
+        assert_eq!(maker.buffer(), BufferSize(1));
+
+        // Once the stretch has (been backdated to have) held past the sustain
+        // window, the next decision raises by exactly the one-turn press.
+        maker.phase.backdate_stretch(Duration::from_secs(6));
+        let d = ingest_at(&mut maker, &conditions(0, 5_000, 0, 300), 3);
+        assert_eq!(
+            d.unwrap().buffer,
+            BufferSize(2),
+            "sustained stretch presses one turn"
+        );
+        assert_eq!(maker.buffer(), BufferSize(2));
+    }
+
     #[test]
     fn raise_jumps_to_target() {
         let mut maker = DecisionMaker::new(

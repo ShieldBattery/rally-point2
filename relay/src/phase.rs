@@ -118,6 +118,14 @@ const INTERVAL_TOLERANCE_US: i64 = 800;
 /// under correction is cut off within a couple of minutes.
 const MAX_UNCONVERGED_ROUNDS: u32 = 8;
 
+/// How long the population must sit continuously stretched before the
+/// pressure term presses the buffer target (see
+/// [`stretch_turns`](PhaseController::stretch_turns)). The interval estimate's
+/// own time constant (~1.3 s) already flattens a single long gap back inside
+/// tolerance well within this window, so an isolated hiccup never presses;
+/// only a session that genuinely cannot hold the turn cadence does.
+const STRETCH_SUSTAIN: Duration = Duration::from_secs(5);
+
 /// Samples a slot must accumulate before its estimate joins the phase
 /// population. One second of turns at the nominal rate: enough for the
 /// estimator to forget its first-sample bias.
@@ -206,8 +214,18 @@ pub struct PhaseController {
     /// dead-band. Reaching [`MAX_UNCONVERGED_ROUNDS`] sets [`Self::disabled`].
     unconverged_rounds: u32,
     /// The give-up latch: the phases would not settle under correction, so the
-    /// controller has stopped for the session's remainder. Never cleared.
+    /// controller has stopped for the session's remainder. Never cleared, and
+    /// deliberately gates only *corrections* — arrival estimates keep folding,
+    /// because the stretch pressure term must keep watching exactly the
+    /// sessions that latched.
     disabled: bool,
+    /// When the population first showed a stretched arrival interval and has
+    /// stayed stretched since; `None` while inside tolerance. The pressure
+    /// term fires once this age passes `STRETCH_SUSTAIN`.
+    stretch_since: Option<Instant>,
+    /// Whether the pressure term is currently pressing, for edge-transition
+    /// logging only.
+    stretch_pressing: bool,
     /// Total per-slot corrections issued, for the session stats line.
     corrections_issued: u64,
     /// The cluster span seen by the most recent full evaluation, for the
@@ -232,6 +250,8 @@ impl PhaseController {
             next_eval_at: None,
             unconverged_rounds: 0,
             disabled: false,
+            stretch_since: None,
+            stretch_pressing: false,
             corrections_issued: 0,
             last_span_us: None,
         }
@@ -244,9 +264,9 @@ impl PhaseController {
     /// post-loss catch-up burst times the recovery, not the sender's phase —
     /// and mesh-forwarded copies, whose extra hop is not this slot's uplink.
     pub fn note_arrival(&mut self, slot: SlotId, seq: u64, now: Instant) {
-        if self.disabled {
-            return;
-        }
+        // Deliberately not gated on the give-up latch: a latched session stops
+        // being *corrected*, but its estimates keep folding so the stretch
+        // pressure term still sees it.
         let epoch = *self.epoch.get_or_insert(now);
         if self.next_eval_at.is_none() {
             self.next_eval_at = Some(now + FIRST_EVAL_DELAY);
@@ -438,6 +458,83 @@ impl PhaseController {
         );
         self.next_eval_at = Some(now + slew + SETTLE);
         corrections
+    }
+
+    /// The buffer-pressure term, in turns: `1` while the session has sat
+    /// continuously stretched — some active slot's arrival interval running
+    /// slower than the turn interval beyond tolerance — for the sustain
+    /// window (`STRETCH_SUSTAIN`), else `0`.
+    ///
+    /// This is the escape hatch for a session that keeps stalling and that
+    /// phase alignment cannot fix. A stall-bound client produces (and sends)
+    /// turns slower than the turn rate, so persistent client-side misery shows
+    /// up relay-side as stretched arrival intervals — first-hand wire
+    /// evidence, never client-asserted telemetry — whatever the cause: phase
+    /// churn the controller latched off over, an overloaded CPU, conditions
+    /// the RTT/loss inputs underweight. The buffer law folds this into its
+    /// target exactly like the delivery cushion (an additive term, the law
+    /// itself untouched), buying the session a turn of slack the way a player
+    /// raising the in-game latency setting once did.
+    ///
+    /// Severity tiles with the alignment controller by construction: the
+    /// stretch boundary is the same interval tolerance the health gate uses,
+    /// so any session stretched enough to press is one the phase controller
+    /// is already refusing to touch, and a session mild enough to correct
+    /// never presses — the two can pull in opposite directions on no input.
+    /// One-sided on purpose (only slower-than-nominal presses): fast arrivals
+    /// are catch-up flushes, not distress. Capped at one turn on purpose: a
+    /// client that fundamentally cannot produce at the turn rate is not fixed
+    /// by any depth, so escalating with continued stretch would chase an
+    /// unfixable client into unbounded latency; one turn is what breaks the
+    /// stall-feedback amplification cases. Only slots homed on this relay are
+    /// visible here, which covers the sessions that matter (single-relay
+    /// sessions are the depth-one population; mesh sessions carry a hop
+    /// cushion).
+    pub fn stretch_turns(&mut self, now: Instant) -> u32 {
+        let stretched = self.slots.values().any(|estimate| {
+            estimate.samples >= MIN_SAMPLES
+                && now.duration_since(estimate.last_sample) <= SAMPLE_MAX_AGE
+                && estimate
+                    .interval_us
+                    .is_some_and(|iv| iv - self.turn_us > INTERVAL_TOLERANCE_US)
+        });
+        if !stretched {
+            self.stretch_since = None;
+            if self.stretch_pressing {
+                self.stretch_pressing = false;
+                tracing::info!("arrival-interval stretch cleared; releasing the buffer pressure");
+            }
+            return 0;
+        }
+        let since = *self.stretch_since.get_or_insert(now);
+        if now.duration_since(since) < STRETCH_SUSTAIN {
+            return 0;
+        }
+        if !self.stretch_pressing {
+            self.stretch_pressing = true;
+            tracing::info!(
+                "sustained arrival-interval stretch; pressing the buffer target by one turn",
+            );
+        }
+        1
+    }
+
+    /// Trips the give-up latch directly, for tests asserting latched-session
+    /// behavior without replaying an unconverging session.
+    #[cfg(test)]
+    fn force_disable(&mut self) {
+        self.disabled = true;
+    }
+
+    /// Moves the recorded stretch onset `by` further into the past, so a test
+    /// can drive the sustain condition without waiting out real wall clock —
+    /// the same trick [`DecisionMaker::backdate_session_start`] plays with the
+    /// region-label gate. A no-op while nothing is stretched.
+    ///
+    /// [`DecisionMaker::backdate_session_start`]: crate::consensus::DecisionMaker
+    #[cfg(test)]
+    pub(crate) fn backdate_stretch(&mut self, by: Duration) {
+        self.stretch_since = self.stretch_since.and_then(|at| at.checked_sub(by));
     }
 
     /// The delay `slot` was last commanded, if any — the value to re-push when
@@ -791,6 +888,125 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(controller.commanded(slot(0)), None);
+    }
+
+    #[test]
+    fn stretch_presses_only_after_the_sustain_window() {
+        // A session stuck at a 50 ms cadence against the ~41.7 ms turn: the
+        // first sighting latches the onset but must not press; once the
+        // stretch has held past the sustain window it presses one turn.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let cadence = 50_000i64;
+        let mut clock = start;
+        for seq in 0..300u64 {
+            let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+        }
+        assert_eq!(
+            controller.stretch_turns(clock),
+            0,
+            "first sighting only latches"
+        );
+        // The stretch persists: another 300 turns (~15 s) at the same cadence.
+        for seq in 300..600u64 {
+            let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+        }
+        assert_eq!(
+            controller.stretch_turns(clock),
+            1,
+            "sustained stretch presses"
+        );
+        // Recovery: the cadence returns to nominal long enough for the
+        // interval estimate to re-center, and the pressure releases.
+        let turn = i64::from(TURN_US);
+        let resume = clock;
+        for i in 0..200u64 {
+            let at = resume + Duration::from_micros(((i + 1) as i64 * turn) as u64);
+            controller.note_arrival(slot(0), 600 + i, at);
+            clock = clock.max(at);
+        }
+        assert_eq!(
+            controller.stretch_turns(clock),
+            0,
+            "recovered cadence releases"
+        );
+    }
+
+    #[test]
+    fn fast_arrivals_never_press() {
+        // Faster-than-nominal cadence is catch-up, not distress: one-sided.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let cadence = 35_000i64;
+        let mut clock = start;
+        for seq in 0..600u64 {
+            let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+        }
+        assert_eq!(controller.stretch_turns(clock), 0);
+        assert_eq!(
+            controller.stretch_turns(clock + Duration::from_millis(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn a_single_long_gap_never_presses() {
+        // One 500 ms hiccup spikes the interval estimate, but the estimate
+        // re-centers well inside the sustain window, so polling the pressure
+        // every turn across the episode never sees it fire.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let turn = i64::from(TURN_US);
+        let mut clock = start;
+        let at_of = |seq: u64, extra_us: i64| {
+            start + Duration::from_micros((seq as i64 * turn + extra_us) as u64)
+        };
+        for seq in 0..200u64 {
+            let at = at_of(seq, 0);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+            assert_eq!(controller.stretch_turns(clock), 0);
+        }
+        // The hiccup: turn 200 lands half a second late, later turns shift
+        // with it (the schedule slipped once, the cadence itself recovered).
+        for seq in 200..500u64 {
+            let at = at_of(seq, 500_000);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+            assert_eq!(controller.stretch_turns(clock), 0, "at seq {seq}");
+        }
+    }
+
+    #[test]
+    fn a_latched_controller_still_presses() {
+        // The give-up latch stops corrections, never the pressure term — the
+        // latched sessions are exactly the ones the escape hatch exists for.
+        let mut controller = PhaseController::new(TURN_US);
+        controller.force_disable();
+        let start = Instant::now();
+        let cadence = 55_000i64;
+        let mut clock = start;
+        for seq in 0..600u64 {
+            let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
+            controller.note_arrival(slot(0), seq, at);
+            clock = clock.max(at);
+            if seq == 300 {
+                // Latch the onset partway through so the tail sustains it.
+                let _ = controller.stretch_turns(clock);
+            }
+        }
+        assert!(
+            controller
+                .evaluate(clock + Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(controller.stretch_turns(clock), 1);
     }
 
     #[test]
