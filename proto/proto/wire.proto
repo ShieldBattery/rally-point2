@@ -365,6 +365,18 @@ message ControlFrame {
     // wins, and the relay re-pushes the current value to a slot that connects
     // after one was issued. See `PhaseDirective`.
     PhaseDirective phase_directive = 12;
+
+    // A client acknowledging that it adopted a send-phase directive (client →
+    // relay only), echoing the delay it now slews toward. Releases the
+    // relay's per-slot command fence: the phase controller never issues a
+    // slot a further command while its previous one is unacknowledged, so a
+    // client whose directives are delayed, lost, or ignored parks after a
+    // single bounded step instead of accumulating a large delay it might
+    // later apply all at once. Client-asserted by design and safe that way:
+    // it can release only the sender's own fence, and a client
+    // misrepresenting adoption can only advance its own command — send
+    // timing it already controls outright. See `PhaseApplied`.
+    PhaseApplied phase_applied = 13;
   }
 }
 
@@ -824,6 +836,20 @@ message PhaseDirective {
   // (and its buffer law) never see the slew as jitter. Zero means "use the
   // client's own default".
   uint32 slew_us_per_s = 2;
+}
+
+// A client's acknowledgement that it adopted a send-phase directive (see
+// `PhaseDirective`): the delay echoed back verbatim, sent the moment the
+// directive becomes the client's slew target. The relay releases the sender's
+// command fence only when the echoed delay matches the currently commanded
+// one, so a stale acknowledgement — an older directive's echo arriving after
+// a newer command — releases nothing. The sending slot is never carried: the
+// relay binds the acknowledgement to the authenticated connection it arrived
+// on, exactly as it stamps a `LobbyCommand` author.
+message PhaseApplied {
+  // The commanded total delay the client adopted as its slew target, echoed
+  // verbatim from the directive it acknowledges.
+  uint32 delay_us = 1;
 }
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a

@@ -615,7 +615,14 @@ correction itself causes closes the gate until the session relaxes), a **per-rou
 (bounded steps toward the target, delay-reducing direction preferred when the zero floor allows,
 never a wrap-around slew — large misalignments converge over several gated rounds), and a
 **give-up latch** (repeated correcting rounds that never measure inside the dead-band mean the
-phases are not quasi-static; the controller disables itself for the session rather than stir it).
+phases are not quasi-static; the controller disables itself for the session rather than stir it),
+and a **per-slot command fence** (a slot is never issued a further command while its previous one
+is unacknowledged — `PhaseApplied`, echoed by the client as it adopts a directive — so delayed,
+lost, or ignored directives park a slot after one bounded step instead of accumulating a large
+delay it might later apply all at once; explicit on purpose, because every reference a relay could
+infer application from drifts with the session, and safely client-asserted, because it releases
+only the sender's own fence — a client misrepresenting adoption can only advance its own command,
+send timing it already controls outright).
 
 Scope is deliberately per-relay: only a slot's home
 relay sees its wire arrivals first-hand, controllers on different relays touch disjoint slots with

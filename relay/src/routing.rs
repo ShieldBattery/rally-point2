@@ -2122,6 +2122,14 @@ pub async fn run_slot_link(
                             "ignoring unexpected client-sent send-phase control frame",
                         );
                     }
+                    // The client acknowledging that it adopted its send-phase
+                    // directive. The slot is the authenticated connection's —
+                    // never a wire claim — and the acknowledgement can release
+                    // only that slot's own command fence, so this is a
+                    // client-asserted input with strictly self-scoped effect.
+                    Some(ControlInbound::PhaseApplied(delay_us)) => {
+                        consensus::note_phase_applied(&decision_makers, &key, slot, delay_us);
+                    }
                     // The client announcing its own clean departure. The
                     // client already flushed its outstanding turns and waited
                     // for their acks before sending this, so nothing of its

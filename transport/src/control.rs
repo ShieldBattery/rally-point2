@@ -25,7 +25,7 @@ use rally_point_proto::control_stream::{
 };
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart,
+    PhaseApplied, PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart,
     SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
@@ -127,6 +127,12 @@ pub enum ControlInbound {
     /// correction racing the connect-time re-push), so the consumer applies it
     /// idempotently, newest wins.
     PhaseDirective(PhaseDirective),
+    /// A client's acknowledgement that it adopted a send-phase directive
+    /// (client → relay only), surfacing the echoed delay. The relay releases
+    /// the sender's command fence when it matches the currently commanded
+    /// delay; a client never receives one back, so the client edge ignores a
+    /// stray one just as it does a `LeaveIntent`.
+    PhaseApplied(u32),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -253,6 +259,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::PhaseDirective(directive)),
                 } => ControlInbound::PhaseDirective(directive),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::PhaseApplied(PhaseApplied { delay_us })),
+                } => ControlInbound::PhaseApplied(delay_us),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -503,6 +512,22 @@ pub async fn send_control_phase_directive(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::PhaseDirective(directive)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Writes a client's acknowledgement that it adopted a send-phase directive
+/// (client → relay), echoing the commanded delay verbatim. An error means the
+/// stream is gone; the caller treats a lost acknowledgement as best-effort —
+/// the relay simply parks the slot's command, the safe reading of silence.
+pub async fn send_control_phase_applied(
+    control_send: &mut quinn::SendStream,
+    delay_us: u32,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::PhaseApplied(PhaseApplied { delay_us })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

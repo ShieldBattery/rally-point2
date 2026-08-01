@@ -4305,6 +4305,12 @@ impl DecisionMaker {
         self.phase.commanded(slot)
     }
 
+    /// Releases `slot`'s send-phase command fence on its acknowledgement (see
+    /// [`PhaseController::note_applied`](crate::phase::PhaseController::note_applied)).
+    pub fn note_phase_applied(&mut self, slot: SlotId, delay_us: u32) {
+        self.phase.note_applied(slot, delay_us);
+    }
+
     /// Records this relay's own id, stamped onto every `BufferDirective` this
     /// maker queues from here on (see `queue_directive`).
     /// Idempotent — the caller's own id never changes for a running relay
@@ -5262,6 +5268,20 @@ pub fn commanded_phase_delay(
     slot: SlotId,
 ) -> Option<u32> {
     registry.lock().get(key)?.commanded_phase_delay(slot)
+}
+
+/// Releases `slot`'s send-phase command fence on the client's acknowledgement
+/// that it adopted `delay_us` (see [`DecisionMaker::note_phase_applied`]). A
+/// no-op when the echo is stale or no maker exists.
+pub fn note_phase_applied(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    delay_us: u32,
+) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_phase_applied(slot, delay_us);
+    }
 }
 
 /// Adopts an authority's mesh `SessionStart` onto a peer relay's maker: latches

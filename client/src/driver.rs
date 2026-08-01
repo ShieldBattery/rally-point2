@@ -79,8 +79,8 @@ use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payloa
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
-    send_control_lobby, send_control_request_drop, send_control_skin, send_control_turn,
-    spawn_control_reader,
+    send_control_lobby, send_control_phase_applied, send_control_request_drop, send_control_skin,
+    send_control_turn, spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::{mpsc, watch};
@@ -756,6 +756,16 @@ impl LinkDriver {
                 Ok(()) => return Ok(()),
                 // A link/stream failure: keep the channels alive and re-dial.
                 Err(error) if is_link_failure(&error) => {
+                    // With the game seam already closed, re-dialing is
+                    // pointless — the reconnect machinery would only bounce
+                    // off the dead seam as GameGone, laundering the session's
+                    // own error (say, a teardown whose clean leave never
+                    // reached the relay) into a clean stop. The error keeps
+                    // its classification instead.
+                    if seam.inbound.is_closed() {
+                        link.connection().close(0u32.into(), b"driver ended");
+                        return Err(error);
+                    }
                     // Close the failed connection now that it is classified.
                     // After a control-stream-only death the connection is still
                     // alive, and the relay's slot-liveness signal is the
@@ -1384,6 +1394,29 @@ impl LinkDriver {
                                 delay_us = directive.delay_us,
                                 slew_us_per_s = directive.slew_us_per_s,
                                 "applying send-phase directive",
+                            );
+                            // Acknowledge adoption so the relay releases this
+                            // slot's command fence — without the ack it parks
+                            // the command after one step, the safe reading of
+                            // silence. Best-effort: on a dead stream the
+                            // session is about to end anyway, and the parked
+                            // command costs only unfinished alignment.
+                            if let Err(error) =
+                                send_control_phase_applied(&mut control_send, directive.delay_us)
+                                    .await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    "phase-applied ack failed; the relay parks this slot's command",
+                                );
+                            }
+                        }
+                        // A phase-applied ack only ever travels client → relay;
+                        // a client never receives one back, so ignore a stray
+                        // one.
+                        Some(ControlInbound::PhaseApplied(_)) => {
+                            tracing::warn!(
+                                "ignoring unexpected relay-sent phase-applied control frame"
                             );
                         }
                         Some(ControlInbound::OversizeTurn(payload)) => {
@@ -3939,6 +3972,7 @@ mod tests {
         let (link_a, mut link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
         let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
         // An absurd slew rate proves the client clamps rather than trusts it.
@@ -3961,6 +3995,16 @@ mod tests {
         .await
         .expect("the directive reaches the driver before the timeout")
         .expect("the status watch stays open");
+        // And is acknowledged upstream, echoing the commanded delay — the
+        // relay releases this slot's command fence on the match.
+        let acked = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the acknowledgement reaches the peer before the timeout")
+            .expect("control reader closed early");
+        assert!(
+            matches!(acked, ControlInbound::PhaseApplied(30_000)),
+            "expected the phase-applied echo, got {acked:?}"
+        );
 
         // Let the slew accumulate a few milliseconds of real delay, then send
         // a burst. Every turn takes the hold-queue path and must still leave
@@ -4120,17 +4164,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5)).await;
         drop(chan_a);
 
-        let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
-            .await
-            .expect("the oversize turn reaches the control stream despite the close")
-            .expect("control reader closed early");
-        match delivered {
-            ControlInbound::OversizeTurn(payload) => {
-                assert_eq!(payload.seq, 0);
-                assert_eq!(payload.commands.len(), 4096);
+        // The directive's own acknowledgement echo precedes the turn on the
+        // stream; skip past anything that isn't the turn itself.
+        let payload = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match control_rx
+                    .recv()
+                    .await
+                    .expect("control reader closed early")
+                {
+                    ControlInbound::OversizeTurn(payload) => break payload,
+                    _ => continue,
+                }
             }
-            other => panic!("expected the oversize turn, got {other:?}"),
-        }
+        })
+        .await
+        .expect("the oversize turn reaches the control stream despite the close");
+        assert_eq!(payload.seq, 0);
+        assert_eq!(payload.commands.len(), 4096);
 
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
