@@ -128,6 +128,23 @@ const CHAT_CHANNEL_CAPACITY: usize = 256;
 /// buffer.
 const SKIN_CHANNEL_CAPACITY: usize = 32;
 
+/// Most turns the send-phase hold queue may retain before it starts sending
+/// the oldest early. A real game holds at most a turn or two (the delay is a
+/// fraction of one turn interval), so this is a memory backstop against a
+/// runaway producer, not a tuned buffer — and it degrades the *delay*, never
+/// the data: an over-cap turn still reaches the wire, just sooner than its
+/// phase deadline asked.
+const HELD_TURN_CAP: usize = 64;
+
+/// How long a game-closed teardown waits for the acks of turns it just drained
+/// out of the send-phase hold before letting the connection close. Datagrams
+/// carry no delivery guarantee of their own, and the close outruns them on the
+/// wire — so a drained final turn must be held to the same standard as a live
+/// one: unacked means retransmitted (the flush re-carry runs during the wait),
+/// acked means truly delivered. Bounded so an unreachable relay cannot park
+/// teardown; comfortably past one RTT plus the relay's own flush cadence.
+const HELD_DRAIN_SETTLE: Duration = Duration::from_secs(1);
+
 /// Depth of the manual-drop-request channel from the game thread to the driver.
 /// A human clicks the drop button a handful of times at most; the relay
 /// rate-limits the requests regardless, so a small backstop against a scheduling
@@ -943,12 +960,15 @@ impl LinkDriver {
         // intent it was the last thing holding. `next_outbound_seq`, the reorder
         // cursors, and the announcer all live in the persistent `state`, so a
         // resumed session continues the seq stream rather than rewinding it.
-        for (_, payload) in std::mem::take(held) {
+        while let Some((_, payload)) = held.pop_front() {
             // Turns still waiting out a send-phase delay when the last link
             // ended go first: their deadlines are long past (any outage dwarfs
             // a sub-turn phase delay) and they predate everything buffered
             // during the outage, so sending them immediately keeps production
-            // order and re-holds nothing.
+            // order and re-holds nothing. Popped one at a time (never drained
+            // wholesale into the loop) so a send failure leaves the unsent
+            // tail in place for the next session — these turns are unstamped
+            // and unretained, so nothing else could ever recover them.
             match send_game_turn(
                 link,
                 &mut control_send,
@@ -970,7 +990,9 @@ impl LinkDriver {
                 .maybe_send(&mut control_send, outbound, held.is_empty(), link)
                 .await?;
         }
-        for buffered in std::mem::take(outbound_buffer) {
+        // Popped one at a time for the same reason as the held turns above: a
+        // send failure must leave the unsent tail for the next session.
+        while let Some(buffered) = outbound_buffer.pop_front() {
             match send_game_turn(
                 link,
                 &mut control_send,
@@ -1031,7 +1053,11 @@ impl LinkDriver {
         // `None` that would spin the loop.
         let mut request_drop_alive = true;
 
-        loop {
+        // Game-initiated teardown exits `break` here rather than `return`, so
+        // they funnel through the held-turn drain below the loop; link-failure
+        // exits `return` directly, keeping their held turns for the reconnect
+        // flush.
+        'serve: loop {
             // Armed only once the game has signaled its departure (the announcer
             // has a `deadline`); the day-out fallback keeps the branch dormant,
             // and the type checker satisfied, otherwise.
@@ -1085,7 +1111,7 @@ impl LinkDriver {
                     }
                     match release_ready(next_seq, pending, inbound) {
                         Release::Delivered => {}
-                        Release::GameClosed => return Ok(()),
+                        Release::GameClosed => break 'serve,
                         Release::GameStalled => return Err(DriverError::GameStalled),
                     }
                     flush_delivered_cursors(link, &mut beacon_send, &mut beacon_writer, next_seq)
@@ -1135,7 +1161,7 @@ impl LinkDriver {
                                     tracing::warn!("game stopped draining synced leaves");
                                     return Err(DriverError::GameStalled);
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // A client only ever *sends* a leave intent up; it never
@@ -1189,7 +1215,7 @@ impl LinkDriver {
                                     tracing::warn!("game stopped draining lobby commands");
                                     return Err(DriverError::GameStalled);
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // An in-game chat message another member authored,
@@ -1221,7 +1247,7 @@ impl LinkDriver {
                                         "dropping game-chat message; the game is not draining chat"
                                     );
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // A cosmetic-skin blob another member authored,
@@ -1249,7 +1275,7 @@ impl LinkDriver {
                                         "dropping player-skin blob; the game is not draining skins"
                                     );
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // The relay-driven session-start directive: every expected
@@ -1271,7 +1297,7 @@ impl LinkDriver {
                                     );
                                     return Err(DriverError::GameStalled);
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // A relay-pushed slot-connectivity change: a member's link
@@ -1309,7 +1335,7 @@ impl LinkDriver {
                                         "dropping connectivity change; the game is not draining them"
                                     );
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // The session's relay → region labels, released by the
@@ -1334,7 +1360,7 @@ impl LinkDriver {
                                         "dropping region labels; the game is not draining them"
                                     );
                                 }
-                                GamePush::Closed => return Ok(()),
+                                GamePush::Closed => break 'serve,
                             }
                         }
                         // A relay send-phase directive: the total delay to hold
@@ -1381,7 +1407,7 @@ impl LinkDriver {
                                     .insert(payload.seq, payload);
                                 match release_ready(next_seq, pending, inbound) {
                                     Release::Delivered => {}
-                                    Release::GameClosed => return Ok(()),
+                                    Release::GameClosed => break 'serve,
                                     Release::GameStalled => return Err(DriverError::GameStalled),
                                 }
                                 flush_delivered_cursors(
@@ -1460,10 +1486,41 @@ impl LinkDriver {
                                 // wire against production order.
                                 let due = held.back().map_or(due, |&(prev, _)| due.max(prev));
                                 held.push_back((due, payload));
+                                // The memory backstop: a producer outrunning
+                                // the turn cadence would otherwise grow the
+                                // hold without bound (the bounded channel is
+                                // being drained into it). Send the oldest
+                                // early — order and delivery hold, only its
+                                // remaining delay is forfeited.
+                                while held.len() > HELD_TURN_CAP {
+                                    let Some((_, early)) = held.pop_front() else {
+                                        break;
+                                    };
+                                    match send_game_turn(
+                                        link,
+                                        &mut control_send,
+                                        announcer,
+                                        next_outbound_seq,
+                                        retention,
+                                        retention_bytes,
+                                        own_slot,
+                                        &mut flush_deadline,
+                                        &mut acks_owed,
+                                        early,
+                                    )
+                                    .await
+                                    {
+                                        OutboundSend::Sent => {}
+                                        OutboundSend::EndSession(result) => return result,
+                                    }
+                                }
                             }
                         }
-                        // The game dropped its sender: a clean stop.
-                        None => return Ok(()),
+                        // The game dropped its sender: a clean stop (after
+                        // the held-turn drain below the loop — the final turns
+                        // of a "send, then close" teardown may still be
+                        // waiting out their phase delay right here).
+                        None => break 'serve,
                     }
                 }
                 // A held turn's send-phase delay expired: hand it, and any
@@ -1740,7 +1797,7 @@ impl LinkDriver {
                 // is noticed even on a quiet link with nothing to deliver — without
                 // it, the closure would surface only on the next `try_send`, leaving
                 // the connection (and the relay slot) open indefinitely.
-                _ = inbound.closed() => return Ok(()),
+                _ = inbound.closed() => break 'serve,
                 _ = sleep_until(flush_deadline) => {
                     // The maintenance flush, reached because the outbound stream
                     // stopped re-carrying unacked turns (near-MTU) or went idle. When
@@ -1761,6 +1818,61 @@ impl LinkDriver {
                 }
             }
         }
+
+        // The game closed its seam. Any turn still waiting out its send-phase
+        // delay was produced before the close and peers need it — lockstep
+        // stalls forever on a missing turn, and nothing will ever drain the
+        // hold queue again — so it is flushed on the way out, deadlines
+        // ignored (a few milliseconds of phase shift stop mattering once the
+        // producer is gone). A link failure mid-drain classifies exactly as a
+        // live send's would.
+        if held.is_empty() {
+            return Ok(());
+        }
+        while let Some((_, payload)) = held.pop_front() {
+            match send_game_turn(
+                link,
+                &mut control_send,
+                announcer,
+                next_outbound_seq,
+                retention,
+                retention_bytes,
+                own_slot,
+                &mut flush_deadline,
+                &mut acks_owed,
+                payload,
+            )
+            .await
+            {
+                OutboundSend::Sent => {}
+                OutboundSend::EndSession(result) => return result,
+            }
+        }
+        // Sending is not delivering: the caller closes the connection the
+        // moment this returns, and a close outruns a datagram on the wire.
+        // Wait (bounded) for the drained turns' acks, running the ordinary
+        // flush re-carry meanwhile so a lost datagram is retransmitted — the
+        // same recovery a live turn gets, compressed into teardown.
+        let settle_deadline = Instant::now() + HELD_DRAIN_SETTLE;
+        let mut settle_flush = Instant::now() + FLUSH_INTERVAL;
+        while link.payloads_in_flight() > 0 {
+            tokio::select! {
+                received = link.recv() => {
+                    if received.is_err() {
+                        // The relay closed first; nothing more can be learned.
+                        break;
+                    }
+                }
+                () = sleep_until(settle_flush) => {
+                    if send_packet(link, None).is_err() {
+                        break;
+                    }
+                    settle_flush = Instant::now() + FLUSH_INTERVAL;
+                }
+                () = sleep_until(settle_deadline) => break,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3769,6 +3881,66 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the driver stops once the game seam closes")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_game_close_flushes_turns_still_held_for_their_phase_delay() {
+        // The "send the final turn, then close" teardown: with a send-phase
+        // delay in effect the last turn sits in the hold queue when the game
+        // drops its seam, and the driver must flush it on the way out — peers
+        // stall forever on a missing turn.
+        use rally_point_proto::messages::PhaseDirective;
+        use rally_point_transport::control::send_control_phase_directive;
+
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        send_control_phase_directive(
+            &mut peer_control_send,
+            PhaseDirective {
+                delay_us: 30_000,
+                slew_us_per_s: 1_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut status_rx = chan_a.phase_status.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status_rx.wait_for(|status| status.target_us == 30_000),
+        )
+        .await
+        .expect("the directive reaches the driver")
+        .expect("the status watch stays open");
+        // Let the slew build a delay comfortably larger than the beat below.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
+        // A short beat so the driver moves the turn into the hold queue (its
+        // deadline is still ~20 ms out), then the game closes its seam.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(chan_a);
+
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let received = link_b.recv().await.expect("peer link stays up");
+                if !received.fresh.is_empty() {
+                    break received;
+                }
+            }
+        })
+        .await
+        .expect("the held turn reaches the wire despite the close");
+        assert_eq!(received.fresh[0].seq, 0);
+        assert_eq!(received.fresh[0].commands[0], 0x2A);
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops after draining")
             .unwrap()
             .unwrap();
     }

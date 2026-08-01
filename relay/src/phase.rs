@@ -70,6 +70,7 @@
 //! how fast that influence can move anyone.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 
 use rally_point_proto::ids::SlotId;
@@ -110,12 +111,16 @@ const SLOT_MAX_CHANGE_US: i64 = 8_000;
 /// closes the gate on itself.
 const INTERVAL_TOLERANCE_US: i64 = 800;
 
-/// Correcting rounds allowed without ever measuring the population inside the
-/// dead-band before the controller concludes the phases are not quasi-static
-/// and disables itself for the session. A full-turn spread takes about three
-/// capped rounds when the plant cooperates, so this leaves room for one
-/// large initial alignment plus drift repair, while a plant that keeps moving
-/// under correction is cut off within a couple of minutes.
+/// Outside-dead-band evaluations allowed without ever measuring the
+/// population inside the dead-band before the controller concludes it cannot
+/// converge the session and disables itself. Counted whether or not the round
+/// issued any correction — a client that ignores its directives saturates its
+/// command at the clamp and stops producing changes, and its correction-free
+/// rounds must still walk toward the latch or the controller would probe it
+/// (with the command pinned high) forever. A full-turn spread takes about
+/// three capped rounds when the plant cooperates, so this leaves room for one
+/// large initial alignment plus drift repair, while a session that stays
+/// spread is cut off within a couple of minutes.
 const MAX_UNCONVERGED_ROUNDS: u32 = 8;
 
 /// How long the population must sit continuously stretched before the
@@ -210,8 +215,9 @@ pub struct PhaseController {
     /// slew-plus-settle dwell that keeps each iteration from measuring the
     /// previous one's transient.
     next_eval_at: Option<Instant>,
-    /// Correcting rounds since the population last measured inside the
-    /// dead-band. Reaching [`MAX_UNCONVERGED_ROUNDS`] sets [`Self::disabled`].
+    /// Outside-dead-band evaluations since the population last measured
+    /// inside the dead-band, correcting or not. Reaching
+    /// [`MAX_UNCONVERGED_ROUNDS`] sets [`Self::disabled`].
     unconverged_rounds: u32,
     /// The give-up latch: the phases would not settle under correction, so the
     /// controller has stopped for the session's remainder. Never cleared, and
@@ -281,20 +287,38 @@ impl PhaseController {
             return;
         };
         let residual = elapsed_us - expected_us;
-        self.slots
-            .entry(slot)
-            .and_modify(|estimate| {
+        match self.slots.entry(slot) {
+            Entry::Occupied(mut occupied) => {
+                let estimate = occupied.get_mut();
+                // The transport is deliberately unordered, so an old turn can
+                // arrive *after* newer ones. Its arrival time reflects the
+                // detour, not the sender's phase, and letting it regress the
+                // seq/time baseline would hand the next interval reading a
+                // garbage difference on top of folding a meaningless residual.
+                // The estimators consume only a monotonically advancing seq;
+                // a stale delivery is skipped wholesale.
+                if seq <= estimate.last_seq {
+                    return;
+                }
                 estimate.residual_us += (residual - estimate.residual_us) >> EWMA_SHIFT;
                 // The per-turn interval, normalized across a filtered-out
-                // catch-up sample; a reordered or wildly-jumped seq
-                // contributes no interval reading (the residual still folds —
-                // its EWMA absorbs the noise the same as any other sample).
-                let turns = seq.saturating_sub(estimate.last_seq);
+                // catch-up sample; a wildly-jumped seq contributes no interval
+                // reading (the residual still folds — its EWMA absorbs the
+                // noise the same as any other sample).
+                let turns = seq - estimate.last_seq;
                 if (1..=4).contains(&turns)
                     && let Ok(gap_us) =
                         i64::try_from(now.duration_since(estimate.last_sample).as_micros())
                 {
-                    let interval = gap_us / turns as i64;
+                    // Clamped: one enormous gap (a long stall, a link outage)
+                    // is real, but folded raw it would swamp the average so
+                    // far past tolerance that a single pause impersonates many
+                    // seconds of sustained stretch — the pressure term's
+                    // sustain window assumes the estimate re-centers within a
+                    // couple of seconds of the cadence recovering. A session
+                    // that is *actually* stall-bound re-crosses tolerance on
+                    // every turn, clamp or no clamp.
+                    let interval = (gap_us / turns as i64).min(self.turn_us.saturating_mul(4));
                     estimate.interval_us = Some(match estimate.interval_us {
                         Some(prior) => prior + ((interval - prior) >> EWMA_SHIFT),
                         None => interval,
@@ -303,14 +327,17 @@ impl PhaseController {
                 estimate.samples = estimate.samples.saturating_add(1);
                 estimate.last_sample = now;
                 estimate.last_seq = seq;
-            })
-            .or_insert(SlotPhase {
-                residual_us: residual,
-                interval_us: None,
-                last_seq: seq,
-                samples: 1,
-                last_sample: now,
-            });
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(SlotPhase {
+                    residual_us: residual,
+                    interval_us: None,
+                    last_seq: seq,
+                    samples: 1,
+                    last_sample: now,
+                });
+            }
+        }
     }
 
     /// Runs one control iteration if one is due, returning the slots whose
@@ -400,6 +427,24 @@ impl PhaseController {
             return Vec::new();
         }
 
+        // Outside the dead-band: this evaluation counts toward the give-up
+        // latch whether or not any correction issues below (see
+        // `MAX_UNCONVERGED_ROUNDS` for why correction-free rounds count).
+        self.unconverged_rounds += 1;
+        if self.unconverged_rounds >= MAX_UNCONVERGED_ROUNDS {
+            // The phases never settled under correction: the plant is moving
+            // for reasons alignment cannot fix. Stop for the session — a
+            // controller that keeps stirring a churning session amplifies the
+            // very stalls it exists to remove.
+            self.disabled = true;
+            tracing::warn!(
+                rounds = self.unconverged_rounds,
+                span_us = span,
+                "send-phase alignment never converged; disabling for this session",
+            );
+            return Vec::new();
+        }
+
         let target = phases[cluster_end].1;
         let mut corrections = Vec::new();
         let mut widest_change = 0i64;
@@ -436,19 +481,6 @@ impl PhaseController {
         if corrections.is_empty() {
             self.next_eval_at = Some(now + IDLE_REEVAL);
             return corrections;
-        }
-        self.unconverged_rounds += 1;
-        if self.unconverged_rounds >= MAX_UNCONVERGED_ROUNDS {
-            // The phases never settled under correction: the plant is moving
-            // for reasons alignment cannot fix. Stop for the session — a
-            // controller that keeps stirring a churning session amplifies the
-            // very stalls it exists to remove.
-            self.disabled = true;
-            tracing::warn!(
-                rounds = self.unconverged_rounds,
-                span_us = span,
-                "send-phase alignment never converged; disabling for this session",
-            );
         }
         self.corrections_issued += corrections.len() as u64;
         // Dwell until the slowest slew could have finished, plus settle time
@@ -957,30 +989,119 @@ mod tests {
 
     #[test]
     fn a_single_long_gap_never_presses() {
-        // One 500 ms hiccup spikes the interval estimate, but the estimate
-        // re-centers well inside the sustain window, so polling the pressure
-        // every turn across the episode never sees it fire.
+        // One hiccup spikes the interval estimate, but the (clamped) sample
+        // decays back inside tolerance well inside the sustain window, so
+        // polling the pressure every turn across the episode never sees it
+        // fire — including a multi-second pause that, folded unclamped, would
+        // hold the estimate past tolerance for longer than the sustain.
+        for gap_us in [500_000i64, 1_500_000, 4_000_000] {
+            let mut controller = PhaseController::new(TURN_US);
+            let start = Instant::now();
+            let turn = i64::from(TURN_US);
+            let mut clock = start;
+            let at_of = |seq: u64, extra_us: i64| {
+                start + Duration::from_micros((seq as i64 * turn + extra_us) as u64)
+            };
+            for seq in 0..200u64 {
+                let at = at_of(seq, 0);
+                controller.note_arrival(slot(0), seq, at);
+                clock = clock.max(at);
+                assert_eq!(controller.stretch_turns(clock), 0);
+            }
+            // The hiccup: turn 200 lands late, later turns shift with it (the
+            // schedule slipped once, the cadence itself recovered).
+            for seq in 200..500u64 {
+                let at = at_of(seq, gap_us);
+                controller.note_arrival(slot(0), seq, at);
+                clock = clock.max(at);
+                assert_eq!(
+                    controller.stretch_turns(clock),
+                    0,
+                    "gap {gap_us} at seq {seq}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_out_of_order_delivery_is_ignored() {
+        // The transport is unordered: an old turn can arrive after newer
+        // ones, its timing describing the detour rather than the sender.
+        // Folding it (or letting it regress the interval baseline) would
+        // poison both estimators; it must change nothing at all.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let offsets = [(slot(0), 0i64), (slot(1), 1_500)];
+        let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
+        // A delayed re-delivery of turn 100 lands now, 200 turns late.
+        controller.note_arrival(slot(0), 100, clock + Duration::from_millis(5));
+        // Steady flow resumes; the phases are aligned within the dead-band,
+        // so a poisoned residual (shifted by the stale fold) or a poisoned
+        // interval (differenced against the regressed baseline, closing the
+        // health gate or faking stretch) would show up below.
+        clock = feed_steady(&mut controller, start, &offsets, 300, 300);
+        assert_eq!(controller.stretch_turns(clock), 0);
+        let corrections = controller.evaluate(clock + Duration::from_millis(1));
+        assert!(corrections.is_empty(), "got {corrections:?}");
+        assert_eq!(controller.commanded(slot(0)), None);
+        assert_eq!(controller.commanded(slot(1)), None);
+    }
+
+    #[test]
+    fn a_population_that_ignores_directives_still_trips_the_latch() {
+        // Two slots 20 ms apart whose clients never apply any correction: the
+        // commanded delay saturates at the clamp within a few rounds, after
+        // which rounds issue nothing — and those correction-free rounds must
+        // still walk to the give-up latch instead of probing forever.
         let mut controller = PhaseController::new(TURN_US);
         let start = Instant::now();
         let turn = i64::from(TURN_US);
+        let offsets = [(slot(0), 0i64), (slot(1), 20_000)];
+        let mut seq = 0u64;
         let mut clock = start;
-        let at_of = |seq: u64, extra_us: i64| {
-            start + Duration::from_micros((seq as i64 * turn + extra_us) as u64)
-        };
-        for seq in 0..200u64 {
-            let at = at_of(seq, 0);
-            controller.note_arrival(slot(0), seq, at);
-            clock = clock.max(at);
-            assert_eq!(controller.stretch_turns(clock), 0);
+        let mut correcting_rounds = 0u32;
+        let mut last_commanded = 0u32;
+        for _ in 0..30u32 {
+            for s_ in seq..seq + 1_000 {
+                for &(id, offset) in &offsets {
+                    let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
+                    controller.note_arrival(id, s_, at);
+                    clock = clock.max(at);
+                }
+            }
+            seq += 1_000;
+            let corrections = controller.evaluate(clock + Duration::from_millis(1));
+            if !corrections.is_empty() {
+                correcting_rounds += 1;
+            }
+            for &(id, delay) in &corrections {
+                assert_eq!(id, slot(0), "only the early slot is corrected");
+                last_commanded = delay;
+            }
         }
-        // The hiccup: turn 200 lands half a second late, later turns shift
-        // with it (the schedule slipped once, the cadence itself recovered).
-        for seq in 200..500u64 {
-            let at = at_of(seq, 500_000);
-            controller.note_arrival(slot(0), seq, at);
-            clock = clock.max(at);
-            assert_eq!(controller.stretch_turns(clock), 0, "at seq {seq}");
+        assert!(
+            correcting_rounds < MAX_UNCONVERGED_ROUNDS,
+            "commands saturate before the round budget, got {correcting_rounds}"
+        );
+        assert!(
+            i64::from(last_commanded) < i64::from(TURN_US),
+            "the command stays inside the turn interval, got {last_commanded}"
+        );
+        // The latch fired: even a later, larger misalignment draws nothing.
+        let mut clock2 = clock;
+        for s_ in seq..seq + 2_000 {
+            let at = start + Duration::from_micros((s_ as i64 * turn) as u64);
+            controller.note_arrival(slot(0), s_, at);
+            let at1 = start + Duration::from_micros((s_ as i64 * turn + 15_000) as u64);
+            controller.note_arrival(slot(1), s_, at1);
+            clock2 = clock2.max(at1);
         }
+        assert!(
+            controller
+                .evaluate(clock2 + Duration::from_millis(1))
+                .is_empty(),
+            "the latched controller stays silent"
+        );
     }
 
     #[test]

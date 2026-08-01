@@ -179,6 +179,13 @@ fn validate(cli: &Cli) -> Result<()> {
     if cli.arrival_rate <= 0.0 {
         bail!("--arrival-rate must be greater than 0");
     }
+    if !(0.0..=10_000.0).contains(&cli.phase_spread_ms) {
+        // Also rejects NaN (which fails every comparison). The ceiling is far
+        // past any useful stagger (one turn interval); beyond it the value is
+        // surely a typo, and a wild or non-finite value would panic the
+        // per-session Duration conversion instead of erroring here.
+        bail!("--phase-spread-ms must be a finite value between 0 and 10000");
+    }
     if cli.players == 0 {
         bail!("--players must be at least 1");
     }
@@ -289,6 +296,18 @@ mod tests {
     #[test]
     fn normal_capacity_matrix_fits_exact_delivery_tracking() {
         assert!(validate(&valid_cli()).is_ok());
+    }
+
+    #[test]
+    fn phase_spread_rejects_values_that_would_panic_duration_conversion() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY, 1e12] {
+            let mut cli = valid_cli();
+            cli.phase_spread_ms = bad;
+            assert!(validate(&cli).is_err(), "accepted {bad}");
+        }
+        let mut cli = valid_cli();
+        cli.phase_spread_ms = 30.0;
+        assert!(validate(&cli).is_ok());
     }
 
     #[test]

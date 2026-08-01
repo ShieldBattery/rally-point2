@@ -1616,6 +1616,11 @@ pub async fn run_slot_link(
                         break 'serve;
                     }
                 };
+                // Stamped before validation, forwarding, and the registry
+                // locks below: the phase controller measures *wire arrival*,
+                // and everything this arm does after this line is relay
+                // processing time that must not leak into the measurement.
+                let received_at = std::time::Instant::now();
                 // Only a payload-bearing packet needs an ack in return; owing one for
                 // a client's ack-only packet would bounce ack-only packets back and
                 // forth on an idle link.
@@ -1704,8 +1709,13 @@ pub async fn run_slot_link(
                 // so this almost always returns nothing; when it does issue
                 // corrections, each named slot gets its own directive.
                 if let Some(seq) = solo_fresh_seq {
-                    let corrections =
-                        consensus::ingest_arrival_phase(&decision_makers, &key, slot, seq);
+                    let corrections = consensus::ingest_arrival_phase(
+                        &decision_makers,
+                        &key,
+                        slot,
+                        seq,
+                        received_at,
+                    );
                     if !corrections.is_empty() {
                         fan_out_phase_directives(&sessions, &key, &corrections);
                     }
