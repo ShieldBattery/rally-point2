@@ -136,14 +136,14 @@ const SKIN_CHANNEL_CAPACITY: usize = 32;
 /// phase deadline asked.
 const HELD_TURN_CAP: usize = 64;
 
-/// How long a game-closed teardown waits for the acks of turns it just drained
-/// out of the send-phase hold before letting the connection close. Datagrams
-/// carry no delivery guarantee of their own, and the close outruns them on the
-/// wire — so a drained final turn must be held to the same standard as a live
-/// one: unacked means retransmitted (the flush re-carry runs during the wait),
-/// acked means truly delivered. Bounded so an unreachable relay cannot park
+/// How long a game-closed teardown may spend fencing delivery before letting
+/// the connection close: waiting out the unacked datagram window (with the
+/// flush re-carry running, so a lost final turn is retransmitted like a live
+/// one) and then, when anything rode the reliable control stream, waiting for
+/// the relay's own close to confirm the stream was read in full. One shared
+/// deadline across both fences, bounded so an unreachable relay cannot park
 /// teardown; comfortably past one RTT plus the relay's own flush cadence.
-const HELD_DRAIN_SETTLE: Duration = Duration::from_secs(1);
+const TEARDOWN_SETTLE: Duration = Duration::from_secs(1);
 
 /// Depth of the manual-drop-request channel from the game thread to the driver.
 /// A human clicks the drop button a handful of times at most; the relay
@@ -983,7 +983,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent => {}
+                OutboundSend::Sent { .. } => {}
                 OutboundSend::EndSession(result) => return result,
             }
             announcer
@@ -1007,7 +1007,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent => {}
+                OutboundSend::Sent { .. } => {}
                 OutboundSend::EndSession(result) => return result,
             }
             announcer
@@ -1472,7 +1472,7 @@ impl LinkDriver {
                                 )
                                 .await
                                 {
-                                    OutboundSend::Sent => {}
+                                    OutboundSend::Sent { .. } => {}
                                     OutboundSend::EndSession(result) => return result,
                                 }
                                 // The turn just sent may have been the last one
@@ -1510,7 +1510,7 @@ impl LinkDriver {
                                     )
                                     .await
                                     {
-                                        OutboundSend::Sent => {}
+                                        OutboundSend::Sent { .. } => {}
                                         OutboundSend::EndSession(result) => return result,
                                     }
                                 }
@@ -1548,7 +1548,7 @@ impl LinkDriver {
                         )
                         .await
                         {
-                            OutboundSend::Sent => {}
+                            OutboundSend::Sent { .. } => {}
                             OutboundSend::EndSession(result) => return result,
                         }
                     }
@@ -1819,16 +1819,18 @@ impl LinkDriver {
             }
         }
 
-        // The game closed its seam. Any turn still waiting out its send-phase
-        // delay was produced before the close and peers need it — lockstep
-        // stalls forever on a missing turn, and nothing will ever drain the
-        // hold queue again — so it is flushed on the way out, deadlines
-        // ignored (a few milliseconds of phase shift stop mattering once the
-        // producer is gone). A link failure mid-drain classifies exactly as a
-        // live send's would.
-        if held.is_empty() {
-            return Ok(());
-        }
+        // The game closed its seam. Everything it produced in its final
+        // moments must still reach the relay — lockstep stalls forever on a
+        // missing turn, and a clean leave that dies here books the departure
+        // as a dropped link — and the closed-seam select arms race the
+        // channel-consuming arms, so a "hand it over, then drop the seam"
+        // sequence may leave any of it sitting unread in the channels. Drain
+        // it all, in production order: turns still waiting out their
+        // send-phase delay first (they are oldest), then turns still queued
+        // in the outbound channel, then a queued leave-intent signal and a
+        // queued result report. A link failure mid-drain classifies exactly
+        // as a live send's would.
+        let mut control_written = false;
         while let Some((_, payload)) = held.pop_front() {
             match send_game_turn(
                 link,
@@ -1844,32 +1846,115 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent => {}
+                OutboundSend::Sent { control_diverted } => control_written |= control_diverted,
                 OutboundSend::EndSession(result) => return result,
             }
         }
+        while let Ok(payload) = outbound.try_recv() {
+            match send_game_turn(
+                link,
+                &mut control_send,
+                announcer,
+                next_outbound_seq,
+                retention,
+                retention_bytes,
+                own_slot,
+                &mut flush_deadline,
+                &mut acks_owed,
+                payload,
+            )
+            .await
+            {
+                OutboundSend::Sent { control_diverted } => control_written |= control_diverted,
+                OutboundSend::EndSession(result) => return result,
+            }
+        }
+        if leave_intent.try_recv().is_ok() {
+            announcer.arm(LEAVE_INTENT_TIMEOUT);
+        }
+        if let Ok(payload) = result.try_recv()
+            && !announcer.result_sent()
+            && !announcer.sent()
+        {
+            // Mirrors the live result arm: best-effort, latched as sent
+            // either way so the leave-intent hold below releases.
+            if let Err(error) = send_control_game_result(&mut control_send, payload.into()).await {
+                tracing::debug!(%error, "game-result send failed at teardown; dropping the report");
+            } else {
+                control_written = true;
+            }
+            announcer.note_result_sent();
+        }
+
         // Sending is not delivering: the caller closes the connection the
-        // moment this returns, and a close outruns a datagram on the wire.
-        // Wait (bounded) for the drained turns' acks, running the ordinary
-        // flush re-carry meanwhile so a lost datagram is retransmitted — the
-        // same recovery a live turn gets, compressed into teardown.
-        let settle_deadline = Instant::now() + HELD_DRAIN_SETTLE;
+        // moment this returns, and a close outruns both datagrams and stream
+        // data on the wire. Fence one, datagrams: wait for the unacked window
+        // to clear — the turns drained above and any zero-delay final turn
+        // sent moments before the seam closed — with the ordinary flush
+        // re-carry running so a lost datagram is retransmitted, the same
+        // recovery a live turn gets, compressed into teardown.
+        let settle_deadline = Instant::now() + TEARDOWN_SETTLE;
         let mut settle_flush = Instant::now() + FLUSH_INTERVAL;
+        let mut link_gone = false;
         while link.payloads_in_flight() > 0 {
             tokio::select! {
                 received = link.recv() => {
                     if received.is_err() {
                         // The relay closed first; nothing more can be learned.
+                        link_gone = true;
                         break;
                     }
                 }
                 () = sleep_until(settle_flush) => {
                     if send_packet(link, None).is_err() {
+                        link_gone = true;
                         break;
                     }
                     settle_flush = Instant::now() + FLUSH_INTERVAL;
                 }
                 () = sleep_until(settle_deadline) => break,
+            }
+        }
+
+        // With everything drained — and, as far as the fence can tell,
+        // delivered — an armed clean leave is finally ready: it was withheld
+        // while turns were outstanding, and losing it here would book the
+        // departure as a dropped link instead of completing the clean-leave
+        // handshake. If the window never cleared, send it anyway: if acks are
+        // not coming the link is effectively dead and announcing is harmless,
+        // the same call the live loop's safety timeout makes.
+        if !link_gone {
+            let _ = announcer
+                .maybe_send(&mut control_send, outbound, held.is_empty(), link)
+                .await;
+            if announcer.deadline().is_some() {
+                let _ = announcer.force_send(&mut control_send).await;
+            }
+            control_written |= announcer.sent();
+        }
+
+        // Fence two, stream data: a successful write proves nothing about
+        // receipt, so when anything above rode the reliable control stream —
+        // an oversize turn, the result, the leave intent — FIN the stream and
+        // wait for the relay to close the link. Its reader treats the EOF (or
+        // the leave intent directly) as this client done and closes, and that
+        // close arriving here proves the stream was read in full. Its own
+        // window, not fence one's remainder: a stalled datagram settle can
+        // exhaust that entirely, and the leave intent force-sent just above
+        // would then race the connection close with zero time on the clock —
+        // the very hole this fence exists to close.
+        if control_written && !link_gone {
+            let _ = control_send.finish();
+            let stream_deadline = Instant::now() + TEARDOWN_SETTLE;
+            loop {
+                tokio::select! {
+                    received = link.recv() => {
+                        if received.is_err() {
+                            break;
+                        }
+                    }
+                    () = sleep_until(stream_deadline) => break,
+                }
             }
         }
         Ok(())
@@ -1878,9 +1963,12 @@ impl LinkDriver {
 
 /// The outcome of one turn's wire handoff: sent (keep looping), or the session
 /// must end with the given result — an absorbed post-leave close (`Ok`) or a
-/// real failure, exactly as if the send site had returned it inline.
+/// real failure, exactly as if the send site had returned it inline. A sent
+/// turn reports whether it rode the reliable control stream (an oversize
+/// divert): the teardown drain needs to know, because stream data needs its
+/// own delivery fence before the connection may close.
 enum OutboundSend {
-    Sent,
+    Sent { control_diverted: bool },
     EndSession(Result<(), DriverError>),
 }
 
@@ -1958,8 +2046,13 @@ async fn send_game_turn(
                 announcer.absorb_link_close(Err(DriverError::from(error))),
             );
         }
+        return OutboundSend::Sent {
+            control_diverted: true,
+        };
     }
-    OutboundSend::Sent
+    OutboundSend::Sent {
+        control_diverted: false,
+    }
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -3885,18 +3978,103 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn a_game_close_flushes_turns_still_held_for_their_phase_delay() {
-        // The "send the final turn, then close" teardown: with a send-phase
-        // delay in effect the last turn sits in the hold queue when the game
-        // drops its seam, and the driver must flush it on the way out — peers
-        // stall forever on a missing turn.
+    /// Drives the "hand the final turn over, then drop the seam" teardown and
+    /// asserts the turn still reaches the peer. `slewed` controls whether a
+    /// send-phase delay is in force (exercising the hold-queue drain) or not
+    /// (exercising the just-sent-datagram fence); `beat` is how long the game
+    /// waits between the send and the drop — zero races the closed-seam
+    /// select arms against `outbound.recv` on purpose, so the turn may still
+    /// be sitting unread in the channel when teardown begins.
+    async fn final_turn_survives_seam_drop(slewed: bool, beat: Duration) {
         use rally_point_proto::messages::PhaseDirective;
         use rally_point_transport::control::send_control_phase_directive;
 
         let (link_a, mut link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        if slewed {
+            send_control_phase_directive(
+                &mut peer_control_send,
+                PhaseDirective {
+                    delay_us: 30_000,
+                    slew_us_per_s: 1_000_000,
+                },
+            )
+            .await
+            .unwrap();
+            let mut status_rx = chan_a.phase_status.clone();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                status_rx.wait_for(|status| status.target_us == 30_000),
+            )
+            .await
+            .expect("the directive reaches the driver")
+            .expect("the status watch stays open");
+            // Let the slew build a delay comfortably larger than the beat.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
+        if !beat.is_zero() {
+            tokio::time::sleep(beat).await;
+        }
+        drop(chan_a);
+
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let received = link_b.recv().await.expect("peer link stays up");
+                if !received.fresh.is_empty() {
+                    break received;
+                }
+            }
+        })
+        .await
+        .expect("the final turn reaches the wire despite the close");
+        assert_eq!(received.fresh[0].seq, 0);
+        assert_eq!(received.fresh[0].commands[0], 0x2A);
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops after draining")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_game_close_flushes_a_turn_already_moved_into_the_hold_queue() {
+        final_turn_survives_seam_drop(true, Duration::from_millis(5)).await;
+    }
+
+    #[tokio::test]
+    async fn a_game_close_flushes_a_turn_still_queued_in_the_outbound_channel() {
+        // No beat: the closed-seam arms race `outbound.recv`, and whichever
+        // wins, the turn must reach the wire.
+        final_turn_survives_seam_drop(true, Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn a_game_close_fences_a_zero_delay_final_datagram() {
+        // No phase delay at all: the final turn goes (or is drained) straight
+        // to a datagram, and the teardown fence must keep the connection open
+        // until it is acked rather than let the close outrun it.
+        final_turn_survives_seam_drop(false, Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn a_game_close_delivers_an_oversize_held_turn() {
+        // An oversize final turn drains onto the reliable control stream at
+        // teardown; a successful write proves nothing about receipt, so the
+        // stream fence must hold the connection open until the peer has read
+        // it.
+        use rally_point_proto::messages::PhaseDirective;
+        use rally_point_transport::control::send_control_phase_directive;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
         let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
         send_control_phase_directive(
@@ -3916,31 +4094,98 @@ mod tests {
         .await
         .expect("the directive reaches the driver")
         .expect("the status watch stays open");
-        // Let the slew build a delay comfortably larger than the beat below.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
-        // A short beat so the driver moves the turn into the hold queue (its
-        // deadline is still ~20 ms out), then the game closes its seam.
+        chan_a.outbound.send(turn(0, &[0x77; 4096])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         drop(chan_a);
 
-        let received = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let received = link_b.recv().await.expect("peer link stays up");
-                if !received.fresh.is_empty() {
-                    break received;
-                }
+        let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the oversize turn reaches the control stream despite the close")
+            .expect("control reader closed early");
+        match delivered {
+            ControlInbound::OversizeTurn(payload) => {
+                assert_eq!(payload.seq, 0);
+                assert_eq!(payload.commands.len(), 4096);
             }
-        })
-        .await
-        .expect("the held turn reaches the wire despite the close");
-        assert_eq!(received.fresh[0].seq, 0);
-        assert_eq!(received.fresh[0].commands[0], 0x2A);
+            other => panic!("expected the oversize turn, got {other:?}"),
+        }
 
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the driver stops after draining")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_last_moment_leave_intent_still_completes_the_clean_leave() {
+        // The game hands over its final turn, signals its clean leave, and
+        // drops the seam in one motion. The intent was withheld while the
+        // turn was outstanding; teardown must still send it once the turn is
+        // fenced, or the relay books the departure as a dropped link.
+        use rally_point_proto::messages::PhaseDirective;
+        use rally_point_transport::control::send_control_phase_directive;
+
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+        send_control_phase_directive(
+            &mut peer_control_send,
+            PhaseDirective {
+                delay_us: 30_000,
+                slew_us_per_s: 1_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut status_rx = chan_a.phase_status.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status_rx.wait_for(|status| status.target_us == 30_000),
+        )
+        .await
+        .expect("the directive reaches the driver")
+        .expect("the status watch stays open");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
+        chan_a.leave_intent.send(()).await.unwrap();
+        drop(chan_a);
+
+        let mut saw_intent = false;
+        let mut saw_turn = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(saw_intent && saw_turn) {
+            tokio::select! {
+                delivered = control_rx.recv() => {
+                    match delivered {
+                        Some(ControlInbound::LeaveIntent) => saw_intent = true,
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                received = link_b.recv() => {
+                    if let Ok(received) = received
+                        && !received.fresh.is_empty()
+                    {
+                        assert_eq!(received.fresh[0].commands[0], 0x2A);
+                        saw_turn = true;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(saw_turn, "the final turn reached the wire");
+        assert!(saw_intent, "the clean-leave intent reached the wire");
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops after the handshake")
             .unwrap()
             .unwrap();
     }

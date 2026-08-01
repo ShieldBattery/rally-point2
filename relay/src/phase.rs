@@ -165,6 +165,34 @@ const IDLE_REEVAL: Duration = Duration::from_secs(5);
 /// a couple of seconds.
 const EWMA_SHIFT: u32 = 5;
 
+/// Maps a circular difference into the signed half-open range
+/// `[-turn/2, turn/2)`, so "how far and which way did the phase move" is
+/// well-defined across the cycle wrap.
+fn signed_mod(delta: i64, turn: i64) -> i64 {
+    let wrapped = delta.rem_euclid(turn);
+    if wrapped >= turn / 2 {
+        wrapped - turn
+    } else {
+        wrapped
+    }
+}
+
+/// A correction a slot has not yet visibly responded to (see
+/// [`PhaseController::awaiting_shift`]).
+struct AwaitedShift {
+    /// The slot's position relative to the round's alignment target when the
+    /// correction was commanded (signed, circular). Relative on purpose:
+    /// every slot's absolute phase drifts together with the session's
+    /// schedule (stalls, clock skew), and a gate keyed on absolute phase
+    /// would mistake that common-mode drift for a response — or mask one.
+    /// Measured against the target, the common mode cancels and only the
+    /// slot's own movement within the population remains.
+    rel_at_command: i64,
+    /// The signed commanded-delay change, whose reflection in the measured
+    /// relative position releases the gate.
+    commanded_delta: i64,
+}
+
 /// One slot's arrival-phase estimate.
 struct SlotPhase {
     /// Exponentially weighted average of the arrival residual: arrival time
@@ -210,6 +238,16 @@ pub struct PhaseController {
     /// correction builds on. Survives slot removal (a reconnecting slot picks
     /// its delay back up via the connect-time re-push) for the session's life.
     commanded_us: HashMap<SlotId, u32>,
+    /// Per slot, the correction it has not yet visibly responded to: the
+    /// phase it measured when the correction was commanded, and the shift the
+    /// correction asked for. While present, the slot gets no further
+    /// commands — a client whose directives are delayed, lost, or ignored
+    /// must not have its command ratcheted round after round toward a
+    /// near-full-turn delay it might then apply all at once. Cleared when the
+    /// measured phase moves at least half the commanded shift in the right
+    /// direction (half, so estimate noise cannot wedge a responsive slot),
+    /// when the population converges, or when the slot's link tears down.
+    awaiting_shift: HashMap<SlotId, AwaitedShift>,
     /// The next instant `evaluate` will actually evaluate. Holds the
     /// first-evaluation delay, the idle cadence, and — after corrections — the
     /// slew-plus-settle dwell that keeps each iteration from measuring the
@@ -253,6 +291,7 @@ impl PhaseController {
             epoch: None,
             slots: HashMap::new(),
             commanded_us: HashMap::new(),
+            awaiting_shift: HashMap::new(),
             next_eval_at: None,
             unconverged_rounds: 0,
             disabled: false,
@@ -421,8 +460,10 @@ impl PhaseController {
         let span = self.turn_us - widest_gap;
         self.last_span_us = Some(span);
         if span <= SPAN_DEAD_BAND_US {
-            // Converged: the plant is holding still under the current delays.
+            // Converged: the plant is holding still under the current delays,
+            // and whatever shifts were still awaited evidently sufficed.
             self.unconverged_rounds = 0;
+            self.awaiting_shift.clear();
             self.next_eval_at = Some(now + IDLE_REEVAL);
             return Vec::new();
         }
@@ -449,6 +490,24 @@ impl PhaseController {
         let mut corrections = Vec::new();
         let mut widest_change = 0i64;
         for &(slot, phase) in &phases {
+            // A slot still owing a response to its previous correction gets
+            // no further command: if directives are delayed, lost, or ignored
+            // the command would otherwise ratchet a cap-step per round toward
+            // a near-full-turn delay the client might then apply all at once.
+            // The gate releases on half the commanded shift landing in the
+            // right direction — half, so estimate noise cannot wedge a
+            // responsive slot — and these held rounds still count toward the
+            // give-up latch above.
+            if let Some(awaited) = self.awaiting_shift.get(&slot) {
+                let rel_now = signed_mod(phase - target, self.turn_us);
+                let observed = signed_mod(rel_now - awaited.rel_at_command, self.turn_us);
+                let responded = observed.signum() == awaited.commanded_delta.signum()
+                    && observed.abs() * 2 >= awaited.commanded_delta.abs();
+                if !responded {
+                    continue;
+                }
+                self.awaiting_shift.remove(&slot);
+            }
             // The forward walk that puts this slot's phase on the target, and
             // its backward (delay-reducing) equivalent one turn shorter. The
             // backward direction is preferred when the current delay can
@@ -472,6 +531,13 @@ impl PhaseController {
                 continue;
             }
             widest_change = widest_change.max(change.abs());
+            self.awaiting_shift.insert(
+                slot,
+                AwaitedShift {
+                    rel_at_command: signed_mod(phase - target, self.turn_us),
+                    commanded_delta: change,
+                },
+            );
             // In [0, turn_us), which fits u32 comfortably.
             let next = u32::try_from(next).unwrap_or(0);
             self.commanded_us.insert(slot, next);
@@ -581,6 +647,10 @@ impl PhaseController {
     /// client still applies it, and the connect-time re-push restates it.
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
+        // The awaited response was pinned to the torn-down link's estimate; a
+        // replacement link re-measures from scratch, so the gate re-arms only
+        // if a fresh correction is ever issued.
+        self.awaiting_shift.remove(&slot);
     }
 
     /// Total per-slot corrections issued over the session, for the stats line.
@@ -784,19 +854,25 @@ mod tests {
     fn churn_after_a_correction_closes_the_gate_until_it_clears() {
         let mut controller = PhaseController::new(TURN_US);
         let start = Instant::now();
-        let offsets = [(slot(0), 0i64), (slot(1), 8_000)];
+        let offsets = [(slot(0), 0i64), (slot(1), 16_000)];
         let last = feed_steady(&mut controller, start, &offsets, 0, 300);
         let first = controller.evaluate(last + Duration::from_millis(1));
-        assert!(!first.is_empty(), "the 8 ms spread draws a correction");
+        assert!(!first.is_empty(), "the 16 ms spread draws a correction");
+        let applied: i64 = first
+            .iter()
+            .find(|&&(id, _)| id == slot(0))
+            .map(|&(_, delay)| i64::from(delay))
+            .expect("the early slot is corrected");
 
-        // The correction kicks the session into churn: turns now arrive at a
-        // stretched period. Once the dwell passes, the gate — not the dwell —
-        // must be what keeps the controller silent.
+        // The client applies the first (capped) correction, but the session
+        // then kicks into churn: turns arrive at a stretched period. Once the
+        // dwell passes, the health gate — not the dwell — must be what keeps
+        // the controller silent, despite the still-open spread.
         let churn_start = last + Duration::from_secs(30);
         let stretched = 50_000i64;
         let mut clock = churn_start;
         for i in 0..300u64 {
-            for &(id, offset) in &offsets {
+            for (id, offset) in [(slot(0), applied), (slot(1), 16_000)] {
                 let at =
                     churn_start + Duration::from_micros((i as i64 * stretched + offset) as u64);
                 controller.note_arrival(id, 300 + i, at);
@@ -811,12 +887,14 @@ mod tests {
         );
 
         // Churn clears: steady nominal-period flow resumes long enough for the
-        // interval estimate to re-center, and evaluation may run again.
+        // interval estimate to re-center, and evaluation may run again — the
+        // applied first step released the response gate, so the remaining
+        // spread draws the next correction.
         let resume = clock + Duration::from_secs(1);
         let mut clock2 = resume;
         let turn = i64::from(TURN_US);
         for i in 0..600u64 {
-            for &(id, offset) in &offsets {
+            for (id, offset) in [(slot(0), applied), (slot(1), 16_000)] {
                 let at = resume + Duration::from_micros((i as i64 * turn + offset) as u64);
                 controller.note_arrival(id, 600 + i, at);
                 clock2 = clock2.max(at);
@@ -1050,9 +1128,11 @@ mod tests {
     #[test]
     fn a_population_that_ignores_directives_still_trips_the_latch() {
         // Two slots 20 ms apart whose clients never apply any correction: the
-        // commanded delay saturates at the clamp within a few rounds, after
-        // which rounds issue nothing — and those correction-free rounds must
-        // still walk to the give-up latch instead of probing forever.
+        // response gate parks the command after a single cap step (an
+        // unresponsive slot must never be ratcheted toward a near-full-turn
+        // delay it might later apply all at once), the correction-free rounds
+        // still walk to the give-up latch, and the latched controller stays
+        // silent for good.
         let mut controller = PhaseController::new(TURN_US);
         let start = Instant::now();
         let turn = i64::from(TURN_US);
@@ -1079,13 +1159,13 @@ mod tests {
                 last_commanded = delay;
             }
         }
-        assert!(
-            correcting_rounds < MAX_UNCONVERGED_ROUNDS,
-            "commands saturate before the round budget, got {correcting_rounds}"
+        assert_eq!(
+            correcting_rounds, 1,
+            "an unresponsive slot is commanded exactly once"
         );
         assert!(
-            i64::from(last_commanded) < i64::from(TURN_US),
-            "the command stays inside the turn interval, got {last_commanded}"
+            i64::from(last_commanded) <= SLOT_MAX_CHANGE_US,
+            "the command parks at one cap step, got {last_commanded}"
         );
         // The latch fired: even a later, larger misalignment draws nothing.
         let mut clock2 = clock;
