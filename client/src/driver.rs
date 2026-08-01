@@ -983,7 +983,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent { .. } => {}
+                OutboundSend::Sent => {}
                 OutboundSend::EndSession(result) => return result,
             }
             announcer
@@ -1007,7 +1007,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent { .. } => {}
+                OutboundSend::Sent => {}
                 OutboundSend::EndSession(result) => return result,
             }
             announcer
@@ -1472,7 +1472,7 @@ impl LinkDriver {
                                 )
                                 .await
                                 {
-                                    OutboundSend::Sent { .. } => {}
+                                    OutboundSend::Sent => {}
                                     OutboundSend::EndSession(result) => return result,
                                 }
                                 // The turn just sent may have been the last one
@@ -1510,7 +1510,7 @@ impl LinkDriver {
                                     )
                                     .await
                                     {
-                                        OutboundSend::Sent { .. } => {}
+                                        OutboundSend::Sent => {}
                                         OutboundSend::EndSession(result) => return result,
                                     }
                                 }
@@ -1548,7 +1548,7 @@ impl LinkDriver {
                         )
                         .await
                         {
-                            OutboundSend::Sent { .. } => {}
+                            OutboundSend::Sent => {}
                             OutboundSend::EndSession(result) => return result,
                         }
                     }
@@ -1830,7 +1830,6 @@ impl LinkDriver {
         // in the outbound channel, then a queued leave-intent signal and a
         // queued result report. A link failure mid-drain classifies exactly
         // as a live send's would.
-        let mut control_written = false;
         while let Some((_, payload)) = held.pop_front() {
             match send_game_turn(
                 link,
@@ -1846,7 +1845,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent { control_diverted } => control_written |= control_diverted,
+                OutboundSend::Sent => {}
                 OutboundSend::EndSession(result) => return result,
             }
         }
@@ -1865,7 +1864,7 @@ impl LinkDriver {
             )
             .await
             {
-                OutboundSend::Sent { control_diverted } => control_written |= control_diverted,
+                OutboundSend::Sent => {}
                 OutboundSend::EndSession(result) => return result,
             }
         }
@@ -1880,8 +1879,6 @@ impl LinkDriver {
             // either way so the leave-intent hold below releases.
             if let Err(error) = send_control_game_result(&mut control_send, payload.into()).await {
                 tracing::debug!(%error, "game-result send failed at teardown; dropping the report");
-            } else {
-                control_written = true;
             }
             announcer.note_result_sent();
         }
@@ -1915,6 +1912,23 @@ impl LinkDriver {
                 () = sleep_until(settle_deadline) => break,
             }
         }
+        if link.payloads_in_flight() > 0 {
+            // The fence gave up: the link died, or a settle window of
+            // re-carries drew no acks (which means the same thing in
+            // practice). The remaining turns are lost — deliberately, with no
+            // reconnect-to-deliver path: the relay is the session's single
+            // distribution point, so a turn it never acked reached *nobody*,
+            // and the survivors stay mutually consistent without it (the
+            // leave/drop machinery removes this slot at a frame every
+            // survivor applies identically). All that is lost is a departing
+            // player's final few commands; re-dialing after the game died, to
+            // deliver commands from a player who is gone, would keep dead
+            // games' drivers dialing for cosmetic gain.
+            tracing::warn!(
+                unacked = link.payloads_in_flight(),
+                "closing with final turns unacknowledged; survivors reconcile via the leave path",
+            );
+        }
 
         // With everything drained — and, as far as the fence can tell,
         // delivered — an armed clean leave is finally ready: it was withheld
@@ -1922,28 +1936,42 @@ impl LinkDriver {
         // departure as a dropped link instead of completing the clean-leave
         // handshake. If the window never cleared, send it anyway: if acks are
         // not coming the link is effectively dead and announcing is harmless,
-        // the same call the live loop's safety timeout makes.
+        // the same call the live loop's safety timeout makes. A failed write
+        // keeps its classification instead of being shrugged into a clean
+        // stop — the connection may be perfectly alive around a broken
+        // control stream, and that difference is what the caller's error
+        // handling (and the operator reading the logs) keys on.
         if !link_gone {
-            let _ = announcer
+            if let Err(error) = announcer
                 .maybe_send(&mut control_send, outbound, held.is_empty(), link)
-                .await;
-            if announcer.deadline().is_some() {
-                let _ = announcer.force_send(&mut control_send).await;
+                .await
+            {
+                return announcer.absorb_link_close(Err(DriverError::from(error)));
             }
-            control_written |= announcer.sent();
+            if announcer.deadline().is_some()
+                && let Err(error) = announcer.force_send(&mut control_send).await
+            {
+                return announcer.absorb_link_close(Err(DriverError::from(error)));
+            }
         }
 
         // Fence two, stream data: a successful write proves nothing about
-        // receipt, so when anything above rode the reliable control stream —
-        // an oversize turn, the result, the leave intent — FIN the stream and
-        // wait for the relay to close the link. Its reader treats the EOF (or
-        // the leave intent directly) as this client done and closes, and that
-        // close arriving here proves the stream was read in full. Its own
+        // receipt, and *any* write this session may still be undelivered —
+        // not just what teardown drained, but an oversize turn the live arm
+        // sent moments before the seam dropped, a mid-game result, the leave
+        // intent above. So the stream is always FINed and fenced: wait for
+        // the relay to close the link — its reader treats the EOF (or the
+        // leave intent directly) as this client done and closes, and that
+        // close arriving here proves the stream was read in full. On a
+        // healthy link the relay's close arrives within a round trip, so the
+        // full window is spent only against an unresponsive relay. Its own
         // window, not fence one's remainder: a stalled datagram settle can
         // exhaust that entirely, and the leave intent force-sent just above
         // would then race the connection close with zero time on the clock —
-        // the very hole this fence exists to close.
-        if control_written && !link_gone {
+        // the very hole this fence exists to close. The finish itself is
+        // best-effort: if the stream is already reset, the wait below still
+        // observes whatever the relay does about it.
+        if !link_gone {
             let _ = control_send.finish();
             let stream_deadline = Instant::now() + TEARDOWN_SETTLE;
             loop {
@@ -1963,12 +1991,9 @@ impl LinkDriver {
 
 /// The outcome of one turn's wire handoff: sent (keep looping), or the session
 /// must end with the given result — an absorbed post-leave close (`Ok`) or a
-/// real failure, exactly as if the send site had returned it inline. A sent
-/// turn reports whether it rode the reliable control stream (an oversize
-/// divert): the teardown drain needs to know, because stream data needs its
-/// own delivery fence before the connection may close.
+/// real failure, exactly as if the send site had returned it inline.
 enum OutboundSend {
-    Sent { control_diverted: bool },
+    Sent,
     EndSession(Result<(), DriverError>),
 }
 
@@ -2046,13 +2071,8 @@ async fn send_game_turn(
                 announcer.absorb_link_close(Err(DriverError::from(error))),
             );
         }
-        return OutboundSend::Sent {
-            control_diverted: true,
-        };
     }
-    OutboundSend::Sent {
-        control_diverted: false,
-    }
+    OutboundSend::Sent
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
@@ -4115,6 +4135,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the driver stops after draining")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_game_close_fences_a_zero_delay_oversize_turn() {
+        // With no phase delay, an oversize final turn goes straight onto the
+        // reliable control stream from the live arm (or from the teardown
+        // drain, if the closed-seam arms win the race) — and either way a
+        // successful write proves nothing about receipt, so the stream fence
+        // must hold the connection open until the peer has read it.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        chan_a.outbound.send(turn(0, &[0x66; 4096])).await.unwrap();
+        drop(chan_a);
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the oversize turn reaches the control stream despite the close")
+            .expect("control reader closed early");
+        match delivered {
+            ControlInbound::OversizeTurn(payload) => {
+                assert_eq!(payload.seq, 0);
+                assert_eq!(payload.commands.len(), 4096);
+            }
+            other => panic!("expected the oversize turn, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver stops after the fence")
             .unwrap()
             .unwrap();
     }

@@ -180,17 +180,28 @@ fn signed_mod(delta: i64, turn: i64) -> i64 {
 /// A correction a slot has not yet visibly responded to (see
 /// [`PhaseController::awaiting_shift`]).
 struct AwaitedShift {
-    /// The slot's position relative to the round's alignment target when the
-    /// correction was commanded (signed, circular). Relative on purpose:
-    /// every slot's absolute phase drifts together with the session's
-    /// schedule (stalls, clock skew), and a gate keyed on absolute phase
-    /// would mistake that common-mode drift for a response — or mask one.
-    /// Measured against the target, the common mode cancels and only the
-    /// slot's own movement within the population remains.
+    /// The slot's position when the correction was commanded, relative to the
+    /// mean phase of that round's *non-commanded* slots (signed, circular).
+    /// Relative on purpose: every slot's absolute phase drifts together with
+    /// the session's schedule (stalls, clock skew), and a gate keyed on
+    /// absolute phase would mistake common-mode drift for a response — or
+    /// mask one. Relative to the non-commanded set specifically: commanded
+    /// peers are about to move by design, so a reference including them would
+    /// swallow a legitimate mass alignment (everyone verifying against
+    /// everyone's movement nets to zero), while a reference of standing-still
+    /// peers passes a real response at full magnitude and dilutes any single
+    /// peer's own drift by the set's size. With one static slot (the target
+    /// in a two-slot session) this degenerates to target-anchored — the best
+    /// available when only one reference exists.
     rel_at_command: i64,
     /// The signed commanded-delay change, whose reflection in the measured
     /// relative position releases the gate.
     commanded_delta: i64,
+    /// The non-commanded slots the relative position was measured against.
+    /// Verification recomputes the same set's mean from current phases
+    /// (members that stopped measuring are skipped; all gone falls back to
+    /// the current target).
+    reference: Vec<SlotId>,
 }
 
 /// One slot's arrival-phase estimate.
@@ -460,10 +471,15 @@ impl PhaseController {
         let span = self.turn_us - widest_gap;
         self.last_span_us = Some(span);
         if span <= SPAN_DEAD_BAND_US {
-            // Converged: the plant is holding still under the current delays,
-            // and whatever shifts were still awaited evidently sufficed.
+            // Converged: the plant is holding still under the current delays.
+            // The response fences deliberately survive this: jitter walks the
+            // span across the dead-band boundary, and a fence dropped on
+            // every inward crossing would let each outward crossing re-command
+            // a slot that never proved it applied anything — a slow ratchet no
+            // round counter would ever catch (the counter resets here too).
+            // A fence is released only by verified movement; a still-fenced
+            // slot in a converged population simply never mattered.
             self.unconverged_rounds = 0;
-            self.awaiting_shift.clear();
             self.next_eval_at = Some(now + IDLE_REEVAL);
             return Vec::new();
         }
@@ -487,19 +503,40 @@ impl PhaseController {
         }
 
         let target = phases[cluster_end].1;
-        let mut corrections = Vec::new();
+        // Every measured phase lies inside the cluster arc (the arc is the
+        // complement of the largest gap), so a set's circular mean is
+        // well-defined by unwrapping along the arc from its earliest phase.
+        let arc_start = phases[(cluster_end + 1) % count].1;
+        let arc_mean = |members: &[SlotId]| -> Option<i64> {
+            let mut sum = 0i64;
+            let mut n = 0i64;
+            for member in members {
+                if let Some(&(_, p)) = phases.iter().find(|&&(s, _)| s == *member) {
+                    sum += (p - arc_start).rem_euclid(self.turn_us);
+                    n += 1;
+                }
+            }
+            (n > 0).then(|| (arc_start + sum / n).rem_euclid(self.turn_us))
+        };
+
+        // Pass one: verify outstanding responses and collect this round's
+        // candidate corrections. A slot still owing a response to its
+        // previous correction gets no further command: if directives are
+        // delayed, lost, or ignored, the command would otherwise ratchet a
+        // cap-step per round toward a near-full-turn delay the client might
+        // later apply all at once. The gate releases only on half the
+        // commanded shift landing in the right direction — half, so estimate
+        // noise cannot wedge a responsive slot — measured against the same
+        // standing-still reference set the command was issued against, and it
+        // survives dead-band crossings and reconnects until that movement is
+        // actually seen. Held rounds still count toward the give-up latch
+        // above.
+        let mut candidates: Vec<(SlotId, i64, i64, i64)> = Vec::new();
         let mut widest_change = 0i64;
         for &(slot, phase) in &phases {
-            // A slot still owing a response to its previous correction gets
-            // no further command: if directives are delayed, lost, or ignored
-            // the command would otherwise ratchet a cap-step per round toward
-            // a near-full-turn delay the client might then apply all at once.
-            // The gate releases on half the commanded shift landing in the
-            // right direction — half, so estimate noise cannot wedge a
-            // responsive slot — and these held rounds still count toward the
-            // give-up latch above.
             if let Some(awaited) = self.awaiting_shift.get(&slot) {
-                let rel_now = signed_mod(phase - target, self.turn_us);
+                let reference = arc_mean(&awaited.reference).unwrap_or(target);
+                let rel_now = signed_mod(phase - reference, self.turn_us);
                 let observed = signed_mod(rel_now - awaited.rel_at_command, self.turn_us);
                 let responded = observed.signum() == awaited.commanded_delta.signum()
                     && observed.abs() * 2 >= awaited.commanded_delta.abs();
@@ -531,11 +568,29 @@ impl PhaseController {
                 continue;
             }
             widest_change = widest_change.max(change.abs());
+            candidates.push((slot, phase, change, next));
+        }
+
+        // Pass two, once the full commanded set is known: the response
+        // reference for each fresh command is the mean of the slots NOT
+        // commanded this round (never empty — the target slot is never
+        // commanded). Commanded peers are excluded because they are about to
+        // move by design; standing-still peers pass a real response at full
+        // magnitude and dilute any single peer's drift by the set's size.
+        let reference: Vec<SlotId> = phases
+            .iter()
+            .map(|&(s, _)| s)
+            .filter(|s| !candidates.iter().any(|&(c, ..)| c == *s))
+            .collect();
+        let reference_mean = arc_mean(&reference).unwrap_or(target);
+        let mut corrections = Vec::new();
+        for &(slot, phase, change, next) in &candidates {
             self.awaiting_shift.insert(
                 slot,
                 AwaitedShift {
-                    rel_at_command: signed_mod(phase - target, self.turn_us),
+                    rel_at_command: signed_mod(phase - reference_mean, self.turn_us),
                     commanded_delta: change,
+                    reference: reference.clone(),
                 },
             );
             // In [0, turn_us), which fits u32 comfortably.
@@ -647,10 +702,11 @@ impl PhaseController {
     /// client still applies it, and the connect-time re-push restates it.
     pub fn remove_slot(&mut self, slot: SlotId) {
         self.slots.remove(&slot);
-        // The awaited response was pinned to the torn-down link's estimate; a
-        // replacement link re-measures from scratch, so the gate re-arms only
-        // if a fresh correction is ever issued.
-        self.awaiting_shift.remove(&slot);
+        // The response fence deliberately survives alongside the commanded
+        // delay it guards: the reconnecting client is re-pushed that same
+        // command, so if it never proved the command applied before the drop,
+        // it must still prove it afterward — clearing here would let each
+        // reconnect advance a never-verified command by another cap step.
     }
 
     /// Total per-slot corrections issued over the session, for the stats line.
@@ -948,6 +1004,143 @@ mod tests {
             correcting_rounds <= MAX_UNCONVERGED_ROUNDS,
             "the latch bounds correcting rounds, got {correcting_rounds}"
         );
+    }
+
+    #[test]
+    fn a_drifting_reference_peer_cannot_reopen_the_response_fence() {
+        // Slot 0 ignores its correction. Its fence was measured against the
+        // two standing-still peers, so one of them drifting afterwards moves
+        // the reference mean only half as far — and slot 0's unchanged phase
+        // must keep reading as no response, drawing no second command.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let turn = i64::from(TURN_US);
+        let offsets = [(slot(0), 0i64), (slot(1), 9_000), (slot(2), 10_000)];
+        let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
+        let first = controller.evaluate(clock + Duration::from_millis(1));
+        assert_eq!(
+            first.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![slot(0)],
+            "only the early slot is corrected"
+        );
+
+        // The target peer drifts 5 ms later; slot 0 applies nothing. Against
+        // a target-anchored fence that drift would read as slot 0 having
+        // moved most of a commanded step; against the reference-set mean it
+        // reads as 2.5 ms the wrong way, and the fence holds.
+        let drifted = [(slot(0), 0i64), (slot(1), 9_000), (slot(2), 15_000)];
+        let mut seq = 300u64;
+        for _ in 0..3u32 {
+            for s_ in seq..seq + 1_000 {
+                for &(id, offset) in &drifted {
+                    let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
+                    controller.note_arrival(id, s_, at);
+                    clock = clock.max(at);
+                }
+            }
+            seq += 1_000;
+            let corrections = controller.evaluate(clock + Duration::from_millis(1));
+            assert!(
+                !corrections.iter().any(|&(s, _)| s == slot(0)),
+                "the unmoved slot draws no second command, got {corrections:?}"
+            );
+        }
+        let parked = controller.commanded(slot(0)).expect("first command stands");
+        assert!(
+            i64::from(parked) <= SLOT_MAX_CHANGE_US,
+            "the command stays parked at one cap step, got {parked}"
+        );
+    }
+
+    #[test]
+    fn dead_band_crossings_do_not_reopen_the_response_fence() {
+        // An ignoring slot near the dead-band boundary: jitter walks the span
+        // in and out of the band. Each inward crossing resets the round
+        // counter, so without a persistent fence every outward crossing would
+        // add another command — a slow ratchet no latch would catch. The
+        // fence must survive the crossings and keep the command parked.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let turn = i64::from(TURN_US);
+        let mut clock = start;
+        let mut seq = 0u64;
+        let feed = |controller: &mut PhaseController,
+                    seq: &mut u64,
+                    clock: &mut Instant,
+                    peer_offset: i64| {
+            for s_ in *seq..*seq + 1_000 {
+                for (id, offset) in [(slot(0), 0i64), (slot(1), peer_offset)] {
+                    let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
+                    controller.note_arrival(id, s_, at);
+                    if at > *clock {
+                        *clock = at;
+                    }
+                }
+            }
+            *seq += 1_000;
+        };
+        // Out of band: the one and only command.
+        feed(&mut controller, &mut seq, &mut clock, 4_000);
+        let first = controller.evaluate(clock + Duration::from_millis(1));
+        assert_eq!(first.len(), 1, "got {first:?}");
+        let parked = first[0].1;
+
+        for _ in 0..4u32 {
+            // The peer jitters inward: span inside the band, rounds reset.
+            feed(&mut controller, &mut seq, &mut clock, 2_500);
+            assert!(
+                controller
+                    .evaluate(clock + Duration::from_millis(1))
+                    .is_empty()
+            );
+            // And back out: the fence must still hold — slot 0 never moved.
+            feed(&mut controller, &mut seq, &mut clock, 4_000);
+            assert!(
+                controller
+                    .evaluate(clock + Duration::from_millis(1))
+                    .is_empty(),
+                "no re-command on an outward crossing"
+            );
+        }
+        assert_eq!(controller.commanded(slot(0)), Some(parked));
+    }
+
+    #[test]
+    fn a_reconnect_does_not_reopen_the_response_fence() {
+        // The commanded delay survives a slot's teardown for the re-push, so
+        // the unverified-response fence must survive with it — otherwise each
+        // reconnect of a never-responding client would advance its command by
+        // another cap step.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let turn = i64::from(TURN_US);
+        let offsets = [(slot(0), 0i64), (slot(1), 8_000)];
+        let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
+        let first = controller.evaluate(clock + Duration::from_millis(1));
+        assert_eq!(first.len(), 1);
+        let commanded = controller.commanded(slot(0)).expect("commanded");
+
+        controller.remove_slot(slot(0));
+        // The reconnected client still applies nothing; fresh estimates, same
+        // unmoved phase.
+        let mut seq = 300u64;
+        for _ in 0..2u32 {
+            for s_ in seq..seq + 1_000 {
+                for &(id, offset) in &offsets {
+                    let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
+                    controller.note_arrival(id, s_, at);
+                    clock = clock.max(at);
+                }
+            }
+            seq += 1_000;
+            assert!(
+                controller
+                    .evaluate(clock + Duration::from_millis(1))
+                    .is_empty(),
+                "no re-command across the reconnect"
+            );
+        }
+        assert_eq!(controller.commanded(slot(0)), Some(commanded));
     }
 
     #[test]
