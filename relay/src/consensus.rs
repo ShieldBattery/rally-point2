@@ -4307,8 +4307,8 @@ impl DecisionMaker {
 
     /// Releases `slot`'s send-phase command fence on its acknowledgement (see
     /// [`PhaseController::note_applied`](crate::phase::PhaseController::note_applied)).
-    pub fn note_phase_applied(&mut self, slot: SlotId, delay_us: u32) {
-        self.phase.note_applied(slot, delay_us);
+    pub fn note_phase_applied(&mut self, slot: SlotId, delay_us: u32, now: Instant) {
+        self.phase.note_applied(slot, delay_us, now);
     }
 
     /// Records this relay's own id, stamped onto every `BufferDirective` this
@@ -5279,8 +5279,9 @@ pub fn note_phase_applied(
     slot: SlotId,
     delay_us: u32,
 ) {
+    let now = Instant::now();
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.note_phase_applied(slot, delay_us);
+        maker.note_phase_applied(slot, delay_us, now);
     }
 }
 

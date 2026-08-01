@@ -628,9 +628,25 @@ impl PhaseController {
     /// the give-up latch: releasing a fence on a latched controller is
     /// harmless (nothing evaluates), and keeping the state coherent costs
     /// nothing.
-    pub fn note_applied(&mut self, slot: SlotId, delay_us: u32) {
-        if self.commanded_us.get(&slot) == Some(&delay_us) {
-            self.awaiting_ack.remove(&slot);
+    ///
+    /// The echo says *adopted*, not *slewed*: the client sends it as it sets
+    /// its new target, with the physical slew still ahead. The issue-time
+    /// dwell normally covers that slew — but an echo delayed past the dwell
+    /// (slow delivery, or the fresh adoption a reconnect re-push triggers)
+    /// would otherwise release the fence straight into an evaluation of a
+    /// barely-applied target, stacking another step onto a client mid-slew.
+    /// So an actual release re-arms a conservative full-step-plus-settle
+    /// dwell from receipt, only ever pushing the next evaluation later.
+    pub fn note_applied(&mut self, slot: SlotId, delay_us: u32, now: Instant) {
+        if self.commanded_us.get(&slot) == Some(&delay_us) && self.awaiting_ack.remove(&slot) {
+            let slew = Duration::from_micros(
+                (SLOT_MAX_CHANGE_US as u64).saturating_mul(1_000_000) / u64::from(SLEW_US_PER_S),
+            );
+            let deadline = now + slew + SETTLE;
+            self.next_eval_at = Some(match self.next_eval_at {
+                Some(at) => at.max(deadline),
+                None => deadline,
+            });
         }
     }
 
@@ -741,7 +757,7 @@ mod tests {
             for &(id, delay) in &corrections {
                 commanded.insert(id, i64::from(delay));
                 // The modeled client both applies and acknowledges.
-                controller.note_applied(id, delay);
+                controller.note_applied(id, delay, clock + Duration::from_millis(2));
             }
             rounds.push(corrections);
         }
@@ -860,7 +876,7 @@ mod tests {
             .map(|&(_, delay)| i64::from(delay))
             .expect("the early slot is corrected");
         for &(id, delay) in &first {
-            controller.note_applied(id, delay);
+            controller.note_applied(id, delay, last + Duration::from_millis(2));
         }
 
         // The client applies the first (capped) correction, but the session
@@ -969,7 +985,7 @@ mod tests {
         );
 
         // A stale echo: acknowledging a delay that was never commanded.
-        controller.note_applied(slot(0), 999);
+        controller.note_applied(slot(0), 999, clock + Duration::from_millis(2));
         // The target peer then drifts 5 ms later while slot 0 applies
         // nothing; no measurement can reopen an explicit fence.
         let drifted = [(slot(0), 0i64), (slot(1), 9_000), (slot(2), 15_000)];
@@ -1100,7 +1116,7 @@ mod tests {
         let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
         let first = controller.evaluate(clock + Duration::from_millis(1));
         assert_eq!(first, vec![(slot(0), 8_000)]);
-        controller.note_applied(slot(0), 8_000);
+        controller.note_applied(slot(0), 8_000, clock + Duration::from_millis(2));
 
         // The client acked but its phase never moved; the released fence
         // permits the next capped step.
@@ -1112,6 +1128,62 @@ mod tests {
             }
         }
         let second = controller.evaluate(clock + Duration::from_millis(1));
+        assert_eq!(second, vec![(slot(0), 16_000)]);
+    }
+
+    #[test]
+    fn a_late_echo_re_arms_the_evaluation_dwell() {
+        // The echo arrives long after the issue-time dwell expired (slow
+        // delivery, or the fresh adoption a reconnect re-push triggers). It
+        // must not release the fence straight into an evaluation of a
+        // barely-adopted target: release re-arms a full-step slew-plus-settle
+        // dwell from receipt, and only after that may the next step issue.
+        let mut controller = PhaseController::new(TURN_US);
+        let start = Instant::now();
+        let turn = i64::from(TURN_US);
+        let offsets = [(slot(0), 0i64), (slot(1), 20_000)];
+        let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
+        let first = controller.evaluate(clock + Duration::from_millis(1));
+        assert_eq!(first, vec![(slot(0), 8_000)]);
+
+        // Well past the issue-time dwell, still unacknowledged: fenced.
+        clock = feed_steady(&mut controller, start, &offsets, 300, 1_000);
+        assert!(
+            controller
+                .evaluate(clock + Duration::from_millis(1))
+                .is_empty()
+        );
+
+        // The echo lands now, late. The fence releases — but evaluation right
+        // after must still hold, because the dwell restarted from receipt.
+        let ack_at = clock + Duration::from_secs(1);
+        controller.note_applied(slot(0), 8_000, ack_at);
+        for seq in 1_300u64..1_340 {
+            for &(id, offset) in &offsets {
+                let at = start + Duration::from_micros((seq as i64 * turn + offset) as u64);
+                controller.note_arrival(id, seq, at);
+                clock = clock.max(at);
+            }
+        }
+        assert!(
+            controller
+                .evaluate(ack_at + Duration::from_millis(500))
+                .is_empty(),
+            "the re-armed dwell holds evaluation off a barely-adopted target"
+        );
+
+        // Once the re-armed dwell passes (with fresh samples), the next
+        // capped step may issue.
+        let mut late = ack_at + Duration::from_secs(13);
+        let resume_seq = 1_340u64;
+        for i in 0..60u64 {
+            for &(id, offset) in &offsets {
+                let at = late + Duration::from_micros((i as i64 * turn + offset) as u64);
+                controller.note_arrival(id, resume_seq + i, at);
+            }
+        }
+        late += Duration::from_micros(59 * u64::from(TURN_US));
+        let second = controller.evaluate(late + Duration::from_millis(1));
         assert_eq!(second, vec![(slot(0), 16_000)]);
     }
 

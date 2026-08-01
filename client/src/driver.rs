@@ -762,7 +762,11 @@ impl LinkDriver {
                     // own error (say, a teardown whose clean leave never
                     // reached the relay) into a clean stop. The error keeps
                     // its classification instead.
-                    if seam.inbound.is_closed() {
+                    // Either half counts: the seam contract stops the driver
+                    // on whichever side the game drops first, so teardown may
+                    // have been entered from a dropped outbound sender with
+                    // the inbound receiver still held.
+                    if seam.inbound.is_closed() || seam.outbound.is_closed() {
                         link.connection().close(0u32.into(), b"driver ended");
                         return Err(error);
                     }
