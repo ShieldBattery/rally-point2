@@ -13,7 +13,12 @@
     "mx": { "aws_region": "mx-central-1", "display_name": "Mexico" }
   },
   "environments": {
-    "staging": { "us-east": "10.80.0.0/22", "us-west": "10.81.0.0/22", "eu-central": "10.82.0.0/22" },
+    "staging": {
+      "us-east": "10.80.0.0/22",
+      "us-west": "10.81.0.0/22",
+      "eu-central": "10.82.0.0/22",
+      "kr": "10.83.0.0/22"
+    },
     "prod": {
       "us-east": "10.84.0.0/22",
       "us-west": "10.85.0.0/22",
