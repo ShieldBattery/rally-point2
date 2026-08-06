@@ -29,8 +29,9 @@ locals {
   }
 
   # The AWS region strings this environment runs in. IAM is global, so the
-  # coordinator user's and execution role's policies are scoped by spelling out
-  # the per-region ARNs of the resources the region module creates; this list
-  # must cover exactly the enabled regions.
+  # execution role's policy is scoped by spelling out the per-region ARNs of
+  # the resources the region module creates; this list must cover exactly the
+  # enabled regions. (The coordinator user's policy instead region-wildcards
+  # its environment-scoped names to stay under the inline-user-policy size cap.)
   aws_regions = [for r in local.regions : r.aws_region]
 }

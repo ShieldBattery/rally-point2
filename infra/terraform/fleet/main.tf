@@ -7,10 +7,10 @@ locals {
   partition  = data.aws_partition.current.partition
 
   # local.aws_regions (in locals.tf) is this environment's AWS region strings.
-  # IAM is global, so the coordinator user's and execution role's policies are
-  # scoped by spelling out the per-region ARNs of the resources the region module
-  # creates. The repositories live in the account stack, so their ARNs are
-  # constructed rather than referenced.
+  # IAM is global, so the execution role's policy is scoped by spelling out the
+  # per-region ARNs of the resources the region module creates. The repositories
+  # live in the account stack, so their ARNs are constructed rather than
+  # referenced.
   repo_arns = [
     for region in local.aws_regions :
     "arn:${local.partition}:ecr:${region}:${local.account_id}:repository/${var.repo_name}"
@@ -26,20 +26,16 @@ locals {
     "arn:${local.partition}:ssm:${region}:${local.account_id}:parameter${local.ssm_parameter_name}"
   ]
 
-  task_definition_arns = [
-    for region in local.aws_regions :
-    "arn:${local.partition}:ecs:${region}:${local.account_id}:task-definition/${local.family}:*"
-  ]
-
-  cluster_arns = [
-    for region in local.aws_regions :
-    "arn:${local.partition}:ecs:${region}:${local.account_id}:cluster/${local.cluster_name}"
-  ]
-
-  task_arns = [
-    for region in local.aws_regions :
-    "arn:${local.partition}:ecs:${region}:${local.account_id}:task/${local.cluster_name}/*"
-  ]
+  # The coordinator user's ECS ARNs wildcard the region segment instead of
+  # enumerating enabled regions: inline user policies are capped at 2048 bytes,
+  # which per-region ARN lists exceed at four regions. The wildcard gives up
+  # nothing that matters — the family and cluster names are environment-scoped
+  # and exist only in regions this environment's Terraform creates them in, so
+  # the credential still cannot touch another environment's (or project's)
+  # clusters anywhere.
+  task_definition_arn_pattern = "arn:${local.partition}:ecs:*:${local.account_id}:task-definition/${local.family}:*"
+  cluster_arn_pattern         = "arn:${local.partition}:ecs:*:${local.account_id}:cluster/${local.cluster_name}"
+  task_arn_pattern            = "arn:${local.partition}:ecs:*:${local.account_id}:task/${local.cluster_name}/*"
 }
 
 # Execution role: used by the ECS agent (not the relay process) to pull the
@@ -124,19 +120,19 @@ resource "aws_iam_user" "coordinator" {
 }
 
 data "aws_iam_policy_document" "coordinator" {
-  # Launch a relay from the task family (any revision) in any of the three
-  # regions. The ecs:cluster condition confines placement to this environment's
+  # Launch a relay from the task family (any revision) in any enabled region.
+  # The ecs:cluster condition confines placement to this environment's
   # clusters, so the credential cannot launch tasks into another cluster.
   statement {
     sid       = "RunTask"
     effect    = "Allow"
     actions   = ["ecs:RunTask"]
-    resources = local.task_definition_arns
+    resources = [local.task_definition_arn_pattern]
 
     condition {
-      test     = "ArnEquals"
+      test     = "ArnLike"
       variable = "ecs:cluster"
-      values   = local.cluster_arns
+      values   = [local.cluster_arn_pattern]
     }
   }
 
@@ -150,12 +146,12 @@ data "aws_iam_policy_document" "coordinator" {
       "ecs:StopTask",
       "ecs:DescribeTasks",
     ]
-    resources = local.task_arns
+    resources = [local.task_arn_pattern]
 
     condition {
-      test     = "ArnEquals"
+      test     = "ArnLike"
       variable = "ecs:cluster"
-      values   = local.cluster_arns
+      values   = [local.cluster_arn_pattern]
     }
   }
 
@@ -169,9 +165,9 @@ data "aws_iam_policy_document" "coordinator" {
     resources = ["*"]
 
     condition {
-      test     = "ArnEquals"
+      test     = "ArnLike"
       variable = "ecs:cluster"
-      values   = local.cluster_arns
+      values   = [local.cluster_arn_pattern]
     }
   }
 
