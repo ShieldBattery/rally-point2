@@ -95,6 +95,18 @@
 //!   but delays the turns inside it by the blackout's whole duration in
 //!   re-carries. The run length *is* that duration in turns, so it joins the
 //!   sum directly.
+//! - **Both loss terms read only *flowing* traffic.** Conditions samples are
+//!   receive-triggered, so a receive gap of a second or more is a stall or
+//!   outage -- lateness no depth inside the bounds could absorb -- and the
+//!   counters accumulated across it (flush re-carries and probes into a dead
+//!   path, declared lost only once acks resume) are excluded from the loss
+//!   windows rather than differenced in as weather, and the gap leaves no
+//!   burst trace -- cumulative counters cannot tie a declaration to the
+//!   packets that died, so no sound dead-path arbiter exists at this layer,
+//!   and a recurring fade is priced when it shows on flowing traffic
+//!   instead. Without the exclusion, a fade
+//!   shorter than the QUIC idle timeout would be punished *harder* than one
+//!   long enough to reconnect, whose epoch reset wipes the windows clean.
 //! - **`turn_duration`** -- one game step at 24 turns/sec == ~41.7ms. Each
 //!   buffer turn adds one step of dispatch delay, so the buffer is measured
 //!   in turns.
@@ -378,6 +390,54 @@ const LOSS_SNAPSHOT_COUNT: usize = 16;
 /// link's RTT, would swing the target by several turns on what is statistically
 /// noise. Below this floor the window reports "no estimate" instead.
 const MIN_LOSS_WINDOW_SENT: u64 = 8;
+
+/// A receive gap at or past this marks the enclosing counter interval as an
+/// outage, not flowing weather. Conditions samples are receive-triggered (one
+/// lands only when the slot's link delivers fresh turns), so the time between
+/// accepted samples is the link's receive gap: a gap this long means the
+/// session was stalled or the link was dark, and no depth inside any session's
+/// buffer bounds -- a few hundred milliseconds -- can absorb that lateness.
+/// The loss counted across such a gap is evidence about a dead path, not about
+/// the weather the buffer prices, so the interval is excluded from the loss
+/// windows (see [`SlotState::rebaseline_after_outage`]). Folding it in would
+/// also punish a short outage *harder* than a long one: past the QUIC idle
+/// timeout the connection tears and the reconnect epoch resets the windows
+/// clean, while a shorter fade would keep the poisoned interval for the whole
+/// loss memory plus the shrink floor.
+const OUTAGE_GAP_MIN: Duration = Duration::from_secs(1);
+
+/// How many advancing samples after its gap an outage pool's banked credit
+/// may still absorb late loss declarations. Loss detection needs post-resume
+/// acks to declare the gap's packets lost, so those declarations land
+/// *after* the gap sample -- as refinements or inside the first post-resume
+/// intervals -- and would poison the restarted windows if differenced in as
+/// fresh weather. Each gap's banked credit expires this many advancing
+/// samples after *its own* gap -- a later gap never renews an earlier
+/// pool's sample deadline -- so a leftover can never mask genuine
+/// post-resume loss beyond a brief resolution window. ~1s of flowing
+/// samples at the nominal cadence: comfortably past loss detection's
+/// resolution (about one RTT after acks resume) at a fraction of the loss
+/// memory. Advancing samples can run far slower than wall time on a
+/// low-traffic link, which is what the wall-clock companion bound below
+/// caps.
+const OUTAGE_LOSS_RESOLUTION_SAMPLES: u32 = 24;
+
+/// The wall-clock companion to [`OUTAGE_LOSS_RESOLUTION_SAMPLES`]: banked
+/// credit expires when *either* bound passes. The sample bound alone
+/// stretches on a link whose sent counter advances rarely (advancing
+/// samples can be far sparser than turns), which would let leftover credit
+/// mask genuine loss for tens of seconds; this caps that stretch. It sits
+/// above the sample bound's nominal ~1s so the sample bound stays the
+/// binding one on a healthy-cadence link. The one place the wall bound is
+/// not enforced is a gap-closing sample's own consumption (see
+/// [`SlotState::rebaseline_after_outage`]): a frozen, ack-less gap defers a
+/// recurrent fade's declarations to exactly that instant, so credit whose
+/// wall window the gap swallowed may still meet them there -- but its
+/// unmet remainder is dropped right after, never carried, because a
+/// *healthy* stall's ack-only traffic resolves pending declarations
+/// mid-gap (a receive gap does not imply an ack gap) and unmet expired
+/// credit is therefore stale.
+const OUTAGE_LOSS_RESOLUTION_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// Ceiling on any single ingested RTT sample, in microseconds (10 seconds).
 /// RTTs arrive as claims — a remote relay's conditions sidecar carries values
@@ -682,6 +742,20 @@ struct LossSnapshot {
 /// decision-maker doesn't act on a rate computed from one cumulative snapshot
 /// or its later loss refinements. A high RTT on the first sample can still
 /// raise the target -- RTT is instantaneous and doesn't need a baseline.
+/// One outage gap's banked absorption credit: how many of that gap's sends
+/// were not yet declared lost when the gap closed, plus the two deadlines
+/// past which the credit no longer absorbs anything -- an advancing-sample
+/// deadline ([`OUTAGE_LOSS_RESOLUTION_SAMPLES`]) and a wall-clock one
+/// ([`OUTAGE_LOSS_RESOLUTION_MAX_AGE`]), whichever passes first. A zero
+/// credit is an empty slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OutagePool {
+    credit: u64,
+    deadline: u32,
+    /// `None` only in an empty slot; banking always stamps a deadline.
+    expires_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SlotState {
     /// Ring buffer of recent RTT samples for jitter-aware sizing.
@@ -741,6 +815,23 @@ struct SlotState {
     /// can still carry a fresh RTT observation, but an exact duplicate must
     /// not consume another position in the sample-count window.
     last_sender_rtt_us: Option<u32>,
+    /// When the last *counter-moving* sample landed; the time since it is the
+    /// receive gap the outage detection reads ([`OUTAGE_GAP_MIN`]). Samples
+    /// with unchanged counters deliberately leave it alone -- across the mesh
+    /// they are usually a cached snapshot re-carried on a sibling slot's
+    /// traffic, not evidence this slot's link is alive. `None` until the
+    /// baseline.
+    last_sample_at: Option<Instant>,
+    /// Banked credit from the last two outage gaps, oldest first: sends from
+    /// a gap not yet declared lost, against which later declarations are
+    /// absorbed (hidden from the loss windows) instead of being priced as
+    /// post-resume weather -- bounded bookkeeping, not packet provenance.
+    /// Two generations so a recurrent fade's unresolved pool survives the
+    /// next gap while each still expires on its *own* deadlines: a later
+    /// gap never renews an earlier pool's deadlines -- at its close an
+    /// expired pool may only meet that sample's declarations before its
+    /// remainder is dropped.
+    outage_pools: [OutagePool; 2],
 }
 
 /// How one cumulative counter sample relates to the accepted loss baseline.
@@ -753,6 +844,11 @@ enum CounterUpdate {
     /// Sent packets advanced and lost packets did not move backward, so this
     /// sample forms a new loss interval.
     Advanced,
+    /// Sent packets advanced, but across a receive gap long enough to be a
+    /// stall or outage rather than flowing weather. The interval was excluded
+    /// from the loss windows -- they re-anchored past it -- instead of being
+    /// differenced in.
+    OutageRebaselined,
     /// Loss detection advanced for the current sent-packet endpoint. Quinn may
     /// declare an already-sent packet lost after the endpoint was sampled, so
     /// this refines that endpoint without rotating it.
@@ -783,6 +879,8 @@ impl SlotState {
         self.blackout_runs = BucketedMax::default();
         self.seen = false;
         self.last_sender_rtt_us = None;
+        self.last_sample_at = None;
+        self.outage_pools = [OutagePool::default(); 2];
     }
 
     /// The jitter-aware RTT: the recent max from the ring buffer. Returns `0`
@@ -810,17 +908,25 @@ impl SlotState {
     /// every that-many advancing samples (plus the baseline), spreading the
     /// ring across the law's loss-memory horizon. `run_bucket_span` is the
     /// blackout-run tracker's bucket width in advancing samples.
+    ///
+    /// `now` is when the sample was accepted. Samples are receive-driven, so
+    /// the time since the previous accepted sample is the link's receive gap;
+    /// an advancing sample across a gap of [`OUTAGE_GAP_MIN`] or more is an
+    /// outage interval and is excluded from the loss windows rather than
+    /// differenced in (see [`rebaseline_after_outage`](Self::rebaseline_after_outage)).
     fn update_counters(
         &mut self,
         lost_packets: u64,
         sent_packets: u64,
         snapshot_interval: u32,
         run_bucket_span: u32,
+        now: Instant,
     ) -> CounterUpdate {
         if !self.seen {
             self.curr_lost = lost_packets;
             self.curr_sent = sent_packets;
             self.seen = true;
+            self.last_sample_at = Some(now);
             self.push_loss_snapshot();
             return CounterUpdate::Baseline;
         }
@@ -830,6 +936,13 @@ impl SlotState {
         }
         if sent_packets == self.curr_sent {
             if lost_packets > self.curr_lost {
+                // Lost moved at the same endpoint: a genuinely fresh home
+                // sample (a cached re-send is bit-identical), so it closes
+                // the receive gap.
+                self.last_sample_at = Some(now);
+                // Declarations matched against banked outage credit are
+                // hidden from every window; see `absorb_outage_losses`.
+                let absorbed = self.absorb_outage_losses(lost_packets - self.curr_lost, now);
                 self.curr_lost = lost_packets;
                 // A loss declared late still belongs to packets sent at (or
                 // before) this endpoint. Any snapshot recorded at this same
@@ -838,18 +951,60 @@ impl SlotState {
                 // few packets sent *after* it, spiking the rate. Refine such
                 // snapshots in place (there is at most one in practice: the
                 // baseline, or a decimation snapshot that happened to land on
-                // this endpoint).
-                for age in 0..self.loss_snapshot_len {
-                    let index = (self.loss_snapshot_head + LOSS_SNAPSHOT_COUNT - 1 - age)
-                        % LOSS_SNAPSHOT_COUNT;
-                    if self.loss_snapshots[index].sent != self.curr_sent {
-                        break;
+                // this endpoint). Older snapshots legitimately count the
+                // refinement -- except the share absorbed by an outage pool,
+                // which is hidden from them as well.
+                for snapshot in &mut self.loss_snapshots[..self.loss_snapshot_len] {
+                    if snapshot.sent == self.curr_sent {
+                        snapshot.lost = lost_packets;
+                    } else {
+                        snapshot.lost = snapshot.lost.saturating_add(absorbed);
                     }
-                    self.loss_snapshots[index].lost = lost_packets;
                 }
                 return CounterUpdate::LossAdvanced;
             }
             return CounterUpdate::NonAdvancing;
+        }
+
+        let delta_sent = sent_packets - self.curr_sent;
+        let delta_lost = lost_packets.saturating_sub(self.curr_lost);
+
+        // The receive gap is measured between *counter-moving* samples, and
+        // only those update the clock. A sample with unchanged counters
+        // (NonAdvancing above) must not close the gap: locally it is a no-op
+        // interval, and across the mesh it is usually a *cached* snapshot of
+        // this slot's conditions re-attached to a co-homed sibling's traffic
+        // (see `snapshot_conditions`) -- during this slot's fade the sibling
+        // keeps forwarding the stale entry, and letting those duplicates
+        // advance the clock would erase the very gap the outage detection
+        // reads. A genuinely flowing link moves its counters on essentially
+        // every home sample (the relay is always sending it at least acks),
+        // so keying the clock to movement costs nothing in the healthy case.
+        let gap = self
+            .last_sample_at
+            .map(|at| now.saturating_duration_since(at));
+        self.last_sample_at = Some(now);
+
+        // An advancing sample across a stall-length receive gap measures a
+        // dead or idle link, not weather -- exclude it from the windows.
+        if gap.is_some_and(|gap| gap >= OUTAGE_GAP_MIN) {
+            return self.rebaseline_after_outage(lost_packets, sent_packets, run_bucket_span, now);
+        }
+
+        // A declaration matched against banked outage credit is *assumed* to
+        // be a gap's late-resolving loss: it is hidden from every retained
+        // window anchor, and the blackout run is judged on the remainder.
+        // This is bounded bookkeeping, not provenance -- no cumulative
+        // counter can say which packets a declaration belongs to -- but the
+        // misattribution cost is capped by the credit's size and expiry,
+        // while pricing a dead gap's declarations as weather would recreate
+        // the very spike the exclusion exists to prevent.
+        let absorbed = self.absorb_outage_losses(delta_lost, now);
+        let weather_lost = delta_lost - absorbed;
+        if absorbed > 0 {
+            for snapshot in &mut self.loss_snapshots[..self.loss_snapshot_len] {
+                snapshot.lost = snapshot.lost.saturating_add(absorbed);
+            }
         }
 
         // A sample interval that lost *every* packet it covered is a link
@@ -861,9 +1016,7 @@ impl SlotState {
         // but arrive without a sent-delta to compare against, so runs are
         // built from advancing samples only -- a slight undercount when loss
         // detection lags, which the rate terms still cover.
-        let delta_sent = sent_packets - self.curr_sent;
-        let delta_lost = lost_packets.saturating_sub(self.curr_lost);
-        if delta_lost >= delta_sent {
+        if weather_lost >= delta_sent {
             self.blackout_run = self.blackout_run.saturating_add(1);
         } else {
             self.blackout_run = 0;
@@ -881,6 +1034,164 @@ impl SlotState {
             self.push_loss_snapshot();
         }
         CounterUpdate::Advanced
+    }
+
+    /// Accepts an advancing sample whose interval spanned a stall-length
+    /// receive gap ([`OUTAGE_GAP_MIN`]), excluding that interval from the loss
+    /// windows instead of differencing it in as weather.
+    ///
+    /// The windows restart at the post-gap endpoint (mirroring what the
+    /// reconnect epoch reset does when an outage runs long enough to tear the
+    /// connection), and the gap's sends not yet declared lost are banked to
+    /// absorb the late declarations that follow once acks resume.
+    ///
+    /// Banking is deliberately unconditional, because it is *self-limiting*:
+    /// credit only ever cancels losses that actually get declared. A dead
+    /// gap's credit is typically consumed by its own late declarations; an
+    /// idle gap's keepalive-sized credit either expires unused or -- since
+    /// absorption is bookkeeping without packet provenance -- soaks up that
+    /// much genuine weather instead. The worst case of over-banking is
+    /// therefore bounded and brief: at most the gap's own handful of sends,
+    /// until the credit's deadlines pass. The worst case of under-banking is
+    /// the original spike this mechanism exists to prevent. (Gating on send
+    /// pacing was tried and is unsound: Quinn's congestion collapse plus PTO
+    /// backoff drives a dead path's *actual* wire rate below any fixed
+    /// threshold as a fade lengthens, misclassifying exactly the gaps that
+    /// matter.)
+    ///
+    /// The gap deliberately leaves **no burst-term residue**. Cumulative
+    /// counters cannot tie a loss declaration to the packets that died, so
+    /// absorption is fungible bookkeeping, not provenance: banked idle
+    /// credit could "materialize" genuine weather losses as outage evidence,
+    /// charging a healthy link the capped credit -- and send pacing fails in
+    /// the opposite direction (above). With no sound dead-path arbiter at
+    /// this layer, the residue is omitted: a recurring fade is priced when
+    /// it manifests on flowing traffic, which the raise side of the law
+    /// already does within about a second.
+    fn rebaseline_after_outage(
+        &mut self,
+        lost_packets: u64,
+        sent_packets: u64,
+        run_bucket_span: u32,
+        now: Instant,
+    ) -> CounterUpdate {
+        let delta_sent = sent_packets - self.curr_sent;
+        let delta_lost = lost_packets.saturating_sub(self.curr_lost);
+
+        // Under a recurrent fade the previous outage's losses are often
+        // declared inside the *next* gap's interval (acks never resumed in
+        // between), so this gap's `delta_lost` consumes the prior pools
+        // first -- otherwise the old declarations would cancel the new gap's
+        // banking, leaving the new gap's own late declarations to be priced
+        // as weather. The wall deadline is deliberately not enforced for
+        // this one consumption: a frozen (ack-less) gap defers resolution to
+        // exactly this sample, so credit whose wall window the gap itself
+        // swallowed still gets to meet its declarations here.
+        let consumed = self.drain_pools(delta_lost, None);
+        let residual_declared = delta_lost - consumed;
+        let fresh_undeclared = delta_sent.saturating_sub(residual_declared);
+
+        // What the close's declarations did not consume survives only within
+        // its own wall window; a wall-expired remainder is dropped, never
+        // carried. A receive gap proves only that no fresh payload produced
+        // a sample -- ack-only traffic still flows through a *healthy* stall
+        // and resolves pending declarations mid-gap (they land in this very
+        // delta), so expired credit with nothing to meet here is stale, and
+        // carrying it (or handing it the gap's length back) would let every
+        // ordinary stall revive old credit to mask genuine post-stall loss.
+        // Accepted residual corner: a second dead fade beginning within a
+        // round-trip of the first and outrunning the wall cap prices the
+        // first fade's stragglers as weather -- bounded by that credit, once.
+        for pool in &mut self.outage_pools {
+            if pool.expires_at.is_none_or(|expires| now >= expires) {
+                pool.credit = 0;
+            }
+        }
+
+        self.curr_lost = lost_packets;
+        self.curr_sent = sent_packets;
+        self.advancing_samples = self.advancing_samples.saturating_add(1);
+        // The gap interval is excluded wholesale: no weather-driven run, and
+        // no synthetic residue either (see the no-residue note above).
+        self.blackout_run = 0;
+        self.blackout_runs
+            .observe(self.advancing_samples, self.blackout_run, run_bucket_span);
+
+        // The gap interval never enters the loss windows: restart them at the
+        // post-gap endpoint, exactly like a reconnect's window reset.
+        self.loss_snapshots = [LossSnapshot::default(); LOSS_SNAPSHOT_COUNT];
+        self.loss_snapshot_head = 0;
+        self.loss_snapshot_len = 0;
+        self.push_loss_snapshot();
+
+        // Bank this gap's credit as its own generation with its own
+        // deadlines. A surviving prior pool keeps its deadlines -- a new gap
+        // must never renew nearly-expired old credit, or stale credit could
+        // absorb genuine loss well past its resolution window. With both
+        // generation slots live, the older is dropped: a third unresolved
+        // episode inside one resolution window is pathological, and dropping
+        // the stalest credit only risks pricing its stragglers as weather,
+        // never masking anything.
+        if fresh_undeclared > 0 {
+            if self.outage_pools[1].credit > 0 {
+                self.outage_pools[0] = self.outage_pools[1];
+            }
+            self.outage_pools[1] = OutagePool {
+                credit: fresh_undeclared,
+                deadline: self
+                    .advancing_samples
+                    .saturating_add(OUTAGE_LOSS_RESOLUTION_SAMPLES),
+                expires_at: Some(now + OUTAGE_LOSS_RESOLUTION_MAX_AGE),
+            };
+        }
+
+        CounterUpdate::OutageRebaselined
+    }
+
+    /// Takes up to `declared` losses out of the banked outage pools (oldest
+    /// generation first), returning how many were absorbed -- counted
+    /// against outage credit rather than priced as current weather. This is
+    /// deliberately bookkeeping, not attribution: no cumulative counter can
+    /// say which packets a declaration belongs to, so what bounds the
+    /// misattribution is the credit itself -- capped at each gap's
+    /// undeclared sends and expired on the earlier of its sample deadline
+    /// ([`OUTAGE_LOSS_RESOLUTION_SAMPLES`]) and its wall-clock age
+    /// ([`OUTAGE_LOSS_RESOLUTION_MAX_AGE`]), so a leftover can never mask
+    /// genuine post-resume loss for long.
+    fn absorb_outage_losses(&mut self, declared: u64, now: Instant) -> u64 {
+        self.drain_pools(declared, Some(now))
+    }
+
+    /// Drains up to `declared` losses from the banked pools, oldest
+    /// generation first. `wall` is the wall-clock instant to enforce expiry
+    /// against -- `None` only at a gap-closing sample, where a frozen gap's
+    /// deferred declarations get to meet credit whose wall window the gap
+    /// itself swallowed (see
+    /// [`rebaseline_after_outage`](Self::rebaseline_after_outage), which
+    /// drops wall-expired remainders immediately afterward). The sample
+    /// deadline is always enforced, lazily expiring what it passes.
+    fn drain_pools(&mut self, declared: u64, wall: Option<Instant>) -> u64 {
+        let at = self.advancing_samples;
+        let mut remaining = declared;
+        let mut absorbed = 0;
+        for pool in &mut self.outage_pools {
+            if pool.credit == 0 {
+                continue;
+            }
+            let wall_expired = match wall {
+                Some(now) => pool.expires_at.is_none_or(|expires| now >= expires),
+                None => false,
+            };
+            if at >= pool.deadline || wall_expired {
+                pool.credit = 0;
+                continue;
+            }
+            let take = remaining.min(pool.credit);
+            pool.credit -= take;
+            remaining -= take;
+            absorbed += take;
+        }
+        absorbed
     }
 
     /// Appends the current counter endpoint to the snapshot ring, overwriting
@@ -2859,6 +3170,15 @@ impl DecisionMaker {
     ) -> Option<Decision> {
         let snapshot_interval = self.law.loss_snapshot_interval();
         let run_bucket_span = self.law.blackout_run_bucket_span();
+        // One acceptance instant for the whole batch: the receive-gap clock
+        // the outage detection reads. Remote sidecars are stamped at authority
+        // arrival, and a mesh sidecar re-carries a *cached* snapshot of every
+        // co-homed slot's conditions on any sibling's traffic -- so arrival
+        // alone proves nothing about a given slot's freshness. That is why
+        // `update_counters` advances the gap clock only on samples whose
+        // counters moved: a cached re-send is bit-identical and leaves the
+        // clock (and so the measured gap) untouched.
+        let now = Instant::now();
         for slot in conditions {
             // A truncating cast would alias an out-of-range wire slot onto a
             // different, valid slot's tracked RTT/loss state, corrupting that
@@ -2895,7 +3215,17 @@ impl DecisionMaker {
                 slot.sent_packets,
                 snapshot_interval,
                 run_bucket_span,
+                now,
             );
+            if counter_update == CounterUpdate::OutageRebaselined {
+                tracing::debug!(
+                    tenant = self.key.tenant.as_ref(),
+                    session = self.key.session.0,
+                    slot = id.0,
+                    "counter sample spanned a stall-length receive gap; \
+                     outage interval excluded from the loss windows",
+                );
+            }
 
             // Sender RTT is instantaneous rather than cumulative, but a
             // counter-regressing sidecar is known to be stale as a whole and
@@ -2907,9 +3237,10 @@ impl DecisionMaker {
             // near-u32::MAX claim cannot saturate every effective-RTT sum.
             let rtt_us = slot.rtt_us.min(MAX_INGEST_RTT_US);
             let admit_sender_rtt = match counter_update {
-                CounterUpdate::Baseline | CounterUpdate::Advanced | CounterUpdate::LossAdvanced => {
-                    true
-                }
+                CounterUpdate::Baseline
+                | CounterUpdate::Advanced
+                | CounterUpdate::OutageRebaselined
+                | CounterUpdate::LossAdvanced => true,
                 CounterUpdate::NonAdvancing => state.last_sender_rtt_us != Some(rtt_us),
                 CounterUpdate::Stale => false,
             };
@@ -6249,6 +6580,26 @@ mod tests {
         maker.slots[&SlotId(slot)].windowed_loss_rate(maker.law.loss_attack_samples)
     }
 
+    /// Drives one raw counter sample into an established slot's state at a
+    /// synthetic instant, so tests can fabricate receive gaps without
+    /// sleeping. Bypasses ingest deliberately: epoch activation and RTT
+    /// admission are not what the gap tests exercise.
+    fn sample_at(
+        maker: &mut DecisionMaker,
+        slot: u8,
+        lost: u64,
+        sent: u64,
+        at: Instant,
+    ) -> CounterUpdate {
+        let interval = maker.law.loss_snapshot_interval();
+        let span = maker.law.blackout_run_bucket_span();
+        maker
+            .slots
+            .get_mut(&SlotId(slot))
+            .unwrap()
+            .update_counters(lost, sent, interval, span, at)
+    }
+
     /// One slot-link packet's worth of input: frames observed off the packet's
     /// validated turns, then the sampled conditions ingested.
     fn ingest_at(maker: &mut DecisionMaker, c: &LinkConditions, frame: u32) -> Option<Decision> {
@@ -6414,6 +6765,12 @@ mod tests {
             let single_decision = single.ingest_local_condition(sample);
 
             assert_eq!(single_decision, batch_decision, "sample {index}");
+            // The two paths capture their acceptance instants microseconds
+            // apart; the wall-clock stamp is incidental to the state
+            // transitions under comparison, so align it before the equality.
+            for (slot, state) in single.slots.iter_mut() {
+                state.last_sample_at = batch.slots[slot].last_sample_at;
+            }
             assert_eq!(single.slots, batch.slots, "sample {index}");
             assert_eq!(single.buffer, batch.buffer, "sample {index}");
             assert_eq!(single.last_decision_frame, batch.last_decision_frame);
@@ -8051,6 +8408,559 @@ mod tests {
             );
         }
         assert_eq!(maker.target_inputs().unwrap().burst_turns, BURST_TURNS_CAP);
+    }
+
+    /// A counter interval spanning a stall-length receive gap is an outage,
+    /// not weather: the loss windows restart past it instead of differencing
+    /// the dead-path interval in -- the rate term, which would otherwise
+    /// read tens of percent for the whole loss memory and hold the shrink
+    /// floor up long after recovery, reads clean, and the excluded gap
+    /// leaves no burst trace either. An outage past the QUIC idle timeout
+    /// reconnects and resets these windows via the connection epoch; a
+    /// shorter fade must not be punished harder.
+    #[test]
+    fn a_stall_spanning_gap_is_excluded_from_the_loss_windows() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        // Clean flowing history at 150ms: path 4 turns, no loss.
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        for i in 1..=10u32 {
+            let update = sample_at(&mut maker, 0, 0, 100 + u64::from(i) * 5, start + step * i);
+            assert_eq!(update, CounterUpdate::Advanced);
+        }
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+
+        // A 5s fade: 40 flush-paced sends into the dead path, all declared
+        // lost by the time the first post-resume sample lands.
+        let resume = start + step * 10 + Duration::from_secs(5);
+        let update = sample_at(&mut maker, 0, 40, 190, resume);
+        assert_eq!(update, CounterUpdate::OutageRebaselined);
+
+        // The poisoned interval is invisible: no rate until the restarted
+        // window spans enough packets, then the actual (clean) post-resume
+        // weather.
+        assert_eq!(slot_loss_rate(&maker, 0), None);
+        for i in 1..=10u32 {
+            sample_at(&mut maker, 0, 40, 190 + u64::from(i) * 5, resume + step * i);
+        }
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+
+        // No trace at all: the target is back to its path term alone.
+        assert_eq!(maker.target_inputs().unwrap().burst_turns, 0);
+        assert_eq!(maker.target(), Some(4));
+    }
+
+    /// Quinn declares an outage's losses only once acks resume -- the gap
+    /// sample itself usually shows the dead-path sends still undeclared, and
+    /// the lost counter jumps one or two samples later. Those late
+    /// declarations belong to the outage: they are absorbed against the
+    /// gap's undeclared sends and hidden from the restarted windows instead
+    /// of being priced as post-resume weather, and the interval carrying the
+    /// jump is no blackout -- its own traffic got through.
+    #[test]
+    fn outage_losses_declared_after_resume_are_absorbed_not_priced() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // 5s fade, 40 dead-path sends, none declared lost yet at resume.
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 140, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+        // The next flowing sample delivers 2 sends -- and the 40 late
+        // declarations land at once.
+        assert_eq!(
+            sample_at(&mut maker, 0, 40, 142, resume + step),
+            CounterUpdate::Advanced,
+        );
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            state.blackout_run, 0,
+            "the jump is outage residue, not a fresh blackout",
+        );
+
+        // Flow on: the windows read the actual weather, not the residue.
+        for i in 2..=12u32 {
+            sample_at(
+                &mut maker,
+                0,
+                40,
+                142 + u64::from(i - 1) * 5,
+                resume + step * i,
+            );
+        }
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+        assert_eq!(maker.target_inputs().unwrap().burst_turns, 0);
+    }
+
+    /// Absorption is fungible bookkeeping, not provenance: a cumulative
+    /// counter cannot say which packets a declaration belongs to, so banked
+    /// idle credit will happily soak up genuine weather losses. That is
+    /// exactly why the excluded gap leaves no burst trace: were absorbed
+    /// declarations treated as dead-path evidence, two idle gaps' delivered
+    /// keepalives plus four genuine weather losses would "materialize" as an
+    /// outage and charge this perfectly healthy link the capped credit.
+    #[test]
+    fn absorbed_weather_losses_never_manufacture_burst_credit() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // Two idle stalls, each bridged by two delivered keepalives, bank
+        // two packets of credit apiece.
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 102, start + Duration::from_secs(2)),
+            CounterUpdate::OutageRebaselined,
+        );
+        let resume = start + Duration::from_secs(4);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 104, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // The first flowing interval genuinely loses four packets. They
+        // drain what idle credit is still unexpired (the bounded masking
+        // cost) -- but they are weather, and no burst credit may appear
+        // for them.
+        sample_at(&mut maker, 0, 4, 108, resume + step);
+        assert_eq!(
+            maker.target_inputs().unwrap().burst_turns,
+            0,
+            "no manufactured outage credit on a healthy link",
+        );
+    }
+
+    /// The absorption pool covers only the brief post-resume window in which
+    /// quinn resolves the outage's losses. Loss past that horizon is priced
+    /// as the weather it is, leftover pool or not.
+    #[test]
+    fn the_outage_absorption_pool_expires() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // 40 dead-path sends, none declared: pool of 40 banked at the gap.
+        let resume = start + Duration::from_secs(5);
+        sample_at(&mut maker, 0, 0, 140, resume);
+        // A clean resolution horizon passes with no declarations.
+        for i in 1..=OUTAGE_LOSS_RESOLUTION_SAMPLES {
+            sample_at(&mut maker, 0, 0, 140 + u64::from(i) * 5, resume + step * i);
+        }
+        // A genuine loss burst after the horizon: nothing absorbs it.
+        let sent = 140 + u64::from(OUTAGE_LOSS_RESOLUTION_SAMPLES) * 5;
+        sample_at(
+            &mut maker,
+            0,
+            10,
+            sent + 10,
+            resume + step * (OUTAGE_LOSS_RESOLUTION_SAMPLES + 1),
+        );
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            state.blackout_run, 1,
+            "an all-lost interval, priced normally"
+        );
+        assert!(slot_loss_rate(&maker, 0).unwrap() > 0.0);
+    }
+
+    /// Gaps shorter than the outage threshold are ordinary sampling cadence:
+    /// an all-lost interval across one still builds the blackout run and
+    /// prices into the rate windows exactly as before.
+    #[test]
+    fn a_sub_second_gap_still_prices_as_weather() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        let update = sample_at(&mut maker, 0, 10, 110, start + Duration::from_millis(500));
+        assert_eq!(update, CounterUpdate::Advanced);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(state.blackout_run, 1);
+        assert_eq!(slot_loss_rate(&maker, 0), Some(1.0));
+    }
+
+    /// A mesh sidecar re-carries a cached snapshot of every co-homed slot's
+    /// conditions on any sibling's traffic, so a faded slot's stale counters
+    /// keep arriving at the authority for as long as its siblings keep
+    /// sending. Those bit-identical duplicates must not advance the
+    /// receive-gap clock: if they did, the authority would measure no gap at
+    /// the recovery jump and difference the dead-path interval into the
+    /// windows as weather -- the original buffer spike, recreated on every
+    /// relay that is not the slot's home.
+    #[test]
+    fn cached_sidecar_duplicates_do_not_defeat_gap_detection() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // The slot fades; its siblings' traffic keeps re-delivering the
+        // cached (sent=100, lost=0) snapshot every quarter second, the last
+        // one only 250ms before recovery -- so an arrival-keyed clock would
+        // measure no stall-length gap at all here.
+        for i in 1..=19u32 {
+            let update = sample_at(
+                &mut maker,
+                0,
+                0,
+                100,
+                start + Duration::from_millis(250) * i,
+            );
+            assert_eq!(update, CounterUpdate::NonAdvancing);
+        }
+
+        // Recovery: 40 dead-path sends declared at once, five seconds after
+        // the last counter *movement*. The duplicates must not have closed
+        // that gap.
+        let update = sample_at(&mut maker, 0, 40, 140, start + Duration::from_secs(5));
+        assert_eq!(update, CounterUpdate::OutageRebaselined);
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            None,
+            "windows restarted, not poisoned",
+        );
+    }
+
+    /// Wi-Fi fades recur, and a second fade can begin before the first
+    /// fade's losses were ever declared (acks never resumed in between).
+    /// The first fade's declarations then land inside the *second* gap's
+    /// interval -- they must consume the prior pool, not cancel the new
+    /// gap's banking. Overwriting the pool with `delta_sent - delta_lost`
+    /// would zero it here and price the second fade's own late declarations
+    /// as ~100% post-resume weather.
+    #[test]
+    fn a_recurrent_fade_keeps_absorbing_across_overlapping_outages() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // Fade 1 resumes: 40 dead-path sends, none declared yet.
+        let resume1 = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 140, resume1),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // Fade 2 begins before fade 1's losses resolve and resumes 5s
+        // later: its own 40 dead-path sends are still undeclared, while
+        // fade 1's 40 declarations land inside this gap's interval.
+        let resume2 = resume1 + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 40, 180, resume2),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // Fade 2's late declarations land on the next flowing sample --
+        // absorbed against the carried-forward pool, not priced as weather.
+        assert_eq!(
+            sample_at(&mut maker, 0, 80, 182, resume2 + step),
+            CounterUpdate::Advanced,
+        );
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            state.blackout_run, 0,
+            "the jump is outage residue, not a fresh blackout",
+        );
+
+        for i in 2..=12u32 {
+            sample_at(
+                &mut maker,
+                0,
+                80,
+                182 + u64::from(i - 1) * 5,
+                resume2 + step * i,
+            );
+        }
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+        assert_eq!(maker.target_inputs().unwrap().burst_turns, 0);
+    }
+
+    /// Pool banking is unconditional but *self-limiting*: an idle gap banks
+    /// only its own delivered handful of sends, so the most it can ever mask
+    /// is that handful, briefly -- genuine post-resume loss beyond it prices
+    /// as the weather it is, and the delivered keepalives never materialize
+    /// as evidence, so the episode earns no burst credit either.
+    #[test]
+    fn an_idle_gap_masks_at_most_its_own_sends() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // A 10s stall bridged by two delivered keepalive pings...
+        let resume = start + Duration::from_secs(10);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 102, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+        // ...then a genuine 10-loss post-resume burst: at most the gap's own
+        // 2 banked sends absorb; the other 8 price into the windows.
+        sample_at(&mut maker, 0, 10, 112, resume + step);
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            Some(0.8),
+            "8 of the 10 losses price over the 10 packets since the gap",
+        );
+        assert_eq!(
+            maker.target_inputs().unwrap().burst_turns,
+            0,
+            "absorption is masking only; it never becomes burst credit",
+        );
+    }
+
+    /// On a genuinely dead path Quinn's congestion window collapses and PTO
+    /// backoff throttles *actual* transmissions to a handful of packets
+    /// however hard the maintenance flush queues -- so dead-path handling
+    /// must not depend on the gap's send volume. The few throttled sends
+    /// still bank, and their declarations still absorb instead of pricing
+    /// as ~100% post-resume weather.
+    #[test]
+    fn a_congestion_throttled_dead_path_still_absorbs() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // A 5s blackout during which Quinn actually transmitted only ten
+        // congestion/PTO-limited packets, none declared lost yet at resume.
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 110, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+        // The declarations land over the first post-resume interval --
+        // absorbed against the banked sends, not priced over two new packets.
+        assert_eq!(
+            sample_at(&mut maker, 0, 10, 112, resume + step),
+            CounterUpdate::Advanced,
+        );
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(state.blackout_run, 0, "outage residue, not fresh weather");
+
+        for i in 2..=12u32 {
+            sample_at(
+                &mut maker,
+                0,
+                10,
+                112 + u64::from(i - 1) * 5,
+                resume + step * i,
+            );
+        }
+        assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+        assert_eq!(
+            maker.target_inputs().unwrap().burst_turns,
+            0,
+            "absorption leaves no synthetic burst trace",
+        );
+    }
+
+    /// Banked credit expires on its own gap's clock, and a later gap must
+    /// never renew it: an idle gap arriving one sample before an old dead
+    /// pool's deadline banks its own two keepalives with a fresh deadline,
+    /// but the old forty-packet pool still dies on schedule -- genuine
+    /// post-idle loss meets at most the idle gap's own tiny credit.
+    #[test]
+    fn an_idle_gap_does_not_extend_a_prior_pools_deadline() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // A dead gap banks 40 undeclared sends (deadline: 24 advancing
+        // samples after this gap sample).
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 140, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+        // 23 clean advancing samples bring the pool one sample from expiry,
+        // with its declarations never arriving.
+        for i in 1..=23u32 {
+            sample_at(&mut maker, 0, 0, 140 + u64::from(i) * 5, resume + step * i);
+        }
+
+        // An idle gap banks its own two keepalives on a fresh deadline; the
+        // old pool's deadline must not move.
+        let idle_resume = resume + step * 23 + Duration::from_millis(1500);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 257, idle_resume),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // Genuine loss on the next sample: the old pool expired on schedule,
+        // so only the idle gap's 2 banked sends absorb -- 8 of the 10 price.
+        sample_at(&mut maker, 0, 10, 262, idle_resume + step);
+        sample_at(&mut maker, 0, 10, 267, idle_resume + step * 2);
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            Some(0.8),
+            "8 of 10 losses over the 10 packets since the idle gap",
+        );
+        assert_eq!(
+            maker.target_inputs().unwrap().burst_turns,
+            1,
+            "the genuine loss's own one-turn run is the only burst trace",
+        );
+    }
+
+    /// The sample-count deadline alone would let banked credit overstay on
+    /// a link whose sent counter advances rarely -- advancing samples can
+    /// cover far more wall time than the nominal cadence suggests -- so a
+    /// wall-clock bound expires it too: after two seconds of connected
+    /// time the leftover credit is gone and genuine loss prices as
+    /// weather, even with the sample deadline nowhere near.
+    #[test]
+    fn banked_credit_expires_on_wall_clock_on_a_slow_advancing_link() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // A dead gap banks 40 undeclared sends.
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 140, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // The link advances only twice a second (each spacing well under the
+        // outage-gap threshold): five advancing samples span 2.5s of
+        // connected time while the 24-sample deadline is nowhere near.
+        let slow = Duration::from_millis(500);
+        for i in 1..=5u32 {
+            sample_at(&mut maker, 0, 0, 140 + u64::from(i) * 2, resume + slow * i);
+        }
+
+        // Genuine loss at 3s: the credit is wall-expired; nothing absorbs.
+        sample_at(&mut maker, 0, 10, 155, resume + slow * 6);
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            state.blackout_run, 1,
+            "an all-lost weather interval, priced"
+        );
+        assert!(
+            slot_loss_rate(&maker, 0).unwrap() > 0.0,
+            "no stale credit absorbs it",
+        );
+    }
+
+    /// A later idle gap must not revive wall-expired credit. A receive gap
+    /// proves only that no fresh payload produced a sample -- ack-only
+    /// traffic still flows through a healthy stall and resolves pending
+    /// declarations mid-gap -- so credit that outlived its wall window with
+    /// nothing to meet at the gap's close is stale, and post-stall genuine
+    /// loss must meet at most the idle gap's own banked sends.
+    #[test]
+    fn an_idle_gap_does_not_revive_expired_credit() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let start = Instant::now();
+        let step = Duration::from_millis(42);
+        ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+
+        // A dead gap banks 40 undeclared sends (wall deadline: 2s out)...
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 140, resume),
+            CounterUpdate::OutageRebaselined,
+        );
+        // ...one clean flowing sample follows...
+        sample_at(&mut maker, 0, 0, 145, resume + Duration::from_millis(100));
+
+        // ...then a healthy 10s stall closes with two delivered keepalives
+        // and no declarations: the old credit found nothing to meet at the
+        // close and is dropped, not revived.
+        let idle_close = resume + Duration::from_millis(10_100);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 147, idle_close),
+            CounterUpdate::OutageRebaselined,
+        );
+
+        // Genuine loss right after: only the idle gap's own two banked
+        // sends absorb. Revived credit would have swallowed all ten and
+        // read a clean window here.
+        sample_at(&mut maker, 0, 10, 157, idle_close + step);
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            Some(0.8),
+            "8 of the 10 losses price; only the idle gap's 2 sends mask",
+        );
     }
 
     /// Edge probation: a floor-level shrink that gets promptly disproven

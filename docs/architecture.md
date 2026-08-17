@@ -493,6 +493,24 @@ stretch boundary is the same tolerance as the alignment health gate, the two mec
 severity axis without overlap (a session stretched enough to press is one alignment already refuses
 to touch).
 
+Loss evidence is likewise gated to what a buffer can actually answer. Conditions samples are
+receive-triggered, so a receive gap of a second or more (measured between counter-*moving* samples —
+across the mesh, a quiet slot's cached conditions keep riding its siblings' traffic, so mere arrival
+proves nothing) marks a stall or outage rather than flowing weather — lateness beyond what any depth
+inside the bounds could absorb. The counters that accumulate across such a gap (maintenance flushes
+and probes transmitted into an unreachable link, declared lost only after acks resume) are excluded
+from the loss-rate windows: the windows re-anchor past the gap, and the gap's not-yet-declared sends
+are banked briefly to absorb the late loss declarations so they cannot masquerade as post-resume
+weather. The excluded gap deliberately leaves no burst-term residue: cumulative loss counters cannot
+tie a declaration to the packets that died, so any after-the-fact "was this gap a dead path" verdict
+is unsound — wire pacing fails because a dead path's congestion-collapsed, PTO-throttled send rate
+falls with fade length, and treating absorbed declarations as evidence fails because absorption is
+fungible, letting banked idle credit "materialize" genuine weather losses as an outage on a healthy
+link. A recurring fade is instead priced the moment it manifests on flowing traffic, which the raise
+side of the law already does within about a second. This keeps the response monotonic in outage
+length: an outage past the QUIC idle timeout already resumes with clean windows (the reconnect's
+connection epoch resets them), so a shorter fade must never be priced harsher than a longer one.
+
 To decide well the decision-maker needs the **whole game's** network conditions, but each relay directly
 observes only its *own* home clients' links — loss, RTT, and the like, which QUIC already measures per
 connection. So those per-client conditions travel **with the turns**: a relay attaches its home clients'
