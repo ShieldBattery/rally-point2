@@ -3782,7 +3782,16 @@ impl DecisionMaker {
                 let dwell_elapsed = self
                     .last_decision_frame
                     .is_none_or(|last| frame.0.saturating_sub(last.0) >= self.law.min_dwell_turns);
-                let lowered = self.buffer.0.saturating_sub(self.law.lower_step);
+                // A multi-turn `lower_step` still may not land below what the
+                // margined target says is the lowest safe size -- the headroom
+                // bounds where a shrink lands, not just whether one fires. A
+                // no-op at the default step of 1 (`shrink_target < buffer`
+                // already puts it at or under `buffer - 1`).
+                let lowered = self
+                    .buffer
+                    .0
+                    .saturating_sub(self.law.lower_step)
+                    .max(shrink_target);
                 let base_floor = self.target_peaks.max_over_last(TARGET_FLOOR_BASE_BUCKETS);
                 let allowed = if lowered == base_floor {
                     let probation_buckets = if self.edge_burned {
@@ -9269,6 +9278,40 @@ mod tests {
         }
         assert_eq!(decisions, vec![BufferSize(3)]);
         assert_eq!(maker.buffer(), BufferSize(3));
+    }
+
+    /// A tuned multi-turn `lower_step` may not step past the margined floor:
+    /// the descent must clamp its landing at the shrink target, not just gate
+    /// on it being below the buffer.
+    #[test]
+    fn a_multi_turn_lower_step_lands_on_the_shrink_target_not_below_it() {
+        let law = ControlLaw {
+            lower_step: 2,
+            ..ControlLaw::default()
+        };
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law,
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // 250ms -> target 7, raise.
+        let d = ingest_at(&mut maker, &conditions(0, 250_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(7));
+
+        // ~1ms under the 3-turn boundary: raw target 3, margined target 4. The
+        // two-turn descent must stop at 4 (7 -> 5 -> 4), never touching 3.
+        let mut sent = 100;
+        let mut decisions = Vec::new();
+        for frame in 2..=2000 {
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 124_000, 0, sent), frame) {
+                decisions.push(d.buffer);
+            }
+        }
+        assert_eq!(decisions, vec![BufferSize(5), BufferSize(4)]);
+        assert_eq!(maker.buffer(), BufferSize(4));
     }
 
     // -- Directive broadcast --
