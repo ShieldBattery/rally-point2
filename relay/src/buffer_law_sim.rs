@@ -556,6 +556,56 @@ mod tests {
         }
     }
 
+    /// RTT riding a few milliseconds under a whole-turn boundary, with brief
+    /// few-ms excursions across it -- the boundary-hover shape that used to
+    /// flip the buffer between adjacent sizes on sub-ms RTT noise. The shrink
+    /// headroom refuses those shrinks outright, so the buffer parks at the
+    /// covering size with zero dips (not even probation's one-per-episode).
+    #[test]
+    fn a_boundary_hovering_rtt_parks_the_buffer_with_no_dips() {
+        for seed in [13, 606, 5150] {
+            // Base path a hair under the 4-turn boundary (166,664us): raw
+            // target 4, margined path pinned at 5. Excursions to ~170ms every
+            // 30s price the 5 the headroom then refuses to give back.
+            let hover = Weather {
+                turns: seconds(29),
+                rtt_us: 163_000,
+                jitter: 0.01,
+                loss: 0.0,
+                burst_start: 0.0,
+                burst_end: 1.0,
+            };
+            let spike = Weather {
+                turns: seconds(1),
+                rtt_us: 170_000,
+                ..hover
+            };
+            let mut phases = vec![Weather {
+                turns: seconds(5),
+                ..hover
+            }];
+            for _ in 0..7 {
+                phases.push(spike);
+                phases.push(hover);
+            }
+            let result = run(ControlLaw::default(), &phases, seed);
+
+            assert_eq!(
+                result.dips_within(seconds(20)),
+                0,
+                "seed {seed}: dipped on the boundary: {:?}",
+                result.changes,
+            );
+            // After the first excursion prices the covering size, the buffer
+            // must simply sit still for the rest of the session.
+            let settled = result.changes_between(seconds(10), seconds(215));
+            assert!(
+                settled.is_empty(),
+                "seed {seed}: boundary churn: {settled:?}"
+            );
+        }
+    }
+
     /// Trace dump for tuning sessions: per-2s rows of weather, target, and
     /// buffer for each scenario. Run with
     /// `cargo test -p rally-point-relay buffer_law_sim -- --ignored --nocapture`.

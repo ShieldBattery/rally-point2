@@ -168,6 +168,18 @@
 //! step), never stuck. Raises, by contrast, fire on the first worsening
 //! sample.
 //!
+//! The floor and the dwell both act in quantized target space, which cannot
+//! see how close the path sits to a whole-turn boundary: at 99% of a bucket
+//! the path `ceil` leaves under a millisecond of real slack, and
+//! sub-millisecond RTT noise flips the target a full turn -- a flap magnet
+//! the turn-space machinery can only punish after the fact. Shrinks are
+//! therefore also gated in *continuous* space: the lower branch evaluates a
+//! target whose path term carries [`ControlLaw::shrink_headroom_us`] of
+//! margin, so a shrink fires only when the path clears the lowered size's
+//! capacity with real headroom, never on a favorable rounding of a path
+//! riding the boundary. Raises always use the unmargined target -- headroom
+//! must never delay a raise.
+//!
 //! One lookback cannot fit every noise pattern: peaks recurring just *past*
 //! it would still bait a shrink that the next peak disproves. That gets
 //! **edge probation**: a shrink landing exactly on the floor whose departed
@@ -367,6 +379,12 @@ const BUFFER_TRACE_INTERVAL_TURNS: u32 = 600;
 /// the worst per-slot capped blackout-run length.
 struct TargetInputs {
     target: u32,
+    /// The target as the shrink gate sees it: identical, except the path term
+    /// is `ceil`'d with [`ControlLaw::shrink_headroom_us`] of margin added, so
+    /// a path within the margin of a whole-turn boundary rounds up to the size
+    /// it is hugging instead of baiting a shrink. Always `>= target`; raises
+    /// never use it.
+    shrink_target: u32,
     path_us: u32,
     worst_loss_risk: f64,
     burst_turns: u32,
@@ -471,6 +489,20 @@ pub struct ControlLaw {
     /// ~ 5s -- enough samples (120) to be confident the improvement is stable
     /// before the buffer shrinks.
     pub min_dwell_turns: u32,
+    /// Margin (us) added to the pairwise path before the shrink gate's `ceil`:
+    /// a lower fires only if the target re-computed with this margin on its
+    /// path term still sits below the buffer. The dwell, floor, and probation
+    /// all act in quantized turn space, which cannot tell a path 60% of the
+    /// way into its whole-turn bucket (comfortable slack, shrink is safe) from
+    /// one at 99.5% (sub-millisecond slack, a shrink is a stutter waiting for
+    /// the next RTT wobble) -- both yield the identical target. This is the
+    /// continuous-space deadband that refuses the boundary-hugging shrinks
+    /// outright instead of letting probation punish them after players felt
+    /// the dip. Sized to clear the estimator noise the recent-max jitter
+    /// window hasn't already captured (a few ms on a stable link) while
+    /// staying well under a turn, so a genuine regime drop still shrinks
+    /// promptly. Raises never see the margin.
+    pub shrink_headroom_us: u32,
     /// The short loss window: how many recent conditions samples (samples
     /// arrive roughly once per turn) the fast-reacting loss estimate covers.
     /// Long enough that its packet denominator makes the rate statistically
@@ -503,6 +535,7 @@ impl Default for ControlLaw {
             turn_duration_us: 1_000_000 / 24, // ~41,667us at 24 turns/sec
             lower_step: 1,
             min_dwell_turns: 120,       // ~5s at 24/sec
+            shrink_headroom_us: 5_208,  // an eighth of a turn at 24/sec (~5.2ms)
             loss_attack_samples: 24,    // ~1s at 24/sec
             loss_memory_samples: 192,   // ~8s at 24/sec
             shrink_lookback_turns: 600, // ~25s at 24/sec
@@ -3558,6 +3591,13 @@ impl DecisionMaker {
         let turn_us = self.law.turn_duration_us as f64;
         let path_turns = (path_us as f64 / turn_us).ceil() as u32;
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
+        // The shrink gate's path term: the same ceil with the headroom margin
+        // added, so a path within the margin of a whole-turn boundary counts
+        // as the size it is hugging. Only the path gets the margin -- the loss
+        // and burst terms carry their own smoothing in time (attack/memory
+        // windows), and boundary quantization is a path phenomenon.
+        let margined_path_turns =
+            (path_us.saturating_add(self.law.shrink_headroom_us) as f64 / turn_us).ceil() as u32;
 
         Some(TargetInputs {
             // Saturating: the terms derive from client-influenced inputs, and
@@ -3565,6 +3605,9 @@ impl DecisionMaker {
             // anyway — overflow here would only trade that clamp for a
             // debug-build panic.
             target: path_turns
+                .saturating_add(loss_turns)
+                .saturating_add(burst_turns),
+            shrink_target: margined_path_turns
                 .saturating_add(loss_turns)
                 .saturating_add(burst_turns),
             path_us,
@@ -3669,10 +3712,13 @@ impl DecisionMaker {
             // a lowered buffer that re-triggers the stretch burns the edge
             // and stops being retried.
             let stretch_turns = self.phase.stretch_turns(Instant::now());
-            let target = inputs
-                .target
-                .saturating_add(self.delivery.cushion_turns())
-                .saturating_add(stretch_turns);
+            let additive_turns = self.delivery.cushion_turns().saturating_add(stretch_turns);
+            let target = inputs.target.saturating_add(additive_turns);
+            // The same target as the shrink gate sees it: the path term
+            // carries the headroom margin, everything else is identical.
+            // Always >= target, so the raise and lower branches below stay
+            // mutually exclusive.
+            let shrink_target = inputs.shrink_target.saturating_add(additive_turns);
             self.target_peaks
                 .observe(frame.0, target, self.law.target_floor_bucket_span());
 
@@ -3703,9 +3749,14 @@ impl DecisionMaker {
                     self.last_burn_frame = Some(frame.0);
                 }
                 Some(target)
-            } else if target < self.buffer.0 {
+            } else if shrink_target < self.buffer.0 {
                 // Lower slow: every buffer-size change alters the game feel,
-                // so a shrink must be both paced and earned. Paced: at least
+                // so a shrink must be both paced and earned -- and judged on
+                // `shrink_target`, whose margined path term refuses a shrink
+                // when the path merely rounds under the lowered size's
+                // whole-turn boundary without real headroom below it (a raw
+                // target below the buffer with `shrink_target` at it holds,
+                // deliberately). Paced: at least
                 // `min_dwell_turns` since the last decision, so a multi-turn
                 // descent steps down gradually. Earned: the shrink may not
                 // take the buffer below the target's trailing high-water mark.
@@ -3798,6 +3849,7 @@ impl DecisionMaker {
             game_frame = frame.0,
             buffer = self.buffer.0,
             target = inputs.target,
+            shrink_target = inputs.shrink_target,
             shrink_floor = self.target_peaks.max_over_last(TARGET_FLOOR_BASE_BUCKETS),
             edge_burned = self.edge_burned,
             path_us = inputs.path_us,
@@ -6661,9 +6713,15 @@ mod tests {
         let turn_us = f64::from(maker.law.turn_duration_us);
         let path_turns = (f64::from(path_us) / turn_us).ceil() as u32;
         let loss_turns = (worst_loss_risk / turn_us).ceil() as u32;
+        let margined_path_turns = (f64::from(path_us.saturating_add(maker.law.shrink_headroom_us))
+            / turn_us)
+            .ceil() as u32;
 
         Some(TargetInputs {
             target: path_turns
+                .saturating_add(loss_turns)
+                .saturating_add(burst_turns),
+            shrink_target: margined_path_turns
                 .saturating_add(loss_turns)
                 .saturating_add(burst_turns),
             path_us,
@@ -6676,6 +6734,7 @@ mod tests {
         let compact = |inputs: TargetInputs| {
             (
                 inputs.target,
+                inputs.shrink_target,
                 inputs.path_us,
                 inputs.worst_loss_risk.to_bits(),
             )
@@ -9148,6 +9207,68 @@ mod tests {
             "a monotonic two-step descent: {decisions:?}",
         );
         assert_eq!(maker.buffer(), BufferSize(5));
+    }
+
+    /// A path settling just under a whole-turn boundary -- inside the shrink
+    /// headroom -- must never bait a shrink: the raw target says the smaller
+    /// size fits, but the ceil's slack there is under a millisecond, so the
+    /// "improvement" is rounding, not weather. The dwell expires and the old
+    /// peaks age out of the shrink floor; the headroom alone must hold.
+    #[test]
+    fn a_path_inside_the_shrink_headroom_of_a_boundary_never_shrinks() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // 150ms -> target 4, raise.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(4));
+
+        // The RTT settles ~1ms under the 3-turn boundary (124,998us): the raw
+        // target is 3, but the margined path rounds back up to 4.
+        let mut sent = 100;
+        for frame in 2..=2000 {
+            sent += 5;
+            let d = ingest_at(&mut maker, &conditions(0, 124_000, 0, sent), frame);
+            assert_eq!(
+                d, None,
+                "no shrink while the path hugs the boundary (frame {frame})"
+            );
+        }
+        assert_eq!(maker.buffer(), BufferSize(4));
+    }
+
+    /// The headroom must not tax genuine recovery: a path clearing the lowered
+    /// size's boundary by more than the margin still walks the buffer down
+    /// once the old peaks age out of the lookback.
+    #[test]
+    fn a_path_clear_of_the_shrink_headroom_still_shrinks() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // 150ms -> target 4, raise.
+        let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+        assert_eq!(d.unwrap().buffer, BufferSize(4));
+
+        // 110ms sits ~15ms under the 3-turn boundary: raw and margined targets
+        // both say 3, so the descent proceeds after the lookback.
+        let mut sent = 100;
+        let mut decisions = Vec::new();
+        for frame in 2..=2000 {
+            sent += 5;
+            if let Some(d) = ingest_at(&mut maker, &conditions(0, 110_000, 0, sent), frame) {
+                decisions.push(d.buffer);
+            }
+        }
+        assert_eq!(decisions, vec![BufferSize(3)]);
+        assert_eq!(maker.buffer(), BufferSize(3));
     }
 
     // -- Directive broadcast --
