@@ -4,3 +4,7 @@
 **/.terraform/
 *.tfstate
 *.tfstate.*
+
+# Saved plans embed variable values — including sensitive ones — so they must
+# never be committed.
+*.tfplan
