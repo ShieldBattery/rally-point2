@@ -483,9 +483,11 @@ message LeaveDirective {
   uint32 leave_seq = 4;
 
   // The exact number of the departing slot's turns every client consumes before
-  // applying the leave — the departed slot's home-authored contiguous
-  // delivered-through count at the departure, past which the home forwards
-  // nothing (see `SlotDeparted.final_turn_count`). This, not `apply_at_frame`,
+  // applying the leave — the departed slot's home-authored gap-free
+  // forwarded-turn count at the departure (the session-level forward gate's
+  // prefix, never any one connection's receive state or a client-claimed resume
+  // anchor), past which the home forwards nothing (see
+  // `SlotDeparted.final_turn_count`). This, not `apply_at_frame`,
   // is the synchronization point a client that understands it must use: turn
   // counts are relay-authored and client-verifiable (each client consumes the
   // identical forwarded set in per-slot order), so every client reaches the
@@ -1216,18 +1218,23 @@ message SlotDeparted {
   // live decision-maker state. Absent for a legacy sender.
   optional fixed64 connection_epoch = 9;
 
-  // The number of the departing slot's turns in its home relay's contiguous
-  // validated prefix at the departure — the count of turns (seqs `0..count`,
-  // gap-free) the home had accepted and will ever forward; anything past it is
-  // cut, so no client anywhere can consume beyond this count. Home-authored
-  // (only the home's client edge sees the slot's contiguous cursor) and carried
-  // verbatim, like `reachable_frame`, so the authority — including one promoted
-  // mid-handoff — stamps the identical `LeaveDirective.final_turn_count`. The
-  // contiguous prefix, not the newest validated seq: a validated turn past a
-  // receive gap can never be consumed by any client (per-slot ordering holds it
-  // behind the gap, and the departed connection can no longer fill it), so a
-  // count past the gap would name a point no client can reach. Absent from a
-  // sender that predates the field.
+  // The number of the departing slot's turns in its home relay's gap-free
+  // forwarded prefix at the departure — the count of turns (seqs `0..count`,
+  // contiguous) the home had validated and fanned out, and will ever forward;
+  // anything past it is cut, so no client anywhere can consume beyond this
+  // count. Home-authored from the session-level forward gate — state that
+  // survives the slot's connection replacements and that no client-claimed
+  // resume anchor can advance, unlike any one connection's receive cursor — and
+  // carried verbatim, like `reachable_frame`, so the authority — including one
+  // promoted mid-handoff — stamps the identical
+  // `LeaveDirective.final_turn_count`. The contiguous prefix, not the newest
+  // forwarded seq: a turn past a gap can never be consumed by any client
+  // (per-slot ordering holds it behind the gap, and the departed slot can no
+  // longer fill it), so a count past the gap would name a point no client can
+  // reach. Absent from a sender that predates the field, and from a home with
+  // no gap-free knowledge to author it from (nothing ever forwarded, or a
+  // re-homed slot whose earlier turns the fresh home never carried) — clients
+  // then fall back to `apply_at_frame`.
   optional uint64 final_turn_count = 10;
 }
 

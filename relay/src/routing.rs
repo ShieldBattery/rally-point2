@@ -177,6 +177,14 @@ const UNACKED_WINDOW_CAP: usize = 1024;
 /// is ever caught by it.
 const MAX_SANE_RESUME_ANCHOR: u64 = 1_000_000_000;
 
+/// How far past this relay's own forwarded prefix a presented resume anchor may
+/// sit before it is logged as a probable lie (see the anchor handling in
+/// [`run_slot_link`]). Sized to the transport's per-slot receive window: after
+/// a re-home, the fresh relay's mesh-forwarded view of the slot can lag the old
+/// home's acks by in-transit gaps, which that window bounds — an honest anchor
+/// never runs further ahead of any relay's forwarded truth than that.
+const RESUME_ANCHOR_LIE_MARGIN: u64 = 4096;
+
 // The native SC:R `pending_leave_reason` value for a *dropped* player (shows
 // "player was dropped") lives in `consensus`, which also classifies a departure
 // notice from it — one source of truth for the dropped-vs-left boundary. A
@@ -1208,11 +1216,6 @@ pub async fn run_slot_link(
     // pulls `mesh` apart, so every exit path can hand the whole bundle to
     // `end_slot_link` without ballooning that function's argument count.
     let mesh_for_teardown = mesh.clone();
-    // The seq of the first turn this connection delivered but failed validation
-    // on (the link closes right there). The dedup's delivered cursor advances
-    // for such a turn even though it was never forwarded, so the slot's final
-    // turn count must clamp below it — see `slot_final_turn_count`.
-    let mut first_invalid_seq: Option<u64> = None;
     // The flight recorder's per-slot counter handle, fetched ONCE here so the
     // per-turn arms below bump plain atomics — no lock, no map lookup on the
     // hot path. The connect event marks a resumed dial (any presented resume
@@ -1313,7 +1316,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1339,7 +1342,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1473,6 +1476,13 @@ pub async fn run_slot_link(
     // the own-slot entry here also keeps it out of the replay below (a slot is never
     // replayed its own turns). Absent (a fresh dial or a peer-only reconnect), this
     // is a no-op and the window bases at 0 as before.
+    //
+    // The anchor is transport state only: it bases this link's dedup window, and
+    // nothing else. It never feeds the slot's final turn count — that comes from
+    // the session-level forward gate (`crate::mesh::forwarded_count`), which
+    // only ever advances over turns genuinely forwarded — so a fabricated
+    // anchor cannot manufacture game state, only break this one connection's
+    // own resume.
     if let Some(anchor) = resume_cursors.remove(&slot) {
         // Reject rather than clamp-and-continue: a client's own-slot anchor
         // this far beyond anything a real session could ever produce is a
@@ -1502,9 +1512,32 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
+        }
+        // A lie tripwire, not a gate: an honest anchor never names a seq past
+        // what some relay acked to the client, so on this slot's long-term home
+        // it sits at or below the forward gate's count. It can legitimately
+        // exceed it after a re-home onto a relay whose mesh-forwarded view of
+        // the slot lags its old home's acks — by transit gaps at most, roughly
+        // a receive window — so anything far past that margin is a client
+        // asserting acks for turns that were never forwarded. Warn-only: the
+        // count is relay-authored regardless (see the comment above), so a
+        // lying anchor gains nothing and hard-rejecting would risk refusing
+        // that legitimate lagging-rehome resume.
+        if let Some(count) = crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot)
+            && anchor > count.saturating_add(RESUME_ANCHOR_LIE_MARGIN)
+        {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                anchor,
+                forwarded_count = count,
+                margin = RESUME_ANCHOR_LIE_MARGIN,
+                "resume-cursor anchor claims acks far past this relay's forwarded prefix",
+            );
         }
         link.anchor_receive_window(slot, anchor);
     }
@@ -1537,7 +1570,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1585,7 +1618,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1611,7 +1644,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1673,7 +1706,6 @@ pub async fn run_slot_link(
                     _ => None,
                 };
                 for payload in received.fresh {
-                    let seq = payload.seq;
                     match validate_turn(slot, payload) {
                         Ok(turn) => {
                             let payload = turn.payload;
@@ -1701,7 +1733,6 @@ pub async fn run_slot_link(
                             );
                         }
                         Err(error) => {
-                            first_invalid_seq.get_or_insert(seq);
                             tracing::warn!(
                                 tenant = key.tenant.as_ref(),
                                 session = key.session.0,
@@ -2197,7 +2228,7 @@ pub async fn run_slot_link(
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
-                            final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+                            crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
                             Some(connection_epoch),
                         );
                         leave_announced = true;
@@ -2246,7 +2277,6 @@ pub async fn run_slot_link(
                         if !fresh {
                             continue;
                         }
-                        let seq = payload.seq;
                         match validate_turn(slot, payload) {
                             Ok(turn) => {
                                 let payload = turn.payload;
@@ -2269,7 +2299,6 @@ pub async fn run_slot_link(
                                 );
                             }
                             Err(error) => {
-                                first_invalid_seq.get_or_insert(seq);
                                 tracing::warn!(
                                     tenant = key.tenant.as_ref(),
                                     session = key.session.0,
@@ -2563,37 +2592,8 @@ pub async fn run_slot_link(
         slot,
         connection_epoch,
         leave_announced,
-        final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
+        crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
     );
-}
-
-/// The departing slot's final turn count: how many of its turns (seqs
-/// `0..count`, gap-free) this — its home — relay accepted and forwarded, and
-/// therefore the exact number every client consumes before applying the
-/// slot's leave (`LeaveDirective::final_turn_count`). `delivered_through` is
-/// the link's contiguous delivered cursor for the slot (total-truthful across
-/// a resume — anchoring seeds it with the prior connection's prefix), clamped
-/// below the first delivered-but-invalid turn, if any: the cursor advances for
-/// a turn that validation then rejects without forwarding, and a count
-/// reaching past it would name a point no client can reach.
-///
-/// `None` in means `None` out: a link that never delivered a turn has no
-/// knowledge of the slot's history, and a fabricated exact count of 0 would be
-/// *wrong* — not merely imprecise — whenever the slot delivered turns on an
-/// earlier connection (a reconnect that died before its resumed stream came
-/// up). An undercounted directive is satisfied immediately by every survivor
-/// and degrades to per-client arrival-time application, the exact divergence
-/// counted leaves exist to prevent. With no count, clients fall back to frame
-/// scheduling, which is never worse than a wrong exact count.
-fn final_turn_count_from(
-    delivered_through: Option<u64>,
-    first_invalid_seq: Option<u64>,
-) -> Option<u64> {
-    let delivered = delivered_through? + 1;
-    Some(match first_invalid_seq {
-        Some(invalid) => delivered.min(invalid),
-        None => delivered,
-    })
 }
 
 /// Runs the full departure/close protocol for a slot link that has ended,
@@ -3466,25 +3466,6 @@ fn sample_slot_conditions(
 }
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn final_turn_count_counts_the_contiguous_prefix_and_clamps_below_an_invalid_turn() {
-        // No turn ever delivered on this link: no knowledge, no count. A
-        // fabricated exact 0 would be wrong whenever the slot delivered turns
-        // on an earlier connection (a reconnect that died before its resumed
-        // stream came up), and an undercounted directive is satisfied
-        // immediately by every survivor — per-client arrival-time application,
-        // the exact divergence counted leaves exist to prevent.
-        assert_eq!(super::final_turn_count_from(None, None), None);
-        assert_eq!(super::final_turn_count_from(None, Some(3)), None);
-        // Seqs are zero-based: delivered through seq 41 = 42 turns.
-        assert_eq!(super::final_turn_count_from(Some(41), None), Some(42));
-        // A delivered-but-invalid turn advanced the cursor without being
-        // forwarded; the count must stop below it.
-        assert_eq!(super::final_turn_count_from(Some(41), Some(40)), Some(40));
-        // An invalid turn past the contiguous prefix constrains nothing.
-        assert_eq!(super::final_turn_count_from(Some(41), Some(50)), Some(42));
-    }
     use super::*;
 
     fn key() -> SessionKey {

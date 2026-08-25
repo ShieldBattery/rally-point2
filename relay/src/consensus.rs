@@ -1677,8 +1677,8 @@ pub struct DepartureStamps {
     pub reachable_frame: Option<u32>,
     /// The end-of-game result the slot reported before departing, if any.
     pub result: Option<ResultEcho>,
-    /// The slot's home-contiguous validated turn count at the departure — the
-    /// exact number of its turns any client can ever consume (see
+    /// The slot's gap-free forwarded turn count at the departure — the exact
+    /// number of its turns any client can ever consume (see
     /// `Departure::final_turn_count`).
     pub final_turn_count: Option<u64>,
 }
@@ -1716,16 +1716,18 @@ struct Departure {
     /// which the departure closes), so once seeded it is final. Carried into the
     /// [`DepartureNotice`] so a departure webhook is atomic terminal truth.
     result: Option<ResultEcho>,
-    /// The number of this slot's turns in its home relay's contiguous validated
+    /// The number of this slot's turns in its home relay's gap-free forwarded
     /// prefix at the departure — the exact count of the slot's turns any client
     /// can ever consume (the home forwards nothing past it), and therefore the
     /// count every client consumes before applying the leave
-    /// (`LeaveDirective::final_turn_count`). Home-authored (only the home's
-    /// client edge sees the slot's contiguous cursor), carried in the
-    /// `SlotDeparted` frame, and folded first-non-`None`-wins exactly like
-    /// `reachable_frame`, so the authority — including one promoted mid-handoff
-    /// — stamps the identical count. `None` when authored by a sender that
-    /// predates the field.
+    /// (`LeaveDirective::final_turn_count`). Home-authored from the
+    /// session-level forward gate (see `crate::mesh::forwarded_count` — state
+    /// that survives connection replacement and that no client claim can
+    /// advance), carried in the `SlotDeparted` frame, and folded
+    /// first-non-`None`-wins exactly like `reachable_frame`, so the authority —
+    /// including one promoted mid-handoff — stamps the identical count. `None`
+    /// when authored by a sender that predates the field, or by a home with no
+    /// gap-free knowledge to answer from.
     final_turn_count: Option<u64>,
     /// Physical connection generation that authored this departure. Stored on
     /// the record itself so Join-time reconciliation cannot accidentally stamp

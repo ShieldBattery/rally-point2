@@ -98,6 +98,13 @@ struct SlotSeen {
     /// Bounded to [`SPARSE_SEEN_CAP`] entries: past that the prefix collapses
     /// forward over the lowest gap (see [`SlotSeen::collapse_to_cap`]).
     ahead: BTreeSet<u64>,
+    /// Whether [`SlotSeen::collapse_to_cap`] has ever advanced the prefix over
+    /// a gap. A collapsed prefix remains correct for the forward-once gate (the
+    /// safe failure direction — see that method's doc) but no longer counts
+    /// only turns that were actually forwarded, so [`forwarded_count`] refuses
+    /// to answer from it: a leave scheduled on an inflated count would have
+    /// survivors wait forever for turns that never existed.
+    prefix_collapsed: bool,
 }
 
 /// Whether a `(slot, seq)` has already been forwarded to local clients.
@@ -122,6 +129,7 @@ impl MeshSeen {
         let state = self.slots.entry(slot).or_insert_with(|| SlotSeen {
             forwarded_through: None,
             ahead: BTreeSet::new(),
+            prefix_collapsed: false,
         });
 
         if state
@@ -207,6 +215,7 @@ impl SlotSeen {
                 .pop_first()
                 .expect("a set over a positive cap is non-empty");
             self.forwarded_through = Some(lowest);
+            self.prefix_collapsed = true;
             self.absorb_contiguous_run();
         }
     }
@@ -245,6 +254,42 @@ pub fn mark_seen(registries: &SeenRegistries, key: &SessionKey, slot: SlotId, se
 pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
     let mut roster = registries.lock();
     roster.remove(key);
+}
+
+/// The number of `slot`'s turns this relay has forwarded to the session's local
+/// clients as a gap-free prefix (seqs `0..count`) — the home relay's source for
+/// the departing slot's final turn count (`LeaveDirective::final_turn_count`),
+/// the exact number of the slot's turns every client consumes before applying
+/// its leave.
+///
+/// This forward-gate cursor, not any one connection's receive state, is the
+/// authoritative basis for that count, for three reasons. It is session-level:
+/// it survives connection replacement, so a reconnect that dies before its
+/// resumed stream comes up still counts everything the slot's earlier
+/// connections forwarded. It sits past validation, at the fan-out choke point:
+/// only turns actually delivered toward local lockstep clients advance it, so a
+/// delivered-but-invalid turn (which advances a link's receive cursor without
+/// being forwarded) never inflates it. And it is relay-authored: a client's
+/// resume-cursor anchor can teleport its own *link's* dedup base, but this
+/// prefix only ever advances contiguously from what was genuinely forwarded, so
+/// no claimed anchor can manufacture a count for turns that never existed.
+///
+/// `None` when the relay has no gap-free knowledge to answer from: the session
+/// or slot has no forwarded prefix (nothing forwarded yet, or a re-homed slot
+/// whose pre-rehome turns this relay never carried), or the prefix was
+/// collapsed over a gap by the sparse-set cap (see [`SlotSeen::collapse_to_cap`]
+/// — correct for the forward-once gate, but no longer a count of real turns).
+/// Callers fall back to frame scheduling on `None`; a fabricated or inflated
+/// exact count is strictly worse than no count.
+pub fn forwarded_count(registries: &SeenRegistries, key: &SessionKey, slot: SlotId) -> Option<u64> {
+    let roster = registries.lock();
+    let state = roster.get(key)?.slots.get(&slot)?;
+    if state.prefix_collapsed {
+        return None;
+    }
+    // A prefix top of `u64::MAX` has no representable successor; no real
+    // session approaches it, and answering `None` (frame fallback) is safe.
+    state.forwarded_through?.checked_add(1)
 }
 
 /// A snapshot of `key`'s forward-gate cursors, as "next needed seq" per slot —
@@ -3730,6 +3775,7 @@ mod tests {
             SlotSeen {
                 forwarded_through: Some(u64::MAX - 2),
                 ahead: BTreeSet::from([u64::MAX]),
+                prefix_collapsed: false,
             },
         );
 
@@ -3883,6 +3929,50 @@ mod tests {
             Seen::Duplicate,
             "a swallowed gap seq is seen, not fresh",
         );
+    }
+
+    /// `forwarded_count` is the home relay's source for a departing slot's final
+    /// turn count: the gap-free forwarded prefix as a count, `None` whenever the
+    /// registry has no truthful prefix to answer from — including a prefix the
+    /// sparse-set cap collapsed over a gap, which is correct for the
+    /// forward-once gate but would inflate a count with turns that never
+    /// existed (survivors scheduled on it would wait forever).
+    #[test]
+    fn forwarded_count_reports_the_gap_free_prefix_and_refuses_a_collapsed_one() {
+        let registries = new_seen_registries();
+        let key = SessionKey {
+            tenant: rally_point_proto::control::TenantId("t".to_owned()),
+            session: rally_point_proto::ids::SessionId(1),
+        };
+
+        // No session, no slot: no knowledge.
+        assert_eq!(forwarded_count(&registries, &key, SlotId(0)), None);
+
+        // A contiguous prefix counts exactly, per slot, unaffected by another
+        // slot's traffic.
+        for seq in 0..5 {
+            mark_seen(&registries, &key, SlotId(0), seq);
+        }
+        mark_seen(&registries, &key, SlotId(1), 0);
+        assert_eq!(forwarded_count(&registries, &key, SlotId(0)), Some(5));
+        assert_eq!(forwarded_count(&registries, &key, SlotId(1)), Some(1));
+
+        // Sparse seqs ahead of the prefix never advance the count — only the
+        // gap-free prefix answers.
+        mark_seen(&registries, &key, SlotId(0), 100);
+        assert_eq!(forwarded_count(&registries, &key, SlotId(0)), Some(5));
+
+        // A slot whose first seqs are all ahead of 0 (a re-homed slot whose
+        // pre-rehome turns this relay never carried) has no prefix at all.
+        mark_seen(&registries, &key, SlotId(2), 500);
+        assert_eq!(forwarded_count(&registries, &key, SlotId(2)), None);
+
+        // Once the sparse cap collapses the prefix over a gap, the count is
+        // permanently refused: the prefix no longer counts only real turns.
+        for seq in (2..).step_by(2).take(SPARSE_SEEN_CAP + 10) {
+            mark_seen(&registries, &key, SlotId(1), seq);
+        }
+        assert_eq!(forwarded_count(&registries, &key, SlotId(1)), None);
     }
 
     #[test]
@@ -4637,6 +4727,7 @@ mod tests {
             SlotSeen {
                 forwarded_through: Some(u64::MAX),
                 ahead: BTreeSet::new(),
+                prefix_collapsed: false,
             },
         );
         seen.lock().insert(key.clone(), session_seen);
