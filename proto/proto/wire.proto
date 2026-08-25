@@ -495,8 +495,20 @@ message LeaveDirective {
   // `apply_at_frame` remains for clients that predate this field; its
   // survivor-reachability clamp can place it at a frame clients have already
   // passed, which such clients then apply on arrival rather than in lockstep —
-  // the imprecision this field exists to remove. Absent from directives
-  // re-derived from a departure record that predates the field.
+  // the imprecision this field exists to remove.
+  //
+  // Carried only for a CLEAN leave (`reason` != dropped). The count is sound
+  // only when nothing past it can ever reach a client, and the clean-leave
+  // intent is the one origin where that is structural: the home relay's serve
+  // task — the slot's single ingress — derives the count and stops forwarding
+  // in the same step, and a decided leave refuses readmission. A dropped
+  // slot has no such cut (it can be mid-reconnect, pushing turns past any
+  // recorded count while a drop-decide races it), so a drop always schedules
+  // by `apply_at_frame` — benign, because survivors of a drop have long since
+  // consumed the identical forwarded prefix and stalled at the same point by
+  // the time one is decided. Also absent from directives re-derived from a
+  // departure record that predates the field, or authored by a home with no
+  // gap-free forwarded knowledge.
   optional uint64 final_turn_count = 5;
 }
 
@@ -1231,8 +1243,11 @@ message SlotDeparted {
   // forwarded seq: a turn past a gap can never be consumed by any client
   // (per-slot ordering holds it behind the gap, and the departed slot can no
   // longer fill it), so a count past the gap would name a point no client can
-  // reach. Absent from a sender that predates the field, and from a home with
-  // no gap-free knowledge to author it from (nothing ever forwarded, or a
+  // reach. Home-authored only for a CLEAN leave — the intent handler is the
+  // one origin whose ingress cut makes a count sound (see
+  // `LeaveDirective.final_turn_count`); a drop always carries none. Also
+  // absent from a sender that predates the field, and from a home with no
+  // gap-free knowledge to author it from (nothing ever forwarded, or a
   // re-homed slot whose earlier turns the fresh home never carried) — clients
   // then fall back to `apply_at_frame`.
   optional uint64 final_turn_count = 10;

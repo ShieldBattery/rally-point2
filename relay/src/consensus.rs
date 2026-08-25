@@ -4055,7 +4055,26 @@ impl DecisionMaker {
         // that understand it apply the leave after consuming exactly this many of
         // the departed slot's turns, and the frame below is only the fallback for
         // clients that predate the count.
-        let final_turn_count = record.and_then(|d| d.final_turn_count);
+        //
+        // Only a clean leave may carry it. A count is sound only when nothing
+        // past it can ever reach a client, and the clean-leave intent is the one
+        // origin where that is structural: the slot's home serve task — its
+        // single ingress — derives the count and stops forwarding in the same
+        // step, and a decided leave refuses readmission. A *dropped* slot's
+        // record has no such cut: the slot can be reconnecting (here or on
+        // another relay) while an honored drop request or abandon expiry
+        // decides this leave, pushing turns past the recorded count into the
+        // mesh — one survivor consumes such a turn before the directive
+        // arrives, another applies the leave first, and they diverge. Dropping
+        // the count degrades a drop to frame scheduling, which is benign for
+        // drops in practice: by the time one is honored, every survivor has
+        // long since consumed the identical forwarded prefix and stalled at
+        // the same point.
+        let final_turn_count = if reason == LEAVE_REASON_DROPPED {
+            None
+        } else {
+            record.and_then(|d| d.final_turn_count)
+        };
         let session = self.session_frame().map(|f| f.0);
         // No framed turn observed anywhere yet (pre-game / lobby): nothing to
         // schedule against, so hold — a `None` short-circuits the decision.
@@ -11020,10 +11039,44 @@ mod tests {
 
     /// The exact production flow on the departing slot's home relay: read the
     /// last frame and the reachability ceiling, record the departure with both,
-    /// A decided leave carries the record's home-authored final turn count
-    /// verbatim — the client-side synchronization point rides the directive.
+    /// A decided clean leave carries the record's home-authored final turn
+    /// count verbatim — the client-side synchronization point rides the
+    /// directive.
     #[test]
-    fn a_decided_leave_carries_the_home_authored_final_turn_count() {
+    fn a_decided_clean_leave_carries_the_home_authored_final_turn_count() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.observe_frame(SlotId(1), GameFrameCount(115));
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(115)),
+                final_turn_count: Some(112),
+                ..Default::default()
+            },
+            LEAVE_REASON_LEFT,
+        );
+        let leave = maker
+            .decide_leave(SlotId(1), LEAVE_REASON_LEFT)
+            .expect("a leave is scheduled");
+        assert_eq!(leave.final_turn_count, Some(112));
+    }
+
+    /// A dropped slot's directive never carries a count, even when its record
+    /// holds one: a drop has no ingress cut — the slot can be reconnecting
+    /// (here or on another relay) while an honored drop request or abandon
+    /// expiry decides this leave, pushing turns past the recorded count into
+    /// the mesh, and a count that under-runs turns that exist splits survivors
+    /// between count-scheduled and consumed-past-it application. A drop
+    /// schedules by frame instead, which its uniformly-stalled survivors apply
+    /// consistently.
+    #[test]
+    fn a_decided_drop_strips_the_final_turn_count() {
         let mut maker = DecisionMaker::new(
             key(),
             bounds(0, 6),
@@ -11044,12 +11097,12 @@ mod tests {
         let leave = maker
             .decide_leave(SlotId(1), DROPPED)
             .expect("a leave is scheduled");
-        assert_eq!(leave.final_turn_count, Some(112));
+        assert_eq!(leave.final_turn_count, None);
     }
 
-    /// A promoted authority re-derives a leave with the identical final turn
-    /// count: the count is part of the shared departure record, so a handoff
-    /// reproduces it exactly like the apply frame.
+    /// A promoted authority re-derives a clean leave with the identical final
+    /// turn count: the count is part of the shared departure record, so a
+    /// handoff reproduces it exactly like the apply frame.
     #[test]
     fn a_handoff_rederivation_reproduces_the_final_turn_count() {
         let stamps = DepartureStamps {
@@ -11060,7 +11113,7 @@ mod tests {
         let mut peer =
             DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
         peer.observe_frame(SlotId(1), GameFrameCount(115));
-        peer.record_departure(SlotId(1), stamps, DROPPED);
+        peer.record_departure(SlotId(1), stamps, LEAVE_REASON_LEFT);
         let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay, &HashSet::new());
         let rederived = leaves
             .iter()

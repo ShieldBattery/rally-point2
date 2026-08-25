@@ -1316,7 +1316,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1342,7 +1341,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1512,7 +1510,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1570,7 +1567,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1618,7 +1614,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -1644,7 +1639,6 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
             );
             return;
         }
@@ -2228,6 +2222,13 @@ pub async fn run_slot_link(
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
+                            // The one origin that stamps an exact count: this
+                            // handler is the slot's single ingress, it stops
+                            // forwarding in the same step (`break 'serve`
+                            // below), and a decided leave refuses readmission,
+                            // so nothing past this count can ever reach a
+                            // client. Every other departure origin passes
+                            // `None` — see `end_slot_link`.
                             crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
                             Some(connection_epoch),
                         );
@@ -2592,7 +2593,6 @@ pub async fn run_slot_link(
         slot,
         connection_epoch,
         leave_announced,
-        crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
     );
 }
 
@@ -2615,7 +2615,6 @@ fn end_slot_link(
     slot: SlotId,
     connection_epoch: u64,
     leave_announced: bool,
-    final_turn_count: Option<u64>,
 ) {
     mesh.decision_makers.flight_recorder().record(
         key,
@@ -2664,7 +2663,14 @@ fn end_slot_link(
             key,
             slot,
             LEAVE_REASON_DROPPED,
-            final_turn_count,
+            // A drop never carries an exact final turn count: unlike the
+            // clean-leave intent (the one origin that does), a dropped slot's
+            // ingress was not cut in the same step the count would be derived
+            // -- the slot can be reconnecting here or on another relay while a
+            // later drop-decide races it, pushing turns past any count
+            // recorded now. `commit_leave` enforces the same rule when the
+            // directive is built.
+            None,
             Some(connection_epoch),
         ) {
             broadcast_connectivity(
@@ -3568,7 +3574,7 @@ mod tests {
 
         // Slot 1's link dies without a clean leave; slot 0 remains, so the
         // session stays open and the recording keeps accumulating.
-        end_slot_link(&sessions, &mesh, &k, SlotId(1), 0, false, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(1), 0, false);
         let events: Vec<_> = flight.events(&k).into_iter().map(|r| r.event).collect();
         assert!(
             events.contains(&crate::flight_recorder::FlightEvent::SlotDisconnected { slot: 1 }),
@@ -3581,7 +3587,7 @@ mod tests {
 
         // The last slot leaves: the close event seals the recording and the
         // detached flush retires it (discarded — no sink configured).
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
         for _ in 0..100 {
             if flight.recorded_sessions().is_empty() {
                 break;
@@ -3615,7 +3621,7 @@ mod tests {
         );
 
         // The only local slot leaves: the session-emptying teardown fires.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
         assert!(
             !mesh.seen.lock().contains_key(&k),
             "the emptied session's seen-registry entry must not survive its teardown",
@@ -3663,7 +3669,7 @@ mod tests {
 
         // The only local slot's link dies without a clean leave — the emptying
         // that must NOT close the session while the drop is held.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
 
         assert!(
             mesh.drop_holds.is_pending(&k, SlotId(0)),
@@ -3744,7 +3750,7 @@ mod tests {
             SlotId(0),
             LEAVE_REASON_LEFT,
         );
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, true, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, true);
 
         assert!(
             !mesh.seen.lock().contains_key(&k),
@@ -4549,7 +4555,7 @@ mod tests {
 
         // The old task has already freed its roster seat and is finishing its
         // cleanup after the replacement published epoch 22.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 11, false, None);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 11, false);
 
         let published = crate::mesh::snapshot_conditions(&mesh.conditions, &k)
             .expect("replacement conditions survive stale teardown");

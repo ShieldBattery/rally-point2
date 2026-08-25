@@ -260,7 +260,10 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
 /// clients as a gap-free prefix (seqs `0..count`) — the home relay's source for
 /// the departing slot's final turn count (`LeaveDirective::final_turn_count`),
 /// the exact number of the slot's turns every client consumes before applying
-/// its leave.
+/// its leave. Its one sound consumer is the clean-leave intent handler, which
+/// reads it in the same step it cuts the slot's ingress; read anywhere else
+/// (a drop, say), the slot may still push turns past the answer through a
+/// reconnect, so every other departure origin stamps no count at all.
 ///
 /// This forward-gate cursor, not any one connection's receive state, is the
 /// authoritative basis for that count, for three reasons. It is session-level:
