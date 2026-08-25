@@ -1481,6 +1481,13 @@ pub struct DecisionMaker {
     /// first and could disagree with its clients about the session buffer
     /// until the next decision.
     decision_seq_tiebreak: Option<u64>,
+    /// The `decision_seq` of the last observed directive whose depth exceeded
+    /// [`GAME_SYNC_SAFE_BUFFER_MAX`] and drew the over-ceiling tripwire, so
+    /// the warn and flight event fire once per such decision rather than on
+    /// every redundant stamped-turn copy. Only a peer authority running code
+    /// that predates the ceiling can author one; this relay's own decisions
+    /// are clamped at the source.
+    over_ceiling_warned_seq: Option<u32>,
     /// The buffer change currently being broadcast, if any. Set when a
     /// decision fires; handed out by
     /// [`active_directive`](Self::active_directive) for every forwarded turn,
@@ -2791,6 +2798,7 @@ impl DecisionMaker {
             last_burn_frame: None,
             decision_seq: 0,
             decision_seq_tiebreak: None,
+            over_ceiling_warned_seq: None,
             pending_directive: None,
             initial_directive_sent: false,
             delivery: crate::delivery::DeliveryTracking::default(),
@@ -6753,9 +6761,47 @@ pub fn decide_abandoned_departures(
 /// has a maker for the session, so a later promotion to authority continues the
 /// session's decision numbering and baselines against the committed buffer (see
 /// [`DecisionMaker::observe_directive`]). A no-op when no maker exists.
+///
+/// A directive whose depth exceeds [`GAME_SYNC_SAFE_BUFFER_MAX`] trips a
+/// once-per-decision warn and flight event on its way through. It is still
+/// forwarded verbatim: only the authoring authority may change a session's
+/// depth (rewriting it selectively here would hand different clients different
+/// depths — itself a desync), and only an authority running code that predates
+/// the ceiling can author one. The tripwire makes the exposure observable; the
+/// operational rule that prevents it is draining every session enrolled with
+/// pre-ceiling bounds before mixing relay versions in a fleet.
 pub fn observe_directive(registry: &DecisionMakers, key: &SessionKey, directive: &BufferDirective) {
-    if let Some(maker) = registry.lock().get_mut(key) {
+    let over_ceiling = {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return;
+        };
         maker.observe_directive(directive);
+        let fresh_over_ceiling = directive.buffer_turns > GAME_SYNC_SAFE_BUFFER_MAX
+            && maker.over_ceiling_warned_seq != Some(directive.decision_seq);
+        if fresh_over_ceiling {
+            maker.over_ceiling_warned_seq = Some(directive.decision_seq);
+        }
+        fresh_over_ceiling
+    };
+    if over_ceiling {
+        tracing::warn!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            buffer_turns = directive.buffer_turns,
+            ceiling = GAME_SYNC_SAFE_BUFFER_MAX,
+            decision_seq = directive.decision_seq,
+            "forwarding a peer authority's buffer directive above the game-sync-safe \
+             ceiling; a depth past it deterministically mass-drops the session once \
+             applied",
+        );
+        registry.flight.record(
+            key,
+            crate::flight_recorder::FlightEvent::OverCeilingDirectiveForwarded {
+                buffer_turns: directive.buffer_turns,
+                decision_seq: directive.decision_seq,
+            },
+        );
     }
 }
 

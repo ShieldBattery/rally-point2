@@ -164,6 +164,16 @@ pub enum FlightEvent {
     /// moment it reports `SessionClosed` to the coordinator, and the trigger
     /// for this recording's flush.
     SessionClosed,
+    /// A peer authority's buffer directive above the game-sync-safe ceiling
+    /// was forwarded verbatim (rewriting it selectively would hand different
+    /// clients different depths). Only an authority running code that
+    /// predates the ceiling can author one; a depth past the ceiling
+    /// deterministically mass-drops the session once applied. Recorded once
+    /// per decision.
+    OverCeilingDirectiveForwarded {
+        buffer_turns: u32,
+        decision_seq: u32,
+    },
 }
 
 /// One recorded event: what happened and when (unix epoch milliseconds).
