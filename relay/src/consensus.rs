@@ -6557,17 +6557,21 @@ pub fn has_reconnectable_departure(
         .is_some_and(|maker| maker.has_reconnectable_departure(held))
 }
 
-/// Whether a decision-maker currently exists for `key`. A maker is created when
-/// the session's descriptor is applied and destroyed when the descriptor is
-/// removed, so this is "is the session still applied on this relay". The
-/// abandoned-session timer's expiry gates its close on this: the timer only ever
-/// arms while a maker exists (its arming condition reads the maker's undecided
-/// departures), so finding none at expiry proves the descriptor was retired
-/// mid-window — the close already ran and reached the coordinator, and
-/// [`claim_close_report`]'s no-maker default (`true`, meant for sessions that
-/// never had a maker at all) must not be read as permission to report it again.
-pub fn maker_exists(registry: &DecisionMakers, key: &SessionKey) -> bool {
-    registry.lock().contains_key(key)
+/// [`claim_close_report`], but refusing (`false`) when no decision-maker exists
+/// — in the same single registry acquisition, so a retirement cannot land
+/// between an existence check and the claim. For the abandoned-session timer's
+/// expiry: a maker is created when the session's descriptor is applied and
+/// destroyed when it is removed, and the timer only ever arms while one exists
+/// (its arming condition reads the maker's undecided departures), so finding
+/// none at expiry proves the descriptor was retired mid-window — the close
+/// already ran and reached the coordinator, and [`claim_close_report`]'s
+/// no-maker default (`true`, meant for sessions that never had a maker at all)
+/// must not be read as permission to report it again.
+pub fn claim_close_report_with_maker(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get_mut(key)
+        .is_some_and(DecisionMaker::claim_close_report)
 }
 
 /// Claims the one session-closed report for `key` (see

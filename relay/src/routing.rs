@@ -2770,6 +2770,31 @@ pub(crate) fn maybe_close_emptied_session(
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
 ) {
+    maybe_close_emptied_session_inner(sessions, mesh, key, false)
+}
+
+/// [`maybe_close_emptied_session`] for the abandon timer's expiry: the close
+/// claim additionally requires a decision-maker to still exist, in one atomic
+/// registry acquisition (see [`consensus::claim_close_report_with_maker`]). The
+/// timer only ever arms while a maker exists, so a missing one at expiry proves
+/// the descriptor was retired mid-window and the close already ran — and a
+/// separate exists-then-claim pair would leave a gap for that retirement to
+/// land in, restoring `claim_close_report`'s no-maker default and duplicating
+/// the close.
+fn maybe_close_emptied_session_for_abandon_expiry(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+) {
+    maybe_close_emptied_session_inner(sessions, mesh, key, true)
+}
+
+fn maybe_close_emptied_session_inner(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    close_claim_requires_maker: bool,
+) {
     let roster = sessions.lock();
     if roster.contains_key(key) {
         // A slot is locally connected (or a reconnect already reclaimed one);
@@ -2787,7 +2812,12 @@ pub(crate) fn maybe_close_emptied_session(
         );
         return;
     }
-    if !consensus::claim_close_report(&mesh.decision_makers, key) {
+    let claimed = if close_claim_requires_maker {
+        consensus::claim_close_report_with_maker(&mesh.decision_makers, key)
+    } else {
+        consensus::claim_close_report(&mesh.decision_makers, key)
+    };
+    if !claimed {
         return;
     }
     consensus::session_closed(&mesh.decision_makers, key);
@@ -3389,19 +3419,12 @@ fn decide_and_broadcast_abandoned(
         return;
     }
     // The `close_reported` flag can lose a race (the close lands after the
-    // timer removed its registry entry, so `note_session_closed` had nothing to
+    // timer's entry was claimed, so `note_session_closed` had nothing to
     // mark); the maker's absence is the reliable signal for that ordering,
-    // since the close cascade's descriptor retirement is what destroys it.
-    if !consensus::maker_exists(&mesh.decision_makers, key) {
-        tracing::debug!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            "abandoned-session window elapsed on a retired session; \
-             not re-reporting its close",
-        );
-        return;
-    }
-    maybe_close_emptied_session(sessions, mesh, key);
+    // since the close cascade's descriptor retirement is what destroys it —
+    // checked atomically with the close claim itself, so a retirement cannot
+    // land between a separate existence check and the claim.
+    maybe_close_emptied_session_for_abandon_expiry(sessions, mesh, key);
 }
 
 /// Sends one packet, returning whether it re-carried any still-unacked turn — if so,

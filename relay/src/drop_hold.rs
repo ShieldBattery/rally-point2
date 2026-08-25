@@ -72,7 +72,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -109,6 +109,10 @@ struct AbandonTimer {
     /// `cancel_abandon` racing the fire must not turn a reported close back into
     /// an unreported one.
     close_reported: Arc<AtomicBool>,
+    /// This timer's identity, compared at expiry so an old timer can never
+    /// remove (and thereby prematurely fire for) a fresh timer armed after its
+    /// cancellation — see [`DropHolds::claim_expiry`].
+    generation: u64,
 }
 
 /// How long a dropped slot's hold must stand before the session's authority relay
@@ -190,6 +194,12 @@ pub struct DropHolds {
     /// is — a test injects a tiny window rather than waiting the production 45 s;
     /// production builds it with [`ABANDONED_SESSION_TIMEOUT`].
     abandon_timeout: Duration,
+    /// Monotonic id source for abandoned-session timers, so an expired timer
+    /// can prove the registry entry it is about to remove is its own (see
+    /// [`claim_expiry`](Self::claim_expiry)) — a bare remove-by-key could
+    /// consume a *fresh* timer armed by a second abandonment after this one's
+    /// cancellation, stealing that timer's full window.
+    abandon_generation: Arc<AtomicU64>,
 }
 
 impl DropHolds {
@@ -202,6 +212,7 @@ impl DropHolds {
             abandon_timers: Arc::new(Mutex::new(HashMap::new())),
             unlock,
             abandon_timeout,
+            abandon_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -400,37 +411,42 @@ impl DropHolds {
     /// removed its entry. `on_expire` must therefore re-derive the abandoned
     /// condition itself before deciding anything, rather than trusting that
     /// reaching it means the session is still empty.
-    pub fn arm_abandon<F>(&self, key: SessionKey, on_expire: F)
+    /// Returns the armed timer's generation (for tests pinning the expiry-claim
+    /// identity check), or `None` when a timer was already running.
+    pub fn arm_abandon<F>(&self, key: SessionKey, on_expire: F) -> Option<u64>
     where
         F: FnOnce(bool) + Send + 'static,
     {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let close_reported = Arc::new(AtomicBool::new(false));
+        let generation = self.abandon_generation.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let mut timers = self.abandon_timers.lock();
             if timers.contains_key(&key) {
                 // A timer is already running for this session; keep it, so a
                 // redundant empty-presence observation cannot push the deadline out.
-                return;
+                return None;
             }
             timers.insert(
                 key.clone(),
                 AbandonTimer {
                     _cancel: cancel_tx,
                     close_reported: Arc::clone(&close_reported),
+                    generation,
                 },
             );
         }
-        let timers = Arc::clone(&self.abandon_timers);
+        let registry = self.clone();
         let timeout = self.abandon_timeout;
         tokio::spawn(async move {
             // `biased` polls the cancel branch first, so a cancellation that
             // lands by the deadline deterministically wins when both branches
             // are ready in the same poll — an unbiased pick could run the
             // expiry over a cancellation that already happened. A cancellation
-            // arriving *after* the sleep completes can still lose; `on_expire`
-            // re-derives the abandoned condition itself before acting (see its
-            // caller), so losing that residual race is harmless.
+            // arriving *after* the sleep completes can still lose; the
+            // generation-checked claim below and `on_expire`'s own re-derivation
+            // of the abandoned condition (see its caller) make losing that
+            // residual race harmless.
             tokio::select! {
                 biased;
                 _ = cancel_rx => {
@@ -438,17 +454,36 @@ impl DropHolds {
                     // the entry; nothing to decide here.
                 }
                 () = tokio::time::sleep(timeout) => {
-                    // The window elapsed: remove our own entry (so a later
-                    // abandonment can arm afresh) and decide. Removing under the lock
-                    // before deciding means a concurrent `cancel_abandon` either
-                    // already won (our entry is gone) or loses (it finds nothing) —
-                    // either way the force-decide is idempotent, so a race cannot
-                    // double-decide.
-                    timers.lock().remove(&key);
-                    on_expire(close_reported.load(Ordering::Relaxed));
+                    if let Some(close_reported) = registry.claim_expiry(&key, generation) {
+                        on_expire(close_reported);
+                    }
                 }
             }
         });
+        Some(generation)
+    }
+
+    /// The expired-timer identity check: removes `key`'s timer entry and returns
+    /// its close-reported flag **only when the entry is this timer's own**
+    /// (matching `generation`), else `None` — the timer must then fire nothing.
+    ///
+    /// An expired timer cannot simply remove by key: between its sleep elapsing
+    /// and this claim, a reconnect can cancel it and a second abandonment can
+    /// arm a *fresh* timer under the same key. A bare remove would consume that
+    /// fresh timer's entry and fire immediately, stealing the full window the
+    /// second abandonment is owed. Finding a different generation (or nothing)
+    /// proves this timer was cancelled, however late the cancellation landed.
+    fn claim_expiry(&self, key: &SessionKey, generation: u64) -> Option<bool> {
+        let mut timers = self.abandon_timers.lock();
+        match timers.get(key) {
+            Some(entry) if entry.generation == generation => {
+                let entry = timers
+                    .remove(key)
+                    .expect("entry checked present under the lock");
+                Some(entry.close_reported.load(Ordering::Relaxed))
+            }
+            _ => None,
+        }
     }
 
     /// Cancels `key`'s abandoned-session timer, if one is running — a slot
@@ -567,6 +602,45 @@ mod tests {
     use super::*;
     use rally_point_proto::control::TenantId;
     use rally_point_proto::ids::SessionId;
+
+    /// The expired-timer identity check: an old timer whose cancellation landed
+    /// after its sleep elapsed must not consume the entry of a fresh timer a
+    /// second abandonment armed under the same key — a bare remove-by-key would
+    /// fire immediately with the fresh timer's flag, stealing the full window
+    /// that second abandonment is owed.
+    #[tokio::test]
+    async fn an_expired_timer_cannot_claim_a_fresh_timers_entry() {
+        let holds = DropHolds::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let k = key();
+        let gen_a = holds
+            .arm_abandon(k.clone(), |_| {})
+            .expect("first timer arms");
+        assert_eq!(
+            holds.arm_abandon(k.clone(), |_| {}),
+            None,
+            "arming over a live timer keeps the existing one",
+        );
+        // The reconnect cancels A; a second abandonment arms B afresh.
+        holds.cancel_abandon(&k);
+        let gen_b = holds
+            .arm_abandon(k.clone(), |_| {})
+            .expect("fresh timer arms");
+        assert_ne!(gen_a, gen_b);
+
+        // Timer A's belated expiry (the ordering where its sleep elapsed before
+        // the cancellation reached its select): the entry it finds is not its
+        // own, so it claims nothing and fires nothing.
+        assert_eq!(holds.claim_expiry(&k, gen_a), None);
+        assert!(
+            holds.abandon_armed(&k),
+            "the fresh timer keeps its entry — and with it, its full window",
+        );
+
+        // The fresh timer's own claim succeeds exactly once.
+        assert_eq!(holds.claim_expiry(&k, gen_b), Some(false));
+        assert!(!holds.abandon_armed(&k));
+        assert_eq!(holds.claim_expiry(&k, gen_b), None, "a claim is one-shot");
+    }
 
     fn key() -> SessionKey {
         SessionKey {
