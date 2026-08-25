@@ -1379,7 +1379,7 @@ mod tests {
         );
         // The session's close flush: removes the recording and seals the key
         // (outside a runtime the detached flush discards synchronously).
-        recorder.flush_session_detached(&key(1));
+        recorder.flush_session_detached(&key(1), true);
 
         // The coordinator reconnects and replays the unchanged descriptor.
         control.apply_descriptor(&desc);

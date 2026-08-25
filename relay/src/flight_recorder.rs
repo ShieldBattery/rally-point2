@@ -1019,17 +1019,22 @@ impl FlightRecorder {
     }
 
     /// Removes `key`'s recording and builds its flushed blob, or `None` if no
-    /// recording exists. The removal is what makes a flush terminal — and the
-    /// close seal left behind is what *keeps* it terminal: without it, a
-    /// straggling event while the session is still mesh-joined would start a
-    /// fresh recording whose store later displaces this blob's (see
-    /// [`CloseSeals`]). Sealed even when there was nothing to remove, so a
-    /// close evaluated against a never-recorded session still blocks
-    /// stragglers.
-    fn take_blob(&self, key: &SessionKey) -> Option<FlightBlob> {
+    /// recording exists. The removal is what makes a flush terminal — and when
+    /// `seal` is set, the close seal left behind is what *keeps* it terminal:
+    /// without it, a straggling event while the session is still mesh-joined
+    /// would start a fresh recording whose store later displaces this blob's
+    /// (see [`CloseSeals`]). Sealed even when there was nothing to remove, so
+    /// a close evaluated against a never-recorded session still blocks
+    /// stragglers. A caller passes `seal: false` only for a session with no
+    /// coordinator lifecycle (no descriptor ever named it), where no
+    /// retirement will ever clear the seal and nothing remains for it to
+    /// guard.
+    fn take_blob(&self, key: &SessionKey, seal: bool) -> Option<FlightBlob> {
         let recording = {
             let mut state = self.inner.recordings.lock();
-            state.closed.seal(key);
+            if seal {
+                state.closed.seal(key);
+            }
             let recording = state.sessions.remove(key)?;
             // Production flushes happen after the slot links quiesce. A drain
             // deadline can force this snapshot while a final link is winding
@@ -1061,7 +1066,13 @@ impl FlightRecorder {
     /// Flushes `key`'s recording to the sink (or logs the discard when no sink
     /// is configured). Terminal for the recording either way.
     pub async fn flush_session(&self, key: &SessionKey) -> FlushOutcome {
-        let Some(blob) = self.take_blob(key) else {
+        self.flush_session_with_seal(key, true).await
+    }
+
+    /// [`flush_session`](Self::flush_session) with the caller choosing whether
+    /// the flush plants a close seal — see [`take_blob`](Self::take_blob).
+    async fn flush_session_with_seal(&self, key: &SessionKey, seal: bool) -> FlushOutcome {
+        let Some(blob) = self.take_blob(key, seal) else {
             return FlushOutcome::Nothing;
         };
         let Some(sink) = self.inner.sink.get() else {
@@ -1115,17 +1126,17 @@ impl FlightRecorder {
     /// session-close path (a sync teardown site inside the runtime). Outside a
     /// tokio runtime — some unit tests exercise the close path directly — the
     /// recording is discarded with a log, matching the no-sink behavior.
-    pub fn flush_session_detached(&self, key: &SessionKey) {
+    pub fn flush_session_detached(&self, key: &SessionKey, seal: bool) {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let recorder = self.clone();
                 let key = key.clone();
                 handle.spawn(async move {
-                    recorder.flush_session(&key).await;
+                    recorder.flush_session_with_seal(&key, seal).await;
                 });
             }
             Err(_) => {
-                let _ = self.take_blob(key);
+                let _ = self.take_blob(key, seal);
             }
         }
     }
@@ -1276,7 +1287,7 @@ mod tests {
         );
 
         // The loss is counted into the flushed blob.
-        let blob = recorder.take_blob(&k).expect("a recording exists");
+        let blob = recorder.take_blob(&k, true).expect("a recording exists");
         assert_eq!(blob.events_dropped, 3);
     }
 
@@ -1296,7 +1307,7 @@ mod tests {
         let conditions = crate::mesh::new_conditions_registry();
         recorder.sample_now(&conditions, |_| (None, None));
 
-        let blob = recorder.take_blob(&k).expect("a recording exists");
+        let blob = recorder.take_blob(&k, true).expect("a recording exists");
         // One tick sample plus the final flush snapshot.
         assert_eq!(blob.samples.len(), 2);
         let row = &blob.samples[0].slots[0];
@@ -1336,7 +1347,9 @@ mod tests {
 
         // Removing the first session's recording (the synchronous core of a
         // flush) does not remove its contribution from relay-lifetime totals.
-        let _ = recorder.take_blob(&first_key).expect("a recording exists");
+        let _ = recorder
+            .take_blob(&first_key, true)
+            .expect("a recording exists");
         assert_eq!(
             recorder.relay_work_snapshot(),
             RelayWorkSnapshot {
@@ -1398,7 +1411,7 @@ mod tests {
         );
         recorder.sample_now(&conditions, |_| (Some(17), Some(2)));
 
-        let blob = recorder.take_blob(&k).expect("a recording exists");
+        let blob = recorder.take_blob(&k, true).expect("a recording exists");
         let sample = &blob.samples[0];
         // The session-level end-to-end view rides the sample row.
         assert_eq!(sample.worst_e2e_lag_turns, Some(17));
@@ -1425,7 +1438,7 @@ mod tests {
         );
         recorder.record(&k, FlightEvent::SessionClosed);
 
-        let blob = recorder.take_blob(&k).expect("a recording exists");
+        let blob = recorder.take_blob(&k, true).expect("a recording exists");
         assert_eq!(blob.version, BLOB_VERSION);
         assert_eq!(blob.tenant, "sb-test");
         assert_eq!(blob.session, 42);

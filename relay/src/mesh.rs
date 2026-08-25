@@ -3082,6 +3082,13 @@ fn dispatch_mesh_control(
                 );
                 return;
             };
+            // Sanitize before anything consumes the directive: a dropped
+            // leave's count is stripped here (a legacy authority's copy can
+            // outrun its matching SlotDeparted, so the departure-record
+            // sanitizers never see it), and the same normalized copy is what
+            // gets cached, recorded, and fanned to local clients below — the
+            // cache and the clients must never disagree about the count.
+            let leave = crate::consensus::normalize_observed_leave(&leave);
             // A `false` here means this relay's own consensus state didn't
             // accept the directive as new: either an ordinary redundant copy
             // (already fanned out on its own first insert, so re-forwarding

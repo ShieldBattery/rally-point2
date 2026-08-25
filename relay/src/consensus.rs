@@ -4357,6 +4357,13 @@ impl DecisionMaker {
     #[must_use]
     pub fn observe_leave(&mut self, leave: &LeaveDirective) -> bool {
         use std::collections::hash_map::Entry;
+        // The cache must never hold a dropped leave's count, no matter which
+        // path delivered the directive — normalize here, where the state
+        // lives, in addition to the wire ingress (see
+        // [`normalize_observed_leave`]). Normalizing before the substance
+        // comparison below also keeps two relays convergent when only one of
+        // them saw the legacy count.
+        let leave = &normalize_observed_leave(leave);
         let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
             // A slot id past `u8` range can't name any real slot; a silent
             // truncation would alias it onto a valid one. Drop it (defensive —
@@ -5649,7 +5656,15 @@ pub fn sync_maker(
     use std::collections::hash_map::Entry;
     // A descriptor naming this session is a genuine (re-)serve: lift any
     // retirement tombstone so the session's mesh traffic dispatches again.
-    registry.retired.lock().remove(key);
+    // Prune expired tombstones on the same touch — descriptor pushes are the
+    // registry's steady heartbeat, so expired entries never sit allocated
+    // waiting for the next (possibly distant) retirement to sweep them.
+    {
+        let now = Instant::now();
+        let mut retired = registry.retired.lock();
+        retired.remove(key);
+        retired.retain(|_, at| now.duration_since(*at) < RETIRED_TOMBSTONE_TTL);
+    }
     let seed = |maker: &mut DecisionMaker| -> Vec<LeaveDirective> {
         let Some(departed) = resumed_departed else {
             return Vec::new();
@@ -6234,6 +6249,29 @@ pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId
         .and_then(|maker| maker.reachable_frame(slot))
 }
 
+/// Normalizes a leave directive observed from the wire: only a clean leave may
+/// carry an exact `final_turn_count`, so a **dropped** directive's count is
+/// stripped before the directive is compared, cached, recorded, or fanned any
+/// further. A count on a dropped directive means the authoring relay ran code
+/// predating the clean-leaves-only rule; because a `LeaveDirective` can outrun
+/// its matching `SlotDeparted` across peer links, this ingress must sanitize
+/// for itself rather than rely on the departure-record sanitizers.
+pub fn normalize_observed_leave(leave: &LeaveDirective) -> LeaveDirective {
+    if leave.reason == LEAVE_REASON_DROPPED && leave.final_turn_count.is_some() {
+        tracing::debug!(
+            slot = leave.slot,
+            leave_seq = leave.leave_seq,
+            stripped_count = ?leave.final_turn_count,
+            "stripping a legacy dropped leave's final turn count at ingress",
+        );
+        return LeaveDirective {
+            final_turn_count: None,
+            ..*leave
+        };
+    }
+    *leave
+}
+
 /// Caches a synced leave a peer relay's authority authored (received off the
 /// mesh) into the session's decision-maker, if the relay has one, so a later
 /// promotion re-broadcasts it verbatim. A no-op when no maker exists.
@@ -6254,12 +6292,16 @@ pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId
 /// disagrees with.
 #[must_use]
 pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) -> bool {
+    // Normalize before the notice below, not just inside the maker's cache:
+    // the departure notice must describe the sanitized directive, never a
+    // legacy count the coordinator would retain and re-seed on a rehome.
+    let leave = normalize_observed_leave(leave);
     let inserted = match registry.lock().get_mut(key) {
-        Some(maker) => maker.observe_leave(leave),
+        Some(maker) => maker.observe_leave(&leave),
         None => false,
     };
     if inserted {
-        registry.notify_departure(departure_notice(registry, key, leave));
+        registry.notify_departure(departure_notice(registry, key, &leave));
     }
     inserted
 }
@@ -6369,7 +6411,17 @@ pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
     registry
         .flight
         .record_existing(key, crate::flight_recorder::FlightEvent::SessionClosed);
-    registry.flight.flush_session_detached(key);
+    // Whether the flush plants a close seal follows the session's lifecycle.
+    // A maker means a descriptor named the session, so the descriptor
+    // retirement that clears seals will come; a maker-less session (a
+    // provisional admission no descriptor ever claimed) has no retirement in
+    // its future — a seal planted for it would live for the relay's lifetime,
+    // and there is nothing for it to guard anyway: no mesh ever joined the
+    // session (membership is descriptor-driven), every local link is already
+    // gone by this point, and a later dial for the id is a genuinely fresh
+    // admission whose recording must not be silently dropped.
+    let seal = registry.lock().contains_key(key);
+    registry.flight.flush_session_detached(key, seal);
 }
 
 /// This relay's known leave state for `key` — every recorded departure and every
@@ -11242,6 +11294,85 @@ mod tests {
         );
     }
 
+    /// A close for a session no descriptor ever named (no maker — a provisional
+    /// admission) plants no close seal: no retirement will ever clear one, so a
+    /// seal would live for the relay's lifetime, and it would also silently
+    /// drop the recording of a genuinely fresh later admission for the same id.
+    /// A descriptor-named session's close still seals until retirement.
+    #[test]
+    fn session_closed_without_a_maker_plants_no_seal() {
+        let registry = new_decision_makers();
+        let k = key();
+        registry.flight_recorder().record(
+            &k,
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+
+        // No tokio runtime here, so the flush (and its seal decision) runs
+        // synchronously — deterministic for the assertion below.
+        session_closed(&registry, &k);
+        assert!(
+            registry.flight_recorder().recorded_sessions().is_empty(),
+            "the close flushed the recording",
+        );
+
+        // A fresh admission for the same id records again — nothing sealed it.
+        registry.flight_recorder().record(
+            &k,
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 1,
+                resumed: false,
+            },
+        );
+        assert!(
+            !registry.flight_recorder().recorded_sessions().is_empty(),
+            "a maker-less close leaves no seal behind",
+        );
+    }
+
+    /// The same close on a descriptor-named session (a maker exists) seals: a
+    /// straggling event before retirement must not conjure a replacement
+    /// recording.
+    #[test]
+    fn session_closed_with_a_maker_still_seals() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+        );
+        registry.flight_recorder().record(
+            &k,
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+
+        session_closed(&registry, &k);
+        registry.flight_recorder().record(
+            &k,
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 1,
+                resumed: false,
+            },
+        );
+        assert!(
+            registry.flight_recorder().recorded_sessions().is_empty(),
+            "the seal blocks a straggler from recreating the recording",
+        );
+    }
+
     /// `set_session_refs` replaces rather than accumulates on a re-apply (a
     /// changed descriptor), and `deregister_maker` forgets a session's refs so
     /// the map doesn't outlive the session it describes.
@@ -11517,14 +11648,16 @@ mod tests {
 
     /// An observed peer directive's count folds into this relay's departure
     /// record, so a later promotion here re-derives with the same count even
-    /// though no `SlotDeparted` ever carried it to this relay.
+    /// though no `SlotDeparted` ever carried it to this relay. Clean leaves
+    /// only: a dropped directive's count is stripped at observation, so its
+    /// record stays count-less too.
     #[test]
     fn an_observed_leave_folds_its_final_turn_count_into_the_record() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
         let directive = LeaveDirective {
             slot: 2,
-            reason: DROPPED,
+            reason: LEAVE_REASON_LEFT,
             apply_at_frame: 116,
             leave_seq: 1,
             final_turn_count: Some(112),
@@ -11533,6 +11666,19 @@ mod tests {
         assert_eq!(
             maker.departures.get(&SlotId(2)).unwrap().final_turn_count,
             Some(112),
+        );
+
+        let dropped = LeaveDirective {
+            slot: 3,
+            reason: DROPPED,
+            leave_seq: 2,
+            ..directive
+        };
+        assert!(maker.observe_leave(&dropped));
+        assert_eq!(
+            maker.departures.get(&SlotId(3)).unwrap().final_turn_count,
+            None,
+            "a dropped directive's stripped count never reaches the record",
         );
     }
 
@@ -12417,14 +12563,16 @@ mod tests {
     /// simulation steps — a genuine authority conflict, not a leave_seq-style
     /// labeling difference. Behaviorally the first still wins (pinned here); the
     /// classification difference is the warn-vs-debug log level, which this
-    /// crate has no tracing-capture harness to assert.
+    /// crate has no tracing-capture harness to assert. Clean-leave reason: only
+    /// clean leaves carry counts at all (a dropped directive's count is
+    /// normalized away before comparison).
     #[test]
     fn observe_leave_treats_a_differing_final_turn_count_as_a_substance_conflict() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let first = LeaveDirective {
             slot: 3,
-            reason: DROPPED,
+            reason: LEAVE_REASON_LEFT,
             apply_at_frame: 51,
             leave_seq: 4,
             final_turn_count: Some(120),
@@ -12444,6 +12592,40 @@ mod tests {
             maker.decided_leaves.get(&SlotId(3)),
             Some(&first),
             "the first cached directive wins a count conflict",
+        );
+    }
+
+    /// A dropped directive arriving with a count was authored by code that
+    /// predates the clean-leaves-only rule. The count is stripped before the
+    /// directive is compared or cached — because a `LeaveDirective` can outrun
+    /// its matching `SlotDeparted`, this ingress is the only sanitizer that
+    /// ever sees it — and a peer's already-sanitized copy of the same decision
+    /// then reads as a plain duplicate, not a substance conflict.
+    #[test]
+    fn observe_leave_strips_a_legacy_dropped_count() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let legacy = LeaveDirective {
+            slot: 3,
+            reason: DROPPED,
+            apply_at_frame: 51,
+            leave_seq: 4,
+            final_turn_count: Some(120),
+        };
+        assert!(maker.observe_leave(&legacy), "first insert for the slot");
+        assert_eq!(
+            maker.decided_leaves[&SlotId(3)].final_turn_count,
+            None,
+            "the legacy count never enters the cache",
+        );
+
+        let sanitized = LeaveDirective {
+            final_turn_count: None,
+            ..legacy
+        };
+        assert!(
+            !maker.observe_leave(&sanitized),
+            "a peer's sanitized copy is a plain duplicate",
         );
     }
 
