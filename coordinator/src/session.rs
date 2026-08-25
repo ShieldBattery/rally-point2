@@ -768,9 +768,9 @@ pub fn rehome(
 ) -> RehomeOutcome {
     rehome_inner(
         setup,
-        tenant,
-        session,
+        &(tenant.clone(), session),
         dead_relay,
+        true,
         move || departed_slots,
         || {},
         |_| {},
@@ -794,9 +794,9 @@ pub fn rehome_with_assignment_commit(
 ) -> RehomeOutcome {
     rehome_inner(
         setup,
-        tenant,
-        session,
+        &(tenant.clone(), session),
         dead_relay,
+        true,
         read_departed,
         || {},
         assignment_committed,
@@ -838,20 +838,45 @@ fn cert_matches_pin(
 /// then retire `session_relays` and `rehomes` as separate, non-nested
 /// acquisitions after releasing lifecycle state. They therefore cannot cross
 /// this body or invert its nested fine-lock order.
-fn rehome_inner(
+/// [`rehome`] that never answers Stay: the named relay is being **evicted**
+/// (it re-enrolled without a capability its finalized-drops sessions
+/// require), so "it is alive and its cert still matches" — the ordinary
+/// false-alarm verdict — is exactly the case that must still move. The
+/// caller marks the relay draining first, which keeps the replacement pick
+/// from choosing the evictee itself.
+pub fn rehome_evicting(
     setup: &SessionSetup,
     tenant: &TenantId,
     session: SessionId,
+    evicted_relay: RelayId,
+    departed_slots: Vec<DepartedSlot>,
+) -> RehomeOutcome {
+    rehome_inner(
+        setup,
+        &(tenant.clone(), session),
+        evicted_relay,
+        false,
+        move || departed_slots,
+        || {},
+        |_| {},
+    )
+}
+
+fn rehome_inner(
+    setup: &SessionSetup,
+    session_key: &(TenantId, SessionId),
     dead_relay: RelayId,
+    allow_stay: bool,
     read_departed: impl FnOnce() -> Vec<DepartedSlot>,
     before_mutation: impl FnOnce(),
     assignment_committed: impl FnOnce(RelayId),
 ) -> RehomeOutcome {
+    let (tenant, session) = (&session_key.0, session_key.1);
     // The outermost assignment lock: this re-home's pick→re-stage span linearizes
     // against a relay's drain mark the same way `create_session` does.
     let _assign = setup.lock_assignment();
 
-    let key = (tenant.clone(), session);
+    let key = session_key.clone();
     let serving = setup.serving_relays(tenant, session);
     // Unknown session (never created here, or a coordinator restart wiped its
     // membership): there is nothing to re-home.
@@ -894,7 +919,8 @@ fn rehome_inner(
     // enroll *generation* is deliberately not the signal: it also bumps on a
     // benign control-WS reconnect that keeps the same cert, where Stay remains the
     // right answer, so generation alone cannot tell the two apart.
-    if serving.contains(&dead_relay)
+    if allow_stay
+        && serving.contains(&dead_relay)
         && let Some(entry) = registry::entry(&setup.registry, dead_relay)
         && cert_matches_pin(setup, &key, dead_relay, &entry.cert_der)
     {
@@ -3736,9 +3762,9 @@ mod tests {
         let departed: std::cell::RefCell<Vec<DepartedSlot>> = std::cell::RefCell::new(vec![]);
         let outcome = rehome_inner(
             &setup,
-            &tid(),
-            resp.session,
+            &(tid(), resp.session),
             RelayId(1),
+            true,
             || departed.borrow().clone(),
             || {
                 // The mid-rehome departure notice (the seam runs after the
@@ -3923,6 +3949,67 @@ mod tests {
         assert!(
             setup.descriptors().current_for(RelayId(4))[0].finalized_drops,
             "the resumed descriptor keeps the immutable flag",
+        );
+    }
+
+    /// A relay downgraded mid-flight (re-enrolled without the capability,
+    /// same cert) is evicted from its finalized-drops sessions: the ordinary
+    /// rehome would answer Stay (it is alive and its cert still matches), so
+    /// the eviction path must not — and, with the evictee marked draining, it
+    /// must land on an in-cohort replacement.
+    #[test]
+    fn a_downgraded_relay_is_evicted_from_its_finalized_drops_sessions() {
+        let reg = registry::new_registry();
+        enroll_capable_relay(&reg, 1, 14900);
+        enroll_capable_relay(&reg, 2, 14901);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = create_default_session(&setup);
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
+        assert!(setup.descriptors().current_for(RelayId(1))[0].finalized_drops);
+
+        // The downgrade: same id, same cert, no capability.
+        let generation = registry::enroll(
+            setup.registry(),
+            RelayHello::new(
+                RelayId(1),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                ProtocolVersion::CURRENT,
+                fake_cert(1),
+            ),
+        );
+        assert!(
+            matches!(
+                rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+                RehomeOutcome::Stay,
+            ),
+            "the ordinary rehome sees a live relay with a matching cert",
+        );
+
+        // The enroll-time eviction: draining first (so the pick can never
+        // choose the evictee), then the stay-less rehome.
+        assert!(registry::mark_draining(
+            setup.registry(),
+            RelayId(1),
+            generation,
+        ));
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome_evicting(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("the eviction moves the session");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(2), "an in-cohort replacement");
+        assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(2)]);
+        assert!(
+            setup.descriptors().current_for(RelayId(2))[0].finalized_drops,
+            "the moved session keeps its immutable flag",
         );
     }
 
@@ -4457,9 +4544,9 @@ mod tests {
 
         let outcome = rehome_inner(
             &setup,
-            &tid(),
-            resp.session,
+            &(tid(), resp.session),
             RelayId(1),
+            true,
             Vec::new,
             || {
                 // The concurrent full close clears the session's membership between the
