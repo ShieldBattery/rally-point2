@@ -736,9 +736,13 @@ impl RecentStores {
 /// `RecorderState::closed`). A seal exists only for the window between a
 /// session's close flush and its membership retirement — a session-teardown
 /// timescale, like [`RECENT_STORES`]'s window — so a bounded set covers every
-/// seal that matters; the cap is a leak backstop for a session whose
-/// retirement never arrives, not a size this is expected to reach.
-const CLOSE_SEAL_CAP: usize = 1024;
+/// seal that matters; the cap is a leak backstop for sessions whose retirement
+/// never arrives, not a size this is expected to reach. It must comfortably
+/// exceed the closed-but-unretired sessions a relay can accumulate while the
+/// coordinator (whose descriptor removals drive retirement) is unreachable:
+/// evicting a still-needed seal reopens the session to the straggler
+/// overwrite the seal exists to prevent, so an eviction warns.
+const CLOSE_SEAL_CAP: usize = 8192;
 
 /// The sessions whose recording was flushed by a close, kept as tombstones so a
 /// straggling event cannot conjure a fresh recording, oldest-first with the
@@ -751,8 +755,11 @@ const CLOSE_SEAL_CAP: usize = 1024;
 /// create-on-first-touch path. That replacement describes nothing, lingers
 /// until the drain flush, and — every recording of one session sharing a single
 /// storage key — its store would displace the real recording. Sealed keys drop
-/// their events instead, until the session's membership is retired (or a fresh
-/// descriptor genuinely re-serves it), which clears the seal.
+/// their events instead, until the session's membership is retired, which
+/// clears the seal. Retirement is the *only* clearing trigger: a descriptor
+/// push is routinely an idempotent replay (a coordinator reconnect re-pushes
+/// every current descriptor), and a genuine re-serve always passes through a
+/// retirement first.
 #[derive(Default)]
 struct CloseSeals {
     /// The sealed keys in seal order; the front is evicted when full.
@@ -771,6 +778,16 @@ impl CloseSeals {
             && let Some(evicted) = self.order.pop_front()
         {
             self.keys.remove(&evicted);
+            // An evicted seal may still have been guarding a
+            // closed-but-unretired session (a long coordinator outage is the
+            // realistic way to accumulate this many), which is now exposed to
+            // the straggler overwrite the seal prevents.
+            tracing::warn!(
+                tenant = evicted.tenant.as_ref(),
+                session = evicted.session.0,
+                cap = CLOSE_SEAL_CAP,
+                "close-seal capacity reached; evicting the oldest seal",
+            );
         }
         self.order.push_back(key.clone());
     }
@@ -955,11 +972,11 @@ impl FlightRecorder {
         }
     }
 
-    /// Clears `key`'s close seal, if any (see [`CloseSeals`]). Called when the
-    /// session's mesh membership is retired — no straggler can arrive once the
-    /// mesh has forgotten the session, so the seal has nothing left to guard —
-    /// and when a fresh descriptor re-serves the session, which opens a
-    /// genuinely new observation window that must be allowed to record.
+    /// Clears `key`'s close seal, if any (see [`CloseSeals`]). Called only when
+    /// the session's mesh membership is retired: the mesh has forgotten the
+    /// session, so the seal has (almost) nothing left to guard, and a genuine
+    /// later re-serve of the key — which always passes through a retirement
+    /// first — must be able to record again.
     pub fn clear_close_seal(&self, key: &SessionKey) {
         self.inner.recordings.lock().closed.clear(key);
     }
@@ -1561,9 +1578,9 @@ mod tests {
         );
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
 
-        // The relay genuinely serves the session again — a fresh descriptor
-        // clears the close seal — and the second store replaces what the first
-        // one wrote.
+        // The relay genuinely serves the session again — its retirement
+        // cleared the close seal before the re-serve — and the second store
+        // replaces what the first one wrote.
         recorder.clear_close_seal(&k);
         recorder.record(
             &k,

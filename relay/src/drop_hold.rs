@@ -550,6 +550,25 @@ impl DropHolds {
             .lock()
             .retain(|(limiter_key, _), _| limiter_key != key);
     }
+
+    /// Drops every hold and limiter for `key` unconditionally — the *terminal*
+    /// counterpart to [`end_session`](Self::end_session), for the session's
+    /// descriptor retirement rather than a local roster emptying.
+    ///
+    /// `end_session` deliberately preserves undecided holds: while the session
+    /// is still served, a hold is the reconnect-admission token and unlock
+    /// clock for a drop nobody has decided. Retirement ends that service — no
+    /// admission path remains for the slot's reconnect and no decide path for
+    /// its leave — so a preserved hold could never again be read by anything
+    /// and would sit in the registry forever (and poison an accidental reuse
+    /// of the session key). The caller cancels the abandon timer alongside
+    /// this for the same reason.
+    pub fn end_session_terminal(&self, key: &SessionKey) {
+        self.holds.lock().retain(|(hold_key, _), _| hold_key != key);
+        self.limiters
+            .lock()
+            .retain(|(limiter_key, _), _| limiter_key != key);
+    }
 }
 
 /// A per-requester token bucket for the drop-request rate cap. A whole-token

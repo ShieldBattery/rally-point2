@@ -291,13 +291,14 @@ impl MeshControl {
             session: descriptor.session,
         };
 
-        // A descriptor naming this session opens (or re-opens) an observation
-        // window: if an earlier close of the same session left its flight
-        // recording sealed against stragglers, this genuine re-serve clears
-        // the seal so the new window records.
-        self.decision_makers
-            .flight_recorder()
-            .clear_close_seal(&key);
+        // Deliberately no close-seal clearing here: a descriptor push is
+        // routinely an idempotent *replay* — a coordinator reconnect re-pushes
+        // every current descriptor — and unsealing a closed-but-not-yet-retired
+        // session would let a straggling mesh event conjure the empty
+        // replacement recording the seal exists to prevent. A *genuine*
+        // re-serve always passes through the session's retirement first (the
+        // coordinator removes a descriptor before it would ever re-add one),
+        // and `end_session` clears the seal there.
 
         // Stamp the tenant's correlation ids into the decision-maker registry
         // so a departure notice for this session can carry its own
@@ -564,16 +565,29 @@ impl MeshControl {
     /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
         consensus::deregister_maker(&self.decision_makers, key);
-        // With the membership gone no straggling event can arrive for the
-        // session, so a close seal left by its flush has nothing more to guard.
-        self.decision_makers.flight_recorder().clear_close_seal(key);
         presence::forget(&self.presence, key);
-        let mut inner = self.inner.lock();
-        let Some(peers) = inner.desired.remove(key) else {
-            return;
-        };
-        reconcile_peers(&mut inner, peers);
-        publish_desired_peers(&mut inner);
+        // Retirement is terminal for the session's drop bookkeeping: with the
+        // descriptor gone there is no admission path left for a held slot's
+        // reconnect and no decide path for its leave, so any armed abandon
+        // timer and every remaining hold would otherwise leak forever — the
+        // timer's expiry stands down on the forgotten presence (never deciding
+        // or releasing), and nothing else ever sweeps the entries.
+        self.drop_holds.cancel_abandon(key);
+        self.drop_holds.end_session_terminal(key);
+        {
+            let mut inner = self.inner.lock();
+            if let Some(peers) = inner.desired.remove(key) {
+                reconcile_peers(&mut inner, peers);
+                publish_desired_peers(&mut inner);
+            }
+        }
+        // Cleared only here — and last, after the mesh Leave commands above are
+        // queued — so the seal guards against straggling mesh events for as
+        // much of the teardown as possible; a genuine later re-serve of this
+        // key must be able to record again. An in-flight event a link driver
+        // was already delivering can still slip past this ordering; the
+        // repeat-store warn diagnoses that residual.
+        self.decision_makers.flight_recorder().clear_close_seal(key);
     }
 }
 
@@ -1282,6 +1296,89 @@ mod tests {
         assert!(
             !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
             "an already-started session fires no fresh session-wide start directive",
+        );
+    }
+
+    /// A descriptor push is routinely an idempotent replay (a coordinator
+    /// reconnect re-pushes every current descriptor), so it must NOT clear a
+    /// close seal: a closed-but-not-yet-retired session's seal is exactly what
+    /// keeps a straggling mesh event from conjuring an empty replacement
+    /// recording that would displace the real stored one.
+    #[test]
+    fn a_descriptor_replay_does_not_unseal_a_closed_flight_recording() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        let desc = descriptor(1, &[]);
+        control.apply_descriptor(&desc);
+
+        let recorder = makers.flight_recorder();
+        recorder.record(
+            &key(1),
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+        // The session's close flush: removes the recording and seals the key
+        // (outside a runtime the detached flush discards synchronously).
+        recorder.flush_session_detached(&key(1));
+
+        // The coordinator reconnects and replays the unchanged descriptor.
+        control.apply_descriptor(&desc);
+
+        // A straggling mesh event must still be dropped, not begin a
+        // replacement recording.
+        recorder.record(
+            &key(1),
+            crate::flight_recorder::FlightEvent::DropHeld { slot: 1 },
+        );
+        assert!(
+            recorder.recorded_sessions().is_empty(),
+            "the replayed descriptor left the close seal in place",
+        );
+
+        // Retirement is what clears it; a genuine re-serve records again.
+        control.end_session(&key(1));
+        recorder.record(
+            &key(1),
+            crate::flight_recorder::FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: true,
+            },
+        );
+        assert_eq!(recorder.recorded_sessions(), vec![key(1)]);
+    }
+
+    /// Descriptor retirement is terminal for the session's drop bookkeeping:
+    /// held (undecided) drops and any armed abandon timer must be swept with
+    /// it, or they leak forever — the timer's expiry stands down on the
+    /// forgotten presence without releasing anything, and no owner remains to
+    /// clean the hold entries.
+    #[tokio::test]
+    async fn end_session_sweeps_undecided_holds_and_the_abandon_timer() {
+        let holds = DropHolds::new(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_drop_holds(holds.clone());
+        control.apply_descriptor(&descriptor(1, &[]));
+
+        holds.hold(key(1), SlotId(0));
+        holds
+            .arm_abandon(key(1), |_| {})
+            .expect("the abandon timer arms");
+
+        control.end_session(&key(1));
+
+        assert!(
+            !holds.is_pending(&key(1), SlotId(0)),
+            "the undecided hold is swept by retirement",
+        );
+        assert!(
+            !holds.abandon_armed(&key(1)),
+            "the abandon timer is cancelled by retirement",
         );
     }
 
