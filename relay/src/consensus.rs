@@ -6141,9 +6141,14 @@ pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
     // close event and flush it (fire-and-forget — a flush must never delay a
     // teardown). This is the recording's ordinary end; the drain path's
     // wholesale flush covers sessions that never reach it.
+    //
+    // Sealing touches only a recording that already exists. A close evaluated
+    // for a session this relay recorded nothing of — or one whose recording an
+    // earlier close already flushed — must store nothing, rather than begin a
+    // recording whose whole content is that the session ended.
     registry
         .flight
-        .record(key, crate::flight_recorder::FlightEvent::SessionClosed);
+        .record_existing(key, crate::flight_recorder::FlightEvent::SessionClosed);
     registry.flight.flush_session_detached(key);
 }
 
@@ -10686,6 +10691,21 @@ mod tests {
             }
             other => panic!("expected a session-closed notice, got {other:?}"),
         }
+    }
+
+    /// A close for a session this relay recorded nothing of leaves the flight
+    /// recorder untouched: the close seals a recording, it never begins one.
+    #[test]
+    fn session_closed_does_not_begin_a_flight_recording() {
+        let registry = new_decision_makers();
+        let k = key();
+
+        session_closed(&registry, &k);
+
+        assert!(
+            registry.flight_recorder().recorded_sessions().is_empty(),
+            "an unobserved session records nothing to flush",
+        );
     }
 
     /// `set_session_refs` replaces rather than accumulates on a re-apply (a

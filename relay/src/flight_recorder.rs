@@ -42,6 +42,13 @@
 //! sink configured the recorder still records — cheap and bounded — and a
 //! flush logs what it discarded rather than storing it.
 //!
+//! A close seals a recording that exists; it never begins one (see
+//! [`FlightRecorder::record_existing`]). A recording starts at the first thing
+//! this relay observed about a session, so a session it observed nothing of
+//! stores nothing at all — which matters because every recording a relay makes
+//! of one session shares a single storage key, and a later store displaces an
+//! earlier one.
+//!
 //! Two sinks exist. The dev/loopback [`FileSink`] (`--flight-dir`) writes one
 //! uncompressed pretty-JSON file per blob at
 //! `<dir>/<tenant>/<session>/<relay_id>.json` — its value is human inspectability.
@@ -719,6 +726,34 @@ impl FlightRecorder {
         });
     }
 
+    /// Records one event for `key`'s session **only when a recording already
+    /// exists**; with none, the event is dropped and no recording is created.
+    ///
+    /// This is for an event that only marks the end of an observation — the
+    /// session close. Beginning a recording from one would be wrong twice
+    /// over: the recording describes nothing that happened (its whole content
+    /// is that the session ended), and every recording a relay makes of one
+    /// session shares a single storage key, so storing it displaces the
+    /// recording of a session the relay really did serve. Both matter once a
+    /// flush has removed a session's recording — a close evaluated after that
+    /// must be a no-op, not a second, contentless recording of the same
+    /// session.
+    pub fn record_existing(&self, key: &SessionKey, event: FlightEvent) {
+        let recording = self
+            .inner
+            .recordings
+            .lock()
+            .sessions
+            .get(key)
+            .map(Arc::clone);
+        if let Some(recording) = recording {
+            recording.push_event(EventRecord {
+                at_ms: now_ms(),
+                event,
+            });
+        }
+    }
+
     /// The counter handle for `key`'s `slot`, fetched **once** at link start so
     /// the per-turn path bumps plain atomics with no lock and no map lookup.
     pub fn slot_counters(&self, key: &SessionKey, slot: SlotId) -> Arc<SlotCounters> {
@@ -1244,6 +1279,82 @@ mod tests {
 
         // A re-flush of the gone recording is a harmless Nothing.
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Nothing);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_never_begins_a_recording() {
+        let recorder = FlightRecorder::default();
+        let sink = Arc::new(CaptureSink::default());
+        recorder.set_sink(sink.clone());
+        let k = key(1);
+
+        recorder.record_existing(&k, FlightEvent::SessionClosed);
+
+        assert!(
+            recorder.recorded_sessions().is_empty(),
+            "an event that only marks the end of an observation starts nothing",
+        );
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Nothing);
+        assert!(sink.blobs.lock().is_empty(), "nothing was stored");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_lands_on_a_live_recording() {
+        let recorder = FlightRecorder::default();
+        let sink = Arc::new(CaptureSink::default());
+        recorder.set_sink(sink.clone());
+        let k = key(1);
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 3,
+                resumed: false,
+            },
+        );
+
+        recorder.record_existing(&k, FlightEvent::SessionClosed);
+
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
+        let blobs = sink.blobs.lock();
+        let stored = blobs.first().expect("the recording was stored");
+        assert_eq!(
+            stored.events.last().map(|record| &record.event),
+            Some(&FlightEvent::SessionClosed),
+            "the close seals the recording it was recorded against",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_close_stores_nothing_over_an_already_stored_recording() {
+        let recorder = FlightRecorder::default();
+        let sink = Arc::new(CaptureSink::default());
+        recorder.set_sink(sink.clone());
+        let k = key(1);
+        recorder.record(
+            &k,
+            FlightEvent::BufferDirective {
+                buffer_turns: 4,
+                apply_frame: 1200,
+                decision_seq: 9,
+            },
+        );
+        recorder.record_existing(&k, FlightEvent::SessionClosed);
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
+
+        // A close evaluated again for the same session — the relay serves it no
+        // longer, so nothing has been recorded since.
+        recorder.record_existing(&k, FlightEvent::SessionClosed);
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Nothing);
+
+        let blobs = sink.blobs.lock();
+        assert_eq!(blobs.len(), 1, "only the served session's recording stored");
+        assert!(
+            blobs[0]
+                .events
+                .iter()
+                .any(|record| matches!(record.event, FlightEvent::BufferDirective { .. })),
+            "the stored recording is the one holding what the relay observed",
+        );
     }
 
     #[tokio::test]
