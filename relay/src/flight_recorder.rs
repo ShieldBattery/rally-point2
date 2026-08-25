@@ -742,11 +742,20 @@ impl RecentStores {
 /// coordinator (whose descriptor removals drive retirement) is unreachable:
 /// evicting a still-needed seal reopens the session to the straggler
 /// overwrite the seal exists to prevent, so an eviction warns.
-const CLOSE_SEAL_CAP: usize = 8192;
+const CLOSE_SEAL_WARN_THRESHOLD: usize = 8192;
 
 /// The sessions whose recording was flushed by a close, kept as tombstones so a
-/// straggling event cannot conjure a fresh recording, oldest-first with the
-/// front evicted past [`CLOSE_SEAL_CAP`].
+/// straggling event cannot conjure a fresh recording. Seals are retained until
+/// retirement, never evicted: an evicted seal would silently reopen its
+/// closed-but-unretired session to exactly the straggler overwrite the seal
+/// exists to prevent. The set is bounded by construction rather than by a cap —
+/// every seal is cleared when its session's descriptor is retired, and the
+/// closed-but-unretired population can only accumulate while the coordinator
+/// (whose descriptor removals drive retirement) is unreachable, during which no
+/// new sessions are assigned to the relay either. Each entry is one small
+/// `SessionKey`, so even a pathological retirement leak costs memory slowly;
+/// crossing [`CLOSE_SEAL_WARN_THRESHOLD`] warns once (re-armed when the count
+/// halves) as the tripwire for such a leak.
 ///
 /// A close flush removes the session's recording, but the relay can stay
 /// mesh-joined for the session until the coordinator retires its descriptor —
@@ -762,10 +771,10 @@ const CLOSE_SEAL_CAP: usize = 8192;
 /// retirement first.
 #[derive(Default)]
 struct CloseSeals {
-    /// The sealed keys in seal order; the front is evicted when full.
-    order: VecDeque<SessionKey>,
-    /// The same keys, for the membership test.
     keys: HashSet<SessionKey>,
+    /// Latched when the count crosses the warn threshold, so the tripwire
+    /// fires once per excursion instead of on every seal past it.
+    warned: bool,
 }
 
 impl CloseSeals {
@@ -774,28 +783,24 @@ impl CloseSeals {
         if !self.keys.insert(key.clone()) {
             return;
         }
-        if self.order.len() >= CLOSE_SEAL_CAP
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.keys.remove(&evicted);
-            // An evicted seal may still have been guarding a
-            // closed-but-unretired session (a long coordinator outage is the
-            // realistic way to accumulate this many), which is now exposed to
-            // the straggler overwrite the seal prevents.
+        if self.keys.len() >= CLOSE_SEAL_WARN_THRESHOLD && !self.warned {
+            self.warned = true;
+            // This many closed-but-unretired sessions means retirement has
+            // stopped clearing seals — a very long coordinator outage, or a
+            // retirement-path leak. The seals are all kept regardless (see
+            // the struct doc); this is the diagnostic, not a limit.
             tracing::warn!(
-                tenant = evicted.tenant.as_ref(),
-                session = evicted.session.0,
-                cap = CLOSE_SEAL_CAP,
-                "close-seal capacity reached; evicting the oldest seal",
+                count = self.keys.len(),
+                "close-seal count crossed the leak-warning threshold",
             );
         }
-        self.order.push_back(key.clone());
     }
 
     /// Clears `key`'s seal, if any.
     fn clear(&mut self, key: &SessionKey) {
-        if self.keys.remove(key) {
-            self.order.retain(|sealed| sealed != key);
+        self.keys.remove(key);
+        if self.warned && self.keys.len() < CLOSE_SEAL_WARN_THRESHOLD / 2 {
+            self.warned = false;
         }
     }
 
@@ -1541,6 +1546,32 @@ mod tests {
                 .any(|record| matches!(record.event, FlightEvent::BufferDirective { .. })),
             "the stored recording is the one holding what the relay observed",
         );
+    }
+
+    #[test]
+    fn a_seal_past_the_warn_threshold_is_retained_not_evicted() {
+        // Volume must never evict a seal: an evicted seal would silently
+        // reopen its closed-but-unretired session to the straggler overwrite
+        // the seal exists to prevent. The threshold only trips the leak warn.
+        let mut seals = CloseSeals::default();
+        let first = key(1);
+        seals.seal(&first);
+        for session in 2..=(CLOSE_SEAL_WARN_THRESHOLD as u64 + 4) {
+            seals.seal(&key(session));
+        }
+        assert!(
+            seals.contains(&first),
+            "the oldest seal survives any volume of later seals",
+        );
+        assert!(seals.warned, "crossing the threshold trips the leak warn");
+
+        // Retirement clearing drains the set; the warn latch re-arms once the
+        // count halves, so a later excursion warns again.
+        for session in 1..=(CLOSE_SEAL_WARN_THRESHOLD as u64 + 4) {
+            seals.clear(&key(session));
+        }
+        assert!(!seals.warned, "the warn latch re-arms as the set drains");
+        assert!(!seals.contains(&first));
     }
 
     #[test]
