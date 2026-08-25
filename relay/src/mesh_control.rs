@@ -109,6 +109,12 @@ pub struct MeshControl {
     /// nothing else ever marks. Wired to the real per-relay registry with
     /// [`with_provisional`](Self::with_provisional).
     provisional: crate::provisional::ProvisionalSessions,
+    /// The per-session terminal ingress boundary. Descriptor application
+    /// reopens a session's gate (a genuine re-serve) and retirement closes it
+    /// before sweeping — see [`crate::session_gate`]. A fresh, never-shared
+    /// registry by default (a control plane with no turn path); wired to the
+    /// relay-wide one with [`with_gates`](Self::with_gates).
+    gates: crate::session_gate::SessionGates,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -185,6 +191,7 @@ impl MeshControl {
             provisional: crate::provisional::ProvisionalSessions::new(
                 crate::provisional::PROVISIONAL_WINDOW,
             ),
+            gates: crate::session_gate::SessionGates::default(),
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 latest_generations: HashMap::new(),
@@ -208,6 +215,16 @@ impl MeshControl {
     pub fn with_broadcast(mut self, sessions: Sessions, mesh_links: MeshLinks) -> Self {
         self.sessions = sessions;
         self.mesh_links = mesh_links;
+        self
+    }
+
+    /// Wires the relay-wide session-gate registry, so the retire/reopen this
+    /// control plane performs is the same boundary the turn path, client
+    /// admission, and mesh dispatch run their ingress through. The production
+    /// relay passes `MeshState::gates`; a control plane with no turn path
+    /// keeps the default fresh registry, where gating is a harmless no-op.
+    pub fn with_gates(mut self, gates: crate::session_gate::SessionGates) -> Self {
+        self.gates = gates;
         self
     }
 
@@ -371,6 +388,11 @@ impl MeshControl {
         // before syncing, so a promotion here skips a slot whose drop a client
         // could still return from — exactly like the presence-driven promotion
         // (`presence::recompute`), which gets the same set from its own caller.
+        // A descriptor naming this session is a genuine (re-)serve: lift any
+        // retirement gate so its ingress — clients, turns, mesh frames —
+        // dispatches again. Before `sync_maker`, so no window exists where
+        // the maker is visible but the gate still refuses.
+        self.gates.reopen(&key);
         let held_slots = self.drop_holds.pending_slots(&key);
         // A rehome (resumed) descriptor's departed-slot seeds — and the
         // resumed latch that stops leaves decided from here on from carrying
@@ -440,6 +462,17 @@ impl MeshControl {
             routing::fan_out_region_labels(&self.sessions, &key, &labels);
         }
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
+        if descriptor.resumed && !descriptor.departed_slots.is_empty() {
+            // A seeded departed slot may still hold a live local link — a
+            // provisionally admitted dial that raced the descriptor. Its
+            // leave is decided, so the home-ingress turn fence already drops
+            // everything it sends; close the link too rather than leaving a
+            // zombie connection pumping fenced turns until it gives up on its
+            // own. The subject deliberately receives no LeaveDirective of its
+            // own, so the close is the only signal it gets.
+            let departed: Vec<_> = descriptor.departed_slots.iter().map(|d| d.slot).collect();
+            crate::routing::close_slots(&self.sessions, &key, &departed);
+        }
         if descriptor.resumed {
             self.decision_makers.flight_recorder().record(
                 &key,
@@ -559,15 +592,17 @@ impl MeshControl {
     /// session has a maker but no mesh peers to reconcile, so gating its teardown
     /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
-        // Tombstone first, before any state is destroyed: the mesh Leave
-        // commands queued below drain asynchronously, and until each link
-        // driver processes its Leave, a buffered mesh frame for this session
-        // still passes the driver's joined check. Dispatch consults the
-        // tombstone and drops such frames — without it, a straggling
-        // `SlotDeparted` would find no maker, read as an undecided drop, and
-        // recreate a drop hold (or a `RequestDrop` would report a second
-        // close) for a session that no longer exists.
-        consensus::mark_session_retired(&self.decision_makers, key);
+        // Close the session's ingress gate first, before any state is
+        // destroyed. The write acquisition drains every in-flight ingress
+        // critical section (mesh dispatch, the turn funnel, an admission), so
+        // their mutations land wholly before the sweeps below; every ingress
+        // that starts afterward observes the retirement and refuses. Without
+        // this boundary a buffered mesh frame — still passing its link
+        // driver's joined check until the queued Leave drains — would find no
+        // maker, read a `SlotDeparted` as an undecided drop, and recreate a
+        // drop hold (or report a second close, or re-create a flight
+        // recording) for a session that no longer exists.
+        self.gates.retire(key);
         consensus::deregister_maker(&self.decision_makers, key);
         presence::forget(&self.presence, key);
         // Retirement is terminal for the session's drop bookkeeping: with the
@@ -1324,16 +1359,20 @@ mod tests {
     /// departures must therefore be *pushed* to it when they are seeded —
     /// otherwise it plays on forever, stalled on the departed slot's turns
     /// that will never come.
-    #[test]
-    fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors() {
+    #[tokio::test]
+    async fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors() {
         let makers = Arc::new(consensus::new_decision_makers());
         let sessions = Sessions::default();
         let mesh_links = crate::mesh::new_mesh_links();
         let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
             .with_broadcast(sessions.clone(), mesh_links.clone());
 
-        // The survivor, admitted before any descriptor arrived.
+        // The survivor — and the departed subject itself — both admitted
+        // before any descriptor arrived (provisional admission).
         let (_reg, mut inbox) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        let (_subject_reg, subject_inbox) =
+            crate::routing::register(&sessions, &key(1), SlotId(1)).unwrap();
+        let subject_shutdown = subject_inbox.shutdown_handle();
 
         let mut desc = descriptor(1, &[]);
         desc.expected_slots = vec![SlotId(0), SlotId(1)];
@@ -1350,6 +1389,15 @@ mod tests {
             .expect("the seeded leave is pushed to the already-connected survivor");
         assert_eq!(leave.slot, 1);
         assert_eq!(leave.final_turn_count, Some(64));
+        // The subject's live provisional link is signaled closed: its leave is
+        // decided, so nothing it sends is part of the game any more (and the
+        // home-ingress turn fence drops whatever it manages to send first).
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            subject_shutdown.notified(),
+        )
+        .await
+        .expect("the seeded departed subject's link is signaled to close");
 
         // The idempotent descriptor replay re-decides nothing, so nothing is
         // re-pushed either (the client would dedup it by slot regardless).

@@ -506,7 +506,17 @@ async fn main() -> Result<()> {
         // applying here clears the provisional mark client admission may have
         // left on the session (`server.rs`), rather than leaving it to expire
         // on a relay the descriptor already covers.
-        .with_provisional(mesh_state.provisional.clone());
+        .with_provisional(mesh_state.provisional.clone())
+        // Wire the relay-wide session gates, so the descriptor retirement this
+        // control plane performs closes the same ingress boundary the turn
+        // path, mesh dispatch, and client admission run through.
+        .with_gates(mesh_state.gates.clone());
+        // The flight recorder's create-on-first-touch consults the same gates,
+        // so a retired session's straggling event cannot begin a recording.
+        mesh_state
+            .decision_makers
+            .flight_recorder()
+            .set_gates(mesh_state.gates.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it

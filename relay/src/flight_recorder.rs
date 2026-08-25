@@ -690,6 +690,10 @@ struct RecorderInner {
     /// Where flushed blobs go. Set once at startup; absent, a flush is a
     /// logged discard (the recorder still records — cheap and bounded).
     sink: OnceLock<Arc<dyn FlightSink>>,
+    /// The relay-wide session gates, consulted by create-on-first-touch so a
+    /// retired session's straggling event cannot begin a recording. Set once
+    /// at startup beside the sink; absent, every session reads as unretired.
+    gates: OnceLock<crate::session_gate::SessionGates>,
     /// The sessions stored recently, so a second store for one of them can say
     /// so (see [`RecentStores`]).
     recent_stores: Mutex<RecentStores>,
@@ -846,11 +850,31 @@ impl FlightRecorder {
         let _ = self.inner.sink.set(sink);
     }
 
+    /// Wires the relay-wide session-gate registry, so create-on-first-touch
+    /// refuses a retired session (see [`recording`](Self::recording)). Set
+    /// once at startup beside the sink; a second call is ignored. Without one
+    /// (tests, a standalone recorder) every session reads as unretired.
+    pub fn set_gates(&self, gates: crate::session_gate::SessionGates) {
+        let _ = self.inner.gates.set(gates);
+    }
+
     /// `key`'s live recording, created on first touch — or `None` when the key
     /// is close-sealed: a session whose recording a close already flushed must
     /// not have a straggler conjure a contentless replacement that would later
     /// displace the stored one (see [`CloseSeals`]).
     fn recording(&self, key: &SessionKey) -> Option<Arc<SessionRecording>> {
+        // A retired session must not have a straggling event conjure a fresh
+        // recording either: the close seal covers close-to-retirement, and
+        // the retirement gate covers everything after — together the whole
+        // tail of the session's lifecycle.
+        if self
+            .inner
+            .gates
+            .get()
+            .is_some_and(|gates| gates.is_retired(key))
+        {
+            return None;
+        }
         let mut state = self.inner.recordings.lock();
         if state.closed.contains(key) {
             return None;
@@ -1569,6 +1593,41 @@ mod tests {
                 .any(|record| matches!(record.event, FlightEvent::BufferDirective { .. })),
             "the stored recording is the one holding what the relay observed",
         );
+    }
+
+    #[test]
+    fn a_retired_sessions_event_never_begins_a_recording() {
+        // The seal covers close-to-retirement; the session gate covers
+        // everything after retirement (which clears the seal). Together no
+        // straggler can conjure a recording anywhere in the session's tail.
+        let recorder = FlightRecorder::default();
+        let gates = crate::session_gate::SessionGates::default();
+        recorder.set_gates(gates.clone());
+        let k = key(1);
+
+        gates.retire(&k);
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+        assert!(
+            recorder.recorded_sessions().is_empty(),
+            "a retired session's event records nothing",
+        );
+
+        // A genuine re-serve reopens the gate and records again.
+        gates.reopen(&k);
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+        assert!(!recorder.recorded_sessions().is_empty());
     }
 
     #[test]

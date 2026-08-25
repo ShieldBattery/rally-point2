@@ -5339,27 +5339,7 @@ pub struct DecisionMakers {
     /// a shortened delay (see [`new_decision_makers_with_region_delay`]) instead
     /// of the gate growing a second, test-only evaluation path.
     region_release_delay: Duration,
-    /// Sessions whose descriptor was retired, kept as short-lived tombstones.
-    /// Retirement sweeps the session's state and *queues* the mesh Leave
-    /// commands, but each link driver holds the session in its own joined map
-    /// until it processes that queued Leave — and a mesh frame it delivers in
-    /// that window would otherwise walk the ordinary dispatch paths against a
-    /// missing maker, recreating a drop hold, a close report, or a flight
-    /// recording for a session that no longer exists. Mesh dispatch checks
-    /// this set first and drops such frames. A tombstone is cleared by the
-    /// next descriptor naming the session (a genuine re-serve) and pruned by
-    /// age otherwise — once every driver has processed its Leave, the joined
-    /// check drops the frames on its own, so the tombstone only needs to
-    /// outlive the queue-drain window by a wide margin.
-    retired: parking_lot::Mutex<HashMap<SessionKey, Instant>>,
 }
-
-/// How long a retired session's tombstone is kept (absent a re-serve clearing
-/// it sooner). The window it must cover — mesh-Leave commands queued by the
-/// retirement sweep still draining through the link drivers — is seconds at
-/// worst; this is orders of magnitude beyond it, while still bounding the set
-/// against a coordinator that retires sessions forever.
-const RETIRED_TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
 
 impl DecisionMakers {
     /// Locks the per-session map. Kept method-shaped (rather than exposing the
@@ -5476,7 +5456,6 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
         refs: parking_lot::Mutex::new(HashMap::new()),
         flight: crate::flight_recorder::FlightRecorder::default(),
         region_release_delay,
-        retired: parking_lot::Mutex::new(HashMap::new()),
     }
 }
 
@@ -5654,17 +5633,6 @@ pub fn sync_maker(
     resumed_departed: Option<&[DepartedSlot]>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
-    // A descriptor naming this session is a genuine (re-)serve: lift any
-    // retirement tombstone so the session's mesh traffic dispatches again.
-    // Prune expired tombstones on the same touch — descriptor pushes are the
-    // registry's steady heartbeat, so expired entries never sit allocated
-    // waiting for the next (possibly distant) retirement to sweep them.
-    {
-        let now = Instant::now();
-        let mut retired = registry.retired.lock();
-        retired.remove(key);
-        retired.retain(|_, at| now.duration_since(*at) < RETIRED_TOMBSTONE_TTL);
-    }
     let seed = |maker: &mut DecisionMaker| -> Vec<LeaveDirective> {
         let Some(departed) = resumed_departed else {
             return Vec::new();
@@ -5816,28 +5784,6 @@ pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.mark_started();
     }
-}
-
-/// Tombstones `key` as retired (see [`DecisionMakers::retired`]). Called by
-/// descriptor retirement **before** the maker is destroyed, so no window
-/// exists where the maker is gone but the tombstone unset. Expired tombstones
-/// are pruned here, on the (rare) retirement path.
-pub fn mark_session_retired(registry: &DecisionMakers, key: &SessionKey) {
-    let now = Instant::now();
-    let mut retired = registry.retired.lock();
-    retired.retain(|_, at| now.duration_since(*at) < RETIRED_TOMBSTONE_TTL);
-    retired.insert(key.clone(), now);
-}
-
-/// Whether `key` is tombstoned as retired — mesh dispatch drops a session's
-/// frames while this holds, so a frame queued behind the retirement sweep
-/// cannot resurrect per-session state (see [`DecisionMakers::retired`]).
-pub fn session_retired(registry: &DecisionMakers, key: &SessionKey) -> bool {
-    registry
-        .retired
-        .lock()
-        .get(key)
-        .is_some_and(|at| at.elapsed() < RETIRED_TOMBSTONE_TTL)
 }
 
 /// Records the descriptor-derived initial-depth inputs (`latency_hint_ms` and
@@ -6247,6 +6193,17 @@ pub fn reachable_frame(registry: &DecisionMakers, key: &SessionKey, slot: SlotId
         .lock()
         .get(key)
         .and_then(|maker| maker.reachable_frame(slot))
+}
+
+/// Whether `slot`'s synced leave is already decided for `key`. Terminal for
+/// the slot's participation: a decided leave refuses readmission, so no turn
+/// the slot originates after this is part of the game — the home-ingress turn
+/// fence keys on it. `false` when no maker exists.
+pub fn slot_leave_decided(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.decided_leaves.contains_key(&slot))
 }
 
 /// Normalizes a leave directive observed from the wire: only a clean leave may
@@ -6739,6 +6696,15 @@ pub fn claim_close_report_with_maker(registry: &DecisionMakers, key: &SessionKey
         .lock()
         .get_mut(key)
         .is_some_and(DecisionMaker::claim_close_report)
+}
+
+/// Whether a decision-maker exists for `key` — that is, whether a descriptor
+/// has ever named the session on this relay (makers are created only by
+/// descriptor application). Distinguishes a coordinator-managed session,
+/// whose lifecycle ends in a descriptor retirement, from a provisionally
+/// admitted one that has no coordinator lifecycle at all.
+pub fn maker_exists(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry.lock().contains_key(key)
 }
 
 /// Claims the one session-closed report for `key` (see

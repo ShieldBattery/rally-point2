@@ -1233,7 +1233,6 @@ pub async fn run_slot_link(
     );
     let crate::mesh::MeshState {
         links: mesh_links,
-        seen: seen_registries,
         conditions,
         decision_makers,
         lobby,
@@ -1717,10 +1716,7 @@ pub async fn run_slot_link(
                             // mislead its own slot.
                             crate::mesh::forward_client_turn(
                                 &sessions,
-                                &mesh_links,
-                                &seen_registries,
-                                &decision_makers,
-                                &turn_ring,
+                                &mesh_for_teardown,
                                 &key,
                                 slot,
                                 payload,
@@ -2290,10 +2286,7 @@ pub async fn run_slot_link(
                                 // above).
                                 crate::mesh::forward_client_turn(
                                     &sessions,
-                                    &mesh_links,
-                                    &seen_registries,
-                                    &decision_makers,
-                                    &turn_ring,
+                                    &mesh_for_teardown,
                                     &key,
                                     slot,
                                     payload,
@@ -2857,6 +2850,14 @@ fn maybe_close_emptied_session_inner(
     // for the same session id (a genuinely fresh admission) gets its own new
     // mark rather than inheriting whatever deadline this one had left.
     mesh.provisional.clear(key);
+    // A session no descriptor ever named has no coordinator lifecycle, so the
+    // retirement that ordinarily cleans up its ingress gate will never come —
+    // drop the gate here, at its retirement-equivalent, or the entry lives
+    // for the relay's lifetime. A descriptor-named session keeps its gate
+    // until real retirement.
+    if !consensus::maker_exists(&mesh.decision_makers, key) {
+        mesh.gates.discard(key);
+    }
 }
 
 /// Announces a home client's departure from the game: records it, tells the peer
@@ -4064,11 +4065,13 @@ mod tests {
             commands: vec![0x05].into(),
             ..payload()
         };
+        let mut mesh_state = crate::mesh::new_mesh_state();
+        mesh_state.seen = seen.clone();
+        mesh_state.decision_makers = makers.clone();
+        mesh_state.turn_ring = turn_ring.clone();
         crate::mesh::deliver_mesh_turn(
             &sessions,
-            &seen,
-            &makers,
-            &turn_ring,
+            &mesh_state,
             &k,
             SlotId(0),
             stamped,
@@ -4125,9 +4128,7 @@ mod tests {
         };
         crate::mesh::deliver_mesh_turn(
             &sessions,
-            &seen,
-            &makers,
-            &turn_ring,
+            &mesh_state,
             &k,
             SlotId(0),
             duplicate,

@@ -1151,10 +1151,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     }
     mesh::forward_client_turn(
         &relay_a.sessions,
-        &relay_a.mesh.links,
-        &relay_a.mesh.seen,
-        &relay_a.mesh.decision_makers,
-        &relay_a.mesh.turn_ring,
+        &relay_a.mesh,
         &key,
         SlotId(0),
         turn(0, triggering_seq),

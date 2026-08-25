@@ -674,6 +674,14 @@ pub struct MeshState {
     /// like `drop_holds`, and threaded through the same admission and
     /// descriptor-apply paths. See [`crate::provisional`].
     pub provisional: crate::provisional::ProvisionalSessions,
+    /// The per-session terminal ingress boundary: client admission, the turn
+    /// funnel, and mesh dispatch all run their critical sections through it,
+    /// and descriptor retirement marks a session retired under its write side
+    /// before sweeping any state — so no ingress can resurrect what a
+    /// retirement removed. Shared with `MeshControl` (which retires and
+    /// reopens) and the flight recorder (whose create-on-first-touch consults
+    /// it). See [`crate::session_gate`].
+    pub gates: crate::session_gate::SessionGates,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -740,6 +748,7 @@ pub fn new_mesh_state_with_timings(
         provisional: crate::provisional::ProvisionalSessions::new(
             crate::provisional::PROVISIONAL_WINDOW,
         ),
+        gates: crate::session_gate::SessionGates::default(),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -1582,53 +1591,78 @@ fn skin_frame(session: SessionId, skin: PlayerSkin) -> MeshControlFrame {
 #[allow(clippy::too_many_arguments)]
 pub fn forward_client_turn(
     sessions: &routing::Sessions,
-    mesh_links: &MeshLinks,
-    seen: &SeenRegistries,
-    decision_makers: &crate::consensus::DecisionMakers,
-    turn_ring: &crate::turn_ring::TurnRing,
+    mesh: &MeshState,
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
 ) {
-    if let Some(payload) = deliver_turn_to_locals(
-        sessions,
-        seen,
-        decision_makers,
-        turn_ring,
-        key,
-        slot,
-        payload,
-        crate::delivery::DeliveryHome::Local,
-    ) {
-        fan_out_to_mesh(mesh_links, key, payload);
+    // Terminal fence for this relay's own homed ingress: a slot whose synced
+    // leave is decided has ended its participation — nothing it originates
+    // afterward is part of the game, and a turn that entered the mesh here
+    // could be consumed by a survivor that had not yet applied the leave,
+    // diverging it from the survivors that did. The clean-leave intent
+    // already stops its slot's forwarding in the same step it decides, but a
+    // descriptor-seeded departure decides a slot that may still hold a live
+    // (provisionally admitted) link, and a decided slot's zombie link can
+    // outlive its decision in general. Mesh-delivered turns are deliberately
+    // NOT fenced ([`deliver_mesh_turn`]): a peer home forwarded them before
+    // the decision reached it, and local survivors may still need them to
+    // reach a clean leave's exact count.
+    if crate::consensus::slot_leave_decided(&mesh.decision_makers, key, slot) {
+        tracing::debug!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = slot.0,
+            "dropping a turn from a slot whose leave is decided",
+        );
+        return;
+    }
+    let delivered = mesh.gates.with_ingress(key, || {
+        deliver_turn_to_locals(
+            sessions,
+            &mesh.seen,
+            &mesh.decision_makers,
+            &mesh.turn_ring,
+            key,
+            slot,
+            payload,
+            crate::delivery::DeliveryHome::Local,
+        )
+    });
+    if let Some(Some(payload)) = delivered {
+        fan_out_to_mesh(&mesh.links, key, payload);
     }
 }
 
 /// Delivers one turn received from `peer` to this relay's local clients and
-/// stops it there. This function deliberately has no [`MeshLinks`] argument:
-/// relay-origin payloads are one mesh hop only and must never be re-forwarded
-/// to either their ingress peer or another relay.
-#[allow(clippy::too_many_arguments)]
+/// stops it there. Relay-origin payloads are one mesh hop only and must never
+/// be re-forwarded to either their ingress peer or another relay — this
+/// function reaches only the local delivery path, never `fan_out_to_mesh`.
 pub(crate) fn deliver_mesh_turn(
     sessions: &routing::Sessions,
-    seen: &SeenRegistries,
-    decision_makers: &crate::consensus::DecisionMakers,
-    turn_ring: &crate::turn_ring::TurnRing,
+    mesh: &MeshState,
     key: &SessionKey,
     slot: SlotId,
     payload: Payload,
     peer: RelayId,
 ) {
-    let _ = deliver_turn_to_locals(
-        sessions,
-        seen,
-        decision_makers,
-        turn_ring,
-        key,
-        slot,
-        payload,
-        crate::delivery::DeliveryHome::Peer(peer),
-    );
+    // The ingress gate makes the delivery's per-session mutations (the seen
+    // gate, frame observation, the turn ring) atomic against a concurrent
+    // retirement sweep — a retired session's mesh turns are dropped here.
+    // Recursive-read, so the mesh-control dispatch arm that funnels an
+    // oversize turn through this path re-enters its own session's gate.
+    let _ = mesh.gates.with_ingress(key, || {
+        deliver_turn_to_locals(
+            sessions,
+            &mesh.seen,
+            &mesh.decision_makers,
+            &mesh.turn_ring,
+            key,
+            slot,
+            payload,
+            crate::delivery::DeliveryHome::Peer(peer),
+        )
+    });
 }
 
 /// The shared local-delivery half of [`forward_client_turn`] and
@@ -2260,9 +2294,7 @@ pub async fn run_mesh_link(
                                     // session-level dedup in `deliver_mesh_turn`.
                                     deliver_mesh_turn(
                                         &sessions,
-                                        &seen_registries,
-                                        &decision_makers,
-                                        &mesh_for_dispatch.turn_ring,
+                                        &mesh_for_dispatch,
                                         &key,
                                         slot,
                                         payload,
@@ -2963,22 +2995,38 @@ fn dispatch_mesh_control(
     };
     let key = state.key.clone();
 
-    // Retirement fence. The joined map above lags retirement: end_session
-    // queues this driver's Leave command, and until it is processed the
-    // session still looks joined here — but its maker, holds, and seals are
-    // already swept, so letting a buffered frame walk the dispatch arms below
-    // would resurrect per-session state (a `SlotDeparted` recreating a drop
-    // hold against the missing maker, a `RequestDrop` reporting a second
-    // close, any event re-creating an unsealed flight recording).
-    if crate::consensus::session_retired(&mesh.decision_makers, &key) {
+    // The gate is the retirement fence AND the mutation barrier. The joined
+    // map above lags retirement (end_session only queues this driver's Leave),
+    // so a buffered frame still passes it — and the dispatch arms below mutate
+    // per-session state (holds, the maker, close reports, flight events) that
+    // a concurrent retirement sweeps. Running the whole dispatch inside the
+    // gate's read side means a retirement either waits for this frame's
+    // mutations (and then sweeps them) or has already marked the session, in
+    // which case the frame is dropped here — a frame can no longer check one
+    // piece of state and then mutate another across the sweep.
+    let dispatched = mesh.gates.with_ingress(&key, || {
+        dispatch_mesh_control_frame(frame, peer_id, &key, sessions, mesh)
+    });
+    if dispatched.is_none() {
         tracing::debug!(
             tenant = key.tenant.as_ref(),
             session = session_id.0,
             "mesh control frame for a retired session; dropping",
         );
-        return;
     }
+}
 
+/// The dispatch arms of [`dispatch_mesh_control`], run inside the session's
+/// ingress gate — see the gate acquisition there.
+fn dispatch_mesh_control_frame(
+    frame: MeshControlFrame,
+    peer_id: RelayId,
+    key: &SessionKey,
+    sessions: &routing::Sessions,
+    mesh: &MeshState,
+) {
+    let session_id = key.session;
+    let key = key.clone();
     match frame.kind {
         Some(mesh_control_frame::Kind::SlotDeparted(departed)) => {
             let Ok(slot) = u8::try_from(departed.slot).map(SlotId) else {
@@ -3134,16 +3182,7 @@ fn dispatch_mesh_control(
             // for this stream-delivered seq already ran in the driver's own
             // select branch (`fold_oversize_into_link`), which has the link
             // access this dispatch doesn't.
-            deliver_mesh_turn(
-                sessions,
-                &mesh.seen,
-                &mesh.decision_makers,
-                &mesh.turn_ring,
-                &key,
-                slot,
-                payload,
-                peer_id,
-            );
+            deliver_mesh_turn(sessions, mesh, &key, slot, payload, peer_id);
         }
         Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
             // A lobby command a peer relay's member authored, already slot-stamped
@@ -4264,6 +4303,7 @@ mod tests {
             provisional: crate::provisional::ProvisionalSessions::new(
                 crate::provisional::PROVISIONAL_WINDOW,
             ),
+            gates: crate::session_gate::SessionGates::default(),
         }
     }
 
@@ -4350,13 +4390,15 @@ mod tests {
             routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
         let (mut peer_b_rx, _peer_b_control_rx) = register_link_channels(&links, &key);
         let (mut peer_c_rx, _peer_c_control_rx) = register_link_channels(&links, &key);
+        let mut mesh_state = new_mesh_state();
+        mesh_state.links = links.clone();
+        mesh_state.seen = seen.clone();
+        mesh_state.decision_makers = makers.clone();
+        mesh_state.turn_ring = turn_ring.clone();
 
         forward_client_turn(
             &sessions,
-            &links,
-            &seen,
-            &makers,
-            &turn_ring,
+            &mesh_state,
             &key,
             SlotId(0),
             Payload {
@@ -4419,11 +4461,13 @@ mod tests {
             ..Default::default()
         };
 
+        let mut mesh_state = new_mesh_state();
+        mesh_state.seen = seen.clone();
+        mesh_state.decision_makers = makers.clone();
+        mesh_state.turn_ring = turn_ring.clone();
         deliver_mesh_turn(
             &sessions,
-            &seen,
-            &makers,
-            &turn_ring,
+            &mesh_state,
             &key,
             SlotId(0),
             payload.clone(),
@@ -4457,16 +4501,7 @@ mod tests {
         // A redundant copy presented by a different peer during reconnect,
         // resume, or re-home overlap is dropped locally and still cannot enter
         // the mesh.
-        deliver_mesh_turn(
-            &sessions,
-            &seen,
-            &makers,
-            &turn_ring,
-            &key,
-            SlotId(0),
-            payload,
-            RelayId(3),
-        );
+        deliver_mesh_turn(&sessions, &mesh_state, &key, SlotId(0), payload, RelayId(3));
         assert!(local.try_recv_forward().is_none());
         assert!(peer_b_rx.try_recv().is_err());
         assert!(peer_c_rx.try_recv().is_err());
@@ -5275,11 +5310,12 @@ mod tests {
 
     /// Retirement sweeps a session's state but only *queues* each link
     /// driver's Leave, so a buffered mesh frame still passes the driver's
-    /// joined check in that window. The retirement tombstone must drop it
-    /// there: without the fence, a straggling `SlotDeparted` finds no maker,
-    /// reads as an undecided drop, and recreates a drop hold for a session
-    /// that no longer exists. A later descriptor naming the session (a
-    /// genuine re-serve) lifts the tombstone and dispatch works again.
+    /// joined check in that window. The session gate must drop it there:
+    /// without the fence, a straggling `SlotDeparted` finds no maker, reads
+    /// as an undecided drop, and recreates a drop hold for a session that no
+    /// longer exists. A later descriptor naming the session (a genuine
+    /// re-serve, which reopens the gate in `apply_descriptor`) dispatches
+    /// again.
     #[test]
     fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
         let sessions: routing::Sessions = Arc::default();
@@ -5342,9 +5378,9 @@ mod tests {
             "a live session's dropped SlotDeparted marks a hold",
         );
 
-        // Retirement, as end_session performs it: tombstone first, then the
-        // sweep — while this driver's joined map still lists the session.
-        crate::consensus::mark_session_retired(&makers, &key);
+        // Retirement, as end_session performs it: close the gate first, then
+        // the sweep — while this driver's joined map still lists the session.
+        mesh_state.gates.retire(&key);
         crate::consensus::deregister_maker(&makers, &key);
         mesh_state.drop_holds.end_session_terminal(&key);
 
@@ -5358,12 +5394,113 @@ mod tests {
             "the swept hold stays swept",
         );
 
-        // A genuine re-serve (a fresh descriptor) lifts the tombstone.
+        // A genuine re-serve: apply_descriptor reopens the gate before it
+        // syncs the maker; model both halves here.
+        mesh_state.gates.reopen(&key);
         serve();
         dispatch_mesh_control(departed(3), RelayId(9), &joined, &sessions, &mesh_state);
         assert!(
             mesh_state.drop_holds.is_pending(&key, SlotId(3)),
             "a re-served session dispatches normally again",
+        );
+    }
+
+    /// A slot whose synced leave is decided is terminal at its home ingress:
+    /// a turn it originates locally is dropped before it can reach local
+    /// survivors or enter the mesh. A mesh-delivered turn for the same slot
+    /// is NOT fenced — a peer home forwarded it before the decision reached
+    /// it, and local survivors may still need it to reach a clean leave's
+    /// exact count.
+    #[test]
+    fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
+        let sessions = routing::Sessions::default();
+        let key = control_key();
+        let mesh_state = new_mesh_state();
+        let makers = Arc::clone(&mesh_state.decision_makers);
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            None,
+        );
+        let (_reg, mut survivor) =
+            routing::register(&sessions, &key, SlotId(1)).expect("survivor registers");
+        let (mut peer_rx, _peer_ctl_rx) = register_link_channels(&mesh_state.links, &key);
+
+        // Slot 0's leave is decided (a peer authority's directive observed).
+        assert!(crate::consensus::observe_leave(
+            &makers,
+            &key,
+            &LeaveDirective {
+                slot: 0,
+                reason: 0,
+                apply_at_frame: 10,
+                leave_seq: 1,
+                final_turn_count: Some(9),
+            },
+        ));
+
+        let turn = |seq: u64| Payload {
+            seq,
+            slot: 0,
+            commands: vec![0x05].into(),
+            ..Default::default()
+        };
+        forward_client_turn(&sessions, &mesh_state, &key, SlotId(0), turn(7));
+        assert!(
+            survivor.try_recv_forward().is_none(),
+            "the decided slot's home-ingress turn never reaches a survivor",
+        );
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "the decided slot's home-ingress turn never enters the mesh",
+        );
+
+        deliver_mesh_turn(&sessions, &mesh_state, &key, SlotId(0), turn(8), RelayId(2));
+        assert!(
+            survivor.try_recv_forward().is_some(),
+            "a mesh-delivered turn for the decided slot still reaches survivors",
+        );
+    }
+
+    /// A retired session's mesh turn is dropped by the ingress gate before it
+    /// can touch per-session state — the datagram counterpart of the
+    /// mesh-control dispatch fence.
+    #[test]
+    fn a_retired_sessions_mesh_turn_is_dropped_by_the_gate() {
+        let sessions = routing::Sessions::default();
+        let key = control_key();
+        let mesh_state = new_mesh_state();
+        let (_reg, mut survivor) =
+            routing::register(&sessions, &key, SlotId(1)).expect("survivor registers");
+
+        mesh_state.gates.retire(&key);
+        deliver_mesh_turn(
+            &sessions,
+            &mesh_state,
+            &key,
+            SlotId(0),
+            Payload {
+                seq: 3,
+                slot: 0,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+            RelayId(2),
+        );
+        assert!(
+            survivor.try_recv_forward().is_none(),
+            "a retired session's mesh turn is dropped",
+        );
+        assert_eq!(
+            mark_seen(&mesh_state.seen, &key, SlotId(0), 3),
+            Seen::New,
+            "the dropped turn never touched the session-level gate",
         );
     }
 

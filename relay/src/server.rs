@@ -50,6 +50,14 @@ pub const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 /// [`homed_slots`]: rally_point_proto::control::SessionDescriptor::homed_slots
 pub const SLOT_NOT_HOMED_CLOSE: u32 = 0x08;
 
+/// The session's descriptor was retired — the coordinator ended the session —
+/// and this dial arrived while the retirement tombstone still stands. Nothing
+/// this relay holds can serve it: the maker, holds, and recording are swept,
+/// and admitting the dial would recreate roster and seen state for a session
+/// with no lifecycle left. A genuine re-serve is preceded by a fresh
+/// descriptor, which lifts the gate before clients dial.
+pub const SESSION_RETIRED_CLOSE: u32 = 0x0B;
+
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
 /// state no matter how fast they arrive, so an unauthenticated flood can't grow
@@ -100,6 +108,14 @@ enum ConnError {
     /// relay in a multi-relay session).
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} is not homed on this relay")]
     SlotNotHomed {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// The session's descriptor was retired and its tombstone still stands —
+    /// a stale dial into a session the coordinator already ended.
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} dialed a retired session")]
+    SessionRetired {
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
@@ -382,8 +398,23 @@ async fn serve_connection(
         });
     }
 
-    let Some((mut registration, inbox)) = routing::register(&sessions, &key, authorized.slot)
+    // Admission is an ingress critical section on the session's gate: the
+    // retirement check and the roster registration happen atomically against
+    // a concurrent descriptor retirement, so a stale dial can neither slip in
+    // behind the sweep (recreating roster/seen state for a session with no
+    // lifecycle left) nor land between the check and the register.
+    let Some(registered) = mesh
+        .gates
+        .with_ingress(&key, || routing::register(&sessions, &key, authorized.slot))
     else {
+        connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+        return Err(ConnError::SessionRetired {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    };
+    let Some((mut registration, inbox)) = registered else {
         connection.close(
             VarInt::from_u32(SLOT_TAKEN_CLOSE),
             b"slot already connected",

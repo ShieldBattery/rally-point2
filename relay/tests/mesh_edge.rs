@@ -1284,10 +1284,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
     };
     mesh::forward_client_turn(
         &relay_a.sessions,
-        &relay_a.mesh.links,
-        &relay_a.mesh.seen,
-        &relay_a.mesh.decision_makers,
-        &relay_a.mesh.turn_ring,
+        &relay_a.mesh,
         &key,
         SlotId(0),
         oversize.clone(),

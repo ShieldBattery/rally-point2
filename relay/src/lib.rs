@@ -100,6 +100,7 @@ pub mod provisional;
 pub mod region_ping;
 pub mod routing;
 pub mod server;
+pub mod session_gate;
 pub mod skin;
 pub mod task_stats;
 pub mod turn_ring;
