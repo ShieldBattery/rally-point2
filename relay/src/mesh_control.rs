@@ -559,6 +559,15 @@ impl MeshControl {
     /// session has a maker but no mesh peers to reconcile, so gating its teardown
     /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
+        // Tombstone first, before any state is destroyed: the mesh Leave
+        // commands queued below drain asynchronously, and until each link
+        // driver processes its Leave, a buffered mesh frame for this session
+        // still passes the driver's joined check. Dispatch consults the
+        // tombstone and drops such frames — without it, a straggling
+        // `SlotDeparted` would find no maker, read as an undecided drop, and
+        // recreate a drop hold (or a `RequestDrop` would report a second
+        // close) for a session that no longer exists.
+        consensus::mark_session_retired(&self.decision_makers, key);
         consensus::deregister_maker(&self.decision_makers, key);
         presence::forget(&self.presence, key);
         // Retirement is terminal for the session's drop bookkeeping: with the

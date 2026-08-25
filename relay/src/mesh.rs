@@ -2963,6 +2963,22 @@ fn dispatch_mesh_control(
     };
     let key = state.key.clone();
 
+    // Retirement fence. The joined map above lags retirement: end_session
+    // queues this driver's Leave command, and until it is processed the
+    // session still looks joined here — but its maker, holds, and seals are
+    // already swept, so letting a buffered frame walk the dispatch arms below
+    // would resurrect per-session state (a `SlotDeparted` recreating a drop
+    // hold against the missing maker, a `RequestDrop` reporting a second
+    // close, any event re-creating an unsealed flight recording).
+    if crate::consensus::session_retired(&mesh.decision_makers, &key) {
+        tracing::debug!(
+            tenant = key.tenant.as_ref(),
+            session = session_id.0,
+            "mesh control frame for a retired session; dropping",
+        );
+        return;
+    }
+
     match frame.kind {
         Some(mesh_control_frame::Kind::SlotDeparted(departed)) => {
             let Ok(slot) = u8::try_from(departed.slot).map(SlotId) else {
@@ -5250,6 +5266,99 @@ mod tests {
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }
 
+    /// Retirement sweeps a session's state but only *queues* each link
+    /// driver's Leave, so a buffered mesh frame still passes the driver's
+    /// joined check in that window. The retirement tombstone must drop it
+    /// there: without the fence, a straggling `SlotDeparted` finds no maker,
+    /// reads as an undecided drop, and recreates a drop hold for a session
+    /// that no longer exists. A later descriptor naming the session (a
+    /// genuine re-serve) lifts the tombstone and dispatch works again.
+    #[test]
+    fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let key = control_key();
+        let serve = || {
+            let _ = crate::consensus::sync_maker(
+                &makers,
+                &key,
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                None,
+            );
+        };
+        serve();
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        let departed = |slot: u32| MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                slot,
+                last_frame: Some(10),
+                reachable_frame: Some(10),
+                reason: crate::consensus::LEAVE_REASON_DROPPED,
+                result_payload: Vec::new().into(),
+                result_arrival_ms: 0,
+                result_session_frame: None,
+                result_slot_frame: None,
+                connection_epoch: Some(1),
+                final_turn_count: None,
+            })),
+        };
+
+        // Control: while the session is live, the same frame installs a hold.
+        dispatch_mesh_control(departed(1), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(
+            mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+            "a live session's dropped SlotDeparted marks a hold",
+        );
+
+        // Retirement, as end_session performs it: tombstone first, then the
+        // sweep — while this driver's joined map still lists the session.
+        crate::consensus::mark_session_retired(&makers, &key);
+        crate::consensus::deregister_maker(&makers, &key);
+        mesh_state.drop_holds.end_session_terminal(&key);
+
+        dispatch_mesh_control(departed(2), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(
+            !mesh_state.drop_holds.is_pending(&key, SlotId(2)),
+            "a retired session's straggler frame resurrects nothing",
+        );
+        assert!(
+            !mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+            "the swept hold stays swept",
+        );
+
+        // A genuine re-serve (a fresh descriptor) lifts the tombstone.
+        serve();
+        dispatch_mesh_control(departed(3), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(
+            mesh_state.drop_holds.is_pending(&key, SlotId(3)),
+            "a re-served session dispatches normally again",
+        );
+    }
 
     /// A game-chat message arriving over the mesh control stream is folded into
     /// this relay's local delivery — fanned to local members, no log to append
