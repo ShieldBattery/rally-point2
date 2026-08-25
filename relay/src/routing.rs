@@ -3677,6 +3677,7 @@ mod tests {
             [SlotId(0)].into_iter().collect(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         consensus::mark_session_started(&mesh.decision_makers, &k);
         consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(50));
@@ -3752,6 +3753,7 @@ mod tests {
             [SlotId(0)].into_iter().collect(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         consensus::mark_session_started(&mesh.decision_makers, &k);
 
@@ -4043,6 +4045,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
 
         // A local client to fan out to.
@@ -4202,6 +4205,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         // Both slots have framed history: the survivor pins a session frame and the
         // departing slot gives the leave its apply-frame basis.
@@ -4564,6 +4568,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         let replacement = SlotConditions {
             slot: 0,
@@ -4631,6 +4636,7 @@ mod tests {
             [SlotId(0), SlotId(1)].into_iter().collect(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
         consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
@@ -4831,6 +4837,7 @@ mod tests {
             [SlotId(0), SlotId(1)].into_iter().collect(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         consensus::mark_session_started(&makers, &k);
         consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
@@ -4911,6 +4918,7 @@ mod tests {
             [SlotId(0), SlotId(1)].into_iter().collect(),
             [SlotId(0)].into_iter().collect(),
             std::collections::HashSet::new(),
+            None,
         );
         assert!(
             !consensus::session_started(&mesh.decision_makers, &k),
@@ -5336,6 +5344,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0)).unwrap();
         let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1)).unwrap();

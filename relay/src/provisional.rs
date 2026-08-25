@@ -300,6 +300,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         assert!(
@@ -466,6 +467,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(
             provisional.is_marked(&key(1)),

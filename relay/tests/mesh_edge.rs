@@ -511,6 +511,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
         expected.clone(),
         [SlotId(0)].into_iter().collect(),
         std::collections::HashSet::new(),
+        None,
     );
     let _ = consensus::sync_maker(
         &relay_b.mesh.decision_makers,
@@ -521,6 +522,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
         expected,
         [SlotId(1)].into_iter().collect(),
         std::collections::HashSet::new(),
+        None,
     );
 
     // Both clients connect before either side joins the mesh session. Their live

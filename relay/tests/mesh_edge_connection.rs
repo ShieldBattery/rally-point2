@@ -1105,6 +1105,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
+        None,
     );
     consensus::mark_session_started(&relay_a.mesh.decision_makers, &key);
 

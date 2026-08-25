@@ -2995,7 +2995,15 @@ fn dispatch_mesh_control(
                     .map(rally_point_proto::ids::GameFrameCount),
                 reachable_frame: departed.reachable_frame,
                 result,
-                final_turn_count: departed.final_turn_count,
+                // Only a clean leave may carry an exact final turn count. A
+                // dropped frame's count is discarded at this ingress rather
+                // than trusted from the wire: the peer may be running code
+                // that predates that rule, and a stale drop count that
+                // survives into the record could ride a later decide or a
+                // straggler reconnect's replayed directive.
+                final_turn_count: (departed.reason != crate::consensus::LEAVE_REASON_DROPPED)
+                    .then_some(departed.final_turn_count)
+                    .flatten(),
             };
             let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
                 mesh.drop_holds.record_and_maybe_hold(&key, slot, || {
@@ -3654,6 +3662,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
@@ -4373,6 +4382,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         let (_registration, mut local) =
             routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
@@ -4591,6 +4601,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         // The authority decided one slot's leave (caches a directive and records a
         // departure), and separately recorded a bare departure for another slot.
@@ -5126,6 +5137,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
 
         // A peer mesh link that must NOT hear an echo of the received turn.
@@ -5237,6 +5249,7 @@ mod tests {
         assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
         assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
     }
+
 
     /// A game-chat message arriving over the mesh control stream is folded into
     /// this relay's local delivery — fanned to local members, no log to append
@@ -5441,6 +5454,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
 
@@ -5539,6 +5553,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
 
         // A local survivor (slot 5) that must hear an accepted leave and must
@@ -5655,6 +5670,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         crate::consensus::record_departure(
             &makers,
@@ -5727,6 +5743,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
@@ -5803,6 +5820,7 @@ mod tests {
                 std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
+                None,
             );
             assert!(crate::consensus::activate_connection_epoch(
                 &makers,
@@ -5956,6 +5974,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         // The target slot dropped: a frame basis for its leave, a recorded departure,
         // and a hold this relay marked. `test_mesh_state` uses a zero unlock floor,
@@ -6038,6 +6057,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         crate::consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(50));
         crate::consensus::record_departure(
@@ -6115,6 +6135,7 @@ mod tests {
             [SlotId(0), SlotId(1)].into(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         consensus::mark_session_started(&decision_makers, &key);
 
@@ -6177,6 +6198,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
         let labels = vec![
             RegionLabel {
@@ -6333,6 +6355,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
 
         // Slot 0's very first turn (seq 0, sync ordinal 0), delivered twice at
@@ -6441,6 +6464,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            None,
         );
 
         // The survivor's turns each arrive twice: the home peer's direct copy,

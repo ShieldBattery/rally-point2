@@ -576,6 +576,15 @@ impl Lifecycle {
         let state = sessions
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
+        // Only a clean leave may carry an exact final turn count; a dropped
+        // notice's count is discarded here rather than trusted from the wire
+        // (the reporting relay may run code that predates that rule), so a
+        // rehome descriptor never re-seeds an unsound drop count into a relay
+        // that would trust it.
+        let final_turn_count = match kind {
+            DepartureKind::Dropped => None,
+            DepartureKind::Left => final_turn_count,
+        };
         // First record for a slot wins — a slot never departs twice, and every
         // relay's copy of the same decided leave carries the same substance.
         state.departures.entry(slot).or_insert(DepartureSeed {

@@ -221,7 +221,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
-    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
+    BufferBounds, DepartedSlot, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
     GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
@@ -4056,10 +4056,16 @@ impl DecisionMaker {
             reason,
             apply_at_frame: 0,
             leave_seq: self.next_leave_seq,
-            // The record can still carry a home-authored count (a drop that
-            // produced turns before the session was abandoned); stamp whatever
-            // it holds so a straggler reconnect applies at the same point.
-            final_turn_count: self.departures.get(&slot).and_then(|d| d.final_turn_count),
+            // Same count gate as `commit_leave`: only a clean leave on a
+            // never-rehomed session may carry the exact count. A dropped
+            // record's count (possibly authored by an older peer over the
+            // mesh) and a resumed session's are unsound and must not ride a
+            // straggler reconnect's replayed directive.
+            final_turn_count: if reason == LEAVE_REASON_DROPPED || self.resumed {
+                None
+            } else {
+                self.departures.get(&slot).and_then(|d| d.final_turn_count)
+            },
         };
         self.decided_leaves.insert(slot, directive);
         Some(directive)
@@ -4231,12 +4237,28 @@ impl DecisionMaker {
     /// apply *frame* is only a fallback for a count-less seed — it is scheduled
     /// one past the current session frame (or 0 before any framed turn), which
     /// a survivor that already applied the leave dedups away by slot.
+    ///
+    /// A **dropped** seed's count is discarded here regardless of what the
+    /// carrier holds: only a clean leave may carry an exact count (see
+    /// `commit_leave`), and the seed may have travelled through a coordinator
+    /// or peer running code that predates that rule, so the invariant is
+    /// re-enforced at this ingress rather than trusted from the wire.
+    ///
+    /// Returns the seeded directive when this call newly decided the slot's
+    /// leave — the copy the caller must fan to already-connected local
+    /// survivors, who otherwise perform their one leave reconciliation at
+    /// registration and would never hear of a departure seeded afterward.
+    /// `None` for a slot already decided (nothing new to deliver).
     pub fn seed_departed(
         &mut self,
         slot: SlotId,
         kind: DepartureKind,
         final_turn_count: Option<u64>,
-    ) {
+    ) -> Option<LeaveDirective> {
+        let final_turn_count = match kind {
+            DepartureKind::Dropped => None,
+            DepartureKind::Left => final_turn_count,
+        };
         let reason = match kind {
             DepartureKind::Dropped => LEAVE_REASON_DROPPED,
             DepartureKind::Left => LEAVE_REASON_LEFT,
@@ -4250,18 +4272,20 @@ impl DecisionMaker {
             reason,
             None,
         );
-        if !self.decided_leaves.contains_key(&slot) {
-            self.next_leave_seq += 1;
-            let base = self.session_frame().map(|f| f.0).unwrap_or(0);
-            let directive = LeaveDirective {
-                slot: u32::from(slot.0),
-                reason,
-                apply_at_frame: base.saturating_add(1),
-                leave_seq: self.next_leave_seq,
-                final_turn_count,
-            };
-            self.decided_leaves.insert(slot, directive);
+        if self.decided_leaves.contains_key(&slot) {
+            return None;
         }
+        self.next_leave_seq += 1;
+        let base = self.session_frame().map(|f| f.0).unwrap_or(0);
+        let directive = LeaveDirective {
+            slot: u32::from(slot.0),
+            reason,
+            apply_at_frame: base.saturating_add(1),
+            leave_seq: self.next_leave_seq,
+            final_turn_count,
+        };
+        self.decided_leaves.insert(slot, directive);
+        Some(directive)
     }
 
     /// Records the end-of-game result `slot` reported, returning whether this was
@@ -5562,6 +5586,24 @@ fn now_ms() -> u64 {
 /// the caller from the drop-hold registry (see [`DecisionMaker::sync`]) --
 /// only meaningful on the reconcile path (a fresh maker has nothing recorded
 /// yet to hold back).
+///
+/// `resumed_departed` is `Some` exactly when the descriptor is a rehome
+/// (resumed) one, carrying the coordinator-known departed slots. They are
+/// seeded — and the maker's started and resumed latches set — *inside* the
+/// registry lock that creates or reconciles the maker, never as follow-up
+/// calls: the moment this function returns, other tasks can reach the maker
+/// (a provisionally admitted client's clean-leave intent, say), and a maker
+/// momentarily visible without its resumed latch would stamp an exact final
+/// turn count that the rehomed session's split forwarding history cannot
+/// support. Seeding runs before the authority `sync`, so a promotion in the
+/// same push re-broadcasts the seeded leaves like any other decided ones.
+///
+/// The returned batch is everything the caller must (re)broadcast: the
+/// promotion re-broadcast, plus any directive newly decided by this push's
+/// seeding — a client admitted before the descriptor did its one leave
+/// reconciliation at registration and would otherwise never hear a seeded
+/// departure, stalling forever on the departed slot's turns. Deduplicated by
+/// slot (receivers dedup again regardless).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn sync_maker(
@@ -5573,9 +5615,27 @@ pub fn sync_maker(
     expected_slots: HashSet<SlotId>,
     homed_slots: HashSet<SlotId>,
     held_slots: HashSet<SlotId>,
+    resumed_departed: Option<&[DepartedSlot]>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
-    let (leaves, fresh) = {
+    let seed = |maker: &mut DecisionMaker| -> Vec<LeaveDirective> {
+        let Some(departed) = resumed_departed else {
+            return Vec::new();
+        };
+        let seeded = departed
+            .iter()
+            .filter_map(|d| maker.seed_departed(d.slot, d.kind, d.final_turn_count))
+            .collect();
+        // Latch the session started, so a resumed relay never waits on the
+        // full expected set (which still lists the departed slots that will
+        // never dial) and never re-fires the session-start machinery
+        // session-wide; and latch it resumed, so no leave it ever decides
+        // carries an exact final turn count.
+        maker.mark_started();
+        maker.resumed = true;
+        seeded
+    };
+    let (mut leaves, fresh, seeded) = {
         let mut makers = registry.lock();
         match makers.entry(key.clone()) {
             Entry::Occupied(mut existing) => {
@@ -5583,7 +5643,9 @@ pub fn sync_maker(
                 maker.set_observers(observers);
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
-                maker.sync(bounds, authority, &held_slots)
+                let seeded = seed(maker);
+                let (leaves, fresh) = maker.sync(bounds, authority, &held_slots);
+                (leaves, fresh, seeded)
             }
             Entry::Vacant(vacant) => {
                 let maker = vacant.insert(DecisionMaker::new(
@@ -5600,13 +5662,22 @@ pub fn sync_maker(
                 // is seeded above.
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
-                (Vec::new(), Vec::new())
+                let seeded = seed(maker);
+                (Vec::new(), Vec::new(), seeded)
             }
         }
     };
     for leave in &fresh {
         record_leave_event(registry, key, leave);
         registry.notify_departure(departure_notice(registry, key, leave));
+    }
+    // A seeded departure fires no departure notice (the coordinator that
+    // seeded it already knows), but must still reach local survivors and mesh
+    // peers exactly like the promotion batch.
+    for seeded_leave in seeded {
+        if !leaves.iter().any(|l| l.slot == seeded_leave.slot) {
+            leaves.push(seeded_leave);
+        }
     }
     leaves
 }
@@ -5697,15 +5768,6 @@ pub fn started_session_slot_count(registry: &DecisionMakers, key: &SessionKey) -
 pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.mark_started();
-    }
-}
-
-/// Latches `key`'s session as resumed — a rehome descriptor named it — so
-/// leaves decided from here on carry no exact final turn count (see the
-/// `DecisionMaker::resumed` field). A no-op when no maker exists.
-pub fn mark_session_resumed(registry: &DecisionMakers, key: &SessionKey) {
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.resumed = true;
     }
 }
 
@@ -6052,27 +6114,6 @@ pub fn remove_slot_for_epoch(
         .lock()
         .get_mut(key)
         .is_some_and(|maker| maker.remove_slot_for_epoch(slot, epoch))
-}
-
-/// Seeds a coordinator-known departure into a session's decision-maker on a
-/// **rehome**: a fresh relay taking over a running session has no mesh peer to
-/// replay a `SlotDeparted` from, so the coordinator carries the already-decided
-/// departures in the descriptor and this records each as *already decided*. The
-/// slot is retired from the comparator, the coverage set, and the live set (like
-/// any departure), and a decided leave is cached so a later authority promotion
-/// re-broadcasts it verbatim (firing no fresh notice) and never re-waits or
-/// re-derives it. A no-op when no maker exists (a session this relay does not
-/// serve). Idempotent — seeding a slot already departed leaves it decided.
-pub fn seed_departed(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-    kind: DepartureKind,
-    final_turn_count: Option<u64>,
-) {
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.seed_departed(slot, kind, final_turn_count);
-    }
 }
 
 /// Records a client's end-of-game result report into the session's
@@ -7293,7 +7334,7 @@ mod tests {
         // re-report a departure the mesh already reported.
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        maker.seed_departed(SlotId(1), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, None);
         assert!(
             !maker.has_undecided_departure(),
             "a seeded departure is already decided, never left undecided",
@@ -7322,8 +7363,8 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        maker.seed_departed(SlotId(1), DepartureKind::Left, None);
-        maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, None);
+        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
         assert_eq!(maker.decided_leaves[&SlotId(1)].reason, LEAVE_REASON_LEFT);
         assert_eq!(
             maker.decided_leaves[&SlotId(2)].reason,
@@ -7341,8 +7382,8 @@ mod tests {
     fn seed_departed_carries_the_original_directives_final_turn_count() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312));
-        maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312));
+        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
         assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, Some(312),);
         assert_eq!(maker.decided_leaves[&SlotId(2)].final_turn_count, None);
         // A promotion re-broadcasts the seeded directive verbatim, count included.
@@ -7352,6 +7393,145 @@ mod tests {
                 .any(|l| l.slot == 1 && l.final_turn_count == Some(312)),
             "the re-broadcast seeded leave keeps the original count",
         );
+    }
+
+    /// A dropped seed's count is discarded at this ingress no matter what the
+    /// carrier holds: only clean leaves may carry counts, and the seed may
+    /// have travelled through a coordinator or peer running code that
+    /// predates that rule.
+    #[test]
+    fn seed_departed_strips_a_dropped_seeds_count() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, Some(99));
+        assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, None);
+    }
+
+    /// The first seed of a slot returns the newly decided directive — the copy
+    /// the descriptor path fans to already-connected local survivors — and a
+    /// repeat (an idempotent descriptor replay) returns nothing to deliver.
+    #[test]
+    fn seed_departed_returns_the_newly_decided_directive_exactly_once() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let first = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7));
+        assert_eq!(
+            first.map(|l| (l.slot, l.final_turn_count)),
+            Some((1, Some(7)))
+        );
+        assert_eq!(
+            maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7)),
+            None,
+            "a replayed seed decides nothing new",
+        );
+    }
+
+    /// A resumed descriptor's latches and seeds install atomically with the
+    /// maker becoming visible in the registry: the instant `sync_maker`
+    /// returns, the maker is already resumed (so a racing clean-leave decide
+    /// can never stamp an exact count) and started, and the returned batch
+    /// carries the seeded directive for local fan-out — a client admitted
+    /// before the descriptor did its one leave reconciliation at registration
+    /// and would otherwise never hear of the seeded departure.
+    #[test]
+    fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
+        let registry = new_decision_makers();
+        let k = key();
+        let departed = [DepartedSlot {
+            slot: SlotId(2),
+            kind: DepartureKind::Left,
+            final_turn_count: Some(41),
+        }];
+        let leaves = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            Some(&departed),
+        );
+        assert!(
+            leaves
+                .iter()
+                .any(|l| l.slot == 2 && l.final_turn_count == Some(41)),
+            "the seeded directive is in the broadcast batch",
+        );
+        {
+            let makers = registry.lock();
+            let maker = makers.get(&k).expect("maker created");
+            assert!(maker.resumed, "the resumed latch is set before exposure");
+            assert!(
+                maker.is_started(),
+                "the started latch is set before exposure"
+            );
+        }
+
+        // A replayed resumed descriptor (an idempotent coordinator re-push)
+        // reconciles the existing maker and has nothing new to broadcast.
+        let replayed = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            Some(&departed),
+        );
+        assert!(
+            replayed.iter().all(|l| l.slot != 2),
+            "a replayed seed is not re-decided or re-delivered",
+        );
+    }
+
+    /// A resumed re-push onto a relay that already holds the maker (it was
+    /// serving the session when the rehome happened) seeds any departure it
+    /// had not yet learned and returns it for broadcast, so survivors on this
+    /// relay hear of a leave that only the coordinator still knew.
+    #[test]
+    fn a_resumed_repush_seeds_into_an_existing_maker() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+        );
+        assert!(!registry.lock().get(&k).unwrap().resumed);
+
+        let departed = [DepartedSlot {
+            slot: SlotId(3),
+            kind: DepartureKind::Dropped,
+            final_turn_count: None,
+        }];
+        let leaves = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            Some(&departed),
+        );
+        assert!(
+            leaves
+                .iter()
+                .any(|l| l.slot == 3 && l.reason == LEAVE_REASON_DROPPED),
+            "the newly seeded dropped leave is in the broadcast batch",
+        );
+        assert!(registry.lock().get(&k).unwrap().resumed);
     }
 
     /// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.
@@ -9994,6 +10174,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         {
             let makers = registry.lock();
@@ -10013,6 +10194,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -10045,6 +10227,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         consensus_observe_and_hold(&registry, &k);
 
@@ -10061,6 +10244,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             held_slots,
+            None,
         );
         assert!(
             leaves.is_empty(),
@@ -10106,6 +10290,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         {
             let mut makers = registry.lock();
@@ -10123,6 +10308,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert_eq!(
             active_directive(&registry, &k),
@@ -10150,6 +10336,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
@@ -10190,6 +10377,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10232,6 +10420,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10281,6 +10470,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -10314,6 +10504,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         record_departure(
@@ -10368,6 +10559,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -10404,6 +10596,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         registry.set_session_refs(
@@ -10436,6 +10629,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         registry.set_session_refs(
@@ -10478,6 +10672,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         registry.set_session_refs(
             &k,
@@ -10521,6 +10716,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -10559,6 +10755,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10608,6 +10805,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10654,6 +10852,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10681,6 +10880,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10717,6 +10917,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10767,6 +10968,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10819,6 +11021,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10850,6 +11053,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
@@ -10964,6 +11168,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         registry.set_session_refs(
@@ -10996,6 +11201,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -12265,6 +12471,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(), // empty homed_slots: unenforced
             HashSet::new(),
+            None,
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(slot_homed(&registry, &key(), SlotId(7)));
@@ -12285,6 +12492,7 @@ mod tests {
             HashSet::new(),
             [SlotId(0), SlotId(2)].into_iter().collect(),
             HashSet::new(),
+            None,
         );
         assert!(
             slot_homed(&registry, &key(), SlotId(0)),
@@ -12318,6 +12526,7 @@ mod tests {
             HashSet::new(),
             [SlotId(0)].into_iter().collect(),
             HashSet::new(),
+            None,
         );
         let held_both: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
 
@@ -12384,6 +12593,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
         assert!(!has_reconnectable_departure(&registry, &k, &held));
@@ -12446,6 +12656,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(claim_close_report(&registry, &k), "the first claim wins");
         assert!(
@@ -12474,6 +12685,7 @@ mod tests {
             HashSet::new(),
             [SlotId(0)].into_iter().collect(),
             HashSet::new(),
+            None,
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(!slot_homed(&registry, &key(), SlotId(1)));
@@ -12489,6 +12701,7 @@ mod tests {
             HashSet::new(),
             [SlotId(1)].into_iter().collect(),
             HashSet::new(),
+            None,
         );
         assert!(
             !slot_homed(&registry, &key(), SlotId(0)),
@@ -12908,6 +13121,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -12957,6 +13171,7 @@ mod tests {
             expected,
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         // No directive until the last expected slot completes the set.
@@ -12994,6 +13209,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -13017,6 +13233,7 @@ mod tests {
             expected,
             HashSet::new(),
             HashSet::new(),
+            None,
         );
 
         // Both expected slots register, but a peer relay never fires.
@@ -13048,6 +13265,7 @@ mod tests {
             expected,
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         // Slot 0 departs, retiring it from the live-slot set.
@@ -13080,6 +13298,7 @@ mod tests {
             expected,
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         assert!(!session_started(&registry, &k));
         mark_session_started(&registry, &k);
@@ -13881,6 +14100,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashSet::new(),
             HashSet::new(),
+            None,
         );
         registry.set_session_refs(
             &k,

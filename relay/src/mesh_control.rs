@@ -372,6 +372,17 @@ impl MeshControl {
         // could still return from — exactly like the presence-driven promotion
         // (`presence::recompute`), which gets the same set from its own caller.
         let held_slots = self.drop_holds.pending_slots(&key);
+        // A rehome (resumed) descriptor's departed-slot seeds — and the
+        // resumed latch that stops leaves decided from here on from carrying
+        // exact final turn counts — install inside `sync_maker`'s registry
+        // lock, atomically with the maker becoming visible: a provisionally
+        // admitted client can clean-leave the instant the maker exists, and a
+        // latch set by a follow-up call would lose that race and emit a count
+        // the rehomed session's split forwarding history cannot support. The
+        // returned batch already folds in any directive the seeding newly
+        // decided, so the broadcast below also reaches local clients admitted
+        // before this descriptor (whose one registration-time leave
+        // reconciliation predates the seed).
         let leaves = consensus::sync_maker(
             &self.decision_makers,
             &key,
@@ -381,6 +392,9 @@ impl MeshControl {
             descriptor.expected_slots.iter().copied().collect(),
             descriptor.homed_slots.iter().copied().collect(),
             held_slots,
+            descriptor
+                .resumed
+                .then_some(descriptor.departed_slots.as_slice()),
         );
         // A descriptor now names this session, so any provisional-admission
         // mark it carried is moot -- the bounded-admission sweep would
@@ -426,27 +440,7 @@ impl MeshControl {
             routing::fan_out_region_labels(&self.sessions, &key, &labels);
         }
         mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
-        // A rehome descriptor (coordinator-mediated failover) resumes an
-        // already-running session onto this relay. Seed the departures the
-        // coordinator already knows about as already-decided leaves — a fresh
-        // relay has no mesh peer to replay their `SlotDeparted` from — so the
-        // desync comparator, the coverage check, and any later promotion
-        // re-broadcast treat them exactly like mesh-learned ones. Then latch the
-        // session started, so this relay never waits on the full expected set
-        // (which still lists the departed slots that will never dial) and never
-        // re-fires the session-start machinery session-wide.
         if descriptor.resumed {
-            for departed in &descriptor.departed_slots {
-                consensus::seed_departed(
-                    &self.decision_makers,
-                    &key,
-                    departed.slot,
-                    departed.kind,
-                    departed.final_turn_count,
-                );
-            }
-            consensus::mark_session_started(&self.decision_makers, &key);
-            consensus::mark_session_resumed(&self.decision_makers, &key);
             self.decision_makers.flight_recorder().record(
                 &key,
                 crate::flight_recorder::FlightEvent::ResumedDescriptorApplied {
@@ -1258,13 +1252,22 @@ mod tests {
         let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
 
         let mut desc = descriptor(1, &[]);
-        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        desc.expected_slots = vec![SlotId(0), SlotId(1), SlotId(2)];
         desc.resumed = true;
-        desc.departed_slots = vec![DepartedSlot {
-            slot: SlotId(1),
-            kind: DepartureKind::Dropped,
-            final_turn_count: Some(240),
-        }];
+        desc.departed_slots = vec![
+            DepartedSlot {
+                slot: SlotId(1),
+                kind: DepartureKind::Left,
+                final_turn_count: Some(240),
+            },
+            DepartedSlot {
+                slot: SlotId(2),
+                kind: DepartureKind::Dropped,
+                // A drop count reaching a descriptor means the carrier ran code
+                // predating the clean-leaves-only rule; the seed strips it.
+                final_turn_count: Some(99),
+            },
+        ];
         control.apply_descriptor(&desc);
 
         {
@@ -1280,7 +1283,7 @@ mod tests {
             );
             assert!(
                 !maker.has_undecided_departure(),
-                "the seeded departure is recorded as already decided",
+                "the seeded departures are recorded as already decided",
             );
         }
         let (_, directives) = consensus::leave_reconcile(&makers, &key(1));
@@ -1288,8 +1291,14 @@ mod tests {
             directives
                 .iter()
                 .any(|l| l.slot == 1 && l.final_turn_count == Some(240)),
-            "the seeded directive a reconnecting survivor replays carries the \
-             coordinator-retained count",
+            "the seeded clean-leave directive a reconnecting survivor replays \
+             carries the coordinator-retained count",
+        );
+        assert!(
+            directives
+                .iter()
+                .any(|l| l.slot == 2 && l.final_turn_count.is_none()),
+            "the seeded dropped directive's unsound count is stripped at ingress",
         );
 
         // Because the session is already started, a slot registering does not fire a
@@ -1298,6 +1307,45 @@ mod tests {
             !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
             "an already-started session fires no fresh session-wide start directive",
         );
+    }
+
+    /// A client admitted before its session's descriptor (provisional
+    /// admission) performs its one leave reconciliation at registration, when
+    /// there is nothing to reconcile. The resumed descriptor's seeded
+    /// departures must therefore be *pushed* to it when they are seeded —
+    /// otherwise it plays on forever, stalled on the departed slot's turns
+    /// that will never come.
+    #[test]
+    fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_links = crate::mesh::new_mesh_links();
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_links.clone());
+
+        // The survivor, admitted before any descriptor arrived.
+        let (_reg, mut inbox) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        desc.resumed = true;
+        desc.departed_slots = vec![DepartedSlot {
+            slot: SlotId(1),
+            kind: DepartureKind::Left,
+            final_turn_count: Some(64),
+        }];
+        control.apply_descriptor(&desc);
+
+        let leave = inbox
+            .try_recv_leave()
+            .expect("the seeded leave is pushed to the already-connected survivor");
+        assert_eq!(leave.slot, 1);
+        assert_eq!(leave.final_turn_count, Some(64));
+
+        // The idempotent descriptor replay re-decides nothing, so nothing is
+        // re-pushed either (the client would dedup it by slot regardless).
+        control.apply_descriptor(&desc);
+        assert_eq!(inbox.try_recv_leave(), None);
     }
 
     /// A descriptor push is routinely an idempotent replay (a coordinator
