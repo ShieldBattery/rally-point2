@@ -1588,6 +1588,16 @@ pub struct DecisionMaker {
     /// re-covering after churn never re-fires and a late-registering local slot
     /// still gets a re-push.
     started: bool,
+    /// One-shot latch: a resumed (rehome) descriptor has named this session.
+    /// After a rehome no single relay's forward gate provably covers
+    /// everything every survivor consumed — the replaced relay can have
+    /// delivered turns toward one surviving relay that another (including the
+    /// slot's fresh home) never carried — so a leave decided after this point
+    /// must not stamp an exact `final_turn_count`; see
+    /// [`commit_leave`](Self::commit_leave). Departures the coordinator seeded
+    /// with a count are unaffected: those were decided before the rehome, by
+    /// an origin that was sound at the time.
+    resumed: bool,
     /// Whether this relay has already reported its own closure for the session
     /// (the `SessionClosed` notice the coordinator's all-relays-closed
     /// retirement counts). The session-emptied close can be evaluated from
@@ -2795,6 +2805,7 @@ impl DecisionMaker {
             homed_slots: HashSet::new(),
             live_slots: HashSet::new(),
             started: false,
+            resumed: false,
             close_reported: false,
             own_relay_id: None,
             latency_hint_ms: None,
@@ -4084,7 +4095,7 @@ impl DecisionMaker {
         // drops in practice: by the time one is honored, every survivor has
         // long since consumed the identical forwarded prefix and stalled at
         // the same point.
-        let final_turn_count = if reason == LEAVE_REASON_DROPPED {
+        let final_turn_count = if reason == LEAVE_REASON_DROPPED || self.resumed {
             None
         } else {
             record.and_then(|d| d.final_turn_count)
@@ -5686,6 +5697,15 @@ pub fn started_session_slot_count(registry: &DecisionMakers, key: &SessionKey) -
 pub fn mark_session_started(registry: &DecisionMakers, key: &SessionKey) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.mark_started();
+    }
+}
+
+/// Latches `key`'s session as resumed — a rehome descriptor named it — so
+/// leaves decided from here on carry no exact final turn count (see the
+/// `DecisionMaker::resumed` field). A no-op when no maker exists.
+pub fn mark_session_resumed(registry: &DecisionMakers, key: &SessionKey) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.resumed = true;
     }
 }
 
@@ -11140,6 +11160,37 @@ mod tests {
         );
         let leave = maker
             .decide_leave(SlotId(1), DROPPED)
+            .expect("a leave is scheduled");
+        assert_eq!(leave.final_turn_count, None);
+    }
+
+    /// After a rehome, no single relay's forward gate provably covers what
+    /// every survivor consumed — the replaced relay can have delivered turns
+    /// toward one surviving relay that the slot's fresh home never carried —
+    /// so even a clean leave decided on a resumed session stamps no count and
+    /// falls back to frame scheduling.
+    #[test]
+    fn a_resumed_session_stamps_no_count_on_new_leaves() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.resumed = true;
+        maker.observe_frame(SlotId(1), GameFrameCount(115));
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(115)),
+                final_turn_count: Some(112),
+                ..Default::default()
+            },
+            LEAVE_REASON_LEFT,
+        );
+        let leave = maker
+            .decide_leave(SlotId(1), LEAVE_REASON_LEFT)
             .expect("a leave is scheduled");
         assert_eq!(leave.final_turn_count, None);
     }

@@ -446,6 +446,7 @@ impl MeshControl {
                 );
             }
             consensus::mark_session_started(&self.decision_makers, &key);
+            consensus::mark_session_resumed(&self.decision_makers, &key);
             self.decision_makers.flight_recorder().record(
                 &key,
                 crate::flight_recorder::FlightEvent::ResumedDescriptorApplied {
