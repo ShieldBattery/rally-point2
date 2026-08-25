@@ -1355,6 +1355,11 @@ fn create_body(
         .lock()
         .insert((request.tenant.clone(), session), relay_ids.clone());
 
+    // Reduced to the response's wire shape before `relay_regions` moves into `refs`
+    // below — the response and the recorded correlation state both need this
+    // placement data, so it is captured once here rather than re-derived later.
+    let response_relay_regions = relay_region_labels(&relay_regions);
+
     // Record the tenant's correlation ids so a later departure webhook can echo
     // them — the notification is then self-describing (the coordinator keeps no
     // other session→game map, and the tenant needs none either).
@@ -1424,6 +1429,7 @@ fn create_body(
         slot_homes,
         tokens,
         bounds,
+        relay_regions: response_relay_regions,
     };
     // Record the exact response a duplicate create for this `external_id`
     // will replay, alongside the fingerprint a replay must match, still under
@@ -1554,20 +1560,51 @@ pub fn build_descriptor(
         latency_estimate_ms: refs.latency_estimate_ms,
         // Every serving relay's region — the whole session's map, not just this
         // descriptor's relay, since a relay releases the complete map to its
-        // clients once its own release delay has elapsed in-game. Untagged
-        // relays are dropped rather than carried with an empty label, so an absent
-        // entry unambiguously means "no region recorded". Iterating a `BTreeMap`
-        // yields ascending relay-id order, so this is deterministic without a
-        // sort. Rebuilt on every push, so a re-home's replacement relay and its
-        // region reach every serving relay with the peer set.
-        relay_regions: refs
-            .relay_regions
-            .into_iter()
-            .filter_map(|(relay_id, region)| {
-                region.map(|region| RelayRegionLabel { relay_id, region })
-            })
-            .collect(),
+        // clients once its own release delay has elapsed in-game. Rebuilt on
+        // every push, so a re-home's replacement relay and its region reach every
+        // serving relay with the peer set.
+        relay_regions: relay_region_labels(&refs.relay_regions),
     })
+}
+
+/// Reduces a relay→region map, as recorded per session in
+/// [`SessionRefs::relay_regions`], to the wire label list a descriptor or session
+/// response carries: one [`RelayRegionLabel`] per relay the coordinator tagged
+/// with a region, in ascending relay-id order (a `BTreeMap`'s natural iteration
+/// order). Untagged relays are dropped rather than carried with an empty label,
+/// so an absent entry unambiguously means "no region recorded".
+fn relay_region_labels(
+    relay_regions: &std::collections::BTreeMap<RelayId, Option<RegionId>>,
+) -> Vec<RelayRegionLabel> {
+    relay_regions
+        .iter()
+        .filter_map(|(&relay_id, region)| {
+            region
+                .clone()
+                .map(|region| RelayRegionLabel { relay_id, region })
+        })
+        .collect()
+}
+
+/// The region `session` has recorded for `relay`, or `None` when the relay
+/// carries no region, or the session (or this particular relay within it) has no
+/// recorded region — an unknown session, a relay the session never served, or a
+/// coordinator run without a region catalog. Backed by the same
+/// [`SessionRefs::relay_regions`] a re-home itself consults to prefer the dead
+/// relay's own region for its replacement pick, so a re-home response can label
+/// its replacement relay the same way a session-create response labels its home
+/// relay.
+pub fn relay_region_for(
+    setup: &SessionSetup,
+    tenant: &rally_point_proto::control::TenantId,
+    session: SessionId,
+    relay: RelayId,
+) -> Option<RegionId> {
+    session_refs(setup, tenant, session)?
+        .relay_regions
+        .get(&relay)
+        .cloned()
+        .flatten()
 }
 
 /// The tenant's correlation ids for `session`, recorded at `create_session`, or
@@ -4796,6 +4833,10 @@ mod tests {
                 "relay {relay_id:?}'s descriptor carries every serving relay's label, in relay-id order",
             );
         }
+        assert_eq!(
+            resp.relay_regions, expected,
+            "the session-create response mirrors the same labels to the app server",
+        );
     }
 
     #[test]
@@ -4816,12 +4857,14 @@ mod tests {
         let refs = session_refs(&setup, &tid(), resp.session).unwrap();
         assert_eq!(refs.relay_regions.get(&RelayId(1)), Some(&None));
         let descriptor = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
+        let expected = vec![RelayRegionLabel {
+            relay_id: RelayId(2),
+            region: RegionId("region-b".to_owned()),
+        }];
+        assert_eq!(descriptor.relay_regions, expected);
         assert_eq!(
-            descriptor.relay_regions,
-            vec![RelayRegionLabel {
-                relay_id: RelayId(2),
-                region: RegionId("region-b".to_owned()),
-            }],
+            resp.relay_regions, expected,
+            "the response also omits the untagged relay's entry",
         );
     }
 

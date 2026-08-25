@@ -705,6 +705,19 @@ pub struct SessionResponse {
     pub tokens: Vec<PlayerToken>,
     /// The latency-buffer bounds the relay's decision-maker clamps to.
     pub bounds: BufferBounds,
+    /// Each serving relay's region at pick time, keyed by relay id — the same
+    /// per-relay data [`SessionDescriptor::relay_regions`] carries to a relay, mirrored onto this
+    /// tenant-facing response for the tenant's own operator-facing tooling (e.g. a game-history
+    /// or debugging view). Only relays the coordinator tagged with a region appear; an untagged
+    /// relay, or a coordinator run without a region catalog, has no entry.
+    ///
+    /// This travels the control-plane response the app server receives, not the client-facing
+    /// [`RelayEndpoint`]/[`RelayPeer`] shapes a game client ultimately dials — see
+    /// [`RelayEntry::region`] for why region is withheld from those until a relay's own
+    /// gameplay-elapsed release. A tenant must not thread this list into anything it hands a game
+    /// client before that release would have disclosed the same information.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_regions: Vec<RelayRegionLabel>,
 }
 
 /// One slot's tenant-assigned correlation id, as carried in a
@@ -852,8 +865,11 @@ pub struct SessionDescriptor {
     /// tagged with a region are omitted entirely, so an absent entry means
     /// "unlabeled" rather than "labeled with nothing".
     ///
-    /// This is the only path a region takes out of the coordinator's placement
-    /// state. A relay holds the map until its own clock says a stretch of real
+    /// This is the only path a region reaches a relay — and, through it, a game
+    /// client. [`SessionResponse::relay_regions`] carries the same per-relay data
+    /// to the tenant's app server for its own operator-facing tooling, but that is
+    /// a separate, tenant-only echo never released to a client on its own. A
+    /// relay holds this map until its own clock says a stretch of real
     /// gameplay has elapsed, then releases it to its local clients as a
     /// [`RegionLabels`](crate::messages::RegionLabels) frame — see
     /// [`RelayEntry::region`] for why the labels are withheld until gameplay has
@@ -2869,8 +2885,42 @@ mod tests {
                 token: vec![0xAB, 0xCD],
             }],
             bounds: BufferBounds::new(1, 6).unwrap(),
+            relay_regions: vec![RelayRegionLabel {
+                relay_id: RelayId(1),
+                region: RegionId("us-east".to_owned()),
+            }],
         };
         let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"relay_regions\":[{\"relay_id\":1,\"region\":\"us-east\"}]"));
+        let back: SessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn session_response_with_no_tagged_relays_omits_relay_regions() {
+        // A coordinator with no region catalog (or a session whose relays are all
+        // untagged) mints a response with an empty `relay_regions`, which the
+        // `skip_serializing_if` drops from the wire entirely rather than sending
+        // an empty array — this is what an app-server client built against an
+        // older coordinator with no `relay_regions` field at all still parses.
+        let resp = SessionResponse {
+            session: SessionId(1),
+            home_relay: RelayEndpoint {
+                relay_id: RelayId(1),
+                relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+                cert_der: vec![0x30, 0x82, 0x01, 0x02],
+                relay_addrs: vec![],
+            },
+            slot_homes: vec![],
+            tokens: vec![PlayerToken {
+                slot: SlotId(0),
+                token: vec![0xAB, 0xCD],
+            }],
+            bounds: BufferBounds::new(1, 6).unwrap(),
+            relay_regions: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("relay_regions"));
         let back: SessionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
     }
@@ -2888,6 +2938,7 @@ mod tests {
         }"#;
         let back: SessionResponse = serde_json::from_str(json).unwrap();
         assert!(back.slot_homes.is_empty());
+        assert!(back.relay_regions.is_empty());
     }
 
     #[test]

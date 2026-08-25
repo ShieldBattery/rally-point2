@@ -499,23 +499,45 @@ struct RehomeResponse {
     /// The replacement relay, present only when `decision` is `newTarget`.
     #[serde(skip_serializing_if = "Option::is_none")]
     relay: Option<RelayEndpoint>,
+    /// `relay`'s region, present only when `decision` is `newTarget` and the
+    /// coordinator has a recorded region for it. Mirrors
+    /// [`SessionResponse::relay_regions`](rally_point_proto::control::SessionResponse::relay_regions)
+    /// for the same tenant-only, operator-facing purpose — not carried on `relay`
+    /// itself, which is the client-facing [`RelayEndpoint`] shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_region: Option<RegionId>,
 }
 
-impl From<RehomeOutcome> for RehomeResponse {
-    fn from(outcome: RehomeOutcome) -> Self {
+impl RehomeResponse {
+    /// Builds the response for `outcome`, looking up the replacement relay's
+    /// recorded region (for a `newTarget` decision) from the session's own
+    /// placement state.
+    fn from_outcome(
+        setup: &SessionSetup,
+        tenant: &TenantId,
+        session: SessionId,
+        outcome: RehomeOutcome,
+    ) -> Self {
         match outcome {
             RehomeOutcome::Stay => Self {
                 decision: "stay",
                 relay: None,
+                relay_region: None,
             },
             RehomeOutcome::Unavailable => Self {
                 decision: "unavailable",
                 relay: None,
+                relay_region: None,
             },
-            RehomeOutcome::NewTarget(endpoint) => Self {
-                decision: "newTarget",
-                relay: Some(endpoint),
-            },
+            RehomeOutcome::NewTarget(endpoint) => {
+                let relay_region =
+                    session::relay_region_for(setup, tenant, session, endpoint.relay_id);
+                Self {
+                    decision: "newTarget",
+                    relay: Some(endpoint),
+                    relay_region,
+                }
+            }
         }
     }
 }
@@ -573,9 +595,12 @@ async fn rehome_session(
     // session records nothing here (its rehomes are cleared at close), so this can
     // never revive a dead session.
     if let Some(endpoint) = session::recorded_rehome(&state.setup, &tenant, session, dead_relay) {
-        return Ok(Json(RehomeResponse::from(RehomeOutcome::NewTarget(
-            endpoint,
-        ))));
+        return Ok(Json(RehomeResponse::from_outcome(
+            &state.setup,
+            &tenant,
+            session,
+            RehomeOutcome::NewTarget(endpoint),
+        )));
     }
 
     // Every non-recorded ask — a first-time survivor, a false-alarm `stay`, or an
@@ -611,7 +636,12 @@ async fn rehome_session(
     // (the client's reconnect backoff absorbs whatever race remains).
     tokio::task::yield_now().await;
 
-    Ok(Json(RehomeResponse::from(outcome)))
+    Ok(Json(RehomeResponse::from_outcome(
+        &state.setup,
+        &tenant,
+        session,
+        outcome,
+    )))
 }
 
 /// The most session ids one liveness probe may ask about, so a caller cannot make
@@ -5002,6 +5032,37 @@ mod tests {
         // `cert_der` rides as a JSON byte array, not hex.
         assert_eq!(json["relay"]["relay_id"], 2);
         assert!(json["relay"]["cert_der"].is_array());
+        // Relay 2 enrolled with no region, so the response carries none either.
+        assert!(json.get("relay_region").is_none());
+    }
+
+    #[tokio::test]
+    async fn rehome_endpoint_includes_the_replacement_relays_region_when_known() {
+        let state = state_with_relay_and_tenant();
+        registry::enroll(
+            state.setup.registry(),
+            RelayHello::new(
+                RelayId(2),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
+                ProtocolVersion::CURRENT,
+                vec![0xC2; 4],
+            )
+            .with_region(RegionId("us-east".to_owned())),
+        );
+        let session = create_rehome_session(&state);
+        // The home relay (1) dies; the session should move to the live, tagged relay 2.
+        registry::remove(state.setup.registry(), RelayId(1));
+
+        let body = rehome_body("sb-test", session, 1);
+        let resp = signed_post(router(state), "/session/rehome", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"], "newTarget");
+        assert_eq!(json["relay"]["relay_id"], 2);
+        assert_eq!(json["relay_region"], "us-east");
     }
 
     #[tokio::test]
@@ -5561,6 +5622,14 @@ mod tests {
             session.home_relay.relay_id,
             RelayId(2),
             "the retry placed on the region's freshly enrolled relay",
+        );
+        assert_eq!(
+            session.relay_regions,
+            vec![rally_point_proto::control::RelayRegionLabel {
+                relay_id: RelayId(2),
+                region: rally_point_proto::control::RegionId("region-a".to_owned()),
+            }],
+            "the response labels its home relay with the region it enrolled in",
         );
     }
 
