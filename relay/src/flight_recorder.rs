@@ -732,6 +732,61 @@ impl RecentStores {
     }
 }
 
+/// How many close-sealed sessions the recorder remembers (see
+/// `RecorderState::closed`). A seal exists only for the window between a
+/// session's close flush and its membership retirement — a session-teardown
+/// timescale, like [`RECENT_STORES`]'s window — so a bounded set covers every
+/// seal that matters; the cap is a leak backstop for a session whose
+/// retirement never arrives, not a size this is expected to reach.
+const CLOSE_SEAL_CAP: usize = 1024;
+
+/// The sessions whose recording was flushed by a close, kept as tombstones so a
+/// straggling event cannot conjure a fresh recording, oldest-first with the
+/// front evicted past [`CLOSE_SEAL_CAP`].
+///
+/// A close flush removes the session's recording, but the relay can stay
+/// mesh-joined for the session until the coordinator retires its descriptor —
+/// and a delayed mesh frame in that window (a late `SlotDeparted` marking a
+/// drop hold, say) would otherwise re-create a recording through the ordinary
+/// create-on-first-touch path. That replacement describes nothing, lingers
+/// until the drain flush, and — every recording of one session sharing a single
+/// storage key — its store would displace the real recording. Sealed keys drop
+/// their events instead, until the session's membership is retired (or a fresh
+/// descriptor genuinely re-serves it), which clears the seal.
+#[derive(Default)]
+struct CloseSeals {
+    /// The sealed keys in seal order; the front is evicted when full.
+    order: VecDeque<SessionKey>,
+    /// The same keys, for the membership test.
+    keys: HashSet<SessionKey>,
+}
+
+impl CloseSeals {
+    /// Seals `key`. A repeat leaves the set unchanged.
+    fn seal(&mut self, key: &SessionKey) {
+        if !self.keys.insert(key.clone()) {
+            return;
+        }
+        if self.order.len() >= CLOSE_SEAL_CAP
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.keys.remove(&evicted);
+        }
+        self.order.push_back(key.clone());
+    }
+
+    /// Clears `key`'s seal, if any.
+    fn clear(&mut self, key: &SessionKey) {
+        if self.keys.remove(key) {
+            self.order.retain(|sealed| sealed != key);
+        }
+    }
+
+    fn contains(&self, key: &SessionKey) -> bool {
+        self.keys.contains(key)
+    }
+}
+
 /// Live recordings plus work retired by terminal flushes. Keeping them behind
 /// one mutex makes moving a quiescent recording from the live set into the
 /// cumulative total atomic with respect to
@@ -741,6 +796,9 @@ impl RecentStores {
 #[derive(Default)]
 struct RecorderState {
     sessions: HashMap<SessionKey, Arc<SessionRecording>>,
+    /// Close-flushed sessions whose recording must not be recreated — see
+    /// [`CloseSeals`].
+    closed: CloseSeals,
     retired_work: RelayWorkSnapshot,
 }
 
@@ -756,24 +814,34 @@ impl FlightRecorder {
         let _ = self.inner.sink.set(sink);
     }
 
-    fn recording(&self, key: &SessionKey) -> Arc<SessionRecording> {
+    /// `key`'s live recording, created on first touch — or `None` when the key
+    /// is close-sealed: a session whose recording a close already flushed must
+    /// not have a straggler conjure a contentless replacement that would later
+    /// displace the stored one (see [`CloseSeals`]).
+    fn recording(&self, key: &SessionKey) -> Option<Arc<SessionRecording>> {
         let mut state = self.inner.recordings.lock();
-        Arc::clone(
+        if state.closed.contains(key) {
+            return None;
+        }
+        Some(Arc::clone(
             state
                 .sessions
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(SessionRecording::new())),
-        )
+        ))
     }
 
     /// Records one event for `key`'s session, creating the recording on first
-    /// touch. Events are rare, so the short per-session mutex is fine here —
-    /// this is never called on the per-turn path.
+    /// touch — unless the key is close-sealed, in which case the event is
+    /// dropped (see [`CloseSeals`]). Events are rare, so the short per-session
+    /// mutex is fine here — this is never called on the per-turn path.
     pub fn record(&self, key: &SessionKey, event: FlightEvent) {
-        self.recording(key).push_event(EventRecord {
-            at_ms: now_ms(),
-            event,
-        });
+        if let Some(recording) = self.recording(key) {
+            recording.push_event(EventRecord {
+                at_ms: now_ms(),
+                event,
+            });
+        }
     }
 
     /// Records one event for `key`'s session **only when a recording already
@@ -806,8 +874,13 @@ impl FlightRecorder {
 
     /// The counter handle for `key`'s `slot`, fetched **once** at link start so
     /// the per-turn path bumps plain atomics with no lock and no map lookup.
+    /// For a close-sealed key the handle counts into the void (a fresh handle
+    /// no recording holds) — the session's recording is already flushed, and
+    /// re-creating one for a straggling link is exactly what the seal prevents.
     pub fn slot_counters(&self, key: &SessionKey, slot: SlotId) -> Arc<SlotCounters> {
-        let recording = self.recording(key);
+        let Some(recording) = self.recording(key) else {
+            return Arc::default();
+        };
         let mut counters = recording.counters.lock();
         Arc::clone(counters.entry(slot).or_default())
     }
@@ -882,6 +955,15 @@ impl FlightRecorder {
         }
     }
 
+    /// Clears `key`'s close seal, if any (see [`CloseSeals`]). Called when the
+    /// session's mesh membership is retired — no straggler can arrive once the
+    /// mesh has forgotten the session, so the seal has nothing left to guard —
+    /// and when a fresh descriptor re-serves the session, which opens a
+    /// genuinely new observation window that must be allowed to record.
+    pub fn clear_close_seal(&self, key: &SessionKey) {
+        self.inner.recordings.lock().closed.clear(key);
+    }
+
     /// The sessions currently holding a recording, for the drain flush and logs.
     pub fn recorded_sessions(&self) -> Vec<SessionKey> {
         self.inner
@@ -905,11 +987,17 @@ impl FlightRecorder {
     }
 
     /// Removes `key`'s recording and builds its flushed blob, or `None` if no
-    /// recording exists. The removal is what makes a flush terminal: later
-    /// events for the same key start a fresh recording.
+    /// recording exists. The removal is what makes a flush terminal — and the
+    /// close seal left behind is what *keeps* it terminal: without it, a
+    /// straggling event while the session is still mesh-joined would start a
+    /// fresh recording whose store later displaces this blob's (see
+    /// [`CloseSeals`]). Sealed even when there was nothing to remove, so a
+    /// close evaluated against a never-recorded session still blocks
+    /// stragglers.
     fn take_blob(&self, key: &SessionKey) -> Option<FlightBlob> {
         let recording = {
             let mut state = self.inner.recordings.lock();
+            state.closed.seal(key);
             let recording = state.sessions.remove(key)?;
             // Production flushes happen after the slot links quiesce. A drain
             // deadline can force this snapshot while a final link is winding
@@ -1226,8 +1314,24 @@ mod tests {
             }
         );
 
-        // Reusing the same session key creates new slot counters wired to the
+        // The flush left the key close-sealed, so a straggling link's counters
+        // count into the void — the deliberate cost of never re-creating a
+        // flushed recording (see `CloseSeals`).
+        recorder
+            .slot_counters(&first_key, SlotId(0))
+            .note_forwarded();
+        assert_eq!(
+            recorder.relay_work_snapshot(),
+            RelayWorkSnapshot {
+                client_turns_validated: 3,
+                local_turn_deliveries: 3,
+                oversize_diverts: 1,
+            }
+        );
+
+        // A genuine re-serve clears the seal; new counters then wire into the
         // same relay-lifetime aggregate rather than restarting from zero.
+        recorder.clear_close_seal(&first_key);
         recorder
             .slot_counters(&first_key, SlotId(0))
             .note_forwarded();
@@ -1457,8 +1561,10 @@ mod tests {
         );
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
 
-        // The relay serves the session again, and the second store replaces what
-        // the first one wrote.
+        // The relay genuinely serves the session again — a fresh descriptor
+        // clears the close seal — and the second store replaces what the first
+        // one wrote.
+        recorder.clear_close_seal(&k);
         recorder.record(
             &k,
             FlightEvent::SlotConnected {
@@ -1491,9 +1597,54 @@ mod tests {
         assert_eq!(recorder.flush_session(&k).await, FlushOutcome::NoSink);
         assert!(recorder.recorded_sessions().is_empty());
 
-        // Recording keeps working after the discard.
+        // The discard is as terminal as a store: the key is close-sealed, so a
+        // straggling event does not begin a replacement recording.
+        recorder.record(&k, FlightEvent::SessionClosed);
+        assert!(recorder.events(&k).is_empty());
+
+        // A genuine re-serve records again.
+        recorder.clear_close_seal(&k);
         recorder.record(&k, FlightEvent::SessionClosed);
         assert_eq!(recorder.events(&k).len(), 1);
+    }
+
+    /// The regression the close seal exists for: a session's close flushes its
+    /// recording while the relay is still mesh-joined for it, and a delayed
+    /// mesh frame then produces an ordinary event (a late `SlotDeparted`
+    /// marking a drop hold). Without the seal that event re-created a
+    /// recording through create-on-first-touch, which lingered until the drain
+    /// flush and — one storage key per session per relay — displaced the real
+    /// stored recording with a contentless one.
+    #[tokio::test]
+    async fn a_straggling_event_after_the_close_flush_cannot_displace_the_stored_recording() {
+        let recorder = FlightRecorder::default();
+        let sink = Arc::new(CaptureSink::default());
+        recorder.set_sink(sink.clone());
+        let k = key(1);
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+        recorder.record_existing(&k, FlightEvent::SessionClosed);
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
+
+        // The straggler: still mesh-joined, a late mesh frame records a hold.
+        recorder.record(&k, FlightEvent::DropHeld { slot: 1 });
+        assert!(
+            recorder.recorded_sessions().is_empty(),
+            "the sealed key began no replacement recording",
+        );
+
+        // The drain flush finds nothing to store over the real recording.
+        recorder.flush_all(Duration::from_secs(1)).await;
+        assert_eq!(sink.blobs.lock().len(), 1, "only the real recording stored");
+
+        // Membership retirement clears the seal; nothing arrives after it.
+        recorder.clear_close_seal(&k);
+        assert!(recorder.recorded_sessions().is_empty());
     }
 
     #[tokio::test]

@@ -291,6 +291,14 @@ impl MeshControl {
             session: descriptor.session,
         };
 
+        // A descriptor naming this session opens (or re-opens) an observation
+        // window: if an earlier close of the same session left its flight
+        // recording sealed against stragglers, this genuine re-serve clears
+        // the seal so the new window records.
+        self.decision_makers
+            .flight_recorder()
+            .clear_close_seal(&key);
+
         // Stamp the tenant's correlation ids into the decision-maker registry
         // so a departure notice for this session can carry its own
         // `external_id`/`external_ref` without depending on the coordinator's
@@ -556,6 +564,9 @@ impl MeshControl {
     /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
         consensus::deregister_maker(&self.decision_makers, key);
+        // With the membership gone no straggling event can arrive for the
+        // session, so a close seal left by its flush has nothing more to guard.
+        self.decision_makers.flight_recorder().clear_close_seal(key);
         presence::forget(&self.presence, key);
         let mut inner = self.inner.lock();
         let Some(peers) = inner.desired.remove(key) else {
