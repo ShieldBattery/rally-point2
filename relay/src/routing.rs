@@ -1313,10 +1313,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -1342,10 +1342,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -1508,10 +1508,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -1546,10 +1546,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -1597,10 +1597,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -1626,10 +1626,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                Some(final_turn_count_from(
+                final_turn_count_from(
                     link.delivered_through(slot),
                     first_invalid_seq,
-                )),
+                ),
             );
             return;
         }
@@ -2215,7 +2215,7 @@ pub async fn run_slot_link(
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
-                            Some(final_turn_count_from(link.delivered_through(slot), first_invalid_seq)),
+                            final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
                             Some(connection_epoch),
                         );
                         leave_announced = true;
@@ -2581,10 +2581,10 @@ pub async fn run_slot_link(
         slot,
         connection_epoch,
         leave_announced,
-        Some(final_turn_count_from(
+        final_turn_count_from(
             link.delivered_through(slot),
             first_invalid_seq,
-        )),
+        ),
     );
 }
 
@@ -2597,12 +2597,24 @@ pub async fn run_slot_link(
 /// below the first delivered-but-invalid turn, if any: the cursor advances for
 /// a turn that validation then rejects without forwarding, and a count
 /// reaching past it would name a point no client can reach.
-fn final_turn_count_from(delivered_through: Option<u64>, first_invalid_seq: Option<u64>) -> u64 {
-    let delivered = delivered_through.map_or(0, |seq| seq + 1);
-    match first_invalid_seq {
+///
+/// `None` in means `None` out: a link that never delivered a turn has no
+/// knowledge of the slot's history, and a fabricated exact count of 0 would be
+/// *wrong* — not merely imprecise — whenever the slot delivered turns on an
+/// earlier connection (a reconnect that died before its resumed stream came
+/// up). An undercounted directive is satisfied immediately by every survivor
+/// and degrades to per-client arrival-time application, the exact divergence
+/// counted leaves exist to prevent. With no count, clients fall back to frame
+/// scheduling, which is never worse than a wrong exact count.
+fn final_turn_count_from(
+    delivered_through: Option<u64>,
+    first_invalid_seq: Option<u64>,
+) -> Option<u64> {
+    let delivered = delivered_through? + 1;
+    Some(match first_invalid_seq {
         Some(invalid) => delivered.min(invalid),
         None => delivered,
-    }
+    })
 }
 
 /// Runs the full departure/close protocol for a slot link that has ended,
@@ -3437,15 +3449,21 @@ mod tests {
 
     #[test]
     fn final_turn_count_counts_the_contiguous_prefix_and_clamps_below_an_invalid_turn() {
-        // No turn ever delivered: the count is zero (a pre-game departure).
-        assert_eq!(super::final_turn_count_from(None, None), 0);
+        // No turn ever delivered on this link: no knowledge, no count. A
+        // fabricated exact 0 would be wrong whenever the slot delivered turns
+        // on an earlier connection (a reconnect that died before its resumed
+        // stream came up), and an undercounted directive is satisfied
+        // immediately by every survivor — per-client arrival-time application,
+        // the exact divergence counted leaves exist to prevent.
+        assert_eq!(super::final_turn_count_from(None, None), None);
+        assert_eq!(super::final_turn_count_from(None, Some(3)), None);
         // Seqs are zero-based: delivered through seq 41 = 42 turns.
-        assert_eq!(super::final_turn_count_from(Some(41), None), 42);
+        assert_eq!(super::final_turn_count_from(Some(41), None), Some(42));
         // A delivered-but-invalid turn advanced the cursor without being
         // forwarded; the count must stop below it.
-        assert_eq!(super::final_turn_count_from(Some(41), Some(40)), 40);
+        assert_eq!(super::final_turn_count_from(Some(41), Some(40)), Some(40));
         // An invalid turn past the contiguous prefix constrains nothing.
-        assert_eq!(super::final_turn_count_from(Some(41), Some(50)), 42);
+        assert_eq!(super::final_turn_count_from(Some(41), Some(50)), Some(42));
     }
     use super::*;
 
