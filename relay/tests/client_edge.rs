@@ -321,6 +321,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
@@ -404,6 +405,7 @@ async fn fires_session_start_when_every_expected_slot_connects() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -474,6 +476,7 @@ async fn a_late_slot_receives_session_start_on_register() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -537,6 +540,7 @@ async fn session_start_carries_the_computed_initial_buffer_depth() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     consensus::set_session_shape(&makers, &key, Some(400), false);
 
@@ -924,6 +928,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1002,6 +1007,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1071,6 +1077,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1165,6 +1172,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     // Watch the notices the relay would send up its coordinator connection.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1276,6 +1284,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -1353,6 +1362,7 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -1607,6 +1617,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1736,6 +1747,7 @@ async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1963,6 +1975,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -2048,6 +2061,7 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
         [SlotId(0)].into_iter().collect(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -2216,6 +2230,7 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
     // release delay is measured from -- fires when both clients have connected,
     // exactly as it does in production.
     control.apply_descriptor(&SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers: vec![],
@@ -2372,6 +2387,7 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     // A descriptor arrives well inside the window.
     tokio::time::sleep(Duration::from_millis(30)).await;
     control.apply_descriptor(&SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers: vec![],
@@ -2518,6 +2534,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -2608,6 +2625,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     presence::set_order(&mesh.presence, &key, vec![Candidate::SelfRelay]);
 
@@ -2753,6 +2771,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);
 

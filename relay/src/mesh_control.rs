@@ -417,6 +417,7 @@ impl MeshControl {
             descriptor
                 .resumed
                 .then_some(descriptor.departed_slots.as_slice()),
+            descriptor.finalized_drops,
         );
         // A descriptor now names this session, so any provisional-admission
         // mark it carried is moot -- the bounded-admission sweep would
@@ -762,6 +763,7 @@ mod tests {
 
     fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
         SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(session),
             peers: peers.iter().map(|&id| relay_peer(id)).collect(),
@@ -1300,11 +1302,13 @@ mod tests {
         desc.resumed = true;
         desc.departed_slots = vec![
             DepartedSlot {
+                finalized: false,
                 slot: SlotId(1),
                 kind: DepartureKind::Left,
                 final_turn_count: Some(240),
             },
             DepartedSlot {
+                finalized: false,
                 slot: SlotId(2),
                 kind: DepartureKind::Dropped,
                 // A drop count reaching a descriptor means the carrier ran code
@@ -1378,6 +1382,7 @@ mod tests {
         desc.expected_slots = vec![SlotId(0), SlotId(1)];
         desc.resumed = true;
         desc.departed_slots = vec![DepartedSlot {
+            finalized: false,
             slot: SlotId(1),
             kind: DepartureKind::Left,
             final_turn_count: Some(64),
@@ -1650,6 +1655,7 @@ mod tests {
         desc.expected_slots = vec![SlotId(0), SlotId(1)];
         desc.resumed = true;
         desc.departed_slots = vec![DepartedSlot {
+            finalized: false,
             slot: SlotId(1),
             kind: DepartureKind::Dropped,
             final_turn_count: None,

@@ -2553,6 +2553,7 @@ fn note_inbound(
                 notice.slot,
                 notice.kind,
                 notice.final_turn_count,
+                notice.finalized,
             );
             notify::handle_departure(setup, &notices.departures, lifecycle, notice);
             InboundAction::None
@@ -3275,6 +3276,7 @@ mod tests {
     /// fixture for the descriptor-diff unit tests.
     fn diff_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
         SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId("sb-test".to_owned()),
             session: SessionId(session),
             peers: peers

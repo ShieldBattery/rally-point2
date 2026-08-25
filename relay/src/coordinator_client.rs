@@ -1843,6 +1843,7 @@ mod tests {
 
     fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
         SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(session),
             peers: peers
@@ -2333,6 +2334,7 @@ mod tests {
 
     fn dropped_notice() -> DepartureNotice {
         DepartureNotice {
+            finalized: false,
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(42),
             slot: rally_point_proto::ids::SlotId(2),

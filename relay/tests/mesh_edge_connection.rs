@@ -430,6 +430,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
     // B's only peer is A. Applying it emits the targeted Join on the link the
     // peer id selects.
     control_a.apply_descriptor(&SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers: vec![RelayPeer {
@@ -451,6 +452,7 @@ async fn descriptor_drives_cross_relay_turn_via_mesh_control() -> Result<(), Any
         relay_regions: Vec::new(),
     });
     control_b.apply_descriptor(&SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers: vec![RelayPeer {
@@ -571,6 +573,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
 
     // The coordinator ranked A first (the session's home relay).
     let descriptor_for = |peers: Vec<RelayPeer>| SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers,
@@ -1106,6 +1109,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
         None,
+        false,
     );
     consensus::mark_session_started(&relay_a.mesh.decision_makers, &key);
 
@@ -2049,6 +2053,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     // The coordinator's descriptors: each relay names the other as its peer,
     // with A ranked first (the authority).
     let delivery_descriptor = |peers: Vec<RelayPeer>| SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session,
         peers,

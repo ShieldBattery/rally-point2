@@ -68,6 +68,14 @@ type SessionRefsStore =
 pub struct SessionRefs {
     /// The tenant's own id for the session (ShieldBattery's `gameId`).
     pub external_id: Option<String>,
+    /// Whether this session runs home-side drop finalization
+    /// ([`SessionDescriptor::finalized_drops`]): every relay in its
+    /// capability-homogeneous cohort advertises
+    /// [`CAPABILITY_FINALIZED_DROP_V1`]. Decided once at create and immutable
+    /// — every descriptor rebuild (rehome, late-departure refresh) reads the
+    /// flag from here, and rehome replacement picks stay within the same
+    /// capability cohort.
+    pub finalized_drops: bool,
     /// The tenant's own id for the player in each slot (a stringified
     /// `SbUserId`). Only slots whose handoff carried an `external_ref` appear.
     pub slots: HashMap<SlotId, String>,
@@ -932,12 +940,25 @@ fn rehome_inner(
     // pin (the stay-check above ruled out a match) — the restart-in-place case,
     // where the relay is live, enrolled, available, and its own fresh cert is
     // exactly the valid target every serving client needs to move onto.
+    // The session's capability cohort (see `place_by_region`): a replacement
+    // from the other side of the finalized-drop boundary would mix the
+    // classes this session's placement deliberately kept apart. A
+    // finalized-drops session picks only capable replacements; a session
+    // created without the feature picks only incapable ones — and if its
+    // cohort has fully drained from the fleet, the rehome is Unavailable (the
+    // session ends) rather than silently mixed.
+    let cohort_capable = setup
+        .session_refs
+        .lock()
+        .get(&key)
+        .is_some_and(|refs| refs.finalized_drops);
     let r_new = serving
         .iter()
         .copied()
         .find(|&id| registry::is_available(&setup.registry, id))
         .or_else(|| {
             let mut entries = registry::available_entries(&setup.registry);
+            entries.retain(|e| relay_finalize_capable(e) == cohort_capable);
             entries.sort_by_key(|e| e.relay_id);
             dead_region
                 .as_ref()
@@ -1407,6 +1428,7 @@ fn create_body(
         homes,
         relay_certs,
         relay_regions,
+        finalized_drops,
     } = placement;
 
     // Test seam: a drain mark racing this create lands wholly before or after,
@@ -1448,6 +1470,7 @@ fn create_body(
         homes,
         relay_certs,
         relay_regions,
+        finalized_drops,
         latency_estimate_ms: request.latency_estimate_ms,
     };
     setup
@@ -1586,6 +1609,7 @@ pub fn build_descriptor(
     let refs = session_refs(setup, tenant, session).unwrap_or_default();
 
     Some(SessionDescriptor {
+        finalized_drops: refs.finalized_drops,
         tenant: tenant.clone(),
         session,
         peers,
@@ -1735,6 +1759,9 @@ struct Placement {
     relay_ids: Vec<RelayId>,
     /// Every slot's assigned home relay id.
     homes: std::collections::BTreeMap<SlotId, RelayId>,
+    /// Whether the placed cohort is finalized-drop capable — the session's
+    /// immutable `finalized_drops` value (see `place_by_region`).
+    finalized_drops: bool,
     /// Each serving relay's client-cert fingerprint, for a later re-home's
     /// restart-in-place detection.
     relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
@@ -1840,6 +1867,22 @@ fn place_by_region(
         return Err(SessionSetupError::NoRelaysAvailable);
     }
 
+    // Capability-homogeneous placement: a session's relays must all sit on
+    // the same side of the finalized-drop capability boundary. A relay
+    // without the capability can still author the historical counted-drop
+    // behavior that capability-bearing relays strip at ingress, so mixing the
+    // two classes in one session would hand different clients different leave
+    // schedules — the divergence the capability exists to rule out. Prefer
+    // the capable cohort (the fleet's future); fall back to the incapable one
+    // only when no capable relay is available at all. Within the chosen
+    // cohort the region logic below runs unchanged — a slot whose region only
+    // exists in the other cohort takes the in-cohort region-blind fallback
+    // rather than mixing.
+    let finalized_drops = entries.iter().any(relay_finalize_capable);
+    if finalized_drops {
+        entries.retain(relay_finalize_capable);
+    }
+
     // NOTE(version-aware placement): each entry carries the relay's advertised
     // `protocol` (negotiated against at enroll — an incompatible relay never gets
     // this far), so a placement policy that keeps one session's relays on a single
@@ -1928,7 +1971,17 @@ fn place_by_region(
         homes,
         relay_certs,
         relay_regions,
+        finalized_drops,
     })
+}
+
+/// Whether `entry` enrolled advertising the finalized-drop capability — the
+/// cohort test placement and rehome both key on.
+fn relay_finalize_capable(entry: &RelayEntry) -> bool {
+    entry
+        .capabilities
+        .iter()
+        .any(|c| c == rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1)
 }
 
 /// The maximum slot id (11: BW supports 12 network participants — 8 players
@@ -1958,6 +2011,22 @@ mod tests {
 
     fn enroll_relay(reg: &RelayRegistry, id: u64, port: u16) {
         enroll_relay_with_cert(reg, id, port, fake_cert(id));
+    }
+
+    /// Enrolls a relay advertising the finalized-drop capability.
+    fn enroll_capable_relay(reg: &RelayRegistry, id: u64, port: u16) {
+        registry::enroll(
+            reg,
+            RelayHello::new(
+                RelayId(id),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                ProtocolVersion::CURRENT,
+                fake_cert(id),
+            )
+            .with_capabilities(vec![
+                rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1.to_owned(),
+            ]),
+        );
     }
 
     /// Enrolls (or re-enrolls) a relay under an explicit cert, so a test can
@@ -3675,6 +3744,7 @@ mod tests {
                 // The mid-rehome departure notice (the seam runs after the
                 // assignment lock is held, before the descriptor build).
                 departed.borrow_mut().push(DepartedSlot {
+                    finalized: false,
                     slot: SlotId(1),
                     kind: DepartureKind::Dropped,
                     final_turn_count: None,
@@ -3689,6 +3759,7 @@ mod tests {
         assert_eq!(
             staged[0].departed_slots,
             vec![DepartedSlot {
+                finalized: false,
                 slot: SlotId(1),
                 kind: DepartureKind::Dropped,
                 final_turn_count: None,
@@ -3717,6 +3788,7 @@ mod tests {
         );
 
         let late = DepartedSlot {
+            finalized: false,
             slot: SlotId(1),
             kind: DepartureKind::Left,
             final_turn_count: Some(88),
@@ -3743,6 +3815,7 @@ mod tests {
 
         refresh_resumed_descriptors(&setup, &tid(), resp.session, || {
             vec![DepartedSlot {
+                finalized: false,
                 slot: SlotId(1),
                 kind: DepartureKind::Left,
                 final_turn_count: Some(3),
@@ -3761,6 +3834,98 @@ mod tests {
         }
     }
 
+    /// Placement is capability-homogeneous and prefers the capable cohort: a
+    /// mixed fleet places the session only on capability-advertising relays,
+    /// and the session's descriptors enable finalized drops.
+    #[test]
+    fn placement_prefers_the_capable_cohort_and_enables_finalized_drops() {
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 1, 14900); // incapable
+        enroll_capable_relay(&reg, 2, 14901);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+
+        let resp = create_default_session(&setup);
+        assert_eq!(
+            setup.serving_relays(&tid(), resp.session),
+            vec![RelayId(2)],
+            "the session lands wholly in the capable cohort, never mixed",
+        );
+        let staged = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(staged.len(), 1);
+        assert!(
+            staged[0].finalized_drops,
+            "an all-capable session enables finalized drops",
+        );
+    }
+
+    /// A fleet with no capable relay places normally with the feature off —
+    /// and the flag is immutable thereafter (rebuilds read the stored value).
+    #[test]
+    fn an_incapable_cohort_creates_the_session_with_finalized_drops_off() {
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        for relay_id in setup.serving_relays(&tid(), resp.session) {
+            let staged = setup.descriptors().current_for(relay_id);
+            assert!(!staged[0].finalized_drops);
+        }
+    }
+
+    /// A rehome replacement must come from the session's own capability
+    /// cohort: a capable session with only incapable relays left is
+    /// Unavailable (the session ends) rather than silently mixed, and a
+    /// capable replacement is taken when one exists.
+    #[test]
+    fn a_rehome_stays_within_the_sessions_capability_cohort() {
+        let reg = registry::new_registry();
+        enroll_capable_relay(&reg, 1, 14900);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = create_default_session(&setup);
+        assert!(
+            setup.descriptors().current_for(RelayId(1))[0].finalized_drops,
+            "a single capable relay creates a finalized-drops session",
+        );
+
+        // The capable home dies; the only live relay is incapable.
+        registry::remove(setup.registry(), RelayId(1));
+        enroll_relay(setup.registry(), 3, 14902);
+        assert!(
+            matches!(
+                rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+                RehomeOutcome::Unavailable,
+            ),
+            "no cross-cohort replacement: the session ends instead of mixing",
+        );
+
+        // A capable relay arrives: the rehome takes it.
+        enroll_capable_relay(setup.registry(), 4, 14903);
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget once a capable replacement exists");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(4));
+        assert!(
+            setup.descriptors().current_for(RelayId(4))[0].finalized_drops,
+            "the resumed descriptor keeps the immutable flag",
+        );
+    }
+
     #[test]
     fn rehome_moves_the_group_to_a_live_relay_when_the_home_died() {
         // The home relay (1) drops out of the registry; the session's whole group
@@ -3772,6 +3937,7 @@ mod tests {
         registry::remove(setup.registry(), RelayId(1));
 
         let departed = vec![DepartedSlot {
+            finalized: false,
             slot: SlotId(0),
             kind: DepartureKind::Dropped,
             final_turn_count: None,
@@ -3996,6 +4162,7 @@ mod tests {
         enroll_relay_with_cert(setup.registry(), 5, 14900, vec![0xEE; 4]);
 
         let departed = vec![DepartedSlot {
+            finalized: false,
             slot: SlotId(0),
             kind: DepartureKind::Dropped,
             final_turn_count: None,
@@ -4138,6 +4305,7 @@ mod tests {
                 resp.session,
                 RelayId(99),
                 vec![DepartedSlot {
+                    finalized: false,
                     slot: SlotId(0),
                     kind: DepartureKind::Dropped,
                     final_turn_count: None,

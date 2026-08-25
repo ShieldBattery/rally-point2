@@ -1194,6 +1194,7 @@ mod tests {
     /// the-field case, which relies entirely on the coordinator's stored session.
     fn notice(session: SessionId, slot: u8, kind: DepartureKind, reason: u32) -> DepartureNotice {
         DepartureNotice {
+            finalized: false,
             tenant: TenantId("sb-test".to_owned()),
             session,
             slot: SlotId(slot),

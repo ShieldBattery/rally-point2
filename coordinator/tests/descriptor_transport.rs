@@ -342,6 +342,7 @@ async fn serve_coordinator_returning_setup(control_auth: ControlAuth) -> (String
 /// the descriptor outbox directly.
 fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(session),
         peers: peers

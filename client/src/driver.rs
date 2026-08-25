@@ -3882,6 +3882,7 @@ mod tests {
             send_control_leave(
                 &mut ctrl_send,
                 LeaveDirective {
+                    finalized: false,
                     slot: i,
                     reason: 0,
                     apply_at_frame: 0,

@@ -164,6 +164,13 @@ pub enum FlightEvent {
     /// moment it reports `SessionClosed` to the coordinator, and the trigger
     /// for this recording's flush.
     SessionClosed,
+    /// A drop finalization was rejected. `no_cursor` marks the fail-closed
+    /// branch — the home holds no gap-free forwarded prefix to seal (a
+    /// collapsed window, or a post-rehome home with no cursor continuity) —
+    /// where the drop stays undecided and survivors stay stalled until they
+    /// retry or quit; a session stuck repeating this event is the signal for
+    /// operator intervention (or the coordinated-abort follow-up).
+    DropFinalizeRejected { slot: u8, no_cursor: bool },
     /// A peer authority's buffer directive above the game-sync-safe ceiling
     /// was forwarded verbatim (rewriting it selectively would hand different
     /// clients different depths). Only an authority running code that

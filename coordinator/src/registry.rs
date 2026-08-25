@@ -216,6 +216,7 @@ fn insert_locked(
         protocol: hello.protocol,
         cert_der: hello.cert_der,
         relay_addrs: hello.relay_addrs,
+        capabilities: hello.capabilities,
         region: hello.region,
     };
     let generation = registry.next_generation.fetch_add(1, Ordering::Relaxed);

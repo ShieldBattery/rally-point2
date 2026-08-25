@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rally_point_proto::control::ResultEcho;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
-    GameChat, LeaveDirective, LinkConditions, LobbyCommand, MeshControlFrame, Payload, PlayerSkin,
-    RequestDrop, SessionStart, SlotConditions, SlotConnectivity, SlotDeparted, SlotPresent,
-    mesh_control_frame,
+    FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LinkConditions, LobbyCommand,
+    MeshControlFrame, Payload, PlayerSkin, RequestDrop, SessionStart, SlotConditions,
+    SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use rally_point_transport::MeshSessionKey;
 use tokio::sync::{Notify, mpsc};
@@ -756,7 +756,7 @@ pub fn new_mesh_state_with_timings(
 /// session's transport state — every game on a relay-pair shares one QUIC
 /// connection, so a single driver task drains all sessions' outbound turns from
 /// one channel.
-type MeshForwardTx = mpsc::Sender<(SessionId, Payload)>;
+pub(crate) type MeshForwardTx = mpsc::Sender<(SessionId, Payload)>;
 
 /// The channel that pushes an outbound `MeshControlFrame` to a peer-relay's
 /// mesh-link task, which writes it on the shared bidirectional control stream.
@@ -769,7 +769,7 @@ type MeshForwardTx = mpsc::Sender<(SessionId, Payload)>;
 /// where every message must be delivered; the only send failure is the driver
 /// having exited (closed channel), which the fan-out tolerates because the link is
 /// gone and a redialed one re-syncs via the Join-time reconcile.
-type MeshControlTx = mpsc::UnboundedSender<MeshControlFrame>;
+pub(crate) type MeshControlTx = mpsc::UnboundedSender<MeshControlFrame>;
 
 /// The pair of senders one session registers into [`MeshLinks`] for one link: the
 /// bounded per-turn forward channel and the unbounded control-frame channel, both
@@ -949,7 +949,7 @@ pub enum MeshLinkExit {
 /// session. `shutdown` is the link's own `Notify` (shared across every session
 /// registered on it), so [`fan_out_to_mesh`] can reset exactly this link on a
 /// full forward queue without touching any sibling peer link.
-fn register_mesh_link(
+pub(crate) fn register_mesh_link(
     links: &MeshLinks,
     key: SessionKey,
     forward: MeshForwardTx,
@@ -1423,6 +1423,74 @@ fn request_drop_frame(session: SessionId, target: SlotId, requester: SlotId) -> 
     }
 }
 
+/// The wire value of [`FinalizeDropResult::outcome`] for a successful
+/// finalization (see the proto message docs).
+pub(crate) const FINALIZE_OUTCOME_FINALIZED: u32 = 1;
+/// [`FinalizeDropResult::outcome`]: rejected, the slot has a live generation.
+pub(crate) const FINALIZE_OUTCOME_REJECTED_LIVE: u32 = 2;
+/// [`FinalizeDropResult::outcome`]: rejected, no gap-free cursor to seal.
+pub(crate) const FINALIZE_OUTCOME_REJECTED_NO_CURSOR: u32 = 3;
+
+/// Broadcasts the authority's request that a dropped slot's home finalize the
+/// drop. Sent to every peer serving `key` — the one relay whose descriptor
+/// strictly homes the slot self-selects and answers; the rest ignore it.
+/// Idempotent by design: every honored drop request re-sends it until a
+/// result decides the leave.
+pub(crate) fn fan_out_finalize_drop(
+    links: &MeshLinks,
+    key: &SessionKey,
+    target: SlotId,
+    connection_epoch: Option<u64>,
+) {
+    fan_out_control(
+        links,
+        key,
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::FinalizeDrop(FinalizeDrop {
+                slot: u32::from(target.0),
+                connection_epoch,
+            })),
+        },
+    );
+}
+
+/// Broadcasts the home's finalization outcome. Sent to every peer serving
+/// `key` rather than plumbed back to one link — the authority (wherever it is,
+/// including mid-handoff) self-selects on receipt; everyone else ignores it.
+pub(crate) fn fan_out_finalize_drop_result(
+    links: &MeshLinks,
+    key: &SessionKey,
+    target: SlotId,
+    connection_epoch: Option<u64>,
+    outcome: crate::consensus::FinalizeOutcome,
+) {
+    let (outcome, final_turn_count) = match outcome {
+        crate::consensus::FinalizeOutcome::Finalized { final_turn_count } => {
+            (FINALIZE_OUTCOME_FINALIZED, Some(final_turn_count))
+        }
+        crate::consensus::FinalizeOutcome::RejectedLive => (FINALIZE_OUTCOME_REJECTED_LIVE, None),
+        crate::consensus::FinalizeOutcome::RejectedNoCursor => {
+            (FINALIZE_OUTCOME_REJECTED_NO_CURSOR, None)
+        }
+    };
+    fan_out_control(
+        links,
+        key,
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::FinalizeDropResult(
+                FinalizeDropResult {
+                    slot: u32::from(target.0),
+                    connection_epoch,
+                    outcome,
+                    final_turn_count,
+                },
+            )),
+        },
+    );
+}
+
 /// Builds a `SlotPresent` mesh control frame for `session`.
 fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
     MeshControlFrame {
@@ -1522,6 +1590,7 @@ fn slot_departed_frame(
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+            finalized: false,
             slot: u32::from(slot.0),
             last_frame: stamps.last_frame.map(|f| f.0),
             reachable_frame: stamps.reachable_frame,
@@ -3053,21 +3122,27 @@ fn dispatch_mesh_control_frame(
                 session_frame: departed.result_session_frame,
                 slot_frame: departed.result_slot_frame,
             });
+            // A dropped count is accepted only with the finalization proof,
+            // in a session whose descriptor runs the handshake; anything else
+            // is discarded at this ingress rather than trusted from the wire
+            // — the peer may be running code that predates the
+            // clean-leaves-or-finalized rule, and a stale drop count that
+            // survives into the record could ride a later decide or a
+            // straggler reconnect's replayed directive.
+            let finalized_accepted = departed.reason == crate::consensus::LEAVE_REASON_DROPPED
+                && departed.finalized
+                && crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key);
             let stamps = crate::consensus::DepartureStamps {
                 last_frame: departed
                     .last_frame
                     .map(rally_point_proto::ids::GameFrameCount),
                 reachable_frame: departed.reachable_frame,
                 result,
-                // Only a clean leave may carry an exact final turn count. A
-                // dropped frame's count is discarded at this ingress rather
-                // than trusted from the wire: the peer may be running code
-                // that predates that rule, and a stale drop count that
-                // survives into the record could ride a later decide or a
-                // straggler reconnect's replayed directive.
-                final_turn_count: (departed.reason != crate::consensus::LEAVE_REASON_DROPPED)
+                final_turn_count: (departed.reason != crate::consensus::LEAVE_REASON_DROPPED
+                    || finalized_accepted)
                     .then_some(departed.final_turn_count)
                     .flatten(),
+                finalized: finalized_accepted,
             };
             let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
                 mesh.drop_holds.record_and_maybe_hold(&key, slot, || {
@@ -3136,7 +3211,10 @@ fn dispatch_mesh_control_frame(
             // sanitizers never see it), and the same normalized copy is what
             // gets cached, recorded, and fanned to local clients below — the
             // cache and the clients must never disagree about the count.
-            let leave = crate::consensus::normalize_observed_leave(&leave);
+            let leave = crate::consensus::normalize_observed_leave(
+                &leave,
+                crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key),
+            );
             // A `false` here means this relay's own consensus state didn't
             // accept the directive as new: either an ordinary redundant copy
             // (already fanned out on its own first insert, so re-forwarding
@@ -3330,20 +3408,131 @@ fn dispatch_mesh_control_frame(
             // the mesh — the origin already sent a copy to every peer, so the
             // authority is among the receivers and re-flooding would only echo (the
             // same no-echo rule the chat and leave arms follow).
-            routing::honor_drop_request(
-                &mesh.drop_holds,
-                &mesh.decision_makers,
-                sessions,
-                &mesh.links,
-                &key,
-                target,
-                request.requester,
-            );
+            routing::honor_drop_request(sessions, mesh, &key, target, request.requester);
             // An honored request just decided a held drop; if it was the last
             // undecided departure deferring this relay's session-emptied close
             // (the requester survives on a peer relay, so the local roster can
             // be empty here), re-evaluate the close.
             routing::maybe_close_emptied_session(sessions, mesh, &key);
+        }
+        Some(mesh_control_frame::Kind::FinalizeDrop(request)) => {
+            let Ok(slot) = u8::try_from(request.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = request.slot,
+                    "mesh FinalizeDrop names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // The authority's request that this slot's home finalize its drop.
+            // Only the relay whose descriptor STRICTLY homes the slot answers
+            // (an open fallback would have every relay finalize with its own,
+            // different cursor), and only in a session whose descriptor runs
+            // the handshake at all. Everyone else stays silent — the request
+            // was broadcast, so the one home is among the receivers.
+            if !crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key)
+                || !crate::consensus::slot_strictly_homed(&mesh.decision_makers, &key, slot)
+            {
+                return;
+            }
+            let outcome =
+                crate::consensus::finalize_drop(&mesh.decision_makers, &key, slot, || {
+                    forwarded_count(&mesh.seen, &key, slot)
+                });
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = session_id.0,
+                slot = slot.0,
+                ?outcome,
+                "home-side drop finalization evaluated",
+            );
+            if outcome == crate::consensus::FinalizeOutcome::RejectedNoCursor {
+                // The fail-closed branch: the drop stays undecided (survivors
+                // remain stalled and may retry), never a frame fallback. Make
+                // it observable — a session stuck here is the signal for the
+                // coordinated-abort follow-up.
+                mesh.decision_makers.flight_recorder().record(
+                    &key,
+                    crate::flight_recorder::FlightEvent::DropFinalizeRejected {
+                        slot: slot.0,
+                        no_cursor: true,
+                    },
+                );
+            }
+            fan_out_finalize_drop_result(
+                &mesh.links,
+                &key,
+                slot,
+                request.connection_epoch,
+                outcome,
+            );
+        }
+        Some(mesh_control_frame::Kind::FinalizeDropResult(result)) => {
+            let Ok(slot) = u8::try_from(result.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = result.slot,
+                    "mesh FinalizeDropResult names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // The home's answer. Only the session authority acts on it (the
+            // broadcast reaches everyone; a non-authority has no decide to
+            // make), and only in a handshake-enabled session.
+            if !crate::consensus::is_authority(&mesh.decision_makers, &key)
+                || !crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key)
+            {
+                return;
+            }
+            match (result.outcome, result.final_turn_count) {
+                (FINALIZE_OUTCOME_FINALIZED, Some(final_turn_count)) => {
+                    routing::complete_finalized_drop(
+                        &mesh.drop_holds,
+                        &mesh.decision_makers,
+                        sessions,
+                        &mesh.links,
+                        &key,
+                        slot,
+                        final_turn_count,
+                    );
+                    // The decide may have been the last undecided departure
+                    // deferring this relay's session-emptied close.
+                    routing::maybe_close_emptied_session(sessions, mesh, &key);
+                }
+                (FINALIZE_OUTCOME_REJECTED_LIVE, _) => {
+                    tracing::info!(
+                        tenant = key.tenant.as_ref(),
+                        session = session_id.0,
+                        slot = slot.0,
+                        "drop finalization rejected; the slot has a live generation",
+                    );
+                }
+                (FINALIZE_OUTCOME_REJECTED_NO_CURSOR, _) => {
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = session_id.0,
+                        slot = slot.0,
+                        "drop finalization rejected with no gap-free cursor; the drop stays                          undecided",
+                    );
+                    mesh.decision_makers.flight_recorder().record(
+                        &key,
+                        crate::flight_recorder::FlightEvent::DropFinalizeRejected {
+                            slot: slot.0,
+                            no_cursor: true,
+                        },
+                    );
+                }
+                (outcome, count) => {
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = session_id.0,
+                        slot = slot.0,
+                        outcome,
+                        ?count,
+                        "unrecognized drop-finalization outcome; ignoring",
+                    );
+                }
+            }
         }
         Some(mesh_control_frame::Kind::DeliveryCursors(delivery)) => {
             // A peer-homed destination's delivered-through cursors: fold each
@@ -3557,7 +3746,7 @@ struct SessionState {
 /// `joined` map. Without it, task cancellation would skip the cleanup and leave a
 /// dead forward channel in `mesh.links` for a session this link no longer serves —
 /// a leak, since session ids are never reused.
-struct MeshLinkRegistration {
+pub(crate) struct MeshLinkRegistration {
     links: MeshLinks,
     key: SessionKey,
     /// The registered channel's id, so the guard removes only this link's entry
@@ -3725,6 +3914,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
@@ -4221,6 +4411,7 @@ mod tests {
         let (_forward_rx, mut control_rx) = register_link_channels(&mesh_links, &key);
 
         let real_leave = LeaveDirective {
+            finalized: false,
             slot: 0,
             reason: 0,
             apply_at_frame: 10,
@@ -4228,6 +4419,7 @@ mod tests {
             final_turn_count: None,
         };
         let malformed_leave = LeaveDirective {
+            finalized: false,
             slot: 300,
             reason: 0,
             apply_at_frame: 10,
@@ -4448,6 +4640,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         let (_registration, mut local) =
             routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
@@ -4626,6 +4819,7 @@ mod tests {
         // tolerates the closed channel and still reaches the healthy first link.
         drop(ctl2);
         let leave = LeaveDirective {
+            finalized: false,
             slot: 2,
             reason: 3,
             apply_at_frame: 42,
@@ -4660,6 +4854,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         // The authority decided one slot's leave (caches a directive and records a
         // departure), and separately recorded a bare departure for another slot.
@@ -5196,6 +5391,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
 
         // A peer mesh link that must NOT hear an echo of the received turn.
@@ -5337,6 +5533,7 @@ mod tests {
                 std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
                 None,
+                false,
             );
         };
         serve();
@@ -5358,6 +5555,7 @@ mod tests {
         let departed = |slot: u32| MeshControlFrame {
             session: key.session.0,
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                finalized: false,
                 slot,
                 last_frame: Some(10),
                 reachable_frame: Some(10),
@@ -5427,6 +5625,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         let (_reg, mut survivor) =
             routing::register(&sessions, &key, SlotId(1)).expect("survivor registers");
@@ -5437,6 +5636,7 @@ mod tests {
             &makers,
             &key,
             &LeaveDirective {
+                finalized: false,
                 slot: 0,
                 reason: 0,
                 apply_at_frame: 10,
@@ -5465,6 +5665,178 @@ mod tests {
         assert!(
             survivor.try_recv_forward().is_some(),
             "a mesh-delivered turn for the decided slot still reaches survivors",
+        );
+    }
+
+    /// The strict home answers a `FinalizeDrop`: it seals the slot, snapshots
+    /// its gap-free forwarded count, and broadcasts the result.
+    #[test]
+    fn the_home_answers_finalize_drop_with_the_sealed_count() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            [SlotId(1)].into_iter().collect(),
+            std::collections::HashSet::new(),
+            None,
+            true,
+        );
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(1),
+            crate::consensus::DepartureStamps::default(),
+            crate::consensus::LEAVE_REASON_DROPPED,
+        );
+        // Three of the slot's turns were forwarded before it died.
+        for seq in 0..3 {
+            let _ = mark_seen(&seen, &key, SlotId(1), seq);
+        }
+        let (_echo_fwd_rx, mut ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        dispatch_mesh_control(
+            MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::FinalizeDrop(FinalizeDrop {
+                    slot: 1,
+                    connection_epoch: None,
+                })),
+            },
+            RelayId(9),
+            &joined,
+            &sessions,
+            &mesh_state,
+        );
+
+        let frame = ctl_rx.try_recv().expect("the home broadcast its answer");
+        match frame.kind {
+            Some(mesh_control_frame::Kind::FinalizeDropResult(result)) => {
+                assert_eq!(result.slot, 1);
+                assert_eq!(result.outcome, FINALIZE_OUTCOME_FINALIZED);
+                assert_eq!(result.final_turn_count, Some(3));
+            }
+            other => panic!("expected a FinalizeDropResult, got {other:?}"),
+        }
+    }
+
+    /// The authority receiving a FINALIZED result stamps the proof, claims the
+    /// hold, and decides the leave — which reaches local survivors carrying
+    /// the sealed count.
+    #[test]
+    fn the_authority_decides_on_a_finalized_result() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            [SlotId(0)].into_iter().collect(),
+            std::collections::HashSet::new(),
+            None,
+            true,
+        );
+        crate::consensus::observe_frame(
+            &makers,
+            &key,
+            SlotId(0),
+            rally_point_proto::ids::GameFrameCount(40),
+        );
+        crate::consensus::observe_frame(
+            &makers,
+            &key,
+            SlotId(1),
+            rally_point_proto::ids::GameFrameCount(50),
+        );
+        let (_reg, mut survivor) =
+            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        // The peer-homed slot dropped: an undecided hold on this relay too.
+        routing::hold_or_decide_leave(
+            &mesh_state.drop_holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &key,
+            SlotId(1),
+            crate::consensus::LEAVE_REASON_DROPPED,
+        );
+        assert!(mesh_state.drop_holds.is_pending(&key, SlotId(1)));
+
+        dispatch_mesh_control(
+            MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::FinalizeDropResult(
+                    FinalizeDropResult {
+                        slot: 1,
+                        connection_epoch: None,
+                        outcome: FINALIZE_OUTCOME_FINALIZED,
+                        final_turn_count: Some(5),
+                    },
+                )),
+            },
+            RelayId(9),
+            &joined,
+            &sessions,
+            &mesh_state,
+        );
+
+        let leave = survivor
+            .try_recv_leave()
+            .expect("the decided leave reaches the survivor");
+        assert_eq!(leave.reason, crate::consensus::LEAVE_REASON_DROPPED);
+        assert_eq!(leave.final_turn_count, Some(5));
+        assert!(leave.finalized);
+        assert!(
+            !mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+            "the hold was claimed by the decide",
         );
     }
 
@@ -5708,6 +6080,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
 
@@ -5745,6 +6118,7 @@ mod tests {
         let stale_departure = MeshControlFrame {
             session: key.session.0,
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                finalized: false,
                 slot: 0,
                 last_frame: Some(10),
                 reachable_frame: Some(9),
@@ -5807,6 +6181,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
 
         // A local survivor (slot 5) that must hear an accepted leave and must
@@ -5834,6 +6209,7 @@ mod tests {
         );
 
         let first = LeaveDirective {
+            finalized: false,
             slot: 0,
             reason: 3,
             apply_at_frame: 90,
@@ -5866,6 +6242,7 @@ mod tests {
         // reason and apply frame, the authority-bug shape `observe_leave`
         // rejects. It must never reach the local survivor.
         let conflicting = LeaveDirective {
+            finalized: false,
             slot: 0,
             reason: 6, // any reason differing from `first`'s -- the conflict is what matters
             apply_at_frame: 150,
@@ -5924,6 +6301,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         crate::consensus::record_departure(
             &makers,
@@ -5997,6 +6375,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
@@ -6074,6 +6453,7 @@ mod tests {
                 std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
                 None,
+                false,
             );
             assert!(crate::consensus::activate_connection_epoch(
                 &makers,
@@ -6100,6 +6480,7 @@ mod tests {
             let leave = MeshControlFrame {
                 session: key.session.0,
                 kind: Some(mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
+                    finalized: false,
                     slot: 0,
                     reason: crate::consensus::LEAVE_REASON_DROPPED,
                     apply_at_frame: 41,
@@ -6110,6 +6491,7 @@ mod tests {
             let departed = MeshControlFrame {
                 session: key.session.0,
                 kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                    finalized: false,
                     slot: 0,
                     last_frame: Some(40),
                     reachable_frame: None,
@@ -6228,6 +6610,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         // The target slot dropped: a frame basis for its leave, a recorded departure,
         // and a hold this relay marked. `test_mesh_state` uses a zero unlock floor,
@@ -6311,6 +6694,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         crate::consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(50));
         crate::consensus::record_departure(
@@ -6389,6 +6773,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         consensus::mark_session_started(&decision_makers, &key);
 
@@ -6452,6 +6837,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
         let labels = vec![
             RegionLabel {
@@ -6609,6 +6995,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
 
         // Slot 0's very first turn (seq 0, sync ordinal 0), delivered twice at
@@ -6718,6 +7105,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             None,
+            false,
         );
 
         // The survivor's turns each arrive twice: the home peer's direct copy,

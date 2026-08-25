@@ -96,6 +96,16 @@ impl AsRef<str> for RegionId {
 // Relay registry (coordinator ⇄ relay)
 // ---------------------------------------------------------------------------
 
+/// The [`RelayHello::capabilities`] tag for home-side drop finalization: the
+/// relay understands the `FinalizeDrop` handshake, strips unproven dropped
+/// counts at every ingress, and honors a descriptor's `finalized_drops` flag.
+/// The coordinator enables finalized drops only for sessions whose every
+/// assigned relay (rehome targets included) advertises this — and, during a
+/// mixed-fleet transition, never places relays with and without it in one
+/// session, since a relay without it can still author the historical unsound
+/// counted-drop behavior.
+pub const CAPABILITY_FINALIZED_DROP_V1: &str = "finalized_drop_v1";
+
 /// The first frame a relay sends on its control connection, enrolling it into
 /// the coordinator's registry (wrapped in [`RelayToCoordinator::Hello`]).
 ///
@@ -151,6 +161,14 @@ pub struct RelayHello {
     /// [`protocol`](Self::protocol), which is exactly how such a relay behaves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_protocol: Option<ProtocolVersion>,
+    /// The optional protocol capabilities this relay build implements, as
+    /// free-form tags (see [`CAPABILITY_FINALIZED_DROP_V1`]). Orthogonal to
+    /// the protocol-version window: a capability changes what the coordinator
+    /// may enable per session (and how it places sessions), not whether the
+    /// relay can enroll. Defaults empty for a relay that predates the field;
+    /// an old coordinator ignores the field entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// The relay's **complete** advertised address set, in the relay's own
     /// preference order — a dual-stack relay advertises both its v4 and v6
     /// endpoints here. When non-empty it *includes*
@@ -207,10 +225,19 @@ impl RelayHello {
             protocol,
             cert_der,
             min_protocol: None,
+            capabilities: Vec::new(),
             relay_addrs: Vec::new(),
             region: None,
             enroll_token: None,
         }
+    }
+
+    /// Sets the optional protocol capabilities this relay build implements
+    /// (see [`RelayHello::capabilities`]). The relay's real enroll passes
+    /// every capability tag its build supports.
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Sets the oldest protocol version the relay still speaks, widening the
@@ -277,6 +304,12 @@ pub struct RelayEntry {
     /// every endpoint/peer built from this entry advertises the full set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_addrs: Vec<SocketAddr>,
+    /// The capability tags the relay enrolled with (from
+    /// [`RelayHello::capabilities`]). Placement reads them to keep every
+    /// session's relay set capability-homogeneous and to decide per-session
+    /// features like [`SessionDescriptor::finalized_drops`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// The region this relay enrolled tagged with (from [`RelayHello::region`]),
     /// or `None` for an untagged relay. The coordinator reads it when placing a
     /// session's slots — a slot requesting this region homes here — and when a
@@ -837,6 +870,17 @@ pub struct SessionDescriptor {
     /// that predates the field.
     #[serde(default)]
     pub resumed: bool,
+    /// Whether home-side drop finalization is enabled for this session: every
+    /// relay ever assigned to it advertises
+    /// [`CAPABILITY_FINALIZED_DROP_V1`], so an honored drop request runs the
+    /// `FinalizeDrop` handshake and a dropped leave may carry a finalized
+    /// exact count. **Immutable for the session's lifetime** — decided at
+    /// create, preserved verbatim through every rebuild (rehome included),
+    /// and a session created without it stays without it until retirement.
+    /// Defaults `false` for a descriptor from a coordinator that predates the
+    /// field.
+    #[serde(default)]
+    pub finalized_drops: bool,
     /// The slots the coordinator already knows have departed this session, each
     /// with the relay's left-vs-dropped classification. Carried only on a
     /// rehome-rebuilt descriptor (see [`resumed`](Self::resumed)): a fresh relay
@@ -915,6 +959,13 @@ pub struct DepartedSlot {
     /// leave) or the coordinator predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_turn_count: Option<u64>,
+    /// Whether the retained count was home-finalized (see
+    /// [`DepartureNotice::finalized`]) — carried through so the fresh relay's
+    /// seed applies the same clean-leaves-or-finalized acceptance rule as
+    /// every other count ingress. Defaults `false` for a coordinator that
+    /// predates the field.
+    #[serde(default)]
+    pub finalized: bool,
 }
 
 /// Identifies one session's descriptor within a relay's set — the `(tenant,
@@ -1571,6 +1622,13 @@ pub struct DepartureNotice {
     /// deciding relay predates counted leaves).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_turn_count: Option<u64>,
+    /// Whether `final_turn_count` on a dropped departure was derived through
+    /// home-side finalization (the wire's `LeaveDirective.finalized`) — the
+    /// proof that lets the coordinator retain a dropped count for rehome
+    /// seeding instead of stripping it as legacy-unsound. Defaults `false`
+    /// for a relay that predates the field.
+    #[serde(default)]
+    pub finalized: bool,
 }
 
 /// One slot the relay's desync comparator found on the losing side of a checksum
@@ -1765,6 +1823,7 @@ mod tests {
     #[test]
     fn relay_hello_roundtrips_json() {
         let hello = RelayHello {
+            capabilities: Vec::new(),
             relay_id: RelayId(7),
             relay_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
             protocol: ProtocolVersion::CURRENT,
@@ -1983,6 +2042,7 @@ mod tests {
         let message = CoordinatorToRelay::Descriptors {
             staged_at_unix_ms: None,
             descriptors: vec![SessionDescriptor {
+                finalized_drops: false,
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
                 peers: vec![RelayPeer {
@@ -2056,6 +2116,7 @@ mod tests {
         let message = CoordinatorToRelay::DescriptorDelta {
             staged_at_unix_ms: Some(1_700_000_000_123),
             upserts: vec![SessionDescriptor {
+                finalized_drops: false,
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
                 peers: vec![RelayPeer {
@@ -2667,6 +2728,7 @@ mod tests {
     #[test]
     fn session_descriptor_roundtrips_json() {
         let desc = SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             peers: vec![RelayPeer {
@@ -2687,6 +2749,7 @@ mod tests {
             homed_slots: vec![SlotId(0)],
             resumed: true,
             departed_slots: vec![DepartedSlot {
+                finalized: false,
                 slot: SlotId(2),
                 kind: DepartureKind::Dropped,
                 final_turn_count: Some(240),
@@ -2771,11 +2834,13 @@ mod tests {
             back.departed_slots,
             vec![
                 DepartedSlot {
+                    finalized: false,
                     slot: SlotId(1),
                     kind: DepartureKind::Left,
                     final_turn_count: Some(312),
                 },
                 DepartedSlot {
+                    finalized: false,
                     slot: SlotId(3),
                     kind: DepartureKind::Dropped,
                     final_turn_count: None,
@@ -2791,6 +2856,7 @@ mod tests {
         // `authority_order`'s plain `#[serde(default)]`), so an empty Vec still
         // serializes as `[]`, not omitted.
         let desc = SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(1),
             peers: vec![],
@@ -3031,6 +3097,7 @@ mod tests {
     #[test]
     fn departure_roundtrips_json() {
         let notice = DepartureNotice {
+            finalized: false,
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slot: SlotId(2),
@@ -3085,6 +3152,7 @@ mod tests {
     #[test]
     fn departure_omits_absent_correlation_ids_on_the_wire() {
         let notice = DepartureNotice {
+            finalized: false,
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(1),
             slot: SlotId(0),

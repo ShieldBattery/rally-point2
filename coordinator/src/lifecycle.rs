@@ -179,6 +179,11 @@ struct DepartureSeed {
     kind: DepartureKind,
     /// The leave directive's exact turn count, `None` when it carried none.
     final_turn_count: Option<u64>,
+    /// Whether a dropped count carries the home-finalization proof
+    /// ([`DepartureNotice::finalized`]) — without it a dropped count is
+    /// stripped at this ingress, and with it the proof rides back out through
+    /// [`DepartedSlot::finalized`] on a rehome seed.
+    finalized: bool,
 }
 
 /// One session's lifecycle state.
@@ -571,25 +576,28 @@ impl Lifecycle {
         slot: SlotId,
         kind: DepartureKind,
         final_turn_count: Option<u64>,
+        finalized: bool,
     ) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
-        // Only a clean leave may carry an exact final turn count; a dropped
-        // notice's count is discarded here rather than trusted from the wire
-        // (the reporting relay may run code that predates that rule), so a
-        // rehome descriptor never re-seeds an unsound drop count into a relay
-        // that would trust it.
+        // A dropped count is retained only with the home-finalization proof;
+        // anything else is discarded here rather than trusted from the wire
+        // (the reporting relay may run code that predates the
+        // clean-leaves-or-finalized rule), so a rehome descriptor never
+        // re-seeds an unsound drop count into a relay that would trust it.
+        let finalized = matches!(kind, DepartureKind::Dropped) && finalized;
         let final_turn_count = match kind {
-            DepartureKind::Dropped => None,
-            DepartureKind::Left => final_turn_count,
+            DepartureKind::Dropped if !finalized => None,
+            _ => final_turn_count,
         };
         // First record for a slot wins — a slot never departs twice, and every
         // relay's copy of the same decided leave carries the same substance.
         state.departures.entry(slot).or_insert(DepartureSeed {
             kind,
             final_turn_count,
+            finalized,
         });
         if state.player_slots.contains(&slot) {
             state.accounted.insert(slot);
@@ -629,6 +637,7 @@ impl Lifecycle {
                     .departures
                     .iter()
                     .map(|(&slot, seed)| DepartedSlot {
+                        finalized: seed.finalized,
                         slot,
                         kind: seed.kind,
                         final_turn_count: seed.final_turn_count,
@@ -1833,7 +1842,7 @@ mod tests {
         );
 
         // Slot 0 accounts (departs); slot 1 is the lone holdout → holdout timer arms.
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None);
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None, false);
         assert!(reaps.try_recv().is_err(), "nothing closes before the grace");
         tokio::time::sleep(SHORT / 2).await;
         assert!(reaps.try_recv().is_err(), "still nothing mid-grace");
@@ -1860,8 +1869,8 @@ mod tests {
             HashSet::new(),
         );
 
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None); // arms holdout for slot 1
-        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None); // the holdout reports → disarm
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None, false); // arms holdout for slot 1
+        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None, false); // the holdout reports → disarm
 
         // Past the holdout grace, nothing was reaped (the linger grace is an hour).
         tokio::time::sleep(SHORT * 2).await;
@@ -1887,11 +1896,21 @@ mod tests {
             HashSet::new(),
         );
 
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Left, Some(312));
-        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None);
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Left, Some(312), false);
+        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None, false);
         // A duplicate notice for slot 0 (another relay's copy of the same
         // decided leave) never rewrites the first record.
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, Some(999));
+        lc.on_departure(
+            tid(),
+            s,
+            SlotId(0),
+            DepartureKind::Dropped,
+            Some(999),
+            false,
+        );
+        // A dropped count WITH the home-finalization proof is retained, proof
+        // and all, for the rehome seed to carry back out.
+        lc.on_departure(tid(), s, SlotId(2), DepartureKind::Dropped, Some(77), true);
 
         let mut departed = lc.departed_slots(&tid(), s);
         departed.sort_by_key(|d| d.slot.0);
@@ -1899,14 +1918,22 @@ mod tests {
             departed,
             vec![
                 DepartedSlot {
+                    finalized: false,
                     slot: SlotId(0),
                     kind: DepartureKind::Left,
                     final_turn_count: Some(312),
                 },
                 DepartedSlot {
+                    finalized: false,
                     slot: SlotId(1),
                     kind: DepartureKind::Dropped,
                     final_turn_count: None,
+                },
+                DepartedSlot {
+                    finalized: true,
+                    slot: SlotId(2),
+                    kind: DepartureKind::Dropped,
+                    final_turn_count: Some(77),
                 },
             ],
         );
@@ -2193,7 +2220,7 @@ mod tests {
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
         );
-        lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left, None);
+        lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left, None, false);
 
         // A's sessionClosed fires once its never-started grace lapses, and its
         // lifecycle state (drain task included) is gone -- not left immortal.
@@ -2408,7 +2435,7 @@ mod tests {
         );
 
         // Arm and fire the holdout reap so a directive is pending for relay 1.
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None);
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None, false);
         let mut rx = reaps.subscribe(RelayId(1));
         let directive = timeout(SHORT * 4, rx.recv())
             .await
@@ -2532,6 +2559,7 @@ mod tests {
             setup.descriptors().record(
                 relay,
                 SessionDescriptor {
+                    finalized_drops: false,
                     tenant: tid(),
                     session,
                     peers: vec![],

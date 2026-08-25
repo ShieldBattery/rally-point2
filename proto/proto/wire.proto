@@ -497,19 +497,29 @@ message LeaveDirective {
   // passed, which such clients then apply on arrival rather than in lockstep —
   // the imprecision this field exists to remove.
   //
-  // Carried only for a CLEAN leave (`reason` != dropped). The count is sound
-  // only when nothing past it can ever reach a client, and the clean-leave
-  // intent is the one origin where that is structural: the home relay's serve
-  // task — the slot's single ingress — derives the count and stops forwarding
-  // in the same step, and a decided leave refuses readmission. A dropped
-  // slot has no such cut (it can be mid-reconnect, pushing turns past any
-  // recorded count while a drop-decide races it), so a drop always schedules
-  // by `apply_at_frame` — benign, because survivors of a drop have long since
-  // consumed the identical forwarded prefix and stalled at the same point by
-  // the time one is decided. Also absent from directives re-derived from a
-  // departure record that predates the field, or authored by a home with no
-  // gap-free forwarded knowledge.
+  // Carried for a CLEAN leave (`reason` != dropped), or for a dropped leave
+  // whose count was home-finalized (`finalized`). The count is sound only
+  // when nothing past it can ever reach a client. The clean-leave intent has
+  // that structurally: the home relay's serve task — the slot's single
+  // ingress — derives the count and stops forwarding in the same step, and a
+  // decided leave refuses readmission. A dropped slot has no such cut on its
+  // own (it can be mid-reconnect, pushing turns past any recorded count while
+  // a drop-decide races it), so an UNFINALIZED drop always schedules by
+  // `apply_at_frame`; finalization recreates the cut explicitly — the home
+  // marks the slot's generation terminal (refusing future admission and
+  // fencing its turn ingress) and only then snapshots this count. Also absent
+  // from directives re-derived from a departure record that predates the
+  // field, or authored by a home with no gap-free forwarded knowledge.
   optional uint64 final_turn_count = 5;
+
+  // Whether `final_turn_count` on a DROPPED leave was derived through the
+  // home-side finalization handshake (see `FinalizeDrop`) — the proof that
+  // distinguishes it from a count authored by code predating the
+  // clean-leaves-only rule. Receivers strip a dropped count that does not
+  // carry this proof (and outside sessions whose descriptor enables
+  // finalized drops). Meaningless on a clean leave. Default false, so every
+  // legacy sender reads as unproven.
+  bool finalized = 6;
 }
 
 // A client's announcement that it is leaving cleanly (client → relay only),
@@ -1077,6 +1087,22 @@ message MeshControlFrame {
     // session, so re-flooding would only echo (the same no-echo rule
     // `LobbyCommand` and `GameChat` follow). See `PlayerSkin`.
     PlayerSkin player_skin = 14;
+
+    // The session authority asks the departed slot's home relay to finalize a
+    // drop: atomically verify no live connection generation exists for the
+    // slot, seal future admission and turn ingress terminally, and snapshot
+    // the slot's gap-free forwarded-turn count. Broadcast to every session
+    // peer; the relay whose descriptor strictly homes the slot self-selects
+    // and answers with `FinalizeDropResult` (also broadcast). Idempotent —
+    // re-sent on every honored drop request until a result decides the leave.
+    FinalizeDrop finalize_drop = 15;
+
+    // The home relay's answer to `FinalizeDrop`. A `FINALIZED` outcome
+    // carries the sealed count; the authority stamps it (with the finalized
+    // proof) into the slot's departure record and decides the leave. Any
+    // rejection leaves the drop undecided — never a frame-scheduled fallback,
+    // which is exactly the unsoundness finalization exists to remove.
+    FinalizeDropResult finalize_drop_result = 16;
   }
 }
 
@@ -1251,6 +1277,12 @@ message SlotDeparted {
   // re-homed slot whose earlier turns the fresh home never carried) — clients
   // then fall back to `apply_at_frame`.
   optional uint64 final_turn_count = 10;
+
+  // Whether `final_turn_count` was derived through home-side drop
+  // finalization (see `FinalizeDrop` and `LeaveDirective.finalized`).
+  // Default false, so every legacy sender reads as unproven and receivers
+  // strip the dropped count.
+  bool finalized = 11;
 }
 
 // A relay's directive that a session may begin: every slot the coordinator
@@ -1339,4 +1371,41 @@ message SlotConnectivity {
   // sidecars and later teardown for any other epoch are stale. Absent for a
   // legacy sender, preserving rolling compatibility.
   optional fixed64 connection_epoch = 3;
+}
+
+// The authority's request that a dropped slot's home finalize the drop — see
+// the `finalize_drop` oneof arm. Generation-bound: `connection_epoch` names
+// the departed generation the authority observed, so a home that has since
+// admitted a newer generation rejects rather than sealing the wrong one.
+message FinalizeDrop {
+  // The dropped slot to finalize.
+  uint32 slot = 1;
+
+  // The departed connection generation the authority is finalizing, from its
+  // departure record. Absent in legacy mode (no generation observed).
+  optional fixed64 connection_epoch = 2;
+}
+
+// The home's answer to `FinalizeDrop` — see the `finalize_drop_result` oneof
+// arm.
+message FinalizeDropResult {
+  // The slot the outcome describes.
+  uint32 slot = 1;
+
+  // The generation the request named, echoed for the authority's validation.
+  optional fixed64 connection_epoch = 2;
+
+  // What happened. 1 == FINALIZED: the generation is sealed terminal and
+  // `final_turn_count` carries the gap-free forwarded count. 2 ==
+  // REJECTED_LIVE: the slot has a live (reconnected) generation — the drop
+  // must not be decided. 3 == REJECTED_NO_CURSOR: the home holds no gap-free
+  // forwarded prefix for the slot (a collapsed sparse window, or a
+  // post-rehome home with no cursor continuity) — the drop stays undecided
+  // rather than falling back to frame scheduling. 0/unknown values are
+  // ignored.
+  uint32 outcome = 3;
+
+  // The sealed gap-free forwarded-turn count, present exactly when `outcome`
+  // is FINALIZED.
+  optional uint64 final_turn_count = 4;
 }

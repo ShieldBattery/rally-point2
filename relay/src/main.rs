@@ -563,7 +563,15 @@ async fn main() -> Result<()> {
                 ca.as_ref().to_vec(),
             )
             .with_min_protocol(ProtocolVersion::MIN_SUPPORTED)
-            .with_relay_addrs(advertise_addrs);
+            .with_relay_addrs(advertise_addrs)
+            // This build implements the home-side drop-finalization handshake
+            // (and strips unproven dropped counts at every ingress); the
+            // coordinator enables the feature per session only when every
+            // assigned relay advertises it, and never mixes advertising and
+            // non-advertising relays in one session.
+            .with_capabilities(vec![
+                rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1.to_owned(),
+            ]);
             if let Some(region) = &cli.region {
                 relay_hello = relay_hello.with_region(RegionId(region.clone()));
             }

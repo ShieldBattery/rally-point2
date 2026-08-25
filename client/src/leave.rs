@@ -210,6 +210,7 @@ mod tests {
 
     fn leave(slot: u32, reason: u32, apply_at_frame: u32, leave_seq: u32) -> LeaveDirective {
         LeaveDirective {
+            finalized: false,
             slot,
             reason,
             apply_at_frame,
@@ -225,6 +226,7 @@ mod tests {
         leave_seq: u32,
     ) -> LeaveDirective {
         LeaveDirective {
+            finalized: false,
             slot,
             reason,
             // A frame the frame-fallback would treat as never-due, so a test

@@ -255,6 +255,7 @@ mod tests {
         let departed = MeshControlFrame {
             session: 7,
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                finalized: false,
                 slot: 2,
                 last_frame: Some(41),
                 reachable_frame: Some(38),
@@ -278,6 +279,7 @@ mod tests {
         let leave = MeshControlFrame {
             session: 7,
             kind: Some(mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
+                finalized: false,
                 slot: 2,
                 reason: 3,
                 apply_at_frame: 42,
@@ -314,6 +316,7 @@ mod tests {
         let departed = MeshControlFrame {
             session: 3,
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                finalized: false,
                 slot: 1,
                 last_frame: None,
                 reachable_frame: None,
@@ -343,6 +346,7 @@ mod tests {
         let departed = MeshControlFrame {
             session: 5,
             kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+                finalized: false,
                 slot: 0,
                 last_frame: Some(4242),
                 reachable_frame: Some(4200),

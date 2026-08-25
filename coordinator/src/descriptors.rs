@@ -334,6 +334,7 @@ mod tests {
 
     fn descriptor(tenant: &str, session: u64, peers: &[u64]) -> SessionDescriptor {
         SessionDescriptor {
+            finalized_drops: false,
             tenant: TenantId(tenant.to_owned()),
             session: SessionId(session),
             peers: peers

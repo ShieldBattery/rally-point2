@@ -795,6 +795,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -921,6 +922,7 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -1079,6 +1081,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
     let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
 
@@ -1095,6 +1098,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
     consensus::mark_session_started(&mesh_b.decision_makers, &key);
     let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
@@ -1238,6 +1242,7 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
     consensus::mark_session_started(&mesh.decision_makers, &key);
 
@@ -1450,6 +1455,7 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
         HashSet::new(),
         HashSet::new(),
         None,
+        false,
     );
     consensus::set_session_shape(&mesh.decision_makers, &key, Some(400), false);
 

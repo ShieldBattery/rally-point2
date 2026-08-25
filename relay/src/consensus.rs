@@ -1605,6 +1605,20 @@ pub struct DecisionMaker {
     /// with a count are unaffected: those were decided before the rehome, by
     /// an origin that was sound at the time.
     resumed: bool,
+    /// Whether this session's descriptor enables home-side drop finalization
+    /// (`SessionDescriptor::finalized_drops`). Latched at maker creation and
+    /// immutable for the session's lifetime, exactly like the descriptor
+    /// field it mirrors: every count-acceptance rule keys on it, so a session
+    /// must never change its mind mid-game.
+    finalized_drops_enabled: bool,
+    /// Slots whose drop is being (or has been) home-finalized here: admission
+    /// is refused while a slot is in this set, which is what makes the
+    /// finalization snapshot's ingress cut real. Populated only on the
+    /// slot's home relay. An entry is removed again only when a finalization
+    /// attempt fails to produce a count (so a later reconnect can still
+    /// resume); a successful finalization's decided leave then refuses
+    /// readmission on its own.
+    finalizing_drops: HashSet<SlotId>,
     /// Whether this relay has already reported its own closure for the session
     /// (the `SessionClosed` notice the coordinator's all-relays-closed
     /// retirement counts). The session-emptied close can be evaluated from
@@ -1698,6 +1712,10 @@ pub struct DepartureStamps {
     /// number of its turns any client can ever consume (see
     /// `Departure::final_turn_count`).
     pub final_turn_count: Option<u64>,
+    /// Whether `final_turn_count` on a DROPPED departure was derived through
+    /// home-side finalization (see [`finalize_drop`]) — the proof every count
+    /// ingress requires before accepting a dropped count.
+    pub finalized: bool,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -1746,6 +1764,13 @@ struct Departure {
     /// when authored by a sender that predates the field, or by a home with no
     /// gap-free knowledge to answer from.
     final_turn_count: Option<u64>,
+    /// Whether `final_turn_count` on a DROPPED departure carries the
+    /// finalization proof: the home marked the slot's generation terminal
+    /// (refusing future admission and fencing its turn ingress) and only then
+    /// snapshotted the count, so nothing past it can ever enter the mesh.
+    /// Sticky across merges — once proven, proven. Without it a dropped
+    /// record's count is never emitted (see `commit_leave`).
+    finalized: bool,
     /// Physical connection generation that authored this departure. Stored on
     /// the record itself so Join-time reconciliation cannot accidentally stamp
     /// it with a newer generation from mutable live-link state.
@@ -2814,6 +2839,8 @@ impl DecisionMaker {
             live_slots: HashSet::new(),
             started: false,
             resumed: false,
+            finalized_drops_enabled: false,
+            finalizing_drops: HashSet::new(),
             close_reported: false,
             own_relay_id: None,
             latency_hint_ms: None,
@@ -3487,6 +3514,17 @@ impl DecisionMaker {
                 consume_hold: hold_pending,
             };
         }
+        // A drop mid-finalization is terminal-in-progress: the home has
+        // sealed the generation and is snapshotting (or has snapshotted) the
+        // count, and an admission here would push turns past it. Refuse
+        // without consuming the hold — if the finalization fails to produce a
+        // count, the mark is lifted and a later reconnect resumes normally.
+        if self.finalizing_drops.contains(&slot) {
+            return ReconnectTransition {
+                admission: ReconnectAdmission::Rejected,
+                consume_hold: false,
+            };
+        }
         if self.connection_activation(slot, observed) == ConnectionActivation::Rejected {
             return ReconnectTransition {
                 admission: ReconnectAdmission::Rejected,
@@ -4059,20 +4097,30 @@ impl DecisionMaker {
         // forever would strand everything keyed on its decision: the slot's
         // drop hold, and the session-emptied close waiting on it.
         self.next_leave_seq += 1;
+        // Same count gate as `commit_leave`: a clean leave on a never-rehomed
+        // session, or a home-finalized drop, may carry the exact count; any
+        // other dropped record's count (possibly authored by an older peer
+        // over the mesh) and a resumed session's clean count are unsound and
+        // must not ride a straggler reconnect's replayed directive.
+        let record = self.departures.get(&slot);
+        let finalized = reason == LEAVE_REASON_DROPPED
+            && record.is_some_and(|d| d.finalized && d.final_turn_count.is_some());
         let directive = LeaveDirective {
+            finalized,
             slot: u32::from(slot.0),
             reason,
             apply_at_frame: 0,
             leave_seq: self.next_leave_seq,
-            // Same count gate as `commit_leave`: only a clean leave on a
-            // never-rehomed session may carry the exact count. A dropped
-            // record's count (possibly authored by an older peer over the
-            // mesh) and a resumed session's are unsound and must not ride a
-            // straggler reconnect's replayed directive.
-            final_turn_count: if reason == LEAVE_REASON_DROPPED || self.resumed {
+            final_turn_count: if reason == LEAVE_REASON_DROPPED {
+                if finalized {
+                    record.and_then(|d| d.final_turn_count)
+                } else {
+                    None
+                }
+            } else if self.resumed {
                 None
             } else {
-                self.departures.get(&slot).and_then(|d| d.final_turn_count)
+                record.and_then(|d| d.final_turn_count)
             },
         };
         self.decided_leaves.insert(slot, directive);
@@ -4095,21 +4143,34 @@ impl DecisionMaker {
         // the departed slot's turns, and the frame below is only the fallback for
         // clients that predate the count.
         //
-        // Only a clean leave may carry it. A count is sound only when nothing
-        // past it can ever reach a client, and the clean-leave intent is the one
-        // origin where that is structural: the slot's home serve task — its
-        // single ingress — derives the count and stops forwarding in the same
-        // step, and a decided leave refuses readmission. A *dropped* slot's
-        // record has no such cut: the slot can be reconnecting (here or on
-        // another relay) while an honored drop request or abandon expiry
-        // decides this leave, pushing turns past the recorded count into the
-        // mesh — one survivor consumes such a turn before the directive
-        // arrives, another applies the leave first, and they diverge. Dropping
-        // the count degrades a drop to frame scheduling, which is benign for
-        // drops in practice: by the time one is honored, every survivor has
-        // long since consumed the identical forwarded prefix and stalled at
-        // the same point.
-        let final_turn_count = if reason == LEAVE_REASON_DROPPED || self.resumed {
+        // A count is sound only when its derivation and the slot's ingress cut
+        // are the same step, so that nothing past it can ever reach a client.
+        // Two origins have that: the clean-leave intent (the slot's home
+        // serve task — its single ingress — derives the count and stops
+        // forwarding in the same step, and a decided leave refuses
+        // readmission), and home-side drop **finalization** (the home seals
+        // the generation terminal — refusing admission and fencing its turn
+        // ingress — and only then snapshots the count; see [`finalize_drop`]).
+        // An UNFINALIZED dropped record has no cut: the slot can be
+        // reconnecting (here or on another relay) while an honored drop
+        // request or abandon expiry decides this leave, pushing turns past
+        // the recorded count into the mesh — one survivor consumes such a
+        // turn before the directive arrives, another applies the leave first,
+        // and they diverge. So an unfinalized drop degrades to frame
+        // scheduling. The `resumed` gate applies to clean-leave counts (a
+        // rehome splits the forwarding history the intent's cut covered); a
+        // finalized count is exempt — its soundness rests entirely on the
+        // home's own gap-free cursor, and a home without cursor continuity
+        // cannot finalize at all (`forwarded_count` is `None` there).
+        let finalized = reason == LEAVE_REASON_DROPPED
+            && record.is_some_and(|d| d.finalized && d.final_turn_count.is_some());
+        let final_turn_count = if reason == LEAVE_REASON_DROPPED {
+            if finalized {
+                record.and_then(|d| d.final_turn_count)
+            } else {
+                None
+            }
+        } else if self.resumed {
             None
         } else {
             record.and_then(|d| d.final_turn_count)
@@ -4126,6 +4187,7 @@ impl DecisionMaker {
         };
         self.next_leave_seq += 1;
         let directive = LeaveDirective {
+            finalized,
             slot: u32::from(slot.0),
             reason,
             apply_at_frame: base.saturating_add(1),
@@ -4246,11 +4308,13 @@ impl DecisionMaker {
     /// one past the current session frame (or 0 before any framed turn), which
     /// a survivor that already applied the leave dedups away by slot.
     ///
-    /// A **dropped** seed's count is discarded here regardless of what the
-    /// carrier holds: only a clean leave may carry an exact count (see
-    /// `commit_leave`), and the seed may have travelled through a coordinator
-    /// or peer running code that predates that rule, so the invariant is
-    /// re-enforced at this ingress rather than trusted from the wire.
+    /// A **dropped** seed's count is accepted only with the finalization
+    /// proof, and only in a session whose descriptor enables finalized drops
+    /// (see `commit_leave`); otherwise it is discarded here regardless of
+    /// what the carrier holds — the seed may have travelled through a
+    /// coordinator or peer running code that predates the
+    /// clean-leaves-or-finalized rule, so the invariant is re-enforced at
+    /// this ingress rather than trusted from the wire.
     ///
     /// Returns the seeded directive when this call newly decided the slot's
     /// leave — the copy the caller must fan to already-connected local
@@ -4262,10 +4326,13 @@ impl DecisionMaker {
         slot: SlotId,
         kind: DepartureKind,
         final_turn_count: Option<u64>,
+        finalized: bool,
     ) -> Option<LeaveDirective> {
+        let finalized =
+            matches!(kind, DepartureKind::Dropped) && finalized && self.finalized_drops_enabled;
         let final_turn_count = match kind {
-            DepartureKind::Dropped => None,
-            DepartureKind::Left => final_turn_count,
+            DepartureKind::Dropped if !finalized => None,
+            _ => final_turn_count,
         };
         let reason = match kind {
             DepartureKind::Dropped => LEAVE_REASON_DROPPED,
@@ -4275,6 +4342,7 @@ impl DecisionMaker {
             slot,
             DepartureStamps {
                 final_turn_count,
+                finalized,
                 ..DepartureStamps::default()
             },
             reason,
@@ -4286,6 +4354,7 @@ impl DecisionMaker {
         self.next_leave_seq += 1;
         let base = self.session_frame().map(|f| f.0).unwrap_or(0);
         let directive = LeaveDirective {
+            finalized: finalized && final_turn_count.is_some(),
             slot: u32::from(slot.0),
             reason,
             apply_at_frame: base.saturating_add(1),
@@ -4357,13 +4426,13 @@ impl DecisionMaker {
     #[must_use]
     pub fn observe_leave(&mut self, leave: &LeaveDirective) -> bool {
         use std::collections::hash_map::Entry;
-        // The cache must never hold a dropped leave's count, no matter which
-        // path delivered the directive — normalize here, where the state
-        // lives, in addition to the wire ingress (see
+        // The cache must never hold an unproven dropped count, no matter
+        // which path delivered the directive — normalize here, where the
+        // state lives, in addition to the wire ingress (see
         // [`normalize_observed_leave`]). Normalizing before the substance
         // comparison below also keeps two relays convergent when only one of
         // them saw the legacy count.
-        let leave = &normalize_observed_leave(leave);
+        let leave = &normalize_observed_leave(leave, self.finalized_drops_enabled);
         let Ok(slot) = u8::try_from(leave.slot).map(SlotId) else {
             // A slot id past `u8` range can't name any real slot; a silent
             // truncation would alias it onto a valid one. Drop it (defensive —
@@ -4551,6 +4620,7 @@ impl DecisionMaker {
                         reachable_frame: departure.reachable_frame,
                         result: departure.result.clone(),
                         final_turn_count: departure.final_turn_count,
+                        finalized: departure.finalized,
                     },
                     departure.reason,
                     departure.connection_epoch,
@@ -4608,6 +4678,7 @@ impl DecisionMaker {
             reachable_frame: reachable,
             result,
             final_turn_count,
+            finalized,
         } = stamps;
         use std::collections::hash_map::Entry;
         let result = result.filter(|echo| {
@@ -4657,6 +4728,7 @@ impl DecisionMaker {
                 record.reachable_frame = record.reachable_frame.or(reachable);
                 record.result = record.result.take().or(result);
                 record.final_turn_count = record.final_turn_count.or(final_turn_count);
+                record.finalized |= finalized;
                 record.connection_epoch = record.connection_epoch.or(connection_epoch);
             }
             Entry::Vacant(vacant) => {
@@ -4667,6 +4739,7 @@ impl DecisionMaker {
                     result,
                     reason,
                     final_turn_count,
+                    finalized,
                     connection_epoch,
                 });
             }
@@ -4927,6 +5000,21 @@ impl DecisionMaker {
     /// [`slot_homed`] at client admission.
     fn admits_slot(&self, slot: SlotId) -> bool {
         self.homed_slots.is_empty() || self.homed_slots.contains(&slot)
+    }
+
+    /// Whether the descriptor strictly homes `slot` here — see the free
+    /// [`slot_strictly_homed`] for why this, unlike `admits_slot`, never
+    /// fails open on an empty set.
+    fn strictly_homes(&self, slot: SlotId) -> bool {
+        self.homed_slots.contains(&slot)
+    }
+
+    /// Whether `slot` currently has a live (Up) connection generation.
+    fn connection_is_up(&self, slot: SlotId) -> bool {
+        matches!(
+            self.connection_states.get(&slot),
+            Some(ConnectionState::Up(_))
+        )
     }
 
     /// Records that `slot` is present — registered on some relay serving the
@@ -5481,6 +5569,7 @@ fn departure_notice(
     let slot = SlotId(leave.slot as u8);
     let refs = registry.session_refs(key);
     DepartureNotice {
+        finalized: leave.finalized,
         tenant: key.tenant.clone(),
         session: key.session,
         slot,
@@ -5619,6 +5708,10 @@ fn now_ms() -> u64 {
 /// reconciliation at registration and would otherwise never hear a seeded
 /// departure, stalling forever on the departed slot's turns. Deduplicated by
 /// slot (receivers dedup again regardless).
+/// `finalized_drops` is the descriptor's immutable per-session flag enabling
+/// the home-side drop-finalization handshake. Latched at maker creation; a
+/// re-push that disagrees is ignored with a warning — every count-acceptance
+/// rule keys on the flag, so a session must never change its mind mid-game.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn sync_maker(
@@ -5631,6 +5724,7 @@ pub fn sync_maker(
     homed_slots: HashSet<SlotId>,
     held_slots: HashSet<SlotId>,
     resumed_departed: Option<&[DepartedSlot]>,
+    finalized_drops: bool,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
     let seed = |maker: &mut DecisionMaker| -> Vec<LeaveDirective> {
@@ -5639,7 +5733,7 @@ pub fn sync_maker(
         };
         let seeded = departed
             .iter()
-            .filter_map(|d| maker.seed_departed(d.slot, d.kind, d.final_turn_count))
+            .filter_map(|d| maker.seed_departed(d.slot, d.kind, d.final_turn_count, d.finalized))
             .collect();
         // Latch the session started, so a resumed relay never waits on the
         // full expected set (which still lists the departed slots that will
@@ -5658,6 +5752,18 @@ pub fn sync_maker(
                 maker.set_observers(observers);
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
+                if maker.finalized_drops_enabled != finalized_drops {
+                    // Immutable for the session's lifetime: the create-time
+                    // value stands, since every count-acceptance decision
+                    // already keyed on it.
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = key.session.0,
+                        latched = maker.finalized_drops_enabled,
+                        pushed = finalized_drops,
+                        "descriptor re-push disagrees on finalized_drops; keeping the latched value",
+                    );
+                }
                 let seeded = seed(maker);
                 let (leaves, fresh) = maker.sync(bounds, authority, &held_slots);
                 (leaves, fresh, seeded)
@@ -5674,9 +5780,11 @@ pub fn sync_maker(
                 // creation — a maker created by this descriptor starts with
                 // them, so a single-relay session (one push, before any
                 // client dials) never loses them, exactly as the observer set
-                // is seeded above.
+                // is seeded above. The finalized-drops flag latches the same
+                // way, and only here (immutable thereafter).
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
+                maker.finalized_drops_enabled = finalized_drops;
                 let seeded = seed(maker);
                 (Vec::new(), Vec::new(), seeded)
             }
@@ -6206,23 +6314,34 @@ pub fn slot_leave_decided(registry: &DecisionMakers, key: &SessionKey, slot: Slo
         .is_some_and(|maker| maker.decided_leaves.contains_key(&slot))
 }
 
-/// Normalizes a leave directive observed from the wire: only a clean leave may
-/// carry an exact `final_turn_count`, so a **dropped** directive's count is
-/// stripped before the directive is compared, cached, recorded, or fanned any
-/// further. A count on a dropped directive means the authoring relay ran code
-/// predating the clean-leaves-only rule; because a `LeaveDirective` can outrun
-/// its matching `SlotDeparted` across peer links, this ingress must sanitize
-/// for itself rather than rely on the departure-record sanitizers.
-pub fn normalize_observed_leave(leave: &LeaveDirective) -> LeaveDirective {
-    if leave.reason == LEAVE_REASON_DROPPED && leave.final_turn_count.is_some() {
+/// Normalizes a leave directive observed from the wire: a **dropped**
+/// directive's `final_turn_count` is accepted only with the finalization
+/// proof (`finalized`), and only when `finalized_drops_enabled` — the
+/// session's descriptor flag — says this session runs the handshake at all.
+/// Anything else is stripped (proof flag included) before the directive is
+/// compared, cached, recorded, or fanned any further: an unproven count means
+/// the authoring relay ran code predating the clean-leaves-or-finalized rule,
+/// and because a `LeaveDirective` can outrun its matching `SlotDeparted`
+/// across peer links, this ingress must sanitize for itself rather than rely
+/// on the departure-record sanitizers.
+pub fn normalize_observed_leave(
+    leave: &LeaveDirective,
+    finalized_drops_enabled: bool,
+) -> LeaveDirective {
+    if leave.reason == LEAVE_REASON_DROPPED
+        && (leave.final_turn_count.is_some() || leave.finalized)
+        && !(leave.finalized && finalized_drops_enabled)
+    {
         tracing::debug!(
             slot = leave.slot,
             leave_seq = leave.leave_seq,
             stripped_count = ?leave.final_turn_count,
-            "stripping a legacy dropped leave's final turn count at ingress",
+            finalized = leave.finalized,
+            "stripping an unproven dropped leave's final turn count at ingress",
         );
         return LeaveDirective {
             final_turn_count: None,
+            finalized: false,
             ..*leave
         };
     }
@@ -6250,17 +6369,21 @@ pub fn normalize_observed_leave(leave: &LeaveDirective) -> LeaveDirective {
 #[must_use]
 pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveDirective) -> bool {
     // Normalize before the notice below, not just inside the maker's cache:
-    // the departure notice must describe the sanitized directive, never a
-    // legacy count the coordinator would retain and re-seed on a rehome.
-    let leave = normalize_observed_leave(leave);
-    let inserted = match registry.lock().get_mut(key) {
-        Some(maker) => maker.observe_leave(&leave),
-        None => false,
+    // the departure notice must describe the sanitized directive, never an
+    // unproven count the coordinator would retain and re-seed on a rehome.
+    let leave = {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return false;
+        };
+        let leave = normalize_observed_leave(leave, maker.finalized_drops_enabled);
+        if !maker.observe_leave(&leave) {
+            return false;
+        }
+        leave
     };
-    if inserted {
-        registry.notify_departure(departure_notice(registry, key, &leave));
-    }
-    inserted
+    registry.notify_departure(departure_notice(registry, key, &leave));
+    true
 }
 
 /// The last game frame observed on `slot`'s validated turns for the session, if
@@ -6696,6 +6819,125 @@ pub fn claim_close_report_with_maker(registry: &DecisionMakers, key: &SessionKey
         .lock()
         .get_mut(key)
         .is_some_and(DecisionMaker::claim_close_report)
+}
+
+/// Whether `key`'s session runs the home-side drop-finalization handshake —
+/// the descriptor's immutable `finalized_drops` flag, latched at maker
+/// creation. `false` when no maker exists.
+pub fn finalized_drops_enabled(registry: &DecisionMakers, key: &SessionKey) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.finalized_drops_enabled)
+}
+
+/// Whether the descriptor **strictly** homes `slot` on this relay: the homed
+/// set is non-empty and names the slot. Unlike [`slot_homed`] (the admission
+/// gate, which fails open on an empty/legacy set), this never fails open —
+/// it selects the one relay that answers a `FinalizeDrop`, and an open
+/// fallback would have every session relay finalize with its own (different)
+/// cursor.
+pub fn slot_strictly_homed(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.strictly_homes(slot))
+}
+
+/// The home-side outcome of a drop finalization (see [`finalize_drop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The slot's generation is sealed terminal and `final_turn_count` is its
+    /// gap-free forwarded count — the authority may decide the leave with it.
+    Finalized {
+        /// The sealed count.
+        final_turn_count: u64,
+    },
+    /// The slot has a live (reconnected) generation — the drop must not be
+    /// decided; the game continues with the slot present.
+    RejectedLive,
+    /// This relay holds no gap-free forwarded prefix for the slot (a
+    /// collapsed sparse window, a post-rehome home with no cursor
+    /// continuity, or no maker at all). The drop stays undecided — never a
+    /// frame-scheduled fallback, which is exactly the unsoundness
+    /// finalization exists to remove.
+    RejectedNoCursor,
+}
+
+/// Home-side drop finalization: atomically (against admission) verifies the
+/// slot has no live connection generation, seals future admission
+/// terminally-in-progress, and only then snapshots the slot's gap-free
+/// forwarded count through `read_cursor` (the caller passes this relay's
+/// session-level forward-gate cursor read). On success the count is stamped
+/// into the departure record with the finalization proof, so the leave the
+/// authority then decides carries it (see `commit_leave`); on
+/// [`RejectedNoCursor`](FinalizeOutcome::RejectedNoCursor) the seal is lifted
+/// again so a later reconnect can still resume the slot.
+///
+/// Idempotent: a re-request after the leave was already decided returns the
+/// decided directive's finalized count (or `RejectedLive` when the slot was
+/// decided without one — nothing here may ever contradict a decided leave).
+/// The snapshot is stable between the seal and the read because the slot has
+/// no live link (checked under the same maker lock that admission uses) and
+/// the seal refuses any new one; the slot's own home is the only ingress
+/// that feeds its cursor.
+pub fn finalize_drop(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    read_cursor: impl FnOnce() -> Option<u64>,
+) -> FinalizeOutcome {
+    {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return FinalizeOutcome::RejectedNoCursor;
+        };
+        if let Some(decided) = maker.decided_leaves.get(&slot) {
+            return match (decided.finalized, decided.final_turn_count) {
+                (true, Some(final_turn_count)) => FinalizeOutcome::Finalized { final_turn_count },
+                _ => FinalizeOutcome::RejectedLive,
+            };
+        }
+        if maker.connection_is_up(slot) {
+            return FinalizeOutcome::RejectedLive;
+        }
+        maker.finalizing_drops.insert(slot);
+    }
+    let count = read_cursor();
+    let mut makers = registry.lock();
+    let Some(maker) = makers.get_mut(key) else {
+        return FinalizeOutcome::RejectedNoCursor;
+    };
+    match count {
+        Some(final_turn_count) => {
+            maker.note_departure(
+                slot,
+                DepartureStamps {
+                    final_turn_count: Some(final_turn_count),
+                    finalized: true,
+                    ..DepartureStamps::default()
+                },
+                LEAVE_REASON_DROPPED,
+                None,
+            );
+            FinalizeOutcome::Finalized { final_turn_count }
+        }
+        None => {
+            maker.finalizing_drops.remove(&slot);
+            FinalizeOutcome::RejectedNoCursor
+        }
+    }
+}
+
+/// The connection generation recorded on `slot`'s departure, if any — echoed
+/// into a `FinalizeDrop` so the home's answer is correlatable. `None` for a
+/// legacy-mode departure (or no record/maker).
+pub fn departure_epoch(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> Option<u64> {
+    registry
+        .lock()
+        .get(key)
+        .and_then(|maker| maker.departures.get(&slot))
+        .and_then(|d| d.connection_epoch)
 }
 
 /// Whether a decision-maker exists for `key` — that is, whether a descriptor
@@ -7444,7 +7686,7 @@ mod tests {
         // re-report a departure the mesh already reported.
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, None, false);
         assert!(
             !maker.has_undecided_departure(),
             "a seeded departure is already decided, never left undecided",
@@ -7473,8 +7715,8 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, None);
-        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, None, false);
+        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None, false);
         assert_eq!(maker.decided_leaves[&SlotId(1)].reason, LEAVE_REASON_LEFT);
         assert_eq!(
             maker.decided_leaves[&SlotId(2)].reason,
@@ -7492,8 +7734,8 @@ mod tests {
     fn seed_departed_carries_the_original_directives_final_turn_count() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312));
-        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312), false);
+        let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None, false);
         assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, Some(312),);
         assert_eq!(maker.decided_leaves[&SlotId(2)].final_turn_count, None);
         // A promotion re-broadcasts the seeded directive verbatim, count included.
@@ -7513,7 +7755,7 @@ mod tests {
     fn seed_departed_strips_a_dropped_seeds_count() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, Some(99));
+        let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, Some(99), false);
         assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, None);
     }
 
@@ -7524,13 +7766,13 @@ mod tests {
     fn seed_departed_returns_the_newly_decided_directive_exactly_once() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        let first = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7));
+        let first = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7), false);
         assert_eq!(
             first.map(|l| (l.slot, l.final_turn_count)),
             Some((1, Some(7)))
         );
         assert_eq!(
-            maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7)),
+            maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7), false),
             None,
             "a replayed seed decides nothing new",
         );
@@ -7548,6 +7790,7 @@ mod tests {
         let registry = new_decision_makers();
         let k = key();
         let departed = [DepartedSlot {
+            finalized: false,
             slot: SlotId(2),
             kind: DepartureKind::Left,
             final_turn_count: Some(41),
@@ -7562,6 +7805,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             Some(&departed),
+            false,
         );
         assert!(
             leaves
@@ -7591,6 +7835,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             Some(&departed),
+            false,
         );
         assert!(
             replayed.iter().all(|l| l.slot != 2),
@@ -7616,10 +7861,12 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(!registry.lock().get(&k).unwrap().resumed);
 
         let departed = [DepartedSlot {
+            finalized: false,
             slot: SlotId(3),
             kind: DepartureKind::Dropped,
             final_turn_count: None,
@@ -7634,6 +7881,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             Some(&departed),
+            false,
         );
         assert!(
             leaves
@@ -7642,6 +7890,241 @@ mod tests {
             "the newly seeded dropped leave is in the broadcast batch",
         );
         assert!(registry.lock().get(&k).unwrap().resumed);
+    }
+
+    /// A registry whose maker runs the finalized-drop handshake, is the
+    /// authority, and strictly homes the given slots, with framed history so
+    /// a decide has a basis.
+    fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
+        let registry = new_decision_makers();
+        let _ = sync_maker(
+            &registry,
+            k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            homed.iter().map(|&s| SlotId(s)).collect(),
+            HashSet::new(),
+            None,
+            true,
+        );
+        observe_frame(&registry, k, SlotId(0), GameFrameCount(40));
+        observe_frame(&registry, k, SlotId(1), GameFrameCount(50));
+        registry
+    }
+
+    /// The full home-side finalization: the seal lands, the count stamps the
+    /// record with its proof, the decided leave carries both, and the sealed
+    /// slot refuses readmission.
+    #[test]
+    fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
+
+        let outcome = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        assert_eq!(
+            outcome,
+            FinalizeOutcome::Finalized {
+                final_turn_count: 42
+            },
+        );
+        assert!(
+            registry
+                .lock()
+                .get(&k)
+                .unwrap()
+                .finalizing_drops
+                .contains(&SlotId(1)),
+            "the admission seal stays after a successful finalization",
+        );
+
+        let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("the authority decides");
+        assert_eq!(
+            leave.final_turn_count,
+            Some(42),
+            "a finalized drop's leave carries the sealed count",
+        );
+        assert!(leave.finalized, "and the proof rides the directive");
+    }
+
+    /// A live (reconnected) generation rejects finalization: the game
+    /// continues with the slot present, and nothing is sealed.
+    #[test]
+    fn finalize_drop_rejects_a_live_generation() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        assert!(activate_connection_epoch(&registry, &k, SlotId(1), 7));
+
+        let outcome = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        assert_eq!(outcome, FinalizeOutcome::RejectedLive);
+        assert!(
+            !registry
+                .lock()
+                .get(&k)
+                .unwrap()
+                .finalizing_drops
+                .contains(&SlotId(1)),
+            "a rejected finalization seals nothing",
+        );
+    }
+
+    /// No gap-free cursor fails closed — and lifts the admission seal again,
+    /// so a later reconnect (or a later finalization, once a cursor exists)
+    /// still works.
+    #[test]
+    fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
+
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), || None),
+            FinalizeOutcome::RejectedNoCursor,
+        );
+        assert!(
+            !registry
+                .lock()
+                .get(&k)
+                .unwrap()
+                .finalizing_drops
+                .contains(&SlotId(1)),
+            "a failed finalization lifts the seal",
+        );
+        // A retry with a cursor succeeds.
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), || Some(7)),
+            FinalizeOutcome::Finalized {
+                final_turn_count: 7
+            },
+        );
+    }
+
+    /// A re-request after the leave is decided is answered from the decided
+    /// directive — idempotent, never a second, different seal.
+    #[test]
+    fn finalize_drop_is_idempotent_after_the_decide() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
+        let _ = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        let _ = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
+
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), || Some(999)),
+            FinalizeOutcome::Finalized {
+                final_turn_count: 42
+            },
+            "the decided directive's count answers a replayed request",
+        );
+    }
+
+    /// The normalization matrix for observed dropped counts: kept only with
+    /// the proof AND the session feature; stripped (flag included) otherwise.
+    #[test]
+    fn normalize_keeps_only_proven_counts_in_enabled_sessions() {
+        let proven = LeaveDirective {
+            finalized: true,
+            slot: 3,
+            reason: DROPPED,
+            apply_at_frame: 51,
+            leave_seq: 4,
+            final_turn_count: Some(120),
+        };
+        assert_eq!(
+            normalize_observed_leave(&proven, true),
+            proven,
+            "a proven count in an enabled session passes through",
+        );
+
+        let stripped = normalize_observed_leave(&proven, false);
+        assert_eq!(stripped.final_turn_count, None);
+        assert!(
+            !stripped.finalized,
+            "a disabled session strips the proof too"
+        );
+
+        let unproven = LeaveDirective {
+            finalized: false,
+            ..proven
+        };
+        let stripped = normalize_observed_leave(&unproven, true);
+        assert_eq!(
+            stripped.final_turn_count, None,
+            "an unproven count is stripped even in an enabled session",
+        );
+    }
+
+    /// A finalized dropped seed keeps its count in an enabled session, and is
+    /// stripped everywhere else.
+    #[test]
+    fn a_finalized_dropped_seed_keeps_its_count_only_when_enabled() {
+        let mut enabled =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        enabled.finalized_drops_enabled = true;
+        let seeded = enabled
+            .seed_departed(SlotId(1), DepartureKind::Dropped, Some(9), true)
+            .expect("newly decided");
+        assert_eq!(seeded.final_turn_count, Some(9));
+        assert!(seeded.finalized);
+
+        let _ = enabled.seed_departed(SlotId(2), DepartureKind::Dropped, Some(9), false);
+        assert_eq!(
+            enabled.decided_leaves[&SlotId(2)].final_turn_count,
+            None,
+            "an unproven dropped seed is stripped even when enabled",
+        );
+
+        let mut disabled =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let _ = disabled.seed_departed(SlotId(1), DepartureKind::Dropped, Some(9), true);
+        assert_eq!(
+            disabled.decided_leaves[&SlotId(1)].final_turn_count,
+            None,
+            "a disabled session strips even a proven dropped seed",
+        );
+    }
+
+    /// The `resumed` gate does not strip a finalized drop's count: its
+    /// soundness rests on the home's own gap-free cursor (a home without
+    /// cursor continuity cannot finalize at all), not on the pre-rehome
+    /// forwarding history the clean-leave gate protects.
+    #[test]
+    fn a_finalized_count_survives_a_resumed_session() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        registry.lock().get_mut(&k).unwrap().resumed = true;
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
+        let _ = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+
+        let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
+        assert_eq!(leave.final_turn_count, Some(42));
+        assert!(leave.finalized);
     }
 
     /// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.
@@ -10285,6 +10768,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         {
             let makers = registry.lock();
@@ -10305,6 +10789,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -10338,6 +10823,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         consensus_observe_and_hold(&registry, &k);
 
@@ -10355,6 +10841,7 @@ mod tests {
             HashSet::new(),
             held_slots,
             None,
+            false,
         );
         assert!(
             leaves.is_empty(),
@@ -10401,6 +10888,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         {
             let mut makers = registry.lock();
@@ -10419,6 +10907,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert_eq!(
             active_directive(&registry, &k),
@@ -10447,6 +10936,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(registry.lock().contains_key(&k));
         deregister_maker(&registry, &k);
@@ -10488,6 +10978,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10531,11 +11022,13 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
 
         let leave = LeaveDirective {
+            finalized: false,
             slot: 2,
             reason: 3,
             apply_at_frame: 90,
@@ -10581,6 +11074,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -10615,6 +11109,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         record_departure(
@@ -10670,6 +11165,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -10707,6 +11203,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         registry.set_session_refs(
@@ -10740,6 +11237,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         registry.set_session_refs(
@@ -10749,6 +11247,7 @@ mod tests {
         );
 
         let leave = LeaveDirective {
+            finalized: false,
             slot: 2,
             reason: DROPPED,
             apply_at_frame: 88,
@@ -10783,6 +11282,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         registry.set_session_refs(
             &k,
@@ -10827,6 +11327,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
@@ -10866,6 +11367,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10916,6 +11418,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10963,6 +11466,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -10991,6 +11495,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -11028,6 +11533,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -11079,6 +11585,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -11132,6 +11639,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
@@ -11164,6 +11672,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
@@ -11316,6 +11825,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         registry.flight_recorder().record(
             &k,
@@ -11358,6 +11868,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         registry.set_session_refs(
@@ -11391,6 +11902,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -11622,6 +12134,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
         let directive = LeaveDirective {
+            finalized: false,
             slot: 2,
             reason: LEAVE_REASON_LEFT,
             apply_at_frame: 116,
@@ -12302,6 +12815,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let observed = LeaveDirective {
+            finalized: false,
             slot: 2,
             reason: DROPPED,
             apply_at_frame: 88,
@@ -12366,6 +12880,7 @@ mod tests {
             }
 
             let leave = LeaveDirective {
+                finalized: false,
                 slot: 0,
                 reason: DROPPED,
                 apply_at_frame: 41,
@@ -12433,6 +12948,7 @@ mod tests {
             &makers,
             &session,
             &LeaveDirective {
+                finalized: false,
                 slot: 0,
                 reason: DROPPED,
                 apply_at_frame: 41,
@@ -12493,6 +13009,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let first = LeaveDirective {
+            finalized: false,
             slot: 3,
             reason: DROPPED,
             apply_at_frame: 51,
@@ -12537,6 +13054,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let first = LeaveDirective {
+            finalized: false,
             slot: 3,
             reason: LEAVE_REASON_LEFT,
             apply_at_frame: 51,
@@ -12572,6 +13090,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         let legacy = LeaveDirective {
+            finalized: false,
             slot: 3,
             reason: DROPPED,
             apply_at_frame: 51,
@@ -12712,6 +13231,7 @@ mod tests {
             HashSet::new(), // empty homed_slots: unenforced
             HashSet::new(),
             None,
+            false,
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(slot_homed(&registry, &key(), SlotId(7)));
@@ -12733,6 +13253,7 @@ mod tests {
             [SlotId(0), SlotId(2)].into_iter().collect(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(
             slot_homed(&registry, &key(), SlotId(0)),
@@ -12767,6 +13288,7 @@ mod tests {
             [SlotId(0)].into_iter().collect(),
             HashSet::new(),
             None,
+            false,
         );
         let held_both: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
 
@@ -12802,6 +13324,7 @@ mod tests {
             &registry,
             &k,
             &LeaveDirective {
+                finalized: false,
                 slot: 0,
                 reason: DROPPED,
                 apply_at_frame: 1,
@@ -12834,6 +13357,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
         assert!(!has_reconnectable_departure(&registry, &k, &held));
@@ -12897,6 +13421,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(claim_close_report(&registry, &k), "the first claim wins");
         assert!(
@@ -12926,6 +13451,7 @@ mod tests {
             [SlotId(0)].into_iter().collect(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(slot_homed(&registry, &key(), SlotId(0)));
         assert!(!slot_homed(&registry, &key(), SlotId(1)));
@@ -12942,6 +13468,7 @@ mod tests {
             [SlotId(1)].into_iter().collect(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(
             !slot_homed(&registry, &key(), SlotId(0)),
@@ -13101,6 +13628,7 @@ mod tests {
             DROPPED,
         );
         let leave = LeaveDirective {
+            finalized: false,
             slot: 1,
             reason: DROPPED,
             apply_at_frame: 51,
@@ -13362,6 +13890,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -13412,6 +13941,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         // No directive until the last expected slot completes the set.
@@ -13450,6 +13980,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -13474,6 +14005,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
 
         // Both expected slots register, but a peer relay never fires.
@@ -13506,6 +14038,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         // Slot 0 departs, retiring it from the live-slot set.
@@ -13539,6 +14072,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         assert!(!session_started(&registry, &k));
         mark_session_started(&registry, &k);
@@ -14341,6 +14875,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
             None,
+            false,
         );
         registry.set_session_refs(
             &k,
