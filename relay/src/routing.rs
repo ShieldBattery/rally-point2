@@ -1313,10 +1313,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -1342,10 +1339,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -1508,10 +1502,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -1546,10 +1537,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -1597,10 +1585,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -1626,10 +1611,7 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
-                final_turn_count_from(
-                    link.delivered_through(slot),
-                    first_invalid_seq,
-                ),
+                final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
             );
             return;
         }
@@ -2581,10 +2563,7 @@ pub async fn run_slot_link(
         slot,
         connection_epoch,
         leave_announced,
-        final_turn_count_from(
-            link.delivered_through(slot),
-            first_invalid_seq,
-        ),
+        final_turn_count_from(link.delivered_through(slot), first_invalid_seq),
     );
 }
 

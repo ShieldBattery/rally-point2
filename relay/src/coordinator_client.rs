@@ -2342,6 +2342,7 @@ mod tests {
             external_id: None,
             external_ref: None,
             result: None,
+            final_turn_count: None,
         }
     }
 

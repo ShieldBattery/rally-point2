@@ -905,6 +905,16 @@ pub struct DepartedSlot {
     pub slot: SlotId,
     /// The relay's left-vs-dropped classification for the departure.
     pub kind: DepartureKind,
+    /// The exact turn count the original leave directive carried
+    /// ([`DepartureNotice::final_turn_count`], retained by the coordinator), so
+    /// the fresh relay's seeded directive schedules the leave's application at
+    /// the same simulation step the original did — a survivor that never
+    /// received the original directive picks it up from the seeded one on
+    /// reconnect. `None` when the original carried no count (the seeded
+    /// directive then falls back to frame scheduling, like any count-less
+    /// leave) or the coordinator predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_turn_count: Option<u64>,
 }
 
 /// Identifies one session's descriptor within a relay's set — the `(tenant,
@@ -1550,6 +1560,17 @@ pub struct DepartureNotice {
     /// predates the field still interops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultEcho>,
+    /// The exact number of the slot's turns clients consume before applying its
+    /// leave, copied from the decided directive (the wire's
+    /// `LeaveDirective.final_turn_count`). Retained by the coordinator so a
+    /// rehome-rebuilt descriptor's [`DepartedSlot`] can hand a fresh relay the
+    /// same count the original directive carried — a survivor that never
+    /// received that directive must still apply the leave at the same
+    /// simulation step as the survivors that did. `None` when the directive
+    /// carried no count (the home relay had no delivery knowledge, or the
+    /// deciding relay predates counted leaves).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_turn_count: Option<u64>,
 }
 
 /// One slot the relay's desync comparator found on the losing side of a checksum
@@ -2668,6 +2689,7 @@ mod tests {
             departed_slots: vec![DepartedSlot {
                 slot: SlotId(2),
                 kind: DepartureKind::Dropped,
+                final_turn_count: Some(240),
             }],
             latency_estimate_ms: Some(30),
             relay_regions: vec![RelayRegionLabel {
@@ -2733,13 +2755,15 @@ mod tests {
     fn session_descriptor_with_rehome_fields_decodes_them() {
         // A rehome-rebuilt descriptor: `resumed` and the seeded departed slots
         // round-trip verbatim so a fresh relay taking over the session can seed
-        // its consensus with the already-decided departures.
+        // its consensus with the already-decided departures. One entry carries a
+        // final turn count, one omits it (a coordinator that recorded the
+        // departure before counted leaves) — both must decode.
         let json = r#"{
             "tenant":"sb-staging","session":42,
             "peers":[],
             "bounds":{"min":1,"max":6},
             "resumed":true,
-            "departed_slots":[{"slot":1,"kind":"left"},{"slot":3,"kind":"dropped"}]
+            "departed_slots":[{"slot":1,"kind":"left","final_turn_count":312},{"slot":3,"kind":"dropped"}]
         }"#;
         let back: SessionDescriptor = serde_json::from_str(json).unwrap();
         assert!(back.resumed);
@@ -2749,10 +2773,12 @@ mod tests {
                 DepartedSlot {
                     slot: SlotId(1),
                     kind: DepartureKind::Left,
+                    final_turn_count: Some(312),
                 },
                 DepartedSlot {
                     slot: SlotId(3),
                     kind: DepartureKind::Dropped,
+                    final_turn_count: None,
                 },
             ],
         );
@@ -3019,6 +3045,7 @@ mod tests {
                 session_frame: Some(4200),
                 slot_frame: Some(4242),
             }),
+            final_turn_count: Some(2100),
         };
         let message = RelayToCoordinator::Departure(notice.clone());
         let json = serde_json::to_string(&message).unwrap();
@@ -3049,6 +3076,10 @@ mod tests {
             notice.result.is_none(),
             "a departure from a relay that predates the embedded result decodes to None",
         );
+        assert!(
+            notice.final_turn_count.is_none(),
+            "a departure from a relay that predates counted leaves decodes to None",
+        );
     }
 
     #[test]
@@ -3063,6 +3094,7 @@ mod tests {
             external_id: None,
             external_ref: None,
             result: None,
+            final_turn_count: None,
         };
         let json = serde_json::to_string(&notice).unwrap();
         assert!(!json.contains("external_id"));
@@ -3070,6 +3102,10 @@ mod tests {
         assert!(
             !json.contains("result"),
             "an absent embedded result is omitted, not sent as null",
+        );
+        assert!(
+            !json.contains("final_turn_count"),
+            "an absent final turn count is omitted, not sent as null",
         );
     }
 

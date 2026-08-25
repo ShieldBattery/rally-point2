@@ -170,6 +170,17 @@ struct WebhookJob {
     kind: &'static str,
 }
 
+/// The retained data one departed slot's rehome seed carries — everything a
+/// [`DepartedSlot`] needs beyond the slot id itself, taken from the departure
+/// notice when the slot departed.
+#[derive(Debug, Clone, Copy)]
+struct DepartureSeed {
+    /// The relay's left-vs-dropped classification.
+    kind: DepartureKind,
+    /// The leave directive's exact turn count, `None` when it carried none.
+    final_turn_count: Option<u64>,
+}
+
 /// One session's lifecycle state.
 struct SessionState {
     /// The relays the coordinator assigned to serve the session — the distinct
@@ -185,15 +196,13 @@ struct SessionState {
     /// Player slots that have a result or a departure — the accounted set. Grows
     /// monotonically (a slot never un-accounts).
     accounted: HashSet<SlotId>,
-    /// Slots (player or observer) that have a departure record. The linger reap
-    /// closes the slots *not* in this set.
-    departed: HashSet<SlotId>,
-    /// Each departed slot's left-vs-dropped classification, retained so a
-    /// coordinator-mediated re-home can seed a fresh relay's consensus with the
-    /// already-decided departures ([`Lifecycle::departed_slots`]). Grows with
-    /// `departed`; the first classification for a slot wins (a slot never departs
-    /// twice with a different kind).
-    departed_kinds: HashMap<SlotId, DepartureKind>,
+    /// Slots (player or observer) that have a departure record, each with the
+    /// data a coordinator-mediated re-home seeds into a fresh relay's consensus
+    /// ([`Lifecycle::departed_slots`]): the left-vs-dropped classification and
+    /// the leave directive's exact turn count. The first record for a slot wins
+    /// (a slot never departs twice). The linger reap closes the slots *not* in
+    /// this map.
+    departures: HashMap<SlotId, DepartureSeed>,
     /// Serving relays that have reported `SessionClosed`, scoped to the control
     /// connection generation that supplied the terminal notice.
     closed_relays: HashMap<RelayId, u64>,
@@ -551,23 +560,28 @@ impl Lifecycle {
     }
 
     /// Records a slot's departure: accounts the slot (if a player), notes it
-    /// departed with its left-vs-dropped classification, and re-evaluates the reap
-    /// timers. The `kind` is retained so a coordinator-mediated re-home can seed a
-    /// fresh relay with the already-decided departure ([`departed_slots`](Self::departed_slots)).
+    /// departed with its left-vs-dropped classification and the leave's exact
+    /// turn count, and re-evaluates the reap timers. Both retained values are
+    /// what a coordinator-mediated re-home seeds into a fresh relay
+    /// ([`departed_slots`](Self::departed_slots)).
     pub fn on_departure(
         &self,
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
         kind: DepartureKind,
+        final_turn_count: Option<u64>,
     ) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
-        state.departed.insert(slot);
-        // First classification for a slot wins — a slot never departs twice.
-        state.departed_kinds.entry(slot).or_insert(kind);
+        // First record for a slot wins — a slot never departs twice, and every
+        // relay's copy of the same decided leave carries the same substance.
+        state.departures.entry(slot).or_insert(DepartureSeed {
+            kind,
+            final_turn_count,
+        });
         if state.player_slots.contains(&slot) {
             state.accounted.insert(slot);
         }
@@ -580,10 +594,12 @@ impl Lifecycle {
     }
 
     /// The slots this coordinator has recorded as departed for `session`, each
-    /// with its left-vs-dropped classification — the seed a coordinator-mediated
-    /// re-home carries in the rebuilt descriptors so a fresh relay's consensus
-    /// treats the departures as already decided. Empty for a session with no
-    /// recorded departures (or one this coordinator lifetime never registered).
+    /// with its left-vs-dropped classification and the leave's exact turn count
+    /// — the seed a coordinator-mediated re-home carries in the rebuilt
+    /// descriptors so a fresh relay's consensus treats the departures as
+    /// already decided (and schedules them at the count the original directive
+    /// carried). Empty for a session with no recorded departures (or one this
+    /// coordinator lifetime never registered).
     pub fn departed_slots(&self, tenant: &TenantId, session: SessionId) -> Vec<DepartedSlot> {
         self.inner
             .sessions
@@ -591,9 +607,13 @@ impl Lifecycle {
             .get(&(tenant.clone(), session))
             .map(|state| {
                 state
-                    .departed_kinds
+                    .departures
                     .iter()
-                    .map(|(&slot, &kind)| DepartedSlot { slot, kind })
+                    .map(|(&slot, seed)| DepartedSlot {
+                        slot,
+                        kind: seed.kind,
+                        final_turn_count: seed.final_turn_count,
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1233,8 +1253,7 @@ impl Lifecycle {
             player_slots: HashSet::new(),
             observer_slots: HashSet::new(),
             accounted: HashSet::new(),
-            departed: HashSet::new(),
-            departed_kinds: HashMap::new(),
+            departures: HashMap::new(),
             closed_relays: HashMap::new(),
             session_closed_enqueued: false,
             queue: tx,
@@ -1476,7 +1495,7 @@ impl Lifecycle {
             .player_slots
             .iter()
             .chain(state.observer_slots.iter())
-            .filter(|s| !state.departed.contains(s))
+            .filter(|s| !state.departures.contains_key(s))
             .copied()
             .collect();
         let relays = state.serving_relays.clone();
@@ -1795,7 +1814,7 @@ mod tests {
         );
 
         // Slot 0 accounts (departs); slot 1 is the lone holdout → holdout timer arms.
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped);
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None);
         assert!(reaps.try_recv().is_err(), "nothing closes before the grace");
         tokio::time::sleep(SHORT / 2).await;
         assert!(reaps.try_recv().is_err(), "still nothing mid-grace");
@@ -1822,14 +1841,55 @@ mod tests {
             HashSet::new(),
         );
 
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped); // arms holdout for slot 1
-        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped); // the holdout reports → disarm
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None); // arms holdout for slot 1
+        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None); // the holdout reports → disarm
 
         // Past the holdout grace, nothing was reaped (the linger grace is an hour).
         tokio::time::sleep(SHORT * 2).await;
         assert!(
             reaps.try_recv().is_err(),
             "a holdout that reports before the grace is not reaped",
+        );
+    }
+
+    /// A departure's retained rehome seed carries the leave directive's exact
+    /// turn count alongside the kind, and the first record for a slot wins —
+    /// every relay serving the session reports the same decided leave, so a
+    /// duplicate notice never rewrites what the first one recorded.
+    #[tokio::test]
+    async fn departed_slots_carry_the_final_turn_count_first_record_wins() {
+        let lc = Lifecycle::with_graces(bare_setup(), HOUR, HOUR, HOUR);
+        let s = SessionId(1);
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0), SlotId(1), SlotId(2)]),
+            HashSet::new(),
+        );
+
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Left, Some(312));
+        lc.on_departure(tid(), s, SlotId(1), DepartureKind::Dropped, None);
+        // A duplicate notice for slot 0 (another relay's copy of the same
+        // decided leave) never rewrites the first record.
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, Some(999));
+
+        let mut departed = lc.departed_slots(&tid(), s);
+        departed.sort_by_key(|d| d.slot.0);
+        assert_eq!(
+            departed,
+            vec![
+                DepartedSlot {
+                    slot: SlotId(0),
+                    kind: DepartureKind::Left,
+                    final_turn_count: Some(312),
+                },
+                DepartedSlot {
+                    slot: SlotId(1),
+                    kind: DepartureKind::Dropped,
+                    final_turn_count: None,
+                },
+            ],
         );
     }
 
@@ -2114,7 +2174,7 @@ mod tests {
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
         );
-        lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left);
+        lc.on_departure(tid(), b, SlotId(0), DepartureKind::Left, None);
 
         // A's sessionClosed fires once its never-started grace lapses, and its
         // lifecycle state (drain task included) is gone -- not left immortal.
@@ -2329,7 +2389,7 @@ mod tests {
         );
 
         // Arm and fire the holdout reap so a directive is pending for relay 1.
-        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped);
+        lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None);
         let mut rx = reaps.subscribe(RelayId(1));
         let directive = timeout(SHORT * 4, rx.recv())
             .await

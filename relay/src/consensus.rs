@@ -4173,18 +4173,37 @@ impl DecisionMaker {
     /// the free [`seed_departed`]). Records the departure — retiring the slot from
     /// the comparator, coverage, and live set — then caches a decided leave for it
     /// so a promotion re-broadcasts it verbatim rather than re-deriving it (which
-    /// would fire a redundant notice) or re-waiting on it. The leave's apply frame
-    /// is only cosmetic here — the survivors that carried into the rehome already
-    /// applied this leave on the old relay, and the client's `LeaveTracker` dedups a
-    /// re-broadcast by slot — so it is scheduled one past the current session frame
-    /// (or 0 before any framed turn). Idempotent: a slot already decided is left as
-    /// is.
-    pub fn seed_departed(&mut self, slot: SlotId, kind: DepartureKind) {
+    /// would fire a redundant notice) or re-waiting on it. Idempotent: a slot
+    /// already decided is left as is.
+    ///
+    /// `final_turn_count` is the count the original directive carried, retained
+    /// by the coordinator across the rehome, and it is **not** cosmetic: a
+    /// survivor that never received the original directive (its link was down
+    /// when the leave was decided, and it reconnected onto this fresh relay)
+    /// picks the leave up from this seeded copy via `leave_reconcile`, and must
+    /// apply it at the same consumption count every other survivor did. The
+    /// apply *frame* is only a fallback for a count-less seed — it is scheduled
+    /// one past the current session frame (or 0 before any framed turn), which
+    /// a survivor that already applied the leave dedups away by slot.
+    pub fn seed_departed(
+        &mut self,
+        slot: SlotId,
+        kind: DepartureKind,
+        final_turn_count: Option<u64>,
+    ) {
         let reason = match kind {
             DepartureKind::Dropped => LEAVE_REASON_DROPPED,
             DepartureKind::Left => LEAVE_REASON_LEFT,
         };
-        self.note_departure(slot, DepartureStamps::default(), reason, None);
+        self.note_departure(
+            slot,
+            DepartureStamps {
+                final_turn_count,
+                ..DepartureStamps::default()
+            },
+            reason,
+            None,
+        );
         if !self.decided_leaves.contains_key(&slot) {
             self.next_leave_seq += 1;
             let base = self.session_frame().map(|f| f.0).unwrap_or(0);
@@ -4193,9 +4212,7 @@ impl DecisionMaker {
                 reason,
                 apply_at_frame: base.saturating_add(1),
                 leave_seq: self.next_leave_seq,
-                // Cosmetic like the frame: the survivors that carried into the
-                // rehome already applied this leave on the old relay.
-                final_turn_count: None,
+                final_turn_count,
             };
             self.decided_leaves.insert(slot, directive);
         }
@@ -5381,6 +5398,9 @@ fn departure_notice(
         // makes the departure webhook atomic terminal truth; `None` proves the
         // slot departed without ever reporting.
         result: registry.departure_result(key, slot),
+        // The count clients schedule the leave's application by — carried so
+        // the coordinator can seed it back through a rehome's `DepartedSlot`.
+        final_turn_count: leave.final_turn_count,
     }
 }
 
@@ -5978,9 +5998,10 @@ pub fn seed_departed(
     key: &SessionKey,
     slot: SlotId,
     kind: DepartureKind,
+    final_turn_count: Option<u64>,
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.seed_departed(slot, kind);
+        maker.seed_departed(slot, kind, final_turn_count);
     }
 }
 
@@ -7185,7 +7206,7 @@ mod tests {
         // re-report a departure the mesh already reported.
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        maker.seed_departed(SlotId(1), DepartureKind::Dropped);
+        maker.seed_departed(SlotId(1), DepartureKind::Dropped, None);
         assert!(
             !maker.has_undecided_departure(),
             "a seeded departure is already decided, never left undecided",
@@ -7214,12 +7235,35 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        maker.seed_departed(SlotId(1), DepartureKind::Left);
-        maker.seed_departed(SlotId(2), DepartureKind::Dropped);
+        maker.seed_departed(SlotId(1), DepartureKind::Left, None);
+        maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
         assert_eq!(maker.decided_leaves[&SlotId(1)].reason, LEAVE_REASON_LEFT);
         assert_eq!(
             maker.decided_leaves[&SlotId(2)].reason,
             LEAVE_REASON_DROPPED
+        );
+    }
+
+    /// The coordinator-retained final turn count survives into the seeded
+    /// directive: a survivor that never received the original directive picks
+    /// the leave up from this seeded copy on reconnect (`leave_reconcile`), and
+    /// must schedule its application at the same consumption count every other
+    /// survivor used — the count is not cosmetic the way the seeded apply
+    /// frame is. A count-less seed stays count-less (frame fallback).
+    #[test]
+    fn seed_departed_carries_the_original_directives_final_turn_count() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312));
+        maker.seed_departed(SlotId(2), DepartureKind::Dropped, None);
+        assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, Some(312),);
+        assert_eq!(maker.decided_leaves[&SlotId(2)].final_turn_count, None);
+        // A promotion re-broadcasts the seeded directive verbatim, count included.
+        let (all, _) = maker.set_authority(Authority::SelfRelay, &HashSet::new());
+        assert!(
+            all.iter()
+                .any(|l| l.slot == 1 && l.final_turn_count == Some(312)),
+            "the re-broadcast seeded leave keeps the original count",
         );
     }
 

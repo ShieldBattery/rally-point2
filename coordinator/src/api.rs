@@ -2549,6 +2549,7 @@ fn note_inbound(
                 notice.session,
                 notice.slot,
                 notice.kind,
+                notice.final_turn_count,
             );
             notify::handle_departure(setup, &notices.departures, lifecycle, notice);
             InboundAction::None

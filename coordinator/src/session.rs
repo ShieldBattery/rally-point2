@@ -3600,6 +3600,7 @@ mod tests {
         let departed = vec![DepartedSlot {
             slot: SlotId(0),
             kind: DepartureKind::Dropped,
+            final_turn_count: None,
         }];
         let RehomeOutcome::NewTarget(endpoint) =
             rehome(&setup, &tid(), resp.session, RelayId(1), departed.clone())
@@ -3823,6 +3824,7 @@ mod tests {
         let departed = vec![DepartedSlot {
             slot: SlotId(0),
             kind: DepartureKind::Dropped,
+            final_turn_count: None,
         }];
         let RehomeOutcome::NewTarget(endpoint) =
             rehome(&setup, &tid(), resp.session, RelayId(5), departed.clone())
@@ -3964,6 +3966,7 @@ mod tests {
                 vec![DepartedSlot {
                     slot: SlotId(0),
                     kind: DepartureKind::Dropped,
+                    final_turn_count: None,
                 }],
             ),
             RehomeOutcome::Unavailable,

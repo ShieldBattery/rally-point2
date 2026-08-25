@@ -428,7 +428,13 @@ impl MeshControl {
         // re-fires the session-start machinery session-wide.
         if descriptor.resumed {
             for departed in &descriptor.departed_slots {
-                consensus::seed_departed(&self.decision_makers, &key, departed.slot, departed.kind);
+                consensus::seed_departed(
+                    &self.decision_makers,
+                    &key,
+                    departed.slot,
+                    departed.kind,
+                    departed.final_turn_count,
+                );
             }
             consensus::mark_session_started(&self.decision_makers, &key);
             self.decision_makers.flight_recorder().record(
@@ -1231,6 +1237,7 @@ mod tests {
         desc.departed_slots = vec![DepartedSlot {
             slot: SlotId(1),
             kind: DepartureKind::Dropped,
+            final_turn_count: Some(240),
         }];
         control.apply_descriptor(&desc);
 
@@ -1250,6 +1257,14 @@ mod tests {
                 "the seeded departure is recorded as already decided",
             );
         }
+        let (_, directives) = consensus::leave_reconcile(&makers, &key(1));
+        assert!(
+            directives
+                .iter()
+                .any(|l| l.slot == 1 && l.final_turn_count == Some(240)),
+            "the seeded directive a reconnecting survivor replays carries the \
+             coordinator-retained count",
+        );
 
         // Because the session is already started, a slot registering does not fire a
         // fresh session-wide start (the authority never re-covers the expected set).
@@ -1423,6 +1438,7 @@ mod tests {
         desc.departed_slots = vec![DepartedSlot {
             slot: SlotId(1),
             kind: DepartureKind::Dropped,
+            final_turn_count: None,
         }];
         control.apply_descriptor(&desc);
 
