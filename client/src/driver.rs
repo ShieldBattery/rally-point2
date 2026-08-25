@@ -3886,6 +3886,7 @@ mod tests {
                     reason: 0,
                     apply_at_frame: 0,
                     leave_seq: i + 1,
+                    final_turn_count: None,
                 },
             )
             .await

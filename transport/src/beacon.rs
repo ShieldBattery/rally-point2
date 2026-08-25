@@ -130,7 +130,7 @@ impl BeaconWriter {
         // The buffer contains only frames produced by `encode_frame` above, so
         // every chunk has the exact valid width. Decode after the successful
         // write so a failed write cannot advance `last_sent` prematurely.
-        for frame in self.write_buf.chunks_exact(beacon::BEACON_FRAME_LEN) {
+        for frame in self.write_buf.as_chunks::<{ beacon::BEACON_FRAME_LEN }>().0 {
             let (slot, cursor) = beacon::decode_frame(frame)
                 .expect("BeaconWriter only buffers frames produced by encode_frame");
             self.last_sent.insert(slot, cursor);

@@ -264,6 +264,7 @@ mod tests {
                 result_session_frame: None,
                 result_slot_frame: None,
                 connection_epoch: None,
+                final_turn_count: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -281,6 +282,7 @@ mod tests {
                 reason: 3,
                 apply_at_frame: 42,
                 leave_seq: 1,
+                final_turn_count: Some(43),
             })),
         };
         let encoded = encode_frame(&leave).unwrap();
@@ -321,6 +323,7 @@ mod tests {
                 result_session_frame: None,
                 result_slot_frame: None,
                 connection_epoch: None,
+                final_turn_count: None,
             })),
         };
         let encoded = encode_frame(&departed).unwrap();
@@ -349,6 +352,7 @@ mod tests {
                 result_session_frame: Some(4200),
                 result_slot_frame: Some(4242),
                 connection_epoch: None,
+                final_turn_count: Some(4243),
             })),
         };
         let encoded = encode_frame(&departed).unwrap();

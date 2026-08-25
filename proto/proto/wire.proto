@@ -481,6 +481,21 @@ message LeaveDirective {
   // numbering continuous across an authority handoff so a promoted relay's
   // re-broadcast outranks stale copies. It never retires a *different* leave.
   uint32 leave_seq = 4;
+
+  // The exact number of the departing slot's turns every client consumes before
+  // applying the leave — the departed slot's home-authored contiguous
+  // delivered-through count at the departure, past which the home forwards
+  // nothing (see `SlotDeparted.final_turn_count`). This, not `apply_at_frame`,
+  // is the synchronization point a client that understands it must use: turn
+  // counts are relay-authored and client-verifiable (each client consumes the
+  // identical forwarded set in per-slot order), so every client reaches the
+  // count at the same simulated step, with no trust in client-stamped frames.
+  // `apply_at_frame` remains for clients that predate this field; its
+  // survivor-reachability clamp can place it at a frame clients have already
+  // passed, which such clients then apply on arrival rather than in lockstep —
+  // the imprecision this field exists to remove. Absent from directives
+  // re-derived from a departure record that predates the field.
+  optional uint64 final_turn_count = 5;
 }
 
 // A client's announcement that it is leaving cleanly (client → relay only),
@@ -1200,6 +1215,20 @@ message SlotDeparted {
   // delayed departure from an old connection cannot retire a newer reconnect's
   // live decision-maker state. Absent for a legacy sender.
   optional fixed64 connection_epoch = 9;
+
+  // The number of the departing slot's turns in its home relay's contiguous
+  // validated prefix at the departure — the count of turns (seqs `0..count`,
+  // gap-free) the home had accepted and will ever forward; anything past it is
+  // cut, so no client anywhere can consume beyond this count. Home-authored
+  // (only the home's client edge sees the slot's contiguous cursor) and carried
+  // verbatim, like `reachable_frame`, so the authority — including one promoted
+  // mid-handoff — stamps the identical `LeaveDirective.final_turn_count`. The
+  // contiguous prefix, not the newest validated seq: a validated turn past a
+  // receive gap can never be consumed by any client (per-slot ordering holds it
+  // behind the gap, and the departed connection can no longer fill it), so a
+  // count past the gap would name a point no client can reach. Absent from a
+  // sender that predates the field.
+  optional uint64 final_turn_count = 10;
 }
 
 // A relay's directive that a session may begin: every slot the coordinator

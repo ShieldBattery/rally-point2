@@ -1654,6 +1654,35 @@ pub struct DecisionMaker {
     started_at: Option<Instant>,
 }
 
+/// One recorded departure as re-announced to a freshly (re)joined mesh link:
+/// the slot, its home-authored stamps, the native leave reason, and the
+/// authoring connection generation. See `DecisionMaker::leave_reconcile`.
+pub type RecordedDeparture = (SlotId, DepartureStamps, u32, Option<u64>);
+
+/// The home-authored half of a departure record: everything the departing
+/// slot's home relay stamps at the departure — its last observed frame, the
+/// survivor-reachability ceiling, any retained end-of-game result, and the
+/// final turn count — and every other relay folds in verbatim (first
+/// non-`None` wins per field), so authority-handoff re-derivation lands on
+/// identical values everywhere. `last_frame` is additionally max-merged with
+/// the folding relay's own observation of the slot (see
+/// [`DecisionMaker::record_departure`]); the other fields are single-sourced.
+#[derive(Debug, Clone, Default)]
+pub struct DepartureStamps {
+    /// The departing slot's last observed frame at its home relay (`None` if it
+    /// never produced a framed turn).
+    pub last_frame: Option<GameFrameCount>,
+    /// The home-authored survivor-reachability ceiling for the leave's apply
+    /// frame (see `DecisionMaker::reachable_frame`).
+    pub reachable_frame: Option<u32>,
+    /// The end-of-game result the slot reported before departing, if any.
+    pub result: Option<ResultEcho>,
+    /// The slot's home-contiguous validated turn count at the departure — the
+    /// exact number of its turns any client can ever consume (see
+    /// `Departure::final_turn_count`).
+    pub final_turn_count: Option<u64>,
+}
+
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
 /// exactly what deriving the leave's apply frame needs: the departing slot's
 /// last observed frame (`None` if it never produced a framed turn -- a lobby
@@ -1687,6 +1716,17 @@ struct Departure {
     /// which the departure closes), so once seeded it is final. Carried into the
     /// [`DepartureNotice`] so a departure webhook is atomic terminal truth.
     result: Option<ResultEcho>,
+    /// The number of this slot's turns in its home relay's contiguous validated
+    /// prefix at the departure — the exact count of the slot's turns any client
+    /// can ever consume (the home forwards nothing past it), and therefore the
+    /// count every client consumes before applying the leave
+    /// (`LeaveDirective::final_turn_count`). Home-authored (only the home's
+    /// client edge sees the slot's contiguous cursor), carried in the
+    /// `SlotDeparted` frame, and folded first-non-`None`-wins exactly like
+    /// `reachable_frame`, so the authority — including one promoted mid-handoff
+    /// — stamps the identical count. `None` when authored by a sender that
+    /// predates the field.
+    final_turn_count: Option<u64>,
     /// Physical connection generation that authored this departure. Stored on
     /// the record itself so Join-time reconciliation cannot accidentally stamp
     /// it with a newer generation from mutable live-link state.
@@ -3917,23 +3957,31 @@ impl DecisionMaker {
     /// directly when a home client's link ends, or on a peer relay's
     /// `SlotDeparted` signal for a client the peer served.
     ///
-    /// The apply frame is one past the departing slot's last observed frame --
-    /// the exact step remaining clients stall at waiting for a turn that will
-    /// never come, so the leave unstalls them right there -- **clamped down** to
-    /// the home-authored reachability ceiling (`Departure`'s `reachable_frame`) so
-    /// a slot that inflates its own `game_frame_count` before leaving cannot
-    /// schedule the leave past a frame the survivors can reach (which would
-    /// strand them). In the honest case `last_frame ≤ ceiling`, so the clamp is a
-    /// no-op; in the game's first turns or under cross-relay mesh lag the ceiling
-    /// can sit a little below `last_frame`, producing a bounded, deterministic
-    /// *early* drop (never a stall) — harmless because the ceiling is
-    /// single-sourced, so every client agrees. The session frame is the basis
-    /// only when the slot never produced a framed turn; it is never folded in as
-    /// a max (see `leave_base_frame` for why that would strand stalled
-    /// survivors) and is not clamped (no `last_frame` to inflate). Both the last
-    /// frame and the ceiling come from the slot's departure record -- surviving
+    /// The directive's primary synchronization point is the record's
+    /// home-authored `final_turn_count` (see `Departure::final_turn_count`):
+    /// clients that understand it apply the leave after consuming exactly that
+    /// many of the departed slot's turns — a relay-authored, client-verifiable
+    /// coordinate every client reaches at the same simulated step, immune to
+    /// anyone's frame stamps.
+    ///
+    /// The apply *frame* is the fallback for clients that predate the count.
+    /// It is one past the departing slot's last observed frame — the step
+    /// remaining clients would stall at waiting for a turn that will never
+    /// come — **clamped down** to the home-authored reachability ceiling
+    /// (`Departure`'s `reachable_frame`) so a slot that inflates its own
+    /// `game_frame_count` before leaving cannot schedule the leave past a frame
+    /// the survivors can reach (which would strand them). That clamp is why the
+    /// frame is only a fallback: the ceiling trails the live frontier by up to
+    /// the buffer depth, so a clamped frame can sit at a frame clients have
+    /// already passed — and a client applies a passed frame on directive
+    /// *arrival*, at whatever frame it happens to be simulating, not in
+    /// lockstep with anyone. The session frame is the basis only when the slot
+    /// never produced a framed turn; it is never folded in as a max (see
+    /// `leave_base_frame` for why that would strand stalled survivors) and is
+    /// not clamped (no `last_frame` to inflate). The count, the last frame,
+    /// and the ceiling all come from the slot's departure record -- surviving
     /// `remove_slot` -- so every relay, including one promoted mid-handoff,
-    /// derives the identical apply frame (clients dedup by slot and require that
+    /// derives the identical directive (clients dedup by slot and require that
     /// agreement).
     pub fn decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
         // Record the departure regardless of the outcome below (even a hold), so
@@ -3942,7 +3990,7 @@ impl DecisionMaker {
         // `slots`; the record is the single frame source from here on. Passing
         // `None` for the ceiling and the result preserves whatever the home
         // already authored.
-        self.note_departure(slot, None, None, None, reason, None);
+        self.note_departure(slot, DepartureStamps::default(), reason, None);
 
         if self.authority != Authority::SelfRelay {
             return None;
@@ -3961,7 +4009,7 @@ impl DecisionMaker {
     /// when several relays' timers fire at once. Records the departure first, like
     /// [`decide_leave`].
     pub fn force_decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
-        self.note_departure(slot, None, None, None, reason, None);
+        self.note_departure(slot, DepartureStamps::default(), reason, None);
         if let Some(directive) = self.commit_leave(slot, reason) {
             return Some(directive);
         }
@@ -3981,6 +4029,10 @@ impl DecisionMaker {
             reason,
             apply_at_frame: 0,
             leave_seq: self.next_leave_seq,
+            // The record can still carry a home-authored count (a drop that
+            // produced turns before the session was abandoned); stamp whatever
+            // it holds so a straggler reconnect applies at the same point.
+            final_turn_count: self.departures.get(&slot).and_then(|d| d.final_turn_count),
         };
         self.decided_leaves.insert(slot, directive);
         Some(directive)
@@ -3997,6 +4049,11 @@ impl DecisionMaker {
         let record = self.departures.get(&slot);
         let slot_last = record.and_then(|d| d.last_frame).map(|f| f.0);
         let reachable = record.and_then(|d| d.reachable_frame);
+        // The precise synchronization point, when the home authored one: clients
+        // that understand it apply the leave after consuming exactly this many of
+        // the departed slot's turns, and the frame below is only the fallback for
+        // clients that predate the count.
+        let final_turn_count = record.and_then(|d| d.final_turn_count);
         let session = self.session_frame().map(|f| f.0);
         // No framed turn observed anywhere yet (pre-game / lobby): nothing to
         // schedule against, so hold — a `None` short-circuits the decision.
@@ -4013,6 +4070,7 @@ impl DecisionMaker {
             reason,
             apply_at_frame: base.saturating_add(1),
             leave_seq: self.next_leave_seq,
+            final_turn_count,
         };
         self.decided_leaves.insert(slot, directive);
         Some(directive)
@@ -4083,15 +4141,8 @@ impl DecisionMaker {
     /// (single-sourced, first non-`None` kept). `result` is the departing slot's
     /// home-authored end-of-game result echo (single-sourced, first non-`None`
     /// kept). The reason keeps the first observation.
-    pub fn record_departure(
-        &mut self,
-        slot: SlotId,
-        last_frame: Option<GameFrameCount>,
-        reachable: Option<u32>,
-        result: Option<ResultEcho>,
-        reason: u32,
-    ) {
-        self.note_departure(slot, last_frame, reachable, result, reason, None);
+    pub fn record_departure(&mut self, slot: SlotId, stamps: DepartureStamps, reason: u32) {
+        self.note_departure(slot, stamps, reason, None);
         // A departed slot's frozen cursors and newest-seq must not hold the
         // worst-lag view (and its buffer cushion) up forever.
         self.delivery.forget_slot(slot);
@@ -4106,23 +4157,14 @@ impl DecisionMaker {
     pub fn record_departure_for_epoch(
         &mut self,
         slot: SlotId,
-        last_frame: Option<GameFrameCount>,
-        reachable: Option<u32>,
-        result: Option<ResultEcho>,
+        stamps: DepartureStamps,
         reason: u32,
         connection_epoch: Option<u64>,
     ) -> bool {
         if !self.mark_connection_down(slot, connection_epoch) {
             return false;
         }
-        self.note_departure(
-            slot,
-            last_frame,
-            reachable,
-            result,
-            reason,
-            connection_epoch,
-        );
+        self.note_departure(slot, stamps, reason, connection_epoch);
         self.delivery.forget_slot(slot);
         true
     }
@@ -4142,7 +4184,7 @@ impl DecisionMaker {
             DepartureKind::Dropped => LEAVE_REASON_DROPPED,
             DepartureKind::Left => LEAVE_REASON_LEFT,
         };
-        self.note_departure(slot, None, None, None, reason, None);
+        self.note_departure(slot, DepartureStamps::default(), reason, None);
         if !self.decided_leaves.contains_key(&slot) {
             self.next_leave_seq += 1;
             let base = self.session_frame().map(|f| f.0).unwrap_or(0);
@@ -4151,6 +4193,9 @@ impl DecisionMaker {
                 reason,
                 apply_at_frame: base.saturating_add(1),
                 leave_seq: self.next_leave_seq,
+                // Cosmetic like the frame: the survivors that carried into the
+                // rehome already applied this leave on the old relay.
+                final_turn_count: None,
             };
             self.decided_leaves.insert(slot, directive);
         }
@@ -4285,7 +4330,16 @@ impl DecisionMaker {
                     .insert(slot, ConnectionState::Down(epoch));
             }
             let retained_result = self.results.get(&slot).cloned();
-            self.note_departure(slot, None, None, retained_result, leave.reason, None);
+            self.note_departure(
+                slot,
+                DepartureStamps {
+                    result: retained_result,
+                    final_turn_count: leave.final_turn_count,
+                    ..DepartureStamps::default()
+                },
+                leave.reason,
+                None,
+            );
             self.delivery.forget_slot(slot);
         }
         inserted
@@ -4376,29 +4430,19 @@ impl DecisionMaker {
     /// still stalled waiting" (see [`drain_handoff_leaves`](Self::drain_handoff_leaves)),
     /// and the cost of a redundant re-announce is a few deduped frames, bounded by
     /// the slot count.
-    #[allow(clippy::type_complexity)]
-    fn leave_reconcile(
-        &self,
-    ) -> (
-        Vec<(
-            SlotId,
-            Option<GameFrameCount>,
-            Option<u32>,
-            Option<ResultEcho>,
-            u32,
-            Option<u64>,
-        )>,
-        Vec<LeaveDirective>,
-    ) {
+    fn leave_reconcile(&self) -> (Vec<RecordedDeparture>, Vec<LeaveDirective>) {
         let departures = self
             .departures
             .iter()
             .map(|(slot, departure)| {
                 (
                     *slot,
-                    departure.last_frame,
-                    departure.reachable_frame,
-                    departure.result.clone(),
+                    DepartureStamps {
+                        last_frame: departure.last_frame,
+                        reachable_frame: departure.reachable_frame,
+                        result: departure.result.clone(),
+                        final_turn_count: departure.final_turn_count,
+                    },
                     departure.reason,
                     departure.connection_epoch,
                 )
@@ -4446,12 +4490,16 @@ impl DecisionMaker {
     fn note_departure(
         &mut self,
         slot: SlotId,
-        last_frame: Option<GameFrameCount>,
-        reachable: Option<u32>,
-        result: Option<ResultEcho>,
+        stamps: DepartureStamps,
         reason: u32,
         connection_epoch: Option<u64>,
     ) {
+        let DepartureStamps {
+            last_frame,
+            reachable_frame: reachable,
+            result,
+            final_turn_count,
+        } = stamps;
         use std::collections::hash_map::Entry;
         let result = result.filter(|echo| {
             let valid = result_payload_is_valid(&echo.payload);
@@ -4499,6 +4547,7 @@ impl DecisionMaker {
                 // First non-`None` wins — single-sourced from the home.
                 record.reachable_frame = record.reachable_frame.or(reachable);
                 record.result = record.result.take().or(result);
+                record.final_turn_count = record.final_turn_count.or(final_turn_count);
                 record.connection_epoch = record.connection_epoch.or(connection_epoch);
             }
             Entry::Vacant(vacant) => {
@@ -4508,6 +4557,7 @@ impl DecisionMaker {
                     reachable_frame: reachable,
                     result,
                     reason,
+                    final_turn_count,
                     connection_epoch,
                 });
             }
@@ -5750,13 +5800,11 @@ pub fn record_departure(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
-    last_frame: Option<GameFrameCount>,
-    reachable: Option<u32>,
-    result: Option<ResultEcho>,
+    stamps: DepartureStamps,
     reason: u32,
 ) {
     if let Some(maker) = registry.lock().get_mut(key) {
-        maker.record_departure(slot, last_frame, reachable, result, reason);
+        maker.record_departure(slot, stamps, reason);
     }
 }
 
@@ -5766,27 +5814,16 @@ pub fn record_departure(
 /// A missing maker preserves [`record_departure`]'s historical no-op admission:
 /// there is no local consensus state with which the frame could conflict.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn record_departure_for_epoch(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
-    last_frame: Option<GameFrameCount>,
-    reachable: Option<u32>,
-    result: Option<ResultEcho>,
+    stamps: DepartureStamps,
     reason: u32,
     connection_epoch: Option<u64>,
 ) -> bool {
-    record_departure_for_epoch_outcome(
-        registry,
-        key,
-        slot,
-        last_frame,
-        reachable,
-        result,
-        reason,
-        connection_epoch,
-    ) != DepartureRecordOutcome::Rejected
+    record_departure_for_epoch_outcome(registry, key, slot, stamps, reason, connection_epoch)
+        != DepartureRecordOutcome::Rejected
 }
 
 /// Records the same epoch-fenced departure while distinguishing an undecided
@@ -5795,14 +5832,11 @@ pub fn record_departure_for_epoch(
 /// final `LeaveDirective` may still enrich the retained record but must never
 /// recreate a drop hold.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_departure_for_epoch_outcome(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
-    last_frame: Option<GameFrameCount>,
-    reachable: Option<u32>,
-    result: Option<ResultEcho>,
+    stamps: DepartureStamps,
     reason: u32,
     connection_epoch: Option<u64>,
 ) -> DepartureRecordOutcome {
@@ -5816,18 +5850,11 @@ pub(crate) fn record_departure_for_epoch_outcome(
         // stream, including after a newer generation was already marked down.
         // Merge only its terminal metadata; do not let that stale generation
         // mutate the current connection tombstone or recreate a drop hold.
-        maker.note_departure(slot, last_frame, reachable, result, reason, None);
+        maker.note_departure(slot, stamps.clone(), reason, None);
         maker.delivery.forget_slot(slot);
         return DepartureRecordOutcome::Terminal;
     }
-    if !maker.record_departure_for_epoch(
-        slot,
-        last_frame,
-        reachable,
-        result,
-        reason,
-        connection_epoch,
-    ) {
+    if !maker.record_departure_for_epoch(slot, stamps, reason, connection_epoch) {
         return DepartureRecordOutcome::Rejected;
     }
     DepartureRecordOutcome::Pending
@@ -6155,21 +6182,10 @@ pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
 /// This relay's known leave state for `key` — every recorded departure and every
 /// cached leave — for re-announcing to a freshly (re)joined mesh link. Empty when
 /// no maker exists. See `DecisionMaker`'s `leave_reconcile`.
-#[allow(clippy::type_complexity)]
 pub fn leave_reconcile(
     registry: &DecisionMakers,
     key: &SessionKey,
-) -> (
-    Vec<(
-        SlotId,
-        Option<GameFrameCount>,
-        Option<u32>,
-        Option<ResultEcho>,
-        u32,
-        Option<u64>,
-    )>,
-    Vec<LeaveDirective>,
-) {
+) -> (Vec<RecordedDeparture>, Vec<LeaveDirective>) {
     registry
         .lock()
         .get(key)
@@ -6896,14 +6912,14 @@ mod tests {
         assert_eq!(inputs.burst_turns, 1);
         assert_eq!(inputs.target, 11);
 
-        maker.record_departure(SlotId(1), None, None, None, DROPPED);
+        maker.record_departure(SlotId(1), DepartureStamps::default(), DROPPED);
         assert_target_inputs_match_reference(&maker);
         let inputs = maker.target_inputs().unwrap();
         assert_eq!(inputs.path_us, 200_000);
         assert_eq!(inputs.worst_loss_risk, 15_000.0);
         assert_eq!(inputs.target, 7);
 
-        maker.record_departure(SlotId(2), None, None, None, DROPPED);
+        maker.record_departure(SlotId(2), DepartureStamps::default(), DROPPED);
         assert_target_inputs_match_reference(&maker);
         maker.remove_slot(SlotId(0));
         assert_target_inputs_match_reference(&maker);
@@ -7942,7 +7958,7 @@ mod tests {
         maker.ingest_local(&conditions(0, 150_000, 0, 100));
         maker.ingest_local(&conditions(0, 160_000, 10, 120));
 
-        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+        maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
         assert!(!maker.slots.contains_key(&SlotId(0)));
         assert!(maker.reinstate_slot(SlotId(0)));
 
@@ -8026,12 +8042,22 @@ mod tests {
         maker.ingest_local(&epoch_conditions(0, 1, 70_000, 0, 10));
         maker.ingest_local(&epoch_conditions(0, 2, 30_000, 0, 1));
 
-        assert!(!maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(1),));
+        assert!(!maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(1)
+        ));
         assert!(!maker.remove_slot_for_epoch(SlotId(0), Some(1)));
         assert!(maker.slots.contains_key(&SlotId(0)));
         assert!(!maker.has_departure(SlotId(0)));
 
-        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(2),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(2)
+        ));
         assert!(maker.has_departure(SlotId(0)));
         assert!(!maker.slots.contains_key(&SlotId(0)));
     }
@@ -8041,7 +8067,12 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
-        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(11)
+        ));
 
         assert_eq!(
             maker.connection_activation(SlotId(0), Some(11)),
@@ -8111,7 +8142,12 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
-        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(11)
+        ));
         assert!(maker.force_decide_leave(SlotId(0), DROPPED).is_some());
 
         assert!(!maker.reinstate_slot(SlotId(0)));
@@ -8123,7 +8159,7 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&conditions(0, 70_000, 0, 10));
-        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+        maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
 
         assert_eq!(
             maker.connection_activation(SlotId(0), None),
@@ -8153,7 +8189,12 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
-        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(11)
+        ));
         // Model unrelated mutable lifecycle state changing after the record was
         // authored. Reconcile must still stamp the record's original E1.
         maker
@@ -8161,7 +8202,7 @@ mod tests {
             .insert(SlotId(0), ConnectionState::Up(22));
 
         let (departures, _) = maker.leave_reconcile();
-        assert_eq!(departures[0].5, Some(11));
+        assert_eq!(departures[0].3, Some(11));
     }
 
     #[test]
@@ -8179,7 +8220,15 @@ mod tests {
         let history = maker.slots[&SlotId(0)].frame_history.clone();
         let last = maker.slot_frame(SlotId(0));
         assert_eq!(last, Some(GameFrameCount(115)));
-        assert!(maker.record_departure_for_epoch(SlotId(0), last, None, None, DROPPED, Some(11),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps {
+                last_frame: last,
+                ..Default::default()
+            },
+            DROPPED,
+            Some(11),
+        ));
 
         let transition = maker.resolve_reconnect(SlotId(0), Some(22), true);
         assert_eq!(
@@ -8199,9 +8248,10 @@ mod tests {
         assert_eq!(redrop_last, Some(GameFrameCount(115)));
         assert!(maker.record_departure_for_epoch(
             SlotId(0),
-            redrop_last,
-            None,
-            None,
+            DepartureStamps {
+                last_frame: redrop_last,
+                ..Default::default()
+            },
             DROPPED,
             Some(22),
         ));
@@ -8238,9 +8288,7 @@ mod tests {
                 &makers,
                 &session,
                 SlotId(0),
-                None,
-                None,
-                None,
+                DepartureStamps::default(),
                 DROPPED,
                 Some(11),
             );
@@ -8264,9 +8312,7 @@ mod tests {
                 &makers,
                 &session,
                 SlotId(0),
-                None,
-                None,
-                None,
+                DepartureStamps::default(),
                 DROPPED,
                 Some(22),
             );
@@ -8294,7 +8340,12 @@ mod tests {
             HashSet::new(),
         );
         assert!(maker.activate_connection_epoch(SlotId(0), 11));
-        assert!(maker.record_departure_for_epoch(SlotId(0), None, None, None, DROPPED, Some(11),));
+        assert!(maker.record_departure_for_epoch(
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+            Some(11)
+        ));
         makers.lock().insert(session.clone(), maker);
         let holds = crate::drop_hold::DropHolds::new(
             std::time::Duration::ZERO,
@@ -8334,9 +8385,7 @@ mod tests {
                 &stale_makers,
                 &stale_key,
                 SlotId(0),
-                None,
-                None,
-                None,
+                DepartureStamps::default(),
                 DROPPED,
                 Some(11),
             );
@@ -9867,7 +9916,14 @@ mod tests {
         let mut makers = registry.lock();
         let maker = makers.get_mut(key).unwrap();
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
     }
 
     /// A relay demoted by a re-push stops broadcasting: only the authority
@@ -10021,6 +10077,7 @@ mod tests {
             reason: 3,
             apply_at_frame: 90,
             leave_seq: 7,
+            final_turn_count: None,
         };
         assert!(
             observe_leave(&registry, &k, &leave),
@@ -10099,9 +10156,10 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(50)),
-            None,
-            None,
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
             3,
         );
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
@@ -10227,6 +10285,7 @@ mod tests {
             reason: DROPPED,
             apply_at_frame: 88,
             leave_seq: 7,
+            final_turn_count: None,
         };
         assert!(observe_leave(&registry, &k, &leave), "first insert");
 
@@ -10266,9 +10325,10 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(50)),
-            None,
-            None,
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
             3,
         );
         assert!(rx.try_recv().is_err(), "recording alone fires nothing");
@@ -10509,9 +10569,11 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(40)),
-            None,
-            Some(folded),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(40)),
+                result: Some(folded),
+                ..Default::default()
+            },
             DROPPED,
         );
 
@@ -10561,9 +10623,11 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(52)),
-            None,
-            Some(retained),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(52)),
+                result: Some(retained),
+                ..Default::default()
+            },
             DROPPED,
         );
         assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -10636,9 +10700,11 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(50)),
-            None,
-            Some(first.clone()),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                result: Some(first.clone()),
+                ..Default::default()
+            },
             DROPPED,
         );
 
@@ -10653,14 +10719,22 @@ mod tests {
             &registry,
             &k,
             SlotId(1),
-            Some(GameFrameCount(50)),
-            None,
-            Some(second),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                result: Some(second),
+                ..Default::default()
+            },
             DROPPED,
         );
 
         // A `None`-carrying re-record (the home's own `decide_leave`) preserves it.
-        record_departure(&registry, &k, SlotId(1), None, None, None, DROPPED);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
 
         let kept = registry
             .lock()
@@ -10865,11 +10939,89 @@ mod tests {
 
     /// The exact production flow on the departing slot's home relay: read the
     /// last frame and the reachability ceiling, record the departure with both,
+    /// A decided leave carries the record's home-authored final turn count
+    /// verbatim — the client-side synchronization point rides the directive.
+    #[test]
+    fn a_decided_leave_carries_the_home_authored_final_turn_count() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.observe_frame(SlotId(1), GameFrameCount(115));
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(115)),
+                final_turn_count: Some(112),
+                ..Default::default()
+            },
+            DROPPED,
+        );
+        let leave = maker
+            .decide_leave(SlotId(1), DROPPED)
+            .expect("a leave is scheduled");
+        assert_eq!(leave.final_turn_count, Some(112));
+    }
+
+    /// A promoted authority re-derives a leave with the identical final turn
+    /// count: the count is part of the shared departure record, so a handoff
+    /// reproduces it exactly like the apply frame.
+    #[test]
+    fn a_handoff_rederivation_reproduces_the_final_turn_count() {
+        let stamps = DepartureStamps {
+            last_frame: Some(GameFrameCount(115)),
+            final_turn_count: Some(112),
+            ..Default::default()
+        };
+        let mut peer =
+            DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
+        peer.observe_frame(SlotId(1), GameFrameCount(115));
+        peer.record_departure(SlotId(1), stamps, DROPPED);
+        let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay, &HashSet::new());
+        let rederived = leaves
+            .iter()
+            .find(|l| l.slot == 1)
+            .expect("the promotion re-derives the leave");
+        assert_eq!(rederived.final_turn_count, Some(112));
+    }
+
+    /// An observed peer directive's count folds into this relay's departure
+    /// record, so a later promotion here re-derives with the same count even
+    /// though no `SlotDeparted` ever carried it to this relay.
+    #[test]
+    fn an_observed_leave_folds_its_final_turn_count_into_the_record() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
+        let directive = LeaveDirective {
+            slot: 2,
+            reason: DROPPED,
+            apply_at_frame: 116,
+            leave_seq: 1,
+            final_turn_count: Some(112),
+        };
+        assert!(maker.observe_leave(&directive));
+        assert_eq!(
+            maker.departures.get(&SlotId(2)).unwrap().final_turn_count,
+            Some(112),
+        );
+    }
+
     /// then decide the (clamped) leave.
     fn home_decide_leave(maker: &mut DecisionMaker, slot: u8) -> LeaveDirective {
         let last = maker.slot_frame(SlotId(slot));
         let ceiling = maker.reachable_frame(SlotId(slot));
-        maker.record_departure(SlotId(slot), last, ceiling, None, DROPPED);
+        maker.record_departure(
+            SlotId(slot),
+            DepartureStamps {
+                last_frame: last,
+                reachable_frame: ceiling,
+                ..Default::default()
+            },
+            DROPPED,
+        );
         maker
             .decide_leave(SlotId(slot), DROPPED)
             .expect("a leave is scheduled")
@@ -11027,7 +11179,15 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        authority.record_departure(SlotId(1), last, ceiling, None, DROPPED);
+        authority.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: last,
+                reachable_frame: ceiling,
+                ..Default::default()
+            },
+            DROPPED,
+        );
         let a = authority
             .decide_leave(SlotId(1), DROPPED)
             .expect("the authority decides the leave");
@@ -11037,7 +11197,15 @@ mod tests {
         // handoff re-derivation reproduces the identical apply frame.
         let mut peer =
             DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
-        peer.record_departure(SlotId(1), last, ceiling, None, DROPPED);
+        peer.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: last,
+                reachable_frame: ceiling,
+                ..Default::default()
+            },
+            DROPPED,
+        );
         let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay, &HashSet::new());
         let p = leaves
             .iter()
@@ -11154,7 +11322,14 @@ mod tests {
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         // The survivor's stamps run ahead of the departed slot's last frame.
         maker.observe_frame(SlotId(0), GameFrameCount(55));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(55)),
@@ -11180,7 +11355,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -11211,7 +11393,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         // Promote while slot 1's drop is still held: the promotion decides nothing.
         let held_slots = HashSet::from([SlotId(1)]);
@@ -11254,7 +11443,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         // A descriptor re-push promotes this relay while slot 1's drop is still
         // held: the promotion must decide nothing for it.
@@ -11287,8 +11483,22 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
-        maker.record_departure(SlotId(2), Some(GameFrameCount(60)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
+        maker.record_departure(
+            SlotId(2),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(60)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         // Slot 1's drop is still held; slot 2 is not held (it left cleanly, or its
         // hold was already released) — only slot 2 is decided.
@@ -11315,7 +11525,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(40));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         assert!(
             maker.reinstate_slot(SlotId(1)),
@@ -11350,7 +11567,15 @@ mod tests {
         // the frame into the record and retires the slot), then runs its
         // teardown remove_slot — now a no-op for this slot.
         let read = maker.slot_frame(SlotId(1));
-        maker.record_departure(SlotId(1), read, None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: read,
+                reachable_frame: None,
+                ..Default::default()
+            },
+            DROPPED,
+        );
         assert_eq!(
             maker.slot_frame(SlotId(1)),
             None,
@@ -11442,6 +11667,7 @@ mod tests {
             reason: DROPPED,
             apply_at_frame: 88,
             leave_seq: 7,
+            final_turn_count: None,
         };
         assert!(maker.observe_leave(&observed), "first insert for the slot");
         assert_eq!(maker.decided_leaves.get(&SlotId(2)), Some(&observed));
@@ -11505,6 +11731,7 @@ mod tests {
                 reason: DROPPED,
                 apply_at_frame: 41,
                 leave_seq: 1,
+                final_turn_count: None,
             };
             assert!(maker.observe_leave(&leave));
 
@@ -11519,9 +11746,10 @@ mod tests {
             }
             let stale_departure = maker.record_departure_for_epoch(
                 SlotId(0),
-                Some(GameFrameCount(40)),
-                None,
-                None,
+                DepartureStamps {
+                    last_frame: Some(GameFrameCount(40)),
+                    ..Default::default()
+                },
                 DROPPED,
                 Some(11),
             );
@@ -11570,6 +11798,7 @@ mod tests {
                 reason: DROPPED,
                 apply_at_frame: 41,
                 leave_seq: 1,
+                final_turn_count: None,
             },
         ));
 
@@ -11584,9 +11813,12 @@ mod tests {
                 &makers,
                 &session,
                 SlotId(0),
-                Some(GameFrameCount(40)),
-                Some(39),
-                Some(result.clone()),
+                DepartureStamps {
+                    last_frame: Some(GameFrameCount(40)),
+                    reachable_frame: Some(39),
+                    result: Some(result.clone()),
+                    ..Default::default()
+                },
                 DROPPED,
                 Some(11),
             ),
@@ -11626,6 +11858,7 @@ mod tests {
             reason: DROPPED,
             apply_at_frame: 51,
             leave_seq: 4,
+            final_turn_count: None,
         };
         assert!(maker.observe_leave(&first), "first insert for the slot");
 
@@ -11669,7 +11902,14 @@ mod tests {
 
         // The peer's SlotDeparted carries the home relay's fuller view (60): the
         // departure record max-merges it over our lagging 30.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(60)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(60)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 61,
@@ -11692,7 +11932,14 @@ mod tests {
         maker.observe_frame(SlotId(0), GameFrameCount(80));
 
         // A stale SlotDeparted carries a lower frame (55): the merge keeps 70.
-        maker.record_departure(SlotId(1), Some(GameFrameCount(55)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(55)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         let leave = maker.decide_leave(SlotId(1), DROPPED).unwrap();
         assert_eq!(
             leave.apply_at_frame, 71,
@@ -11706,7 +11953,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         assert_eq!(
             maker.decide_leave(SlotId(1), DROPPED),
             None,
@@ -11804,14 +12058,26 @@ mod tests {
 
         // A peer-homed slot drops: undecided session-wide and held, but its
         // reconnect (if any) lands on its own home relay.
-        record_departure(&registry, &k, SlotId(1), None, None, None, DROPPED);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
         assert!(has_undecided_departure(&registry, &k));
         assert!(!has_reconnectable_departure(&registry, &k, &held_both));
 
         // This relay's own homed slot drops: while held, the close must wait —
         // but with the hold gone (a clean leave releases it), nothing can be
         // admitted back, so nothing waits.
-        record_departure(&registry, &k, SlotId(0), None, None, None, DROPPED);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+        );
         assert!(has_reconnectable_departure(&registry, &k, &held_both));
         assert!(!has_reconnectable_departure(&registry, &k, &HashSet::new()));
 
@@ -11826,6 +12092,7 @@ mod tests {
                 reason: DROPPED,
                 apply_at_frame: 1,
                 leave_seq: 1,
+                final_turn_count: None,
             },
         ));
         assert!(!has_reconnectable_departure(&registry, &k, &held_both));
@@ -11855,7 +12122,13 @@ mod tests {
         );
         let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
         assert!(!has_reconnectable_departure(&registry, &k, &held));
-        record_departure(&registry, &k, SlotId(3), None, None, None, DROPPED);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(3),
+            DepartureStamps::default(),
+            DROPPED,
+        );
         assert!(has_reconnectable_departure(&registry, &k, &held));
     }
 
@@ -11868,7 +12141,7 @@ mod tests {
     fn force_decide_leave_commits_with_no_frame_basis() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        maker.record_departure(SlotId(0), None, None, None, DROPPED);
+        maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
         assert_eq!(
             maker.decide_leave(SlotId(0), DROPPED),
             None,
@@ -11975,7 +12248,14 @@ mod tests {
         maker.observe_frame(SlotId(1), GameFrameCount(50));
         assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
 
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         assert_eq!(
             maker.session_frame(),
             Some(GameFrameCount(60)),
@@ -11991,7 +12271,14 @@ mod tests {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         maker.observe_frame(SlotId(1), GameFrameCount(52));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -12014,7 +12301,14 @@ mod tests {
             HashSet::new(),
         );
         maker.observe_frame(SlotId(0), GameFrameCount(60));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
 
         let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
         assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -12080,12 +12374,20 @@ mod tests {
         // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
         maker.observe_frame(SlotId(0), GameFrameCount(40));
         maker.observe_frame(SlotId(1), GameFrameCount(50));
-        maker.record_departure(SlotId(1), Some(GameFrameCount(50)), None, None, DROPPED);
+        maker.record_departure(
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
+            DROPPED,
+        );
         let leave = LeaveDirective {
             slot: 1,
             reason: DROPPED,
             apply_at_frame: 51,
             leave_seq: 1,
+            final_turn_count: None,
         };
         let _ = maker.observe_leave(&leave);
 
@@ -12484,7 +12786,13 @@ mod tests {
         );
         assert!(!note_slot_present(&registry, &k, SlotId(0)));
         // Slot 0 departs, retiring it from the live-slot set.
-        record_departure(&registry, &k, SlotId(0), None, None, None, DROPPED);
+        record_departure(
+            &registry,
+            &k,
+            SlotId(0),
+            DepartureStamps::default(),
+            DROPPED,
+        );
         // Slot 1 arrives: coverage is still incomplete (slot 0 left), so no fire.
         assert!(!note_slot_present(&registry, &k, SlotId(1)));
         assert!(!session_started(&registry, &k));
@@ -12744,7 +13052,7 @@ mod tests {
 
         // Ordinal 1: slot 1 reports, slot 2 departs before ever reporting it.
         feed(&mut m, 1, 1, SYNC_A);
-        m.record_departure(SlotId(2), None, None, None, DROPPED);
+        m.record_departure(SlotId(2), DepartureStamps::default(), DROPPED);
         assert!(!m.sync.members.contains_key(&SlotId(2)));
 
         // Slot 0 continues; ordinal 1 completes on the two survivors once the

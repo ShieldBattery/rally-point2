@@ -1208,6 +1208,11 @@ pub async fn run_slot_link(
     // pulls `mesh` apart, so every exit path can hand the whole bundle to
     // `end_slot_link` without ballooning that function's argument count.
     let mesh_for_teardown = mesh.clone();
+    // The seq of the first turn this connection delivered but failed validation
+    // on (the link closes right there). The dedup's delivered cursor advances
+    // for such a turn even though it was never forwarded, so the slot's final
+    // turn count must clamp below it — see `slot_final_turn_count`.
+    let mut first_invalid_seq: Option<u64> = None;
     // The flight recorder's per-slot counter handle, fetched ONCE here so the
     // per-turn arms below bump plain atomics — no lock, no map lookup on the
     // hot path. The connect event marks a resumed dial (any presented resume
@@ -1308,6 +1313,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1333,6 +1342,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1495,6 +1508,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 false,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1529,6 +1546,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1550,7 +1571,7 @@ pub async fn run_slot_link(
     // and a reconnect for a slot whose own leave was decided was refused at
     // admission). Empty on a fresh dial: no session history, nothing missed.
     let (departures, directives) = consensus::leave_reconcile(&decision_makers, &key);
-    for (departed, _, _, _, _, departed_epoch) in departures {
+    for (departed, _, _, departed_epoch) in departures {
         if departed == slot {
             continue;
         }
@@ -1576,6 +1597,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1601,6 +1626,10 @@ pub async fn run_slot_link(
                 slot,
                 connection_epoch,
                 leave_announced,
+                Some(final_turn_count_from(
+                    link.delivered_through(slot),
+                    first_invalid_seq,
+                )),
             );
             return;
         }
@@ -1662,6 +1691,7 @@ pub async fn run_slot_link(
                     _ => None,
                 };
                 for payload in received.fresh {
+                    let seq = payload.seq;
                     match validate_turn(slot, payload) {
                         Ok(turn) => {
                             let payload = turn.payload;
@@ -1689,6 +1719,7 @@ pub async fn run_slot_link(
                             );
                         }
                         Err(error) => {
+                            first_invalid_seq.get_or_insert(seq);
                             tracing::warn!(
                                 tenant = key.tenant.as_ref(),
                                 session = key.session.0,
@@ -2184,6 +2215,7 @@ pub async fn run_slot_link(
                             &key,
                             slot,
                             LEAVE_REASON_LEFT,
+                            Some(final_turn_count_from(link.delivered_through(slot), first_invalid_seq)),
                             Some(connection_epoch),
                         );
                         leave_announced = true;
@@ -2232,6 +2264,7 @@ pub async fn run_slot_link(
                         if !fresh {
                             continue;
                         }
+                        let seq = payload.seq;
                         match validate_turn(slot, payload) {
                             Ok(turn) => {
                                 let payload = turn.payload;
@@ -2254,6 +2287,7 @@ pub async fn run_slot_link(
                                 );
                             }
                             Err(error) => {
+                                first_invalid_seq.get_or_insert(seq);
                                 tracing::warn!(
                                     tenant = key.tenant.as_ref(),
                                     session = key.session.0,
@@ -2547,7 +2581,28 @@ pub async fn run_slot_link(
         slot,
         connection_epoch,
         leave_announced,
+        Some(final_turn_count_from(
+            link.delivered_through(slot),
+            first_invalid_seq,
+        )),
     );
+}
+
+/// The departing slot's final turn count: how many of its turns (seqs
+/// `0..count`, gap-free) this — its home — relay accepted and forwarded, and
+/// therefore the exact number every client consumes before applying the
+/// slot's leave (`LeaveDirective::final_turn_count`). `delivered_through` is
+/// the link's contiguous delivered cursor for the slot (total-truthful across
+/// a resume — anchoring seeds it with the prior connection's prefix), clamped
+/// below the first delivered-but-invalid turn, if any: the cursor advances for
+/// a turn that validation then rejects without forwarding, and a count
+/// reaching past it would name a point no client can reach.
+fn final_turn_count_from(delivered_through: Option<u64>, first_invalid_seq: Option<u64>) -> u64 {
+    let delivered = delivered_through.map_or(0, |seq| seq + 1);
+    match first_invalid_seq {
+        Some(invalid) => delivered.min(invalid),
+        None => delivered,
+    }
 }
 
 /// Runs the full departure/close protocol for a slot link that has ended,
@@ -2569,6 +2624,7 @@ fn end_slot_link(
     slot: SlotId,
     connection_epoch: u64,
     leave_announced: bool,
+    final_turn_count: Option<u64>,
 ) {
     mesh.decision_makers.flight_recorder().record(
         key,
@@ -2617,6 +2673,7 @@ fn end_slot_link(
             key,
             slot,
             LEAVE_REASON_DROPPED,
+            final_turn_count,
             Some(connection_epoch),
         ) {
             broadcast_connectivity(
@@ -2817,6 +2874,7 @@ fn announce_departure(
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
+    final_turn_count: Option<u64>,
     connection_epoch: Option<u64>,
 ) -> bool {
     let roster_guard = (reason == LEAVE_REASON_DROPPED).then(|| sessions.lock());
@@ -2838,9 +2896,12 @@ fn announce_departure(
     // home, holds the retained report and computes the ceiling), so every relay
     // clamps to the identical apply frame and folds the identical result — see
     // `consensus::reachable_frame` / `consensus::result_for`.
-    let last_frame = consensus::slot_frame(decision_makers, key, slot);
-    let reachable = consensus::reachable_frame(decision_makers, key, slot);
-    let result = consensus::result_for(decision_makers, key, slot);
+    let stamps = consensus::DepartureStamps {
+        last_frame: consensus::slot_frame(decision_makers, key, slot),
+        reachable_frame: consensus::reachable_frame(decision_makers, key, slot),
+        result: consensus::result_for(decision_makers, key, slot),
+        final_turn_count,
+    };
     let outcome = if reason == LEAVE_REASON_DROPPED {
         // A dropped departure and its reconnect hold are one transition. The
         // hold lock stays held while `record` takes the maker lock, then the
@@ -2850,9 +2911,7 @@ fn announce_departure(
                 decision_makers,
                 key,
                 slot,
-                last_frame,
-                reachable,
-                result.clone(),
+                stamps.clone(),
                 reason,
                 connection_epoch,
             );
@@ -2865,9 +2924,7 @@ fn announce_departure(
         decision_makers,
         key,
         slot,
-        last_frame,
-        reachable,
-        result.clone(),
+        stamps.clone(),
         reason,
         connection_epoch,
     ) {
@@ -2878,16 +2935,7 @@ fn announce_departure(
     if outcome != consensus::DepartureRecordOutcome::Pending {
         return false;
     }
-    crate::mesh::fan_out_slot_departed(
-        mesh_links,
-        key,
-        slot,
-        last_frame.map(|f| f.0),
-        reachable,
-        result,
-        reason,
-        connection_epoch,
-    );
+    crate::mesh::fan_out_slot_departed(mesh_links, key, slot, &stamps, reason, connection_epoch);
     // Turn the recorded departure into the synced leave — but a *drop* is only
     // marked as an undecided hold, never decided here: survivors are removed on a
     // disconnect only when a human's `RequestDrop` is honored past the unlock
@@ -3359,6 +3407,19 @@ fn sample_slot_conditions(
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn final_turn_count_counts_the_contiguous_prefix_and_clamps_below_an_invalid_turn() {
+        // No turn ever delivered: the count is zero (a pre-game departure).
+        assert_eq!(super::final_turn_count_from(None, None), 0);
+        // Seqs are zero-based: delivered through seq 41 = 42 turns.
+        assert_eq!(super::final_turn_count_from(Some(41), None), 42);
+        // A delivered-but-invalid turn advanced the cursor without being
+        // forwarded; the count must stop below it.
+        assert_eq!(super::final_turn_count_from(Some(41), Some(40)), 40);
+        // An invalid turn past the contiguous prefix constrains nothing.
+        assert_eq!(super::final_turn_count_from(Some(41), Some(50)), 42);
+    }
     use super::*;
 
     fn key() -> SessionKey {
@@ -3461,7 +3522,7 @@ mod tests {
 
         // Slot 1's link dies without a clean leave; slot 0 remains, so the
         // session stays open and the recording keeps accumulating.
-        end_slot_link(&sessions, &mesh, &k, SlotId(1), 0, false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(1), 0, false, None);
         let events: Vec<_> = flight.events(&k).into_iter().map(|r| r.event).collect();
         assert!(
             events.contains(&crate::flight_recorder::FlightEvent::SlotDisconnected { slot: 1 }),
@@ -3474,7 +3535,7 @@ mod tests {
 
         // The last slot leaves: the close event seals the recording and the
         // detached flush retires it (discarded — no sink configured).
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
         for _ in 0..100 {
             if flight.recorded_sessions().is_empty() {
                 break;
@@ -3508,7 +3569,7 @@ mod tests {
         );
 
         // The only local slot leaves: the session-emptying teardown fires.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
         assert!(
             !mesh.seen.lock().contains_key(&k),
             "the emptied session's seen-registry entry must not survive its teardown",
@@ -3552,7 +3613,7 @@ mod tests {
 
         // The only local slot's link dies without a clean leave — the emptying
         // that must NOT close the session while the drop is held.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false, None);
 
         assert!(
             mesh.drop_holds.is_pending(&k, SlotId(0)),
@@ -3632,7 +3693,7 @@ mod tests {
             SlotId(0),
             LEAVE_REASON_LEFT,
         );
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, true);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, true, None);
 
         assert!(
             !mesh.seen.lock().contains_key(&k),
@@ -4390,6 +4451,7 @@ mod tests {
             SlotId(1),
             LEAVE_REASON_DROPPED,
             None,
+            None,
         );
 
         assert!(
@@ -4436,7 +4498,7 @@ mod tests {
 
         // The old task has already freed its roster seat and is finishing its
         // cleanup after the replacement published epoch 22.
-        end_slot_link(&sessions, &mesh, &k, SlotId(0), 11, false);
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 11, false, None);
 
         let published = crate::mesh::snapshot_conditions(&mesh.conditions, &k)
             .expect("replacement conditions survive stale teardown");
@@ -4522,6 +4584,7 @@ mod tests {
             SlotId(0),
             LEAVE_REASON_DROPPED,
             None,
+            None,
         );
         report_own_presence(
             &sessions,
@@ -4537,6 +4600,7 @@ mod tests {
             &k,
             SlotId(1),
             LEAVE_REASON_DROPPED,
+            None,
             None,
         );
         report_own_presence(
@@ -4708,12 +4772,40 @@ mod tests {
             makers,
             k,
             slot,
-            Some(rally_point_proto::ids::GameFrameCount(50)),
-            None,
-            None,
+            crate::consensus::DepartureStamps {
+                last_frame: Some(rally_point_proto::ids::GameFrameCount(50)),
+                ..Default::default()
+            },
             LEAVE_REASON_DROPPED,
         );
         holds.hold(k.clone(), slot);
+    }
+
+    /// Leaves `slot` departed with its hold already gone: undecided, so it arms
+    /// the abandoned-session timer, but promising no reconnect, so the
+    /// session-emptied close runs instead of deferring — the state a departure
+    /// whose hold has been released leaves behind.
+    fn depart_slot_unheld(
+        makers: &Arc<crate::consensus::DecisionMakers>,
+        holds: &DropHolds,
+        k: &SessionKey,
+        slot: SlotId,
+    ) {
+        drop_slot(makers, holds, k, slot);
+        assert!(holds.release(k, slot), "the departure's hold is released");
+    }
+
+    /// Drains `rx` and counts the session-closed notices in it.
+    fn closes_reported(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::consensus::RelayNotice>,
+    ) -> usize {
+        let mut closes = 0;
+        while let Ok(notice) = rx.try_recv() {
+            if matches!(notice, crate::consensus::RelayNotice::SessionClosed { .. }) {
+                closes += 1;
+            }
+        }
+        closes
     }
 
     /// Regression for a relay assigned to a multi-relay session whose own client

@@ -1032,7 +1032,6 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
-    use base64::Engine as _;
     use rally_point_proto::control::{
         BufferBounds, DepartureKind, DivergedSlot, PlayerHandoff, RelayHello, ResultNotice,
         SessionRequest, TenantId,

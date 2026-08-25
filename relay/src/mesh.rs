@@ -1233,29 +1233,18 @@ fn reconcile_ack_cursors(
 /// Announces a departed slot to every peer relay serving `key`: the home relay
 /// tells its peers one of its clients left, so the session's authority can author
 /// the synced leave and every relay records the departure for handoff robustness.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn fan_out_slot_departed(
     links: &MeshLinks,
     key: &SessionKey,
     slot: SlotId,
-    last_frame: Option<u32>,
-    reachable_frame: Option<u32>,
-    result: Option<ResultEcho>,
+    stamps: &crate::consensus::DepartureStamps,
     reason: u32,
     connection_epoch: Option<u64>,
 ) {
     fan_out_control(
         links,
         key,
-        slot_departed_frame(
-            key.session,
-            slot,
-            last_frame,
-            reachable_frame,
-            result,
-            reason,
-            connection_epoch,
-        ),
+        slot_departed_frame(key.session, slot, stamps, reason, connection_epoch),
     );
 }
 
@@ -1459,34 +1448,33 @@ pub(crate) fn broadcast_leaves(
 fn slot_departed_frame(
     session: SessionId,
     slot: SlotId,
-    last_frame: Option<u32>,
-    reachable_frame: Option<u32>,
-    result: Option<ResultEcho>,
+    stamps: &crate::consensus::DepartureStamps,
     reason: u32,
     connection_epoch: Option<u64>,
 ) -> MeshControlFrame {
-    let (result_payload, result_arrival_ms, result_session_frame, result_slot_frame) = match result
-    {
-        Some(echo) => (
-            echo.payload.into(),
-            echo.arrival_ms,
-            echo.session_frame,
-            echo.slot_frame,
-        ),
-        None => (Vec::new().into(), 0, None, None),
-    };
+    let (result_payload, result_arrival_ms, result_session_frame, result_slot_frame) =
+        match stamps.result.clone() {
+            Some(echo) => (
+                echo.payload.into(),
+                echo.arrival_ms,
+                echo.session_frame,
+                echo.slot_frame,
+            ),
+            None => (Vec::new().into(), 0, None, None),
+        };
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
             slot: u32::from(slot.0),
-            last_frame,
-            reachable_frame,
+            last_frame: stamps.last_frame.map(|f| f.0),
+            reachable_frame: stamps.reachable_frame,
             reason,
             result_payload,
             result_arrival_ms,
             result_session_frame,
             result_slot_frame,
             connection_epoch,
+            final_turn_count: stamps.final_turn_count,
         })),
     }
 }
@@ -2953,17 +2941,21 @@ fn dispatch_mesh_control(
                 session_frame: departed.result_session_frame,
                 slot_frame: departed.result_slot_frame,
             });
+            let stamps = crate::consensus::DepartureStamps {
+                last_frame: departed
+                    .last_frame
+                    .map(rally_point_proto::ids::GameFrameCount),
+                reachable_frame: departed.reachable_frame,
+                result,
+                final_turn_count: departed.final_turn_count,
+            };
             let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
                 mesh.drop_holds.record_and_maybe_hold(&key, slot, || {
                     let outcome = crate::consensus::record_departure_for_epoch_outcome(
                         &mesh.decision_makers,
                         &key,
                         slot,
-                        departed
-                            .last_frame
-                            .map(rally_point_proto::ids::GameFrameCount),
-                        departed.reachable_frame,
-                        result,
+                        stamps.clone(),
                         departed.reason,
                         departed.connection_epoch,
                     );
@@ -2976,11 +2968,7 @@ fn dispatch_mesh_control(
                 &mesh.decision_makers,
                 &key,
                 slot,
-                departed
-                    .last_frame
-                    .map(rally_point_proto::ids::GameFrameCount),
-                departed.reachable_frame,
-                result,
+                stamps,
                 departed.reason,
                 departed.connection_epoch,
             ) {
@@ -3308,13 +3296,11 @@ fn reconcile_leaves_on_join(
     let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
     // Unbounded send only fails on a closed channel; the driver we are
     // registering into is alive here, so these always enqueue.
-    for (slot, last_frame, reachable_frame, result, reason, connection_epoch) in departures {
+    for (slot, stamps, reason, connection_epoch) in departures {
         let _ = control_tx.send(slot_departed_frame(
             key.session,
             slot,
-            last_frame.map(|f| f.0),
-            reachable_frame,
-            result,
+            &stamps,
             reason,
             connection_epoch,
         ));
@@ -4075,12 +4061,14 @@ mod tests {
             reason: 0,
             apply_at_frame: 10,
             leave_seq: 1,
+            final_turn_count: None,
         };
         let malformed_leave = LeaveDirective {
             slot: 300,
             reason: 0,
             apply_at_frame: 10,
             leave_seq: 2,
+            final_turn_count: None,
         };
 
         broadcast_leaves(
@@ -4445,7 +4433,18 @@ mod tests {
         let (_fwd1, mut ctl1) = register_link_channels(&links, &key);
         let (_fwd2, mut ctl2) = register_link_channels(&links, &key);
 
-        fan_out_slot_departed(&links, &key, SlotId(2), Some(41), Some(38), None, 3, None);
+        fan_out_slot_departed(
+            &links,
+            &key,
+            SlotId(2),
+            &crate::consensus::DepartureStamps {
+                last_frame: Some(rally_point_proto::ids::GameFrameCount(41)),
+                reachable_frame: Some(38),
+                ..Default::default()
+            },
+            3,
+            None,
+        );
         for rx in [&mut ctl1, &mut ctl2] {
             let frame = rx.try_recv().expect("every link is told");
             assert_eq!(
@@ -4470,6 +4469,7 @@ mod tests {
             reason: 3,
             apply_at_frame: 42,
             leave_seq: 1,
+            final_turn_count: None,
         };
         fan_out_leave_directive(&links, &key, leave);
         match ctl1.try_recv().expect("the live link still gets it").kind {
@@ -4508,9 +4508,10 @@ mod tests {
             &makers,
             &key,
             SlotId(2),
-            Some(GameFrameCount(60)),
-            None,
-            None,
+            crate::consensus::DepartureStamps {
+                last_frame: Some(GameFrameCount(60)),
+                ..Default::default()
+            },
             0x4000_0006,
         );
 
@@ -5392,6 +5393,7 @@ mod tests {
                 result_session_frame: None,
                 result_slot_frame: None,
                 connection_epoch: Some(11),
+                final_turn_count: None,
             })),
         };
         dispatch_mesh_control(stale_departure, RelayId(9), &joined, &sessions, &mesh_state);
@@ -5474,6 +5476,7 @@ mod tests {
             reason: 3,
             apply_at_frame: 90,
             leave_seq: 7,
+            final_turn_count: None,
         };
         let frame = MeshControlFrame {
             session: key.session.0,
@@ -5505,6 +5508,7 @@ mod tests {
             reason: 6, // any reason differing from `first`'s -- the conflict is what matters
             apply_at_frame: 150,
             leave_seq: 8,
+            final_turn_count: None,
         };
         let frame = MeshControlFrame {
             session: key.session.0,
@@ -5558,7 +5562,13 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
         );
-        crate::consensus::record_departure(&makers, &key, SlotId(0), None, None, None, 0x4000_0006);
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(0),
+            crate::consensus::DepartureStamps::default(),
+            0x4000_0006,
+        );
 
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
 
@@ -5634,9 +5644,7 @@ mod tests {
             &makers,
             &key,
             SlotId(0),
-            None,
-            None,
-            None,
+            crate::consensus::DepartureStamps::default(),
             0x4000_0006,
             Some(11),
         ));
@@ -5731,6 +5739,7 @@ mod tests {
                     reason: crate::consensus::LEAVE_REASON_DROPPED,
                     apply_at_frame: 41,
                     leave_seq: 1,
+                    final_turn_count: None,
                 })),
             };
             let departed = MeshControlFrame {
@@ -5745,6 +5754,7 @@ mod tests {
                     result_session_frame: None,
                     result_slot_frame: None,
                     connection_epoch: Some(11),
+                    final_turn_count: None,
                 })),
             };
 
@@ -5861,9 +5871,10 @@ mod tests {
             &makers,
             &key,
             SlotId(0),
-            Some(GameFrameCount(50)),
-            None,
-            None,
+            crate::consensus::DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
             0x4000_0006,
         );
 
@@ -5939,9 +5950,10 @@ mod tests {
             &makers,
             &key,
             SlotId(0),
-            Some(GameFrameCount(50)),
-            None,
-            None,
+            crate::consensus::DepartureStamps {
+                last_frame: Some(GameFrameCount(50)),
+                ..Default::default()
+            },
             0x4000_0006,
         );
 
