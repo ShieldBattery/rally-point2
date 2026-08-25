@@ -4282,14 +4282,19 @@ impl DecisionMaker {
                     // (`next_leave_seq += 1`), so two relays independently
                     // force-deciding the same fully-abandoned slot (see
                     // `force_decide_leave`) can agree completely on the decision
-                    // itself — `reason` and `apply_at_frame` — while disagreeing on
-                    // this purely-local numbering. That is not a conflict, just two
-                    // relays labeling the identical decision differently, so it is
-                    // logged at debug. A disagreement on the decision's substance
-                    // (a different reason or apply frame) is the real
-                    // authority-bug signal and still warns.
+                    // itself — `reason`, `apply_at_frame`, and
+                    // `final_turn_count` — while disagreeing on this
+                    // purely-local numbering. That is not a conflict, just two
+                    // relays labeling the identical decision differently, so it
+                    // is logged at debug. A disagreement on the decision's
+                    // substance is the real authority-bug signal and still
+                    // warns — the count especially, since clients schedule the
+                    // leave's application by it, so a count disagreement means
+                    // two relays would have survivors remove the slot at
+                    // different simulation steps.
                     if cached.reason == leave.reason
                         && cached.apply_at_frame == leave.apply_at_frame
+                        && cached.final_turn_count == leave.final_turn_count
                     {
                         tracing::debug!(
                             tenant = self.key.tenant.as_ref(),
@@ -4306,6 +4311,8 @@ impl DecisionMaker {
                             slot = leave.slot,
                             cached_apply = cached.apply_at_frame,
                             observed_apply = leave.apply_at_frame,
+                            cached_count = ?cached.final_turn_count,
+                            observed_count = ?leave.final_turn_count,
                             "conflicting synced leave for a slot already cached; keeping the first",
                         );
                     }
@@ -11881,6 +11888,42 @@ mod tests {
             maker.next_leave_seq, 9,
             "the higher observed seq is still adopted so this relay's own numbering \
              never collides, even though the directive itself wasn't cached",
+        );
+    }
+
+    /// `final_turn_count` is part of the decision's substance: clients schedule
+    /// the leave's application by it, so two directives that agree on reason and
+    /// frame but not count would have survivors remove the slot at different
+    /// simulation steps — a genuine authority conflict, not a leave_seq-style
+    /// labeling difference. Behaviorally the first still wins (pinned here); the
+    /// classification difference is the warn-vs-debug log level, which this
+    /// crate has no tracing-capture harness to assert.
+    #[test]
+    fn observe_leave_treats_a_differing_final_turn_count_as_a_substance_conflict() {
+        let mut maker =
+            DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+        let first = LeaveDirective {
+            slot: 3,
+            reason: DROPPED,
+            apply_at_frame: 51,
+            leave_seq: 4,
+            final_turn_count: Some(120),
+        };
+        assert!(maker.observe_leave(&first), "first insert for the slot");
+
+        let conflicting_count = LeaveDirective {
+            leave_seq: 9,
+            final_turn_count: Some(121),
+            ..first
+        };
+        assert!(
+            !maker.observe_leave(&conflicting_count),
+            "a count conflict is still not a fresh insert",
+        );
+        assert_eq!(
+            maker.decided_leaves.get(&SlotId(3)),
+            Some(&first),
+            "the first cached directive wins a count conflict",
         );
     }
 
