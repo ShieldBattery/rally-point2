@@ -2210,24 +2210,31 @@ pub async fn run_slot_link(
                             slot,
                             Some(connection_epoch),
                         );
-                        announce_departure(
-                            &drop_holds,
-                            &decision_makers,
-                            &sessions,
-                            &mesh_links,
-                            &key,
-                            slot,
-                            LEAVE_REASON_LEFT,
-                            // The one origin that stamps an exact count: this
-                            // handler is the slot's single ingress, it stops
-                            // forwarding in the same step (`break 'serve`
-                            // below), and a decided leave refuses readmission,
-                            // so nothing past this count can ever reach a
-                            // client. Every other departure origin passes
-                            // `None` — see `end_slot_link`.
-                            crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
-                            Some(connection_epoch),
-                        );
+                        // Gated like the teardown announce: a clean leave
+                        // landing after the session's retirement must not
+                        // write into swept state.
+                        let _ = mesh_for_teardown.gates.with_ingress(&key, || {
+                            announce_departure(
+                                &drop_holds,
+                                &decision_makers,
+                                &sessions,
+                                &mesh_links,
+                                &key,
+                                slot,
+                                LEAVE_REASON_LEFT,
+                                // The one intent-origin exact count: this
+                                // handler is the slot's single ingress, it
+                                // stops forwarding in the same step (`break
+                                // 'serve` below), and a decided leave refuses
+                                // readmission, so nothing past this count can
+                                // ever reach a client. Every other departure
+                                // origin passes `None` — see `end_slot_link`
+                                // (a finalized drop's count comes through
+                                // `finalize_drop`'s own seal instead).
+                                crate::mesh::forwarded_count(&mesh_for_teardown.seen, &key, slot),
+                                Some(connection_epoch),
+                            )
+                        });
                         leave_announced = true;
                         // The client's driver never expects an ack for the
                         // intent itself -- closing the link is the
@@ -2646,24 +2653,33 @@ fn end_slot_link(
         // (local and across the mesh) this one is no longer connected, immediately
         // and independent of the hold below, so survivors' displays reflect the
         // disconnect ~at once even while their turn stream stalls waiting on it.
-        if announce_departure(
-            &mesh.drop_holds,
-            &mesh.decision_makers,
-            sessions,
-            &mesh.links,
-            key,
-            slot,
-            LEAVE_REASON_DROPPED,
-            // A drop never carries an exact final turn count: unlike the
-            // clean-leave intent (the one origin that does), a dropped slot's
-            // ingress was not cut in the same step the count would be derived
-            // -- the slot can be reconnecting here or on another relay while a
-            // later drop-decide races it, pushing turns past any count
-            // recorded now. `commit_leave` enforces the same rule when the
-            // directive is built.
-            None,
-            Some(connection_epoch),
-        ) {
+        // Under the session's ingress gate: a link that dies during (or after)
+        // the session's retirement — the coordinator evicting a live relay
+        // closes links exactly this way — must not announce a departure into
+        // swept state, recreating a drop hold and a departure record nothing
+        // will ever clean up. The roster and per-member cleanup above still
+        // ran; a retired session has no one left to inform.
+        let announced = mesh.gates.with_ingress(key, || {
+            announce_departure(
+                &mesh.drop_holds,
+                &mesh.decision_makers,
+                sessions,
+                &mesh.links,
+                key,
+                slot,
+                LEAVE_REASON_DROPPED,
+                // A drop never carries an exact final turn count at the
+                // announce: unlike the clean-leave intent, a dropped slot's
+                // ingress was not cut in the same step a count would be
+                // derived — the slot can be reconnecting here or on another
+                // relay while a later drop-decide races it. An exact count
+                // for a drop only ever comes from the finalization handshake
+                // (`finalize_drop`), whose seal recreates the cut.
+                None,
+                Some(connection_epoch),
+            )
+        });
+        if announced == Some(true) {
             broadcast_connectivity(
                 sessions,
                 &mesh.links,
@@ -2781,6 +2797,23 @@ fn maybe_close_emptied_session_for_abandon_expiry(
 }
 
 fn maybe_close_emptied_session_inner(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    close_claim_requires_maker: bool,
+) {
+    // The whole evaluation is one ingress critical section: an emptied-close
+    // racing the session's retirement must land wholly before the sweeps (and
+    // be swept) or observe the retirement and do nothing — without this, a
+    // retired session's close evaluation would find no maker, claim the
+    // no-maker close default, and report a second SessionClosed. Recursive
+    // for the dispatch arms that already hold the gate.
+    let _ = mesh.gates.with_ingress(key, || {
+        maybe_close_emptied_session_gated(sessions, mesh, key, close_claim_requires_maker)
+    });
+}
+
+fn maybe_close_emptied_session_gated(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
@@ -5602,6 +5635,25 @@ mod tests {
     }
 
     /// A window that elapses on a session this relay already closed reports no
+    /// A retired session's emptied-close evaluation is refused by the ingress
+    /// gate outright: with the maker swept, the no-maker close default would
+    /// otherwise claim and report a second SessionClosed.
+    #[test]
+    fn a_retired_sessions_emptied_close_reports_nothing() {
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mesh.decision_makers.set_notice_notifier(tx);
+        let k = key();
+
+        mesh.gates.retire(&k);
+        maybe_close_emptied_session(&sessions, &mesh, &k);
+        assert!(
+            rx.try_recv().is_err(),
+            "a retired session's close evaluation reports nothing",
+        );
+    }
+
     /// second close — not even once the decision-maker is gone, which is what a
     /// retired session's descriptor removal leaves behind and which takes the
     /// close-report latch with it.
