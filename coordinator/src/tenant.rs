@@ -213,10 +213,21 @@ pub fn enroll_from_pkcs8(
     // and the durable-key startup path), so this is where the game-side buffer
     // ceiling is enforced for programmatic tenant sources — the JSON registry
     // loader checks it separately for its friendlier startup error, but a
-    // caller handing in deserialized bounds bypasses that loader entirely. A
-    // `max` past the ceiling would have every session's relay clamp it back
-    // anyway, so refusing here surfaces the misconfiguration instead of
-    // silently serving narrower bounds than the tenant asked for.
+    // caller handing in deserialized bounds bypasses that loader entirely
+    // (`BufferBounds`'s fields are public and the type derives `Deserialize`,
+    // both bypassing `BufferBounds::new`). Inversion is rejected first: with
+    // `min > max`, `max` alone understates what `clamp`'s swap-tolerant
+    // reading actually allows (`{ min: 15, max: 1 }` clamps as `1..=15`), so
+    // an inverted range could smuggle an over-ceiling depth past a max-only
+    // check. A `max` past the ceiling would have every session's relay clamp
+    // it back anyway, so refusing here surfaces the misconfiguration instead
+    // of silently serving narrower bounds than the tenant asked for.
+    if bounds.min > bounds.max {
+        return Err(KeyError::InvertedBounds {
+            min: bounds.min,
+            max: bounds.max,
+        });
+    }
     if bounds.max > rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX {
         return Err(KeyError::BoundsPastGameSafeMax { max: bounds.max });
     }
@@ -536,6 +547,12 @@ pub enum KeyError {
         rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX
     )]
     BoundsPastGameSafeMax { max: u32 },
+    /// The tenant's buffer bounds are inverted (`min > max`) — only reachable
+    /// through deserialized bounds that bypassed `BufferBounds::new`, and
+    /// refused rather than swap-read because an inverted range's real extent
+    /// is `max..=min`, which a max-only ceiling check would misjudge.
+    #[error("buffer bounds inverted: min {min} > max {max}")]
+    InvertedBounds { min: u32, max: u32 },
 }
 
 /// Creates an empty tenant store for a coordinator with no tenants enrolled.
@@ -620,6 +637,32 @@ mod tests {
             BufferBounds::new(1, GAME_SYNC_SAFE_BUFFER_MAX).unwrap(),
         )
         .expect("bounds at the ceiling enroll");
+    }
+
+    /// Deserialized bounds bypass `BufferBounds::new`, so an inverted range can
+    /// reach enrollment — and `{ min: 15, max: 1 }` clamps swap-tolerantly as
+    /// `1..=15`, smuggling an over-ceiling depth past a max-only check.
+    /// Enrollment refuses the inversion outright.
+    #[test]
+    fn inverted_bounds_fail_enrollment() {
+        use rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX;
+
+        let store = new_store();
+        let err = enroll(
+            &store,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            // A struct literal, as deserialization would produce it.
+            BufferBounds {
+                min: GAME_SYNC_SAFE_BUFFER_MAX + 1,
+                max: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            KeyError::InvertedBounds { min, max } if min == GAME_SYNC_SAFE_BUFFER_MAX + 1 && max == 1
+        ));
     }
 
     fn store_with_tenant() -> (TenantStore, KeyId, TenantId) {

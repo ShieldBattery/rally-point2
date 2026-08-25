@@ -3672,6 +3672,20 @@ impl DecisionMaker {
     /// cushion again -- both scale with the buffer, so the horizon does too (the
     /// wider of the old and new cushion, plus a fixed delivery margin).
     fn queue_directive(&mut self, new_buffer: u32, frame: GameFrameCount) -> Decision {
+        // The last line of defense for every locally-authored directive: the
+        // decision path clamps through `game_safe_clamp`, but the initial
+        // unconditional broadcast re-affirms `self.buffer` raw — which is
+        // seeded straight from wire `bounds.min` with no validation — and any
+        // future caller could slip the same way. Capping at the single point
+        // every directive is built means no configuration can make this relay
+        // author a game-breaking depth. Deliberately NOT applied to a peer
+        // authority's stamp this relay merely forwards (see
+        // `observe_directive`'s caller): rewriting or dropping one selectively
+        // would hand different clients different depths, which is itself a
+        // desync — and an observed over-ceiling buffer left raw as the
+        // baseline is what lets a later promotion here author the corrective
+        // lower instead of believing no change is needed.
+        let new_buffer = new_buffer.min(GAME_SYNC_SAFE_BUFFER_MAX);
         let span = self.buffer.0.max(new_buffer);
         self.buffer = BufferSize(new_buffer);
         let applied_frame =
@@ -9716,6 +9730,32 @@ mod tests {
         // Fires once: a later still-RTT-less framed turn queues nothing new.
         let again = ingest_at(&mut maker, &conditions(0, 0, 0, 200), 6);
         assert_eq!(again, None, "the initial broadcast is a one-shot");
+    }
+
+    /// The initial broadcast re-affirms `self.buffer`, which is seeded straight
+    /// from wire `bounds.min` with no validation — a deserialized or inverted
+    /// bounds (public fields bypass `BufferBounds::new`) can put it past the
+    /// game-sync-safe ceiling, and a directive that deep deterministically
+    /// mass-drops the game's players. `queue_directive` caps every
+    /// locally-authored directive regardless of how the value reached it.
+    #[test]
+    fn the_initial_broadcast_is_capped_at_the_game_sync_safe_ceiling() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            // A struct literal, as wire deserialization would produce it: no
+            // constructor validation, min already past the ceiling.
+            BufferBounds {
+                min: GAME_SYNC_SAFE_BUFFER_MAX + 6,
+                max: GAME_SYNC_SAFE_BUFFER_MAX + 6,
+            },
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let d = ingest_at(&mut maker, &conditions(0, 0, 0, 100), 5).expect("initial directive");
+        assert_eq!(d.buffer, BufferSize(GAME_SYNC_SAFE_BUFFER_MAX));
+        let stamp = maker.active_directive().expect("queued for broadcast");
+        assert_eq!(stamp.buffer_turns, GAME_SYNC_SAFE_BUFFER_MAX);
     }
 
     /// Nothing is broadcast before the first framed turn: conditions can flow in
