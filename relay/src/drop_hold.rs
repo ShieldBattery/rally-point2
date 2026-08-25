@@ -392,6 +392,14 @@ impl DropHolds {
     /// the relay reported the session's close during the window (see
     /// [`note_session_closed`](Self::note_session_closed)): the force-decide is owed
     /// either way, but a close already reported is not owed a second time.
+    ///
+    /// Expiry is not proof the abandonment still holds: a cancellation can land
+    /// in the same instant the window elapses (the select is biased toward the
+    /// cancel, but a cancel arriving after the sleep completes still loses), and
+    /// the close-reported flag can miss a close that lands after the timer
+    /// removed its entry. `on_expire` must therefore re-derive the abandoned
+    /// condition itself before deciding anything, rather than trusting that
+    /// reaching it means the session is still empty.
     pub fn arm_abandon<F>(&self, key: SessionKey, on_expire: F)
     where
         F: FnOnce(bool) + Send + 'static,
@@ -416,7 +424,19 @@ impl DropHolds {
         let timers = Arc::clone(&self.abandon_timers);
         let timeout = self.abandon_timeout;
         tokio::spawn(async move {
+            // `biased` polls the cancel branch first, so a cancellation that
+            // lands by the deadline deterministically wins when both branches
+            // are ready in the same poll — an unbiased pick could run the
+            // expiry over a cancellation that already happened. A cancellation
+            // arriving *after* the sleep completes can still lose; `on_expire`
+            // re-derives the abandoned condition itself before acting (see its
+            // caller), so losing that residual race is harmless.
             tokio::select! {
+                biased;
+                _ = cancel_rx => {
+                    // Cancelled (a slot re-registered). The canceller already removed
+                    // the entry; nothing to decide here.
+                }
                 () = tokio::time::sleep(timeout) => {
                     // The window elapsed: remove our own entry (so a later
                     // abandonment can arm afresh) and decide. Removing under the lock
@@ -426,10 +446,6 @@ impl DropHolds {
                     // double-decide.
                     timers.lock().remove(&key);
                     on_expire(close_reported.load(Ordering::Relaxed));
-                }
-                _ = cancel_rx => {
-                    // Cancelled (a slot re-registered). The canceller already removed
-                    // the entry; nothing to decide here.
                 }
             }
         });

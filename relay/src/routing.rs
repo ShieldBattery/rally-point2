@@ -3307,11 +3307,14 @@ pub(crate) fn reconcile_abandon(
 /// re-evaluated here once the holds are released — this timer firing is the
 /// bound on how long an abandoned session's close can be deferred. That
 /// re-evaluation is skipped when `close_reported` says the relay already reported
-/// this session's close: the deferral it exists to end never happened, and the
-/// latch that would otherwise refuse a second report lives on the decision-maker,
-/// which the retiring session's descriptor removal takes away mid-window. The
-/// force-decide above still runs either way — the undecided holds it releases
-/// outlive the close, and nothing else ever releases them.
+/// this session's close (the deferral it exists to end never happened), and also
+/// when no decision-maker exists anymore: the timer only ever armed while one
+/// did, so a missing maker proves the descriptor was retired mid-window — the
+/// close already ran and reached the coordinator — and
+/// [`consensus::claim_close_report`]'s no-maker default (`true`, meant for
+/// sessions that never had a maker) must not re-report it. The force-decide
+/// above still runs either way — the undecided holds it releases outlive the
+/// close, and nothing else ever releases them.
 ///
 /// This release is cleanup, not a claim gate — unlike [`honor_drop_request`], it
 /// does not need to check the boolean before deciding, because
@@ -3330,6 +3333,31 @@ fn decide_and_broadcast_abandoned(
     key: &SessionKey,
     close_reported: bool,
 ) {
+    // Re-derive the abandoned condition before deciding anything. The timer's
+    // expiry can race the cancellation a re-registering slot sends
+    // (`cancel_abandon` and the elapsed sleep can both be ready in the same
+    // poll), and a cancellation that loses that race must still win the
+    // outcome: with a slot live again — here, or on a peer whose presence
+    // report says so — the departures stay held for the live machinery (a
+    // survivor's drop request, the slot's own reconnect, or a later
+    // re-abandonment re-arming this timer) instead of being force-decided out
+    // from under a live session. Presence is eventually consistent, so a
+    // reconnect on a peer relay in the final instants can still slip past this
+    // check — but the recheck narrows the race from the whole abandon window
+    // to that propagation gap, and the decided-slot reinstate guard already
+    // covers the reconnecting slot itself.
+    let own_live = {
+        let roster = sessions.lock();
+        roster.get(key).map_or(0, |slots| slots.len() as u32)
+    };
+    if own_live > 0 || !crate::presence::all_empty(&mesh.presence, key, own_live) {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            "abandoned-session window elapsed but a slot is live again; leaving departures held",
+        );
+        return;
+    }
     let leaves = consensus::decide_abandoned_departures(&mesh.decision_makers, key);
     if !leaves.is_empty() {
         tracing::info!(
@@ -3351,6 +3379,19 @@ fn decide_and_broadcast_abandoned(
             session = key.session.0,
             "abandoned-session window elapsed on an already-closed session; \
              leaving its reported close alone",
+        );
+        return;
+    }
+    // The `close_reported` flag can lose a race (the close lands after the
+    // timer removed its registry entry, so `note_session_closed` had nothing to
+    // mark); the maker's absence is the reliable signal for that ordering,
+    // since the close cascade's descriptor retirement is what destroys it.
+    if !consensus::maker_exists(&mesh.decision_makers, key) {
+        tracing::debug!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            "abandoned-session window elapsed on a retired session; \
+             not re-reporting its close",
         );
         return;
     }
@@ -3633,6 +3674,10 @@ mod tests {
 
         let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
         g0.disarm();
+        // The serve path reports own presence right after registering; without a
+        // live report the session is never `ever_live` and the abandoned-expiry
+        // recheck below would (correctly) refuse to treat it as abandoned.
+        report_own_presence(&sessions, &mesh, &k);
         crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
 
         // The only local slot's link dies without a clean leave — the emptying
@@ -5035,6 +5080,91 @@ mod tests {
             crate::consensus::has_undecided_departure(&makers, &k),
             "no departure was decided",
         );
+    }
+
+    /// An expiry that races a re-registration and loses the cancellation (the
+    /// sleep completed in the same instant the cancel landed) must still not
+    /// force-decide: the expiry re-derives the abandoned condition, finds a
+    /// slot live again on the local roster, and stands down — leaving the other
+    /// slot's drop held for the live machinery (the returned survivor's drop
+    /// request, or a later re-abandonment) instead of force-deciding it out
+    /// from under a live session.
+    #[test]
+    fn an_expiry_that_lost_the_cancel_race_stands_down_when_a_slot_is_live_again() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_notice_notifier(tx);
+        drop_slot(&makers, &holds, &k, SlotId(0));
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+
+        // Slot 0 re-registers exactly as the server's re-register path does...
+        assert!(
+            holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
+                &makers,
+                &k,
+                SlotId(0)
+            ))
+        );
+        let (_registration, _inbox) =
+            register(&sessions, &k, SlotId(0)).expect("the returning slot registers");
+        crate::presence::record_own(&presence, &k, 1);
+
+        // ...and the expiry callback fires anyway (the ordering where its sleep
+        // completed before the cancellation reached the select).
+        decide_and_broadcast_abandoned(
+            &sessions,
+            &mesh_with(&holds, &makers, &mesh_links, &presence),
+            &k,
+            false,
+        );
+
+        assert!(
+            crate::consensus::has_undecided_departure(&makers, &k),
+            "the raced expiry decided nothing",
+        );
+        assert!(
+            holds.is_pending(&k, SlotId(1)),
+            "the other slot's drop is still held for the live session",
+        );
+        assert_eq!(closes_reported(&mut rx), 0, "no close was reported");
+    }
+
+    /// The same stand-down applies when the liveness is on a peer relay: an
+    /// expiry that finds a peer explicitly reporting a live slot leaves the
+    /// departures held.
+    #[test]
+    fn an_expiry_stands_down_when_a_peer_reports_a_live_slot() {
+        use crate::presence::Candidate;
+        use rally_point_proto::ids::RelayId;
+
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        crate::presence::set_order(
+            &presence,
+            &k,
+            vec![Candidate::SelfRelay, Candidate::Peer(RelayId(2))],
+        );
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_notice_notifier(tx);
+        drop_slot(&makers, &holds, &k, SlotId(0));
+        drop_slot(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+        crate::presence::record_peer(&presence, &k, RelayId(2), 1);
+
+        decide_and_broadcast_abandoned(
+            &sessions,
+            &mesh_with(&holds, &makers, &mesh_links, &presence),
+            &k,
+            false,
+        );
+
+        assert!(
+            crate::consensus::has_undecided_departure(&makers, &k),
+            "a peer's live slot keeps the departures held",
+        );
+        assert_eq!(closes_reported(&mut rx), 0, "no close was reported");
     }
 
     /// The timer never arms while at least one slot is live session-wide, no matter
