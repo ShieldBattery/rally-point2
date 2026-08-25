@@ -600,6 +600,16 @@ impl Lifecycle {
         self.mark_started(state);
         self.reevaluate_reaps(&tenant, session, state);
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
+        // Fold a departure recorded after a rehome's descriptor build into the
+        // staged resumed descriptors (a no-op for a never-rehomed session).
+        // The sessions lock must be released first: the refresh takes the
+        // assignment lock and then re-reads the accounting through
+        // `departed_slots`, and every other path orders assignment before
+        // sessions.
+        drop(sessions);
+        crate::session::refresh_resumed_descriptors(&self.inner.setup, &tenant, session, || {
+            self.departed_slots(&tenant, session)
+        });
     }
 
     /// The slots this coordinator has recorded as departed for `session`, each

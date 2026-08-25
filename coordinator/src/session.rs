@@ -1081,6 +1081,58 @@ fn rehome_inner(
     RehomeOutcome::NewTarget(RelayEndpoint::from(&new_entry))
 }
 
+/// Re-stages every serving relay's **resumed** descriptor for `session` with
+/// the current departed accounting — a no-op unless the session's staged
+/// descriptors are already resumed ones (it has been rehomed).
+///
+/// Called on every departure notice. A rehome reads the departed accounting
+/// once, at descriptor-build time; a departure recorded after that read lives
+/// only in the lifecycle's accounting and the reporting relay's own mesh
+/// state, and if that relay drains or dies before mesh-reconciling with the
+/// rehomed relay, no surviving peer can ever replay it — the fresh relay then
+/// waits forever on a slot that permanently left. Re-staging folds the late
+/// departure into the descriptors themselves, which every serving relay's
+/// idempotent descriptor replay then seeds and fans.
+///
+/// `read_departed` is invoked under the assignment lock, exactly like the
+/// rehome's own departed read, so the rebuild linearizes against a concurrent
+/// rehome or terminal close: whichever runs second sees the other's committed
+/// state. A never-rehomed session needs none of this — its relays all learn
+/// departures over the mesh as they happen, and its original descriptors
+/// carry no departure seeds by design.
+pub(crate) fn refresh_resumed_descriptors(
+    setup: &SessionSetup,
+    tenant: &rally_point_proto::control::TenantId,
+    session: SessionId,
+    read_departed: impl FnOnce() -> Vec<DepartedSlot>,
+) {
+    let _assign = setup.lock_assignment();
+    let serving = setup.serving_relays(tenant, session);
+    let resumed = serving.iter().any(|&relay_id| {
+        setup
+            .descriptors
+            .current_for(relay_id)
+            .iter()
+            .any(|d| d.tenant == *tenant && d.session == session && d.resumed)
+    });
+    if !resumed {
+        return;
+    }
+    let departed_slots = read_departed();
+    for relay_id in serving {
+        if let Some(descriptor) = build_descriptor(
+            setup,
+            tenant,
+            session,
+            relay_id,
+            true,
+            departed_slots.clone(),
+        ) {
+            setup.descriptors.record(relay_id, descriptor);
+        }
+    }
+}
+
 /// The first session id for a freshly constructed coordinator: the wall clock
 /// in microseconds since the Unix epoch. Relays hold per-session state keyed
 /// on `(tenant, session)` — routing groups, dedup sets, decision-makers — and
@@ -3643,6 +3695,70 @@ mod tests {
             }],
             "the mid-rehome departure rides the resumed descriptor",
         );
+    }
+
+    #[test]
+    fn a_departure_after_the_rehome_refreshes_the_staged_resumed_descriptors() {
+        // A departure notice landing after the rehome committed (and whose
+        // reporting relay may die before ever mesh-reconciling with the new
+        // relay) must still reach the rehomed relay: the refresh folds it into
+        // the staged resumed descriptors, whose idempotent replay seeds it.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+        let RehomeOutcome::NewTarget(_) = rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            setup.descriptors().current_for(RelayId(2))[0].departed_slots,
+            vec![],
+            "the rehome staged no departures yet",
+        );
+
+        let late = DepartedSlot {
+            slot: SlotId(1),
+            kind: DepartureKind::Left,
+            final_turn_count: Some(88),
+        };
+        refresh_resumed_descriptors(&setup, &tid(), resp.session, || vec![late.clone()]);
+
+        let staged = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].resumed, "the refreshed descriptor stays resumed");
+        assert_eq!(
+            staged[0].departed_slots,
+            vec![late],
+            "the late departure rides the refreshed resumed descriptor",
+        );
+    }
+
+    #[test]
+    fn a_departure_on_a_never_rehomed_session_restages_nothing() {
+        // Without a rehome, every serving relay learns departures over the
+        // mesh as they happen; the original descriptors carry no departure
+        // seeds by design, and the refresh must leave them untouched.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+
+        refresh_resumed_descriptors(&setup, &tid(), resp.session, || {
+            vec![DepartedSlot {
+                slot: SlotId(1),
+                kind: DepartureKind::Left,
+                final_turn_count: Some(3),
+            }]
+        });
+
+        for relay_id in setup.serving_relays(&tid(), resp.session) {
+            let staged = setup.descriptors().current_for(relay_id);
+            assert_eq!(staged.len(), 1);
+            assert!(!staged[0].resumed, "an original descriptor stays unresumed");
+            assert_eq!(
+                staged[0].departed_slots,
+                vec![],
+                "no departure seeds are staged onto a never-rehomed session",
+            );
+        }
     }
 
     #[test]
