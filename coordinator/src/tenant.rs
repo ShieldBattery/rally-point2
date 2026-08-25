@@ -209,6 +209,17 @@ pub fn enroll_from_pkcs8(
     bounds: BufferBounds,
     pkcs8: &[u8],
 ) -> Result<[u8; PUBLIC_KEY_LEN], KeyError> {
+    // Every enrollment path funnels through here (`enroll`, `enroll_generated`,
+    // and the durable-key startup path), so this is where the game-side buffer
+    // ceiling is enforced for programmatic tenant sources — the JSON registry
+    // loader checks it separately for its friendlier startup error, but a
+    // caller handing in deserialized bounds bypasses that loader entirely. A
+    // `max` past the ceiling would have every session's relay clamp it back
+    // anyway, so refusing here surfaces the misconfiguration instead of
+    // silently serving narrower bounds than the tenant asked for.
+    if bounds.max > rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX {
+        return Err(KeyError::BoundsPastGameSafeMax { max: bounds.max });
+    }
     // `maybe_unchecked`: ring verifies the embedded public key when the
     // document carries one (v2) and simply has none to check in the v1 form —
     // the verifying key returned below is derived from the private half either
@@ -514,6 +525,17 @@ pub enum KeyError {
     /// The token could not be encoded (oversized kid or tenant string).
     #[error("token encoding error: {0}")]
     Token(rally_point_proto::token::TokenError),
+    /// The tenant's buffer-bounds `max` exceeds the game-sync-safe ceiling
+    /// ([`rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX`]) — a depth
+    /// past it deterministically mass-drops the game's players, so enrollment
+    /// refuses it rather than serving a tenant whose policy the relays would
+    /// have to clamp back.
+    #[error(
+        "buffer bounds max {max} exceeds the game-sync-safe ceiling \
+         ({})",
+        rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX
+    )]
+    BoundsPastGameSafeMax { max: u32 },
 }
 
 /// Creates an empty tenant store for a coordinator with no tenants enrolled.
@@ -567,6 +589,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, KeyError::InvalidPkcs8));
+    }
+
+    /// Every enrollment path funnels through `enroll_from_pkcs8`, so bounds past
+    /// the game-sync-safe ceiling are refused for programmatic tenant sources
+    /// too — not only the JSON registry loader's own check. A buffer depth past
+    /// the ceiling deterministically mass-drops the game's players.
+    #[test]
+    fn bounds_past_the_game_safe_ceiling_fail_enrollment() {
+        use rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX;
+
+        let store = new_store();
+        let err = enroll(
+            &store,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, GAME_SYNC_SAFE_BUFFER_MAX + 1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            KeyError::BoundsPastGameSafeMax { max } if max == GAME_SYNC_SAFE_BUFFER_MAX + 1
+        ));
+
+        // The ceiling itself is the last allowed value.
+        enroll(
+            &store,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, GAME_SYNC_SAFE_BUFFER_MAX).unwrap(),
+        )
+        .expect("bounds at the ceiling enroll");
     }
 
     fn store_with_tenant() -> (TenantStore, KeyId, TenantId) {

@@ -221,8 +221,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
-    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot, ResultEcho,
-    ResultNotice, TenantId,
+    BufferBounds, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
+    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
@@ -3857,7 +3857,7 @@ impl DecisionMaker {
             };
 
             if let Some(new_buffer) = new_buffer {
-                let new_buffer = self.bounds.clamp(new_buffer);
+                let new_buffer = self.game_safe_clamp(new_buffer);
                 if new_buffer != self.buffer.0 {
                     // A real change is itself the session's first broadcast, so
                     // the initial-directive fallback below is satisfied.
@@ -4811,15 +4811,30 @@ impl DecisionMaker {
     /// promotion reasons from the right base and this relay stamps the same depth.
     /// A depth-less directive (an authority that predates the field, or a resumed
     /// re-home re-push into a running game) leaves the buffer untouched: a stale
-    /// initial depth must never resize a live game. The depth is bounds-clamped
-    /// defensively, though the authority already clamped it before stamping.
+    /// initial depth must never resize a live game. The depth is clamped
+    /// defensively (bounds plus the game-sync-safe ceiling), though the
+    /// authority already clamped it before stamping.
     pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
         self.latch_started();
         if let Some(depth) = initial_buffer_turns {
-            let clamped = self.bounds.clamp(depth);
+            let clamped = self.game_safe_clamp(depth);
             self.buffer = BufferSize(clamped);
             self.initial_buffer_turns = Some(clamped);
         }
+    }
+
+    /// Clamps a buffer depth into this session's policy bounds, then caps it at
+    /// [`GAME_SYNC_SAFE_BUFFER_MAX`] regardless of what those bounds allow. The
+    /// coordinator validates its tenant registry against the same ceiling, but
+    /// bounds also reach the relay straight off the wire — a descriptor from an
+    /// older or misconfigured coordinator deserializes with no validation — and
+    /// a depth past the ceiling deterministically mass-drops the game's players
+    /// (the game's own sync validation, not the relay, is what breaks). Every
+    /// depth the relay emits (the computed seed, an adopted seed, and each
+    /// buffer directive) funnels through this, so no configuration can make the
+    /// relay issue a game-breaking depth.
+    fn game_safe_clamp(&self, depth: u32) -> u32 {
+        self.bounds.clamp(depth).min(GAME_SYNC_SAFE_BUFFER_MAX)
     }
 
     /// Whether `slot` is admissible on this relay: the homed set is empty
@@ -4971,7 +4986,7 @@ impl DecisionMaker {
             base.saturating_add(cushion)
         };
 
-        self.bounds.clamp(depth)
+        self.game_safe_clamp(depth)
     }
 
     /// The descriptor's one-way `latency_hint_ms` converted to whole turns:
@@ -13135,6 +13150,24 @@ mod tests {
             BufferSize(1),
             "the seed buffer is untouched"
         );
+    }
+
+    /// Wire bounds deserialize with no validation, so a misconfigured or older
+    /// coordinator can hand a maker a `max` past the game-sync-safe ceiling —
+    /// but every depth the relay emits is capped at the ceiling regardless: a
+    /// depth past it deterministically mass-drops the game's players (the
+    /// game's native sync validation, not the relay, is what breaks).
+    #[test]
+    fn emitted_depths_are_capped_at_the_game_sync_safe_ceiling_regardless_of_bounds() {
+        let deep = bounds(1, GAME_SYNC_SAFE_BUFFER_MAX + 10);
+        let mut m = DecisionMaker::new(key(), deep, law(), Authority::Peer, HashSet::new());
+        m.adopt_session_start(Some(GAME_SYNC_SAFE_BUFFER_MAX + 10));
+        assert_eq!(
+            m.initial_buffer_turns(),
+            Some(GAME_SYNC_SAFE_BUFFER_MAX),
+            "an adopted seed past the ceiling caps at it, not at the wire bounds",
+        );
+        assert_eq!(m.buffer(), BufferSize(GAME_SYNC_SAFE_BUFFER_MAX));
     }
 
     #[test]
