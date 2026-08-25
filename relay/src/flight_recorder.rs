@@ -61,7 +61,7 @@
 //! identity the blob header carries; the tenant-first prefix is the structural hook
 //! for tenant-scoped read authorization.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -680,6 +680,56 @@ struct RecorderInner {
     /// Where flushed blobs go. Set once at startup; absent, a flush is a
     /// logged discard (the recorder still records — cheap and bounded).
     sink: OnceLock<Arc<dyn FlightSink>>,
+    /// The sessions stored recently, so a second store for one of them can say
+    /// so (see [`RecentStores`]).
+    recent_stores: Mutex<RecentStores>,
+}
+
+/// How many recently stored sessions the recorder remembers. A store is only
+/// worth announcing as a repeat while the recording it displaces is the one an
+/// investigation would read, and every way a second store arises — a session
+/// this relay serves again, a teardown path evaluated twice — happens within a
+/// session teardown's own timescale. So a bounded recent window catches the
+/// repeats that matter at fixed cost, rather than remembering every session the
+/// relay has ever served for the life of the process.
+const RECENT_STORES: usize = 256;
+
+/// The recently stored sessions, oldest-first: a bounded window over what this
+/// relay has written to the flight store.
+///
+/// Every recording a relay makes of one session is stored under a single key, so
+/// storing a session twice replaces what the first store wrote: expected when the
+/// relay genuinely served the session again, a silently lost recording otherwise.
+/// The two are indistinguishable at the store, so the second store says so in the
+/// log — and this window is how it knows it is the second.
+#[derive(Default)]
+struct RecentStores {
+    /// The remembered keys in store order; the front is evicted when the window
+    /// is full.
+    order: VecDeque<SessionKey>,
+    /// The same keys, for the membership test.
+    keys: HashSet<SessionKey>,
+}
+
+impl RecentStores {
+    /// Notes a store of `key`'s recording, reporting whether the window already
+    /// held one for it — that is, whether this store replaced an earlier one.
+    /// A repeat leaves the window unchanged: it names the same session that is
+    /// already in it, and re-recording it would evict an unrelated session for
+    /// nothing.
+    fn note(&mut self, key: &SessionKey) -> bool {
+        if self.keys.contains(key) {
+            return true;
+        }
+        if self.order.len() >= RECENT_STORES
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.keys.remove(&evicted);
+        }
+        self.order.push_back(key.clone());
+        self.keys.insert(key.clone());
+        false
+    }
 }
 
 /// Live recordings plus work retired by terminal flushes. Keeping them behind
@@ -912,6 +962,21 @@ impl FlightRecorder {
                     samples = blob.samples.len(),
                     "flight recording flushed",
                 );
+                // One key per session per relay: this store replaced whatever the
+                // earlier one wrote, so the earlier recording is no longer
+                // readable and the fact belongs in the log rather than only in
+                // the difference between two stored objects nobody compares.
+                if self.inner.recent_stores.lock().note(key) {
+                    tracing::warn!(
+                        tenant = key.tenant.as_ref(),
+                        session = key.session.0,
+                        relay_id = blob.relay_id,
+                        events = blob.events.len(),
+                        samples = blob.samples.len(),
+                        "flight recording stored again for a session already stored; \
+                         it replaced this relay's earlier recording",
+                    );
+                }
                 FlushOutcome::Stored
             }
             Err(error) => {
@@ -1354,6 +1419,62 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record.event, FlightEvent::BufferDirective { .. })),
             "the stored recording is the one holding what the relay observed",
+        );
+    }
+
+    #[test]
+    fn the_recent_store_window_reports_a_repeat_and_evicts_the_oldest() {
+        let mut recent = RecentStores::default();
+        assert!(!recent.note(&key(1)), "a first store is not a repeat");
+        assert!(recent.note(&key(1)), "storing the same session again is");
+        assert_eq!(
+            recent.order.len(),
+            1,
+            "a repeat does not re-enter the window"
+        );
+
+        // One store past the cap evicts the oldest session, which then reads as a
+        // first store again.
+        for session in 2..=(RECENT_STORES as u64 + 1) {
+            assert!(!recent.note(&key(session)), "each session is new");
+        }
+        assert_eq!(recent.order.len(), RECENT_STORES, "the window is capped");
+        assert!(!recent.note(&key(1)), "the evicted session is forgotten");
+    }
+
+    #[tokio::test]
+    async fn a_store_for_an_already_stored_session_is_noticed() {
+        let recorder = FlightRecorder::default();
+        let sink = Arc::new(CaptureSink::default());
+        recorder.set_sink(sink.clone());
+        let k = key(1);
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: false,
+            },
+        );
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
+
+        // The relay serves the session again, and the second store replaces what
+        // the first one wrote.
+        recorder.record(
+            &k,
+            FlightEvent::SlotConnected {
+                slot: 0,
+                resumed: true,
+            },
+        );
+        assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
+
+        assert_eq!(sink.blobs.lock().len(), 2, "both stores reached the sink");
+        let mut recent = recorder.inner.recent_stores.lock();
+        assert!(recent.note(&k), "the flushes remembered the stored session");
+        assert_eq!(
+            recent.order.len(),
+            1,
+            "one entry for the one session stored"
         );
     }
 

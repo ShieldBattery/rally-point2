@@ -72,6 +72,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -91,11 +92,24 @@ type Holds = Arc<Mutex<HashMap<(SessionKey, SlotId), Instant>>>;
 type RequestLimiters = Arc<Mutex<HashMap<(SessionKey, SlotId), RequestBucket>>>;
 
 /// The map of live abandoned-session timers: one per session that has gone empty
-/// session-wide with an undecided departure. The value is the timer task's cancel
-/// handle — dropping it (via [`DropHolds::cancel_abandon`], or when the timer fires
-/// and removes its own entry) sends the task down its cancel branch. A present
-/// entry means a timer is running for that session.
-type AbandonTimers = Arc<Mutex<HashMap<SessionKey, oneshot::Sender<()>>>>;
+/// session-wide with an undecided departure. A present entry means a timer is
+/// running for that session.
+type AbandonTimers = Arc<Mutex<HashMap<SessionKey, AbandonTimer>>>;
+
+/// One running abandoned-session timer, as the map holds it: the task's cancel
+/// handle plus what the task must learn about the window it is timing.
+struct AbandonTimer {
+    /// The timer task's cancel handle. Dropping it (via
+    /// [`DropHolds::cancel_abandon`], or when the timer fires and removes its own
+    /// entry) sends the task down its cancel branch.
+    _cancel: oneshot::Sender<()>,
+    /// Whether the relay reported this session's close while the timer ran (see
+    /// [`DropHolds::note_session_closed`]). The timer task holds the same handle
+    /// and reads it at expiry, so the answer survives the map entry's removal: a
+    /// `cancel_abandon` racing the fire must not turn a reported close back into
+    /// an unreported one.
+    close_reported: Arc<AtomicBool>,
+}
 
 /// How long a dropped slot's hold must stand before the session's authority relay
 /// will honor a manual request to drop it.
@@ -374,12 +388,16 @@ impl DropHolds {
     ///
     /// `on_expire` is the decide-and-broadcast step; it runs once, at expiry, on the
     /// timer task. It is synchronous (a force-decide plus channel sends, no awaits)
-    /// so the timer needs no borrowed state past the fire.
+    /// so the timer needs no borrowed state past the fire. Its argument is whether
+    /// the relay reported the session's close during the window (see
+    /// [`note_session_closed`](Self::note_session_closed)): the force-decide is owed
+    /// either way, but a close already reported is not owed a second time.
     pub fn arm_abandon<F>(&self, key: SessionKey, on_expire: F)
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce(bool) + Send + 'static,
     {
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let close_reported = Arc::new(AtomicBool::new(false));
         {
             let mut timers = self.abandon_timers.lock();
             if timers.contains_key(&key) {
@@ -387,7 +405,13 @@ impl DropHolds {
                 // redundant empty-presence observation cannot push the deadline out.
                 return;
             }
-            timers.insert(key.clone(), cancel_tx);
+            timers.insert(
+                key.clone(),
+                AbandonTimer {
+                    _cancel: cancel_tx,
+                    close_reported: Arc::clone(&close_reported),
+                },
+            );
         }
         let timers = Arc::clone(&self.abandon_timers);
         let timeout = self.abandon_timeout;
@@ -401,7 +425,7 @@ impl DropHolds {
                     // either way the force-decide is idempotent, so a race cannot
                     // double-decide.
                     timers.lock().remove(&key);
-                    on_expire();
+                    on_expire(close_reported.load(Ordering::Relaxed));
                 }
                 _ = cancel_rx => {
                     // Cancelled (a slot re-registered). The canceller already removed
@@ -417,6 +441,23 @@ impl DropHolds {
     /// cancel branch.
     pub fn cancel_abandon(&self, key: &SessionKey) {
         self.abandon_timers.lock().remove(key);
+    }
+
+    /// Records that this relay has reported `key`'s session close, so an
+    /// abandoned-session timer still running for it force-decides at expiry
+    /// without re-running the close (see [`arm_abandon`](Self::arm_abandon)).
+    ///
+    /// A no-op when no timer is armed, which is safe in both directions. A timer
+    /// armed *after* the close cannot re-run it either: arming takes an undecided
+    /// departure, so the session's decision-maker still exists, and while it does
+    /// it holds the claimed close-report latch that refuses a second report. Only a
+    /// timer spanning the close needs to be told, because the descriptor removal
+    /// that retires the session takes that maker — and the latch with it — while
+    /// the timer runs on.
+    pub fn note_session_closed(&self, key: &SessionKey) {
+        if let Some(timer) = self.abandon_timers.lock().get(key) {
+            timer.close_reported.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Whether an abandoned-session timer is currently armed for `key` — for tests
@@ -445,7 +486,11 @@ impl DropHolds {
     /// The abandoned-session timer is, separately, never swept here either: it
     /// arms at the very moment this relay's last local slot leaves (a fully-empty
     /// session), so cancelling it in the same teardown would defeat its whole
-    /// purpose. It self-removes when it fires, or is cancelled by a re-register.
+    /// purpose — the force-decide that releases the undecided holds this sweep
+    /// deliberately keeps. It self-removes when it fires, or is cancelled by a
+    /// re-register. A close running alongside this sweep marks it instead (see
+    /// [`note_session_closed`](Self::note_session_closed)), so the expiry still
+    /// force-decides but does not re-run the close.
     pub fn end_session(&self, key: &SessionKey, decided: &HashSet<SlotId>) {
         self.holds
             .lock()

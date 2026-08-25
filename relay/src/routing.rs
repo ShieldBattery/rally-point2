@@ -2794,6 +2794,11 @@ pub(crate) fn maybe_close_emptied_session(
         return;
     }
     consensus::session_closed(&mesh.decision_makers, key);
+    // An abandoned-session timer running for this session must not re-run the
+    // close when its window elapses: the close has been reported now, and the
+    // teardown below is what it would otherwise repeat. Its force-decide is still
+    // owed, so the timer is marked rather than cancelled.
+    mesh.drop_holds.note_session_closed(key);
     // The relay's last local member for the session is gone, so its lobby log
     // and (now-empty) member set can be dropped — mirroring how the roster
     // group is dropped when its last slot leaves.
@@ -3269,9 +3274,15 @@ pub(crate) fn reconcile_abandon(
         let sessions_for_expire = Arc::clone(sessions);
         let mesh_for_expire = mesh.clone();
         let key_for_expire = key.clone();
-        mesh.drop_holds.arm_abandon(key.clone(), move || {
-            decide_and_broadcast_abandoned(&sessions_for_expire, &mesh_for_expire, &key_for_expire);
-        });
+        mesh.drop_holds
+            .arm_abandon(key.clone(), move |close_reported| {
+                decide_and_broadcast_abandoned(
+                    &sessions_for_expire,
+                    &mesh_for_expire,
+                    &key_for_expire,
+                    close_reported,
+                );
+            });
     } else {
         mesh.drop_holds.cancel_abandon(key);
     }
@@ -3303,7 +3314,13 @@ pub(crate) fn reconcile_abandon(
 /// Deciding every held departure is exactly what unblocks a deferred
 /// session-emptied close (see [`maybe_close_emptied_session`]), so that close is
 /// re-evaluated here once the holds are released — this timer firing is the
-/// bound on how long an abandoned session's close can be deferred.
+/// bound on how long an abandoned session's close can be deferred. That
+/// re-evaluation is skipped when `close_reported` says the relay already reported
+/// this session's close: the deferral it exists to end never happened, and the
+/// latch that would otherwise refuse a second report lives on the decision-maker,
+/// which the retiring session's descriptor removal takes away mid-window. The
+/// force-decide above still runs either way — the undecided holds it releases
+/// outlive the close, and nothing else ever releases them.
 ///
 /// This release is cleanup, not a claim gate — unlike [`honor_drop_request`], it
 /// does not need to check the boolean before deciding, because
@@ -3320,6 +3337,7 @@ fn decide_and_broadcast_abandoned(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
+    close_reported: bool,
 ) {
     let leaves = consensus::decide_abandoned_departures(&mesh.decision_makers, key);
     if !leaves.is_empty() {
@@ -3335,6 +3353,15 @@ fn decide_and_broadcast_abandoned(
             }
         }
         crate::mesh::broadcast_leaves(sessions, &mesh.links, key, leaves);
+    }
+    if close_reported {
+        tracing::debug!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            "abandoned-session window elapsed on an already-closed session; \
+             leaving its reported close alone",
+        );
+        return;
     }
     maybe_close_emptied_session(sessions, mesh, key);
 }
@@ -3632,8 +3659,9 @@ mod tests {
 
         // The abandoned-session force-decide (the expiry effect of the timer the
         // emptying armed) decides the held drop — which is what unblocks and
-        // runs the deferred close.
-        decide_and_broadcast_abandoned(&sessions, &mesh, &k);
+        // runs the deferred close. No close has been reported for the session:
+        // the emptying above deferred it.
+        decide_and_broadcast_abandoned(&sessions, &mesh, &k, false);
 
         assert!(
             !mesh.seen.lock().contains_key(&k),
@@ -5076,6 +5104,76 @@ mod tests {
         assert!(
             again.is_empty(),
             "a duplicate abandoned-decide finds nothing left to decide",
+        );
+    }
+
+    /// A window that elapses on a session this relay already closed reports no
+    /// second close — not even once the decision-maker is gone, which is what a
+    /// retired session's descriptor removal leaves behind and which takes the
+    /// close-report latch with it.
+    #[tokio::test]
+    async fn an_elapsed_window_reports_no_second_close_for_a_closed_session() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_notice_notifier(tx);
+        // Both slots are gone with nothing holding them: the timer arms, and the
+        // close runs rather than deferring on a promised reconnect.
+        depart_slot_unheld(&makers, &holds, &k, SlotId(0));
+        depart_slot_unheld(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+
+        reconcile_abandon(
+            &sessions,
+            &mesh_with(&holds, &makers, &mesh_links, &presence),
+            &k,
+        );
+        assert!(holds.abandon_armed(&k), "the emptying armed the timer");
+        assert_eq!(closes_reported(&mut rx), 1, "the emptying reported a close");
+
+        // The coordinator retires the session and drops its descriptor.
+        crate::consensus::deregister_maker(&makers, &k);
+
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert_eq!(
+            closes_reported(&mut rx),
+            0,
+            "the elapsed window left the reported close alone",
+        );
+    }
+
+    /// The window still force-decides after a close: the close ends this relay's
+    /// serving state, not the departures the timer was armed to decide.
+    #[tokio::test]
+    async fn an_elapsed_window_still_decides_departures_after_a_close() {
+        let (presence, sessions, mesh_links, makers, k) = abandoned_harness();
+        let holds = DropHolds::new(UNREACHABLE_UNLOCK, TINY_ABANDON);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        makers.set_notice_notifier(tx);
+        depart_slot_unheld(&makers, &holds, &k, SlotId(0));
+        depart_slot_unheld(&makers, &holds, &k, SlotId(1));
+        crate::presence::record_own(&presence, &k, 0);
+
+        reconcile_abandon(
+            &sessions,
+            &mesh_with(&holds, &makers, &mesh_links, &presence),
+            &k,
+        );
+        assert_eq!(closes_reported(&mut rx), 1, "the emptying reported a close");
+        assert!(
+            crate::consensus::has_undecided_departure(&makers, &k),
+            "the close decided nothing on its own",
+        );
+
+        tokio::time::sleep(TINY_ABANDON + Duration::from_millis(80)).await;
+        assert!(
+            !crate::consensus::has_undecided_departure(&makers, &k),
+            "the elapsed window decided the abandoned session's departures",
+        );
+        assert_eq!(
+            closes_reported(&mut rx),
+            0,
+            "deciding them reported no further close",
         );
     }
 
