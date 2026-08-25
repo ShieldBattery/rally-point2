@@ -610,7 +610,6 @@ async fn rehome_session(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    let departed = state.lifecycle.departed_slots(&tenant, session);
     // Cancel any globally-empty proof before the assignment mutation. Otherwise an
     // already-expired reap task could retire the replacement assignment in the
     // narrow interval before `on_rehome` updates the lifecycle's cached relay set.
@@ -619,12 +618,16 @@ async fn rehome_session(
     // the assignment lock and before it publishes resumed descriptors. Terminal
     // notices take that same lock, so a replacement can never report closed in a
     // gap where authoritative membership is new but lifecycle membership is old.
+    // The departed accounting is handed over as a reader, not a snapshot: the
+    // rehome reads it at descriptor-build time under that same lock, so a
+    // departure notice landing while this request is in flight still seeds the
+    // resumed descriptors (see `rehome_inner`).
     let outcome = session::rehome_with_assignment_commit(
         &state.setup,
         &tenant,
         session,
         dead_relay,
-        departed,
+        || state.lifecycle.departed_slots(&tenant, session),
         |replacement| {
             state
                 .lifecycle

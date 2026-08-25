@@ -763,7 +763,7 @@ pub fn rehome(
         tenant,
         session,
         dead_relay,
-        departed_slots,
+        move || departed_slots,
         || {},
         |_| {},
     )
@@ -781,7 +781,7 @@ pub fn rehome_with_assignment_commit(
     tenant: &TenantId,
     session: SessionId,
     dead_relay: RelayId,
-    departed_slots: Vec<DepartedSlot>,
+    read_departed: impl FnOnce() -> Vec<DepartedSlot>,
     assignment_committed: impl FnOnce(RelayId),
 ) -> RehomeOutcome {
     rehome_inner(
@@ -789,7 +789,7 @@ pub fn rehome_with_assignment_commit(
         tenant,
         session,
         dead_relay,
-        departed_slots,
+        read_departed,
         || {},
         assignment_committed,
     )
@@ -835,7 +835,7 @@ fn rehome_inner(
     tenant: &TenantId,
     session: SessionId,
     dead_relay: RelayId,
-    departed_slots: Vec<DepartedSlot>,
+    read_departed: impl FnOnce() -> Vec<DepartedSlot>,
     before_mutation: impl FnOnce(),
     assignment_committed: impl FnOnce(RelayId),
 ) -> RehomeOutcome {
@@ -1039,6 +1039,17 @@ fn rehome_inner(
     // terminal-close handling, so a replacement close can only run after this
     // callback has completed.
     assignment_committed(r_new);
+
+    // Read the departed accounting only now, at descriptor-build time under the
+    // assignment lock, never as a caller-side snapshot: a departure notice can
+    // land at any moment before this point, and one recorded after an early
+    // snapshot but before publication would be omitted from every resumed
+    // descriptor -- the fresh relay would then wait on a slot that permanently
+    // left, since only surviving mesh peers could re-announce it (and after a
+    // single-relay death there are none). A departure recorded after this read
+    // reaches the fresh relay through those mesh peers' leave reconciliation,
+    // which can only be missing in the case this read now covers.
+    let departed_slots = read_departed();
 
     // Rebuild every serving relay's descriptor as a resumed (rehome) descriptor,
     // seeding the departed slots, and push each. Record R_new's first so it is
@@ -3588,6 +3599,53 @@ mod tests {
     }
 
     #[test]
+    fn a_departure_recorded_mid_rehome_still_seeds_the_resumed_descriptors() {
+        // Models a departure notice landing while the rehome is already inside
+        // its assignment-locked body: the departed accounting gains an entry
+        // after the request began (a caller-side snapshot taken up front would
+        // miss it) but before the resumed descriptors are built. The reader is
+        // invoked at build time, so the entry still rides every descriptor —
+        // otherwise a fresh relay would wait forever on a slot that
+        // permanently left, with no surviving mesh peer to re-announce it
+        // after a single-relay death.
+        let setup = setup_with_two_relays_and_tenant();
+        let resp = create_default_session(&setup);
+        registry::remove(setup.registry(), RelayId(1));
+
+        let departed: std::cell::RefCell<Vec<DepartedSlot>> = std::cell::RefCell::new(vec![]);
+        let outcome = rehome_inner(
+            &setup,
+            &tid(),
+            resp.session,
+            RelayId(1),
+            || departed.borrow().clone(),
+            || {
+                // The mid-rehome departure notice (the seam runs after the
+                // assignment lock is held, before the descriptor build).
+                departed.borrow_mut().push(DepartedSlot {
+                    slot: SlotId(1),
+                    kind: DepartureKind::Dropped,
+                    final_turn_count: None,
+                });
+            },
+            |_| {},
+        );
+        assert!(matches!(outcome, RehomeOutcome::NewTarget(_)));
+
+        let staged = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].departed_slots,
+            vec![DepartedSlot {
+                slot: SlotId(1),
+                kind: DepartureKind::Dropped,
+                final_turn_count: None,
+            }],
+            "the mid-rehome departure rides the resumed descriptor",
+        );
+    }
+
+    #[test]
     fn rehome_moves_the_group_to_a_live_relay_when_the_home_died() {
         // The home relay (1) drops out of the registry; the session's whole group
         // moves to the lowest-id live relay (2), and the rebuilt descriptor is a
@@ -3645,7 +3703,7 @@ mod tests {
             &tid(),
             resp.session,
             RelayId(1),
-            vec![],
+            Vec::new,
             |replacement| {
                 assert_eq!(replacement, RelayId(2));
                 assert_eq!(
@@ -4118,7 +4176,7 @@ mod tests {
             &tid(),
             resp.session,
             RelayId(1),
-            vec![],
+            Vec::new,
             || {
                 // The concurrent full close clears the session's membership between the
                 // snapshot and the mutation (its forget_rehomes would block on the
