@@ -434,8 +434,9 @@ buffer, the exact future frame to apply it at, and a **decision seq** ordering i
 it identically at the same simulated step, out of band from command processing. A command in the byte
 stream was the alternative, rejected because a native latency command caps the buffer at the game's
 built-in range and a client applies one turn per remote player per step, so an extra command can't just be
-handed over; riding the envelope, the buffer has no ceiling and the turn it stamps is one the client
-already receives. The relay stamps **every turn it forwards until the whole session has passed the apply
+handed over; riding the envelope, the directive mechanism itself has no ceiling — though the game's
+own sync validation still imposes one (see the end of this section) — and the turn it stamps is one
+the client already receives. The relay stamps **every turn it forwards until the whole session has passed the apply
 frame**: a client picks the change up off a peer's turn (it never receives its own turns back), and a
 client whose peers aren't producing turns yet is covered automatically, because lockstep — and so the
 apply frame — can't advance without it. Copies are idempotent; when decisions come quickly, the higher
@@ -473,6 +474,19 @@ existing bounds clamp; the law itself is unchanged. The inputs are client-claime
 can only *understate its own* delivery — the same bounded push-the-buffer-up lever as inflating its own
 link loss — and the cap plus bounds contain it; it can never stall anyone or frame another player. The
 same per-session worst-lag and hop-count view rides the flight recorder's sample rows.
+
+**The game imposes the real depth ceiling.** The directive mechanism escaped the *native latency
+command's* cap, but not the game's sync validation: StarCraft checks every sync command a client
+executes against a 16-entry ring of locally recorded snapshots, addressed by a 4-bit index in the
+command's own bytes with no sequence number or wraparound detection. A sync executed 16+ turns
+after its snapshot silently aliases onto a newer entry, fails validation, and drops its sender on
+every client at once — a session past the boundary collapses, it doesn't degrade. Buffer fills
+(the session-start seed, a raise directive) are the sharp edge: the game issues all injected turns
+within one step, sharing one snapshot whose ring slot expires for all of them together. With the
+observed one-turn skew between issue and execution, depth 15 is fatal and 14 is the zero-margin
+structural ceiling — `GAME_SYNC_SAFE_BUFFER_MAX` in `proto::control`, which the coordinator
+enforces against every tenant's configured `BufferBounds.max` at startup. Policy should sit below
+it with margin (the game's own networking never ran deeper than 12).
 
 A second additive term rides the target the same way: **sustained arrival-interval stretch**, the
 relay-measured form of "the clients are stalling anyway." A stall-bound client produces — and

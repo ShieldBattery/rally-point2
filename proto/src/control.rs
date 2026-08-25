@@ -441,6 +441,26 @@ fn addr_for_family(
 // Consensus policy (coordinator → relay, at session setup)
 // ---------------------------------------------------------------------------
 
+/// The deepest latency buffer (in turns) the game's own sync validation
+/// tolerates. This is a property of StarCraft, not a policy choice: the game
+/// validates every sync command a client executes against a 16-entry ring of
+/// locally recorded snapshots, addressed by a 4-bit ring index carried in the
+/// command itself — with no sequence number and no wraparound detection. A
+/// sync executed 16 or more turns after its snapshot was recorded silently
+/// aliases onto a newer entry, fails validation, and the game drops the
+/// *sender* — deterministically on every client at once, so a session that
+/// crosses the boundary collapses rather than degrades. Buffer fills (the
+/// session-start seed, a directive raising the depth) are the sharpest edge:
+/// the game issues all injected turns within one step, so they share one
+/// snapshot whose ring slot expires together.
+///
+/// In live games the fatal depth is 15 — one turn of skew between issue and
+/// execution puts the effective delivery delay at depth + 1 — which leaves 14
+/// as the structural ceiling, validating with zero margin. Policy should stay
+/// below this ceiling, not at it (the game's own networking never ran deeper
+/// than 12).
+pub const GAME_SYNC_SAFE_BUFFER_MAX: u32 = 14;
+
 /// The latency-buffer bounds the coordinator sets at setup. The relay's
 /// decision-maker stays within these; the coordinator only sets policy and
 /// makes no per-adjustment decision, so a running game is unaffected by a
@@ -474,6 +494,13 @@ fn addr_for_family(
 /// above `consensus::SYNC_ABSURD_BUFFER_MAX` — a defensive backstop far above
 /// any real policy, not a live constraint — disables desync detection
 /// outright.
+///
+/// **Depth and the game's own sync validation.** The relay tolerates any
+/// depth; the *game* does not. `max` must never exceed
+/// [`GAME_SYNC_SAFE_BUFFER_MAX`] — past that ceiling the game's native sync
+/// validation mass-drops players deterministically (see the constant's docs).
+/// The coordinator enforces this when it loads its tenant registry, so an
+/// over-deep `max` fails startup rather than killing sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferBounds {
     /// The minimum buffer (in turns) the decision-maker may set.

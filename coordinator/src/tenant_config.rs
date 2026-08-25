@@ -44,7 +44,7 @@ use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use rally_point_proto::control::{BufferBounds, TenantId};
+use rally_point_proto::control::{BufferBounds, GAME_SYNC_SAFE_BUFFER_MAX, TenantId};
 use rally_point_proto::token::{KeyId, PUBLIC_KEY_LEN};
 use serde::Deserialize;
 
@@ -223,6 +223,20 @@ pub enum TenantConfigError {
         /// The configured maximum.
         max: u32,
     },
+    /// A tenant's `bounds.max` allows a deeper latency buffer than the game's
+    /// own sync validation tolerates ([`GAME_SYNC_SAFE_BUFFER_MAX`]) — a depth
+    /// past that ceiling mass-drops players deterministically, so serving it
+    /// would be worse than refusing to start.
+    #[error(
+        "tenant {tenant:?} has bounds max {max}, past the game-safe ceiling of \
+         {GAME_SYNC_SAFE_BUFFER_MAX} turns"
+    )]
+    BoundsPastGameSafeMax {
+        /// The offending tenant's id.
+        tenant: String,
+        /// The configured maximum.
+        max: u32,
+    },
     /// Two tenants share an id — the coordinator could not tell which one a
     /// request meant.
     #[error("duplicate tenant id {0:?}")]
@@ -361,11 +375,23 @@ fn validate_entry(
 
     let bounds = match entry.bounds {
         Some(b) => {
-            BufferBounds::new(b.min, b.max).map_err(|_| TenantConfigError::InvalidBounds {
-                tenant: entry.id.clone(),
-                min: b.min,
-                max: b.max,
-            })?
+            let bounds =
+                BufferBounds::new(b.min, b.max).map_err(|_| TenantConfigError::InvalidBounds {
+                    tenant: entry.id.clone(),
+                    min: b.min,
+                    max: b.max,
+                })?;
+            // The game-side ceiling, enforced where policy enters the system: a
+            // relay clamps every seed and directive to these bounds, so a `max`
+            // past what the game's sync validation tolerates would kill
+            // sessions rather than merely buffer deeply.
+            if bounds.max > GAME_SYNC_SAFE_BUFFER_MAX {
+                return Err(TenantConfigError::BoundsPastGameSafeMax {
+                    tenant: entry.id.clone(),
+                    max: bounds.max,
+                });
+            }
+            bounds
         }
         None => default_bounds(),
     };
@@ -647,6 +673,32 @@ mod tests {
             }
             other => panic!("expected InvalidBounds, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bounds_past_the_game_safe_ceiling_are_rejected() {
+        let json = single_tenant_json(
+            "active",
+            "ENV",
+            &one_valid_pubkey(),
+            r#"{"min": 1, "max": 15}"#,
+        );
+        match from_json(&json) {
+            Err(TenantConfigError::BoundsPastGameSafeMax { tenant, max }) => {
+                assert_eq!(tenant, "solo");
+                assert_eq!(max, 15);
+            }
+            other => panic!("expected BoundsPastGameSafeMax, got {other:?}"),
+        }
+
+        // The ceiling itself passes — the guard rejects strictly past it.
+        let json = single_tenant_json(
+            "active",
+            "ENV",
+            &one_valid_pubkey(),
+            &format!(r#"{{"min": 1, "max": {GAME_SYNC_SAFE_BUFFER_MAX}}}"#),
+        );
+        assert!(from_json(&json).is_ok());
     }
 
     #[test]
