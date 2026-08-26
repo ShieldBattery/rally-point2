@@ -84,10 +84,23 @@ pub enum PennedIngress {
     /// leave's count is derived at the drain, after the slot's own journaled
     /// turns have been forwarded ahead of it — the count captured at deposit
     /// time would be blind to them.
+    ///
+    /// `revision` is stamped by [`hold`](ProvisionalTurnPen::hold) (deposit
+    /// callers pass `0`): each slot's newest journaled departure supersedes
+    /// every older one, and an older one may already sit in a drain's
+    /// private in-flight batch where the queue compaction cannot reach it —
+    /// so the drain validates each departure's revision against the slot's
+    /// current one ([`departure_is_current`]
+    /// (ProvisionalTurnPen::departure_is_current)) and skips a superseded
+    /// entry instead of replaying it. Without this, a superseded old-epoch
+    /// drop replayed after a newer clean leave's teardown would install its
+    /// stale generation first and have the real departure rejected as stale
+    /// by the epoch fence.
     Departure {
         slot: SlotId,
         reason: u32,
         connection_epoch: Option<u64>,
+        revision: u64,
     },
 }
 
@@ -137,6 +150,10 @@ struct SessionPen {
     /// leave takes over clean-leave refusal; an overflowed slot stays
     /// refused for the session's life).
     sealed: std::collections::HashSet<SlotId>,
+    /// Each slot's current departure revision — the supersession token the
+    /// drain validates before replaying a journaled departure (see
+    /// [`PennedIngress::Departure`]'s `revision`).
+    departure_revisions: HashMap<SlotId, u64>,
 }
 
 impl SessionPen {
@@ -144,6 +161,7 @@ impl SessionPen {
         SessionPen {
             phase: Phase::Gathering(VecDeque::new()),
             sealed: std::collections::HashSet::new(),
+            departure_revisions: HashMap::new(),
         }
     }
 }
@@ -203,7 +221,7 @@ impl ProvisionalTurnPen {
     /// keeps memory bounded regardless. A clean-leave departure also seals
     /// its slot against readmission (see [`slot_sealed`](Self::slot_sealed)).
     #[must_use]
-    pub fn hold(&self, key: &SessionKey, entry: PennedIngress) -> HoldOutcome {
+    pub fn hold(&self, key: &SessionKey, mut entry: PennedIngress) -> HoldOutcome {
         let mut sessions = self.inner.sessions.lock();
         let pen = sessions
             .entry(key.clone())
@@ -212,10 +230,25 @@ impl ProvisionalTurnPen {
             Phase::Resolved => return HoldOutcome::Resolved(entry),
             Phase::Gathering(queue) | Phase::Draining(queue) => queue,
         };
-        if matches!(entry, PennedIngress::Turn(..)) && queue.len() >= PER_SESSION_CAP {
+        if let PennedIngress::Turn(slot, _) = &entry
+            && queue.len() >= PER_SESSION_CAP
+        {
+            // Seal HERE, atomically with the overflow verdict and under the
+            // caller's ingress gate: the overflowed slot's accepted
+            // sequence has a permanent hole, so it must never be
+            // readmitted. Sealing from the caller after the gate released
+            // would race a retirement's terminal discard and recreate
+            // journal state for an ended session.
+            pen.sealed.insert(*slot);
             return HoldOutcome::Overflow(entry);
         }
-        if let PennedIngress::Departure { slot, reason, .. } = &entry {
+        if let PennedIngress::Departure {
+            slot,
+            reason,
+            revision,
+            ..
+        } = &mut entry
+        {
             if *reason == crate::consensus::LEAVE_REASON_LEFT {
                 pen.sealed.insert(*slot);
             }
@@ -224,8 +257,13 @@ impl ProvisionalTurnPen {
             // maker-less slot can otherwise connect-and-drop in a loop
             // (its own valid token) and grow the cap-exempt departure
             // population without bound. The newest observation supersedes
-            // the older one; the drain-time reclaim check governs whether
-            // it stands regardless.
+            // the older one twice over: it is compacted out of the queue,
+            // and its revision goes stale — which is what a drain's private
+            // in-flight batch (beyond the compaction's reach) validates
+            // before replaying.
+            let current = pen.departure_revisions.entry(*slot).or_insert(0);
+            *current += 1;
+            *revision = *current;
             let slot = *slot;
             queue.retain(
                 |queued| !matches!(queued, PennedIngress::Departure { slot: s, .. } if *s == slot),
@@ -235,18 +273,17 @@ impl ProvisionalTurnPen {
         HoldOutcome::Held
     }
 
-    /// Seals `slot` against admission without journaling anything — the
-    /// overflow path's terminal marker: the slot's accepted sequence has a
-    /// permanent hole, so a reconnect must be refused for the session's
-    /// life, not offered a resume past the gap.
-    pub fn seal_slot(&self, key: &SessionKey, slot: SlotId) {
+    /// Whether a journaled departure's `revision` is still the slot's
+    /// current one — the drain's pre-replay validation: a departure
+    /// superseded while it sat in the drain's private batch is skipped, not
+    /// replayed, so a stale old-generation drop can never install itself
+    /// ahead of the newer departure that superseded it.
+    pub fn departure_is_current(&self, key: &SessionKey, slot: SlotId, revision: u64) -> bool {
         self.inner
             .sessions
             .lock()
-            .entry(key.clone())
-            .or_insert_with(SessionPen::gathering)
-            .sealed
-            .insert(slot);
+            .get(key)
+            .is_some_and(|pen| pen.departure_revisions.get(&slot) == Some(&revision))
     }
 
     /// Whether `slot` had a clean leave journaled — terminal to admission
@@ -315,10 +352,7 @@ impl ProvisionalTurnPen {
         self.inner.sessions.lock().remove(key);
     }
 
-    /// Whether `key` has journaled entries still awaiting a drain — read by
-    /// the emptied-session close to keep the journal (and the session's
-    /// gate) alive for the descriptor that will drain it, instead of
-    /// discarding the only record of what happened pre-descriptor.
+    /// Whether `key` has journaled entries still awaiting a drain.
     pub fn has_undrained(&self, key: &SessionKey) -> bool {
         self.inner
             .sessions
@@ -326,6 +360,27 @@ impl ProvisionalTurnPen {
             .get(key)
             .is_some_and(|pen| match &pen.phase {
                 Phase::Gathering(queue) | Phase::Draining(queue) => !queue.is_empty(),
+                Phase::Resolved => false,
+            })
+    }
+
+    /// Whether `key` has a journaled DEPARTURE still awaiting a drain — the
+    /// emptied-session close's retention predicate: a journaled departure is
+    /// the only record that the slot left at all, so it (and the session's
+    /// gate) must survive until a descriptor drains it or the provisional
+    /// sweep gives up on one ever coming. A journal holding only turns is
+    /// NOT retained: every non-reap teardown journals a departure, so a
+    /// turns-only journal at an emptied close is the residue of a reaped
+    /// session's suppressed teardowns, with nothing left to preserve.
+    pub fn has_undrained_departure(&self, key: &SessionKey) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .get(key)
+            .is_some_and(|pen| match &pen.phase {
+                Phase::Gathering(queue) | Phase::Draining(queue) => queue
+                    .iter()
+                    .any(|entry| matches!(entry, PennedIngress::Departure { .. })),
                 Phase::Resolved => false,
             })
     }
@@ -369,6 +424,7 @@ mod tests {
             slot: SlotId(slot),
             reason,
             connection_epoch: Some(9),
+            revision: 0,
         }
     }
 
@@ -388,6 +444,7 @@ mod tests {
                 slot: SlotId(1),
                 reason: 3,
                 connection_epoch: Some(9),
+                ..
             }
         ));
         assert!(matches!(drained[2], PennedIngress::Turn(SlotId(2), _)));
@@ -462,7 +519,8 @@ mod tests {
     /// At most one journaled departure per slot, as an enforced invariant: a
     /// maker-less slot connect-and-dropping in a loop must not grow the
     /// cap-exempt departure population without bound — the newest
-    /// observation supersedes the older one, in the newer position.
+    /// observation supersedes the older one, in the newer position, and the
+    /// older one's revision goes stale.
     #[test]
     fn repeated_departures_for_one_slot_compact_to_the_newest() {
         let pen = ProvisionalTurnPen::default();
@@ -475,6 +533,7 @@ mod tests {
                     slot: SlotId(1),
                     reason: 3,
                     connection_epoch: Some(11),
+                    revision: 0,
                 },
             ),
             HoldOutcome::Held,
@@ -487,19 +546,65 @@ mod tests {
             PennedIngress::Departure {
                 slot: SlotId(1),
                 connection_epoch: Some(11),
+                revision: 2,
                 ..
             }
         ));
     }
 
-    /// An overflow seal is terminal without journaling anything.
+    /// A departure superseded while it sat in a drain's private in-flight
+    /// batch — beyond the queue compaction's reach — fails the revision
+    /// validation the drain runs before replaying it, while the superseding
+    /// entry passes.
     #[test]
-    fn seal_slot_refuses_admission_without_a_journal_entry() {
+    fn a_superseded_departure_in_an_active_batch_fails_revision_validation() {
         let pen = ProvisionalTurnPen::default();
-        pen.seal_slot(&key(), SlotId(1));
+        assert_eq!(pen.hold(&key(), departure(1, 3)), HoldOutcome::Held);
+        let batch = pen.begin_drain(&key()).expect("claims");
+        let PennedIngress::Departure { revision: old, .. } = batch[0] else {
+            panic!("the batch holds the journaled departure");
+        };
+        assert!(pen.departure_is_current(&key(), SlotId(1), old));
+
+        // A newer generation's departure lands mid-drain.
+        assert_eq!(
+            pen.hold(&key(), departure(1, crate::consensus::LEAVE_REASON_LEFT)),
+            HoldOutcome::Held,
+        );
+        assert!(
+            !pen.departure_is_current(&key(), SlotId(1), old),
+            "the batched departure is superseded and must not replay",
+        );
+        match pen.continue_drain(&key()) {
+            DrainStep::More(next) => {
+                let PennedIngress::Departure { revision, .. } = next[0] else {
+                    panic!("the superseding departure drains next");
+                };
+                assert!(pen.departure_is_current(&key(), SlotId(1), revision));
+            }
+            DrainStep::Done => panic!("the superseding departure must drain"),
+        }
+    }
+
+    /// Overflow seals the offending slot atomically with the verdict —
+    /// installed by `hold` itself, under the caller's ingress gate, never as
+    /// a separate post-gate step a retirement could interleave with.
+    #[test]
+    fn overflow_seals_the_slot_atomically_with_the_verdict() {
+        let pen = ProvisionalTurnPen::default();
+        for seq in 0..PER_SESSION_CAP as u64 {
+            assert_eq!(pen.hold(&key(), turn(1, seq)), HoldOutcome::Held);
+        }
+        assert!(!pen.slot_sealed(&key(), SlotId(1)));
+        assert!(matches!(
+            pen.hold(&key(), turn(1, PER_SESSION_CAP as u64)),
+            HoldOutcome::Overflow(_),
+        ));
         assert!(pen.slot_sealed(&key(), SlotId(1)));
-        assert_eq!(pen.held(&key()), 0);
-        assert!(!pen.has_undrained(&key()));
+        assert!(
+            !pen.slot_sealed(&key(), SlotId(2)),
+            "only the overflowing slot is sealed",
+        );
     }
 
     #[test]

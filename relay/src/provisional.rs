@@ -235,12 +235,20 @@ pub async fn run_sweep_with(
                     session = key.session.0,
                     "provisional session's deadline passed with no applied descriptor; reaping",
                 );
-                // The terminal janitor for the descriptor that never came:
-                // the journal (which the emptied-session close deliberately
-                // keeps while it holds undrained ingress) and the session's
-                // gate go with the reap. Link teardowns the reap triggers
-                // may momentarily recreate the gate; their own emptied-close
-                // then discards it against the now-empty journal.
+                // The terminal janitor for the descriptor that never came.
+                // The reap below only signals live links asynchronously, so
+                // this discard alone is NOT a barrier — a still-live link
+                // can touch a fresh gate and journal right after it. That
+                // residue converges instead of resurrecting, by three rules:
+                // a reap-triggered teardown suppresses its departure
+                // announce (nothing deposits), an emptied close discards a
+                // journal holding no departure (stray turns clean up with
+                // the last link), and an emptied close that DOES retain a
+                // journaled departure re-marks the session — handing it
+                // back to this sweep for the next deadline. Retiring the
+                // gate here would close the race harder but would also
+                // refuse the slot's redial until a descriptor reopened it,
+                // breaking the slow-descriptor-only-delays contract.
                 provisional_turns.discard(&key);
                 gates.discard(&key);
                 routing::reap_provisional(&sessions, &key);

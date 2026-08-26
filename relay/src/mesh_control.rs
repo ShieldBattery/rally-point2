@@ -540,7 +540,28 @@ impl MeshControl {
                             slot,
                             reason,
                             connection_epoch,
+                            revision,
                         } => {
+                            // A departure superseded while it sat in this
+                            // drain's private batch (the queue compaction
+                            // cannot reach entries already taken) must not
+                            // replay: an old generation's drop announced
+                            // after a newer generation's teardown would
+                            // install its stale epoch first and have the
+                            // real departure rejected as stale.
+                            if !turn_path
+                                .provisional_turns
+                                .departure_is_current(&key, slot, revision)
+                            {
+                                tracing::debug!(
+                                    tenant = key.tenant.as_ref(),
+                                    session = key.session.0,
+                                    slot = slot.0,
+                                    revision,
+                                    "skipping a superseded journaled departure",
+                                );
+                                continue;
+                            }
                             let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
                                 .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
                                 .flatten();

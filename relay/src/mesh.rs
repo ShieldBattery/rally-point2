@@ -1727,11 +1727,12 @@ pub fn forward_client_turn(
                 // a same-relay resume deliberately does not re-inject
                 // acknowledged retention — it is genuinely unrecoverable, so
                 // the slot that produced it now has a permanent hole in its
-                // accepted sequence. Fail THAT SLOT closed terminally: seal
-                // it against readmission FIRST (an ordinary link close is
-                // reconnectable, and a resume would carry on past the hole,
-                // cementing the divergence — or retransmit into the still-
-                // full journal in a close loop), then close its link, whose
+                // accepted sequence. `hold` already sealed the slot against
+                // readmission, atomically with this verdict and inside the
+                // ingress gate (an ordinary link close is reconnectable, and
+                // a resume would carry on past the hole, cementing the
+                // divergence — or retransmit into the still-full journal in
+                // a close loop). All that remains is closing its link, whose
                 // teardown journals a dropped departure the survivors
                 // resolve through the drop flow once the descriptor lands.
                 // The rest of the session's journal is untouched — only the
@@ -1740,9 +1741,8 @@ pub fn forward_client_turn(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     slot = slot.0,
-                    "provisional journal overflowed; sealing and closing the overflowing slot",
+                    "provisional journal overflowed; the slot is sealed — closing its link",
                 );
-                mesh.provisional_turns.seal_slot(key, slot);
                 routing::close_slots(sessions, key, std::slice::from_ref(&slot));
                 return;
             }
