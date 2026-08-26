@@ -1130,6 +1130,18 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   scope is per-relay by design: only the home relay sees a slot's wire arrivals first-hand, and
   cross-relay alignment would need a shared inter-relay clock for a regime (mesh sessions,
   hop-cushioned off depth one) that barely benefits — don't re-chase it without that clock.
+- **Turns are sent at the game's tick rate — no duplicate-turn rate doubling.** A proposed 48pps
+  mode (each turn sent again in a second packet half an interval later, to smooth loss/jitter and
+  shrink the buffer) was researched and declined. The piggyback redundancy already gives every
+  unacked payload fresh delivery attempts one and two intervals later, and multiplayer relay
+  fan-out is already sub-interval-dense; measured internet loss is bursty — conditional loss is
+  roughly two orders of magnitude elevated a half-interval after a drop — so the duplicate tends
+  to die with its original exactly when it would matter; jitter spikes are shared-fate FIFO
+  queueing that a duplicate sent into the same queue cannot overtake; and doubling packet rate
+  roughly doubles relay CPU. Shipped lockstep games universally piggyback at tick rate rather
+  than duplicate. If evidence ever demands more, the shape is a staleness-triggered mid-interval
+  flush (the hedged-request pattern: send early only when the ack is already late), gated on
+  flight-recorder data — not blanket duplication.
 - **Game clients never talk to the coordinator.** Re-home is app-server-mediated (the client
   authenticates to its app server exactly as for result submission; the app server makes the
   tenant-signed coordinator call).
