@@ -128,7 +128,7 @@ impl SessionGates {
     ///
     /// An acquisition that lands on a defunct instance (the gate was rotated
     /// out of the registry while this caller held its `Arc`) retries against
-    /// the registry's current gate — see [`SessionGate::defunct`].
+    /// the registry's current gate — see `SessionGate::defunct`.
     pub fn with_ingress<R>(&self, key: &SessionKey, f: impl FnOnce() -> R) -> Option<R> {
         loop {
             let gate = self.gate(key);

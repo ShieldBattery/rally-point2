@@ -280,7 +280,7 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
 /// `None` when the relay has no gap-free knowledge to answer from: the session
 /// or slot has no forwarded prefix (nothing forwarded yet, or a re-homed slot
 /// whose pre-rehome turns this relay never carried), or the prefix was
-/// collapsed over a gap by the sparse-set cap (see [`SlotSeen::collapse_to_cap`]
+/// collapsed over a gap by the sparse-set cap (see `SlotSeen::collapse_to_cap`
 /// — correct for the forward-once gate, but no longer a count of real turns).
 /// Callers fall back to frame scheduling on `None`; a fabricated or inflated
 /// exact count is strictly worse than no count.

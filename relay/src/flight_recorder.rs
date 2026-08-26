@@ -992,7 +992,7 @@ impl FlightRecorder {
     }
 
     /// Wires the relay-wide session-gate registry, so create-on-first-touch
-    /// refuses a retired session (see [`recording`](Self::recording)). Set
+    /// refuses a retired session (see `Self::recording`). Set
     /// once at startup beside the sink; a second call is ignored. Without one
     /// (tests, a standalone recorder) every session reads as unretired.
     pub fn set_gates(&self, gates: crate::session_gate::SessionGates) {
@@ -1037,7 +1037,7 @@ impl FlightRecorder {
 
     /// Records one event for `key`'s session, creating the recording on first
     /// touch — unless the key is close-sealed, in which case the event is
-    /// dropped (see [`CloseSeals`]). Events are rare, so the short per-session
+    /// dropped (see `CloseSeals`). Events are rare, so the short per-session
     /// mutex is fine here — this is never called on the per-turn path.
     pub fn record(&self, key: &SessionKey, event: FlightEvent) {
         if let Some(recording) = self.recording(key) {
@@ -1159,7 +1159,7 @@ impl FlightRecorder {
         }
     }
 
-    /// Clears `key`'s close seal, if any (see [`CloseSeals`]). Called only when
+    /// Clears `key`'s close seal, if any (see `CloseSeals`). Called only when
     /// the session's mesh membership is retired: the mesh has forgotten the
     /// session, so the seal has (almost) nothing left to guard, and a genuine
     /// later re-serve of the key — which always passes through a retirement

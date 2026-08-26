@@ -48,9 +48,9 @@
 //! control-plane follow-up, not a local heuristic. Until then the
 //! relay-wide footprint is bounded the only safe way left: NEW data fails
 //! closed instead of old data being deleted. Turn deposits fail against an
-//! aggregate byte budget ([`AGGREGATE_TURN_BYTE_BUDGET`]) exactly like a
+//! aggregate byte budget (`AGGREGATE_TURN_BYTE_BUDGET`) exactly like a
 //! per-session overflow, and deposits that would track a NEW session fail
-//! against a session ceiling ([`MAX_JOURNALED_SESSIONS`]) — together a
+//! against a session ceiling (`MAX_JOURNALED_SESSIONS`) — together a
 //! finite worst-case footprint, with nothing retained ever deleted to make
 //! room.
 //!
@@ -119,8 +119,8 @@ pub enum PennedIngress {
     /// every older one, and an older one may already sit in a drain's
     /// private in-flight batch where the queue compaction cannot reach it —
     /// so the drain validates each departure's revision against the slot's
-    /// current one ([`departure_is_current`]
-    /// (ProvisionalTurnPen::departure_is_current)) and skips a superseded
+    /// current one ([`ProvisionalTurnPen::departure_is_current`]) and skips a
+    /// superseded
     /// entry instead of replaying it. Without this, a superseded old-epoch
     /// drop replayed after a newer clean leave's teardown would install its
     /// stale generation first and have the real departure rejected as stale
@@ -340,7 +340,7 @@ impl ProvisionalTurnPen {
     /// per slot (enforced by compaction), each is a few dozen bytes, and
     /// losing one strands the session on an expected-but-absent slot. Only
     /// the relay-wide session ceiling refuses one, and only when it would
-    /// CREATE a new tracking entry ([`MAX_JOURNALED_SESSIONS`]). A
+    /// CREATE a new tracking entry (`MAX_JOURNALED_SESSIONS`). A
     /// clean-leave departure also seals its slot against readmission (see
     /// [`slot_sealed`](Self::slot_sealed)).
     #[must_use]

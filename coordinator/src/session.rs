@@ -75,7 +75,9 @@ pub struct SessionRefs {
     /// (rehome, late-departure refresh) reads the flag from here.
     pub finalized_drops: bool,
     /// Whether every relay in this session's capability-homogeneous cohort
-    /// advertises [`CAPABILITY_FINALIZED_DROP_V1`] — the session's BUILD
+    /// advertises
+    /// [`CAPABILITY_FINALIZED_DROP_V1`](rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1)
+    /// — the session's BUILD
     /// class, distinct from `finalized_drops` (the feature can be switched
     /// off while cohorts still exist). Rehome replacement picks and
     /// enrollment-time cohort eviction key on THIS, never on the feature

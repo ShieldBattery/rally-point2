@@ -4407,7 +4407,7 @@ impl DecisionMaker {
     }
 
     /// Seeds a coordinator-known departure as **already decided** on a rehome (see
-    /// the free [`seed_departed`]). Records the departure — retiring the slot from
+    /// the free [`sync_maker`]). Records the departure — retiring the slot from
     /// the comparator, coverage, and live set — then caches a decided leave for it
     /// so a promotion re-broadcasts it verbatim rather than re-deriving it (which
     /// would fire a redundant notice) or re-waiting on it. Idempotent: a slot

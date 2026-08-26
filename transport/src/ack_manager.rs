@@ -243,7 +243,7 @@ impl AckManager {
     }
 
     /// Peer packets that never arrived, cumulative for this connection. See
-    /// [`ReceivedPacketHistory::lost`] for what it counts and why nothing that
+    /// `ReceivedPacketHistory::lost` for what it counts and why nothing that
     /// makes decisions may read it.
     pub fn upstream_lost_packets(&self) -> u64 {
         self.received_packets.lost
