@@ -488,10 +488,17 @@ pub struct ControlLaw {
     /// of 24/sec this is `1_000_000 / 24` (~41,667us). The buffer is sized in
     /// turns, so this converts RTT (us) to turns.
     pub turn_duration_us: u32,
-    /// How many turns to decrement per lower decision. One at a time: the
-    /// cushion shrinks conservatively so a momentary improvement doesn't flap
-    /// the buffer down and back up. Raising jumps to the target immediately;
-    /// lowering steps down.
+    /// How many turns to decrement per lower decision. Raising jumps to the
+    /// target immediately; lowering steps down.
+    ///
+    /// The step is not what keeps a shrink safe -- the floor is. A lower may
+    /// never land below the target's trailing high-water mark whatever the
+    /// step size, so a larger step cannot descend anywhere a sequence of
+    /// single steps would not have reached anyway; it only spends fewer
+    /// decisions getting there, and every one of those decisions is a resize
+    /// every player feels. What the step does control is how long the buffer
+    /// stays above a floor that has genuinely dropped, which is the whole cost
+    /// of a brief episode once the weather behind it is over.
     pub lower_step: u32,
     /// Minimum number of turns between *lower* decisions -- and the span for
     /// which the target must have stayed *strictly below* the buffer before a
@@ -546,7 +553,7 @@ impl Default for ControlLaw {
     fn default() -> Self {
         Self {
             turn_duration_us: 1_000_000 / 24, // ~41,667us at 24 turns/sec
-            lower_step: 1,
+            lower_step: 2,
             min_dwell_turns: 120,       // ~5s at 24/sec
             shrink_headroom_us: 5_208,  // an eighth of a turn at 24/sec (~5.2ms)
             loss_attack_samples: 24,    // ~1s at 24/sec
@@ -8804,9 +8811,10 @@ mod tests {
         assert_eq!(maker.buffer(), BufferSize(4));
     }
 
-    /// Lower decrements by one step, not to the target.
+    /// A lower steps the buffer down by `lower_step`; it never jumps to the
+    /// target the way a raise does.
     #[test]
-    fn lower_decrements_by_one_step() {
+    fn lower_steps_down_rather_than_jumping_to_the_target() {
         let mut maker = DecisionMaker {
             buffer: BufferSize(5),
             ..DecisionMaker::new(
@@ -8817,9 +8825,10 @@ mod tests {
                 HashSet::new(),
             )
         };
+        // 50ms targets 2, but the buffer descends by the step instead.
         let d = ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
-        assert_eq!(d.unwrap().buffer, BufferSize(4));
-        assert_eq!(maker.buffer(), BufferSize(4));
+        assert_eq!(d.unwrap().buffer, BufferSize(3));
+        assert_eq!(maker.buffer(), BufferSize(3));
     }
 
     // -- Asymmetric dwell: raises immediate, lowers gated --
@@ -8873,7 +8882,7 @@ mod tests {
         // last frame that observed a target of 8), the lower fires.
         let d4 = ingest_at(&mut maker, &conditions(0, 50_000, 0, 1_000), 700);
         assert!(d4.is_some(), "lower fires once the high-water ages out");
-        assert_eq!(maker.buffer(), BufferSize(7));
+        assert_eq!(maker.buffer(), BufferSize(8 - law().lower_step));
     }
 
     /// Anti-flap: an oscillating target raises on the first worsening, then
@@ -9816,7 +9825,7 @@ mod tests {
         let d = ingest_at(&mut maker, &conditions(0, 150_000, 50, sent), 200);
         assert_eq!(
             d.unwrap().buffer,
-            BufferSize(5),
+            BufferSize(6 - law.lower_step),
             "one earned step down after sustained improvement",
         );
     }
@@ -10505,10 +10514,19 @@ mod tests {
     /// dwell cadence while the burn is still armed.
     #[test]
     fn a_burned_edge_does_not_slow_a_genuine_regime_drop() {
+        // Single-turn steps on purpose: the pattern under test is a *descent's*
+        // pacing -- several ungated steps, then one that waits out probation --
+        // and only a fine-grained stride puts enough steps above the floor to
+        // watch the cadence of. What is being checked (probation gates edge
+        // shrinks and nothing else) is independent of how far each step moves.
+        let law = ControlLaw {
+            lower_step: 1,
+            ..ControlLaw::default()
+        };
         let mut maker = DecisionMaker::new(
             key(),
             bounds(0, 20),
-            law(),
+            law,
             Authority::SelfRelay,
             HashSet::new(),
         );
@@ -10552,10 +10570,13 @@ mod tests {
             vec![BufferSize(5), BufferSize(4), BufferSize(3), BufferSize(2)],
             "the full descent ran: {descent:?}",
         );
+        // Only the last step lands ON the resting target, so only it is an edge
+        // shrink; every step before it lands above the floor and runs at plain
+        // dwell cadence, undelayed by the armed burn.
         for pair in descent.windows(2).take(2) {
             assert_eq!(
                 pair[1].0 - pair[0].0,
-                120,
+                law.min_dwell_turns,
                 "the non-edge steps are dwell-paced, not probation-delayed: {descent:?}",
             );
         }
@@ -10616,8 +10637,8 @@ mod tests {
         );
         assert_eq!(
             decisions.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
-            vec![BufferSize(6), BufferSize(5)],
-            "a monotonic two-step descent: {decisions:?}",
+            vec![BufferSize(5)],
+            "a monotonic descent, landing on the aged-out floor: {decisions:?}",
         );
         assert_eq!(maker.buffer(), BufferSize(5));
     }
