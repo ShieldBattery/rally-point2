@@ -121,7 +121,11 @@ struct Cli {
     /// is harmless — the token is checked only at handshake, never per-turn — so
     /// an overly generous value costs only how long an abandoned, never-started
     /// session lingers before the never-started reaper retires it. Default 6
-    /// hours.
+    /// hours; values above the fleet ceiling
+    /// (`rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS`, 24 hours)
+    /// are clamped with a warning — the relay's retired-session tombstones are
+    /// sized against that ceiling, and a longer-lived token could re-dial a
+    /// session after its tombstone was pruned.
     #[arg(
         long,
         env = "COORDINATOR_PLAYER_TOKEN_LIFETIME_SECS",
@@ -496,6 +500,22 @@ async fn main() -> Result<()> {
     // configured pairs still lacking a measurement and bootstrap relays to fill them.
     let provision_pair_rtts = pair_rtts.clone();
 
+    // Clamp the configured token lifetime to the fleet-wide ceiling. The relay
+    // retains a retired session's tombstone only long enough to outlast the
+    // longest-lived token this constant permits; minting past it would let a
+    // stale token re-dial a session after its tombstone was pruned.
+    let player_token_lifetime_secs = if cli.player_token_lifetime_secs
+        > rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS
+    {
+        tracing::warn!(
+            configured = cli.player_token_lifetime_secs,
+            ceiling = rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS,
+            "player token lifetime exceeds the fleet ceiling; clamping",
+        );
+        rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS
+    } else {
+        cli.player_token_lifetime_secs
+    };
     let state = CoordinatorState {
         setup,
         notices,
@@ -504,7 +524,7 @@ async fn main() -> Result<()> {
         hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: api::LIVENESS_TIMEOUT,
         regions,
-        player_token_lifetime: Duration::from_secs(cli.player_token_lifetime_secs),
+        player_token_lifetime: Duration::from_secs(player_token_lifetime_secs),
         ledger,
         pair_rtts,
         flight_store,

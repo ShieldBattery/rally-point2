@@ -41,14 +41,15 @@ use crate::routing::SessionKey;
 /// Two windows to cover. The short one — retirement's queued mesh Leave
 /// commands still draining through the link drivers — is seconds at worst.
 /// The long one is what actually sizes this: a retired session's client
-/// tokens stay valid for the coordinator's token lifetime (hours), and once
-/// the gate is pruned a stale dial is admitted through the permissive
-/// no-maker path, resurrecting roster/seen state for a session the
-/// coordinator already ended. So the TTL must comfortably outlast the
-/// longest token lifetime a coordinator would mint (default six hours) —
-/// a retired entry is a key and a timestamp, so holding a day's worth
-/// still bounds the map at trivial cost.
-const RETIRED_GATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// tokens stay valid for the coordinator's token lifetime, and once the gate
+/// is pruned a stale dial is admitted through the permissive no-maker path,
+/// resurrecting roster/seen state for a session the coordinator already
+/// ended. So the TTL is tied to the credential invariant, not a guess: the
+/// fleet-wide token-lifetime ceiling the coordinator clamps its minting to,
+/// plus an hour of margin. A retired entry is a key and a timestamp, so
+/// holding a day's worth still bounds the map at trivial cost.
+const RETIRED_GATE_TTL: Duration =
+    Duration::from_secs(rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS + 60 * 60);
 
 #[derive(Default)]
 struct GateState {

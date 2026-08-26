@@ -106,6 +106,17 @@ impl AsRef<str> for RegionId {
 /// counted-drop behavior.
 pub const CAPABILITY_FINALIZED_DROP_V1: &str = "finalized_drop_v1";
 
+/// The fleet-wide ceiling on a player token's lifetime, in seconds (24 hours).
+///
+/// A shared contract, not a tuning knob: the coordinator clamps its configured
+/// `player_token_lifetime` to this before minting, and the relay sizes its
+/// retired-session tombstone retention to outlast it. The pairing is what
+/// keeps a retired session terminal — a token can never outlive the tombstone
+/// that refuses its stale re-dial, no matter how the coordinator is
+/// configured. Raising this without also revisiting the relay's
+/// retired-gate retention would silently reopen that gap.
+pub const MAX_PLAYER_TOKEN_LIFETIME_SECS: u64 = 24 * 60 * 60;
+
 /// The first frame a relay sends on its control connection, enrolling it into
 /// the coordinator's registry (wrapped in [`RelayToCoordinator::Hello`]).
 ///
