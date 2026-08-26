@@ -606,6 +606,47 @@ mod tests {
         }
     }
 
+    /// Tuning aid: what a *brief* bad episode costs after it is over. The
+    /// scenario tests all run sustained weather, where a buffer that stays up
+    /// is doing its job; this measures the opposite case, where it is not.
+    ///
+    /// The number to watch is how far the elevated-after column tracks the
+    /// episode length. It cannot track it closely -- the loss memory holds the
+    /// target up past the weather by design, and the shrink floor then holds
+    /// the peak for its lookback -- but a law where a two-second blip costs
+    /// what a minute-long outage costs is charging every player for weather
+    /// that has been over for half a minute. Run with
+    /// `cargo test -p rally-point-relay buffer_law_sim -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual tuning aid, prints measurements"]
+    fn dump_transient_cost() {
+        println!("== cost of a brief episode, after it ends ==");
+        for episode in [2u32, 5, 15, 60] {
+            let mut elevated = Vec::new();
+            let mut peaks = Vec::new();
+            for seed in [7u64, 99, 1234, 11, 555] {
+                let phases = [
+                    Weather::clean(seconds(60), 40_000),
+                    Weather::throttled(seconds(episode), 40_000),
+                    Weather::clean(seconds(240), 40_000),
+                ];
+                let result = run(ControlLaw::default(), &phases, seed);
+                let baseline = result.buffer_at(seconds(59));
+                let end = seconds(60) + seconds(episode);
+                let last = result.buffer_by_turn.len() as u32;
+                peaks.push((end..last).map(|t| result.buffer_at(t)).max().unwrap_or(0));
+                let recovered = (end..last)
+                    .find(|&t| result.buffer_at(t) <= baseline)
+                    .unwrap_or(last);
+                elevated.push((recovered - end) / 24);
+            }
+            let mean = f64::from(elevated.iter().sum::<u32>()) / elevated.len() as f64;
+            println!(
+                "   episode {episode:>3}s: peak buffer {peaks:?}, elevated after {elevated:?}                  (mean {mean:.1}s)",
+            );
+        }
+    }
+
     /// Trace dump for tuning sessions: per-2s rows of weather, target, and
     /// buffer for each scenario. Run with
     /// `cargo test -p rally-point-relay buffer_law_sim -- --ignored --nocapture`.

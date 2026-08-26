@@ -49,7 +49,8 @@
 //! formula:
 //!
 //! ```text
-//! target = ceil(pairwise_path / turn_duration) + ceil(loss_risk / turn_duration)
+//! target = ceil(pairwise_path / turn_duration)
+//!        + max(ceil(loss_risk / turn_duration), burst_turns)
 //! ```
 //!
 //! Path and loss are `ceil`'d separately because loss recovery is quantized to
@@ -93,8 +94,19 @@
 //!   fades drop runs of consecutive packets -- and the mean-rate term
 //!   structurally understates it: a 30ms blackout every 300ms is ~10% loss
 //!   but delays the turns inside it by the blackout's whole duration in
-//!   re-carries. The run length *is* that duration in turns, so it joins the
-//!   sum directly.
+//!   re-carries. The run length *is* that duration in turns.
+//! - **The two loss terms fold with `max`, not a sum.** Both estimate one
+//!   quantity -- the delivery delay the worst link's loss adds -- and the
+//!   burst term exists precisely *because* the mean-rate term reads that
+//!   quantity badly on bursty loss. A correction is not additive with the
+//!   thing it corrects, and at the limit the two are visibly one event: a run
+//!   of fully-dark intervals is exactly what drives the windowed rate to
+//!   saturation, so summing there charges the buffer twice for one dark
+//!   stretch. Taking the worse keeps whichever estimator is reading the
+//!   current loss shape correctly -- the rate under uniform loss, the run
+//!   under bursts -- and, the two being strongly correlated, it is also the
+//!   markedly quieter signal: the target moves less often, so the buffer does
+//!   too.
 //! - **Both loss terms read only *flowing* traffic.** Conditions samples are
 //!   receive-triggered, so a receive gap of a second or more is a stall or
 //!   outage -- lateness no depth inside the bounds could absorb -- and the
@@ -3629,7 +3641,8 @@ impl DecisionMaker {
     /// applying it. This is the formula:
     ///
     /// ```text
-    /// target = ceil(pairwise_path / turn_duration) + ceil(loss_risk / turn_duration)
+    /// target = ceil(pairwise_path / turn_duration)
+    ///        + max(ceil(loss_risk / turn_duration), burst_turns)
     /// ```
     ///
     /// Path and loss are `ceil`'d separately because loss recovery is quantized
@@ -3721,17 +3734,18 @@ impl DecisionMaker {
         let margined_path_turns =
             (path_us.saturating_add(self.law.shrink_headroom_us) as f64 / turn_us).ceil() as u32;
 
+        // Both loss terms estimate one quantity -- the delivery delay the worst
+        // link's loss adds -- from different angles, so the estimate is the
+        // worse of the two, not their sum.
+        let loss_delay_turns = loss_turns.max(burst_turns);
+
         Some(TargetInputs {
             // Saturating: the terms derive from client-influenced inputs, and
             // an absurd target is clamped to the session bounds at `decide`
             // anyway — overflow here would only trade that clamp for a
             // debug-build panic.
-            target: path_turns
-                .saturating_add(loss_turns)
-                .saturating_add(burst_turns),
-            shrink_target: margined_path_turns
-                .saturating_add(loss_turns)
-                .saturating_add(burst_turns),
+            target: path_turns.saturating_add(loss_delay_turns),
+            shrink_target: margined_path_turns.saturating_add(loss_delay_turns),
             path_us,
             worst_loss_risk,
             burst_turns,
@@ -7432,14 +7446,11 @@ mod tests {
         let margined_path_turns = (f64::from(path_us.saturating_add(maker.law.shrink_headroom_us))
             / turn_us)
             .ceil() as u32;
+        let loss_delay_turns = loss_turns.max(burst_turns);
 
         Some(TargetInputs {
-            target: path_turns
-                .saturating_add(loss_turns)
-                .saturating_add(burst_turns),
-            shrink_target: margined_path_turns
-                .saturating_add(loss_turns)
-                .saturating_add(burst_turns),
+            target: path_turns.saturating_add(loss_delay_turns),
+            shrink_target: margined_path_turns.saturating_add(loss_delay_turns),
             path_us,
             worst_loss_risk,
             burst_turns,
@@ -7596,14 +7607,18 @@ mod tests {
         // loss *risk*) is unmeasured -- a fully dark link stalls lockstep
         // regardless of how short its path is.
         assert_eq!(inputs.burst_turns, 1);
-        assert_eq!(inputs.target, 11);
+        // Path 8, and the worse of the loss terms (risk 60ms -> 2 turns,
+        // against the 1-turn burst) rather than their sum.
+        assert_eq!(inputs.target, 10);
 
         maker.record_departure(SlotId(1), DepartureStamps::default(), DROPPED);
         assert_target_inputs_match_reference(&maker);
         let inputs = maker.target_inputs().unwrap();
         assert_eq!(inputs.path_us, 200_000);
         assert_eq!(inputs.worst_loss_risk, 15_000.0);
-        assert_eq!(inputs.target, 7);
+        // Path 5, plus one turn for loss: the risk and the burst run agree at
+        // a turn here, so max and sum would only differ by which is doubled.
+        assert_eq!(inputs.target, 6);
 
         maker.record_departure(SlotId(2), DepartureStamps::default(), DROPPED);
         assert_target_inputs_match_reference(&maker);
@@ -9807,11 +9822,13 @@ mod tests {
     }
 
     /// A stretch of sample intervals that lost *every* packet is a link
-    /// blackout, and its length joins the target as whole turns (capped):
-    /// delivery inside it is dark for exactly that many re-carries, which the
-    /// mean loss rate understates for bursty loss.
+    /// blackout, and its length is available to the target as whole turns
+    /// (capped): delivery inside it is dark for exactly that many re-carries,
+    /// which the mean loss rate understates for bursty loss. The two loss
+    /// terms describe one blackout from two angles, so the target takes the
+    /// worse rather than their sum.
     #[test]
-    fn a_full_blackout_adds_its_duration_to_the_target() {
+    fn a_full_blackout_prices_its_duration_into_the_target() {
         let mut maker = DecisionMaker::new(
             key(),
             bounds(0, 20),
@@ -9823,13 +9840,16 @@ mod tests {
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
 
         // Three consecutive intervals lose all 10 of their packets: a ~3-turn
-        // blackout. The windowed rate also saturates (30 lost of the 30 sent
-        // since baseline -> 1.0 * 150ms -> 4 turns), and the burst term adds
-        // the observed 3-turn duration on top.
+        // blackout. Both loss terms see it -- the windowed rate saturates
+        // (30 lost of the 30 sent since baseline -> 1.0 * 150ms -> 4 turns)
+        // *because* every packet in the blackout was dropped, and the burst
+        // term measures the same darkness directly as its 3-turn run. They are
+        // one hazard counted two ways, so the target carries the worse of them
+        // once, not 7 turns of loss allowance for 3 turns of dark link.
         ingest_at(&mut maker, &conditions(0, 150_000, 10, 110), 2);
         ingest_at(&mut maker, &conditions(0, 150_000, 20, 120), 3);
         ingest_at(&mut maker, &conditions(0, 150_000, 30, 130), 4);
-        assert_eq!(maker.target(), Some(4 + 4 + 3));
+        assert_eq!(maker.target(), Some(4 + 4));
 
         // Partial loss is not a blackout: re-carries still get through, so
         // the run resets and the burst term stops growing.
