@@ -1502,20 +1502,31 @@ async fn serve_relay_control(
         let result =
             lifecycle.enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello));
         let evict = match &result {
-            Ok(generation) if !finalize_capable => {
-                let enabled: Vec<_> = setup
+            Ok(generation) => {
+                // Sessions whose recorded build-class cohort no longer
+                // matches this relay's advertised capability — the relay
+                // crossed the finalized-drop boundary in EITHER direction
+                // while still assigned. Both directions mix build classes
+                // that deliver dropped-leave counts differently, so both
+                // evict. Only the downgrade additionally drains the relay:
+                // an incapable build must take no new capable-cohort work,
+                // while an upgraded relay is exactly what new sessions want.
+                let mismatched: Vec<_> = setup
                     .descriptors()
                     .current_for(relay_id)
                     .iter()
-                    .filter(|d| d.finalized_drops)
+                    .filter(|d| {
+                        session::session_capable_cohort(&setup, &d.tenant, d.session)
+                            .is_some_and(|cohort| cohort != finalize_capable)
+                    })
                     .map(|d| (d.tenant.clone(), d.session))
                     .collect();
-                if !enabled.is_empty() {
+                if !mismatched.is_empty() && !finalize_capable {
                     let _ = registry::mark_draining(setup.registry(), relay_id, *generation);
                 }
-                enabled
+                mismatched
             }
-            _ => Vec::new(),
+            Err(_) => Vec::new(),
         };
         (result, evict)
     };
@@ -1545,20 +1556,23 @@ async fn serve_relay_control(
         "relay enrolled over control connection"
     );
 
-    // A relay that re-enrolled WITHOUT the finalized-drop capability while
-    // still assigned finalized-drops sessions was downgraded mid-flight. It
-    // must never silently serve them — its build can author the historical
-    // unsound counted-drop behavior those sessions' peers no longer strip
-    // defensively for their own cohort. The drain mark (no new assignments,
-    // and the eviction below can never pick it as its own replacement) and
-    // the session snapshot were taken under the assignment lock above; move
-    // each enabled session off it here. A session with no in-cohort
-    // replacement ends (Unavailable) rather than continuing mixed.
+    // A relay that re-enrolled on the other side of the finalized-drop
+    // capability boundary while still assigned sessions of the old cohort
+    // must never silently serve them — the two build classes deliver
+    // dropped-leave counts differently (one authors/passes the historical
+    // counted-drop behavior, the other strips it), so a mixed session hands
+    // different clients different leave schedules. The mismatch snapshot
+    // (and, for a downgrade, the drain mark) was taken under the assignment
+    // lock above; move each mismatched session off it here. A session with
+    // no in-cohort replacement ends (Unavailable) rather than continuing
+    // mixed. In this deployment upgrades arrive as fresh relay ids, so the
+    // upgrade direction firing at all is itself a signal worth the warn.
     if !evict.is_empty() {
         tracing::warn!(
             relay_id = relay_id.0,
             sessions = evict.len(),
-            "relay re-enrolled without FINALIZED_DROP_V1 while serving                  finalized-drops sessions; draining it and evicting them",
+            finalize_capable,
+            "relay re-enrolled across the finalized-drop capability boundary while assigned                  sessions of the other cohort; evicting them",
         );
         for (tenant, session) in evict {
             let departed = lifecycle.departed_slots(&tenant, session);
@@ -1568,7 +1582,7 @@ async fn serve_relay_control(
                 tenant = tenant.as_ref(),
                 session = session.0,
                 ?outcome,
-                "evicted a finalized-drops session from a downgraded relay",
+                "evicted a cohort-mismatched session from a capability-changed relay",
             );
         }
     }

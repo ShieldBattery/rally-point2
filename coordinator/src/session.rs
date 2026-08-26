@@ -69,13 +69,21 @@ pub struct SessionRefs {
     /// The tenant's own id for the session (ShieldBattery's `gameId`).
     pub external_id: Option<String>,
     /// Whether this session runs home-side drop finalization
-    /// ([`SessionDescriptor::finalized_drops`]): every relay in its
-    /// capability-homogeneous cohort advertises
-    /// [`CAPABILITY_FINALIZED_DROP_V1`]. Decided once at create and immutable
-    /// — every descriptor rebuild (rehome, late-departure refresh) reads the
-    /// flag from here, and rehome replacement picks stay within the same
-    /// capability cohort.
+    /// ([`SessionDescriptor::finalized_drops`]): its cohort is capable AND
+    /// the coordinator's finalized-drops feature switch was on at create.
+    /// Decided once at create and immutable — every descriptor rebuild
+    /// (rehome, late-departure refresh) reads the flag from here.
     pub finalized_drops: bool,
+    /// Whether every relay in this session's capability-homogeneous cohort
+    /// advertises [`CAPABILITY_FINALIZED_DROP_V1`] — the session's BUILD
+    /// class, distinct from `finalized_drops` (the feature can be switched
+    /// off while cohorts still exist). Rehome replacement picks and
+    /// enrollment-time cohort eviction key on THIS, never on the feature
+    /// flag: a session must never mix relays across the capability boundary
+    /// regardless of whether the handshake is enabled, because the two build
+    /// classes deliver dropped-leave counts differently and mixing them
+    /// hands different clients different leave schedules.
+    pub capable_cohort: bool,
     /// The tenant's own id for the player in each slot (a stringified
     /// `SbUserId`). Only slots whose handoff carried an `external_ref` appear.
     pub slots: HashMap<SlotId, String>,
@@ -458,6 +466,10 @@ pub struct SessionSetup {
     /// instead of unbounded session/descriptor/lifecycle growth. Idempotent
     /// replays of a still-live session are exempt — they mint nothing.
     session_ceiling: Option<usize>,
+    /// Whether new sessions on capable cohorts enable the finalized-drop
+    /// handshake. Cohort placement is unconditional; only the feature bit is
+    /// gated. See [`with_finalized_drops`](Self::with_finalized_drops).
+    finalize_feature: bool,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -493,7 +505,21 @@ impl SessionSetup {
             provision: ProvisionGate::dormant(),
             pending_creates: Arc::new(Mutex::new(HashMap::new())),
             session_ceiling: None,
+            finalize_feature: true,
         }
+    }
+
+    /// Sets whether new sessions on capable cohorts run the finalized-drop
+    /// handshake. Placement still keeps build-class cohorts apart either way;
+    /// this only decides whether a capable cohort's sessions actually enable
+    /// the feature. Production wires this from the coordinator's
+    /// `--enable-finalized-drops` switch (default OFF until the coordinated
+    /// rehome fence exists — see the flag's doc); the constructor default is
+    /// ON so the feature's own tests exercise it without ceremony.
+    #[must_use]
+    pub fn with_finalized_drops(mut self, enabled: bool) -> Self {
+        self.finalize_feature = enabled;
+        self
     }
 
     /// Sets the global live-session ceiling (see the field docs). `None` — the
@@ -725,6 +751,23 @@ pub enum RehomeOutcome {
 /// is the lock-free sibling of the identical lookup inside [`rehome`], which runs
 /// there under the rehomes lock so the read-and-mutate stays atomic; a shared
 /// helper cannot be reused there without re-entering that lock.
+/// The session's recorded build-class cohort — whether its relays advertise
+/// the finalized-drop capability — or `None` for a session this coordinator
+/// lifetime doesn't know. Enrollment consults this to evict a session from a
+/// relay that re-enrolled on the other side of the boundary, in either
+/// direction: build classes must never mix in one session.
+pub(crate) fn session_capable_cohort(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+) -> Option<bool> {
+    setup
+        .session_refs
+        .lock()
+        .get(&(tenant.clone(), session))
+        .map(|refs| refs.capable_cohort)
+}
+
 pub fn recorded_rehome(
     setup: &SessionSetup,
     tenant: &TenantId,
@@ -977,7 +1020,7 @@ fn rehome_inner(
         .session_refs
         .lock()
         .get(&key)
-        .is_some_and(|refs| refs.finalized_drops);
+        .is_some_and(|refs| refs.capable_cohort);
     // The cohort filter applies to BOTH branches: an already-serving member
     // can be capability-mismatched too — a serving relay that re-enrolled
     // across the finalized-drop boundary is being evicted concurrently, and
@@ -1455,7 +1498,12 @@ fn create_body(
     // placements use it to rotate the primary home, but a placement failure must
     // leave the same id available to the next successful create.
     let candidate_session = candidate_session_id(setup);
-    let placement = place_by_region(&setup.registry, &request, candidate_session)?;
+    let placement = place_by_region(
+        &setup.registry,
+        &request,
+        candidate_session,
+        setup.finalize_feature,
+    )?;
 
     if !tenant::is_enrolled(&setup.tenants, &request.tenant) {
         return Err(SessionSetupError::TenantNotFound(request.tenant));
@@ -1476,6 +1524,7 @@ fn create_body(
         relay_certs,
         relay_regions,
         finalized_drops,
+        capable_cohort,
     } = placement;
 
     // Test seam: a drain mark racing this create lands wholly before or after,
@@ -1518,6 +1567,7 @@ fn create_body(
         relay_certs,
         relay_regions,
         finalized_drops,
+        capable_cohort,
         latency_estimate_ms: request.latency_estimate_ms,
     };
     setup
@@ -1806,9 +1856,13 @@ struct Placement {
     relay_ids: Vec<RelayId>,
     /// Every slot's assigned home relay id.
     homes: std::collections::BTreeMap<SlotId, RelayId>,
-    /// Whether the placed cohort is finalized-drop capable — the session's
-    /// immutable `finalized_drops` value (see `place_by_region`).
+    /// Whether the session runs the finalized-drop handshake: the placed
+    /// cohort is capable AND the feature switch is on (see `place_by_region`).
     finalized_drops: bool,
+    /// Whether the placed cohort is finalized-drop capable — the session's
+    /// build class, kept even when the feature switch is off so rehome and
+    /// eviction never mix build classes.
+    capable_cohort: bool,
     /// Each serving relay's client-cert fingerprint, for a later re-home's
     /// restart-in-place detection.
     relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
@@ -1908,6 +1962,7 @@ fn place_by_region(
     registry: &RelayRegistry,
     request: &SessionRequest,
     session: SessionId,
+    finalize_feature: bool,
 ) -> Result<Placement, SessionSetupError> {
     let mut entries = registry::available_entries(registry);
     if entries.is_empty() {
@@ -1924,11 +1979,15 @@ fn place_by_region(
     // only when no capable relay is available at all. Within the chosen
     // cohort the region logic below runs unchanged — a slot whose region only
     // exists in the other cohort takes the in-cohort region-blind fallback
-    // rather than mixing.
-    let finalized_drops = entries.iter().any(relay_finalize_capable);
-    if finalized_drops {
+    // rather than mixing. Cohorting applies whether or not the FEATURE is
+    // enabled — build classes must never mix in one session regardless — but
+    // the handshake itself only turns on for a capable cohort when the
+    // coordinator's feature switch says so.
+    let capable_cohort = entries.iter().any(relay_finalize_capable);
+    if capable_cohort {
         entries.retain(relay_finalize_capable);
     }
+    let finalized_drops = capable_cohort && finalize_feature;
 
     // NOTE(version-aware placement): each entry carries the relay's advertised
     // `protocol` (negotiated against at enroll — an incompatible relay never gets
@@ -2019,6 +2078,7 @@ fn place_by_region(
         relay_certs,
         relay_regions,
         finalized_drops,
+        capable_cohort,
     })
 }
 
@@ -3923,6 +3983,59 @@ mod tests {
             let staged = setup.descriptors().current_for(relay_id);
             assert!(!staged[0].finalized_drops);
         }
+    }
+
+    /// With the finalized-drops feature switch OFF, placement still keeps
+    /// build-class cohorts apart (a mixed session hands different clients
+    /// different leave schedules regardless of the feature), but the session
+    /// runs without the handshake — and a rehome still stays in-cohort,
+    /// keyed on the recorded build class rather than the feature flag.
+    #[test]
+    fn the_feature_switch_off_keeps_cohorts_but_disables_the_handshake() {
+        let reg = registry::new_registry();
+        enroll_capable_relay(&reg, 1, 14900);
+        enroll_relay(&reg, 2, 14901);
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            TenantId("sb-test".to_owned()),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants).with_finalized_drops(false);
+        let resp = create_default_session(&setup);
+
+        let staged = setup.descriptors().current_for(RelayId(1));
+        assert_eq!(
+            staged.len(),
+            1,
+            "the capable cohort is still preferred with the feature off",
+        );
+        assert!(
+            !staged[0].finalized_drops,
+            "the switched-off feature never enables the handshake",
+        );
+
+        // The capable home dies with only the incapable relay 2 live: the
+        // rehome must NOT cross the build-class boundary even though the
+        // session's finalized_drops flag is false.
+        registry::remove(setup.registry(), RelayId(1));
+        assert!(
+            matches!(
+                rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+                RehomeOutcome::Unavailable,
+            ),
+            "the build-class cohort binds the rehome even with the feature off",
+        );
+        enroll_capable_relay(setup.registry(), 4, 14903);
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget once an in-cohort replacement exists");
+        };
+        assert_eq!(endpoint.relay_id, RelayId(4));
+        assert!(!setup.descriptors().current_for(RelayId(4))[0].finalized_drops);
     }
 
     /// A rehome replacement must come from the session's own capability

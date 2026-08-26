@@ -133,6 +133,18 @@ struct Cli {
     )]
     player_token_lifetime_secs: u64,
 
+    /// Enables the finalized-drop handshake for new sessions placed on
+    /// capable relay cohorts. Off by default: the handshake's remaining
+    /// exposure is a partition-delayed finalization result deciding a count
+    /// after the slot re-homed and played on — closable only by a
+    /// coordinated rehome fence (all serving relays ack the resumed
+    /// descriptor before the replacement home admits), which does not exist
+    /// yet. Until it does, dropped leaves use the frame-scheduled fallback.
+    /// Placement still keeps capability cohorts apart either way, so
+    /// flipping this on later changes only newly created sessions.
+    #[arg(long, env = "COORDINATOR_ENABLE_FINALIZED_DROPS")]
+    enable_finalized_drops: bool,
+
     /// Global ceiling on concurrently live sessions across every tenant. At the
     /// cap, fresh session creates are refused (503) until sessions close — an
     /// emergency brake so a runaway caller or an abuse burst degrades into
@@ -376,9 +388,13 @@ async fn main() -> Result<()> {
     // warm endpoint's demand is shared with the loop. Absent ⇒ the setup keeps its
     // dormant gate and every hold-until-ready behavior is off.
     let mut setup = session::SessionSetup::new(registry::new_registry(), tenants)
-        .with_session_ceiling(cli.max_sessions);
+        .with_session_ceiling(cli.max_sessions)
+        .with_finalized_drops(cli.enable_finalized_drops);
     if let Some(ceiling) = cli.max_sessions {
         tracing::info!(ceiling, "global live-session ceiling enabled");
+    }
+    if cli.enable_finalized_drops {
+        tracing::info!("finalized-drop handshake enabled for new capable-cohort sessions");
     }
     if provisioning_enabled {
         setup = setup.with_provision_gate(session::ProvisionGate::provisioning(
