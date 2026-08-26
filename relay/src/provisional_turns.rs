@@ -48,9 +48,10 @@
 //! intent racing the replay still orders AFTER the slot's in-flight turns —
 //! its count is derived over all of them, and nothing is ever announced
 //! ahead of turns it should have counted. Only the drain's atomic
-//! empty-check flips a session to `Resolved`. The state lives until the
-//! session ends (retirement, the reap, or the emptied-session close of a
-//! drained journal discards it).
+//! empty-check flips a session to `Resolved`. The state then lives until
+//! descriptor retirement discards it (the reap never touches the journal,
+//! and the emptied-session close removes only a provably empty one — see
+//! the retention rule above).
 //!
 //! **A journaled clean leave seals its slot.** The intent is terminal the
 //! moment the client sent it, exactly as a maker's decided leave would be —
@@ -81,11 +82,11 @@ use rally_point_proto::messages::Payload;
 
 use crate::routing::SessionKey;
 
-/// The most journaled entries one session may accumulate. Sized to cover the
+/// The most journaled TURNS one session may accumulate. Sized to cover the
 /// provisional window at worst-case turn traffic (a full lobby at game turn
-/// rate for the sweep's whole deadline) with room to spare; a session that
-/// genuinely exceeds it is reaped and recovered through resume rather than
-/// silently holed — see the module doc's overflow policy.
+/// rate for the sweep's whole deadline) with room to spare; a slot that
+/// genuinely exceeds it is sealed and its link closed rather than its
+/// accepted sequence silently holed — see the module doc's overflow policy.
 pub(crate) const PER_SESSION_CAP: usize = 4096;
 
 /// How long an undrained journal is retained waiting for its descriptor
@@ -421,21 +422,23 @@ impl ProvisionalTurnPen {
     }
 
     /// Removes every journal that has waited longer than `ttl` for a
-    /// descriptor that never came, sparing sessions `spare` claims (a maker
-    /// exists — the descriptor DID come and the session owns its own
-    /// lifecycle now). Returns the pruned keys so the caller can drop their
-    /// session gates alongside.
+    /// descriptor that never came, sparing sessions `spare` claims. Returns
+    /// the pruned keys so the caller can drop their session gates alongside.
     ///
-    /// This is the journal's ONE terminal janitor. Everything else retains:
-    /// journaled entries are transport-acknowledged, a same-relay resume
-    /// deliberately does not re-inject acknowledged retention, and the
-    /// provisional reap's close is documented as retryable — so discarding a
-    /// journal while any still-valid token could redial the session would
-    /// silently hole an accepted sequence. Only once the fleet's token
-    /// ceiling has fully elapsed can no client return, and only then is the
-    /// journal (and its sealed slots, revisions, and gate) safe to drop.
-    /// Active drains are spared like `Draining` everywhere else; `Resolved`
-    /// journals belong to served sessions and are cleaned at retirement.
+    /// This is the journal's ONE terminal janitor, and `spare` carries half
+    /// its proof obligation. Everything else retains: journaled entries are
+    /// transport-acknowledged, a same-relay resume deliberately does not
+    /// re-inject acknowledged retention, and the provisional reap's close is
+    /// documented as retryable — so a journal may only be dropped when the
+    /// session is provably terminal. `ttl` (the fleet token ceiling) proves
+    /// no NEW link can ever be admitted; it proves nothing about links that
+    /// never died, since token expiry is checked only at the handshake and a
+    /// kept-alive connection outlives it freely. The caller's `spare` must
+    /// therefore claim, at minimum, every session with a live roster link
+    /// (a depositor may still be running) and every session with a maker
+    /// (the descriptor came; retirement owns its cleanup). Active drains
+    /// are spared like `Draining` everywhere else; `Resolved` journals
+    /// belong to served sessions and are cleaned at retirement.
     #[must_use]
     pub fn prune_stale(
         &self,
@@ -760,7 +763,18 @@ mod tests {
         assert_eq!(pruned, vec![stale.clone()]);
         assert_eq!(pen.held(&stale), 0);
         assert_eq!(pen.held(&described), 1, "a maker spares the journal");
-        assert_eq!(pen.held(&draining), 1, "an active drain spares the journal");
+        // The draining journal's queue is empty (its entry sits in this
+        // test's private batch), so probe the retained CLAIM instead of the
+        // queue: a pruned key would hand a fresh drain out; the spared one
+        // still refuses because the original drain owns it.
+        assert!(
+            pen.begin_drain(&draining).is_none(),
+            "an active drain spares the journal — the claim survives the prune",
+        );
+        match pen.continue_drain(&draining) {
+            DrainStep::Done => {}
+            DrainStep::More(_) => panic!("nothing further was deposited mid-drain"),
+        }
 
         // A generous TTL prunes nothing.
         assert!(
