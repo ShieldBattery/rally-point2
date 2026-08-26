@@ -1619,6 +1619,19 @@ pub struct DecisionMaker {
     /// resume); a successful finalization's decided leave then refuses
     /// readmission on its own.
     finalizing_drops: HashSet<SlotId>,
+    /// Homed slots whose forward-gate cursor cannot be trusted as a total
+    /// count of the slot's turns: every home this relay *gained* mid-session
+    /// (a rehome moved the slot here), plus every home seeded by a resumed
+    /// descriptor into a fresh maker. For such a slot this relay was not the
+    /// single ingress for the slot's whole history, so even a non-`None`
+    /// gap-free forwarded prefix (this relay may have been serving the
+    /// session all along, just not homing the slot) can stop short of turns
+    /// other relays' clients already consumed — sealing that prefix as the
+    /// slot's final turn count would recreate the exact desync finalization
+    /// exists to remove. Drop finalization refuses these slots outright; a
+    /// home held continuously since the session's first descriptor is the
+    /// only sound finalizer. Never removed for the session's lifetime.
+    rehomed_homes: HashSet<SlotId>,
     /// Whether this relay has already reported its own closure for the session
     /// (the `SessionClosed` notice the coordinator's all-relays-closed
     /// retirement counts). The session-emptied close can be evaluated from
@@ -2841,6 +2854,7 @@ impl DecisionMaker {
             resumed: false,
             finalized_drops_enabled: false,
             finalizing_drops: HashSet::new(),
+            rehomed_homes: HashSet::new(),
             close_reported: false,
             own_relay_id: None,
             latency_hint_ms: None,
@@ -4161,7 +4175,9 @@ impl DecisionMaker {
         // rehome splits the forwarding history the intent's cut covered); a
         // finalized count is exempt — its soundness rests entirely on the
         // home's own gap-free cursor, and a home without cursor continuity
-        // cannot finalize at all (`forwarded_count` is `None` there).
+        // refuses to finalize at all (a home gained mid-session is refused
+        // outright via `rehomed_homes`, and a collapsed or absent prefix
+        // reads as no cursor).
         let finalized = reason == LEAVE_REASON_DROPPED
             && record.is_some_and(|d| d.finalized && d.final_turn_count.is_some());
         let final_turn_count = if reason == LEAVE_REASON_DROPPED {
@@ -5751,6 +5767,17 @@ pub fn sync_maker(
                 let maker = existing.get_mut();
                 maker.set_observers(observers);
                 maker.set_expected_slots(expected_slots);
+                // Any home this push ADDS to an existing maker is a home
+                // gained mid-session — this relay was not the slot's single
+                // ingress for its whole history, so its forward-gate cursor
+                // can never soundly seal the slot's final turn count (see
+                // `rehomed_homes`). Recorded before the wholesale replace
+                // below, which is what makes "added" observable at all.
+                let gained: Vec<SlotId> = homed_slots
+                    .difference(&maker.homed_slots)
+                    .copied()
+                    .collect();
+                maker.rehomed_homes.extend(gained);
                 maker.set_homed_slots(homed_slots);
                 if maker.finalized_drops_enabled != finalized_drops {
                     // Immutable for the session's lifetime: the create-time
@@ -5785,6 +5812,15 @@ pub fn sync_maker(
                 maker.set_expected_slots(expected_slots);
                 maker.set_homed_slots(homed_slots);
                 maker.finalized_drops_enabled = finalized_drops;
+                // A maker created by a RESUMED descriptor is a relay pulled
+                // into (or restarted into) a session that already has
+                // history this relay's forward gate never carried — even if
+                // a stale seen registry answers with a prefix, it is not the
+                // slot's whole ingress history. Every home it starts with is
+                // therefore cursor-broken for finalization purposes.
+                if resumed_departed.is_some() {
+                    maker.rehomed_homes = maker.homed_slots.clone();
+                }
                 let seeded = seed(maker);
                 (Vec::new(), Vec::new(), seeded)
             }
@@ -6312,6 +6348,25 @@ pub fn slot_leave_decided(registry: &DecisionMakers, key: &SessionKey, slot: Slo
         .lock()
         .get(key)
         .is_some_and(|maker| maker.decided_leaves.contains_key(&slot))
+}
+
+/// Whether `slot`'s leave, if decided right now, would actually commit: a
+/// framed scheduling basis exists (a session frame, or a last frame on the
+/// slot's own departure record) — the same short-circuit `commit_leave`
+/// applies. Read before releasing a drop hold whose decide must not silently
+/// fail: a released hold with no committed leave strands the departure with
+/// nothing left to retry against. Monotone-safe as a check-then-act — frames
+/// only accumulate, so a `true` here never becomes `false` by decide time.
+/// `false` with no maker (nothing to decide into).
+pub fn leave_schedulable(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry.lock().get(key).is_some_and(|maker| {
+        maker.session_frame().is_some()
+            || maker
+                .departures
+                .get(&slot)
+                .and_then(|d| d.last_frame)
+                .is_some()
+    })
 }
 
 /// Normalizes a leave directive observed from the wire: a **dropped**
@@ -6881,10 +6936,20 @@ pub enum FinalizeOutcome {
 /// no live link (checked under the same maker lock that admission uses) and
 /// the seal refuses any new one; the slot's own home is the only ingress
 /// that feeds its cursor.
+///
+/// `requested_epoch` is the departed connection generation the requester is
+/// finalizing, checked against this relay's own departure record for the
+/// slot: a mismatch means the request describes a generation this home has
+/// moved past (the slot reconnected and dropped again since the request was
+/// authored, or the record was seeded by a rehome), and sealing against it
+/// would answer for the wrong departure — rejected as
+/// [`RejectedLive`](FinalizeOutcome::RejectedLive) so the requester re-asks
+/// with its current record.
 pub fn finalize_drop(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
+    requested_epoch: Option<u64>,
     read_cursor: impl FnOnce() -> Option<u64>,
 ) -> FinalizeOutcome {
     {
@@ -6900,6 +6965,33 @@ pub fn finalize_drop(
         }
         if maker.connection_is_up(slot) {
             return FinalizeOutcome::RejectedLive;
+        }
+        let recorded_epoch = maker.departures.get(&slot).and_then(|d| d.connection_epoch);
+        if recorded_epoch != requested_epoch {
+            return FinalizeOutcome::RejectedLive;
+        }
+        // A home gained mid-session (rehome) has a cursor covering only what
+        // it forwarded itself, not the slot's whole ingress history — a
+        // non-`None` prefix can still stop short of turns other relays'
+        // clients already consumed, so it must never be sealed as a count.
+        if maker.rehomed_homes.contains(&slot) {
+            return FinalizeOutcome::RejectedNoCursor;
+        }
+        // Pre-frame (no framed turn observed anywhere, and none on the
+        // slot's own record): the game has not started, nothing is stalled,
+        // and the leave the count would feed has no scheduling basis yet —
+        // sealing admission here would only lock a lobby slot out of
+        // rejoining while the decide side could never complete. Refuse
+        // without sealing; the drop stays held and a later request, once
+        // frames exist, finalizes normally.
+        if maker.session_frame().is_none()
+            && maker
+                .departures
+                .get(&slot)
+                .and_then(|d| d.last_frame)
+                .is_none()
+        {
+            return FinalizeOutcome::RejectedNoCursor;
         }
         maker.finalizing_drops.insert(slot);
     }
@@ -7929,7 +8021,7 @@ mod tests {
             DROPPED,
         );
 
-        let outcome = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        let outcome = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
         assert_eq!(
             outcome,
             FinalizeOutcome::Finalized {
@@ -7963,7 +8055,7 @@ mod tests {
         let k = key();
         assert!(activate_connection_epoch(&registry, &k, SlotId(1), 7));
 
-        let outcome = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        let outcome = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
         assert_eq!(outcome, FinalizeOutcome::RejectedLive);
         assert!(
             !registry
@@ -7992,7 +8084,7 @@ mod tests {
         );
 
         assert_eq!(
-            finalize_drop(&registry, &k, SlotId(1), || None),
+            finalize_drop(&registry, &k, SlotId(1), None, || None),
             FinalizeOutcome::RejectedNoCursor,
         );
         assert!(
@@ -8006,7 +8098,7 @@ mod tests {
         );
         // A retry with a cursor succeeds.
         assert_eq!(
-            finalize_drop(&registry, &k, SlotId(1), || Some(7)),
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(7)),
             FinalizeOutcome::Finalized {
                 final_turn_count: 7
             },
@@ -8026,11 +8118,11 @@ mod tests {
             DepartureStamps::default(),
             DROPPED,
         );
-        let _ = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
         let _ = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
 
         assert_eq!(
-            finalize_drop(&registry, &k, SlotId(1), || Some(999)),
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(999)),
             FinalizeOutcome::Finalized {
                 final_turn_count: 42
             },
@@ -8120,11 +8212,170 @@ mod tests {
             DepartureStamps::default(),
             DROPPED,
         );
-        let _ = finalize_drop(&registry, &k, SlotId(1), || Some(42));
+        let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
 
         let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
         assert_eq!(leave.final_turn_count, Some(42));
         assert!(leave.finalized);
+    }
+
+    /// A home gained mid-session (a rehome push added the slot to this
+    /// relay's homed set) refuses to finalize even with a non-`None` cursor —
+    /// an already-serving replacement's forwarded prefix can stop short of
+    /// turns other relays' clients consumed during a partition. A home held
+    /// continuously stays finalizable through the same resumed push.
+    #[test]
+    fn finalize_refuses_a_home_gained_by_a_rehome() {
+        let registry = finalized_drop_registry(&key(), &[0]);
+        let k = key();
+        // The rehome push: slot 1's home moves onto this relay; slot 0's stays.
+        let departed: [DepartedSlot; 0] = [];
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+            HashSet::new(),
+            Some(&departed),
+            true,
+        );
+        let framed = DepartureStamps {
+            last_frame: Some(GameFrameCount(40)),
+            ..DepartureStamps::default()
+        };
+        record_departure(&registry, &k, SlotId(1), framed.clone(), DROPPED);
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+            FinalizeOutcome::RejectedNoCursor,
+            "a rehome-gained home never seals a count, cursor or not",
+        );
+        record_departure(&registry, &k, SlotId(0), framed, DROPPED);
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(0), None, || Some(7)),
+            FinalizeOutcome::Finalized {
+                final_turn_count: 7
+            },
+            "the continuously-held home still finalizes after the rehome",
+        );
+    }
+
+    /// A maker created BY a resumed descriptor (a fresh replacement relay, or
+    /// a restart-in-place) treats every home it starts with as cursor-broken:
+    /// whatever prefix a stale seen registry might answer with is not the
+    /// slot's whole ingress history.
+    #[test]
+    fn finalize_refuses_every_home_of_a_resumed_created_maker() {
+        let registry = new_decision_makers();
+        let k = key();
+        let departed: [DepartedSlot; 0] = [];
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(1)].into_iter().collect(),
+            HashSet::new(),
+            Some(&departed),
+            true,
+        );
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(40)),
+                ..DepartureStamps::default()
+            },
+            DROPPED,
+        );
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+            FinalizeOutcome::RejectedNoCursor,
+        );
+    }
+
+    /// The finalize request is generation-bound: a request naming a departed
+    /// generation other than the one this home recorded (the slot reconnected
+    /// and dropped again since the request was authored) is refused rather
+    /// than sealed against the wrong departure; the matching generation
+    /// finalizes normally.
+    #[test]
+    fn finalize_rejects_a_request_naming_a_stale_generation() {
+        let registry = finalized_drop_registry(&key(), &[0, 1]);
+        let k = key();
+        assert!(record_departure_for_epoch(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(40)),
+                ..DepartureStamps::default()
+            },
+            DROPPED,
+            Some(7),
+        ));
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+            FinalizeOutcome::RejectedLive,
+            "an epoch-less request against an epoch-recorded departure is stale",
+        );
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), Some(3), || Some(42)),
+            FinalizeOutcome::RejectedLive,
+            "a request naming an older generation is stale",
+        );
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), Some(7), || Some(42)),
+            FinalizeOutcome::Finalized {
+                final_turn_count: 42
+            },
+        );
+    }
+
+    /// A pre-frame (lobby) drop is refused WITHOUT sealing admission: nothing
+    /// is stalled, the decide it would feed has no scheduling basis, and a
+    /// seal would lock the slot out of rejoining the lobby.
+    #[test]
+    fn finalize_refuses_a_pre_frame_drop_without_sealing() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(0, 20),
+            Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            [SlotId(1)].into_iter().collect(),
+            HashSet::new(),
+            None,
+            true,
+        );
+        record_departure(
+            &registry,
+            &k,
+            SlotId(1),
+            DepartureStamps::default(),
+            DROPPED,
+        );
+        assert_eq!(
+            finalize_drop(&registry, &k, SlotId(1), None, || Some(3)),
+            FinalizeOutcome::RejectedNoCursor,
+        );
+        assert!(
+            !registry
+                .lock()
+                .get(&k)
+                .unwrap()
+                .finalizing_drops
+                .contains(&SlotId(1)),
+            "a pre-frame refusal leaves no seal behind",
+        );
     }
 
     /// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.

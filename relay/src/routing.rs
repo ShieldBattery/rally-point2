@@ -3200,9 +3200,13 @@ pub(crate) fn honor_drop_request(
             // and undecided, never frame-scheduled.
             if consensus::finalized_drops_enabled(decision_makers, key) {
                 if consensus::slot_strictly_homed(decision_makers, key, target) {
-                    let outcome = consensus::finalize_drop(decision_makers, key, target, || {
-                        crate::mesh::forwarded_count(seen, key, target)
-                    });
+                    let outcome = consensus::finalize_drop(
+                        decision_makers,
+                        key,
+                        target,
+                        consensus::departure_epoch(decision_makers, key, target),
+                        || crate::mesh::forwarded_count(seen, key, target),
+                    );
                     tracing::info!(
                         tenant = key.tenant.as_ref(),
                         session = key.session.0,
@@ -3319,6 +3323,31 @@ pub(crate) fn complete_finalized_drop(
     target: SlotId,
     final_turn_count: u64,
 ) {
+    // The decide below silently short-circuits without a framed scheduling
+    // basis — and by then the hold would already be released, leaving the
+    // departure with no committed leave, no hold for a retry to claim, and
+    // (with the home's seal standing) no reconnect path either: a stranded
+    // session. Check the basis FIRST and keep the hold when it is missing;
+    // the home's answer is idempotent, so a later honored drop request
+    // completes once a framed turn exists. Safe as a check-then-act because
+    // frames only accumulate — schedulable never reverts to unschedulable.
+    if !consensus::leave_schedulable(decision_makers, key, target) {
+        tracing::warn!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            target = target.0,
+            final_turn_count,
+            "finalized drop has no framed scheduling basis yet; keeping the hold for a retry",
+        );
+        decision_makers.flight_recorder().record(
+            key,
+            crate::flight_recorder::FlightEvent::DropFinalizeRejected {
+                slot: target.0,
+                no_cursor: false,
+            },
+        );
+        return;
+    }
     consensus::record_departure(
         decision_makers,
         key,
