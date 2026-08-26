@@ -717,7 +717,20 @@ resumes, decided leaves with their apply coordinates, buffer directives, detecte
 requests, the session-start directive, a re-home landing, the close), periodic **link-health samples**
 (the same per-slot QUIC rtt/loss the slot links already publish for the latency-buffer decision-maker,
 folded together with per-slot turn-stream counters — validated/delivered turns, newest seq, dedup drops,
-oversize diverts — by a relay-wide 10s sampling tick). It **observes only**: no decision logic reads it,
+oversize diverts — by a relay-wide 10s sampling tick).
+
+Sample rows carry three things the decision path never sees. **Redundancy depth** — still-unacked turns
+re-carried to a client — is read against the loss counters: loss says how much a link dropped, redundancy
+says how much forward recovery spent replacing it. **Upstream loss** closes the direction gap: QUIC's path
+stats measure only what an endpoint *sends*, so nothing else observes loss on the way *in* — the direction
+that, for a client link, carries the turns the whole lockstep is waiting on. It is derived from gaps in the
+peer's own packet numbering, counted only once a seq can no longer arrive (a packet reordered behind up to
+31 of its successors still lands as received), which also makes it client-numbered: a peer that skips seqs
+overstates its own loss and nobody else's, so it is recording-only and no decision may read it without the
+client-influenceable treatment the delivery cursors get. **Congestion window and event count** answer
+whether the transport itself is holding turns back: turn traffic is a tiny fixed-rate flow that should sit
+far below any congestion window, so a window near its floor while turns queue points at the controller
+rather than the network. It **observes only**: no decision logic reads it,
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
 

@@ -186,6 +186,20 @@ impl Link {
         self.acks.payloads_in_flight()
     }
 
+    /// Packets the peer sent that never arrived, cumulative for this
+    /// connection. QUIC's own path stats measure only the direction *we* send,
+    /// so this is the sole view of loss on the way *in* — the direction that,
+    /// for a client link, carries the turns everyone else in the lockstep is
+    /// waiting on.
+    ///
+    /// Derived from gaps in the peer's own packet numbering, so a peer that
+    /// skips seqs overstates its own loss and no one else's. Observability
+    /// only: nothing that sizes a buffer or decides a session may read it
+    /// without treating it as the client-influenceable input it is.
+    pub fn upstream_lost_packets(&self) -> u64 {
+        self.acks.upstream_lost_packets()
+    }
+
     /// The lowest still-unacked payload seq this link holds for `slot`, or `None`
     /// if nothing is in flight for it. It is the oldest seq the redundancy pass will
     /// re-carry over a rebound connection, so a driver presents it as its own-slot

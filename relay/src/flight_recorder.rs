@@ -303,6 +303,26 @@ pub struct SlotSample {
     /// denominator).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_packets: Option<u64>,
+    /// Still-unacked turns re-carried to this slot's client as redundancy,
+    /// cumulative since the recording began. Read against `lost_packets`: loss
+    /// says how much the link dropped, this says how much forward recovery
+    /// spent replacing it.
+    pub redundant_payloads: u64,
+    /// Packets this slot's client sent that never reached the relay, from gaps
+    /// in the client's own packet numbering. `lost_packets` covers only the
+    /// relay-to-client direction; this is the other one — and for a client
+    /// link it is the direction carrying the turns the whole lockstep waits on.
+    ///
+    /// Client-numbered, so a client that skips seqs overstates its own loss and
+    /// nobody else's. Recording only: no decision reads it.
+    pub upstream_lost_packets: u64,
+    /// The QUIC path's congestion window for this client, bytes. Turn traffic
+    /// is a tiny fixed-rate flow, so this normally sits far above what the
+    /// session offers; a window near its floor while turns queue is the
+    /// signature of the transport, not the network, holding them back.
+    pub cwnd: u64,
+    /// Congestion events QUIC has recorded on this client's path.
+    pub congestion_events: u64,
 }
 
 /// One periodic sample row: every live slot's counters + link health at one
@@ -586,6 +606,10 @@ pub struct SlotCounters {
     newest_seq: AtomicU64,
     dedup_drops: AtomicU64,
     oversize_diverts: AtomicU64,
+    redundant_payloads: AtomicU64,
+    upstream_lost_packets: AtomicU64,
+    cwnd: AtomicU64,
+    congestion_events: AtomicU64,
 }
 
 impl SlotCounters {
@@ -608,6 +632,33 @@ impl SlotCounters {
 
     fn note_dedup_drop(&self) {
         self.dedup_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A packet to this slot's client re-carried `count` still-unacked turns as
+    /// redundancy. Summed over the session, this is how hard forward recovery
+    /// was working on the link — the counterpart to the loss counters, which
+    /// say how much was dropped but not how much was spent replacing it.
+    pub fn note_redundancy(&self, count: usize) {
+        if count > 0 {
+            self.redundant_payloads
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Publishes the current link-level gauges for this slot: peer packets that
+    /// never arrived, and the QUIC path's congestion window and event count.
+    ///
+    /// These are the live connection's own values, not recorder-owned totals,
+    /// so a reconnect starts them over the same way it starts `rtt_us` and the
+    /// path loss counters over. Stored rather than accumulated for that reason
+    /// — a sample says what the link looked like then, and the row it lands in
+    /// already carries the epoch-scoped path counters beside it.
+    pub fn note_link_gauges(&self, upstream_lost: u64, cwnd: u64, congestion_events: u64) {
+        self.upstream_lost_packets
+            .store(upstream_lost, Ordering::Relaxed);
+        self.cwnd.store(cwnd, Ordering::Relaxed);
+        self.congestion_events
+            .store(congestion_events, Ordering::Relaxed);
     }
 }
 
@@ -723,6 +774,10 @@ impl SessionRecording {
                     rtt_us: cond.map(|c| c.rtt_us),
                     lost_packets: cond.map(|c| c.lost_packets),
                     sent_packets: cond.map(|c| c.sent_packets),
+                    redundant_payloads: c.redundant_payloads.load(Ordering::Relaxed),
+                    upstream_lost_packets: c.upstream_lost_packets.load(Ordering::Relaxed),
+                    cwnd: c.cwnd.load(Ordering::Relaxed),
+                    congestion_events: c.congestion_events.load(Ordering::Relaxed),
                 }
             })
             .collect();
@@ -1511,7 +1566,11 @@ mod tests {
     fn the_sampler_folds_published_link_conditions_into_the_row() {
         let recorder = FlightRecorder::default();
         let k = key(1);
-        let _counters = recorder.slot_counters(&k, SlotId(0));
+        let counters = recorder.slot_counters(&k, SlotId(0));
+        counters.note_redundancy(3);
+        counters.note_redundancy(2);
+        counters.note_redundancy(0);
+        counters.note_link_gauges(9, 12_000, 4);
 
         let conditions = crate::mesh::new_conditions_registry();
         crate::mesh::activate_conditions(
@@ -1537,6 +1596,12 @@ mod tests {
         assert_eq!(row.rtt_us, Some(42_000));
         assert_eq!(row.lost_packets, Some(3));
         assert_eq!(row.sent_packets, Some(500));
+        // Redundancy accumulates across packets; the gauges are the link's
+        // latest published values, not a running total.
+        assert_eq!(row.redundant_payloads, 5);
+        assert_eq!(row.upstream_lost_packets, 9);
+        assert_eq!(row.cwnd, 12_000);
+        assert_eq!(row.congestion_events, 4);
     }
 
     #[test]

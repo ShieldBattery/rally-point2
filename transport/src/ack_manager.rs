@@ -52,18 +52,35 @@ const SENT_PACKETS_SIZE: usize = 256;
 struct ReceivedPacketHistory {
     most_recent: Option<u32>,
     ack_bits: u32,
+    /// Peer packet seqs that left the window without ever being received — the
+    /// receive-side mirror of the QUIC path's send-side `lost_packets`, and the
+    /// only measure of loss in the peer-to-us direction (an endpoint cannot ask
+    /// its stack what it never got). Counted at the moment a seq becomes
+    /// unrecoverable rather than when a gap first appears, so a packet
+    /// reordered behind up to 31 of its successors still lands as received.
+    ///
+    /// Peer-assigned seqs, so a peer that skips them inflates its own number.
+    /// That makes this an observability signal only: nothing that sizes a
+    /// buffer or decides a session may read it without the same
+    /// client-influenceable treatment the delivery cursors get.
+    lost: u64,
+    /// The first seq ever recorded, so the empty window a connection opens with
+    /// is not read as 32 packets that went missing before it began.
+    first: Option<u32>,
 }
 
 impl ReceivedPacketHistory {
     fn record(&mut self, seq: u32) {
         let Some(most_recent) = self.most_recent else {
             self.most_recent = Some(seq);
+            self.first = Some(seq);
             return;
         };
 
         match seq.cmp(&most_recent) {
             std::cmp::Ordering::Greater => {
                 let advanced = seq - most_recent;
+                self.note_departed(most_recent, advanced);
                 self.ack_bits = if advanced <= 32 {
                     self.ack_bits.checked_shl(advanced).unwrap_or(0) | (1u32 << (advanced - 1))
                 } else {
@@ -82,6 +99,39 @@ impl ReceivedPacketHistory {
             }
             std::cmp::Ordering::Equal => {}
         }
+    }
+
+    /// Accrues the seqs that this advance pushes out of reach, given the window
+    /// is about to shift by `advanced`.
+    ///
+    /// Two disjoint groups leave. The tracked ones are the top `advanced` bits
+    /// of the current window (bit `N` holds `most_recent - (N + 1)`, so the
+    /// oldest seqs sit in the highest bits); every one of those still unset was
+    /// never received. Beyond that, an advance of more than 33 skips seqs that
+    /// the shifted window will not even cover — those are gone without ever
+    /// having had a bit to set. Positions addressing seqs from before the
+    /// connection's first are neither: they are the window still filling.
+    fn note_departed(&mut self, most_recent: u32, advanced: u32) {
+        let Some(first) = self.first else {
+            return;
+        };
+        let tracked = advanced.min(32);
+        let mut unset = 0u32;
+        for age in (32 - tracked)..32 {
+            // Bit `age` holds `most_recent - (age + 1)`. A position addressing a
+            // seq the connection never reached is empty window, not a gap.
+            let Some(departing) = most_recent.checked_sub(age + 1) else {
+                continue;
+            };
+            if departing >= first && self.ack_bits & (1u32 << age) == 0 {
+                unset += 1;
+            }
+        }
+        let never_tracked = advanced.saturating_sub(33);
+        self.lost = self
+            .lost
+            .saturating_add(u64::from(unset))
+            .saturating_add(u64::from(never_tracked));
     }
 }
 
@@ -190,6 +240,13 @@ impl AckManager {
     /// `(most_recent - N - 1)` has been received.
     fn ack_bits(&self) -> u32 {
         self.received_packets.ack_bits
+    }
+
+    /// Peer packets that never arrived, cumulative for this connection. See
+    /// [`ReceivedPacketHistory::lost`] for what it counts and why nothing that
+    /// makes decisions may read it.
+    pub fn upstream_lost_packets(&self) -> u64 {
+        self.received_packets.lost
     }
 
     /// Builds the next outgoing [`Packet`].
@@ -752,6 +809,48 @@ mod tests {
                 "history diverged at deterministic randomized step {step}",
             );
         }
+    }
+
+    #[test]
+    fn upstream_loss_counts_only_seqs_that_can_no_longer_arrive() {
+        let mut history = ReceivedPacketHistory::default();
+        for seq in 0..40 {
+            history.record(seq);
+        }
+        assert_eq!(history.lost, 0, "a gapless run loses nothing");
+
+        // A gap inside the window is not yet loss: the packet may still arrive
+        // reordered, and does.
+        let mut history = ReceivedPacketHistory::default();
+        for seq in [0u32, 1, 3] {
+            history.record(seq);
+        }
+        assert_eq!(history.lost, 0, "2 is still reachable");
+        history.record(2);
+        for seq in 4..80 {
+            history.record(seq);
+        }
+        assert_eq!(history.lost, 0, "the late packet landed before it aged out");
+
+        // The same gap, never filled, is counted once it leaves the window.
+        let mut history = ReceivedPacketHistory::default();
+        for seq in [0u32, 1, 3] {
+            history.record(seq);
+        }
+        for seq in 4..80 {
+            history.record(seq);
+        }
+        assert_eq!(history.lost, 1, "seq 2 aged out unset");
+
+        // A jump far past the window: everything skipped is unreachable, and
+        // the seqs the shifted window still covers are not counted yet.
+        let mut history = ReceivedPacketHistory::default();
+        history.record(0);
+        history.record(1000);
+        assert_eq!(
+            history.lost, 967,
+            "1..999 skipped, less the 32 the new window still covers",
+        );
     }
 
     #[test]

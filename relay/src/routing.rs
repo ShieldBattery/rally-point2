@@ -1272,7 +1272,7 @@ pub async fn run_slot_link(
         // can emit no directive — `decide` bails until a framed turn gives it a
         // consensus coordinate — so this only accumulates state. Publishing it also
         // seeds the mesh sidecar for this slot.
-        let handshake_sample = sample_slot_conditions(link.connection(), slot, connection_epoch);
+        let handshake_sample = sample_slot_conditions(&link, slot, connection_epoch).conditions;
         crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
         let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
 
@@ -1705,8 +1705,13 @@ pub async fn run_slot_link(
                 // per packet (not per payload) is enough — all fresh payloads in
                 // one packet share the same connection path.
                 if should_sample_active_conditions(&received) {
-                    let sample =
-                        sample_slot_conditions(link.connection(), slot, connection_epoch);
+                    let sampled = sample_slot_conditions(&link, slot, connection_epoch);
+                    flight_counters.note_link_gauges(
+                        sampled.upstream_lost_packets,
+                        sampled.cwnd,
+                        sampled.congestion_events,
+                    );
+                    let sample = sampled.conditions;
                     let sample_is_current =
                         crate::mesh::publish_conditions(&conditions, &key, slot, sample);
                     // The decision it may fire schedules against frames observed
@@ -2095,7 +2100,7 @@ pub async fn run_slot_link(
                         // stream, so push the flush out; if it carried none (a
                         // near-MTU turn), leave the timer so the flush
                         // retransmits them.
-                        match send_packet(&mut link, Some(payload)) {
+                        match send_packet(&mut link, Some(payload), &flight_counters) {
                             Ok(carried_redundancy) => {
                                 acks_owed = false;
                                 if carried_redundancy {
@@ -2545,7 +2550,7 @@ pub async fn run_slot_link(
                 // what acks a client with no return traffic; it stays silent when
                 // nothing is unacked and nothing is owed.
                 if acks_owed || link.payloads_in_flight() > 0 {
-                    if let Err(error) = send_packet(&mut link, None) {
+                    if let Err(error) = send_packet(&mut link, None, &flight_counters) {
                         log_link_closed(&key, slot, &error);
                         break 'serve;
                     }
@@ -2565,7 +2570,7 @@ pub async fn run_slot_link(
                     pre_start_sampling = false;
                 } else {
                     let sample =
-                        sample_slot_conditions(link.connection(), slot, connection_epoch);
+                        sample_slot_conditions(&link, slot, connection_epoch).conditions;
                     if crate::mesh::publish_conditions(&conditions, &key, slot, sample) {
                         let _ =
                             consensus::ingest_local_condition(&decision_makers, &key, &sample);
@@ -3767,9 +3772,16 @@ fn decide_and_broadcast_abandoned(
 /// turn too big for the path: the forward branch pre-checks with
 /// [`Link::payload_fits`] and diverts those to the control stream (and the
 /// link itself refuses one pre-registration as a second line of defense).
-fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<bool, LinkError> {
+fn send_packet(
+    link: &mut Link,
+    payload: Option<Payload>,
+    counters: &crate::flight_recorder::SlotCounters,
+) -> Result<bool, LinkError> {
     match link.send(payload) {
-        Ok(redundant) => Ok(redundant > 0),
+        Ok(redundant) => {
+            counters.note_redundancy(redundant);
+            Ok(redundant > 0)
+        }
         Err(LinkError::PayloadTooLarge { needed, budget }) => {
             tracing::debug!(
                 needed,
@@ -3804,25 +3816,38 @@ fn should_sample_active_conditions(received: &Received) -> bool {
     !received.fresh.is_empty()
 }
 
-/// Samples this client's QUIC connection path stats as a [`SlotConditions`], for
-/// both the mesh sidecar and the decision-maker. RTT comes from QUIC's smoothed
-/// path estimate (via [`crate::mesh::rtt_us`], which owns the "0 means no
-/// measurement" convention); lost/sent are cumulative counters the
+/// Samples this client's link: the QUIC path stats that become a
+/// [`SlotConditions`] for the mesh sidecar and the decision-maker, plus the
+/// recording-only gauges taken from the same snapshot. RTT comes from QUIC's
+/// smoothed path estimate (via [`crate::mesh::rtt_us`], which owns the "0 means
+/// no measurement" convention); lost/sent are cumulative counters the
 /// decision-maker differences between consecutive samples to get a loss rate
 /// over the interval.
-fn sample_slot_conditions(
-    connection: &rally_point_transport::quinn::Connection,
-    slot: SlotId,
-    connection_epoch: u64,
-) -> SlotConditions {
-    let path = connection.stats().path;
-    SlotConditions {
-        slot: u32::from(slot.0),
-        rtt_us: crate::mesh::rtt_us(path.rtt),
-        lost_packets: path.lost_packets,
-        sent_packets: path.sent_packets,
-        connection_epoch: Some(connection_epoch),
+fn sample_slot_conditions(link: &Link, slot: SlotId, connection_epoch: u64) -> SampledLink {
+    let path = link.connection().stats().path;
+    SampledLink {
+        conditions: SlotConditions {
+            slot: u32::from(slot.0),
+            rtt_us: crate::mesh::rtt_us(path.rtt),
+            lost_packets: path.lost_packets,
+            sent_packets: path.sent_packets,
+            connection_epoch: Some(connection_epoch),
+        },
+        upstream_lost_packets: link.upstream_lost_packets(),
+        cwnd: path.cwnd,
+        congestion_events: path.congestion_events,
     }
+}
+
+/// One sampling of a client link: the conditions that travel (to the mesh
+/// sidecar and the decision-maker) alongside the gauges that only ever land in
+/// the flight recording. They are read from one `stats()` snapshot so the two
+/// always describe the same instant.
+struct SampledLink {
+    conditions: SlotConditions,
+    upstream_lost_packets: u64,
+    cwnd: u64,
+    congestion_events: u64,
 }
 #[cfg(test)]
 mod tests {
