@@ -1684,14 +1684,63 @@ pub fn forward_client_turn(
     // exact final turn count (a re-homed group's dial racing its resumed
     // descriptor). A departed slot's turn fanned out in that window is a turn
     // past the leave's synchronization point, consumed by co-admitted
-    // survivors but by no one else. Hold every pre-descriptor turn instead;
-    // descriptor application drains the pen back through this function, where
-    // the seeded decided-leave fence below sorts current from departed.
-    if mesh.provisional_turns.armed() && !crate::consensus::maker_exists(&mesh.decision_makers, key)
-    {
-        mesh.provisional_turns.hold(key, slot, payload);
-        return;
-    }
+    // survivors but by no one else. Journal every pre-descriptor turn
+    // instead; descriptor application drains the journal back through this
+    // function, where the seeded decided-leave fence below sorts current
+    // from departed. The maker check and the deposit run inside the
+    // session's ingress gate (a racing retirement, which discards the
+    // journal, cannot have this recreate entries for an ended session), and
+    // the journal's one-shot resolved mark makes the pair atomic against the
+    // descriptor's single drain: a deposit that loses that race is refused
+    // and re-runs here against the maker that now provably exists.
+    let payload = if mesh.provisional_turns.armed() {
+        use crate::provisional_turns::{HoldOutcome, PennedIngress};
+        enum Funnel {
+            Proceed(Payload),
+            Held,
+            Overflow,
+        }
+        let Some(verdict) = mesh.gates.with_ingress(key, || {
+            if crate::consensus::maker_exists(&mesh.decision_makers, key) {
+                return Funnel::Proceed(payload);
+            }
+            match mesh
+                .provisional_turns
+                .hold(key, PennedIngress::Turn(slot, payload))
+            {
+                HoldOutcome::Held => Funnel::Held,
+                HoldOutcome::Resolved(PennedIngress::Turn(_, payload)) => Funnel::Proceed(payload),
+                HoldOutcome::Resolved(PennedIngress::Departure { .. }) => {
+                    unreachable!("a turn deposit is echoed back as a turn")
+                }
+                HoldOutcome::Overflow(_) => Funnel::Overflow,
+            }
+        }) else {
+            // Retired: dropped exactly like the gated delivery below would.
+            return;
+        };
+        match verdict {
+            Funnel::Proceed(payload) => payload,
+            Funnel::Held => return,
+            Funnel::Overflow => {
+                // Fail the session closed with recovery rather than silently
+                // holing an acknowledged sequence: reap its provisional links
+                // — each client re-dials and the resume machinery re-supplies
+                // everything this relay never forwarded.
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "provisional journal overflowed; reaping the session's provisional links",
+                );
+                mesh.provisional_turns.discard(key);
+                routing::reap_provisional(sessions, key);
+                return;
+            }
+        }
+    } else {
+        payload
+    };
     // Terminal fence for this relay's own homed ingress: a slot whose synced
     // leave is decided has ended its participation — nothing it originates
     // afterward is part of the game, and a turn that entered the mesh here
@@ -6227,6 +6276,35 @@ mod tests {
             }
             other => panic!("expected a SlotDeparted, got {other:?}"),
         }
+    }
+
+    /// A retired session's client turn is refused by the gate BEFORE the
+    /// provisional journal too — retirement discards the journal, so a
+    /// still-live link must not recreate entries for the ended session.
+    #[test]
+    fn a_retired_sessions_client_turn_never_grows_the_journal() {
+        let sessions = routing::Sessions::default();
+        let key = control_key();
+        let mesh_state = new_mesh_state();
+        mesh_state.provisional_turns.arm();
+        mesh_state.gates.retire(&key);
+        forward_client_turn(
+            &sessions,
+            &mesh_state,
+            &key,
+            SlotId(0),
+            Payload {
+                seq: 0,
+                slot: 0,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mesh_state.provisional_turns.held(&key),
+            0,
+            "the gate refuses before the journal deposit",
+        );
     }
 
     /// A retired session's mesh turn is dropped by the ingress gate before it

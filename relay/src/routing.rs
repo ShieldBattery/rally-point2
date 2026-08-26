@@ -1275,6 +1275,30 @@ pub async fn run_slot_link(
         let handshake_sample = sample_slot_conditions(link.connection(), slot, connection_epoch);
         crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
         let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
+
+        // Announce this slot's presence to the mesh and record it into the session's
+        // live-slot set. On the authority relay, this slot completing the descriptor's
+        // expected set fires the session-start directive to every slot (local and
+        // across the mesh); if the session already started before this slot arrived (a
+        // late or reconnecting slot), the directive is re-pushed straight to it. The
+        // roster already includes this slot (registration preceded this task), so
+        // `fan_out_session_start` reaches it too.
+        announce_slot_present(&sessions, &decision_makers, &mesh_links, &key, slot);
+
+        // Announce this slot's link as connected to every slot in the session (local
+        // and across the mesh), so survivors' connectivity displays reflect it. A
+        // pre-start frame (this is the initial dial for most slots) is harmless — a
+        // client ignores connectivity until it cares — and a re-register (a later
+        // reconnect feature) reuses this same signal. Independent of the session-start
+        // and leave paths.
+        broadcast_connectivity(
+            &sessions,
+            &mesh_links,
+            &key,
+            slot,
+            true,
+            Some(connection_epoch),
+        );
     });
     if activated.is_none() {
         tracing::info!(
@@ -1297,30 +1321,6 @@ pub async fn run_slot_link(
         );
         return;
     }
-
-    // Announce this slot's presence to the mesh and record it into the session's
-    // live-slot set. On the authority relay, this slot completing the descriptor's
-    // expected set fires the session-start directive to every slot (local and
-    // across the mesh); if the session already started before this slot arrived (a
-    // late or reconnecting slot), the directive is re-pushed straight to it. The
-    // roster already includes this slot (registration preceded this task), so
-    // `fan_out_session_start` reaches it too.
-    announce_slot_present(&sessions, &decision_makers, &mesh_links, &key, slot);
-
-    // Announce this slot's link as connected to every slot in the session (local
-    // and across the mesh), so survivors' connectivity displays reflect it. A
-    // pre-start frame (this is the initial dial for most slots) is harmless — a
-    // client ignores connectivity until it cares — and a re-register (a later
-    // reconnect feature) reuses this same signal. Independent of the session-start
-    // and leave paths.
-    broadcast_connectivity(
-        &sessions,
-        &mesh_links,
-        &key,
-        slot,
-        true,
-        Some(connection_epoch),
-    );
 
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
@@ -2250,6 +2250,7 @@ pub async fn run_slot_link(
                                 &decision_makers,
                                 &sessions,
                                 &mesh_links,
+                                &mesh_for_teardown.provisional_turns,
                                 &key,
                                 slot,
                                 LEAVE_REASON_LEFT,
@@ -2696,6 +2697,7 @@ fn end_slot_link(
                 &mesh.decision_makers,
                 sessions,
                 &mesh.links,
+                &mesh.provisional_turns,
                 key,
                 slot,
                 LEAVE_REASON_DROPPED,
@@ -2963,11 +2965,12 @@ fn maybe_close_emptied_session_gated(
 /// `fan_out_leave`) needs the roster lock itself — holding it here too would
 /// deadlock.
 #[allow(clippy::too_many_arguments)]
-fn announce_departure(
+pub(crate) fn announce_departure(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
+    provisional_turns: &crate::provisional_turns::ProvisionalTurnPen,
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
@@ -2982,8 +2985,62 @@ fn announce_departure(
     {
         // A reconnect already reclaimed this seat; its own post-register
         // admission (current state, not a stale snapshot) is the sole authority
-        // on this slot now.
+        // on this relay now.
         return false;
+    }
+
+    // On a coordinator-managed relay with no maker yet (a pre-descriptor
+    // provisional session), announcing would land in a void — nothing records
+    // the departure, yet the caller marks it announced, so when the
+    // descriptor arrives the slot is expected-but-absent and the session
+    // stalls on it until the coordinator's holdout reap. Journal the
+    // departure instead: the descriptor drain replays it here once the maker
+    // exists, ordered after the slot's own journaled turns (a clean leave's
+    // exact count is recomputed there, over exactly those turns). The
+    // one-shot resolved mark closes the deposit-vs-drain race the same way
+    // the turn funnel's does. Callers run this under the session's ingress
+    // gate, so a racing retirement cannot have the deposit recreate journal
+    // state either.
+    if provisional_turns.armed() && !consensus::maker_exists(decision_makers, key) {
+        use crate::provisional_turns::{HoldOutcome, PennedIngress};
+        drop(roster_guard);
+        match provisional_turns.hold(
+            key,
+            PennedIngress::Departure {
+                slot,
+                reason,
+                connection_epoch,
+            },
+        ) {
+            HoldOutcome::Held => return true,
+            // The drain already ran: the maker provably exists now, so fall
+            // through and announce into it normally.
+            HoldOutcome::Resolved(_) => {
+                return announce_departure(
+                    drop_holds,
+                    decision_makers,
+                    sessions,
+                    mesh_links,
+                    provisional_turns,
+                    key,
+                    slot,
+                    reason,
+                    final_turn_count,
+                    connection_epoch,
+                );
+            }
+            HoldOutcome::Overflow(_) => {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "provisional journal overflowed on a departure; reaping the session",
+                );
+                provisional_turns.discard(key);
+                reap_provisional(sessions, key);
+                return false;
+            }
+        }
     }
 
     // Read the last observed frame, the reachability ceiling, and the slot's
@@ -5005,6 +5062,7 @@ mod tests {
             &makers,
             &sessions,
             &mesh_links,
+            &crate::provisional_turns::ProvisionalTurnPen::default(),
             &k,
             SlotId(1),
             LEAVE_REASON_DROPPED,
@@ -5142,6 +5200,7 @@ mod tests {
             &makers,
             &sessions,
             &mesh_links,
+            &crate::provisional_turns::ProvisionalTurnPen::default(),
             &k,
             SlotId(0),
             LEAVE_REASON_DROPPED,
@@ -5159,6 +5218,7 @@ mod tests {
             &makers,
             &sessions,
             &mesh_links,
+            &crate::provisional_turns::ProvisionalTurnPen::default(),
             &k,
             SlotId(1),
             LEAVE_REASON_DROPPED,
