@@ -25,20 +25,28 @@
 //! that now exists (a clean leave's exact count is recomputed there, after
 //! its own turns drained ahead of it).
 //!
-//! **The journal is append-only until drained or expired.** Journaled turns
-//! are transport-acknowledged, the provisional reap's close is documented as
-//! retryable, and a same-relay resume deliberately does not re-inject
-//! acknowledged retention — so any path that deleted an undrained journal
-//! while a still-valid token could redial the session would silently hole an
-//! accepted sequence. Nothing therefore discards undrained entries: not the
-//! sweep's reap (links close, the journal stays for the redial and the
-//! descriptor), not the emptied-session close (which removes only a provably
-//! empty journal, atomically — [`discard_if_empty`]
-//! (ProvisionalTurnPen::discard_if_empty)). The two terminal owners are
-//! descriptor retirement (the session's real end) and the stale prune
-//! ([`prune_stale`](ProvisionalTurnPen::prune_stale)), which fires only once
-//! the fleet's token ceiling has fully elapsed — past it, no client can
-//! return for what the journal holds.
+//! **The journal is append-only until drained, and retained until the
+//! session provably ends.** Journaled turns are transport-acknowledged, the
+//! provisional reap's close is documented as retryable, and a same-relay
+//! resume deliberately does not re-inject acknowledged retention — so any
+//! path that deleted an undrained journal while the session could still
+//! become real would silently hole an accepted sequence. And no LOCAL fact
+//! proves it cannot: token expiry only stops new handshakes (an established
+//! link outlives it on keepalives), an empty local roster says nothing
+//! about peer-homed survivors who will need these turns once the descriptor
+//! lands, and a coordinator outage can delay that descriptor arbitrarily.
+//! Nothing therefore discards undrained entries: not the sweep's reap
+//! (links close, the journal stays for the redial and the descriptor), not
+//! the emptied-session close (which removes only a provably empty journal,
+//! atomically — [`discard_if_empty`](ProvisionalTurnPen::discard_if_empty)).
+//! The ONE terminal owner is descriptor retirement — the coordinator ending
+//! the session. A journal whose session is never described OR retired is
+//! deliberately retained for the relay's lifetime: it is small, its count
+//! is bounded by sessions the coordinator actually minted tokens for, and
+//! every cheaper janitor tried here (age TTLs, roster emptiness) turned out
+//! to delete acknowledged data some interleaving still needed. Reclaiming
+//! these safely needs a coordinator-confirmed session-death signal — a
+//! control-plane follow-up, not a local heuristic.
 //!
 //! **The drain is a one-shot state machine, not a sweep.** A session moves
 //! Gathering → Draining → Resolved, all under the journal's own lock.
@@ -88,16 +96,6 @@ use crate::routing::SessionKey;
 /// genuinely exceeds it is sealed and its link closed rather than its
 /// accepted sequence silently holed — see the module doc's overflow policy.
 pub(crate) const PER_SESSION_CAP: usize = 4096;
-
-/// How long an undrained journal is retained waiting for its descriptor
-/// before the stale prune may remove it: the fleet's token-lifetime ceiling
-/// plus margin — the same credential bound the retired-session tombstone
-/// uses, because the same invariant is at stake: once no token minted for
-/// the session can still be valid, no client can redial for what the
-/// journal holds, and only then is dropping acknowledged entries safe.
-pub const JOURNAL_STALE_TTL: std::time::Duration = std::time::Duration::from_secs(
-    rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS + 60 * 60,
-);
 
 /// One deposited ingress effect, replayed in arrival order at the drain.
 #[derive(Debug, PartialEq)]
@@ -163,12 +161,6 @@ enum Phase {
 }
 
 struct SessionPen {
-    /// When this journal state was first created — the basis for the stale
-    /// prune (see [`ProvisionalTurnPen::prune_stale`]): a journal is
-    /// append-only until a descriptor drains it, and the prune is the ONLY
-    /// path that may remove undrained entries, once no token that could
-    /// still redial the session can remain valid.
-    created_at: std::time::Instant,
     phase: Phase,
     /// Slots terminal to admission: a journaled CLEAN leave (the intent is
     /// final the moment the client sent it, exactly as a maker's decided
@@ -190,7 +182,6 @@ struct SessionPen {
 impl SessionPen {
     fn gathering() -> Self {
         SessionPen {
-            created_at: std::time::Instant::now(),
             phase: Phase::Gathering(VecDeque::new()),
             sealed: std::collections::HashSet::new(),
             departure_revisions: HashMap::new(),
@@ -401,8 +392,8 @@ impl ProvisionalTurnPen {
     /// emptied-session close uses this so its "nothing to keep" verdict and
     /// the removal are one step: a deposit racing the close either lands
     /// first (the discard refuses, the journal is retained) or lands after
-    /// (recreating a fresh journal the stale prune eventually owns) — never
-    /// into the void between a check and a separate removal. A `Draining`
+    /// (recreating a fresh journal, retained like any other) — never into
+    /// the void between a check and a separate removal. A `Draining`
     /// journal always refuses: an active drain owns the pen, and removing it
     /// would reset the departure revisions a drainer's private batch is
     /// validated against (the ABA the revisions exist to prevent).
@@ -419,44 +410,6 @@ impl ProvisionalTurnPen {
                 _ => false,
             },
         }
-    }
-
-    /// Removes every journal that has waited longer than `ttl` for a
-    /// descriptor that never came, sparing sessions `spare` claims. Returns
-    /// the pruned keys so the caller can drop their session gates alongside.
-    ///
-    /// This is the journal's ONE terminal janitor, and `spare` carries half
-    /// its proof obligation. Everything else retains: journaled entries are
-    /// transport-acknowledged, a same-relay resume deliberately does not
-    /// re-inject acknowledged retention, and the provisional reap's close is
-    /// documented as retryable — so a journal may only be dropped when the
-    /// session is provably terminal. `ttl` (the fleet token ceiling) proves
-    /// no NEW link can ever be admitted; it proves nothing about links that
-    /// never died, since token expiry is checked only at the handshake and a
-    /// kept-alive connection outlives it freely. The caller's `spare` must
-    /// therefore claim, at minimum, every session with a live roster link
-    /// (a depositor may still be running) and every session with a maker
-    /// (the descriptor came; retirement owns its cleanup). Active drains
-    /// are spared like `Draining` everywhere else; `Resolved` journals
-    /// belong to served sessions and are cleaned at retirement.
-    #[must_use]
-    pub fn prune_stale(
-        &self,
-        ttl: std::time::Duration,
-        spare: impl Fn(&SessionKey) -> bool,
-    ) -> Vec<SessionKey> {
-        let now = std::time::Instant::now();
-        let mut pruned = Vec::new();
-        self.inner.sessions.lock().retain(|key, pen| {
-            let expired = matches!(pen.phase, Phase::Gathering(_))
-                && now.duration_since(pen.created_at) >= ttl
-                && !spare(key);
-            if expired {
-                pruned.push(key.clone());
-            }
-            !expired
-        });
-        pruned
     }
 
     #[cfg(test)]
@@ -735,51 +688,6 @@ mod tests {
         assert!(
             !pen.discard_if_empty(&key()),
             "a resolved journal belongs to the session lifecycle, not the close",
-        );
-    }
-
-    /// The stale prune removes only maker-less Gathering journals past the
-    /// TTL — the one terminal janitor for a descriptor that never came.
-    #[test]
-    fn prune_stale_removes_only_expired_makerless_gathering_journals() {
-        let pen = ProvisionalTurnPen::default();
-        let stale = key();
-        let described = SessionKey {
-            tenant: rally_point_proto::control::TenantId("sb-test".to_owned()),
-            session: SessionId(8),
-        };
-        let draining = SessionKey {
-            tenant: rally_point_proto::control::TenantId("sb-test".to_owned()),
-            session: SessionId(9),
-        };
-        assert_eq!(pen.hold(&stale, turn(1, 0)), HoldOutcome::Held);
-        assert_eq!(pen.hold(&described, turn(1, 0)), HoldOutcome::Held);
-        assert_eq!(pen.hold(&draining, turn(1, 0)), HoldOutcome::Held);
-        let _ = pen.begin_drain(&draining).expect("claims");
-
-        // A zero TTL makes every journal ripe; only the unclaimed,
-        // maker-less Gathering one may go.
-        let pruned = pen.prune_stale(std::time::Duration::ZERO, |k| *k == described);
-        assert_eq!(pruned, vec![stale.clone()]);
-        assert_eq!(pen.held(&stale), 0);
-        assert_eq!(pen.held(&described), 1, "a maker spares the journal");
-        // The draining journal's queue is empty (its entry sits in this
-        // test's private batch), so probe the retained CLAIM instead of the
-        // queue: a pruned key would hand a fresh drain out; the spared one
-        // still refuses because the original drain owns it.
-        assert!(
-            pen.begin_drain(&draining).is_none(),
-            "an active drain spares the journal — the claim survives the prune",
-        );
-        match pen.continue_drain(&draining) {
-            DrainStep::Done => {}
-            DrainStep::More(_) => panic!("nothing further was deposited mid-drain"),
-        }
-
-        // A generous TTL prunes nothing.
-        assert!(
-            pen.prune_stale(std::time::Duration::from_secs(3600), |_| false)
-                .is_empty(),
         );
     }
 

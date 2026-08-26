@@ -2611,8 +2611,9 @@ pub async fn run_slot_link(
                 // journal is append-only and survives the reap, so if the
                 // slot redials (this close is retryable) the drain-time
                 // reclaim check stands the stale drop down, and if it never
-                // does, the departure drains truthfully or expires with the
-                // journal at the token ceiling.
+                // does, the departure drains truthfully once a descriptor
+                // arrives — or is retained with the journal, whose retention
+                // rule no local fact can safely cut short.
                 break 'serve;
             }
         }
@@ -2938,15 +2939,16 @@ fn maybe_close_emptied_session_gated(
     // EXCEPT when the provisional journal still holds anything undrained:
     // journaled entries are transport-acknowledged (turns) or the only
     // record that a slot left at all (departures), and the journal is
-    // append-only until a descriptor drains it or the stale prune expires
-    // it at the token ceiling — discarding it here would silently hole an
-    // accepted sequence, or leave peer-homed survivors waiting forever on
-    // an expected slot with neither presence nor a departure. The
-    // empty-check and the removal are ONE atomic step
+    // retained until a descriptor drains it or retirement ends the session
+    // — no local fact can prove it unneeded sooner (see the retention rule
+    // in `crate::provisional_turns`) — so discarding it here would silently
+    // hole an accepted sequence, or leave peer-homed survivors waiting
+    // forever on an expected slot with neither presence nor a departure.
+    // The empty-check and the removal are ONE atomic step
     // (`discard_if_empty`), so a departure deposited by a sibling
     // teardown's announce racing this close can never be classified away
-    // and then deleted: it either refuses the discard or lands in a fresh
-    // journal the prune owns.
+    // and then deleted: it either refuses the discard or lands in a fresh,
+    // retained journal.
     if consensus::maker_exists(&mesh.decision_makers, key) {
         mesh.provisional.clear(key);
     } else if mesh.provisional_turns.discard_if_empty(key) {

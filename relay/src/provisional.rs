@@ -159,16 +159,12 @@ pub async fn run_sweep(
     provisional: ProvisionalSessions,
     sessions: Sessions,
     decision_makers: Arc<DecisionMakers>,
-    provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
-    gates: crate::session_gate::SessionGates,
     armed: watch::Receiver<bool>,
 ) {
     run_sweep_with(
         provisional,
         sessions,
         decision_makers,
-        provisional_turns,
-        gates,
         armed,
         SWEEP_INTERVAL,
     )
@@ -195,8 +191,6 @@ pub async fn run_sweep_with(
     provisional: ProvisionalSessions,
     sessions: Sessions,
     decision_makers: Arc<DecisionMakers>,
-    provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
-    gates: crate::session_gate::SessionGates,
     armed: watch::Receiver<bool>,
     sweep_interval: Duration,
 ) {
@@ -222,32 +216,6 @@ pub async fn run_sweep_with(
             provisional.restart_all();
         }
         was_armed = now_armed;
-        // The journal's terminal janitor, on the same periodic tick: drop
-        // journals (and their gates) whose session is PROVABLY terminal.
-        // The proof needs both halves. The token ceiling elapsing means no
-        // NEW handshake can succeed (expiry is checked at auth, and every
-        // token for a session is minted at its create) — but expiry is
-        // never re-checked on an established link, and QUIC keepalives can
-        // hold one open indefinitely, so an occupied roster means a
-        // depositor may still be live and its acknowledged turns must not
-        // be dropped. Only an EMPTY roster past the ceiling closes both
-        // return paths: no link remains, and none can ever be admitted
-        // again. A session with a maker is spared regardless — its
-        // descriptor DID come, and retirement owns its cleanup. Runs armed
-        // or not: an outage cannot deliver descriptors, but the
-        // terminality proof does not depend on the control connection.
-        for key in provisional_turns
-            .prune_stale(crate::provisional_turns::JOURNAL_STALE_TTL, |key| {
-                decision_makers.lock().contains_key(key) || sessions.lock().contains_key(key)
-            })
-        {
-            tracing::info!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                "pruning a provisional journal past the token ceiling",
-            );
-            gates.discard(&key);
-        }
         if now_armed {
             for key in provisional.take_expired(Instant::now()) {
                 // A descriptor may have named the session as its deadline passed:
@@ -267,10 +235,10 @@ pub async fn run_sweep_with(
                 // not re-inject acknowledged retention), so the journal is
                 // the only copy of any acknowledged pre-descriptor turns —
                 // deleting it would hole an accepted sequence the moment a
-                // delayed descriptor finally lands. The journal is
-                // append-only until a descriptor drains it; the stale prune
-                // below is its one terminal janitor, firing only once the
-                // token ceiling guarantees no client can redial.
+                // delayed descriptor finally lands. The journal is retained
+                // until a descriptor drains it or retirement ends the
+                // session — no local heuristic can prove it dead sooner
+                // (see the retention rule in `crate::provisional_turns`).
                 routing::reap_provisional(&sessions, &key);
             }
         }
@@ -410,8 +378,6 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
-            Default::default(),
-            Default::default(),
             armed_rx,
             tick,
         ));
@@ -466,8 +432,6 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
-            Default::default(),
-            Default::default(),
             armed_rx,
             Duration::from_millis(10),
         ));
@@ -527,8 +491,6 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
-            Default::default(),
-            Default::default(),
             armed_rx,
             Duration::from_millis(10),
         ));
