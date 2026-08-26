@@ -39,6 +39,16 @@
 //! [`discard_if`](SessionGates::discard_if), which runs the check under the
 //! gate's write side so nothing can create session state between the verdict
 //! and the removal.
+//!
+//! Lock order: gate → registry is the ONLY sanctioned blocking nesting. A
+//! rotation holds its gate's lock while it takes the registry mutex to
+//! remove the entry, so nothing may BLOCK on a gate lock while holding the
+//! registry — that inversion is a cross-session deadlock with the registry
+//! held, stalling every gate lookup on the relay. Paths that need a gate's
+//! state after a registry lookup clone the `Arc` out and release the
+//! registry first; the TTL prune, which genuinely needs both, probes each
+//! gate with a non-blocking `try` read and keeps anything contended for the
+//! next round.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -164,11 +174,24 @@ impl SessionGates {
     /// paths that only need the flag (the flight recorder's create-on-touch),
     /// not a critical section. Prefer [`with_ingress`](Self::with_ingress)
     /// anywhere the caller mutates per-session state.
+    ///
+    /// The gate is cloned out and the registry mutex released before the
+    /// state lock is taken: BLOCKING on a gate lock while holding the
+    /// registry inverts the gate→registry order everything else obeys (a
+    /// rotation holds its gate's write side while it takes the registry to
+    /// remove the entry), and the inversion deadlocks with the registry held
+    /// — freezing gate lookup for every session, not just this one.
     pub fn is_retired(&self, key: &SessionKey) -> bool {
-        self.inner
-            .lock()
-            .get(key)
-            .is_some_and(|gate| gate.state.read_recursive().retired_at.is_some())
+        loop {
+            let Some(gate) = self.inner.lock().get(key).cloned() else {
+                return false;
+            };
+            let state = gate.state.read_recursive();
+            if gate.defunct.load(Ordering::SeqCst) {
+                continue;
+            }
+            return state.retired_at.is_some();
+        }
     }
 
     /// Marks `key` retired. The write acquisition drains every in-flight
@@ -191,12 +214,41 @@ impl SessionGates {
             state.retired_at = Some(Instant::now());
             break;
         }
+        self.prune_expired();
+    }
+
+    /// Removes retired gates older than [`RETIRED_GATE_TTL`].
+    ///
+    /// Runs under the registry mutex, so each gate's state is probed with a
+    /// NON-BLOCKING read (`try_read_recursive`): waiting on a gate lock here
+    /// would invert the gate→registry order — a rotation holds its gate's
+    /// write side while it takes the registry to remove the entry, so a
+    /// prune blocking on that gate while a rotation waits for the registry
+    /// is a cross-session deadlock with the registry held (every gate
+    /// lookup relay-wide stalls behind it). A gate whose lock is contended
+    /// is simply kept this round; the next retirement prunes it.
+    ///
+    /// Removal marks the instance defunct first, inside the registry mutex,
+    /// exactly as every other rotation does — a holder of the pruned `Arc`
+    /// (a stale dial about to acquire it) re-fetches instead of running
+    /// against the orphan.
+    fn prune_expired(&self) {
+        self.prune_expired_with(RETIRED_GATE_TTL);
+    }
+
+    fn prune_expired_with(&self, ttl: Duration) {
         let now = Instant::now();
         self.inner.lock().retain(|_, gate| {
-            gate.state
-                .read_recursive()
+            let Some(state) = gate.state.try_read_recursive() else {
+                return true;
+            };
+            let expired = state
                 .retired_at
-                .is_none_or(|at| now.duration_since(at) < RETIRED_GATE_TTL)
+                .is_some_and(|at| now.duration_since(at) >= ttl);
+            if expired {
+                gate.defunct.store(true, Ordering::SeqCst);
+            }
+            !expired
         });
     }
 
@@ -449,6 +501,66 @@ mod tests {
             });
             assert!(gates.is_retired(&k));
         }
+    }
+
+    #[test]
+    fn cleanup_and_cross_session_retirement_do_not_deadlock() {
+        // A rotation holds its gate's write side and then takes the registry
+        // to remove the entry; retirement's TTL prune holds the registry and
+        // probes every gate. If the probe BLOCKED on a contended gate, these
+        // two would deadlock across unrelated sessions with the registry
+        // held. The prune's non-blocking probe (skip and keep) is what this
+        // pins — under the blocking shape this test hangs.
+        for _ in 0..100 {
+            let gates = SessionGates::default();
+            let a = key(1);
+            let b = key(2);
+            assert_eq!(gates.with_ingress(&a, || ()), Some(()));
+            assert_eq!(gates.with_ingress(&b, || ()), Some(()));
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _ = gates.discard_if(&a, || {
+                        std::thread::yield_now();
+                        true
+                    });
+                });
+                s.spawn(|| gates.retire(&b));
+            });
+            assert!(gates.is_retired(&b));
+        }
+    }
+
+    #[test]
+    fn pruning_marks_the_removed_gate_defunct() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        gates.retire(&k);
+        let held = gates.gate(&k);
+        gates.prune_expired_with(Duration::ZERO);
+        assert_eq!(gates.tracked(), 0, "the expired tombstone is pruned");
+        assert!(
+            held.defunct.load(Ordering::SeqCst),
+            "a holder of the pruned instance must observe it as rotated out",
+        );
+        // A stale dial that raced the prune with the old Arc retries onto a
+        // fresh gate and is admitted — the TTL's intent.
+        assert_eq!(gates.with_ingress(&k, || 4), Some(4));
+    }
+
+    #[test]
+    fn pruning_keeps_a_gate_whose_lock_is_contended() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        gates.retire(&k);
+        let held = gates.gate(&k);
+        {
+            let _write = held.state.write();
+            gates.prune_expired_with(Duration::ZERO);
+            assert_eq!(gates.tracked(), 1, "a contended gate is kept this round");
+            assert!(!held.defunct.load(Ordering::SeqCst));
+        }
+        gates.prune_expired_with(Duration::ZERO);
+        assert_eq!(gates.tracked(), 0, "the next round prunes it");
     }
 
     #[test]
