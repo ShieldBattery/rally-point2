@@ -164,12 +164,15 @@ pub enum FlightEvent {
     /// moment it reports `SessionClosed` to the coordinator, and the trigger
     /// for this recording's flush.
     SessionClosed,
-    /// A drop finalization was rejected. `no_cursor` marks the fail-closed
-    /// branch — the home holds no gap-free forwarded prefix to seal (a
-    /// collapsed window, or a post-rehome home with no cursor continuity) —
-    /// where the drop stays undecided and survivors stay stalled until they
-    /// retry or quit; a session stuck repeating this event is the signal for
-    /// operator intervention (or the coordinated-abort follow-up).
+    /// A drop finalization was rejected, keeping the drop held and
+    /// undecided. `no_cursor` marks the home-side fail-closed branch — no
+    /// gap-free forwarded prefix to seal (a collapsed window, or a home
+    /// gained mid-session whose cursor cannot cover the slot's whole
+    /// history); `false` marks the authority-side refusal to complete a
+    /// finalized answer that has no framed scheduling basis yet (a pre-frame
+    /// session). Either way survivors stay stalled until they retry or quit;
+    /// a session stuck repeating this event is the signal for operator
+    /// intervention (or the coordinated-abort follow-up).
     DropFinalizeRejected { slot: u8, no_cursor: bool },
     /// A peer authority's buffer directive above the game-sync-safe ceiling
     /// was forwarded verbatim (rewriting it selectively would hand different
@@ -873,25 +876,32 @@ impl FlightRecorder {
         // A retired session must not have a straggling event conjure a fresh
         // recording either: the close seal covers close-to-retirement, and
         // the retirement gate covers everything after — together the whole
-        // tail of the session's lifecycle.
-        if self
-            .inner
-            .gates
-            .get()
-            .is_some_and(|gates| gates.is_retired(key))
-        {
-            return None;
+        // tail of the session's lifecycle. The create runs INSIDE the gate's
+        // ingress section, not after a bare flag read: retirement clears the
+        // close seal as its last sweep, so a flag read racing the sweep
+        // could pass while unretired, then insert after the seal was
+        // cleared — a post-retirement replacement recording that would later
+        // displace the stored one. Holding the read side across the insert
+        // makes the retirement's write acquisition wait it out (or refuse
+        // this create wholesale once marked).
+        let create = || {
+            let mut state = self.inner.recordings.lock();
+            if state.closed.contains(key) {
+                return None;
+            }
+            Some(Arc::clone(
+                state
+                    .sessions
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(SessionRecording::new())),
+            ))
+        };
+        match self.inner.gates.get() {
+            Some(gates) => gates.with_ingress(key, create).flatten(),
+            // No gate registry wired (tests, a standalone recorder): every
+            // session reads as unretired, exactly as before.
+            None => create(),
         }
-        let mut state = self.inner.recordings.lock();
-        if state.closed.contains(key) {
-            return None;
-        }
-        Some(Arc::clone(
-            state
-                .sessions
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(SessionRecording::new())),
-        ))
     }
 
     /// Records one event for `key`'s session, creating the recording on first

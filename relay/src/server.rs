@@ -449,13 +449,30 @@ async fn serve_connection(
     // or wholly after it (and is stale); it cannot re-land between reinstatement
     // and activation. The no-hold path uses the same maker critical section, so
     // a departure that won immediately beforehand is observed rather than raced.
-    let admission = consensus::admit_reconnect(
-        &mesh.decision_makers,
-        &mesh.drop_holds,
-        &key,
-        authorized.slot,
-        Some(connection_epoch),
-    );
+    //
+    // Run under the session's ingress gate: the handshake-ack write above is
+    // an await the register-time gate section could not span, so a
+    // retirement can land in between — sweeping the maker and holds — and
+    // this admission would then sail through the permissive no-maker path
+    // and start a link on a session the coordinator already ended. The gate
+    // re-check makes the sweep and this resolution mutually exclusive; a
+    // retirement that lands first refuses the admission here.
+    let Some(admission) = mesh.gates.with_ingress(&key, || {
+        consensus::admit_reconnect(
+            &mesh.decision_makers,
+            &mesh.drop_holds,
+            &key,
+            authorized.slot,
+            Some(connection_epoch),
+        )
+    }) else {
+        connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+        return Err(ConnError::SessionRetired {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    };
     let reinstated = match admission {
         consensus::ReconnectAdmission::Admitted { reinstated } => reinstated,
         consensus::ReconnectAdmission::Rejected => {

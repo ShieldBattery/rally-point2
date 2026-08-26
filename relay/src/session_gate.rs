@@ -38,12 +38,17 @@ use parking_lot::{Mutex, RwLock};
 use crate::routing::SessionKey;
 
 /// How long a retired session's gate is kept (absent a re-serve reopening it).
-/// The window it must cover — retirement's queued mesh Leave commands still
-/// draining through the link drivers, after which the drivers' own joined
-/// checks drop the session's frames — is seconds at worst; this is orders of
-/// magnitude beyond it while still bounding the map against a coordinator
-/// that retires sessions forever.
-const RETIRED_GATE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Two windows to cover. The short one — retirement's queued mesh Leave
+/// commands still draining through the link drivers — is seconds at worst.
+/// The long one is what actually sizes this: a retired session's client
+/// tokens stay valid for the coordinator's token lifetime (hours), and once
+/// the gate is pruned a stale dial is admitted through the permissive
+/// no-maker path, resurrecting roster/seen state for a session the
+/// coordinator already ended. So the TTL must comfortably outlast the
+/// longest token lifetime a coordinator would mint (default six hours) —
+/// a retired entry is a key and a timestamp, so holding a day's worth
+/// still bounds the map at trivial cost.
+const RETIRED_GATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Default)]
 struct GateState {
