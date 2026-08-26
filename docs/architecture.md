@@ -721,6 +721,17 @@ oversize diverts — by a relay-wide 10s sampling tick). It **observes only**: n
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
 
+A buffer directive carries the **derivation** behind it, not just the depth it landed on: the law's
+own terms (pairwise path, loss risk, burst), the additive cushion and stretch terms folded on top, the
+shrink floor and edge-burn state that bounded how far the buffer could move, and every slot's effective
+RTT as the law weighed it. Without them a recording says a session ran deep but not which slot or which
+term drove it there, and the depth alone cannot distinguish a law that asked for exactly that from one
+whose ask the bounds trimmed — the recorded target sitting above the applied depth is the only evidence
+of the latter. The terms are gathered on the path that queues a directive, not on the per-sample ingests
+that merely evaluate the law, so the cost rides the few dozen decisions a game makes rather than its tens
+of thousands of samples. A directive the law did not author — the one-shot re-affirm of the standing
+buffer — records no derivation rather than an invented one.
+
 **What it never records:** raw turn/command bytes and chat. Summaries only. User identity *does* transit
 a relay — end-of-game result reports ride the turn path as opaque tenant payloads that carry account
 ids — but the relay never parses or persists those bytes, and the recorder never captures payload bytes

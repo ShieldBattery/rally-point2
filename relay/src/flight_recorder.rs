@@ -133,6 +133,12 @@ pub enum FlightEvent {
         buffer_turns: u32,
         apply_frame: u32,
         decision_seq: u32,
+        /// What the control law derived this depth from. Absent when the
+        /// directive carries no law verdict — the one-shot re-affirm that
+        /// broadcasts the standing buffer fires precisely when the law had no
+        /// target to act on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inputs: Option<BufferDecisionInputs>,
     },
     /// The desync comparator confirmed a divergence.
     DesyncDetected {
@@ -195,6 +201,65 @@ pub enum FlightEvent {
         buffer_turns: u32,
         decision_seq: u32,
     },
+}
+
+/// The control law's derivation of one latency-buffer decision: every term
+/// that fed the target, plus the gate state that decided how far the buffer
+/// was allowed to move. A depth on its own says only what the session got;
+/// these say why, which is the difference between reading a recording and
+/// guessing at one.
+///
+/// Every turn-valued field is in game turns and every microsecond-valued one
+/// says `_us`. The terms compose as
+/// `law_target = ceil(path) + ceil(loss_risk) + burst_turns` and
+/// `target = law_target + cushion_turns + stretch_turns`; `target` above
+/// `buffer_turns` means the session bounds (or the sync-safe ceiling) trimmed
+/// what the law asked for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BufferDecisionInputs {
+    /// The control law's own target — path, loss, and burst — before the
+    /// additive terms.
+    pub law_target: u32,
+    /// The full target the raise branch compared against the buffer: the law's
+    /// target plus the additive cushion and stretch terms.
+    pub target: u32,
+    /// The target as the shrink gate sees it, with the path term's headroom
+    /// margin applied. Always at least `target`; a lower fires only while this
+    /// sits below the standing buffer.
+    pub shrink_target: u32,
+    /// Worst pairwise one-way path across the session, microseconds.
+    pub path_us: u32,
+    /// Worst per-slot `loss_rate * eff_rtt`, microseconds — how much delivery
+    /// delay the measured loss is expected to add.
+    pub loss_risk_us: u32,
+    /// Worst per-slot blackout-run length in turns, capped by the law.
+    pub burst_turns: u32,
+    /// The end-to-end delivery cushion: one turn per relay hop past the first,
+    /// plus the capped lag-responsive term.
+    pub cushion_turns: u32,
+    /// The sustained arrival-interval stretch term: nonzero while some home
+    /// slot has been producing turns slower than the turn rate for longer than
+    /// the law's sustain window.
+    pub stretch_turns: u32,
+    /// The trailing target high-water mark a shrink may not step below.
+    pub shrink_floor: u32,
+    /// Whether a disproven edge shrink is holding the floor over the long
+    /// probation window rather than the base lookback.
+    pub edge_burned: bool,
+    /// Every slot's effective RTT at decision time, sorted by slot — the
+    /// per-slot detail behind `path_us`, and the only place the mesh's
+    /// contribution to a slot's path is visible.
+    pub eff_rtts: Vec<SlotEffRtt>,
+}
+
+/// One slot's effective RTT as the control law weighed it: the slot's own link
+/// RTT plus the one-way mesh hop from the deciding relay to the slot's home
+/// relay, so a slot this relay homes and one it reaches across the mesh are
+/// directly comparable. Microseconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotEffRtt {
+    pub slot: u8,
+    pub eff_rtt_us: u32,
 }
 
 /// One recorded event: what happened and when (unix epoch milliseconds).
@@ -1505,6 +1570,70 @@ mod tests {
         assert_eq!(back, blob);
     }
 
+    /// A recorded decision's derivation survives the blob round-trip with its
+    /// per-slot detail intact, and a directive without one stays absent rather
+    /// than serializing a hole.
+    #[test]
+    fn a_buffer_directives_derivation_roundtrips() {
+        let recorder = FlightRecorder::default();
+        recorder.set_identity(RelayId(7));
+        let k = key(42);
+        recorder.record(
+            &k,
+            FlightEvent::BufferDirective {
+                buffer_turns: 12,
+                apply_frame: 340,
+                decision_seq: 2,
+                inputs: Some(BufferDecisionInputs {
+                    law_target: 8,
+                    target: 13,
+                    shrink_target: 13,
+                    path_us: 125_000,
+                    loss_risk_us: 4_700,
+                    burst_turns: 4,
+                    cushion_turns: 4,
+                    stretch_turns: 1,
+                    shrink_floor: 13,
+                    edge_burned: true,
+                    eff_rtts: vec![
+                        SlotEffRtt {
+                            slot: 0,
+                            eff_rtt_us: 45_000,
+                        },
+                        SlotEffRtt {
+                            slot: 3,
+                            eff_rtt_us: 205_000,
+                        },
+                    ],
+                }),
+            },
+        );
+        recorder.record(
+            &k,
+            FlightEvent::BufferDirective {
+                buffer_turns: 5,
+                apply_frame: 900,
+                decision_seq: 3,
+                inputs: None,
+            },
+        );
+
+        let blob = recorder.take_blob(&k, true).expect("a recording exists");
+        let json = serde_json::to_string_pretty(&blob).unwrap();
+        assert!(
+            json.contains("\"eff_rtts\""),
+            "the per-slot detail reaches the wire",
+        );
+        assert_eq!(
+            json.matches("\"inputs\"").count(),
+            1,
+            "the directive with no derivation serializes no key for one",
+        );
+
+        let back: FlightBlob = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, blob);
+    }
+
     #[tokio::test]
     async fn the_file_sink_writes_the_tenant_scoped_path() {
         let dir = std::env::temp_dir().join(format!("rp2-flight-test-{}", std::process::id()));
@@ -1602,6 +1731,7 @@ mod tests {
                 buffer_turns: 4,
                 apply_frame: 1200,
                 decision_seq: 9,
+                inputs: None,
             },
         );
         recorder.record_existing(&k, FlightEvent::SessionClosed);

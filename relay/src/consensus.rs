@@ -230,6 +230,7 @@ use rally_point_proto::messages::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::flight_recorder::BufferDecisionInputs;
 use crate::routing::SessionKey;
 
 /// How long a relay withholds the session's relay → region labels from its
@@ -1497,6 +1498,12 @@ pub struct DecisionMaker {
     /// decisions), so it never stamps -- it only forwards the authority's
     /// already-stamped turns verbatim.
     pending_directive: Option<BufferDirective>,
+    /// The control-law derivation behind [`pending_directive`], for the flight
+    /// recording only -- no decision reads it back. Unlike the directive, which
+    /// keeps being stamped onto turns until the session passes its apply frame,
+    /// this is consumed by the recording of the decision that produced it, so a
+    /// later directive can never be recorded against a stale derivation.
+    pending_decision_inputs: Option<BufferDecisionInputs>,
     /// Whether this authority has broadcast the session's buffer at least once.
     /// The control law only emits a directive when the buffer *changes*, so a
     /// session that sits at its initial buffer never broadcasts one -- and a
@@ -2838,6 +2845,7 @@ impl DecisionMaker {
             decision_seq_tiebreak: None,
             over_ceiling_warned_seq: None,
             pending_directive: None,
+            pending_decision_inputs: None,
             initial_directive_sent: false,
             delivery: crate::delivery::DeliveryTracking::default(),
             last_trace_frame: None,
@@ -3147,6 +3155,7 @@ impl DecisionMaker {
             // Its cached leaves and recorded departures are deliberately kept --
             // they are what a later promotion re-broadcasts.
             self.pending_directive = None;
+            self.pending_decision_inputs = None;
         }
         if promoting {
             // Start the desync comparator fresh. No per-ordinal checksum state
@@ -3742,7 +3751,18 @@ impl DecisionMaker {
     /// cushion, and the fastest client runs ahead of the slowest by at most the
     /// cushion again -- both scale with the buffer, so the horizon does too (the
     /// wider of the old and new cushion, plus a fixed delivery margin).
-    fn queue_directive(&mut self, new_buffer: u32, frame: GameFrameCount) -> Decision {
+    /// `inputs` is the control-law derivation to record alongside the
+    /// directive, or `None` for a directive the law did not author (the
+    /// one-shot re-affirm of the standing buffer). It is carried as a
+    /// parameter rather than read back off the maker so a caller cannot queue
+    /// a directive and leave the previous decision's derivation standing
+    /// against it.
+    fn queue_directive(
+        &mut self,
+        new_buffer: u32,
+        frame: GameFrameCount,
+        inputs: Option<BufferDecisionInputs>,
+    ) -> Decision {
         // The last line of defense for every locally-authored directive: the
         // decision path clamps through `game_safe_clamp`, but the initial
         // unconditional broadcast re-affirms `self.buffer` raw — which is
@@ -3771,6 +3791,7 @@ impl DecisionMaker {
         // stamp observed later wins only from a strictly higher relay id --
         // the same displacement rule clients apply.
         self.decision_seq_tiebreak = self.own_relay_id.map(|id| id.0);
+        self.pending_decision_inputs = inputs;
         self.pending_directive = Some(BufferDirective {
             buffer_turns: new_buffer,
             apply_at_frame: applied_frame.0,
@@ -3839,7 +3860,8 @@ impl DecisionMaker {
             // a lowered buffer that re-triggers the stretch burns the edge
             // and stops being retried.
             let stretch_turns = self.phase.stretch_turns(Instant::now());
-            let additive_turns = self.delivery.cushion_turns().saturating_add(stretch_turns);
+            let cushion_turns = self.delivery.cushion_turns();
+            let additive_turns = cushion_turns.saturating_add(stretch_turns);
             let target = inputs.target.saturating_add(additive_turns);
             // The same target as the shrink gate sees it: the path term
             // carries the headroom margin, everything else is identical.
@@ -3946,10 +3968,20 @@ impl DecisionMaker {
             if let Some(new_buffer) = new_buffer {
                 let new_buffer = self.game_safe_clamp(new_buffer);
                 if new_buffer != self.buffer.0 {
+                    // Snapshot the derivation before the clamp is applied to
+                    // the buffer, so a recording shows what the law asked for
+                    // next to what the session was allowed to have.
+                    let recorded = self.decision_inputs(
+                        inputs,
+                        target,
+                        shrink_target,
+                        cushion_turns,
+                        stretch_turns,
+                    );
                     // A real change is itself the session's first broadcast, so
                     // the initial-directive fallback below is satisfied.
                     self.initial_directive_sent = true;
-                    return Some(self.queue_directive(new_buffer, frame));
+                    return Some(self.queue_directive(new_buffer, frame, Some(recorded)));
                 }
             }
         }
@@ -3959,10 +3991,56 @@ impl DecisionMaker {
         // target sits at the minimum.
         if !self.initial_directive_sent {
             self.initial_directive_sent = true;
-            return Some(self.queue_directive(self.buffer.0, frame));
+            return Some(self.queue_directive(self.buffer.0, frame, None));
         }
 
         None
+    }
+
+    /// Assembles the derivation behind one decision for the flight recording:
+    /// the law's own terms, the additive terms folded on top, and the shrink
+    /// gate state that bounded how far the buffer could move. Built only on the
+    /// path that actually queues a directive -- decisions are rare next to the
+    /// per-sample ingests that evaluate the law, and the per-slot gather below
+    /// should not ride every one of those.
+    fn decision_inputs(
+        &self,
+        inputs: &TargetInputs,
+        target: u32,
+        shrink_target: u32,
+        cushion_turns: u32,
+        stretch_turns: u32,
+    ) -> BufferDecisionInputs {
+        BufferDecisionInputs {
+            law_target: inputs.target,
+            target,
+            shrink_target,
+            path_us: inputs.path_us,
+            // The risk is a rate times a duration, so it lands in the same
+            // microseconds the path is measured in; the fraction it is rounded
+            // off carries no meaning the law acts on (the term is `ceil`'d to
+            // whole turns before it reaches the target).
+            loss_risk_us: inputs.worst_loss_risk.round() as u32,
+            burst_turns: inputs.burst_turns,
+            cushion_turns,
+            stretch_turns,
+            shrink_floor: self.target_peaks.max_over_last(TARGET_FLOOR_BASE_BUCKETS),
+            edge_burned: self.edge_burned,
+            eff_rtts: {
+                // Sorted so consecutive recordings of the same session are
+                // diffable; the map they come from has no order of its own.
+                let mut rtts: Vec<_> = self
+                    .slots
+                    .iter()
+                    .map(|(slot, state)| crate::flight_recorder::SlotEffRtt {
+                        slot: slot.0,
+                        eff_rtt_us: state.eff_rtt(),
+                    })
+                    .collect();
+                rtts.sort_unstable_by_key(|row| row.slot);
+                rtts
+            },
+        }
     }
 
     /// Emits a rate-limited debug trace of the control law's inputs, so a wrong
@@ -6724,7 +6802,7 @@ fn ingest_conditions(
     mesh_rtt_us: u32,
     local: bool,
 ) -> Option<Decision> {
-    let (decision, directive) = {
+    let (decision, directive, inputs) = {
         let mut makers = registry.lock();
         let maker = makers.get_mut(key)?;
         if local {
@@ -6733,11 +6811,17 @@ fn ingest_conditions(
         let decision = maker.ingest_slots(conditions, mesh_rtt_us)?;
         // The queued broadcast carries the decision seq the Decision lacks;
         // read it under the same lock so the recorded event matches exactly
-        // what clients will be stamped with.
-        (decision, maker.pending_directive)
+        // what clients will be stamped with. The derivation is *taken* -- it
+        // belongs to this decision alone, and the next directive brings its
+        // own (or none).
+        (
+            decision,
+            maker.pending_directive,
+            maker.pending_decision_inputs.take(),
+        )
     };
     log_decision(key, decision);
-    record_buffer_event(registry, key, directive);
+    record_buffer_event(registry, key, directive, inputs);
     Some(decision)
 }
 
@@ -6747,6 +6831,7 @@ fn record_buffer_event(
     registry: &DecisionMakers,
     key: &SessionKey,
     directive: Option<BufferDirective>,
+    inputs: Option<BufferDecisionInputs>,
 ) {
     if let Some(directive) = directive {
         registry.flight.record(
@@ -6755,6 +6840,7 @@ fn record_buffer_event(
                 buffer_turns: directive.buffer_turns,
                 apply_frame: directive.apply_at_frame,
                 decision_seq: directive.decision_seq,
+                inputs,
             },
         );
     }
@@ -8839,6 +8925,88 @@ mod tests {
         let d = ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
         assert_eq!(d.unwrap().buffer, BufferSize(2));
         assert_eq!(maker.buffer(), BufferSize(2));
+    }
+
+    // -- Recorded decision derivation --
+
+    /// A law-authored decision carries the terms it was derived from, and they
+    /// reconstruct the target the buffer moved to.
+    #[test]
+    fn a_law_decision_records_the_terms_it_derived_the_target_from() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let decision = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).unwrap();
+        let recorded = maker
+            .pending_decision_inputs
+            .as_ref()
+            .expect("a law decision records its derivation");
+
+        assert_eq!(recorded.path_us, 150_000);
+        assert_eq!(
+            recorded.law_target,
+            recorded.target - recorded.cushion_turns - recorded.stretch_turns,
+            "the additive terms are what separate the law's target from the full one",
+        );
+        assert_eq!(
+            decision.buffer,
+            BufferSize(recorded.target),
+            "nothing clamped this decision, so the buffer is the target",
+        );
+        assert_eq!(
+            recorded.eff_rtts,
+            vec![crate::flight_recorder::SlotEffRtt {
+                slot: 0,
+                eff_rtt_us: 150_000,
+            }],
+            "the per-slot detail names which link drove the path",
+        );
+    }
+
+    /// A raise the bounds trim still records what the law asked for -- the gap
+    /// between the recorded target and the applied depth is the only evidence
+    /// that the session wanted more buffer than it was allowed.
+    #[test]
+    fn a_clamped_raise_records_the_target_the_law_asked_for() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 3),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        let decision = ingest_at(&mut maker, &conditions(0, 300_000, 0, 100), 1).unwrap();
+        let recorded = maker.pending_decision_inputs.as_ref().unwrap();
+
+        assert_eq!(decision.buffer, BufferSize(3), "trimmed to the bounds");
+        assert!(
+            recorded.target > 3,
+            "the recorded target is the law's ask ({}), not the trimmed depth",
+            recorded.target,
+        );
+    }
+
+    /// The one-shot re-affirm of the standing buffer is not a law verdict, so
+    /// it records no derivation rather than an invented one.
+    #[test]
+    fn the_standing_buffer_reaffirm_records_no_derivation() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(4, 20),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        // A 150ms path targets exactly the minimum the buffer already sits at,
+        // so the law holds and the unconditional broadcast is what fires.
+        let decision = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1).unwrap();
+        assert_eq!(decision.buffer, BufferSize(4));
+        assert!(maker.pending_directive.is_some(), "the re-affirm broadcast");
+        assert!(maker.pending_decision_inputs.is_none());
     }
 
     // -- Authority --
