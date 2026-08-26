@@ -398,6 +398,26 @@ async fn serve_connection(
         });
     }
 
+    // A clean leave journaled before the session's descriptor is terminal
+    // from the moment of the intent, exactly as a maker's decided leave is:
+    // without this, the same valid token could redial into the
+    // pre-descriptor window (where the permissive no-maker admission would
+    // wave it through), and its fresh generation would race the journaled
+    // leave's drained count with post-count turns. The seal outlives the
+    // journal's drain (the drained decided leave then refuses through the
+    // maker), so this check is monotone-safe read here before registration.
+    if mesh.provisional_turns.armed() && mesh.provisional_turns.slot_sealed(&key, authorized.slot) {
+        connection.close(
+            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+            b"slot already departed",
+        );
+        return Err(ConnError::SlotDeparted {
+            tenant: key.tenant,
+            session: key.session,
+            slot: authorized.slot,
+        });
+    }
+
     // Admission is an ingress critical section on the session's gate: the
     // retirement check and the roster registration happen atomically against
     // a concurrent descriptor retirement, so a stale dial can neither slip in

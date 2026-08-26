@@ -1723,18 +1723,22 @@ pub fn forward_client_turn(
             Funnel::Proceed(payload) => payload,
             Funnel::Held => return,
             Funnel::Overflow => {
-                // Fail the session closed with recovery rather than silently
-                // holing an acknowledged sequence: reap its provisional links
-                // — each client re-dials and the resume machinery re-supplies
-                // everything this relay never forwarded.
+                // The overflowed turn was already transport-acknowledged and
+                // a same-relay resume deliberately does not re-inject
+                // acknowledged retention — it is genuinely unrecoverable, so
+                // the slot that produced it now has a permanent hole in its
+                // accepted sequence. Fail THAT SLOT closed: close its link,
+                // whose teardown journals an ordinary dropped departure the
+                // survivors resolve through the drop flow once the
+                // descriptor lands. The rest of the session's journal is
+                // untouched — only the offender pays.
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     slot = slot.0,
-                    "provisional journal overflowed; reaping the session's provisional links",
+                    "provisional journal overflowed; closing the overflowing slot's link",
                 );
-                mesh.provisional_turns.discard(key);
-                routing::reap_provisional(sessions, key);
+                routing::close_slots(sessions, key, std::slice::from_ref(&slot));
                 return;
             }
         }
@@ -6276,6 +6280,43 @@ mod tests {
             }
             other => panic!("expected a SlotDeparted, got {other:?}"),
         }
+    }
+
+    /// Journal overflow closes the overflowing slot's link — the overflowed
+    /// turn is transport-acknowledged and unrecoverable, so the offender
+    /// fails closed while the rest of the session's journal is untouched.
+    #[tokio::test]
+    async fn journal_overflow_closes_the_overflowing_slots_link() {
+        let sessions = routing::Sessions::default();
+        let key = control_key();
+        let mesh_state = new_mesh_state();
+        mesh_state.provisional_turns.arm();
+        let (_reg, inbox) =
+            routing::register(&sessions, &key, SlotId(1)).expect("the flooder registers");
+        let shutdown = inbox.shutdown_handle();
+
+        for seq in 0..=(crate::provisional_turns::PER_SESSION_CAP as u64) {
+            forward_client_turn(
+                &sessions,
+                &mesh_state,
+                &key,
+                SlotId(1),
+                Payload {
+                    seq,
+                    slot: 1,
+                    commands: vec![0x05].into(),
+                    ..Default::default()
+                },
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(100), shutdown.notified())
+            .await
+            .expect("the overflowing slot's link is signaled closed");
+        assert_eq!(
+            mesh_state.provisional_turns.held(&key),
+            crate::provisional_turns::PER_SESSION_CAP,
+            "the journal keeps everything below the cap",
+        );
     }
 
     /// A retired session's client turn is refused by the gate BEFORE the

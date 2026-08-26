@@ -647,6 +647,8 @@ async fn main() -> Result<()> {
                 mesh_state.provisional.clone(),
                 Arc::clone(&sessions),
                 Arc::clone(&mesh_state.decision_makers),
+                mesh_state.provisional_turns.clone(),
+                mesh_state.gates.clone(),
                 control_connected_rx,
             ));
             // Measure backbone round-trips to the coordinator's region beacons and

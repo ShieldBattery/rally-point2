@@ -2244,7 +2244,7 @@ pub async fn run_slot_link(
                         // Gated like the teardown announce: a clean leave
                         // landing after the session's retirement must not
                         // write into swept state.
-                        let _ = mesh_for_teardown.gates.with_ingress(&key, || {
+                        let announced = mesh_for_teardown.gates.with_ingress(&key, || {
                             announce_departure(
                                 &drop_holds,
                                 &decision_makers,
@@ -2267,7 +2267,12 @@ pub async fn run_slot_link(
                                 Some(connection_epoch),
                             )
                         });
-                        leave_announced = true;
+                        // Marked announced only when the announce (or its
+                        // journal deposit) actually happened: a refused gate
+                        // or a stood-down announce leaves the teardown's
+                        // fallback drop-announcement armed as the recovery
+                        // path rather than silently suppressed.
+                        leave_announced = announced == Some(true);
                         // The client's driver never expects an ack for the
                         // intent itself -- closing the link is the
                         // confirmation it waits on, so give it one now
@@ -2918,9 +2923,19 @@ fn maybe_close_emptied_session_gated(
     // retirement that ordinarily cleans up its ingress gate will never come —
     // drop the gate here, at its retirement-equivalent, or the entry lives
     // for the relay's lifetime. A descriptor-named session keeps its gate
-    // until real retirement. Any turns still penned for the maker-less
-    // session go with it: no descriptor will ever drain them.
-    if !consensus::maker_exists(&mesh.decision_makers, key) {
+    // until real retirement.
+    //
+    // EXCEPT when the provisional journal still holds undrained ingress: a
+    // journaled clean leave whose link was the session's only local one
+    // empties the roster before the descriptor arrives, and discarding here
+    // would erase the only record of that departure — the descriptor would
+    // then drain nothing and peer-homed survivors would wait forever on an
+    // expected slot with neither presence nor a departure. Keep the journal
+    // (and its gate) for the descriptor that will drain it; if none ever
+    // comes, the provisional sweep is the janitor that discards both.
+    if !consensus::maker_exists(&mesh.decision_makers, key)
+        && !mesh.provisional_turns.has_undrained(key)
+    {
         mesh.gates.discard(key);
         mesh.provisional_turns.discard(key);
     }
@@ -2964,6 +2979,21 @@ fn maybe_close_emptied_session_gated(
 /// racing it, and its own decide path (`decide_and_broadcast_leave` →
 /// `fan_out_leave`) needs the roster lock itself — holding it here too would
 /// deadlock.
+/// The journal-aware wrapper around [`announce_departure_recorded`]. On a
+/// coordinator-managed relay, the departure is deposited into the session's
+/// provisional journal unless the journal has fully drained (the maker
+/// provably exists) — a pre-descriptor announce would otherwise land in a
+/// maker-less void: nothing records it, yet the caller marks it announced, so
+/// when the descriptor arrives the slot is expected-but-absent and the
+/// session stalls on it until the coordinator's holdout reap. Depositing
+/// while the drain is mid-replay is journaled too, ordered after the batch in
+/// flight, so a clean leave landing then still counts every one of its own
+/// turns. The drain replays journaled departures through
+/// [`announce_departure_recorded`] once the maker exists (a clean leave's
+/// exact count recomputed there over exactly its drained turns; the
+/// drain-time reclaim check stands a stale journaled drop down if the slot
+/// reconnected meanwhile). Callers run this under the session's ingress gate,
+/// so a racing retirement cannot have the deposit recreate journal state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn announce_departure(
     drop_holds: &crate::drop_hold::DropHolds,
@@ -2971,6 +3001,52 @@ pub(crate) fn announce_departure(
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
     provisional_turns: &crate::provisional_turns::ProvisionalTurnPen,
+    key: &SessionKey,
+    slot: SlotId,
+    reason: u32,
+    final_turn_count: Option<u64>,
+    connection_epoch: Option<u64>,
+) -> bool {
+    if provisional_turns.armed() {
+        use crate::provisional_turns::{HoldOutcome, PennedIngress};
+        match provisional_turns.hold(
+            key,
+            PennedIngress::Departure {
+                slot,
+                reason,
+                connection_epoch,
+            },
+        ) {
+            HoldOutcome::Held => return true,
+            // The journal fully drained: the maker provably exists, so
+            // announce into it directly below.
+            HoldOutcome::Resolved(_) => {}
+            HoldOutcome::Overflow(_) => unreachable!("departures are cap-exempt"),
+        }
+    }
+    announce_departure_recorded(
+        drop_holds,
+        decision_makers,
+        sessions,
+        mesh_links,
+        key,
+        slot,
+        reason,
+        final_turn_count,
+        connection_epoch,
+    )
+}
+
+/// The journal-blind half of [`announce_departure`]: records, holds, and
+/// broadcasts against the session's current state. Called directly by the
+/// journal drain (whose deposits must not re-enter the journal) and by the
+/// wrapper above once the journal is resolved.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn announce_departure_recorded(
+    drop_holds: &crate::drop_hold::DropHolds,
+    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    sessions: &Sessions,
+    mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
@@ -2985,62 +3061,8 @@ pub(crate) fn announce_departure(
     {
         // A reconnect already reclaimed this seat; its own post-register
         // admission (current state, not a stale snapshot) is the sole authority
-        // on this relay now.
+        // on this slot now.
         return false;
-    }
-
-    // On a coordinator-managed relay with no maker yet (a pre-descriptor
-    // provisional session), announcing would land in a void — nothing records
-    // the departure, yet the caller marks it announced, so when the
-    // descriptor arrives the slot is expected-but-absent and the session
-    // stalls on it until the coordinator's holdout reap. Journal the
-    // departure instead: the descriptor drain replays it here once the maker
-    // exists, ordered after the slot's own journaled turns (a clean leave's
-    // exact count is recomputed there, over exactly those turns). The
-    // one-shot resolved mark closes the deposit-vs-drain race the same way
-    // the turn funnel's does. Callers run this under the session's ingress
-    // gate, so a racing retirement cannot have the deposit recreate journal
-    // state either.
-    if provisional_turns.armed() && !consensus::maker_exists(decision_makers, key) {
-        use crate::provisional_turns::{HoldOutcome, PennedIngress};
-        drop(roster_guard);
-        match provisional_turns.hold(
-            key,
-            PennedIngress::Departure {
-                slot,
-                reason,
-                connection_epoch,
-            },
-        ) {
-            HoldOutcome::Held => return true,
-            // The drain already ran: the maker provably exists now, so fall
-            // through and announce into it normally.
-            HoldOutcome::Resolved(_) => {
-                return announce_departure(
-                    drop_holds,
-                    decision_makers,
-                    sessions,
-                    mesh_links,
-                    provisional_turns,
-                    key,
-                    slot,
-                    reason,
-                    final_turn_count,
-                    connection_epoch,
-                );
-            }
-            HoldOutcome::Overflow(_) => {
-                tracing::warn!(
-                    tenant = key.tenant.as_ref(),
-                    session = key.session.0,
-                    slot = slot.0,
-                    "provisional journal overflowed on a departure; reaping the session",
-                );
-                provisional_turns.discard(key);
-                reap_provisional(sessions, key);
-                return false;
-            }
-        }
     }
 
     // Read the last observed frame, the reachability ceiling, and the slot's
@@ -3876,6 +3898,50 @@ mod tests {
             roster[0].1,
             vec![SlotId(0), SlotId(2)],
             "the group's connected slots, in sorted order",
+        );
+    }
+
+    /// The session's ONLY local link cleanly leaves before the descriptor: its
+    /// teardown empties the roster, but the emptied-session close must keep
+    /// the journal (and the gate) holding that departure — discarding it
+    /// would erase the only record of the leave, and the descriptor would
+    /// then drain nothing while peer-homed survivors wait forever on an
+    /// expected slot with neither presence nor a departure.
+    #[tokio::test]
+    async fn an_emptied_close_keeps_an_undrained_journal() {
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        mesh.provisional_turns.arm();
+        let k = key();
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("the leaver registers");
+        g1.disarm();
+
+        // The clean-leave intent path: journal the departure, then the full
+        // link teardown with the leave already announced.
+        let announced = mesh.gates.with_ingress(&k, || {
+            announce_departure(
+                &mesh.drop_holds,
+                &mesh.decision_makers,
+                &sessions,
+                &mesh.links,
+                &mesh.provisional_turns,
+                &k,
+                SlotId(1),
+                LEAVE_REASON_LEFT,
+                None,
+                Some(3),
+            )
+        });
+        assert_eq!(announced, Some(true), "the pre-descriptor leave journals");
+        end_slot_link(&sessions, &mesh, &k, SlotId(1), 3, true);
+
+        assert!(
+            mesh.provisional_turns.has_undrained(&k),
+            "the emptied close keeps the journaled departure for the descriptor",
+        );
+        assert!(
+            mesh.provisional_turns.slot_sealed(&k, SlotId(1)),
+            "the clean leave's admission seal survives the emptied close",
         );
     }
 

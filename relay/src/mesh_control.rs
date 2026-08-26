@@ -510,42 +510,59 @@ impl MeshControl {
         // decided-leave fence and die instead of reaching co-admitted
         // survivors; every current slot's turns flow exactly as if they had
         // arrived a moment later. A journaled departure re-announces into
-        // the maker — a clean leave's exact count is derived HERE, over
-        // exactly the slot's own turns drained ahead of it (its link was
-        // closed at the intent, so the journaled prefix is complete), never
-        // from the deposit-time snapshot that was blind to them. The drain
-        // itself is the journal's one-shot resolved transition
-        // (`take_and_resolve`), so a deposit racing this is refused and
-        // re-runs against the maker.
-        if let Some(turn_path) = &self.turn_path {
-            for entry in turn_path.provisional_turns.take_and_resolve(&key) {
-                match entry {
-                    crate::provisional_turns::PennedIngress::Turn(slot, payload) => {
-                        mesh::forward_client_turn(&self.sessions, turn_path, &key, slot, payload);
-                    }
-                    crate::provisional_turns::PennedIngress::Departure {
-                        slot,
-                        reason,
-                        connection_epoch,
-                    } => {
-                        let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
-                            .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
-                            .flatten();
-                        let _ = turn_path.gates.with_ingress(&key, || {
-                            routing::announce_departure(
-                                &self.drop_holds,
-                                &self.decision_makers,
+        // the maker through the journal-blind inner half (the drain must not
+        // re-enter the journal) — a clean leave's exact count is derived
+        // HERE, over exactly the slot's own turns drained ahead of it (its
+        // link was closed at the intent, so the journaled prefix is
+        // complete), never from the deposit-time snapshot that was blind to
+        // them. The drain is the journal's Gathering → Draining → Resolved
+        // transition: deposits landing while a batch replays are journaled
+        // and picked up by the next `continue_drain` pass, and only the
+        // atomic empty-check resolves the session — so nothing is ever
+        // announced ahead of ingress it should have ordered behind, and
+        // nothing deposits past the completed drain.
+        if let Some(turn_path) = &self.turn_path
+            && let Some(mut batch) = turn_path.provisional_turns.begin_drain(&key)
+        {
+            loop {
+                for entry in batch {
+                    match entry {
+                        crate::provisional_turns::PennedIngress::Turn(slot, payload) => {
+                            mesh::forward_client_turn(
                                 &self.sessions,
-                                &self.mesh_links,
-                                &turn_path.provisional_turns,
+                                turn_path,
                                 &key,
                                 slot,
-                                reason,
-                                exact_count,
-                                connection_epoch,
-                            )
-                        });
+                                payload,
+                            );
+                        }
+                        crate::provisional_turns::PennedIngress::Departure {
+                            slot,
+                            reason,
+                            connection_epoch,
+                        } => {
+                            let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
+                                .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
+                                .flatten();
+                            let _ = turn_path.gates.with_ingress(&key, || {
+                                routing::announce_departure_recorded(
+                                    &self.drop_holds,
+                                    &self.decision_makers,
+                                    &self.sessions,
+                                    &self.mesh_links,
+                                    &key,
+                                    slot,
+                                    reason,
+                                    exact_count,
+                                    connection_epoch,
+                                )
+                            });
+                        }
                     }
+                }
+                match turn_path.provisional_turns.continue_drain(&key) {
+                    crate::provisional_turns::DrainStep::More(next) => batch = next,
+                    crate::provisional_turns::DrainStep::Done => break,
                 }
             }
         }
@@ -1667,6 +1684,67 @@ mod tests {
             "the exact count is derived at the drain, over the drained turns",
         );
         assert!(consensus::slot_departed(&makers, &key(1), SlotId(1)));
+    }
+
+    /// A journaled clean leave whose link (the session's only local one) is
+    /// long gone still drains into a real recorded-and-decided leave when the
+    /// descriptor arrives — peer-homed survivors get their answer instead of
+    /// waiting forever on an expected slot with neither presence nor a
+    /// departure.
+    #[test]
+    fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_state = crate::mesh::MeshState {
+            decision_makers: makers.clone(),
+            ..crate::mesh::new_mesh_state()
+        };
+        mesh_state.provisional_turns.arm();
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_state.links.clone())
+            .with_turn_path(mesh_state.clone());
+
+        // The leaver plays one framed turn and cleanly leaves; its link (and
+        // with it the whole local roster) is gone before the descriptor.
+        crate::mesh::forward_client_turn(
+            &sessions,
+            &mesh_state,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::messages::Payload {
+                seq: 0,
+                slot: 1,
+                game_frame_count: Some(40),
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+        let announced = mesh_state.gates.with_ingress(&key(1), || {
+            crate::routing::announce_departure(
+                &mesh_state.drop_holds,
+                &makers,
+                &sessions,
+                &mesh_state.links,
+                &mesh_state.provisional_turns,
+                &key(1),
+                SlotId(1),
+                consensus::LEAVE_REASON_LEFT,
+                None,
+                Some(7),
+            )
+        });
+        assert_eq!(announced, Some(true));
+
+        control.apply_descriptor(&descriptor(1, &[]));
+
+        assert!(consensus::slot_departed(&makers, &key(1), SlotId(1)));
+        let (_, directives) = consensus::leave_reconcile(&makers, &key(1));
+        let leave = directives
+            .iter()
+            .find(|l| l.slot == 1)
+            .expect("the drained leave is decided");
+        assert_eq!(leave.reason, consensus::LEAVE_REASON_LEFT);
+        assert_eq!(leave.final_turn_count, Some(1));
     }
 
     /// A descriptor push is routinely an idempotent replay (a coordinator

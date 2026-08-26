@@ -129,8 +129,15 @@ impl SessionGates {
 
     /// Lifts `key`'s retirement — a descriptor names the session again (a
     /// genuine re-serve). A no-op for a session that was never retired.
+    ///
+    /// The gate is cloned out and the registry mutex RELEASED before the
+    /// write acquisition: an ingress critical section may take the registry
+    /// mutex itself (an emptied-session close holds its gate's read side and
+    /// then calls [`discard`](Self::discard)), so waiting for the write while
+    /// holding the registry mutex would be an ABBA deadlock against it.
     pub fn reopen(&self, key: &SessionKey) {
-        if let Some(gate) = self.inner.lock().get(key) {
+        let gate = self.inner.lock().get(key).cloned();
+        if let Some(gate) = gate {
             gate.state.write().retired_at = None;
         }
     }

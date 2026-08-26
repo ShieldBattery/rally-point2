@@ -159,12 +159,16 @@ pub async fn run_sweep(
     provisional: ProvisionalSessions,
     sessions: Sessions,
     decision_makers: Arc<DecisionMakers>,
+    provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
+    gates: crate::session_gate::SessionGates,
     armed: watch::Receiver<bool>,
 ) {
     run_sweep_with(
         provisional,
         sessions,
         decision_makers,
+        provisional_turns,
+        gates,
         armed,
         SWEEP_INTERVAL,
     )
@@ -191,6 +195,8 @@ pub async fn run_sweep_with(
     provisional: ProvisionalSessions,
     sessions: Sessions,
     decision_makers: Arc<DecisionMakers>,
+    provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
+    gates: crate::session_gate::SessionGates,
     armed: watch::Receiver<bool>,
     sweep_interval: Duration,
 ) {
@@ -229,6 +235,14 @@ pub async fn run_sweep_with(
                     session = key.session.0,
                     "provisional session's deadline passed with no applied descriptor; reaping",
                 );
+                // The terminal janitor for the descriptor that never came:
+                // the journal (which the emptied-session close deliberately
+                // keeps while it holds undrained ingress) and the session's
+                // gate go with the reap. Link teardowns the reap triggers
+                // may momentarily recreate the gate; their own emptied-close
+                // then discards it against the now-empty journal.
+                provisional_turns.discard(&key);
+                gates.discard(&key);
                 routing::reap_provisional(&sessions, &key);
             }
         }
@@ -368,6 +382,8 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
+            Default::default(),
+            Default::default(),
             armed_rx,
             tick,
         ));
@@ -422,6 +438,8 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
+            Default::default(),
+            Default::default(),
             armed_rx,
             Duration::from_millis(10),
         ));
@@ -481,6 +499,8 @@ mod tests {
             provisional.clone(),
             sessions,
             makers.clone(),
+            Default::default(),
+            Default::default(),
             armed_rx,
             Duration::from_millis(10),
         ));
