@@ -478,6 +478,19 @@ async fn serve_connection(
     // re-check makes the sweep and this resolution mutually exclusive; a
     // retirement that lands first refuses the admission here.
     let Some(admission) = mesh.gates.with_ingress(&key, || {
+        // Re-check the journal seal now that registration succeeded: the
+        // pre-register check can race the sealing link itself — the old
+        // link's clean intent installs the seal and only then frees the
+        // roster seat, so a dial that read "not sealed" while the seat was
+        // still occupied can find it free moments later. Registration
+        // succeeding proves the old link deregistered, which proves its
+        // seal (if any) was already installed — so this post-register read
+        // is authoritative where the pre-register one was only a fast-fail.
+        if mesh.provisional_turns.armed()
+            && mesh.provisional_turns.slot_sealed(&key, authorized.slot)
+        {
+            return consensus::ReconnectAdmission::Rejected;
+        }
         let admission = consensus::admit_reconnect(
             &mesh.decision_makers,
             &mesh.drop_holds,

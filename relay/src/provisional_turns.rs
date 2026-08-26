@@ -126,12 +126,16 @@ enum Phase {
 
 struct SessionPen {
     phase: Phase,
-    /// Slots whose CLEAN leave was journaled — terminal to admission from
-    /// the moment of the intent, exactly as a maker's decided leave would
-    /// be: the same token must not redial into the pre-descriptor window,
-    /// slip past the journal once the maker appears, and race the drained
-    /// leave's count. Never removed while the session's journal state lives
-    /// (by then the drained decided leave has taken over refusal).
+    /// Slots terminal to admission: a journaled CLEAN leave (the intent is
+    /// final the moment the client sent it, exactly as a maker's decided
+    /// leave would be — the same token must not redial into the
+    /// pre-descriptor window, slip past the journal once the maker appears,
+    /// and race the drained leave's count), or a journal OVERFLOW (the
+    /// slot's accepted sequence has a permanent, unrecoverable hole — a
+    /// reconnect would resume past it and cement the divergence). Never
+    /// removed while the session's journal state lives (a drained decided
+    /// leave takes over clean-leave refusal; an overflowed slot stays
+    /// refused for the session's life).
     sealed: std::collections::HashSet<SlotId>,
 }
 
@@ -211,13 +215,38 @@ impl ProvisionalTurnPen {
         if matches!(entry, PennedIngress::Turn(..)) && queue.len() >= PER_SESSION_CAP {
             return HoldOutcome::Overflow(entry);
         }
-        if let PennedIngress::Departure { slot, reason, .. } = &entry
-            && *reason == crate::consensus::LEAVE_REASON_LEFT
-        {
-            pen.sealed.insert(*slot);
+        if let PennedIngress::Departure { slot, reason, .. } = &entry {
+            if *reason == crate::consensus::LEAVE_REASON_LEFT {
+                pen.sealed.insert(*slot);
+            }
+            // At most one journaled departure per slot — an ENFORCED
+            // invariant, not an assumption: only clean leaves seal, so a
+            // maker-less slot can otherwise connect-and-drop in a loop
+            // (its own valid token) and grow the cap-exempt departure
+            // population without bound. The newest observation supersedes
+            // the older one; the drain-time reclaim check governs whether
+            // it stands regardless.
+            let slot = *slot;
+            queue.retain(
+                |queued| !matches!(queued, PennedIngress::Departure { slot: s, .. } if *s == slot),
+            );
         }
         queue.push_back(entry);
         HoldOutcome::Held
+    }
+
+    /// Seals `slot` against admission without journaling anything — the
+    /// overflow path's terminal marker: the slot's accepted sequence has a
+    /// permanent hole, so a reconnect must be refused for the session's
+    /// life, not offered a resume past the gap.
+    pub fn seal_slot(&self, key: &SessionKey, slot: SlotId) {
+        self.inner
+            .sessions
+            .lock()
+            .entry(key.clone())
+            .or_insert_with(SessionPen::gathering)
+            .sealed
+            .insert(slot);
     }
 
     /// Whether `slot` had a clean leave journaled — terminal to admission
@@ -428,6 +457,49 @@ mod tests {
 
         pen.discard(&key());
         assert!(!pen.slot_sealed(&key(), SlotId(1)));
+    }
+
+    /// At most one journaled departure per slot, as an enforced invariant: a
+    /// maker-less slot connect-and-dropping in a loop must not grow the
+    /// cap-exempt departure population without bound — the newest
+    /// observation supersedes the older one, in the newer position.
+    #[test]
+    fn repeated_departures_for_one_slot_compact_to_the_newest() {
+        let pen = ProvisionalTurnPen::default();
+        assert_eq!(pen.hold(&key(), departure(1, 3)), HoldOutcome::Held);
+        assert_eq!(pen.hold(&key(), turn(2, 0)), HoldOutcome::Held);
+        assert_eq!(
+            pen.hold(
+                &key(),
+                PennedIngress::Departure {
+                    slot: SlotId(1),
+                    reason: 3,
+                    connection_epoch: Some(11),
+                },
+            ),
+            HoldOutcome::Held,
+        );
+        let drained = pen.begin_drain(&key()).expect("claims");
+        assert_eq!(drained.len(), 2, "the older departure was superseded");
+        assert!(matches!(drained[0], PennedIngress::Turn(SlotId(2), _)));
+        assert!(matches!(
+            drained[1],
+            PennedIngress::Departure {
+                slot: SlotId(1),
+                connection_epoch: Some(11),
+                ..
+            }
+        ));
+    }
+
+    /// An overflow seal is terminal without journaling anything.
+    #[test]
+    fn seal_slot_refuses_admission_without_a_journal_entry() {
+        let pen = ProvisionalTurnPen::default();
+        pen.seal_slot(&key(), SlotId(1));
+        assert!(pen.slot_sealed(&key(), SlotId(1)));
+        assert_eq!(pen.held(&key()), 0);
+        assert!(!pen.has_undrained(&key()));
     }
 
     #[test]

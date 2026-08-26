@@ -1727,17 +1727,22 @@ pub fn forward_client_turn(
                 // a same-relay resume deliberately does not re-inject
                 // acknowledged retention — it is genuinely unrecoverable, so
                 // the slot that produced it now has a permanent hole in its
-                // accepted sequence. Fail THAT SLOT closed: close its link,
-                // whose teardown journals an ordinary dropped departure the
-                // survivors resolve through the drop flow once the
-                // descriptor lands. The rest of the session's journal is
-                // untouched — only the offender pays.
+                // accepted sequence. Fail THAT SLOT closed terminally: seal
+                // it against readmission FIRST (an ordinary link close is
+                // reconnectable, and a resume would carry on past the hole,
+                // cementing the divergence — or retransmit into the still-
+                // full journal in a close loop), then close its link, whose
+                // teardown journals a dropped departure the survivors
+                // resolve through the drop flow once the descriptor lands.
+                // The rest of the session's journal is untouched — only the
+                // offender pays.
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     slot = slot.0,
-                    "provisional journal overflowed; closing the overflowing slot's link",
+                    "provisional journal overflowed; sealing and closing the overflowing slot",
                 );
+                mesh.provisional_turns.seal_slot(key, slot);
                 routing::close_slots(sessions, key, std::slice::from_ref(&slot));
                 return;
             }
@@ -6316,6 +6321,11 @@ mod tests {
             mesh_state.provisional_turns.held(&key),
             crate::provisional_turns::PER_SESSION_CAP,
             "the journal keeps everything below the cap",
+        );
+        assert!(
+            mesh_state.provisional_turns.slot_sealed(&key, SlotId(1)),
+            "overflow seals the slot terminally — an ordinary reconnect would \
+             resume past the permanent hole",
         );
     }
 

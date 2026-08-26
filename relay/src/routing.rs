@@ -2915,27 +2915,29 @@ fn maybe_close_emptied_session_gated(
     // has decided yet. See `crate::drop_hold` module docs.
     let decided = consensus::decided_slots(&mesh.decision_makers, key);
     mesh.drop_holds.end_session(key, &decided);
-    // Nothing local remains for a provisional mark to protect -- a later dial
-    // for the same session id (a genuinely fresh admission) gets its own new
-    // mark rather than inheriting whatever deadline this one had left.
-    mesh.provisional.clear(key);
     // A session no descriptor ever named has no coordinator lifecycle, so the
     // retirement that ordinarily cleans up its ingress gate will never come —
-    // drop the gate here, at its retirement-equivalent, or the entry lives
-    // for the relay's lifetime. A descriptor-named session keeps its gate
-    // until real retirement.
+    // drop the gate (and the provisional mark: a later dial for the same id
+    // is a genuinely fresh admission with its own new deadline) here, at its
+    // retirement-equivalent, or the entries live for the relay's lifetime. A
+    // descriptor-named session keeps its gate until real retirement, and its
+    // mark was already cleared at descriptor application.
     //
     // EXCEPT when the provisional journal still holds undrained ingress: a
     // journaled clean leave whose link was the session's only local one
     // empties the roster before the descriptor arrives, and discarding here
     // would erase the only record of that departure — the descriptor would
     // then drain nothing and peer-homed survivors would wait forever on an
-    // expected slot with neither presence nor a departure. Keep the journal
-    // (and its gate) for the descriptor that will drain it; if none ever
-    // comes, the provisional sweep is the janitor that discards both.
-    if !consensus::maker_exists(&mesh.decision_makers, key)
-        && !mesh.provisional_turns.has_undrained(key)
-    {
+    // expected slot with neither presence nor a departure. Keep the journal,
+    // its gate, AND the provisional mark together: the mark is what makes
+    // the sweep visit this key at its deadline, so clearing it while
+    // retaining the journal would leave the retained state (journal, seals,
+    // gate) immortal if no descriptor ever comes. Whichever of the
+    // descriptor drain or the sweep runs first clears all of it as one.
+    if consensus::maker_exists(&mesh.decision_makers, key) {
+        mesh.provisional.clear(key);
+    } else if !mesh.provisional_turns.has_undrained(key) {
+        mesh.provisional.clear(key);
         mesh.gates.discard(key);
         mesh.provisional_turns.discard(key);
     }
@@ -3915,6 +3917,11 @@ mod tests {
         let k = key();
         let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("the leaver registers");
         g1.disarm();
+        // Admission marks the undescribed session for the provisional sweep.
+        assert!(
+            mesh.provisional
+                .mark_if_undescribed(&mesh.decision_makers, &k)
+        );
 
         // The clean-leave intent path: journal the departure, then the full
         // link teardown with the leave already announced.
@@ -3942,6 +3949,12 @@ mod tests {
         assert!(
             mesh.provisional_turns.slot_sealed(&k, SlotId(1)),
             "the clean leave's admission seal survives the emptied close",
+        );
+        assert!(
+            mesh.provisional.is_marked(&k),
+            "the sweep mark is retained WITH the journal — clearing it while \
+             keeping the journal would leave the retained state immortal if \
+             no descriptor ever comes",
         );
     }
 
