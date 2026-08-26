@@ -222,6 +222,25 @@ pub async fn run_sweep_with(
             provisional.restart_all();
         }
         was_armed = now_armed;
+        // The journal's terminal janitor, on the same periodic tick: drop
+        // journals (and their gates) that have waited out the token ceiling
+        // for a descriptor that never came — past it, no client can redial
+        // for what they hold. Sessions with makers are spared: their
+        // descriptor DID come, and retirement owns their cleanup. Runs
+        // armed or not — an outage cannot deliver descriptors, but a
+        // ceiling-stale journal is unreachable regardless.
+        for key in provisional_turns
+            .prune_stale(crate::provisional_turns::JOURNAL_STALE_TTL, |key| {
+                decision_makers.lock().contains_key(key)
+            })
+        {
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                "pruning a provisional journal past the token ceiling",
+            );
+            gates.discard(&key);
+        }
         if now_armed {
             for key in provisional.take_expired(Instant::now()) {
                 // A descriptor may have named the session as its deadline passed:
@@ -235,22 +254,16 @@ pub async fn run_sweep_with(
                     session = key.session.0,
                     "provisional session's deadline passed with no applied descriptor; reaping",
                 );
-                // The terminal janitor for the descriptor that never came.
-                // The reap below only signals live links asynchronously, so
-                // this discard alone is NOT a barrier — a still-live link
-                // can touch a fresh gate and journal right after it. That
-                // residue converges instead of resurrecting, by three rules:
-                // a reap-triggered teardown suppresses its departure
-                // announce (nothing deposits), an emptied close discards a
-                // journal holding no departure (stray turns clean up with
-                // the last link), and an emptied close that DOES retain a
-                // journaled departure re-marks the session — handing it
-                // back to this sweep for the next deadline. Retiring the
-                // gate here would close the race harder but would also
-                // refuse the slot's redial until a descriptor reopened it,
-                // breaking the slow-descriptor-only-delays contract.
-                provisional_turns.discard(&key);
-                gates.discard(&key);
+                // Close the links only. The session's journal is
+                // deliberately NOT discarded here: this close is retryable
+                // (a same-relay redial re-admits, and that resume path does
+                // not re-inject acknowledged retention), so the journal is
+                // the only copy of any acknowledged pre-descriptor turns —
+                // deleting it would hole an accepted sequence the moment a
+                // delayed descriptor finally lands. The journal is
+                // append-only until a descriptor drains it; the stale prune
+                // below is its one terminal janitor, firing only once the
+                // token ceiling guarantees no client can redial.
                 routing::reap_provisional(&sessions, &key);
             }
         }

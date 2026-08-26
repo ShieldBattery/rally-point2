@@ -542,31 +542,40 @@ impl MeshControl {
                             connection_epoch,
                             revision,
                         } => {
+                            // The revision validation and the record run as
+                            // ONE exclusive gate section: every deposit runs
+                            // under the gate's read side, so nothing can
+                            // bump the slot's revision between "this entry
+                            // is still current" and the record it licenses.
                             // A departure superseded while it sat in this
                             // drain's private batch (the queue compaction
-                            // cannot reach entries already taken) must not
-                            // replay: an old generation's drop announced
-                            // after a newer generation's teardown would
-                            // install its stale epoch first and have the
-                            // real departure rejected as stale.
-                            if !turn_path
-                                .provisional_turns
-                                .departure_is_current(&key, slot, revision)
-                            {
-                                tracing::debug!(
-                                    tenant = key.tenant.as_ref(),
-                                    session = key.session.0,
-                                    slot = slot.0,
-                                    revision,
-                                    "skipping a superseded journaled departure",
-                                );
-                                continue;
-                            }
-                            let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
-                                .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
-                                .flatten();
-                            let _ = turn_path.gates.with_ingress(&key, || {
-                                routing::announce_departure_recorded(
+                            // cannot reach entries already taken) is
+                            // therefore skipped with certainty, never merely
+                            // best-effort — an old generation's drop
+                            // recorded after a newer generation's teardown
+                            // would install its stale epoch first and have
+                            // the real departure rejected as stale. The
+                            // superseding deposit sits in the Draining
+                            // queue, so a later pass of this loop replays
+                            // it.
+                            let _ = turn_path.gates.with_exclusive(&key, || {
+                                if !turn_path
+                                    .provisional_turns
+                                    .departure_is_current(&key, slot, revision)
+                                {
+                                    tracing::debug!(
+                                        tenant = key.tenant.as_ref(),
+                                        session = key.session.0,
+                                        slot = slot.0,
+                                        revision,
+                                        "skipping a superseded journaled departure",
+                                    );
+                                    return;
+                                }
+                                let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
+                                    .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
+                                    .flatten();
+                                let _ = routing::announce_departure_recorded(
                                     &self.drop_holds,
                                     &self.decision_makers,
                                     &self.sessions,
@@ -576,7 +585,7 @@ impl MeshControl {
                                     reason,
                                     exact_count,
                                     connection_epoch,
-                                )
+                                );
                             });
                         }
                     }

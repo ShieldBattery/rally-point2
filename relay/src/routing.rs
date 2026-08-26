@@ -2601,13 +2601,13 @@ pub async fn run_slot_link(
                     VarInt::from_u32(PROVISIONAL_EXPIRED_CLOSE),
                     b"provisional admission expired",
                 );
-                // Suppress the teardown's departure announce: the sweep just
-                // discarded this session's journal and consumed its mark, so
-                // a journaled departure deposited by THIS teardown would be
-                // fresh state nothing is left to clean — and a reaped
-                // session has no survivors here that a departure could
-                // inform anyway.
-                leave_announced = true;
+                // The teardown below announces (journals) an ordinary
+                // dropped departure, exactly like any other link death: the
+                // journal is append-only and survives the reap, so if the
+                // slot redials (this close is retryable) the drain-time
+                // reclaim check stands the stale drop down, and if it never
+                // does, the departure drains truthfully or expires with the
+                // journal at the token ceiling.
                 break 'serve;
             }
         }
@@ -2930,31 +2930,23 @@ fn maybe_close_emptied_session_gated(
     // descriptor-named session keeps its gate until real retirement, and its
     // mark was already cleared at descriptor application.
     //
-    // EXCEPT when the provisional journal still holds an undrained
-    // DEPARTURE: a journaled clean leave whose link was the session's only
-    // local one empties the roster before the descriptor arrives, and
-    // discarding here would erase the only record of that departure — the
-    // descriptor would then drain nothing and peer-homed survivors would
-    // wait forever on an expected slot with neither presence nor a
-    // departure. Retention comes with its own janitor: RE-MARK the session
-    // for the provisional sweep, because the mark that admitted these links
-    // may already be consumed (the sweep's reap can race the teardowns that
-    // deposited this very departure), and retained state with no mark would
-    // be immortal if no descriptor ever comes. Whichever of the descriptor
-    // drain or the sweep's next deadline runs first clears everything as
-    // one. A journal holding only turns is NOT retained — every non-reap
-    // teardown journals a departure, so turns-only residue here belongs to
-    // a reaped session's suppressed teardowns and dies with the gate.
+    // EXCEPT when the provisional journal still holds anything undrained:
+    // journaled entries are transport-acknowledged (turns) or the only
+    // record that a slot left at all (departures), and the journal is
+    // append-only until a descriptor drains it or the stale prune expires
+    // it at the token ceiling — discarding it here would silently hole an
+    // accepted sequence, or leave peer-homed survivors waiting forever on
+    // an expected slot with neither presence nor a departure. The
+    // empty-check and the removal are ONE atomic step
+    // (`discard_if_empty`), so a departure deposited by a sibling
+    // teardown's announce racing this close can never be classified away
+    // and then deleted: it either refuses the discard or lands in a fresh
+    // journal the prune owns.
     if consensus::maker_exists(&mesh.decision_makers, key) {
         mesh.provisional.clear(key);
-    } else if mesh.provisional_turns.has_undrained_departure(key) {
-        let _ = mesh
-            .provisional
-            .mark_if_undescribed(&mesh.decision_makers, key);
-    } else {
+    } else if mesh.provisional_turns.discard_if_empty(key) {
         mesh.provisional.clear(key);
         mesh.gates.discard(key);
-        mesh.provisional_turns.discard(key);
     }
 }
 

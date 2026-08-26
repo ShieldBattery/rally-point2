@@ -2113,6 +2113,9 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
     let provisional: ProvisionalSessions = mesh.provisional.clone();
     let decision_makers = mesh.decision_makers.clone();
+    // Armed exactly as production coordinator wiring arms it, so the reap
+    // exercises the journal paths a coordinator-managed relay runs.
+    mesh.provisional_turns.arm();
     let provisional_turns = mesh.provisional_turns.clone();
     let gates = mesh.gates.clone();
     let (chain, key_der, ca) = self_signed();
@@ -2353,6 +2356,9 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
     let provisional: ProvisionalSessions = mesh.provisional.clone();
     let decision_makers = mesh.decision_makers.clone();
+    // Armed exactly as production coordinator wiring arms it, so the reap
+    // exercises the journal paths a coordinator-managed relay runs.
+    mesh.provisional_turns.arm();
     let provisional_turns = mesh.provisional_turns.clone();
     let gates = mesh.gates.clone();
     // Points at the same decision-maker registry and provisional map the

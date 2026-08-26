@@ -100,6 +100,25 @@ impl SessionGates {
         Some(f())
     }
 
+    /// Runs `f` as an EXCLUSIVE critical section for `key`: `None` (with `f`
+    /// never run) when the session is retired, otherwise `Some(f())` under
+    /// the gate's write side — every in-flight ingress section drains first,
+    /// and none can start until `f` returns. This is the serialization the
+    /// provisional journal's drain needs: its validate-then-record pair must
+    /// not interleave with a deposit (which runs under the read side), or a
+    /// departure superseded between the two would still record first. Use
+    /// sparingly — the write acquisition stalls the session's whole ingress
+    /// — and never from inside an ingress section (the recursive read does
+    /// not extend to the write side; that would deadlock).
+    pub fn with_exclusive<R>(&self, key: &SessionKey, f: impl FnOnce() -> R) -> Option<R> {
+        let gate = self.gate(key);
+        let state = gate.state.write();
+        if state.retired_at.is_some() {
+            return None;
+        }
+        Some(f())
+    }
+
     /// Whether `key` is currently retired — the lock-free-shaped query for
     /// paths that only need the flag (the flight recorder's create-on-touch),
     /// not a critical section. Prefer [`with_ingress`](Self::with_ingress)
@@ -180,6 +199,17 @@ mod tests {
         assert_eq!(gates.with_ingress(&k, || ran = true), None);
         assert!(!ran, "a retired session's ingress closure never runs");
         assert!(gates.is_retired(&k));
+    }
+
+    #[test]
+    fn exclusive_sections_run_while_served_and_refuse_after_retirement() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        assert_eq!(gates.with_exclusive(&k, || 5), Some(5));
+        gates.retire(&k);
+        let mut ran = false;
+        assert_eq!(gates.with_exclusive(&k, || ran = true), None);
+        assert!(!ran, "a retired session's exclusive closure never runs");
     }
 
     #[test]
