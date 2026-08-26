@@ -525,6 +525,13 @@ impl MeshControl {
             && let Some(mut batch) = turn_path.provisional_turns.begin_drain(&key)
         {
             loop {
+                // The batch stays charged against the journal's byte budget
+                // until replayed — the budget tracks resident memory, and
+                // these allocations live until this loop drops them.
+                let batch_bytes: usize = batch
+                    .iter()
+                    .map(crate::provisional_turns::ProvisionalTurnPen::entry_bytes)
+                    .sum();
                 for entry in batch {
                     match entry {
                         crate::provisional_turns::PennedIngress::Turn(slot, payload) => {
@@ -590,6 +597,7 @@ impl MeshControl {
                         }
                     }
                 }
+                turn_path.provisional_turns.release_drained(batch_bytes);
                 match turn_path.provisional_turns.continue_drain(&key) {
                     crate::provisional_turns::DrainStep::More(next) => batch = next,
                     crate::provisional_turns::DrainStep::Done => break,

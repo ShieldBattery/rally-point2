@@ -58,6 +58,14 @@ pub const SLOT_NOT_HOMED_CLOSE: u32 = 0x08;
 /// descriptor, which lifts the gate before clients dial.
 pub const SESSION_RETIRED_CLOSE: u32 = 0x0B;
 
+/// The relay's provisional-journal session ceiling is full, so a
+/// pre-descriptor connection cannot be admitted: every turn it sent would
+/// need journaling, and a turn acknowledged but retained nowhere is a
+/// permanent sequence hole. Retryable — capacity frees as descriptors drain
+/// journals and sessions retire, and a described session is never refused
+/// this way.
+pub const PROVISIONAL_CAPACITY_CLOSE: u32 = 0x0C;
+
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
 /// state no matter how fast they arrive, so an unauthenticated flood can't grow
@@ -116,6 +124,15 @@ enum ConnError {
     /// a stale dial into a session the coordinator already ended.
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} dialed a retired session")]
     SessionRetired {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// The provisional journal's session ceiling refused a pre-descriptor
+    /// admission — the connection is closed before any turn could be
+    /// accepted, so nothing is acknowledged that cannot be retained.
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} refused at provisional capacity")]
+    ProvisionalCapacity {
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
@@ -541,6 +558,44 @@ async fn serve_connection(
             slot = authorized.slot.0,
             "client re-registered while its drop was undecided; claimed the hold and reinstated",
         );
+    }
+
+    // Reserve the session's journal entry BEFORE the link serves: every turn
+    // this connection sends pre-descriptor must be journalable, or the relay
+    // would acknowledge a turn it retains nowhere — the receive arm
+    // publishes delivered-through before it could observe a refusal, so the
+    // only sound place to fail the journal's session ceiling is here, where
+    // no turn has been accepted yet and the whole CONNECTION can be refused
+    // with a retryable close instead. A described session needs no
+    // reservation (its journal is drained/resolved), and an already-tracked
+    // session's reservation is a no-op.
+    if mesh.provisional_turns.armed() {
+        let reserved = mesh.gates.with_ingress(&key, || {
+            consensus::maker_exists(&mesh.decision_makers, &key)
+                || mesh.provisional_turns.reserve(&key)
+        });
+        match reserved {
+            Some(true) => {}
+            Some(false) => {
+                connection.close(
+                    VarInt::from_u32(PROVISIONAL_CAPACITY_CLOSE),
+                    b"provisional capacity exhausted",
+                );
+                return Err(ConnError::ProvisionalCapacity {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slot: authorized.slot,
+                });
+            }
+            None => {
+                connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+                return Err(ConnError::SessionRetired {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slot: authorized.slot,
+                });
+            }
+        }
     }
 
     registration.disarm();
