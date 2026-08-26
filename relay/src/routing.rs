@@ -3039,7 +3039,24 @@ pub(crate) fn announce_departure(
             // The journal fully drained: the maker provably exists, so
             // announce into it directly below.
             HoldOutcome::Resolved(_) => {}
-            HoldOutcome::Overflow(_) => unreachable!("departures are cap-exempt"),
+            // Only the relay-wide session ceiling refuses a departure
+            // (byte and per-session caps exempt them): the relay is under
+            // session-churn pressure and may not grow the journal map for
+            // yet another maker-less session. The departure is lost —
+            // survivors of a genuine session in this state wait for the
+            // coordinator's holdout reap — which is the deliberate
+            // degraded mode: bounded memory over per-session fidelity,
+            // only once thousands of undescribed sessions are already
+            // being tracked.
+            HoldOutcome::Overflow(_) => {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "journal session ceiling reached; a pre-descriptor departure could not be                      journaled",
+                );
+                return false;
+            }
         }
     }
     announce_departure_recorded(

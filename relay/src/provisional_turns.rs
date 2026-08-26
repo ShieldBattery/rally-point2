@@ -41,12 +41,18 @@
 //! atomically — [`discard_if_empty`](ProvisionalTurnPen::discard_if_empty)).
 //! The ONE terminal owner is descriptor retirement — the coordinator ending
 //! the session. A journal whose session is never described OR retired is
-//! deliberately retained for the relay's lifetime: it is small, its count
-//! is bounded by sessions the coordinator actually minted tokens for, and
-//! every cheaper janitor tried here (age TTLs, roster emptiness) turned out
-//! to delete acknowledged data some interleaving still needed. Reclaiming
+//! deliberately retained for the relay's lifetime — every cheaper janitor
+//! tried here (age TTLs, roster emptiness) turned out to delete
+//! acknowledged data some interleaving still needed. Reclaiming
 //! these safely needs a coordinator-confirmed session-death signal — a
-//! control-plane follow-up, not a local heuristic.
+//! control-plane follow-up, not a local heuristic. Until then the
+//! relay-wide footprint is bounded the only safe way left: NEW data fails
+//! closed instead of old data being deleted. Turn deposits fail against an
+//! aggregate byte budget ([`AGGREGATE_TURN_BYTE_BUDGET`]) exactly like a
+//! per-session overflow, and deposits that would track a NEW session fail
+//! against a session ceiling ([`MAX_JOURNALED_SESSIONS`]) — together a
+//! finite worst-case footprint, with nothing retained ever deleted to make
+//! room.
 //!
 //! **The drain is a one-shot state machine, not a sweep.** A session moves
 //! Gathering → Draining → Resolved, all under the journal's own lock.
@@ -198,6 +204,40 @@ pub enum DrainStep {
     Done,
 }
 
+/// The relay-wide aggregate budget for journaled TURN bytes, across every
+/// session. Sessions are unbounded over a relay's lifetime and tokens are
+/// not relay-bound, so per-session caps alone let repeated valid tokens grow
+/// one chosen relay without limit; this is the hard relay-wide ceiling. At
+/// the budget, new turn deposits fail closed exactly like a per-session
+/// overflow — the offending slot is sealed and its link closed — and nothing
+/// already retained is ever deleted to make room. Generous against
+/// legitimate use: real journals live for a descriptor-push gap measured in
+/// seconds, so even a burst of concurrent rehomes sits orders of magnitude
+/// below this.
+const AGGREGATE_TURN_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// The relay-wide ceiling on tracked journal sessions. The byte budget
+/// bounds turns, but departures are byte-exempt and every touched session
+/// key holds a map entry — so without this, unbounded session churn (tokens
+/// are not relay-bound, and session ids never repeat) could still grow the
+/// map a kilobyte at a time. At the ceiling a deposit for a NOT-yet-tracked
+/// session is refused outright, nothing is inserted, and nothing retained is
+/// deleted; a descriptor's drain still tracks its session regardless (the
+/// coordinator legitimized it, and its entry is reclaimed at retirement).
+/// With per-session state capped in the low tens of KiB, the ceiling puts
+/// the journal's worst-case footprint near 100 MiB, finite by construction.
+const MAX_JOURNALED_SESSIONS: usize = 4096;
+
+/// The accounting size of one journaled entry: a turn's command bytes plus a
+/// flat allowance for the envelope; departures (tiny, per-slot-deduped)
+/// count nothing — see [`ProvisionalTurnPen::hold`] for why they are exempt.
+fn entry_turn_bytes(entry: &PennedIngress) -> usize {
+    match entry {
+        PennedIngress::Turn(_, payload) => payload.commands.len() + 64,
+        PennedIngress::Departure { .. } => 0,
+    }
+}
+
 /// The relay-wide journal. Cheaply cloneable (`Arc` inside); the turn funnel,
 /// the departure announce, descriptor application, and session teardown must
 /// all hold the same instance or the hold means nothing.
@@ -206,13 +246,42 @@ pub struct ProvisionalTurnPen {
     inner: Arc<PenInner>,
 }
 
-#[derive(Default)]
 struct PenInner {
     /// Whether the relay is coordinator-managed — armed once at startup.
     /// Disarmed (the default, and every test constructor's state), nothing
     /// is ever journaled and every ingress path behaves exactly as before.
     armed: AtomicBool,
-    sessions: Mutex<HashMap<SessionKey, SessionPen>>,
+    /// The aggregate turn-byte ceiling — [`AGGREGATE_TURN_BYTE_BUDGET`] in
+    /// production; injectable so a test can drive the budget path without
+    /// megabytes of fixture.
+    turn_byte_budget: usize,
+    /// The tracked-session ceiling — [`MAX_JOURNALED_SESSIONS`] in
+    /// production; injectable for the same reason.
+    max_sessions: usize,
+    state: Mutex<PenState>,
+}
+
+impl Default for PenInner {
+    fn default() -> Self {
+        PenInner {
+            armed: AtomicBool::new(false),
+            turn_byte_budget: AGGREGATE_TURN_BYTE_BUDGET,
+            max_sessions: MAX_JOURNALED_SESSIONS,
+            state: Mutex::new(PenState::default()),
+        }
+    }
+}
+
+/// Everything the journal mutex guards: the per-session states and the
+/// relay-wide turn-byte total they sum to. One mutex, so the budget check,
+/// the deposit, and every removal's release are each one atomic step.
+#[derive(Default)]
+struct PenState {
+    sessions: HashMap<SessionKey, SessionPen>,
+    /// Total [`entry_turn_bytes`] currently journaled across every session's
+    /// in-pen queue. Batches a drain has taken are already released — they
+    /// are owned by the drainer and leave memory as it replays them.
+    turn_bytes: usize,
 }
 
 impl ProvisionalTurnPen {
@@ -238,15 +307,29 @@ impl ProvisionalTurnPen {
     /// journaled and replayed by the drain loop's next pass, so it stays
     /// ordered behind everything already in flight.
     ///
-    /// A [`Departure`](PennedIngress::Departure) is exempt from the cap —
-    /// there is at most one per slot, losing one strands the session on an
-    /// expected-but-absent slot, and exempting a slot-bounded entry kind
-    /// keeps memory bounded regardless. A clean-leave departure also seals
-    /// its slot against readmission (see [`slot_sealed`](Self::slot_sealed)).
+    /// A [`Departure`](PennedIngress::Departure) is exempt from the
+    /// per-session cap and the aggregate byte budget — there is at most one
+    /// per slot (enforced by compaction), each is a few dozen bytes, and
+    /// losing one strands the session on an expected-but-absent slot. Only
+    /// the relay-wide session ceiling refuses one, and only when it would
+    /// CREATE a new tracking entry ([`MAX_JOURNALED_SESSIONS`]). A
+    /// clean-leave departure also seals its slot against readmission (see
+    /// [`slot_sealed`](Self::slot_sealed)).
     #[must_use]
     pub fn hold(&self, key: &SessionKey, mut entry: PennedIngress) -> HoldOutcome {
-        let mut sessions = self.inner.sessions.lock();
-        let pen = sessions
+        let entry_bytes = entry_turn_bytes(&entry);
+        let mut guard = self.inner.state.lock();
+        let state = &mut *guard;
+        // The session ceiling: a deposit may not CREATE a tracking entry
+        // past it. Refused without inserting anything — including the seal,
+        // which would itself be the map growth the ceiling exists to stop.
+        if !state.sessions.contains_key(key) && state.sessions.len() >= self.inner.max_sessions {
+            return HoldOutcome::Overflow(entry);
+        }
+        let over_budget =
+            state.turn_bytes.saturating_add(entry_bytes) > self.inner.turn_byte_budget;
+        let pen = state
+            .sessions
             .entry(key.clone())
             .or_insert_with(SessionPen::gathering);
         let queue = match &mut pen.phase {
@@ -254,14 +337,17 @@ impl ProvisionalTurnPen {
             Phase::Gathering(queue) | Phase::Draining(queue) => queue,
         };
         if let PennedIngress::Turn(slot, _) = &entry
-            && queue.len() >= PER_SESSION_CAP
+            && (queue.len() >= PER_SESSION_CAP || over_budget)
         {
-            // Seal HERE, atomically with the overflow verdict and under the
-            // caller's ingress gate: the overflowed slot's accepted
-            // sequence has a permanent hole, so it must never be
-            // readmitted. Sealing from the caller after the gate released
-            // would race a retirement's terminal discard and recreate
-            // journal state for an ended session.
+            // Per-session cap or relay-wide budget: either way the turn
+            // cannot be journaled, and dropping it silently would hole an
+            // acknowledged sequence. Seal HERE, atomically with the
+            // overflow verdict and under the caller's ingress gate: the
+            // slot must never be readmitted past its hole. Sealing from
+            // the caller after the gate released would race a
+            // retirement's terminal discard and recreate journal state for
+            // an ended session. Nothing already retained is deleted to
+            // make room — the budget fails NEW data closed instead.
             pen.sealed.insert(*slot);
             return HoldOutcome::Overflow(entry);
         }
@@ -293,6 +379,7 @@ impl ProvisionalTurnPen {
             );
         }
         queue.push_back(entry);
+        state.turn_bytes += entry_bytes;
         HoldOutcome::Held
     }
 
@@ -303,20 +390,23 @@ impl ProvisionalTurnPen {
     /// ahead of the newer departure that superseded it.
     pub fn departure_is_current(&self, key: &SessionKey, slot: SlotId, revision: u64) -> bool {
         self.inner
-            .sessions
+            .state
             .lock()
+            .sessions
             .get(key)
             .is_some_and(|pen| pen.departure_revisions.get(&slot) == Some(&revision))
     }
 
-    /// Whether `slot` had a clean leave journaled — terminal to admission
-    /// until the drained decided leave takes refusal over. Checked at client
+    /// Whether `slot` is sealed against admission — a journaled clean leave
+    /// (terminal until the drained decided leave takes refusal over) or an
+    /// overflow (terminal for the session's life). Checked at client
     /// admission on a coordinator-managed relay; survives the whole
     /// Gathering → Draining → Resolved life of the journal state.
     pub fn slot_sealed(&self, key: &SessionKey, slot: SlotId) -> bool {
         self.inner
-            .sessions
+            .state
             .lock()
+            .sessions
             .get(key)
             .is_some_and(|pen| pen.sealed.contains(&slot))
     }
@@ -330,14 +420,21 @@ impl ProvisionalTurnPen {
     /// journaled, so every covered session ends the call `Resolved`.
     #[must_use]
     pub fn begin_drain(&self, key: &SessionKey) -> Option<Vec<PennedIngress>> {
-        let mut sessions = self.inner.sessions.lock();
-        let pen = sessions
+        let mut guard = self.inner.state.lock();
+        let state = &mut *guard;
+        let pen = state
+            .sessions
             .entry(key.clone())
             .or_insert_with(SessionPen::gathering);
         match &mut pen.phase {
             Phase::Gathering(queue) => {
                 let batch = std::mem::take(queue);
                 pen.phase = Phase::Draining(VecDeque::new());
+                // The drainer owns the batch now; its bytes leave the
+                // relay-wide total as it replays and drops them.
+                state.turn_bytes = state
+                    .turn_bytes
+                    .saturating_sub(batch.iter().map(entry_turn_bytes).sum());
                 Some(batch.into())
             }
             Phase::Draining(_) | Phase::Resolved => None,
@@ -351,9 +448,11 @@ impl ProvisionalTurnPen {
     /// deposit can land between "queue looked empty" and "session resolved".
     #[must_use]
     pub fn continue_drain(&self, key: &SessionKey) -> DrainStep {
-        let mut sessions = self.inner.sessions.lock();
-        let Some(pen) = sessions.get_mut(key) else {
-            // Discarded mid-drain (retirement/reap): nothing left to replay.
+        let mut guard = self.inner.state.lock();
+        let state = &mut *guard;
+        let Some(pen) = state.sessions.get_mut(key) else {
+            // Discarded mid-drain (the session was retired): nothing left
+            // to replay.
             return DrainStep::Done;
         };
         match &mut pen.phase {
@@ -361,25 +460,44 @@ impl ProvisionalTurnPen {
                 pen.phase = Phase::Resolved;
                 DrainStep::Done
             }
-            Phase::Draining(queue) => DrainStep::More(std::mem::take(queue).into()),
-            // Not draining (discard + fresh deposits recreated Gathering, or
-            // already resolved): this drainer's claim is gone either way.
+            Phase::Draining(queue) => {
+                let batch = std::mem::take(queue);
+                state.turn_bytes = state
+                    .turn_bytes
+                    .saturating_sub(batch.iter().map(entry_turn_bytes).sum());
+                DrainStep::More(batch.into())
+            }
+            // Not draining (a retirement's discard plus fresh deposits
+            // recreated Gathering, or already resolved): this drainer's
+            // claim is gone either way.
             Phase::Gathering(_) | Phase::Resolved => DrainStep::Done,
         }
     }
 
-    /// Drops `key`'s journal state outright — gathered entries, seals, and
-    /// the resolved mark alike. The session ended (reaped, emptied, or
-    /// retired); a later dial for the id starts a genuinely fresh journal.
+    /// Drops `key`'s journal state outright — gathered entries, seals,
+    /// revisions, and the resolved mark alike. Descriptor retirement's path
+    /// (the coordinator ended the session); a later dial for the id starts a
+    /// genuinely fresh journal.
     pub fn discard(&self, key: &SessionKey) {
-        self.inner.sessions.lock().remove(key);
+        let mut guard = self.inner.state.lock();
+        let state = &mut *guard;
+        if let Some(pen) = state.sessions.remove(key) {
+            let released: usize = match &pen.phase {
+                Phase::Gathering(queue) | Phase::Draining(queue) => {
+                    queue.iter().map(entry_turn_bytes).sum()
+                }
+                Phase::Resolved => 0,
+            };
+            state.turn_bytes = state.turn_bytes.saturating_sub(released);
+        }
     }
 
     /// Whether `key` has journaled entries still awaiting a drain.
     pub fn has_undrained(&self, key: &SessionKey) -> bool {
         self.inner
-            .sessions
+            .state
             .lock()
+            .sessions
             .get(key)
             .is_some_and(|pen| match &pen.phase {
                 Phase::Gathering(queue) | Phase::Draining(queue) => !queue.is_empty(),
@@ -399,10 +517,13 @@ impl ProvisionalTurnPen {
     /// validated against (the ABA the revisions exist to prevent).
     #[must_use]
     pub fn discard_if_empty(&self, key: &SessionKey) -> bool {
-        let mut sessions = self.inner.sessions.lock();
+        let mut guard = self.inner.state.lock();
+        let sessions = &mut guard.sessions;
         match sessions.get(key) {
             None => true,
             Some(pen) => match &pen.phase {
+                // An empty Gathering holds zero turn bytes — nothing to
+                // release from the aggregate total.
                 Phase::Gathering(queue) if queue.is_empty() => {
                     sessions.remove(key);
                     true
@@ -413,8 +534,35 @@ impl ProvisionalTurnPen {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_turn_byte_budget(budget: usize) -> Self {
+        ProvisionalTurnPen {
+            inner: Arc::new(PenInner {
+                turn_byte_budget: budget,
+                ..PenInner::default()
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_session_ceiling(max_sessions: usize) -> Self {
+        ProvisionalTurnPen {
+            inner: Arc::new(PenInner {
+                max_sessions,
+                ..PenInner::default()
+            }),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn held(&self, key: &SessionKey) -> usize {
-        match self.inner.sessions.lock().get(key).map(|pen| &pen.phase) {
+        match self
+            .inner
+            .state
+            .lock()
+            .sessions
+            .get(key)
+            .map(|pen| &pen.phase)
+        {
             Some(Phase::Gathering(queue)) | Some(Phase::Draining(queue)) => queue.len(),
             _ => 0,
         }
@@ -688,6 +836,103 @@ mod tests {
         assert!(
             !pen.discard_if_empty(&key()),
             "a resolved journal belongs to the session lifecycle, not the close",
+        );
+    }
+
+    /// The relay-wide budget fails NEW turn deposits closed across sessions
+    /// — seals the depositor like a per-session overflow — while departures
+    /// stay exempt and nothing already journaled is deleted.
+    #[test]
+    fn the_aggregate_budget_fails_new_turns_closed_across_sessions() {
+        // Each turn accounts 1 command byte + 64 overhead = 65; budget fits
+        // exactly two turns.
+        let pen = ProvisionalTurnPen::with_turn_byte_budget(130);
+        let other = SessionKey {
+            tenant: rally_point_proto::control::TenantId("sb-test".to_owned()),
+            session: SessionId(8),
+        };
+        assert_eq!(pen.hold(&key(), turn(1, 0)), HoldOutcome::Held);
+        assert_eq!(pen.hold(&other, turn(2, 0)), HoldOutcome::Held);
+        assert!(matches!(
+            pen.hold(&other, turn(2, 1)),
+            HoldOutcome::Overflow(_),
+        ));
+        assert!(
+            pen.slot_sealed(&other, SlotId(2)),
+            "the budget-refused depositor is sealed like any overflow",
+        );
+        assert_eq!(pen.held(&key()), 1, "retained data survives the budget");
+        assert_eq!(pen.held(&other), 1);
+        assert_eq!(
+            pen.hold(&other, departure(3, 3)),
+            HoldOutcome::Held,
+            "departures stay exempt at the budget",
+        );
+
+        // Draining a session releases its bytes back to the budget.
+        let batch = pen.begin_drain(&key()).expect("claims");
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(pen.continue_drain(&key()), DrainStep::Done));
+        assert_eq!(
+            pen.hold(&other, turn(4, 0)),
+            HoldOutcome::Held,
+            "released bytes admit new turns again",
+        );
+    }
+
+    /// The session ceiling refuses deposits that would CREATE a tracking
+    /// entry, while already-tracked sessions keep depositing and a
+    /// descriptor's drain still tracks its session past the ceiling.
+    #[test]
+    fn the_session_ceiling_refuses_only_new_tracking_entries() {
+        let pen = ProvisionalTurnPen::with_session_ceiling(1);
+        assert_eq!(pen.hold(&key(), turn(1, 0)), HoldOutcome::Held);
+        let other = SessionKey {
+            tenant: rally_point_proto::control::TenantId("sb-test".to_owned()),
+            session: SessionId(8),
+        };
+        assert!(matches!(
+            pen.hold(&other, turn(1, 0)),
+            HoldOutcome::Overflow(_),
+        ));
+        assert!(matches!(
+            pen.hold(&other, departure(1, 3)),
+            HoldOutcome::Overflow(_),
+        ));
+        assert_eq!(pen.held(&other), 0, "nothing was inserted at the ceiling");
+        assert!(
+            !pen.slot_sealed(&other, SlotId(1)),
+            "no seal either — a seal would itself be the map growth",
+        );
+        assert_eq!(
+            pen.hold(&key(), turn(1, 1)),
+            HoldOutcome::Held,
+            "tracked sessions keep depositing at the ceiling",
+        );
+        assert!(
+            pen.begin_drain(&other).is_some(),
+            "a descriptor's drain tracks its session past the ceiling",
+        );
+    }
+
+    /// Discarding a session releases its journaled bytes back to the budget.
+    #[test]
+    fn discard_releases_turn_bytes_to_the_budget() {
+        let pen = ProvisionalTurnPen::with_turn_byte_budget(65);
+        assert_eq!(pen.hold(&key(), turn(1, 0)), HoldOutcome::Held);
+        let other = SessionKey {
+            tenant: rally_point_proto::control::TenantId("sb-test".to_owned()),
+            session: SessionId(8),
+        };
+        assert!(matches!(
+            pen.hold(&other, turn(2, 0)),
+            HoldOutcome::Overflow(_),
+        ));
+        pen.discard(&key());
+        assert_eq!(
+            pen.hold(&other, turn(2, 1)),
+            HoldOutcome::Held,
+            "the discarded session's bytes are back in the budget",
         );
     }
 
