@@ -1162,15 +1162,6 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
     }
 }
 
-/// Fires the provisional-reap signal for each of `key`'s currently-registered
-/// slots, closing every connection with [`PROVISIONAL_EXPIRED_CLOSE`] -- the
-/// bounded-admission sweep's teardown when no descriptor named a provisionally
-/// admitted session before its deadline (see [`crate::provisional`]). A
-/// session absent from the roster (already gone) is simply a no-op.
-///
-/// Signals rather than yanking the roster entry, exactly like [`close_slots`]:
-/// each slot's own link task closes its connection and deregisters itself, so
-/// no replacement can register a second sender in the interim.
 /// Light teardown for an admission the relay REFUSED after its registration
 /// attempt had already created per-session scaffolding — the ingress gate on
 /// first touch, and possibly an empty journal reservation. With no other
@@ -1182,35 +1173,56 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
 /// closes. Deliberately NOT the full emptied-session close: nothing was
 /// served, so there is nothing to report, announce, or flush.
 ///
-/// Concurrency-safe by checking ownership signals in order: a retired gate
-/// is a tombstone and is left standing; an occupied roster means another
-/// connection owns the session's state (a registration always commits its
-/// roster seat before reserving, so a concurrent admission is visible here
-/// by the time it holds anything worth keeping); a journal holding entries,
-/// seals, or an active drain refuses `discard_if_empty`. A concurrent
-/// admission that has not yet registered can at worst have its
-/// freshly-created gate replaced by an equivalent fresh one — the gate's
-/// only state is the retirement stamp, which neither instance carries.
+/// The ownership checks and the removal are ONE exclusive gate section
+/// ([`SessionGates::discard_if`](crate::session_gate::SessionGates)), which
+/// is what makes them trustworthy. A concurrent dial commits its roster seat
+/// and its journal reservation inside ingress sections, so under the write
+/// side either it already registered (the roster check sees the seat and
+/// refuses the discard) or it is still waiting on the gate and will retry
+/// onto a fresh one after the rotation — its admission then builds fresh
+/// state that this cleanup, already finished, can never erase. A retirement
+/// orders against the same write side: one that landed first leaves a
+/// tombstone the discard refuses to touch, and one that arrives during the
+/// rotation re-stamps the registry's current entry rather than the removed
+/// orphan. Checking these signals over separate locks — the shape this
+/// replaced — let a refusal erase a concurrent admission's reservation after
+/// its `HANDSHAKE_OK`, or delete a tombstone installed between the check and
+/// the removal.
+///
+/// The journal check remains [`ProvisionalTurnPen::discard_if_empty`]
+/// (entries, an active drain, or a seal refuse it), so an emptied journal
+/// reservation is dropped in the same breath as the gate.
+///
+/// [`ProvisionalTurnPen::discard_if_empty`]: crate::provisional_turns::ProvisionalTurnPen::discard_if_empty
 pub(crate) fn abandon_refused_admission(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
 ) {
-    if mesh.gates.is_retired(key) {
-        return;
-    }
-    if sessions.lock().contains_key(key) {
-        return;
-    }
-    if consensus::maker_exists(&mesh.decision_makers, key) {
-        return;
-    }
-    if mesh.provisional_turns.discard_if_empty(key) {
+    let _ = mesh.gates.discard_if(key, || {
+        if sessions.lock().contains_key(key) {
+            return false;
+        }
+        if consensus::maker_exists(&mesh.decision_makers, key) {
+            return false;
+        }
+        if !mesh.provisional_turns.discard_if_empty(key) {
+            return false;
+        }
         mesh.provisional.clear(key);
-        mesh.gates.discard(key);
-    }
+        true
+    });
 }
 
+/// Fires the provisional-reap signal for each of `key`'s currently-registered
+/// slots, closing every connection with [`PROVISIONAL_EXPIRED_CLOSE`] -- the
+/// bounded-admission sweep's teardown when no descriptor named a provisionally
+/// admitted session before its deadline (see [`crate::provisional`]). A
+/// session absent from the roster (already gone) is simply a no-op.
+///
+/// Signals rather than yanking the roster entry, exactly like [`close_slots`]:
+/// each slot's own link task closes its connection and deregisters itself, so
+/// no replacement can register a second sender in the interim.
 pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
     let roster = sessions.lock();
     let Some(group) = roster.get(key) else {

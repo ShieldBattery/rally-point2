@@ -28,9 +28,21 @@
 //! its emptied-session close ([`discard`](SessionGates::discard)) — no
 //! retirement will ever come for it, and nothing remains for its gate to
 //! guard.
+//!
+//! Removing a gate is a ROTATION, not a plain map delete: the removed
+//! instance is marked defunct, and every acquisition re-checks that mark
+//! after taking the lock, retrying against the registry's current entry. A
+//! caller that raced the removal (a dial blocked behind it, a retirement
+//! about to stamp its tombstone) therefore always lands on the gate future
+//! acquisitions will actually observe, never on an orphan. Cleanup that must
+//! check ownership and remove in one step uses
+//! [`discard_if`](SessionGates::discard_if), which runs the check under the
+//! gate's write side so nothing can create session state between the verdict
+//! and the removal.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -63,6 +75,18 @@ struct GateState {
 #[derive(Default)]
 struct SessionGate {
     state: RwLock<GateState>,
+    /// Set — permanently — when this INSTANCE is rotated out of the registry
+    /// (a discard removed the map entry while someone might still hold the
+    /// `Arc`). Every acquisition checks it after taking the lock and, on
+    /// `true`, re-fetches the registry's CURRENT gate instead of proceeding
+    /// on the orphan. Without this, a dial blocked behind a discard would
+    /// wake on the removed instance and run its admission outside any gate a
+    /// later retirement could drain, and a retirement blocked the same way
+    /// would stamp its tombstone on an instance no future acquisition can
+    /// ever observe — silently un-retiring the session. Only ever set inside
+    /// the registry mutex, immediately before the map removal, so a gate
+    /// fetched from the map is never already defunct.
+    defunct: AtomicBool,
 }
 
 /// The relay-wide gate registry. Cheaply cloneable (one `Arc` inside); every
@@ -91,13 +115,22 @@ impl SessionGates {
     /// another gated path (mesh dispatch delivering an oversize turn through
     /// the shared turn funnel, say) re-enters its own session's gate without
     /// deadlocking against a waiting writer.
+    ///
+    /// An acquisition that lands on a defunct instance (the gate was rotated
+    /// out of the registry while this caller held its `Arc`) retries against
+    /// the registry's current gate — see [`SessionGate::defunct`].
     pub fn with_ingress<R>(&self, key: &SessionKey, f: impl FnOnce() -> R) -> Option<R> {
-        let gate = self.gate(key);
-        let state = gate.state.read_recursive();
-        if state.retired_at.is_some() {
-            return None;
+        loop {
+            let gate = self.gate(key);
+            let state = gate.state.read_recursive();
+            if gate.defunct.load(Ordering::SeqCst) {
+                continue;
+            }
+            if state.retired_at.is_some() {
+                return None;
+            }
+            return Some(f());
         }
-        Some(f())
     }
 
     /// Runs `f` as an EXCLUSIVE critical section for `key`: `None` (with `f`
@@ -110,13 +143,21 @@ impl SessionGates {
     /// sparingly — the write acquisition stalls the session's whole ingress
     /// — and never from inside an ingress section (the recursive read does
     /// not extend to the write side; that would deadlock).
+    ///
+    /// Retries past a defunct instance exactly as
+    /// [`with_ingress`](Self::with_ingress) does.
     pub fn with_exclusive<R>(&self, key: &SessionKey, f: impl FnOnce() -> R) -> Option<R> {
-        let gate = self.gate(key);
-        let state = gate.state.write();
-        if state.retired_at.is_some() {
-            return None;
+        loop {
+            let gate = self.gate(key);
+            let state = gate.state.write();
+            if gate.defunct.load(Ordering::SeqCst) {
+                continue;
+            }
+            if state.retired_at.is_some() {
+                return None;
+            }
+            return Some(f());
         }
-        Some(f())
     }
 
     /// Whether `key` is currently retired — the lock-free-shaped query for
@@ -134,9 +175,22 @@ impl SessionGates {
     /// ingress section first, so the caller's subsequent sweeps run against
     /// state no concurrent ingress is still mutating. Expired retired gates
     /// are pruned on the same (rare) call.
+    ///
+    /// Retries past a defunct instance: a retirement that blocked behind a
+    /// concurrent discard must land its tombstone on the registry's current
+    /// gate, not on the removed orphan — stamping the orphan would leave the
+    /// session observably un-retired, and a still-valid stale token could
+    /// then resurrect it through the permissive no-maker admission path.
     pub fn retire(&self, key: &SessionKey) {
-        let gate = self.gate(key);
-        gate.state.write().retired_at = Some(Instant::now());
+        loop {
+            let gate = self.gate(key);
+            let mut state = gate.state.write();
+            if gate.defunct.load(Ordering::SeqCst) {
+                continue;
+            }
+            state.retired_at = Some(Instant::now());
+            break;
+        }
         let now = Instant::now();
         self.inner.lock().retain(|_, gate| {
             gate.state
@@ -165,8 +219,67 @@ impl SessionGates {
     /// with no coordinator lifecycle (no descriptor ever named it), where no
     /// retirement will ever come and nothing remains to guard. A later dial
     /// for the id is a genuinely fresh admission with a fresh gate.
+    ///
+    /// The removed instance is marked defunct (inside the registry mutex, so
+    /// the mark and the removal are one step against every fetch): anyone
+    /// who cloned the `Arc` before the removal and acquires it afterward —
+    /// a blocked retirement, a queued dial — re-fetches the registry's
+    /// current state instead of proceeding on the orphan.
     pub fn discard(&self, key: &SessionKey) {
-        self.inner.lock().remove(key);
+        if let Some(gate) = self.inner.lock().remove(key) {
+            gate.defunct.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Atomically discards `key`'s gate IF the ownership check `f` allows it,
+    /// returning whether it did. The whole call is one EXCLUSIVE critical
+    /// section on the gate: the write acquisition drains every in-flight
+    /// ingress first (so no admission is mid-registration while `f` reads
+    /// the roster), a retirement that already landed refuses without running
+    /// `f` (the tombstone stands), a retirement that arrives later blocks
+    /// until the rotation completes and then retries onto the fresh entry,
+    /// and `f`'s verdict and the removal happen with no seam between them —
+    /// nothing can create state for the session after `f` approves and
+    /// before the gate is gone, because creating that state requires an
+    /// ingress section this call excludes.
+    ///
+    /// This is what a check-then-discard sequence over separate locks cannot
+    /// give: a concurrent admission commits its roster seat and its journal
+    /// reservation inside ingress sections, so a cleanup that snapshots the
+    /// roster and then separately removes the journal can interleave with it
+    /// and erase an admission it never saw — acknowledged, but with the
+    /// capacity reservation this cleanup just deleted.
+    ///
+    /// `f` runs under the gate's write side; it must not acquire this
+    /// registry or any gate lock (its own session locks — roster, makers,
+    /// journal — follow the same discipline every gated section already
+    /// obeys). Never call from inside an ingress section: the write
+    /// acquisition would deadlock against the held read, exactly as
+    /// [`with_exclusive`](Self::with_exclusive) documents.
+    #[must_use]
+    pub fn discard_if(&self, key: &SessionKey, f: impl FnOnce() -> bool) -> bool {
+        loop {
+            let gate = self.gate(key);
+            let state = gate.state.write();
+            if gate.defunct.load(Ordering::SeqCst) {
+                continue;
+            }
+            if state.retired_at.is_some() {
+                return false;
+            }
+            if !f() {
+                return false;
+            }
+            let mut map = self.inner.lock();
+            gate.defunct.store(true, Ordering::SeqCst);
+            if map
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, &gate))
+            {
+                map.remove(key);
+            }
+            return true;
+        }
     }
 
     #[cfg(test)]
@@ -257,5 +370,123 @@ mod tests {
         assert_eq!(gates.tracked(), 0);
         // A later dial is a genuinely fresh admission.
         assert_eq!(gates.with_ingress(&k, || 1), Some(1));
+    }
+
+    #[test]
+    fn discard_if_refuses_a_retired_gate_without_running_the_check() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        gates.retire(&k);
+        let mut ran = false;
+        assert!(!gates.discard_if(&k, || {
+            ran = true;
+            true
+        }));
+        assert!(
+            !ran,
+            "a tombstone refuses the discard before the check runs"
+        );
+        assert!(gates.is_retired(&k), "the tombstone stands");
+    }
+
+    #[test]
+    fn discard_if_rotates_when_the_check_approves() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        assert_eq!(gates.with_ingress(&k, || ()), Some(()));
+        assert!(gates.discard_if(&k, || true));
+        assert_eq!(gates.tracked(), 0);
+        // A later dial gets a fresh, working gate.
+        assert_eq!(gates.with_ingress(&k, || 2), Some(2));
+    }
+
+    #[test]
+    fn discard_if_retains_when_the_check_refuses() {
+        let gates = SessionGates::default();
+        let k = key(1);
+        assert_eq!(gates.with_ingress(&k, || ()), Some(()));
+        assert!(!gates.discard_if(&k, || false));
+        assert_eq!(gates.tracked(), 1);
+    }
+
+    #[test]
+    fn a_retirement_racing_a_conditional_discard_always_lands_its_tombstone() {
+        // The write side serializes them: a retirement that lands first
+        // leaves a tombstone the discard refuses; one that blocks behind the
+        // rotation retries onto the fresh registry entry rather than
+        // stamping the removed orphan (which would leave the session
+        // observably un-retired for a stale token to resurrect).
+        for _ in 0..200 {
+            let gates = SessionGates::default();
+            let k = key(1);
+            assert_eq!(gates.with_ingress(&k, || ()), Some(()));
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _ = gates.discard_if(&k, || true);
+                });
+                s.spawn(|| gates.retire(&k));
+            });
+            assert!(gates.is_retired(&k));
+        }
+    }
+
+    #[test]
+    fn a_retirement_racing_an_in_section_discard_always_lands_its_tombstone() {
+        // The emptied-close shape: the discard runs from INSIDE an ingress
+        // section (read side held), so a concurrent retirement can block on
+        // the very instance the section removes. The defunct mark makes the
+        // woken retirement re-fetch and stamp the registry's current entry
+        // instead of the orphan.
+        for _ in 0..200 {
+            let gates = SessionGates::default();
+            let k = key(1);
+            assert_eq!(gates.with_ingress(&k, || ()), Some(()));
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _ = gates.with_ingress(&k, || gates.discard(&k));
+                });
+                s.spawn(|| gates.retire(&k));
+            });
+            assert!(gates.is_retired(&k));
+        }
+    }
+
+    #[test]
+    fn a_conditional_discard_never_erases_a_concurrent_admissions_state() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Miniature of admission-vs-cleanup: the admission commits its state
+        // (roster seat, journal reservation) inside an ingress section; the
+        // cleanup's check and erasure are one exclusive section. Either the
+        // check sees the committed state and refuses, or the erasure
+        // finishes strictly before the admission runs (on the fresh gate) —
+        // the state can never be created between the check and the erasure
+        // and then deleted.
+        for _ in 0..200 {
+            let gates = SessionGates::default();
+            let k = key(1);
+            assert_eq!(gates.with_ingress(&k, || ()), Some(()));
+            let state = AtomicU32::new(0);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _ = gates.discard_if(&k, || {
+                        if state.load(Ordering::SeqCst) == 1 {
+                            return false;
+                        }
+                        state.store(0, Ordering::SeqCst);
+                        true
+                    });
+                });
+                s.spawn(|| {
+                    let admitted = gates.with_ingress(&k, || state.store(1, Ordering::SeqCst));
+                    assert!(admitted.is_some(), "nothing retires the session here");
+                });
+            });
+            assert_eq!(
+                state.load(Ordering::SeqCst),
+                1,
+                "an admission that ran must keep its state; the cleanup may only \
+                 erase before it or refuse after it",
+            );
+        }
     }
 }
