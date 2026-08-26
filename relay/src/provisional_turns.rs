@@ -281,9 +281,11 @@ impl Default for PenInner {
 #[derive(Default)]
 struct PenState {
     sessions: HashMap<SessionKey, SessionPen>,
-    /// Total [`entry_turn_bytes`] currently journaled across every session's
-    /// in-pen queue. Batches a drain has taken are already released — they
-    /// are owned by the drainer and leave memory as it replays them.
+    /// Total [`entry_turn_bytes`] charged against the budget: every
+    /// session's in-pen queue PLUS batches a drain has taken but not yet
+    /// finished replaying — the budget tracks resident memory, and a taken
+    /// batch's allocations live until the drainer replays, drops, and
+    /// releases them ([`ProvisionalTurnPen::release_drained`]).
     turn_bytes: usize,
 }
 
@@ -588,8 +590,14 @@ impl ProvisionalTurnPen {
             None => true,
             Some(pen) => match &pen.phase {
                 // An empty Gathering holds zero turn bytes — nothing to
-                // release from the aggregate total.
-                Phase::Gathering(queue) if queue.is_empty() => {
+                // release from the aggregate total. A SEAL refuses the
+                // discard even with an empty queue: a budget-overflow seal
+                // is installed without a deposit, so in the window between
+                // the sealed link's deregistration and its teardown's
+                // departure deposit the pen is exactly empty-but-sealed —
+                // and dropping the seal there would let the slot readmit
+                // past its permanent hole.
+                Phase::Gathering(queue) if queue.is_empty() && pen.sealed.is_empty() => {
                     sessions.remove(key);
                     true
                 }
@@ -608,8 +616,11 @@ impl ProvisionalTurnPen {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_session_ceiling(max_sessions: usize) -> Self {
+    /// A pen with an explicit session ceiling — a test seam (like
+    /// `mesh::new_mesh_state_with_provisional_window`) so an end-to-end test
+    /// can drive the admission-time capacity refusal without four thousand
+    /// fixture sessions. Production always builds the default ceiling.
+    pub fn with_session_ceiling(max_sessions: usize) -> Self {
         ProvisionalTurnPen {
             inner: Arc::new(PenInner {
                 max_sessions,
@@ -1052,6 +1063,25 @@ mod tests {
             pen.hold(&other, turn(2, 1)),
             HoldOutcome::Held,
             "the discarded session's bytes are back in the budget",
+        );
+    }
+
+    /// An empty-but-sealed journal refuses the empty discard: a
+    /// budget-overflow seal is installed without any deposit, and dropping
+    /// it in the deregister-to-teardown-deposit window would let the sealed
+    /// slot readmit past its permanent hole.
+    #[test]
+    fn an_empty_but_sealed_journal_refuses_the_empty_discard() {
+        let pen = ProvisionalTurnPen::with_turn_byte_budget(0);
+        assert!(matches!(
+            pen.hold(&key(), turn(1, 0)),
+            HoldOutcome::Overflow(_),
+        ));
+        assert!(pen.slot_sealed(&key(), SlotId(1)));
+        assert_eq!(pen.held(&key()), 0, "the refused turn was never journaled");
+        assert!(
+            !pen.discard_if_empty(&key()),
+            "the seal keeps the journal state alive",
         );
     }
 

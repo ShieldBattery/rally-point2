@@ -720,6 +720,19 @@ pub fn new_mesh_state_with_provisional_window(window: std::time::Duration) -> Me
     }
 }
 
+/// [`new_mesh_state`] with an explicit provisional-journal session ceiling,
+/// so a test can drive the admission-time capacity refusal without four
+/// thousand fixture sessions. The pen is NOT armed — arm it explicitly, as
+/// production wiring does. Every other setting keeps its production value.
+pub fn new_mesh_state_with_journal_ceiling(max_sessions: usize) -> MeshState {
+    MeshState {
+        provisional_turns: crate::provisional_turns::ProvisionalTurnPen::with_session_ceiling(
+            max_sessions,
+        ),
+        ..new_mesh_state()
+    }
+}
+
 /// [`new_mesh_state`] with an explicit region-label release delay, so a test can
 /// drive the release path without waiting out the production
 /// [`crate::consensus::REGION_LABEL_RELEASE_DELAY`]. Every other timing keeps its

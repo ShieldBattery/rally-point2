@@ -2025,6 +2025,45 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     }
 }
 
+/// The provisional journal's session ceiling refuses a pre-descriptor
+/// admission BEFORE the handshake acknowledgment: the client is never told
+/// its slot is routable (so nothing can be acknowledged that the relay
+/// retains nowhere), the close carries the distinct retryable capacity
+/// code, and an already-tracked session's other slots keep admitting at the
+/// ceiling.
+#[tokio::test]
+async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
+    use rally_point_relay::server::PROVISIONAL_CAPACITY_CLOSE;
+
+    let tenant = make_tenant(KID, TENANT);
+    let mesh = rally_point_relay::mesh::new_mesh_state_with_journal_ceiling(1);
+    mesh.provisional_turns.arm();
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    // The first session takes the only journal slot and serves normally; a
+    // second slot of the SAME (tracked) session is still admitted.
+    let _a0 = connect_slot(&endpoint, addr, &tenant, SessionId(320), SlotId(0)).await;
+    let _a1 = connect_slot(&endpoint, addr, &tenant, SessionId(320), SlotId(1)).await;
+
+    // A distinct session past the ceiling is refused before HANDSHAKE_OK.
+    let client_key = keypair();
+    let token = mint_token(&tenant, SessionId(321), SlotId(0), client_key.public);
+    let dial = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    assert!(
+        handshake(&dial, &token, &client_key, &[]).await.is_err(),
+        "a ceiling-refused admission is never acknowledged",
+    );
+    match dial.closed().await {
+        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+            u32::try_from(u64::from(app.error_code)).unwrap(),
+            PROVISIONAL_CAPACITY_CLOSE,
+            "refused with the distinct retryable capacity close code",
+        ),
+        other => panic!("expected the capacity application close, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_slot_not_homed_on_this_relay_is_refused() {
     use rally_point_relay::consensus::{self, Authority};

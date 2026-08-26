@@ -456,6 +456,10 @@ async fn serve_connection(
             VarInt::from_u32(SLOT_TAKEN_CLOSE),
             b"slot already connected",
         );
+        // The register attempt created the session's gate on first touch;
+        // if this session holds nothing else, don't leave that scaffolding
+        // behind (the live occupant's seat makes this a no-op here).
+        routing::abandon_refused_admission(&sessions, &mesh, &key);
         return Err(ConnError::SlotTaken {
             tenant: key.tenant,
             session: key.session,
@@ -463,20 +467,64 @@ async fn serve_connection(
         });
     };
 
-    // Write the handshake ack BEFORE touching any hold/departure state. A write
-    // failure here returns via `?` with NOTHING mutated: `registration` is still
-    // armed, so its guard frees the roster seat on drop (see `SlotRegistration`),
-    // and neither a hold nor a departure record was ever claimed or cleared —
-    // there is nothing to roll back, and nothing left inconsistent for a later
-    // retry to trip over. The old ordering used to release the hold and reinstate
-    // the slot first and write the ack after, so a write failure here would leave
-    // the drop's hold gone and its departure record cleared with no client ever
-    // actually connected — unrecoverable, since nothing was left to decide
-    // against and no hold to admit a future retry's resume.
-    handshake_send
-        .write_all(&[HANDSHAKE_OK])
-        .await
-        .map_err(AuthError::from)?;
+    // Reserve the session's journal capacity BEFORE the handshake ack and
+    // BEFORE any hold/departure state is touched. Both orderings are
+    // load-bearing: `HANDSHAKE_OK` is the shared contract's "your slot is
+    // routable" — a client that reads it treats the link as up, so a
+    // capacity refusal after the ack could be observed as a success that
+    // then dies; and `admit_reconnect` can consume a drop hold or reinstate
+    // a departure, mutations a refused connection must never have made.
+    // Refusing here, the connection has been told nothing and changed
+    // nothing beyond its roster seat and possibly this reservation — both
+    // rolled back below.
+    if mesh.provisional_turns.armed() {
+        let reserved = mesh.gates.with_ingress(&key, || {
+            consensus::maker_exists(&mesh.decision_makers, &key)
+                || mesh.provisional_turns.reserve(&key)
+        });
+        match reserved {
+            Some(true) => {}
+            Some(false) => {
+                connection.close(
+                    VarInt::from_u32(PROVISIONAL_CAPACITY_CLOSE),
+                    b"provisional capacity exhausted",
+                );
+                drop(registration);
+                routing::abandon_refused_admission(&sessions, &mesh, &key);
+                return Err(ConnError::ProvisionalCapacity {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slot: authorized.slot,
+                });
+            }
+            None => {
+                connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+                return Err(ConnError::SessionRetired {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slot: authorized.slot,
+                });
+            }
+        }
+    }
+
+    // Write the handshake ack BEFORE touching any hold/departure state. A
+    // write failure here rolls back everything this admission created — the
+    // roster seat (the registration guard's drop) and the session
+    // scaffolding when nothing else owns it (`abandon_refused_admission`,
+    // which removes only an empty, un-drained journal reservation) — and
+    // neither a hold nor a departure record was ever claimed or cleared, so
+    // nothing is left inconsistent for a later retry to trip over. The old
+    // ordering used to release the hold and reinstate the slot first and
+    // write the ack after, so a write failure would leave the drop's hold
+    // gone and its departure record cleared with no client ever actually
+    // connected — unrecoverable, since nothing was left to decide against
+    // and no hold to admit a future retry's resume.
+    if let Err(error) = handshake_send.write_all(&[HANDSHAKE_OK]).await {
+        drop(registration);
+        routing::abandon_refused_admission(&sessions, &mesh, &key);
+        return Err(AuthError::from(error).into());
+    }
     let _ = handshake_send.finish();
 
     // Resolve this slot against CURRENT hold, departure, final-leave, and epoch
@@ -544,6 +592,8 @@ async fn serve_connection(
                 VarInt::from_u32(SLOT_DEPARTED_CLOSE),
                 b"slot already departed",
             );
+            drop(registration);
+            routing::abandon_refused_admission(&sessions, &mesh, &key);
             return Err(ConnError::SlotDeparted {
                 tenant: key.tenant,
                 session: key.session,
@@ -558,44 +608,6 @@ async fn serve_connection(
             slot = authorized.slot.0,
             "client re-registered while its drop was undecided; claimed the hold and reinstated",
         );
-    }
-
-    // Reserve the session's journal entry BEFORE the link serves: every turn
-    // this connection sends pre-descriptor must be journalable, or the relay
-    // would acknowledge a turn it retains nowhere — the receive arm
-    // publishes delivered-through before it could observe a refusal, so the
-    // only sound place to fail the journal's session ceiling is here, where
-    // no turn has been accepted yet and the whole CONNECTION can be refused
-    // with a retryable close instead. A described session needs no
-    // reservation (its journal is drained/resolved), and an already-tracked
-    // session's reservation is a no-op.
-    if mesh.provisional_turns.armed() {
-        let reserved = mesh.gates.with_ingress(&key, || {
-            consensus::maker_exists(&mesh.decision_makers, &key)
-                || mesh.provisional_turns.reserve(&key)
-        });
-        match reserved {
-            Some(true) => {}
-            Some(false) => {
-                connection.close(
-                    VarInt::from_u32(PROVISIONAL_CAPACITY_CLOSE),
-                    b"provisional capacity exhausted",
-                );
-                return Err(ConnError::ProvisionalCapacity {
-                    tenant: key.tenant,
-                    session: key.session,
-                    slot: authorized.slot,
-                });
-            }
-            None => {
-                connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
-                return Err(ConnError::SessionRetired {
-                    tenant: key.tenant,
-                    session: key.session,
-                    slot: authorized.slot,
-                });
-            }
-        }
     }
 
     registration.disarm();

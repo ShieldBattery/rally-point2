@@ -1171,6 +1171,46 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
 /// Signals rather than yanking the roster entry, exactly like [`close_slots`]:
 /// each slot's own link task closes its connection and deregisters itself, so
 /// no replacement can register a second sender in the interim.
+/// Light teardown for an admission the relay REFUSED after its registration
+/// attempt had already created per-session scaffolding — the ingress gate on
+/// first touch, and possibly an empty journal reservation. With no other
+/// live slot, no maker, and nothing journaled or sealed, that scaffolding is
+/// discarded; otherwise everything is left exactly as found. Without this,
+/// every distinct valid session refused past the journal's session ceiling
+/// would leave a live gate (and its map entry) behind forever — an
+/// unbounded-memory vector one registry over from the one the ceiling
+/// closes. Deliberately NOT the full emptied-session close: nothing was
+/// served, so there is nothing to report, announce, or flush.
+///
+/// Concurrency-safe by checking ownership signals in order: a retired gate
+/// is a tombstone and is left standing; an occupied roster means another
+/// connection owns the session's state (a registration always commits its
+/// roster seat before reserving, so a concurrent admission is visible here
+/// by the time it holds anything worth keeping); a journal holding entries,
+/// seals, or an active drain refuses `discard_if_empty`. A concurrent
+/// admission that has not yet registered can at worst have its
+/// freshly-created gate replaced by an equivalent fresh one — the gate's
+/// only state is the retirement stamp, which neither instance carries.
+pub(crate) fn abandon_refused_admission(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+) {
+    if mesh.gates.is_retired(key) {
+        return;
+    }
+    if sessions.lock().contains_key(key) {
+        return;
+    }
+    if consensus::maker_exists(&mesh.decision_makers, key) {
+        return;
+    }
+    if mesh.provisional_turns.discard_if_empty(key) {
+        mesh.provisional.clear(key);
+        mesh.gates.discard(key);
+    }
+}
+
 pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
     let roster = sessions.lock();
     let Some(group) = roster.get(key) else {
@@ -3953,6 +3993,50 @@ mod tests {
             roster[0].1,
             vec![SlotId(0), SlotId(2)],
             "the group's connected slots, in sorted order",
+        );
+    }
+
+    /// A refused admission's light teardown removes exactly the scaffolding
+    /// the failed attempt created — the first-touch gate, the empty journal
+    /// reservation, any mark — and nothing anyone else owns: not a retired
+    /// tombstone, not an occupied session's gate, not a journal with
+    /// entries.
+    #[test]
+    fn a_refused_admission_leaves_no_scaffolding() {
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state();
+        mesh.provisional_turns.arm();
+        let k = key();
+
+        // The refusal path's residue: the register attempt touched the gate,
+        // the reservation created the empty journal entry.
+        let _ = mesh.gates.with_ingress(&k, || ());
+        assert!(mesh.provisional_turns.reserve(&k));
+        abandon_refused_admission(&sessions, &mesh, &k);
+        assert_eq!(
+            mesh.gates.tracked(),
+            0,
+            "the refused session's gate is gone"
+        );
+        assert!(
+            mesh.provisional_turns.discard_if_empty(&k),
+            "the empty reservation is gone too (an absent journal reads empty)",
+        );
+
+        // A retired gate is a tombstone: kept.
+        mesh.gates.retire(&k);
+        abandon_refused_admission(&sessions, &mesh, &k);
+        assert_eq!(mesh.gates.tracked(), 1, "the tombstone stands");
+        mesh.gates.reopen(&k);
+
+        // An occupied roster owns the session's state: kept.
+        let (_reg, _inbox) = register(&sessions, &k, SlotId(0)).expect("registers");
+        assert!(mesh.provisional_turns.reserve(&k));
+        abandon_refused_admission(&sessions, &mesh, &k);
+        assert_eq!(
+            mesh.gates.tracked(),
+            1,
+            "a live occupant's gate (and journal state) is untouched",
         );
     }
 
