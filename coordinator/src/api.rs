@@ -1485,9 +1485,41 @@ async fn serve_relay_control(
         .capabilities
         .iter()
         .any(|c| c == rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1);
-    let generation = match lifecycle
-        .enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello))
-    {
+    // The enrollment's registry mutation and the capability-transition
+    // snapshot run under the assignment lock, so they land wholly before or
+    // wholly after any in-flight rehome's capability-check → descriptor-commit
+    // span (which holds the same lock). Without this, a rehome could validate
+    // a candidate as capable, this enrollment could downgrade it and find no
+    // staged finalized-drops descriptor to evict (the rehome hasn't committed
+    // yet), and the commit would then hand a finalized_drops session to a
+    // relay that no longer runs the handshake. Ordered either way, one side
+    // sees the other: enrollment-first fails the rehome's filter;
+    // rehome-first leaves a staged descriptor this snapshot picks up. The
+    // eviction rehomes themselves run after the lock drops — each re-acquires
+    // it internally.
+    let (enroll_result, evict) = {
+        let _assign = setup.lock_assignment();
+        let result =
+            lifecycle.enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello));
+        let evict = match &result {
+            Ok(generation) if !finalize_capable => {
+                let enabled: Vec<_> = setup
+                    .descriptors()
+                    .current_for(relay_id)
+                    .iter()
+                    .filter(|d| d.finalized_drops)
+                    .map(|d| (d.tenant.clone(), d.session))
+                    .collect();
+                if !enabled.is_empty() {
+                    let _ = registry::mark_draining(setup.registry(), relay_id, *generation);
+                }
+                enabled
+            }
+            _ => Vec::new(),
+        };
+        (result, evict)
+    };
+    let generation = match enroll_result {
         Ok(generation) => generation,
         Err(registry::EnrollConflict) => {
             tracing::warn!(
@@ -1517,37 +1549,27 @@ async fn serve_relay_control(
     // still assigned finalized-drops sessions was downgraded mid-flight. It
     // must never silently serve them — its build can author the historical
     // unsound counted-drop behavior those sessions' peers no longer strip
-    // defensively for their own cohort. Mark it draining (no new assignments,
+    // defensively for their own cohort. The drain mark (no new assignments,
     // and the eviction below can never pick it as its own replacement) and
-    // move each enabled session off it; a session with no in-cohort
+    // the session snapshot were taken under the assignment lock above; move
+    // each enabled session off it here. A session with no in-cohort
     // replacement ends (Unavailable) rather than continuing mixed.
-    if !finalize_capable {
-        let enabled: Vec<_> = setup
-            .descriptors()
-            .current_for(relay_id)
-            .iter()
-            .filter(|d| d.finalized_drops)
-            .map(|d| (d.tenant.clone(), d.session))
-            .collect();
-        if !enabled.is_empty() {
-            tracing::warn!(
+    if !evict.is_empty() {
+        tracing::warn!(
+            relay_id = relay_id.0,
+            sessions = evict.len(),
+            "relay re-enrolled without FINALIZED_DROP_V1 while serving                  finalized-drops sessions; draining it and evicting them",
+        );
+        for (tenant, session) in evict {
+            let departed = lifecycle.departed_slots(&tenant, session);
+            let outcome = session::rehome_evicting(&setup, &tenant, session, relay_id, departed);
+            tracing::info!(
                 relay_id = relay_id.0,
-                sessions = enabled.len(),
-                "relay re-enrolled without FINALIZED_DROP_V1 while serving                  finalized-drops sessions; draining it and evicting them",
+                tenant = tenant.as_ref(),
+                session = session.0,
+                ?outcome,
+                "evicted a finalized-drops session from a downgraded relay",
             );
-            let _ = registry::mark_draining(setup.registry(), relay_id, generation);
-            for (tenant, session) in enabled {
-                let departed = lifecycle.departed_slots(&tenant, session);
-                let outcome =
-                    session::rehome_evicting(&setup, &tenant, session, relay_id, departed);
-                tracing::info!(
-                    relay_id = relay_id.0,
-                    tenant = tenant.as_ref(),
-                    session = session.0,
-                    ?outcome,
-                    "evicted a finalized-drops session from a downgraded relay",
-                );
-            }
         }
     }
 
