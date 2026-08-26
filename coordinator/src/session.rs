@@ -978,10 +978,19 @@ fn rehome_inner(
         .lock()
         .get(&key)
         .is_some_and(|refs| refs.finalized_drops);
+    // The cohort filter applies to BOTH branches: an already-serving member
+    // can be capability-mismatched too — a serving relay that re-enrolled
+    // across the finalized-drop boundary is being evicted concurrently, and
+    // picking it here would land the whole homed group on the wrong side of
+    // the boundary the placement kept apart.
+    let cohort_matches = |id: RelayId| {
+        registry::entry(&setup.registry, id)
+            .is_some_and(|e| relay_finalize_capable(&e) == cohort_capable)
+    };
     let r_new = serving
         .iter()
         .copied()
-        .find(|&id| registry::is_available(&setup.registry, id))
+        .find(|&id| registry::is_available(&setup.registry, id) && cohort_matches(id))
         .or_else(|| {
             let mut entries = registry::available_entries(&setup.registry);
             entries.retain(|e| relay_finalize_capable(e) == cohort_capable);
@@ -1117,6 +1126,18 @@ fn rehome_inner(
         }
     }
 
+    // Re-point this session's earlier rehome records that answered with the
+    // relay this rehome just moved off: after R1 → R2 and now R2 → R3, a
+    // straggler still asking about R1 must be sent to R3, not to a
+    // live-but-no-longer-serving R2 — the recorded-rehome fast path
+    // validates only registry liveness, so a stale alias would misroute it
+    // permanently (an evicted or restarted R2 is live in the registry while
+    // serving nothing of this session).
+    for ((alias_tenant, alias_session, _), target) in rehomes.iter_mut() {
+        if alias_tenant == tenant && *alias_session == session && *target == dead_relay {
+            *target = r_new;
+        }
+    }
     rehomes.insert((tenant.clone(), session, dead_relay), r_new);
     tracing::info!(
         tenant = tenant.as_ref(),
@@ -4214,6 +4235,95 @@ mod tests {
                 &registry::entry(setup.registry(), RelayId(2)).unwrap()
             )),
             "the recorded replacement overrules the re-enrolled dead relay's liveness",
+        );
+    }
+
+    #[test]
+    fn a_chained_rehome_repoints_earlier_recorded_aliases() {
+        // R1 → R2, then R2 → R3, then R2 restarts (live in the registry but
+        // serving nothing of this session). A straggler still asking about R1
+        // must be sent to R3: the recorded-rehome lookup validates only
+        // registry liveness, so a stale R1 → R2 alias would misroute it
+        // permanently onto a relay the session no longer uses.
+        let setup = setup_with_two_relays_and_tenant();
+        enroll_relay(setup.registry(), 3, 14902);
+        let resp = create_default_session(&setup);
+
+        registry::remove(setup.registry(), RelayId(1));
+        let first = rehome(&setup, &tid(), resp.session, RelayId(1), vec![]);
+        assert!(matches!(first, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2)));
+
+        registry::remove(setup.registry(), RelayId(2));
+        let second = rehome(&setup, &tid(), resp.session, RelayId(2), vec![]);
+        assert!(matches!(second, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(3)));
+
+        // Relay 2 restarts: live again, but no longer serving this session.
+        enroll_relay(setup.registry(), 2, 14901);
+
+        assert_eq!(
+            recorded_rehome(&setup, &tid(), resp.session, RelayId(1))
+                .expect("the straggler's re-ask finds a recorded target")
+                .relay_id,
+            RelayId(3),
+            "the R1 alias follows the chain to the current target, not to the restarted R2",
+        );
+        assert!(
+            matches!(
+                rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+                RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(3)
+            ),
+            "the in-lock idempotency lookup answers the re-pointed alias too",
+        );
+    }
+
+    #[test]
+    fn rehome_never_picks_a_serving_member_across_the_capability_boundary() {
+        // The session was created without finalized drops on relays 1 and 2;
+        // relay 2 then re-enrolled advertising the capability (an in-place
+        // upgrade). When relay 1 dies, the already-serving relay 2 is the
+        // preferred candidate by order — but it now sits on the wrong side of
+        // the capability boundary, so the rehome must skip it and pick the
+        // in-cohort idle relay 3 instead of mixing the classes placement kept
+        // apart.
+        let reg = registry::new_registry();
+        enroll_relay(&reg, 1, 14900);
+        enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
+        let tenants = tenant::new_store();
+        tenant::enroll(
+            &tenants,
+            KeyId("test-key-1".to_owned()),
+            tid(),
+            BufferBounds::new(1, 6).unwrap(),
+        )
+        .unwrap();
+        let setup = SessionSetup::new(reg, tenants);
+        let resp = create_session(
+            &setup,
+            SessionRequest {
+                tenant: tid(),
+                players: two_players_slot_1_in_region_b(),
+                external_id: None,
+                latency_estimate_ms: None,
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap()
+        .response;
+
+        // Relay 2 upgrades in place; relay 3 is idle and still in-cohort.
+        enroll_capable_relay(setup.registry(), 2, 14901);
+        enroll_relay(setup.registry(), 3, 14902);
+        registry::remove(setup.registry(), RelayId(1));
+
+        let RehomeOutcome::NewTarget(endpoint) =
+            rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+        else {
+            panic!("expected a NewTarget re-home decision");
+        };
+        assert_eq!(
+            endpoint.relay_id,
+            RelayId(3),
+            "the upgraded serving member is skipped for an in-cohort replacement",
         );
     }
 
