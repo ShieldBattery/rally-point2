@@ -510,7 +510,12 @@ async fn main() -> Result<()> {
         // Wire the relay-wide session gates, so the descriptor retirement this
         // control plane performs closes the same ingress boundary the turn
         // path, mesh dispatch, and client admission run through.
-        .with_gates(mesh_state.gates.clone());
+        .with_gates(mesh_state.gates.clone())
+        // Wire the full turn-path state, so a descriptor applying here drains
+        // the provisional-turn pen through the ordinary forward path — the
+        // freshly created maker's seeded decided leaves then fence a departed
+        // slot's held turns instead of letting them reach survivors.
+        .with_turn_path(mesh_state.clone());
         // The flight recorder's create-on-first-touch consults the same gates,
         // so a retired session's straggling event cannot begin a recording.
         mesh_state
@@ -525,6 +530,13 @@ async fn main() -> Result<()> {
         // the registry still fills as links establish and tests drive `Join` on
         // the command senders directly.
         if let Some(coordinator_url) = cli.coordinator_url.clone() {
+            // Coordinator-managed: every session's descriptor is expected, so
+            // arm the provisional-turn pen — the turn funnel holds a
+            // pre-descriptor client's turns until the descriptor proves its
+            // slot current (or seeds it departed, fencing them). A standalone
+            // dev/loopback relay has no descriptor source and leaves the pen
+            // disarmed, keeping its descriptor-less sessions flowing.
+            mesh_state.provisional_turns.arm();
             // The on-demand dialer: establish (and re-establish) mesh links to the
             // peers the coordinator's descriptors name, driven by the Join source's
             // desired-peer set. This is the production dial path — the static

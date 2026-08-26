@@ -1243,29 +1243,60 @@ pub async fn run_slot_link(
         ..
     } = mesh;
 
-    // A slot link is serving this session (again): any session-closed report an
-    // earlier emptying latched no longer describes this relay, so the next
-    // emptying must report anew. See `consensus::claim_close_report`.
-    consensus::reopen_close_report(&decision_makers, &key);
+    // The activation prologue runs as ONE ingress critical section: the
+    // admission gate (`server.rs`) necessarily released across the
+    // handshake-ack await before this task started, so a retirement can land
+    // in between — and these mutations would then recreate the close-report,
+    // presence, and condition state the sweep just removed, for a session the
+    // coordinator already ended. Under the gate, either the sweep waits for
+    // this block or this block observes the retirement and the link is torn
+    // down instead of serving.
+    let activated = mesh_for_teardown.gates.with_ingress(&key, || {
+        // A slot link is serving this session (again): any session-closed report an
+        // earlier emptying latched no longer describes this relay, so the next
+        // emptying must report anew. See `consensus::claim_close_report`.
+        consensus::reopen_close_report(&decision_makers, &key);
 
-    // This client joining may change who decides the session's buffer — most
-    // notably a first client arriving on the relay that heads the authority
-    // order, which turns the descriptor-time verdict into a live one. The
-    // roster already includes this slot (registration preceded this task), so
-    // report it and re-derive. The peers learn the new count from the mesh
-    // drivers' presence reconcile, off the same roster.
-    report_own_presence(&sessions, &mesh_for_teardown, &key);
+        // This client joining may change who decides the session's buffer — most
+        // notably a first client arriving on the relay that heads the authority
+        // order, which turns the descriptor-time verdict into a live one. The
+        // roster already includes this slot (registration preceded this task), so
+        // report it and re-derive. The peers learn the new count from the mesh
+        // drivers' presence reconcile, off the same roster.
+        report_own_presence(&sessions, &mesh_for_teardown, &key);
 
-    // Feed an immediate conditions sample from the completed QUIC handshake into
-    // the session's decision-maker BEFORE announcing presence, so when this slot
-    // completes the expected set and the authority sizes the initial buffer depth,
-    // this slot's measured path RTT is already accounted for. A pre-start `ingest`
-    // can emit no directive — `decide` bails until a framed turn gives it a
-    // consensus coordinate — so this only accumulates state. Publishing it also
-    // seeds the mesh sidecar for this slot.
-    let handshake_sample = sample_slot_conditions(link.connection(), slot, connection_epoch);
-    crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
-    let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
+        // Feed an immediate conditions sample from the completed QUIC handshake into
+        // the session's decision-maker BEFORE announcing presence, so when this slot
+        // completes the expected set and the authority sizes the initial buffer depth,
+        // this slot's measured path RTT is already accounted for. A pre-start `ingest`
+        // can emit no directive — `decide` bails until a framed turn gives it a
+        // consensus coordinate — so this only accumulates state. Publishing it also
+        // seeds the mesh sidecar for this slot.
+        let handshake_sample = sample_slot_conditions(link.connection(), slot, connection_epoch);
+        crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
+        let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
+    });
+    if activated.is_none() {
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = slot.0,
+            "session retired before slot-link activation; closing the link",
+        );
+        link.connection().close(
+            VarInt::from_u32(crate::server::SESSION_RETIRED_CLOSE),
+            b"session retired",
+        );
+        end_slot_link(
+            &sessions,
+            &mesh_for_teardown,
+            &key,
+            slot,
+            connection_epoch,
+            false,
+        );
+        return;
+    }
 
     // Announce this slot's presence to the mesh and record it into the session's
     // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -2885,9 +2916,11 @@ fn maybe_close_emptied_session_gated(
     // retirement that ordinarily cleans up its ingress gate will never come —
     // drop the gate here, at its retirement-equivalent, or the entry lives
     // for the relay's lifetime. A descriptor-named session keeps its gate
-    // until real retirement.
+    // until real retirement. Any turns still penned for the maker-less
+    // session go with it: no descriptor will ever drain them.
     if !consensus::maker_exists(&mesh.decision_makers, key) {
         mesh.gates.discard(key);
+        mesh.provisional_turns.discard(key);
     }
 }
 
@@ -3221,6 +3254,7 @@ pub(crate) fn honor_drop_request(
                             decision_makers,
                             sessions,
                             mesh_links,
+                            seen,
                             key,
                             target,
                             final_turn_count,
@@ -3314,15 +3348,48 @@ pub(crate) fn honor_drop_request(
 /// ([`honor_drop_request`]) and the mesh `FinalizeDropResult` arm. A lost
 /// hold-claim race stands down exactly like the legacy honor path — the slot
 /// may be live again on a relay whose rejection is still in flight.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete_finalized_drop(
     drop_holds: &crate::drop_hold::DropHolds,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
     mesh_links: &crate::mesh::MeshLinks,
+    seen: &crate::mesh::SeenRegistries,
     key: &SessionKey,
     target: SlotId,
     final_turn_count: u64,
 ) {
+    // Local staleness proof, checked before anything is stamped: if this
+    // relay's own gap-free forwarded prefix for the slot already extends
+    // PAST the sealed count, turns beyond the count entered the mesh after
+    // the seal the answer describes — the slot reconnected (on a new home)
+    // and played on while this answer was in flight. The home is the slot's
+    // single ingress, so past the seal no legitimate turn can ever exceed
+    // the count; a longer prefix here is proof, not suspicion. The epoch
+    // check at the mesh arm closes most of this; this closes the interleaving
+    // where the reconnect's own connectivity update is still in flight while
+    // its turns (datagrams, a different channel) have already arrived.
+    if let Some(forwarded) = crate::mesh::forwarded_count(seen, key, target)
+        && forwarded > final_turn_count
+    {
+        tracing::warn!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            target = target.0,
+            final_turn_count,
+            forwarded,
+            "finalized count is stale; this relay already forwarded past it — refusing",
+        );
+        decision_makers.flight_recorder().record(
+            key,
+            crate::flight_recorder::FlightEvent::DropFinalizeStaleCount {
+                slot: target.0,
+                sealed_count: final_turn_count,
+                forwarded,
+            },
+        );
+        return;
+    }
     // The decide below silently short-circuits without a framed scheduling
     // basis — and by then the hold would already be released, leaving the
     // departure with no committed leave, no hold for a retry to claim, and

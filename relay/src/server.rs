@@ -458,13 +458,27 @@ async fn serve_connection(
     // re-check makes the sweep and this resolution mutually exclusive; a
     // retirement that lands first refuses the admission here.
     let Some(admission) = mesh.gates.with_ingress(&key, || {
-        consensus::admit_reconnect(
+        let admission = consensus::admit_reconnect(
             &mesh.decision_makers,
             &mesh.drop_holds,
             &key,
             authorized.slot,
             Some(connection_epoch),
-        )
+        );
+        // Bound the admit-first race this connection just rode (`slot_homed`
+        // above, admitted because no descriptor names this session yet): if
+        // the coordinator's descriptor push never arrives, the
+        // provisional-admission sweep tears this session down rather than
+        // trusting it indefinitely. A session already covered by a descriptor
+        // — even one with an empty (unenforced) homed set — is left alone;
+        // see `crate::provisional::ProvisionalSessions::mark_if_undescribed`.
+        // Inside the ingress section so the mark and the maker existence it
+        // keys on are read atomically against a retirement sweep.
+        if matches!(admission, consensus::ReconnectAdmission::Admitted { .. }) {
+            mesh.provisional
+                .mark_if_undescribed(&mesh.decision_makers, &key);
+        }
+        admission
     }) else {
         connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
         return Err(ConnError::SessionRetired {
@@ -495,16 +509,6 @@ async fn serve_connection(
             "client re-registered while its drop was undecided; claimed the hold and reinstated",
         );
     }
-
-    // Bound the admit-first race this connection just rode (`slot_homed`
-    // above, admitted because no descriptor names this session yet): if the
-    // coordinator's descriptor push never arrives, the provisional-admission
-    // sweep tears this session down rather than trusting it indefinitely. A
-    // session already covered by a descriptor — even one with an empty
-    // (unenforced) homed set — is left alone; see
-    // `crate::provisional::ProvisionalSessions::mark_if_undescribed`.
-    mesh.provisional
-        .mark_if_undescribed(&mesh.decision_makers, &key);
 
     registration.disarm();
 

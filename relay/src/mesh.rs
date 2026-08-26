@@ -682,6 +682,14 @@ pub struct MeshState {
     /// reopens) and the flight recorder (whose create-on-first-touch consults
     /// it). See [`crate::session_gate`].
     pub gates: crate::session_gate::SessionGates,
+    /// The holding pen for pre-descriptor client turns: while a session has
+    /// no decision-maker, the turn funnel deposits turns here instead of
+    /// fanning them out, and descriptor application drains them through the
+    /// ordinary forward path — where freshly seeded decided leaves fence a
+    /// departed slot's turns. Armed only on a coordinator-managed relay
+    /// (`main.rs`); disarmed (every test constructor), the funnel behaves
+    /// exactly as before. See [`crate::provisional_turns`].
+    pub provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -749,6 +757,7 @@ pub fn new_mesh_state_with_timings(
             crate::provisional::PROVISIONAL_WINDOW,
         ),
         gates: crate::session_gate::SessionGates::default(),
+        provisional_turns: crate::provisional_turns::ProvisionalTurnPen::default(),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -1669,6 +1678,20 @@ pub fn forward_client_turn(
     slot: SlotId,
     payload: Payload,
 ) {
+    // On a coordinator-managed relay, a session with no decision-maker is a
+    // session no descriptor has named here yet — and until one does, the
+    // relay cannot tell a current slot from one that already departed with an
+    // exact final turn count (a re-homed group's dial racing its resumed
+    // descriptor). A departed slot's turn fanned out in that window is a turn
+    // past the leave's synchronization point, consumed by co-admitted
+    // survivors but by no one else. Hold every pre-descriptor turn instead;
+    // descriptor application drains the pen back through this function, where
+    // the seeded decided-leave fence below sorts current from departed.
+    if mesh.provisional_turns.armed() && !crate::consensus::maker_exists(&mesh.decision_makers, key)
+    {
+        mesh.provisional_turns.hold(key, slot, payload);
+        return;
+    }
     // Terminal fence for this relay's own homed ingress: a slot whose synced
     // leave is decided has ended its participation — nothing it originates
     // afterward is part of the game, and a turn that entered the mesh here
@@ -3519,6 +3542,7 @@ fn dispatch_mesh_control_frame(
                         &mesh.decision_makers,
                         sessions,
                         &mesh.links,
+                        &mesh.seen,
                         &key,
                         slot,
                         final_turn_count,
@@ -4524,6 +4548,7 @@ mod tests {
                 crate::provisional::PROVISIONAL_WINDOW,
             ),
             gates: crate::session_gate::SessionGates::default(),
+            provisional_turns: crate::provisional_turns::ProvisionalTurnPen::default(),
         }
     }
 
@@ -5982,6 +6007,106 @@ mod tests {
             .expect("the matching generation's result decides");
         assert_eq!(leave.final_turn_count, Some(5));
         assert!(!mesh_state.drop_holds.is_pending(&key, SlotId(1)));
+    }
+
+    /// A FINALIZED result whose sealed count the authority's own forwarded
+    /// prefix already exceeds is refused: the longer prefix is local proof
+    /// that turns past the count entered the mesh after the seal (the slot
+    /// reconnected elsewhere and played on while the answer was in flight),
+    /// even when the epoch check cannot see it yet. A count matching the
+    /// prefix completes normally.
+    #[test]
+    fn the_authority_refuses_a_finalized_count_its_own_prefix_exceeds() {
+        let sessions: routing::Sessions = Arc::default();
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            [SlotId(0)].into_iter().collect(),
+            std::collections::HashSet::new(),
+            None,
+            true,
+        );
+        crate::consensus::observe_frame(
+            &makers,
+            &key,
+            SlotId(0),
+            rally_point_proto::ids::GameFrameCount(40),
+        );
+        let (_reg, mut survivor) =
+            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+        crate::consensus::record_departure(
+            &makers,
+            &key,
+            SlotId(1),
+            crate::consensus::DepartureStamps::default(),
+            crate::consensus::LEAVE_REASON_DROPPED,
+        );
+        routing::hold_or_decide_leave(
+            &mesh_state.drop_holds,
+            &makers,
+            &sessions,
+            &mesh_links,
+            &key,
+            SlotId(1),
+            crate::consensus::LEAVE_REASON_DROPPED,
+        );
+        // This relay has already forwarded eight of the slot's turns toward
+        // its locals — a prefix past the stale count below.
+        for seq in 0..8 {
+            let _ = mark_seen(&mesh_state.seen, &key, SlotId(1), seq);
+        }
+
+        let result_for = |count: u64| MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::FinalizeDropResult(
+                FinalizeDropResult {
+                    slot: 1,
+                    connection_epoch: None,
+                    outcome: FINALIZE_OUTCOME_FINALIZED,
+                    final_turn_count: Some(count),
+                },
+            )),
+        };
+        dispatch_mesh_control(result_for(5), RelayId(9), &joined, &sessions, &mesh_state);
+        assert!(
+            survivor.try_recv_leave().is_none(),
+            "a count the local prefix exceeds decides nothing",
+        );
+        assert!(
+            mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+            "the hold survives the stale count",
+        );
+
+        dispatch_mesh_control(result_for(8), RelayId(9), &joined, &sessions, &mesh_state);
+        let leave = survivor
+            .try_recv_leave()
+            .expect("a count matching the prefix completes");
+        assert_eq!(leave.final_turn_count, Some(8));
     }
 
     /// A FINALIZED result arriving before any framed scheduling basis exists

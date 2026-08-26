@@ -174,6 +174,17 @@ pub enum FlightEvent {
     /// a session stuck repeating this event is the signal for operator
     /// intervention (or the coordinated-abort follow-up).
     DropFinalizeRejected { slot: u8, no_cursor: bool },
+    /// The authority refused a home's FINALIZED answer because its own
+    /// forwarded prefix for the slot already extends past the sealed count —
+    /// local proof that turns beyond the count entered the mesh after the
+    /// seal the answer describes (a partition-delayed result from a home the
+    /// slot has since moved past). The drop stays held; a later re-request
+    /// answers from the slot's current state.
+    DropFinalizeStaleCount {
+        slot: u8,
+        sealed_count: u64,
+        forwarded: u64,
+    },
     /// A peer authority's buffer directive above the game-sync-safe ceiling
     /// was forwarded verbatim (rewriting it selectively would hand different
     /// clients different depths). Only an authority running code that

@@ -115,6 +115,14 @@ pub struct MeshControl {
     /// registry by default (a control plane with no turn path); wired to the
     /// relay-wide one with [`with_gates`](Self::with_gates).
     gates: crate::session_gate::SessionGates,
+    /// The relay's full turn-path state, wired with
+    /// [`with_turn_path`](Self::with_turn_path) so descriptor application can
+    /// drain the provisional-turn pen through the ordinary forward path the
+    /// moment the maker exists (and the seeded decided-leave fence with it).
+    /// `None` by default (a control plane with no turn path — tests, a
+    /// standalone descriptor driver), where nothing ever pens a turn and
+    /// there is nothing to drain.
+    turn_path: Option<crate::mesh::MeshState>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -192,6 +200,7 @@ impl MeshControl {
                 crate::provisional::PROVISIONAL_WINDOW,
             ),
             gates: crate::session_gate::SessionGates::default(),
+            turn_path: None,
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 latest_generations: HashMap::new(),
@@ -250,6 +259,18 @@ impl MeshControl {
         provisional: crate::provisional::ProvisionalSessions,
     ) -> Self {
         self.provisional = provisional;
+        self
+    }
+
+    /// Wires the relay's full turn-path state, so `apply_descriptor` can
+    /// drain the provisional-turn pen through the ordinary forward path the
+    /// moment a descriptor creates the session's maker — the freshly seeded
+    /// decided-leave fence then sorts a departed slot's held turns (dropped)
+    /// from a current slot's (forwarded). The production relay passes its
+    /// `MeshState` clone; a control plane with no turn path has nothing
+    /// penned and skips the drain.
+    pub fn with_turn_path(mut self, turn_path: crate::mesh::MeshState) -> Self {
+        self.turn_path = Some(turn_path);
         self
     }
 
@@ -482,6 +503,17 @@ impl MeshControl {
                 },
             );
         }
+        // A maker now exists, so drain any turns the funnel penned while the
+        // session had none (pre-descriptor provisional dials) back through
+        // the ordinary forward path. This runs AFTER the seeding above, so a
+        // seeded-departed slot's held turns hit the decided-leave fence and
+        // die instead of reaching co-admitted survivors; every current slot's
+        // turns flow exactly as if they had arrived a moment later.
+        if let Some(turn_path) = &self.turn_path {
+            for (slot, payload) in turn_path.provisional_turns.take(&key) {
+                mesh::forward_client_turn(&self.sessions, turn_path, &key, slot, payload);
+            }
+        }
         // Reconcile the roster into the maker this descriptor just created or
         // updated. A slot that dialed and registered before this descriptor
         // arrived announced its presence when the session had no maker yet, so
@@ -606,6 +638,11 @@ impl MeshControl {
         self.gates.retire(key);
         consensus::deregister_maker(&self.decision_makers, key);
         presence::forget(&self.presence, key);
+        // Discard any turns still penned for the session — with the maker
+        // gone and the gate retired, no descriptor will ever drain them.
+        if let Some(turn_path) = &self.turn_path {
+            turn_path.provisional_turns.discard(key);
+        }
         // Retirement is terminal for the session's drop bookkeeping: with the
         // descriptor gone there is no admission path left for a held slot's
         // reconnect and no decide path for its leave, so any armed abandon
@@ -1408,6 +1445,107 @@ mod tests {
         // re-pushed either (the client would dedup it by slot regardless).
         control.apply_descriptor(&desc);
         assert_eq!(inbox.try_recv_leave(), None);
+    }
+
+    /// On a coordinator-managed relay (pen armed), a turn arriving before any
+    /// descriptor names its session is held, not fanned out — and descriptor
+    /// application drains it through the ordinary forward path, where a
+    /// current slot's turn reaches the survivors exactly as if it had arrived
+    /// a moment later.
+    #[test]
+    fn a_pre_descriptor_turn_is_held_and_drained_current_by_the_descriptor() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_state = crate::mesh::MeshState {
+            decision_makers: makers.clone(),
+            ..crate::mesh::new_mesh_state()
+        };
+        mesh_state.provisional_turns.arm();
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_state.links.clone())
+            .with_turn_path(mesh_state.clone());
+
+        let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        crate::mesh::forward_client_turn(
+            &sessions,
+            &mesh_state,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::messages::Payload {
+                seq: 0,
+                slot: 1,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            survivor.try_recv_forward().is_none(),
+            "a pre-descriptor turn is held, not fanned out",
+        );
+        assert_eq!(mesh_state.provisional_turns.held(&key(1)), 1);
+
+        control.apply_descriptor(&descriptor(1, &[]));
+        assert!(
+            survivor.try_recv_forward().is_some(),
+            "the descriptor drains the held turn to the survivor",
+        );
+        assert_eq!(mesh_state.provisional_turns.held(&key(1)), 0);
+    }
+
+    /// The drain runs AFTER a resumed descriptor's departure seeding, so a
+    /// slot the descriptor reveals as already departed has its held turns die
+    /// at the decided-leave fence instead of reaching co-admitted survivors —
+    /// the exact post-count ingress the pen exists to close.
+    #[test]
+    fn a_seeded_departed_slots_held_turns_die_at_the_fence() {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let sessions = Sessions::default();
+        let mesh_state = crate::mesh::MeshState {
+            decision_makers: makers.clone(),
+            ..crate::mesh::new_mesh_state()
+        };
+        mesh_state.provisional_turns.arm();
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
+            .with_broadcast(sessions.clone(), mesh_state.links.clone())
+            .with_turn_path(mesh_state.clone());
+
+        let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        // The departed subject dials provisionally and originates a turn past
+        // its sealed count before the descriptor lands.
+        crate::mesh::forward_client_turn(
+            &sessions,
+            &mesh_state,
+            &key(1),
+            SlotId(1),
+            rally_point_proto::messages::Payload {
+                seq: 64,
+                slot: 1,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+        assert!(survivor.try_recv_forward().is_none());
+
+        let mut desc = descriptor(1, &[]);
+        desc.expected_slots = vec![SlotId(0), SlotId(1)];
+        desc.resumed = true;
+        desc.departed_slots = vec![DepartedSlot {
+            finalized: false,
+            slot: SlotId(1),
+            kind: DepartureKind::Left,
+            final_turn_count: Some(64),
+        }];
+        control.apply_descriptor(&desc);
+
+        assert!(
+            survivor.try_recv_leave().is_some(),
+            "the seeded leave reaches the survivor",
+        );
+        assert!(
+            survivor.try_recv_forward().is_none(),
+            "the departed slot's held turn dies at the fence, never fanned",
+        );
+        assert_eq!(mesh_state.provisional_turns.held(&key(1)), 0);
     }
 
     /// A descriptor push is routinely an idempotent replay (a coordinator
