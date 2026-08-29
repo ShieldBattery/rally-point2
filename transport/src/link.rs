@@ -252,28 +252,44 @@ impl Link {
         self.acks.reinject_unacked(payload);
     }
 
+    /// The budget a payload must fit alone (under worst-case header state) to
+    /// be admitted for datagram carriage on this link — the single admission
+    /// number [`payload_fits`](Self::payload_fits) answers with and
+    /// [`send`](Self::send) enforces, computed in one place so the two can
+    /// never disagree (a fits-then-refused skew would drop the fresh turn:
+    /// the driver treats `send`'s refusal as a recoverable bundle race, and
+    /// the turn would be neither registered for re-carry nor diverted).
+    ///
+    /// Both components are constant for the connection's life, so admission
+    /// never flips. The
+    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
+    /// floor covers the path-MTU component of the live `max_datagram_size()`,
+    /// which discovery raises and the black-hole detector shrinks back — but
+    /// never below the floor. The live value's *other* component, the peer's
+    /// advertised datagram limit, is a handshake transport parameter quinn
+    /// permits to be arbitrarily small; it never changes after the handshake,
+    /// so taking the minimum keeps admission both safe against a small peer
+    /// limit and stable over time.
+    fn datagram_admission_budget(&self) -> Result<usize, LinkError> {
+        let live = self
+            .connection
+            .max_datagram_size()
+            .ok_or(LinkError::DatagramsUnsupported)?;
+        Ok(live.min(crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET))
+    }
+
     /// Whether `payload` can ride datagrams on this link for the rest of the
     /// connection's life: a packet carrying it alone, under worst-case header
-    /// state, fits
-    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
-    /// — the budget no legal path MTU can undercut. Deliberately *not* the live `max_datagram_size()`:
-    /// that value shrinks when quinn's black-hole detector reacts to loss
-    /// bursts (the exact weather redundancy exists for), and a payload
-    /// admitted against a discovered budget could out-size every later packet
-    /// — flushes included — stranding it in the unacked window while its seq
-    /// wedges the peer's delivered prefix. The caller's pre-check for the
+    /// state, fits the link-lifetime admission budget — a
+    /// connection-lifetime constant, deliberately not the live
+    /// `max_datagram_size()` (see the helper's docs for why each of its
+    /// components must be pinned). The caller's pre-check for the
     /// divert-to-stream path — a payload this returns `false` for must go
     /// over the reliable control stream, never into [`send`](Self::send)
     /// (which would refuse it anyway, but by then the caller has lost the
     /// payload to the move).
     pub fn payload_fits(&self, payload: &Payload) -> Result<bool, LinkError> {
-        // The connection must support datagrams at all for any answer to be
-        // meaningful; the budget itself is the static floor, not the probe.
-        self.connection
-            .max_datagram_size()
-            .ok_or(LinkError::DatagramsUnsupported)?;
-        Ok(crate::ack_manager::lone_packet_len(payload)
-            <= crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
+        Ok(crate::ack_manager::lone_packet_len(payload) <= self.datagram_admission_budget()?)
     }
 
     /// Anchors this link's receive window for `slot` to `anchor`, treating every
@@ -363,7 +379,7 @@ impl Link {
                 return Err(LinkError::MalformedSlot(p.slot));
             }
             let needed = crate::ack_manager::lone_packet_len(p);
-            let admission = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET.min(budget);
+            let admission = self.datagram_admission_budget()?;
             if needed > admission {
                 return Err(LinkError::PayloadTooLarge {
                     needed,
@@ -1779,5 +1795,75 @@ mod tests {
             ..Default::default()
         };
         assert!(client.payload_fits(&under).unwrap());
+    }
+
+    /// A peer may advertise a datagram limit *below* the guaranteed floor —
+    /// quinn permits an arbitrarily small handshake value — and admission
+    /// must then judge against that limit, exactly as `send` enforces it. A
+    /// `payload_fits` that ignored the peer limit would approve a payload
+    /// `send` refuses; the drivers treat that refusal as a recoverable bundle
+    /// race, so the fresh turn would be neither registered for re-carry nor
+    /// diverted — silently lost.
+    #[tokio::test]
+    async fn admission_respects_a_peer_advertised_datagram_limit() {
+        let (chain, key, ca) = self_signed();
+        let mut server_cfg = server_config(chain, key).unwrap();
+        // The server advertises an 800-byte datagram limit; the client's
+        // max_datagram_size toward it lands just under that.
+        let mut transport = quinn::TransportConfig::default();
+        transport.datagram_receive_buffer_size(Some(800));
+        server_cfg.transport_config(std::sync::Arc::new(transport));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = client_config(roots).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client_ep = quinn::Endpoint::client(bind).unwrap();
+        client_ep.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_conn = client_ep
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+
+        let mut client = Link::new(client_conn);
+        let live = client
+            .connection()
+            .max_datagram_size()
+            .expect("datagrams supported");
+        assert!(
+            live < crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET,
+            "premise: the advertised limit ({live}) must undercut the floor",
+        );
+
+        // Between the peer's limit and the floor: payload_fits and send must
+        // agree it cannot ride.
+        let commands = 900usize;
+        let wide = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; commands].into(),
+            ..Default::default()
+        };
+        assert!(!client.payload_fits(&wide).unwrap());
+        match client.send(Some(wide)) {
+            Err(LinkError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+        assert_eq!(client.payloads_in_flight(), 0);
+
+        // Under the peer's limit: both admit it.
+        let small = turn(0, 0, 0x11);
+        assert!(client.payload_fits(&small).unwrap());
+        client.send(Some(small)).unwrap();
     }
 }

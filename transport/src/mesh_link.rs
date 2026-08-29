@@ -86,6 +86,29 @@ fn tenant_element_len(tenant: &str) -> usize {
     1 + prost::encoding::encoded_len_varint(body_len as u64) + body_len
 }
 
+/// The inner-`Packet` budget a payload must fit alone to be admitted for
+/// datagram carriage on a session — guaranteed to hold for the rest of the
+/// connection's life, and computed identically by
+/// [`MeshLink::payload_fits`] and [`MeshLink::send`] so the two can never
+/// disagree.
+///
+/// It is the outer datagram floor —
+/// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET),
+/// further capped by the live budget's peer-advertised component, a
+/// handshake constant quinn permits to be arbitrarily small — minus the
+/// wrapper costs that accompany *every* one of the session's packets: the
+/// `MeshPacket` overhead and the session's own tenant framing (up to 258
+/// bytes for a maximum-length 255-byte tenant id, which would otherwise eat
+/// the floor's whole safety margin). The conditions sidecar is deliberately
+/// *not* reserved: it is optional per send, and the fresh-free, sidecar-free
+/// maintenance flush whose room this floor guarantees never carries one.
+fn packet_admission_floor(live_datagram_budget: usize, tenant: Option<&str>) -> usize {
+    crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET
+        .min(live_datagram_budget)
+        .saturating_sub(MESH_PACKET_OVERHEAD)
+        .saturating_sub(tenant.map(tenant_element_len).unwrap_or(0))
+}
+
 /// A mesh link's per-session key: the bare session id a `MeshPacket` always
 /// carries, plus the tenant it optionally stamps.
 ///
@@ -463,13 +486,13 @@ impl MeshLink {
             .saturating_sub(MESH_PACKET_OVERHEAD);
         // A payload that might someday be unable to ride a datagram is refused
         // *before* it is registered as unacked (mirroring `Link::send`) —
-        // against the static admission floor as well as this send's budget,
-        // since the live budget can later shrink below what it reads today.
-        // Registered, every rebuilt bundle would try and fail to carry it
-        // while its seq holds a permanent gap in the peer's delivered prefix.
-        // This is the second line of defense — the caller pre-checks with
-        // [`payload_fits`](Self::payload_fits) and diverts oversize turns to the
-        // mesh control stream before ever calling `send`.
+        // against the session's admission floor as well as this send's
+        // budget, since the live budget can later shrink below what it reads
+        // today. Registered, every rebuilt bundle would try and fail to carry
+        // it while its seq holds a permanent gap in the peer's delivered
+        // prefix. This is the second line of defense — the caller pre-checks
+        // with [`payload_fits`](Self::payload_fits) and diverts oversize turns
+        // to the mesh control stream before ever calling `send`.
         if let Some(p) = &payload {
             // A wire slot that doesn't fit a `SlotId` can't be tracked without
             // narrowing it onto a different, valid slot's bookkeeping, so it is
@@ -480,7 +503,10 @@ impl MeshLink {
                 return Err(MeshLinkError::MalformedSlot(p.slot));
             }
             let needed = crate::ack_manager::lone_packet_len(p);
-            let admission = packet_budget.min(crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET);
+            let admission = packet_budget.min(packet_admission_floor(
+                datagram_budget,
+                key.tenant.as_deref(),
+            ));
             if needed > admission {
                 return Err(MeshLinkError::PayloadTooLarge {
                     needed,
@@ -522,13 +548,13 @@ impl MeshLink {
     /// connection's life: sized against the smaller of the send-time budget
     /// (the live `max_datagram_size()` minus the exact wire cost of the
     /// `conditions` sidecar and the `tenant` string that would accompany it,
-    /// and the `MeshPacket` wrapper's own overhead) and the static
-    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
-    /// floor. The floor is what keeps an admitted payload re-carryable
-    /// forever: the live budget shrinks when quinn's black-hole detector
-    /// reacts to loss, and a payload admitted against a discovered budget
-    /// could out-size every later packet (see the constant's docs). The
-    /// caller's pre-check for the divert path — a payload this returns
+    /// and the `MeshPacket` wrapper's own overhead) and the session's
+    /// packet admission floor (`packet_admission_floor`). The floor is what keeps an admitted payload
+    /// re-carryable forever: the live budget shrinks when quinn's black-hole
+    /// detector reacts to loss, and a payload admitted against a discovered
+    /// budget could out-size every later packet (see
+    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)).
+    /// The caller's pre-check for the divert path — a payload this returns
     /// `false` for must go over the mesh control stream, never into `send`
     /// (which would refuse it anyway, but by then the caller has lost the
     /// payload to the move). Mirrors
@@ -551,7 +577,7 @@ impl MeshLink {
             .saturating_sub(conditions_overhead)
             .saturating_sub(tenant_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD)
-            .min(crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET);
+            .min(packet_admission_floor(datagram_budget, tenant));
         Ok(crate::ack_manager::lone_packet_len(payload) <= packet_budget)
     }
 
@@ -845,6 +871,56 @@ mod tests {
     /// `MeshSessionKey` instead of by distinct session ids — proving the
     /// tenant (or its absence) is what disambiguates, not merely the numeric
     /// id.
+    /// A session's tenant framing rides *every* one of its packets, so mesh
+    /// admission must reserve it out of the guaranteed floor. Without the
+    /// reservation, a payload admitted near the bare floor on a large
+    /// discovered path could — after black-hole fallback to the MTU floor —
+    /// exceed what a maintenance flush can carry once the tenant and wrapper
+    /// are paid for, and the head-of-line gate would emit ack-only flushes
+    /// forever.
+    #[tokio::test]
+    async fn admission_reserves_the_persistent_tenant_framing() {
+        let (mut sender, _receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+
+        let session = SessionId(9);
+        let max_tenant = "t".repeat(255);
+        let key = MeshSessionKey::new(session, max_tenant.as_str());
+        sender.open_session(key.clone());
+
+        // Sized to pass the bare floor comfortably but not survive the
+        // 255-byte tenant's framing plus the wrapper being carved from it.
+        let wide = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; 900].into(),
+            ..Default::default()
+        };
+        assert!(
+            sender.payload_fits(&wide, None, None).unwrap(),
+            "premise: the payload is admissible on a tenant-less session",
+        );
+        assert!(
+            !sender
+                .payload_fits(&wide, None, Some(max_tenant.as_str()))
+                .unwrap(),
+            "a maximum-length tenant must shrink the admission floor",
+        );
+        // The send guard agrees (second line of defense): refused, and never
+        // registered for re-carry.
+        match sender.send(key.clone(), Some(wide), None) {
+            Err(MeshLinkError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+
+        // An ordinary turn still rides the tenant session.
+        assert!(
+            sender
+                .payload_fits(&turn(0, 0, 0x22), None, Some(max_tenant.as_str()))
+                .unwrap()
+        );
+        sender.send(key, Some(turn(0, 0, 0x22)), None).unwrap();
+    }
+
     #[tokio::test]
     async fn two_tenants_sharing_a_session_id_exchange_turns_without_cross_delivery() {
         let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;

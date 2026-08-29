@@ -1232,14 +1232,21 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   payload always fits — packing smaller candidates around a blocked head would reset that flush
   from packets the head can never ride, stranding it behind continuous traffic. (The flush serves
   it within one flush interval on the client edge and the relay's client-facing links; the mesh
-  checks per-session flush deadlines on a link-global maintenance tick, which bounds it at roughly
-  two.) That flush always having room is itself guaranteed statically: datagram payloads are
-  admitted against a **fixed floor budget** (`GUARANTEED_DATAGRAM_BUDGET`), never the live
-  discovered `max_datagram_size()` — quinn's black-hole detector shrinks the live value back to the
-  1200-byte MTU floor under loss bursts, exactly the weather redundancy exists for, and a payload
-  admitted against a discovered budget could out-size every later packet, flushes included, and
-  strand silently. Payloads over the floor divert to the reliable control streams, which carry any
-  size. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  checks per-session flush deadlines on a link-global maintenance tick, so its healthy-link
+  expectation is roughly two intervals — a stalled reliable control stream can hold the
+  maintenance branch up to its ten-second write timeout, after which the link resets and the
+  reconnect path re-carries.) That flush always having room is itself guaranteed statically:
+  datagram payloads are admitted against a **fixed floor budget** (`GUARANTEED_DATAGRAM_BUDGET`),
+  never the live discovered `max_datagram_size()` — quinn's black-hole detector shrinks the live
+  value back to the 1200-byte MTU floor under loss bursts, exactly the weather redundancy exists
+  for, and a payload admitted against a discovered budget could out-size every later packet,
+  flushes included, and strand silently. Each link type derives its admission number from the
+  floor: the client edge also pins the peer's advertised datagram limit (a handshake constant that
+  may legally be smaller than the floor, and which `payload_fits` and `send` must judge
+  identically — a fits-then-refused skew silently drops the fresh turn), and the mesh reserves the
+  wrapper costs riding every one of a session's packets, the `MeshPacket` overhead and the
+  session's tenant framing included. Payloads over the applicable floor divert to the reliable
+  control streams, which carry any size. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
   rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
   below backlog growth, and most-overdue-first is also the right priority there, approximating the
   oldest-first order the lockstep prefix actually needs. No loss pattern can strand a payload.

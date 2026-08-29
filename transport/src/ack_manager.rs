@@ -862,11 +862,16 @@ fn payload_element_len(payload_len: usize) -> usize {
 /// 1200 bytes (the QUIC-guaranteed datagram size; its setter refuses lower),
 /// and 1200 minus the worst-case short-header overhead (first byte, a 20-byte
 /// connection id, 4-byte packet number, 16-byte AEAD tag, ~3-byte datagram
-/// frame header) leaves at least ~1156 — ~1140 inside a `MeshPacket` wrapper.
-/// 1024 sits comfortably under both, so a payload admitted here fits a
-/// fresh-free, sidecar-free packet alone at any legal MTU — the invariant the
-/// head-of-line liveness argument rests on. Larger payloads divert to the
-/// reliable control streams, which carry any size.
+/// frame header) leaves at least ~1156. 1024 sits comfortably under that, so
+/// a payload admitted against it fits a fresh-free, sidecar-free packet alone
+/// at any legal MTU — the invariant the head-of-line liveness argument rests
+/// on. This is the **outer datagram** floor: each link type derives its own
+/// admission number from it — the client edge caps it by the peer's
+/// advertised datagram limit (a handshake constant that may legally be
+/// smaller), and the mesh additionally reserves the wrapper costs riding
+/// *every* packet of a session (the `MeshPacket` overhead and the session's
+/// tenant framing). Larger payloads divert to the reliable control streams,
+/// which carry any size.
 pub const GUARANTEED_DATAGRAM_BUDGET: usize = 1024;
 
 /// The encoded size of a packet carrying `payload` alone, assuming worst-case
