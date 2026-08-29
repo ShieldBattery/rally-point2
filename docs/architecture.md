@@ -1221,11 +1221,18 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   That ranking key grows for a candidate that gets passed over, so every payload is served while any
   redundancy flows at all — a ranking on any static property starves here, because continuous fresh
   traffic introduces new better-ranked candidates every packet, parking an outranked payload below
-  the budget cutoff indefinitely while its seq gates the peer's delivered prefix. Under saturation
-  the wait scales with the backlog (bounded by the unacked-window cap) rather than the spacing cap —
-  a fixed cadence is impossible when redundancy service runs at or below backlog growth, and
-  most-overdue-first is also the right priority there, approximating the oldest-first order the
-  lockstep prefix actually needs. No loss pattern can strand a payload. Accepted trade:
+  the budget cutoff indefinitely while its seq gates the peer's delivered prefix. (A payload with no
+  recorded carry at all — a refused build, a re-home re-inject, a reset survivor — outranks
+  everything: zero copies of it are on the wire.) The head of that line gates the whole refill: when
+  even the datagram budget cannot fit the most overdue payload (a wide turn sharing a packet with a
+  fresh one), the packet carries **no redundancy at all**, because both drivers arm their
+  maintenance flush exactly when a send re-carries nothing, and the flush's fresh-free packet is the
+  one place the wide payload always fits — packing smaller candidates around a blocked head would
+  reset that flush from packets the head can never ride, stranding it behind continuous traffic.
+  Under saturation the wait scales with the backlog (bounded by the unacked-window cap) rather than
+  the spacing cap — a fixed cadence is impossible when redundancy service runs at or below backlog
+  growth, and most-overdue-first is also the right priority there, approximating the oldest-first
+  order the lockstep prefix actually needs. No loss pattern can strand a payload. Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench

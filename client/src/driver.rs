@@ -5131,6 +5131,75 @@ mod tests {
         let _ = task.await;
     }
 
+    /// The head-of-line counterpart of the near-MTU test above: the dropped
+    /// turn is wide (fits a datagram alone, never beside another fresh turn),
+    /// and the continuing traffic is *small* — so its packets have plenty of
+    /// room for smaller redundancy. The refill must decline to pack any (the
+    /// wide turn heads the line and cannot ride), leaving the flush timer
+    /// armed to retransmit the wide turn on a fresh-free packet. Packing
+    /// smaller redundancy around the blocked head would reset the flush from
+    /// every packet and strand the wide turn behind continuous traffic.
+    #[tokio::test]
+    async fn retransmits_a_dropped_wide_turn_under_continuous_small_traffic() {
+        let (link_a, mut link_b, _ea, _eb) = connected_links().await;
+        let budget = link_b
+            .connection()
+            .max_datagram_size()
+            .expect("loopback supports datagrams");
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // The wide turn goes out alone, and its datagram is dropped on the wire.
+        chan_a
+            .outbound
+            .send(turn(0, &vec![0x7u8; budget * 3 / 4]))
+            .await
+            .unwrap();
+        let _lost = link_b.connection().read_datagram().await.unwrap();
+
+        // A steady stream of small turns follows with no idle gap. Each of
+        // their packets could carry the *other* small turns as redundancy —
+        // never the wide one — so recovery hinges on those packets carrying
+        // none at all and the flush firing.
+        let sender = {
+            let outbound = chan_a.outbound.clone();
+            tokio::spawn(async move {
+                for _ in 0..24 {
+                    if outbound.send(turn(0, &[0x7u8; 110])).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            })
+        };
+
+        // The wide turn (seq 0) must reach the peer despite the unbroken
+        // small-turn stream.
+        let got_zero = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if link_b
+                    .recv()
+                    .await
+                    .unwrap()
+                    .fresh
+                    .iter()
+                    .any(|p| p.seq == 0)
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            got_zero.is_ok(),
+            "dropped wide turn 0 was never retransmitted under continuous small traffic"
+        );
+
+        sender.abort();
+        drop(chan_a.outbound);
+        let _ = task.await;
+    }
+
     #[tokio::test]
     async fn an_idle_link_goes_quiet_after_a_turn_is_acked() {
         let (link_a, mut link_b, _ea, _eb) = connected_links().await;

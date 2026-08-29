@@ -527,15 +527,21 @@ impl AckManager {
                 // there indefinitely while its retirement (and with it the
                 // peer's delivered prefix, which its seq gates) never advances.
                 // Time-since-last-carry is monotone in exactly the right way —
-                // a skipped candidate only ranks higher next packet, newcomers
-                // enter at the bottom, so every payload is served while any
-                // redundancy flows at all. Under scarcity that order is also
-                // the *correct* priority: it approximates oldest-first, and the
-                // oldest missing seq is what gates lockstep. The stable sort
-                // keeps tied candidates in the BTreeMap's underlying
-                // `(slot, seq)` order, oldest per slot first, which also
-                // spreads coverage across slots. The fresh payload isn't in
-                // `unacked_payloads` yet, so it cannot double up.
+                // a skipped candidate only ranks higher next packet, and a
+                // successfully sent fresh payload enters at the bottom (its
+                // ride was just recorded) — so every payload is served while
+                // any redundancy flows at all. Under scarcity that order is
+                // also the *correct* priority: it approximates oldest-first,
+                // and the oldest missing seq is what gates lockstep. A payload
+                // with no recorded carry on this connection (a fresh one whose
+                // datagram was refused, a re-home re-inject, a survivor of a
+                // connection reset) deliberately outranks everything: zero
+                // copies of it exist on the wire, so nothing else in the
+                // window needs a ride more. The stable sort keeps tied
+                // candidates in the BTreeMap's underlying `(slot, seq)` order,
+                // oldest per slot first, which also spreads coverage across
+                // slots. The fresh payload isn't in `unacked_payloads` yet, so
+                // it cannot double up.
                 let mut candidates: Vec<&SentPayload> = self
                     .unacked_payloads
                     .values()
@@ -547,23 +553,34 @@ impl AckManager {
                         Some(last) => building_seq.saturating_sub(last),
                     })
                 });
-                // Until one redundancy element is packed, candidates are capped
-                // by the datagram budget alone, not the policy budget: a
-                // payload wider than the policy budget could otherwise never be
-                // re-carried by any packet — including the standalone flushes
-                // that exist to retransmit it — and a lost wide turn would
-                // stall lockstep unrecoverably. The exemption admits at most
-                // one over-budget element per packet, so the aggregate stays
-                // bounded by budget + one payload.
+                // The first (most overdue) candidate is capped by the datagram
+                // budget alone, not the policy budget: a payload wider than
+                // the policy budget could otherwise never be re-carried by any
+                // packet — including the standalone flushes that exist to
+                // retransmit it — and a lost wide turn would stall lockstep
+                // unrecoverably. The exemption admits at most one over-budget
+                // element per packet, so the aggregate stays bounded by
+                // budget + one payload.
+                //
+                // And when even the datagram budget cannot fit that first
+                // candidate (a wide turn sharing a packet with a fresh one),
+                // the packet deliberately carries **no redundancy at all**
+                // rather than serving smaller, lower-priority candidates
+                // around it. Both drivers arm their maintenance flush exactly
+                // when a send re-carried nothing, and a flush packet — no
+                // fresh payload — always has room for any registered payload
+                // (an oversize one is refused before registration). Packing
+                // around a blocked head of line instead would keep resetting
+                // that flush from packets the wide payload can never ride,
+                // stranding it behind traffic indefinitely.
                 let mut packed_redundancy = false;
                 for sent in candidates {
                     let element = sent.wire_len;
-                    let cap = if packed_redundancy {
-                        redundancy_cap
-                    } else {
-                        max_packet_len
-                    };
-                    if used + element > cap {
+                    if !packed_redundancy {
+                        if used + element > max_packet_len {
+                            break;
+                        }
+                    } else if used + element > redundancy_cap {
                         continue;
                     }
                     packed_redundancy = true;
@@ -838,10 +855,9 @@ struct SentPacket {
 
 /// A payload we've sent and are still re-sending until it's acked.
 struct SentPayload {
-    /// How many packets this payload has been included in on the current
-    /// connection. Feeds the least-resent-first constrained ranking and the
-    /// [`CarrySpacing`] schedule; reset (with the carry stamp) when the
-    /// connection it counted carries on dies.
+    /// How many packets this payload has been recorded as riding on the
+    /// current connection. Feeds the [`CarrySpacing`] schedule; reset (with
+    /// the carry stamp) when the connection it counted carries on dies.
     send_count: u32,
     /// The packet seq that last carried this payload on the current connection,
     /// or `None` if it has not been carried on it yet — the [`CarrySpacing`]
@@ -1745,6 +1761,84 @@ mod tests {
         assert_eq!(keys(&flush), vec![(0, 0)]);
         let flush = build_sent(&mut manager, None, MTU);
         assert_eq!(keys(&flush), vec![(0, 1)]);
+    }
+
+    /// When the most overdue due payload cannot fit a packet at all — a wide
+    /// turn sharing the datagram with a fresh one — the packet must carry no
+    /// redundancy whatsoever, not pack smaller candidates around it. Both
+    /// drivers arm their maintenance flush exactly when a send re-carries
+    /// nothing, and the flush packet (no fresh payload) is the one place the
+    /// wide payload fits; packing around it would keep resetting that flush
+    /// from packets the wide payload can never ride, stranding it behind
+    /// continuous smaller traffic indefinitely.
+    #[test]
+    fn a_blocked_wide_payload_suppresses_all_redundancy_so_the_flush_stays_armed() {
+        let budget = 1350usize;
+        let mut manager = AckManager::new();
+
+        // A wide turn that fits a datagram alone but never beside a fresh
+        // payload; its datagram is lost.
+        build_sent(&mut manager, Some(test_payload_sized(0, 0, 1250)), budget);
+
+        // Continuous smaller fresh turns follow, never acked, so smaller
+        // redundancy candidates are always available. Every packet must
+        // decline them all: the wide payload heads the line and cannot ride.
+        for i in 1..=10u64 {
+            let packet = build_sent(&mut manager, Some(test_payload_sized(0, i, 110)), budget);
+            assert_eq!(
+                packet.payloads.len(),
+                1,
+                "packet {} packed redundancy around the blocked wide payload",
+                packet.seq,
+            );
+        }
+
+        // The flush the drivers fire on those redundancy-free sends has no
+        // fresh payload, so the wide turn heads it — recovery rides there.
+        let flush = build_sent(&mut manager, None, budget);
+        assert_eq!(flush.payloads.first().map(|p| p.seq), Some(0));
+    }
+
+    /// A fresh payload registered by a refused build (never carried) outranks
+    /// every carried payload — zero copies of it exist on the wire — and under
+    /// a constrained budget the older carried payloads still get served right
+    /// behind it rather than being displaced indefinitely.
+    #[test]
+    fn a_refused_fresh_payload_is_served_first_without_displacing_older_carries() {
+        // Budget of one small element per packet keeps every refill
+        // constrained, so the ranking (not capacity) decides who rides.
+        let mut manager = AckManager::with_policy(RecarryPolicy {
+            redundancy_byte_budget: Some(payload_element_len(test_payload(0, 0).encoded_len())),
+            spacing: Some(CarrySpacing {
+                dense_carries: 2,
+                max_spacing: 8,
+            }),
+        });
+
+        // Three payloads with recorded carries, oldest first.
+        for seq in 0..3u64 {
+            build_sent(&mut manager, Some(test_payload(0, seq)), MTU);
+        }
+        // A fresh build the wire refuses: registered, never carried.
+        let _refused = manager
+            .build_outgoing(Some(test_payload(0, 3)), MTU)
+            .unwrap();
+
+        // Successful flushes now serve the never-carried payload first, then
+        // the carried ones oldest-carry-first — nobody is displaced for long.
+        let mut served: Vec<u64> = Vec::new();
+        for _ in 0..4 {
+            let flush = build_sent(&mut manager, None, MTU);
+            served.extend(flush.payloads.first().map(|p| p.seq));
+        }
+        assert_eq!(served[0], 3, "the never-carried payload must ride first");
+        for seq in 0..3u64 {
+            assert!(
+                served.contains(&seq),
+                "carried payload {seq} was displaced by the refused fresh one \
+                 (served order: {served:?})",
+            );
+        }
     }
 
     /// A built-but-never-recorded packet (the transport refused the datagram)
