@@ -111,8 +111,12 @@ Recovery is **ours, layered on QUIC's unreliable datagrams** — QUIC supplies e
 control, MTU sizing, migration, and a loss signal, but no per-datagram delivery receipt for our
 redundantly-packed payloads.
 
-- Each packet carries a **fresh** payload plus **still-unacked recent ones**, oldest-first, up to the
-  live datagram budget. So a dropped packet's payloads ride the *next* packets automatically.
+- Each packet carries a **fresh** payload plus **still-unacked ones**, so a dropped packet's payloads
+  ride the *next* packets automatically. How much a packet spends on that is governed by the send-side
+  **re-carry policy** (`RecarryPolicy`, default: 384-byte redundancy budget, two dense carries then
+  geometric spacing capped at 8 packets) — see the settled-decisions entry below for why the refill
+  must be bounded and how the parameters were chosen. The fresh payload is always exempt: the current
+  turn is never squeezed out.
 - There is **no retransmit-on-timeout**. We never wait a round-trip to notice a gap and resend — the
   redundancy already covers it. Turns are tiny, so the bandwidth cost is negligible; the latency saved
   is a whole RTT per loss, which lockstep cannot spend.
@@ -1196,6 +1200,30 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   rollout would be costly.
 - **Downlink coalescing (if ever built) must define its recovery-window vs byte budget at
   implementation time** — low-stakes: the window is small and coalescing is weak-downlink-only.
+- **Re-carry redundancy is bounded by policy — a per-packet byte budget plus per-payload carry
+  spacing — never an unbounded window refill.** The unacked window scales with the path's round-trip
+  time (a payload stays in it until an ack returns), so an every-packet full-window refill spends the
+  most bytes exactly when a squeezed path can least afford them: a last-mile fade inflates RTT, the
+  window grows with it, bundles grow with the window, and the extra bytes deepen the very queue that
+  inflated RTT. The two bounds hold in different regimes and neither substitutes for the other. At a
+  **capacity-edge fade** (path throughput squeezed near the turn stream's own byte rate — the shape a
+  crushed congestion window over a bufferbloated last mile produces), the *spacing* is what keeps the
+  system stable: it converts window growth into flat redundancy load, where even a budget-capped
+  every-packet refill feeds the feedback loop until delivery runs seconds behind. The transport sim
+  tips into runaway at three dense carries and damps at two — the margin is thin, which is why the
+  dense phase is the minimum that still recovers an isolated loss on the very next packet. Below the
+  fresh stream's own byte rate (an outage-grade fade, where lockstep must stall regardless), spacing's
+  aggregate no longer converges — the due set grows with the window — and the *budget* is what still
+  bounds every bundle. **Liveness is load-bearing:** a packet's first redundancy element is exempt
+  from the policy budget (a payload wider than the budget must still be re-carryable — lockstep can
+  never drop a turn), and the spacing cap keeps every unacked payload on a bounded re-carry cadence
+  until an ack or beacon cursor retires it, so no loss pattern can strand a payload. Accepted trade:
+  burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
+  backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
+  both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench
+  for any retune is `transport/src/recarry_sim.rs`, which drives real `AckManager` pairs through
+  fade/burst/blackout scenarios and prints the comparison tables
+  (`cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`).
 - **Relay regions reach clients, but only after real play has elapsed, and the gate is wall-clock.**
   Regions are placement state the control plane also publishes: the coordinator carries the whole
   session's relay → region map down every serving relay's descriptor, and each relay releases it to

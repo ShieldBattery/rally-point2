@@ -166,9 +166,10 @@ const LEAVE_INTENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The flush timer is reset whenever an outbound turn re-carries unacked turns as
 /// redundancy — the common case, where recovery rides the turn stream and the flush
 /// never fires, so it costs no extra packets. It is *not* reset by a send that
-/// carried no redundancy (a near-MTU turn that filled the datagram) or by an idle
-/// stretch; in those cases it fires and sends an ack-only packet that re-carries
-/// unacked turns oldest-first and folds in owed acks. It stays silent when nothing
+/// carried no redundancy (a near-MTU turn that filled the datagram, or a stretch
+/// where the re-carry policy's spacing left nothing due) or by an idle stretch; in
+/// those cases it fires and sends a packet that re-carries whatever unacked turns
+/// the policy has due and folds in owed acks. It stays silent when nothing
 /// is unacked and no acks are owed. Set to a few turns at the 24-per-second turn
 const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 

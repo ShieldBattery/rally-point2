@@ -3,8 +3,11 @@
 //!
 //! A link's payloads ride unreliable QUIC datagrams, each one carried in a
 //! [`Packet`]. Every packet carries a fresh payload plus copies of still-unacked
-//! older payloads, up to the datagram's size budget, so a single dropped packet
-//! rarely loses a payload outright — the next packet re-carries it. Each packet
+//! older payloads, so a single dropped packet rarely loses a payload outright —
+//! the next packet re-carries it. How much redundancy a packet spends, and how
+//! often one payload is re-carried, is governed by the link's [`RecarryPolicy`]
+//! (see its docs for why the refill must be bounded); the datagram's size
+//! budget always applies on top, and the fresh payload always rides. Each packet
 //! also acks the peer's recent packets (a most-recent `ack` plus a 32-bit
 //! [`Packet::ack_bits`] history). When a packet of ours is acked, every payload
 //! it carried is retired and stops being re-sent.
@@ -39,6 +42,110 @@ use crate::sequence_buffer::SequenceBuffer;
 /// that any packet old enough to fall out of the buffer can safely be treated as
 /// lost (its payloads are still re-sent until separately acked).
 const SENT_PACKETS_SIZE: usize = 256;
+
+/// Policy governing how much redundancy a packet carries and how often one
+/// payload is re-carried.
+///
+/// The unacked window is proportional to the path's round-trip time (a payload
+/// stays in it until an ack returns), so an unbounded refill makes bundle bytes
+/// grow with delay — largest exactly when the path is squeezed and every byte
+/// deepens the queue. The two knobs bound that coupling independently: the
+/// byte budget caps what any single packet spends on redundancy, and carry
+/// spacing stops re-carrying a payload every packet once it has had its dense
+/// initial coverage, letting bundles fall back toward baseline even while the
+/// window itself is stretched by an inflated RTT.
+///
+/// The fresh payload is exempt from both: the current turn always rides.
+///
+/// The two bounds hold in different failure regimes, which is why both exist
+/// (established in `recarry_sim`, whose squeeze scenarios reproduce the
+/// production fade shape). When a fade squeezes the path near the turn
+/// stream's own byte rate, the *spacing* is what keeps the system stable: it
+/// converts unacked-window growth into flat redundancy load, where an
+/// every-packet refill — even a budget-capped one — feeds the queue→RTT→window
+/// feedback loop until delivery runs seconds behind. When the path is squeezed
+/// *below* the fresh byte rate (an outright outage-grade fade, where lockstep
+/// must stall no matter what), spacing's aggregate no longer converges — the
+/// due set grows with the window — and the *budget* is what still bounds every
+/// bundle. Neither bound substitutes for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecarryPolicy {
+    /// Max encoded bytes of redundant payload elements per packet (each counted
+    /// as its full repeated-field element, tag and length included, matching
+    /// how the datagram budget is consumed). `None` fills to the datagram
+    /// budget. The datagram budget still applies on top: the effective cap is
+    /// the smaller of the two. A packet's *first* redundancy element is capped
+    /// by the datagram budget alone — a payload wider than this budget must
+    /// still be re-carryable (lockstep cannot drop it), so the real bound per
+    /// packet is this budget plus at most one payload.
+    pub redundancy_byte_budget: Option<usize>,
+    /// Minimum packets between carries of one payload, as a function of how
+    /// often it has been carried. `None` re-carries every packet.
+    pub spacing: Option<CarrySpacing>,
+}
+
+impl RecarryPolicy {
+    /// No bounds: every packet re-carries the whole unacked window up to the
+    /// datagram budget. For tests that isolate the refill mechanics.
+    pub fn unbounded() -> Self {
+        Self {
+            redundancy_byte_budget: None,
+            spacing: None,
+        }
+    }
+}
+
+impl Default for RecarryPolicy {
+    /// The shipped policy, chosen from the `recarry_sim` sweeps: a 384-byte
+    /// redundancy budget (several typical turns, comfortably above the
+    /// healthy-window all-fit size, far under the datagram budget) with dense
+    /// carries 2 / max spacing 8. Two dense carries preserve next-packet
+    /// recovery of an isolated loss while keeping the sustained re-carry rate
+    /// low enough that a capacity-edge fade damps instead of amplifying — the
+    /// sweeps tip into runaway at three. The spacing cap of 8 keeps the
+    /// worst-case re-carry cadence a third of a second at the turn rate, and
+    /// measured best-in-sweep on burst tails and blackout drain.
+    fn default() -> Self {
+        Self {
+            redundancy_byte_budget: Some(384),
+            spacing: Some(CarrySpacing {
+                dense_carries: 2,
+                max_spacing: 8,
+            }),
+        }
+    }
+}
+
+/// Carry-spacing schedule: dense at first, then geometrically sparser.
+///
+/// A payload's first `dense_carries` carries ride consecutive packets — the
+/// window in which recovering an isolated loss at the very next packet is the
+/// whole point of redundancy. After that, each further carry must wait twice as
+/// many packets as the one before, capped at `max_spacing`, so a payload that
+/// stays unacked only because acks are late stops taxing every bundle, while
+/// one whose carries genuinely died keeps a bounded worst-case re-carry
+/// cadence (`max_spacing` packets) until the ack-beacon cursor or a packet ack
+/// retires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrySpacing {
+    /// Carries that ride consecutive packets before backoff begins.
+    pub dense_carries: u32,
+    /// Ceiling on the inter-carry gap, in packets.
+    pub max_spacing: u32,
+}
+
+impl CarrySpacing {
+    /// Packets that must elapse since the payload's last carry before it may be
+    /// carried again, given it has been carried `send_count` times.
+    fn required_gap(&self, send_count: u32) -> u32 {
+        if send_count <= self.dense_carries {
+            1
+        } else {
+            let doublings = (send_count - self.dense_carries).min(30);
+            (1u32 << doublings).min(self.max_spacing.max(1))
+        }
+    }
+}
 
 /// The peer packet history represented directly in the wire format's shape.
 ///
@@ -163,16 +270,25 @@ pub struct AckManager {
     /// The peer's recently-received packets, keyed by their packet seq. Drives
     /// the `ack` / `ack_bits` we send back.
     received_packets: ReceivedPacketHistory,
+    /// How the redundancy refill spends bytes and rotates coverage.
+    policy: RecarryPolicy,
 }
 
 impl AckManager {
     pub fn new() -> Self {
+        Self::with_policy(RecarryPolicy::default())
+    }
+
+    /// An `AckManager` with an explicit redundancy policy. `new` uses
+    /// [`RecarryPolicy::default`].
+    pub fn with_policy(policy: RecarryPolicy) -> Self {
         Self {
             packet_seq: 0,
             sent_packets: SequenceBuffer::with_capacity(SENT_PACKETS_SIZE),
             unacked_payloads: BTreeMap::new(),
             unacked_payload_wire_len: Some(0),
             received_packets: ReceivedPacketHistory::default(),
+            policy,
         }
     }
 
@@ -192,7 +308,14 @@ impl AckManager {
         self.sent_packets = SequenceBuffer::with_capacity(SENT_PACKETS_SIZE);
         self.received_packets = ReceivedPacketHistory::default();
         // unacked_payloads intentionally preserved for re-carry over the new
-        // connection.
+        // connection — but their coverage history is not: every carry (and the
+        // packet seq it rode) belongs to the connection that died, so each
+        // survivor starts the new connection uncovered and immediately eligible
+        // for dense re-carry.
+        for sent in self.unacked_payloads.values_mut() {
+            sent.send_count = 0;
+            sent.last_carried_packet_seq = None;
+        }
     }
 
     /// The peer's most recently received packet seq, or `None` if we've seen
@@ -256,11 +379,14 @@ impl AckManager {
     /// origin identity, already assigned by the sending client and preserved
     /// untouched here — always included (even if it alone exceeds `max_packet_len`
     /// — the current turn is never dropped), and tracked for re-sending until
-    /// acked. The remaining space up to `max_packet_len` is then filled with
-    /// still-unacked payloads, oldest-seq-first within each slot, for redundancy.
-    /// If `payload` is `None`, there is no fresh payload, but still-unacked
-    /// payloads are packed as redundancy when they fit. The result is truly
-    /// ack-only only when the unacked window is empty (or none of it fits).
+    /// acked. The remaining space is then filled with still-unacked payloads for
+    /// redundancy, as the manager's [`RecarryPolicy`] directs: only payloads due
+    /// under its spacing schedule compete, its byte budget caps what they may
+    /// collectively spend (the first element exempt, so a wide payload stays
+    /// re-carryable), and `max_packet_len` bounds everything. If `payload` is
+    /// `None`, there is no fresh payload, but due payloads are packed as
+    /// redundancy the same way. The result is truly ack-only only when nothing
+    /// is due (or none of it fits).
     ///
     /// `max_packet_len` is the live datagram budget (e.g. quinn's
     /// `max_datagram_size()`); pass the current value each call so the bundle
@@ -329,43 +455,106 @@ impl AckManager {
             payload_keys.push((*slot, p.seq));
         }
 
-        // When the whole unacked window fits, ranking cannot affect coverage:
-        // every candidate rides this packet. Check that case from the cached
-        // encoded lengths and refill directly in the BTreeMap's stable
-        // `(slot, seq)` order, avoiding both the temporary candidate allocation
-        // and its sort on the common small-window path.
+        // The cap redundancy may fill to: the datagram budget, tightened by the
+        // policy's per-packet redundancy byte budget when one is set. The fresh
+        // payload is exempt (it was pushed above, before this cap is computed),
+        // so the budget only ever limits re-carries.
+        let redundancy_cap = match self.policy.redundancy_byte_budget {
+            Some(budget) => max_packet_len.min(used.saturating_add(budget)),
+            None => max_packet_len,
+        };
+        let spacing = self.policy.spacing;
+        let building_seq = packet.seq;
+
+        // When no spacing schedule filters the window and the whole window fits
+        // under the cap, ranking cannot affect coverage: every candidate rides
+        // this packet. Check that case from the cached encoded lengths and
+        // refill directly in the BTreeMap's stable `(slot, seq)` order,
+        // avoiding both the temporary candidate allocation and its sort on the
+        // common small-window path.
         let unacked_payload_wire_len = self.unacked_payload_wire_len();
-        let all_candidates_fit = max_packet_len
+        let all_candidates_fit = redundancy_cap
             .checked_sub(used)
             .is_some_and(|remaining| unacked_payload_wire_len <= remaining);
-        if all_candidates_fit {
+        if spacing.is_none() && all_candidates_fit {
             packet.payloads.reserve(self.unacked_payloads.len());
             payload_keys.reserve(self.unacked_payloads.len());
             for (key, sent) in &mut self.unacked_payloads {
                 sent.send_count += 1;
+                sent.last_carried_packet_seq = Some(building_seq);
                 packet.payloads.push(sent.payload.clone());
                 payload_keys.push(*key);
             }
         } else {
-            // A constrained packet refills least-resent-first: it must not let
-            // the same low `(slot, seq)` subset starve everything ranked after
-            // it. Sorting by `send_count` spreads redundancy coverage fairly
-            // across every slot. The stable sort keeps tied candidates in the
-            // BTreeMap's underlying `(slot, seq)` order, oldest per slot first.
-            // The fresh payload isn't in `unacked_payloads` yet, so it cannot
-            // double up.
-            let mut candidates: Vec<(&(SlotId, u64), &mut SentPayload)> =
-                self.unacked_payloads.iter_mut().collect();
-            candidates.sort_by_key(|(_, sent)| sent.send_count);
-            for (key, sent) in candidates {
-                let element = sent.wire_len;
-                if used + element > max_packet_len {
-                    continue;
+            // Only payloads due under the spacing schedule compete for the
+            // cap. First pass: the due set's size and total wire cost.
+            let mut due_wire_len = 0usize;
+            let mut due_count = 0usize;
+            for sent in self.unacked_payloads.values() {
+                if sent.is_due(spacing, building_seq) {
+                    due_wire_len += sent.wire_len;
+                    due_count += 1;
                 }
-                sent.send_count += 1;
-                used += element;
-                packet.payloads.push(sent.payload.clone());
-                payload_keys.push(*key);
+            }
+            let all_due_fit = redundancy_cap
+                .checked_sub(used)
+                .is_some_and(|remaining| due_wire_len <= remaining);
+            if all_due_fit {
+                // Every due candidate rides, so ranking cannot affect coverage:
+                // carry them in the BTreeMap's stable `(slot, seq)` order with
+                // no candidate allocation — the common shape once spacing has
+                // thinned the set.
+                packet.payloads.reserve(due_count);
+                payload_keys.reserve(due_count);
+                for (key, sent) in &mut self.unacked_payloads {
+                    if !sent.is_due(spacing, building_seq) {
+                        continue;
+                    }
+                    sent.send_count += 1;
+                    sent.last_carried_packet_seq = Some(building_seq);
+                    packet.payloads.push(sent.payload.clone());
+                    payload_keys.push(*key);
+                }
+            } else {
+                // A constrained packet refills least-resent-first: it must not
+                // let the same low `(slot, seq)` subset starve everything
+                // ranked after it. Sorting by `send_count` spreads redundancy
+                // coverage fairly across every slot. The stable sort keeps tied
+                // candidates in the BTreeMap's underlying `(slot, seq)` order,
+                // oldest per slot first. The fresh payload isn't in
+                // `unacked_payloads` yet, so it cannot double up.
+                let mut candidates: Vec<(&(SlotId, u64), &mut SentPayload)> = self
+                    .unacked_payloads
+                    .iter_mut()
+                    .filter(|(_, sent)| sent.is_due(spacing, building_seq))
+                    .collect();
+                candidates.sort_by_key(|(_, sent)| sent.send_count);
+                // Until one redundancy element is packed, candidates are capped
+                // by the datagram budget alone, not the policy budget: a
+                // payload wider than the policy budget could otherwise never be
+                // re-carried by any packet — including the standalone flushes
+                // that exist to retransmit it — and a lost wide turn would
+                // stall lockstep unrecoverably. The exemption admits at most
+                // one over-budget element per packet, so the aggregate stays
+                // bounded by budget + one payload.
+                let mut packed_redundancy = false;
+                for (key, sent) in candidates {
+                    let element = sent.wire_len;
+                    let cap = if packed_redundancy {
+                        redundancy_cap
+                    } else {
+                        max_packet_len
+                    };
+                    if used + element > cap {
+                        continue;
+                    }
+                    packed_redundancy = true;
+                    sent.send_count += 1;
+                    sent.last_carried_packet_seq = Some(building_seq);
+                    used += element;
+                    packet.payloads.push(sent.payload.clone());
+                    payload_keys.push(*key);
+                }
             }
         }
 
@@ -375,6 +564,7 @@ impl AckManager {
                 (slot, p.seq),
                 SentPayload {
                     send_count: 1,
+                    last_carried_packet_seq: Some(building_seq),
                     wire_len: payload_element_len(len),
                     payload: p,
                 },
@@ -508,6 +698,7 @@ impl AckManager {
                 key,
                 SentPayload {
                     send_count: 0,
+                    last_carried_packet_seq: None,
                     wire_len: payload_element_len(encoded_len),
                     payload,
                 },
@@ -600,12 +791,36 @@ struct SentPacket {
 
 /// A payload we've sent and are still re-sending until it's acked.
 struct SentPayload {
-    /// How many packets this payload has been included in (diagnostics).
+    /// How many packets this payload has been included in on the current
+    /// connection. Feeds the least-resent-first constrained ranking and the
+    /// [`CarrySpacing`] schedule; reset (with the carry stamp) when the
+    /// connection it counted carries on dies.
     send_count: u32,
+    /// The packet seq that last carried this payload on the current connection,
+    /// or `None` if it has not been carried on it yet — the [`CarrySpacing`]
+    /// schedule's clock.
+    last_carried_packet_seq: Option<u32>,
     /// Cached size of its complete repeated-field wire element, so refilling a
     /// packet and maintaining the aggregate do not recalculate its varint.
     wire_len: usize,
     payload: Payload,
+}
+
+impl SentPayload {
+    /// Whether the spacing schedule permits carrying this payload in the packet
+    /// currently being built (`building_seq`). No schedule, or no carry yet on
+    /// this connection, means always due.
+    fn is_due(&self, spacing: Option<CarrySpacing>, building_seq: u32) -> bool {
+        let Some(spacing) = spacing else {
+            return true;
+        };
+        match self.last_carried_packet_seq {
+            None => true,
+            Some(last) => {
+                building_seq.saturating_sub(last) >= spacing.required_gap(self.send_count)
+            }
+        }
+    }
 }
 
 /// The per-connection packet sequence space is exhausted: every `u32` packet
@@ -1351,7 +1566,10 @@ mod tests {
     /// re-carried at all for as long as the budget stayed this tight.
     #[test]
     fn a_permanently_tight_budget_spreads_redundancy_coverage_across_slots() {
-        let mut manager = AckManager::new();
+        // Unbounded policy: this test pins the constrained refill's fairness
+        // ranking, so the spacing schedule (which would legitimately let
+        // well-covered payloads sit out rounds) is disabled.
+        let mut manager = AckManager::with_policy(RecarryPolicy::unbounded());
         // Four slots, each with one unacked payload that is never touched
         // again as "fresh" -- from here on each is purely along for the
         // redundancy ride, competing for the same tight budget.
@@ -1394,6 +1612,50 @@ mod tests {
                  starved instead of getting a fair share of redundancy coverage",
             );
         }
+    }
+
+    /// A payload wider than the policy's redundancy byte budget must still be
+    /// re-carried — the budget bounds the aggregate, and its first-element
+    /// exemption is what keeps a lost wide turn recoverable at all. At most one
+    /// over-budget element rides per packet, so two wide payloads alternate
+    /// across successive flushes instead of stacking.
+    #[test]
+    fn a_payload_wider_than_the_policy_budget_is_still_re_carried() {
+        let mut manager = AckManager::with_policy(RecarryPolicy {
+            redundancy_byte_budget: Some(64),
+            spacing: Some(CarrySpacing {
+                dense_carries: 2,
+                max_spacing: 8,
+            }),
+        });
+        let wide = |slot: u8, seq: u64| Payload {
+            seq,
+            slot: u32::from(slot),
+            commands: vec![0u8; 300].into(),
+            ..Default::default()
+        };
+
+        // Wide turn A goes out fresh (and its datagram is, say, lost).
+        manager.build_outgoing(Some(wide(0, 0)), MTU).unwrap();
+        // Wide turn B's packet re-carries A via the exemption: both fit the
+        // datagram, and A alone is allowed past the 64-byte policy budget.
+        let second = manager.build_outgoing(Some(wide(0, 1)), MTU).unwrap();
+        let keys = |packet: &Packet| {
+            packet
+                .payloads
+                .iter()
+                .map(|p| (p.slot as u8, p.seq))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&second), vec![(0, 1), (0, 0)]);
+
+        // Flushes carry exactly one over-budget element each: the least-carried
+        // wide payload wins the exempt slot, so the two alternate rather than
+        // stack.
+        let flush = manager.build_outgoing(None, MTU).unwrap();
+        assert_eq!(keys(&flush), vec![(0, 1)]);
+        let flush = manager.build_outgoing(None, MTU).unwrap();
+        assert_eq!(keys(&flush), vec![(0, 0)]);
     }
 
     #[test]

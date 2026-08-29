@@ -57,6 +57,9 @@ pub mod beacon;
 pub mod control;
 pub mod mesh_control_stream;
 
+#[cfg(test)]
+mod recarry_sim;
+
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.
 pub use {quinn, rustls};
