@@ -461,11 +461,13 @@ impl MeshLink {
             .saturating_sub(conditions_overhead)
             .saturating_sub(tenant_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
-        // A payload that can never ride any datagram is refused *before* it is
-        // registered as unacked (mirroring `Link::send`): registered, every
-        // rebuilt bundle would try and fail to carry it while its seq holds a
-        // permanent gap in the peer's delivered prefix. This is the second line
-        // of defense — the caller pre-checks with
+        // A payload that might someday be unable to ride a datagram is refused
+        // *before* it is registered as unacked (mirroring `Link::send`) —
+        // against the static admission floor as well as this send's budget,
+        // since the live budget can later shrink below what it reads today.
+        // Registered, every rebuilt bundle would try and fail to carry it
+        // while its seq holds a permanent gap in the peer's delivered prefix.
+        // This is the second line of defense — the caller pre-checks with
         // [`payload_fits`](Self::payload_fits) and diverts oversize turns to the
         // mesh control stream before ever calling `send`.
         if let Some(p) = &payload {
@@ -478,10 +480,11 @@ impl MeshLink {
                 return Err(MeshLinkError::MalformedSlot(p.slot));
             }
             let needed = crate::ack_manager::lone_packet_len(p);
-            if needed > packet_budget {
+            let admission = packet_budget.min(crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET);
+            if needed > admission {
                 return Err(MeshLinkError::PayloadTooLarge {
                     needed,
-                    budget: packet_budget,
+                    budget: admission,
                 });
             }
         }
@@ -515,17 +518,23 @@ impl MeshLink {
         }
     }
 
-    /// Whether `payload` can ever ride a mesh datagram on this connection's
-    /// current path, sized against the same budget [`send`](Self::send) applies:
-    /// the live `max_datagram_size()` minus the exact wire cost of the
+    /// Whether `payload` can ride mesh datagrams for the rest of this
+    /// connection's life: sized against the smaller of the send-time budget
+    /// (the live `max_datagram_size()` minus the exact wire cost of the
     /// `conditions` sidecar and the `tenant` string that would accompany it,
-    /// and the `MeshPacket` wrapper's own overhead. The caller's pre-check for
-    /// the divert path — a payload this returns `false` for must go over the
-    /// mesh control stream, never into `send` (which would refuse it anyway,
-    /// but by then the caller has lost the payload to the move). Mirrors
+    /// and the `MeshPacket` wrapper's own overhead) and the static
+    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
+    /// floor. The floor is what keeps an admitted payload re-carryable
+    /// forever: the live budget shrinks when quinn's black-hole detector
+    /// reacts to loss, and a payload admitted against a discovered budget
+    /// could out-size every later packet (see the constant's docs). The
+    /// caller's pre-check for the divert path — a payload this returns
+    /// `false` for must go over the mesh control stream, never into `send`
+    /// (which would refuse it anyway, but by then the caller has lost the
+    /// payload to the move). Mirrors
     /// [`Link::payload_fits`](crate::Link::payload_fits) on the client edge;
-    /// takes the conditions and tenant because the mesh budget, unlike the
-    /// client edge's, varies with what's attached to each send.
+    /// takes the conditions and tenant because the mesh send-time budget,
+    /// unlike the client edge's, varies with what's attached to each send.
     pub fn payload_fits(
         &self,
         payload: &Payload,
@@ -541,7 +550,8 @@ impl MeshLink {
         let packet_budget = datagram_budget
             .saturating_sub(conditions_overhead)
             .saturating_sub(tenant_overhead)
-            .saturating_sub(MESH_PACKET_OVERHEAD);
+            .saturating_sub(MESH_PACKET_OVERHEAD)
+            .min(crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET);
         Ok(crate::ack_manager::lone_packet_len(payload) <= packet_budget)
     }
 

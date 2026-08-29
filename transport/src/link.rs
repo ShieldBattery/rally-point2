@@ -252,18 +252,28 @@ impl Link {
         self.acks.reinject_unacked(payload);
     }
 
-    /// Whether `payload` can ever ride a datagram on this link's current path:
-    /// a packet carrying it alone, under worst-case header state, fits the live
-    /// `max_datagram_size()`. The caller's pre-check for the divert-to-stream
-    /// path — a payload this returns `false` for must go over the reliable
-    /// control stream, never into [`send`](Self::send) (which would refuse it
-    /// anyway, but by then the caller has lost the payload to the move).
+    /// Whether `payload` can ride datagrams on this link for the rest of the
+    /// connection's life: a packet carrying it alone, under worst-case header
+    /// state, fits
+    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
+    /// — the budget no legal path MTU can undercut. Deliberately *not* the live `max_datagram_size()`:
+    /// that value shrinks when quinn's black-hole detector reacts to loss
+    /// bursts (the exact weather redundancy exists for), and a payload
+    /// admitted against a discovered budget could out-size every later packet
+    /// — flushes included — stranding it in the unacked window while its seq
+    /// wedges the peer's delivered prefix. The caller's pre-check for the
+    /// divert-to-stream path — a payload this returns `false` for must go
+    /// over the reliable control stream, never into [`send`](Self::send)
+    /// (which would refuse it anyway, but by then the caller has lost the
+    /// payload to the move).
     pub fn payload_fits(&self, payload: &Payload) -> Result<bool, LinkError> {
-        let budget = self
-            .connection
+        // The connection must support datagrams at all for any answer to be
+        // meaningful; the budget itself is the static floor, not the probe.
+        self.connection
             .max_datagram_size()
             .ok_or(LinkError::DatagramsUnsupported)?;
-        Ok(crate::ack_manager::lone_packet_len(payload) <= budget)
+        Ok(crate::ack_manager::lone_packet_len(payload)
+            <= crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
     }
 
     /// Anchors this link's receive window for `slot` to `anchor`, treating every
@@ -330,14 +340,18 @@ impl Link {
             .ok_or(LinkError::DatagramsUnsupported)?;
         let had_fresh = payload.is_some();
 
-        // A payload that can never ride any datagram is refused *before* it is
-        // registered as unacked. Registered, it would poison recovery: every
-        // rebuilt bundle would try and fail to carry it, and its seq would hold
-        // a permanent gap in the peer's delivered prefix. Refused here, the
-        // caller diverts it (the reliable control stream) or fails fast. This
-        // is distinct from a *bundle* that outgrew a shrunken path below —
-        // that payload fit when checked, is registered, and its refusal is a
-        // recoverable loss the next (smaller) bundle re-carries.
+        // A payload that might someday be unable to ride a datagram is refused
+        // *before* it is registered as unacked — against the static
+        // [`GUARANTEED_DATAGRAM_BUDGET`] floor, not the live budget, which
+        // path-MTU shrink can pull below what it reads today (see
+        // [`payload_fits`](Self::payload_fits)). Registered, such a payload
+        // would poison recovery: every rebuilt bundle would try and fail to
+        // carry it, and its seq would hold a permanent gap in the peer's
+        // delivered prefix. Refused here, the caller diverts it (the reliable
+        // control stream) or fails fast. This is distinct from a *bundle* that
+        // outgrew a shrunken path below — that payload fit the floor when
+        // checked, is registered, and its refusal is a recoverable loss the
+        // next (smaller) bundle re-carries.
         if let Some(p) = &payload {
             // A wire slot that doesn't fit a `SlotId` can't be tracked without
             // narrowing it onto a different, valid slot's bookkeeping, so it is
@@ -349,8 +363,12 @@ impl Link {
                 return Err(LinkError::MalformedSlot(p.slot));
             }
             let needed = crate::ack_manager::lone_packet_len(p);
-            if needed > budget {
-                return Err(LinkError::PayloadTooLarge { needed, budget });
+            let admission = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET.min(budget);
+            if needed > admission {
+                return Err(LinkError::PayloadTooLarge {
+                    needed,
+                    budget: admission,
+                });
             }
         }
 
@@ -1700,7 +1718,8 @@ mod tests {
 
         // A turn whose own bytes dwarf the datagram budget can ride no datagram, so
         // send surfaces it as an error rather than silently stalling. With the tiny
-        // turns of a lockstep game this never happens.
+        // turns of a lockstep game this never happens. Admission is judged
+        // against the guaranteed floor, so that is the budget the error names.
         let oversize = Payload {
             seq: 0,
             slot: 0,
@@ -1712,10 +1731,53 @@ mod tests {
                 needed,
                 budget: reported,
             }) => {
-                assert_eq!(reported, budget);
-                assert!(needed > budget);
+                assert_eq!(
+                    reported,
+                    crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET.min(budget)
+                );
+                assert!(needed > reported);
             }
             other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
+    }
+
+    /// Datagram admission is judged against the guaranteed floor, never the
+    /// live discovered budget: a payload sized between the two must be refused
+    /// (diverted by the caller), because path-MTU shrink — quinn's black-hole
+    /// response to the loss weather redundancy exists for — could otherwise
+    /// leave it registered but too wide for every later packet, flushes
+    /// included, stranding it while its seq wedges the peer's prefix.
+    #[tokio::test]
+    async fn admission_uses_the_guaranteed_floor_not_the_discovered_budget() {
+        let (client, _server, _client_ep, _server_ep) = connected_links().await;
+
+        let live = client
+            .connection()
+            .max_datagram_size()
+            .expect("loopback supports datagrams");
+        assert!(
+            live > crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET,
+            "premise: the live budget ({live}) must exceed the floor for the \
+             gap this test covers to exist",
+        );
+
+        // Between the floor and the live budget: fits today's packets, but not
+        // necessarily tomorrow's — refused.
+        let between = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET + 16].into(),
+            ..Default::default()
+        };
+        assert!(!client.payload_fits(&between).unwrap());
+
+        // Comfortably under the floor: admitted.
+        let under = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET - 64].into(),
+            ..Default::default()
+        };
+        assert!(client.payload_fits(&under).unwrap());
     }
 }

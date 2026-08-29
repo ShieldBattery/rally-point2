@@ -47,7 +47,7 @@ pub mod mesh_link;
 pub mod quic;
 pub mod sequence_buffer;
 
-pub use ack_manager::{AckError, AckManager};
+pub use ack_manager::{AckError, AckManager, GUARANTEED_DATAGRAM_BUDGET};
 pub use link::{Link, LinkError, Received};
 pub use mesh_link::{
     MeshLink, MeshLinkError, MeshReceived, MeshSessionKey, SessionLink, should_dial_mesh,

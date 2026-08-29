@@ -1222,17 +1222,28 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   redundancy flows at all — a ranking on any static property starves here, because continuous fresh
   traffic introduces new better-ranked candidates every packet, parking an outranked payload below
   the budget cutoff indefinitely while its seq gates the peer's delivered prefix. (A payload with no
-  recorded carry at all — a refused build, a re-home re-inject, a reset survivor — outranks
-  everything: zero copies of it are on the wire.) The head of that line gates the whole refill: when
-  even the datagram budget cannot fit the most overdue payload (a wide turn sharing a packet with a
-  fresh one), the packet carries **no redundancy at all**, because both drivers arm their
-  maintenance flush exactly when a send re-carries nothing, and the flush's fresh-free packet is the
-  one place the wide payload always fits — packing smaller candidates around a blocked head would
-  reset that flush from packets the head can never ride, stranding it behind continuous traffic.
-  Under saturation the wait scales with the backlog (bounded by the unacked-window cap) rather than
-  the spacing cap — a fixed cadence is impossible when redundancy service runs at or below backlog
-  growth, and most-overdue-first is also the right priority there, approximating the oldest-first
-  order the lockstep prefix actually needs. No loss pattern can strand a payload. Accepted trade:
+  recorded carry at all — a refused build, a re-home re-inject, a reset survivor — waits from its
+  registration instead of its last carry, so the same monotone key covers it: a *recurring* stream
+  of never-carried arrivals each starts its wait at zero and cannot indefinitely outrank a payload
+  whose wait keeps growing.) The head of that line gates the whole refill: when even the datagram
+  budget cannot fit the most overdue payload (a wide turn sharing a packet with a fresh one), the
+  packet carries **no redundancy at all**, because both drivers arm their maintenance flush exactly
+  when a send re-carries nothing, and the flush's fresh-free packet is the one place the wide
+  payload always fits — packing smaller candidates around a blocked head would reset that flush
+  from packets the head can never ride, stranding it behind continuous traffic. (The flush serves
+  it within one flush interval on the client edge and the relay's client-facing links; the mesh
+  checks per-session flush deadlines on a link-global maintenance tick, which bounds it at roughly
+  two.) That flush always having room is itself guaranteed statically: datagram payloads are
+  admitted against a **fixed floor budget** (`GUARANTEED_DATAGRAM_BUDGET`), never the live
+  discovered `max_datagram_size()` — quinn's black-hole detector shrinks the live value back to the
+  1200-byte MTU floor under loss bursts, exactly the weather redundancy exists for, and a payload
+  admitted against a discovered budget could out-size every later packet, flushes included, and
+  strand silently. Payloads over the floor divert to the reliable control streams, which carry any
+  size. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
+  below backlog growth, and most-overdue-first is also the right priority there, approximating the
+  oldest-first order the lockstep prefix actually needs. No loss pattern can strand a payload.
+  Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench

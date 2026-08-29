@@ -5081,9 +5081,16 @@ mod tests {
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
 
-        // Near-MTU turns: each fresh turn nearly fills a datagram, so a packet has no
-        // room to also re-carry an older unacked turn as redundancy.
-        let big = move || turn(0, &vec![0x7u8; budget * 3 / 4]);
+        // The largest datagram-admissible turns: each fresh turn is close to
+        // the admission floor, so two of them can never share one datagram and
+        // a packet has no room to also re-carry an older unacked turn as
+        // redundancy.
+        let big_commands = rally_point_transport::GUARANTEED_DATAGRAM_BUDGET - 64;
+        assert!(
+            big_commands * 2 > budget,
+            "premise: two near-floor turns must not share a {budget}-byte datagram",
+        );
+        let big = move || turn(0, &vec![0x7u8; big_commands]);
 
         // Turn 0 goes out, but its datagram is dropped on the wire.
         chan_a.outbound.send(big()).await.unwrap();
@@ -5149,10 +5156,27 @@ mod tests {
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
 
+        // The wide turn is the largest admissible; the following turns are
+        // sized so that (a) wide + one of them exceeds the live budget — the
+        // head-of-line block this test exists to exercise — while (b) any two
+        // of them share a packet comfortably, so smaller redundancy *is*
+        // available to wrongly pack around the blocked head. 64 bytes of
+        // slack covers packet/element framing in both directions.
+        let wide_commands = rally_point_transport::GUARANTEED_DATAGRAM_BUDGET - 64;
+        let small_commands = budget - wide_commands;
+        assert!(
+            wide_commands + small_commands + 64 > budget,
+            "premise (a): wide + small must exceed the {budget}-byte budget",
+        );
+        assert!(
+            small_commands * 2 + 64 < budget,
+            "premise (b): two smalls must share a {budget}-byte datagram",
+        );
+
         // The wide turn goes out alone, and its datagram is dropped on the wire.
         chan_a
             .outbound
-            .send(turn(0, &vec![0x7u8; budget * 3 / 4]))
+            .send(turn(0, &vec![0x7u8; wide_commands]))
             .await
             .unwrap();
         let _lost = link_b.connection().read_datagram().await.unwrap();
@@ -5165,7 +5189,11 @@ mod tests {
             let outbound = chan_a.outbound.clone();
             tokio::spawn(async move {
                 for _ in 0..24 {
-                    if outbound.send(turn(0, &[0x7u8; 110])).await.is_err() {
+                    if outbound
+                        .send(turn(0, &vec![0x7u8; small_commands]))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(30)).await;
