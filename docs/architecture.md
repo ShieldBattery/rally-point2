@@ -1214,10 +1214,18 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   dense phase is the minimum that still recovers an isolated loss on the very next packet. Below the
   fresh stream's own byte rate (an outage-grade fade, where lockstep must stall regardless), spacing's
   aggregate no longer converges — the due set grows with the window — and the *budget* is what still
-  bounds every bundle. **Liveness is load-bearing:** a packet's first redundancy element is exempt
-  from the policy budget (a payload wider than the budget must still be re-carryable — lockstep can
-  never drop a turn), and the spacing cap keeps every unacked payload on a bounded re-carry cadence
-  until an ack or beacon cursor retires it, so no loss pattern can strand a payload. Accepted trade:
+  bounds every bundle. **Liveness is load-bearing, and it is an ordering guarantee, not a fixed cadence:** a packet's
+  first redundancy element is exempt from the policy budget (a payload wider than the budget must
+  still be re-carryable — lockstep can never drop a turn), and when the due backlog outgrows what
+  the budget can serve per packet, the constrained refill serves the *longest-waiting* carry first.
+  That ranking key grows for a candidate that gets passed over, so every payload is served while any
+  redundancy flows at all — a ranking on any static property starves here, because continuous fresh
+  traffic introduces new better-ranked candidates every packet, parking an outranked payload below
+  the budget cutoff indefinitely while its seq gates the peer's delivered prefix. Under saturation
+  the wait scales with the backlog (bounded by the unacked-window cap) rather than the spacing cap —
+  a fixed cadence is impossible when redundancy service runs at or below backlog growth, and
+  most-overdue-first is also the right priority there, approximating the oldest-first order the
+  lockstep prefix actually needs. No loss pattern can strand a payload. Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench

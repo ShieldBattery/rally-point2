@@ -493,12 +493,20 @@ impl MeshLink {
             session: key.session.0,
             packet: Some(packet),
             conditions,
-            tenant: key.tenant,
+            tenant: key.tenant.clone(),
         };
         let encoded = mesh_packet.encode_to_vec();
         let datagram_len = encoded.len();
         match self.connection.send_datagram(encoded.into()) {
-            Ok(()) => Ok(redundant),
+            // Carry bookkeeping describes what reached the wire (see
+            // `Link::send`): recorded on acceptance, never for a refused send.
+            Ok(()) => {
+                if let Some(session_link) = self.sessions.get_mut(&key) {
+                    let packet = mesh_packet.packet.as_ref().expect("set above");
+                    session_link.acks.record_sent(packet);
+                }
+                Ok(redundant)
+            }
             Err(quinn::SendDatagramError::TooLarge) => Err(MeshLinkError::PayloadTooLarge {
                 needed: datagram_len,
                 budget: datagram_budget,

@@ -555,6 +555,9 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
                     let packet = sender
                         .build_outgoing(Some(payload), DATAGRAM_BUDGET)
                         .expect("seq space is ample for a sim run");
+                    // The simulated QUIC endpoint accepts every datagram (loss
+                    // and queueing happen beyond it), so every build records.
+                    sender.record_sent(&packet);
                     net.dispatch_forward(now_ms, packet);
                 }
                 // Track the worst prefix lag: newest created seq vs slot 0's
@@ -576,6 +579,7 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
                 let packet = receiver
                     .build_outgoing(None, DATAGRAM_BUDGET)
                     .expect("seq space is ample for a sim run");
+                receiver.record_sent(&packet);
                 if !net.reverse.loss.lost(now_ms, &mut net.rng) {
                     let at = now_ms + net.reverse.owd_at(now_ms);
                     net.push(at, EventKind::DeliverReverse(packet));
@@ -760,9 +764,14 @@ fn scenarios() -> Vec<Scenario> {
             },
             reverse: clean_path,
         },
-        // A harsher squeeze: deeper bufferbloat and heavier loss. Verifies the
-        // chosen schedule has margin past the milder episode's capacity edge
-        // rather than sitting exactly on it.
+        // An outage-grade squeeze: deeper bufferbloat and heavier loss push
+        // effective capacity below what the fresh turn stream needs, so every
+        // policy runs far behind and lockstep must stall — no redundancy
+        // discipline can rescue an inelastic flow from a path that cannot
+        // carry it. This is a boundary probe, not a margin claim: what it
+        // shows is the degradation *shape* — the budget still bounds every
+        // bundle (where spacing alone lets bundles grow back to the MTU), and
+        // recovery after the fade lifts stays prompt.
         Scenario {
             name: "squeeze-harsh",
             duration_ms: 120_000.0,

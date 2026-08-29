@@ -360,7 +360,15 @@ impl Link {
         let encoded = packet.encode_to_vec();
         let datagram_len = encoded.len();
         match self.connection.send_datagram(encoded.into()) {
-            Ok(()) => Ok(redundant),
+            // Carry bookkeeping describes what reached the wire, so it is
+            // recorded only once the transport accepts the datagram: a refused
+            // send (a path-MTU race, a dying connection) leaves the carried
+            // payloads' re-carry schedules undisturbed and nothing for an
+            // impossible ack to retire.
+            Ok(()) => {
+                self.acks.record_sent(&packet);
+                Ok(redundant)
+            }
             Err(quinn::SendDatagramError::TooLarge) => Err(LinkError::PayloadTooLarge {
                 needed: datagram_len,
                 budget,
