@@ -935,6 +935,18 @@ pub(crate) fn lone_packet_len(payload: &Payload) -> usize {
     header.encoded_len() + payload_element_len(payload.encoded_len())
 }
 
+/// Whether `payload` can ride the datagram path at all: its worst-case lone
+/// packet (`lone_packet_len`) fits [`GUARANTEED_DATAGRAM_BUDGET`]. This is
+/// the static, connection-free half of `Link::payload_fits` — and since every
+/// establishment path refuses a peer whose advertised datagram limit
+/// undercuts the floor, the two agree on every connection a session can
+/// actually hold. For callers with no live connection at hand: a reconnect
+/// deciding, from its retained turns alone, which ones the resume will
+/// re-send over the reliable control stream rather than the datagram window.
+pub fn fits_guaranteed_datagram(payload: &Payload) -> bool {
+    lone_packet_len(payload) <= GUARANTEED_DATAGRAM_BUDGET
+}
+
 /// What one of our sent packets carried, so an ack can retire its payloads.
 #[derive(Default, Clone)]
 struct SentPacket {

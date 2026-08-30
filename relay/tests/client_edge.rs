@@ -1977,6 +1977,196 @@ async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
     assert_eq!(reached, 2);
 }
 
+/// The lost-oversize-turn resume shape: oversize seq 0 was written to the old
+/// connection's control stream but never reached the relay, while datagram
+/// seq 1 was received. The reconnect anchors at 0 — the oldest seq its
+/// restage will re-send — and the relay must both seed the received seq 1
+/// from its forward-gate receipts and accept the control-stream retry of seq
+/// 0 as FRESH. An anchor computed from the datagram window alone would sit at
+/// 1 (the oversize turn never entered it), and the relay's dedup would then
+/// swallow the retry as a duplicate before fan-out — permanently stranding
+/// every peer on seq 0.
+#[tokio::test]
+async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry() {
+    use rally_point_transport::control::{ControlInbound, send_control_turn, spawn_control_reader};
+
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(323);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let mut ctrl0 = spawn_control_reader(slot0.connection().clone());
+
+    // Datagram seq 1 reaches the relay; oversize seq 0 never does.
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    slot1
+        .send(Some(Payload {
+            seq: 1,
+            slot: 0,
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let mut delivered = Vec::new();
+    while delivered.is_empty() {
+        delivered = slot0.recv().await.unwrap().fresh;
+    }
+    assert_eq!(delivered[0].seq, 1);
+    slot1.connection().close(0u32.into(), b"dropped");
+
+    // The production anchor: no replayable datagram seq (1 was acked), oldest
+    // restaged oversize turn at 0 — the cursor names 0.
+    let slot1b = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(1), 0)],
+    )
+    .await;
+
+    // The resume restages the oversize turn onto the fresh control stream.
+    let (mut ctrl1_send, _unused_recv) = slot1b.connection().open_bi().await.unwrap();
+    send_control_turn(
+        &mut ctrl1_send,
+        Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0x05u8; 2000].into(),
+            game_frame_count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The retry is accepted as fresh and fanned to the peer's control stream
+    // (oversize turns ride the reliable path end to end).
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ctrl0
+                .recv()
+                .await
+                .expect("slot 0's control stream stays open")
+            {
+                ControlInbound::OversizeTurn(payload) => break payload,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("the restaged oversize turn must be forwarded, not deduped away");
+    assert_eq!(forwarded.seq, 0);
+    assert_eq!(forwarded.slot, 1, "bound to the authorized slot");
+    assert_eq!(forwarded.commands.len(), 2000);
+}
+
+/// A never-started session's last-slot disconnect closes the session at once
+/// but keeps the undecided drop hold — the token that admits a quick
+/// reconnect. The receipts that reconnect's resume seeds from must survive
+/// exactly as long as the token: here seq 1 was received and acked while seq
+/// 0 was lost, the reconnect anchors at 0, and the relay must still close the
+/// acked hole at 1 from receipts that outlived the emptied-session teardown.
+#[tokio::test]
+async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receipts() {
+    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::routing::SessionKey;
+
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(324);
+
+    // Descriptor-backed but never started: the maker exists, and the expected
+    // set is never covered by slot 1 alone, so no session-start ever fires.
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &mesh.decision_makers,
+        &key,
+        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+        Authority::SelfRelay,
+        std::collections::HashSet::new(),
+        [SlotId(0), SlotId(1)].into_iter().collect(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        None,
+        false,
+    );
+    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let endpoint = client_endpoint(&ca);
+
+    // Seq 1 reaches the relay (seq 0 is lost). Waiting for the ack — the
+    // unacked window emptying — proves the relay received and recorded it.
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    slot1
+        .send(Some(Payload {
+            seq: 1,
+            slot: 0,
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while slot1.payloads_in_flight() > 0 {
+            let _ = slot1.recv().await;
+        }
+    })
+    .await
+    .expect("the relay acks the received turn");
+    slot1.connection().close(0u32.into(), b"dropped");
+
+    // Give the relay time to process the disconnect: the departure marks the
+    // drop hold and the never-started emptying runs its close — the teardown
+    // that must retain the receipts. (Reconnecting faster would still work,
+    // but by replacing the live seat rather than exercising the retention.)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let slot1b = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(1), 0)],
+    )
+    .await;
+    let mut beacons =
+        rally_point_transport::beacon::spawn_beacon_reader(slot1b.connection().clone());
+    let mut slot1b = slot1b;
+
+    // Replay the lost seq 0, then continue live past the acked hole at 1.
+    for seq in [0u64, 2] {
+        slot1b
+            .send(Some(Payload {
+                seq,
+                slot: 0,
+                commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+
+    // The beacon cursor folds through the retained receipt at 1 and reaches
+    // 2. If the teardown had destroyed the receipts, the prefix would wedge
+    // at 0 forever and this times out.
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match beacons.recv().await {
+                Some((SlotId(1), cursor)) if cursor >= 2 => break cursor,
+                Some(_) => continue,
+                None => panic!("the beacon stream ended before the cursor advanced"),
+            }
+        }
+    })
+    .await
+    .expect("the resumed window must fold through receipts retained past the close");
+    assert_eq!(reached, 2);
+}
+
 /// A client presenting an absurd own-slot resume-cursor anchor (near the u64
 /// ceiling) is refused outright rather than let that value become the dedup
 /// window's base -- the real gate the transport-level saturating arithmetic

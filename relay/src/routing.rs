@@ -2994,17 +2994,6 @@ fn maybe_close_emptied_session_gated(
     // Same for the skin blob map and member set: no local member remains to
     // replay it to, so the whole per-session state can be dropped.
     crate::skin::end_session(&mesh.skins, key);
-    // Same for the forwarded-turn replay ring: no local slot remains to resume,
-    // so nothing more will be replayed from it.
-    mesh.turn_ring.end_session(key);
-    // Same for this session's forward-once state: no local
-    // slot remains to forward to, so there is nothing left for it to gate.
-    // Its entry is created lazily on the first turn forwarded for the
-    // session (there is no explicit "join" counterpart to pair this with),
-    // but this is the same "last local slot gone" trigger every other
-    // per-session registry above already tears down on, so its lifetime
-    // matches theirs.
-    crate::mesh::deregister_seen(&mesh.seen, key);
     // Same for request limiters, and for any hold whose slot's leave is already
     // decided — but NOT for an undecided hold: on a session that never started
     // (where a fresh undecided drop does not defer the close) that hold is
@@ -3012,6 +3001,30 @@ fn maybe_close_emptied_session_gated(
     // has decided yet. See `crate::drop_hold` module docs.
     let decided = consensus::decided_slots(&mesh.decision_makers, key);
     mesh.drop_holds.end_session(key, &decided);
+    // The forwarded-turn replay ring and the forward-once seen state (whose
+    // entry is created lazily on the first turn forwarded — there is no
+    // explicit "join" counterpart to pair the teardown with) go down on the
+    // same "last local slot gone" trigger as the registries above — UNLESS a
+    // surviving hold still promises a reconnect this relay would admit. That
+    // reconnect's resume seeds its fresh receive window from the seen state's
+    // receipts (every transport-acked seq its sparse anchor will not re-send),
+    // so destroying them here while honoring the hold would admit a resume
+    // whose acked holes nothing can ever fill: the prefix wedges, and the
+    // live stream eventually exits the receive window. Receipt-state lifetime
+    // must match the reconnect-admission token's, exactly as the provisional
+    // journal is retained while a descriptor could still drain it — so both
+    // stores are kept until no such token remains: a reconnect re-opens the
+    // close latch and this teardown re-runs at the next emptying, and
+    // descriptor retirement sweeps them terminally (`MeshControl::end_session`)
+    // if the reconnect never comes. (The retained ring is empty in practice —
+    // it records only started sessions, and a started session's reconnectable
+    // departure defers this close entirely above — but tying both stores to
+    // the same token keeps the rule whole rather than shape-dependent.)
+    let surviving_holds = mesh.drop_holds.pending_slots(key);
+    if !consensus::has_reconnectable_departure(&mesh.decision_makers, key, &surviving_holds) {
+        mesh.turn_ring.end_session(key);
+        crate::mesh::deregister_seen(&mesh.seen, key);
+    }
     // A session no descriptor ever named has no coordinator lifecycle, so the
     // retirement that ordinarily cleans up its ingress gate will never come —
     // drop the gate (and the provisional mark: a later dial for the same id
@@ -4346,6 +4359,67 @@ mod tests {
             saw_closed |= matches!(notice, RelayNotice::SessionClosed { .. });
         }
         assert!(saw_closed, "the close reported on the emptying itself");
+    }
+
+    /// A NEVER-started session's emptying closes immediately — nothing defers
+    /// it — but the undecided held drop still survives as the
+    /// reconnect-admission token, and the receipts that reconnect's resume
+    /// depends on must survive exactly as long. The teardown erasing the seen
+    /// state while honoring the hold would admit a resume whose
+    /// transport-acked holes (a pre-start turn the forward gate recorded)
+    /// nothing could ever seed: the fresh window's prefix wedges permanently.
+    #[tokio::test]
+    async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
+        use crate::consensus::{self, Authority, RelayNotice};
+        use rally_point_proto::control::BufferBounds;
+
+        let k = key();
+        let sessions: Sessions = Arc::default();
+        let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mesh.decision_makers.set_notice_notifier(tx);
+        // Descriptor-backed (a maker exists, homing slot 0) but never started.
+        let _ = consensus::sync_maker(
+            &mesh.decision_makers,
+            &k,
+            BufferBounds::new(0, 20).unwrap(),
+            Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            [SlotId(0)].into_iter().collect(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            None,
+            false,
+        );
+
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        g0.disarm();
+        // A pre-start turn passed the forward gate: seq 1 was received and
+        // transport-acked while seq 0 never arrived — the acked hole the
+        // resume's anchor-0 seeding must close from these receipts.
+        crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 1);
+
+        // The only local slot's link dies without a clean leave.
+        end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
+
+        assert!(
+            mesh.drop_holds.is_pending(&k, SlotId(0)),
+            "the drop marked a hold — the reconnect-admission token",
+        );
+        let mut saw_closed = false;
+        while let Ok(notice) = rx.try_recv() {
+            saw_closed |= matches!(notice, RelayNotice::SessionClosed { .. });
+        }
+        assert!(
+            saw_closed,
+            "a never-started emptying still closes immediately",
+        );
+        let receipts = crate::mesh::slot_receipts(&mesh.seen, &k, SlotId(0));
+        assert_eq!(
+            receipts.ahead,
+            vec![1],
+            "the receipts survive the close for as long as the hold does",
+        );
     }
 
     #[test]

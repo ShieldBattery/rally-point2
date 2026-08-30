@@ -729,9 +729,18 @@ impl MeshControl {
         consensus::deregister_maker(&self.decision_makers, key);
         presence::forget(&self.presence, key);
         // Discard any turns still penned for the session — with the maker
-        // gone and the gate retired, no descriptor will ever drain them.
+        // gone and the gate retired, no descriptor will ever drain them. The
+        // replay ring and forward-once seen state fall with them: the
+        // session-emptied close retains both while an undecided hold still
+        // promises a reconnect (their receipts seed that resume's receive
+        // window), and retirement is the terminal boundary that ends the
+        // promise — with the descriptor gone there is no admission path left,
+        // so nothing else would ever sweep a retained pair whose reconnect
+        // never came. Idempotent when the emptied close already removed them.
         if let Some(turn_path) = &self.turn_path {
             turn_path.provisional_turns.discard(key);
+            turn_path.turn_ring.end_session(key);
+            crate::mesh::deregister_seen(&turn_path.seen, key);
         }
         // Retirement is terminal for the session's drop bookkeeping: with the
         // descriptor gone there is no admission path left for a held slot's
@@ -1865,6 +1874,46 @@ mod tests {
         assert!(
             !holds.abandon_armed(&key(1)),
             "the abandon timer is cancelled by retirement",
+        );
+    }
+
+    /// Retirement is also the terminal sweep for the receipt (forward-once
+    /// seen) and replay (turn ring) stores: the session-emptied close retains
+    /// both while an undecided hold still promises a reconnect their receipts
+    /// would seed, and with the descriptor gone no admission path remains —
+    /// nothing else would ever clean a retained pair whose reconnect never
+    /// came.
+    #[tokio::test]
+    async fn end_session_sweeps_retained_receipts_and_replay_state() {
+        let mesh_state = crate::mesh::new_mesh_state();
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control =
+            MeshControl::new(RelayId(1), makers, Arc::default()).with_turn_path(mesh_state.clone());
+        control.apply_descriptor(&descriptor(1, &[]));
+
+        crate::mesh::mark_seen(&mesh_state.seen, &key(1), SlotId(0), 0);
+        mesh_state.turn_ring.record(
+            &key(1),
+            &rally_point_proto::messages::Payload {
+                seq: 0,
+                slot: 0,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+            crate::turn_ring::TurnOrigin::Local,
+            2,
+        );
+
+        control.end_session(&key(1));
+
+        assert!(
+            !mesh_state.seen.lock().contains_key(&key(1)),
+            "the seen receipts are swept by retirement",
+        );
+        assert_eq!(
+            mesh_state.turn_ring.totals().sessions,
+            0,
+            "the replay ring is swept by retirement",
         );
     }
 
