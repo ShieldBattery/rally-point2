@@ -363,17 +363,27 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   seq, that tears the whole group down at once. The client heads it off by naming, as its own-slot cursor,
   the lowest seq its re-send can make **contiguous** — the anchor is a promise that every seq above it will
   arrive and close the window's prefix, and selective packet acks make the unacked window *sparse*, so the
-  bare oldest-unacked seq cannot honor it alone. On a **same-relay resume** the anchor is the oldest
-  still-unacked seq — presented even at 0, since its presence is what requests the seeding below — and the
-  **relay closes the acked holes itself**: it seeds the fresh window (`Link::seed_delivered`) from the two
-  session-lifetime stores that together hold every receipt it has ever acknowledged for the slot, at any
-  point in the session's life and across any connection churn. Those are the forward gate's seen registry
+  bare oldest-unacked seq cannot honor it alone. On a **same-relay resume** the anchor is the oldest seq
+  the resume will re-send over EITHER of its paths — the datagram redundancy's oldest still-unacked seq,
+  min'd with the oldest retained oversize turn the resume restages onto the fresh control stream (an
+  oversize turn never enters the unacked window, and the relay's dedup gates its control-delivered retry
+  exactly as it gates a datagram, so an anchor above it would discard the retry as a duplicate) — and it
+  is presented even at 0, since its presence is what requests the seeding below. The **relay closes the
+  acked holes itself**: it seeds the fresh window (`Link::seed_delivered`) from the two session-lifetime
+  stores that together hold every receipt it has ever acknowledged for the slot, at any point in the
+  session's life and across any connection churn. Those are the forward gate's seen registry
   (every turn that passed the gate, pre-start included — unlike the bounded replay ring, it never evicts;
   its sparse-cap collapse already treats swallowed gaps as delivered, so seeding from a collapsed prefix
   mirrors the gate's documented failure direction rather than adding one) and the provisional journal
   (turns accepted before a descriptor named the session — read before the gate, so a descriptor drain
   moving entries journal → gate can't hide one from both reads, and a journal overflow seals its slot
-  against readmission, so no resumable slot ever lost an entry to it). On a **re-home** the replacement
+  against readmission, so no resumable slot ever lost an entry to it). "Session-lifetime" is enforced
+  against every reconnect-admission token, not just a live roster: a never-started session's emptying
+  closes immediately but keeps the undecided drop hold that admits a quick re-dial, so the emptied-session
+  teardown retains the seen state (and replay ring) for as long as a surviving hold still promises a
+  reconnect this relay would admit — a reconnect re-opens the close latch and the next emptying
+  re-evaluates, and descriptor retirement sweeps a retained pair terminally if the reconnect never comes,
+  the same retained-until-retirement rule the provisional journal follows. On a **re-home** the replacement
   relay seeds from the same stores (its gate may hold mesh-forwarded receipts for the slot), but has no
   first-hand ack history, so the anchor itself carries the contract: the retention front extended downward
   only through *contiguously* unacked seqs (`contiguous_replayable_anchor`). Unacked seqs below the first
