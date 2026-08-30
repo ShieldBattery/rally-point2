@@ -1298,9 +1298,14 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   oldest-first order the lockstep prefix actually needs. The delivery guarantee, stated
   precisely: **while its session lives, every payload keeps being retried on a bounded cadence
   over a path that can carry it** — datagram payloads by the refill and the flushes, oversize
-  turns by the reliable control streams — with retirement only ever peer-confirmed. The one
-  scoped exception is a re-home anchor's below-the-hole replays, discarded under conditions where
-  no peer still needs them (see the resume-anchor contiguity rules in the reconnect section).
+  turns by the reliable control streams — with retirement only ever peer-confirmed. Two scoped
+  qualifications. A re-home anchor's below-the-hole replays are discarded under conditions where
+  no peer still needs them (see the resume-anchor contiguity rules in the reconnect section). And
+  an oversize turn's cross-connection retry rides the retention ring, which is bounded (512 turns
+  / 256 KiB, drop-oldest) — so "while its session lives" holds for it only as far as the ring
+  reaches. That an evicted oversize turn is never one a peer still needs is a game-model fact,
+  not a transport invariant: lockstep stalls turn production behind an undelivered turn, so the
+  ring can only rotate hundreds of turns past one that every peer has already consumed.
   Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —

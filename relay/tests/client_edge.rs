@@ -1977,15 +1977,22 @@ async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
     assert_eq!(reached, 2);
 }
 
-/// The lost-oversize-turn resume shape: oversize seq 0 was written to the old
-/// connection's control stream but never reached the relay, while datagram
-/// seq 1 was received. The reconnect anchors at 0 — the oldest seq its
-/// restage will re-send — and the relay must both seed the received seq 1
-/// from its forward-gate receipts and accept the control-stream retry of seq
-/// 0 as FRESH. An anchor computed from the datagram window alone would sit at
-/// 1 (the oversize turn never entered it), and the relay's dedup would then
-/// swallow the retry as a duplicate before fan-out — permanently stranding
-/// every peer on seq 0.
+/// The RELAY-SIDE integration of the lost-oversize-turn resume: oversize seq
+/// 0 was written to the old connection's control stream but never reached the
+/// relay, while datagram seq 1 was received. The reconnect anchors at 0 — the
+/// oldest seq its restage will re-send — and the relay must both seed the
+/// received seq 1 from its forward-gate receipts and accept the
+/// control-stream retry of seq 0 as FRESH. An anchor at 1 (what the datagram
+/// window alone would name — the oversize turn never entered it) has the
+/// relay's dedup swallow the retry as a duplicate before fan-out,
+/// permanently stranding every peer on seq 0.
+///
+/// This test supplies the anchor value and the retry directly, exercising
+/// the relay half in full: the real handshake, receipt seeding, control
+/// ingress, dedup, and fan-out. The client half — that a production
+/// reconnect computes exactly this anchor, the min across both re-send
+/// paths — is pinned by the driver's own
+/// `same_relay_cursor_anchors_below_a_restaged_oversize_turn` unit test.
 #[tokio::test]
 async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry() {
     use rally_point_transport::control::{ControlInbound, send_control_turn, spawn_control_reader};
@@ -2015,8 +2022,10 @@ async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry
     assert_eq!(delivered[0].seq, 1);
     slot1.connection().close(0u32.into(), b"dropped");
 
-    // The production anchor: no replayable datagram seq (1 was acked), oldest
-    // restaged oversize turn at 0 — the cursor names 0.
+    // The anchor a production reconnect computes for this shape: an emptied
+    // datagram window (its client retires seq 1 on ack — not observed here;
+    // the awaited fan-out above proves receipt, which is what the seeding
+    // depends on) and an oldest retained oversize turn at 0 name cursor 0.
     let slot1b = connect_slot_resuming(
         &endpoint,
         addr,
