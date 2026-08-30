@@ -494,6 +494,16 @@ pub async fn run_mesh_accept(
                 return;
             };
 
+            // Same floor invariant every establishment enforces (see
+            // `verify_datagram_budget`): a fleet peer advertising an
+            // under-floor datagram budget is misconfigured; refuse it and let
+            // the dial supervisor's ordinary retry own the fallout.
+            if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
+                tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
+                connection.close(0u32.into(), b"datagram budget under guaranteed floor");
+                return;
+            }
+
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
             let _ = links.send((peer_id, lease.generation(), tx)).await;
@@ -814,6 +824,15 @@ async fn dial_and_serve(
         connection.close(0u32.into(), b"superseded mesh link");
         return DialOutcome::Stop;
     };
+
+    // Same floor invariant every establishment enforces (see
+    // `verify_datagram_budget`); retrying the same misconfigured peer is
+    // pointless but harmless, so surface it as an ordinary failed attempt.
+    if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
+        tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
+        connection.close(0u32.into(), b"datagram budget under guaranteed floor");
+        return DialOutcome::Retry;
+    }
 
     // A cheap handle kept past the link's move below, so a driver exit can still
     // read the connection's close reason (naming a protocol-version refusal).

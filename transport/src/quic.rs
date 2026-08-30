@@ -149,6 +149,46 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     out
 }
 
+/// A freshly established connection's datagram budget falls short of
+/// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)
+/// — the peer advertised a datagram limit below the floor the transport's
+/// liveness arguments assume (path MTU alone can never take the budget under
+/// the floor; only a peer's handshake parameter can).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "peer's datagram budget ({advertised} bytes) is under the {floor}-byte guaranteed floor \
+     (or datagrams are unsupported)"
+)]
+pub struct DatagramBudgetTooSmall {
+    /// The connection's live `max_datagram_size()`, or 0 when datagrams are
+    /// not supported at all.
+    pub advertised: usize,
+    /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET).
+    pub floor: usize,
+}
+
+/// Verifies that `connection` supports datagrams with a budget at or above the
+/// guaranteed floor. **Every** link establishment — client-edge dial,
+/// client-edge accept, mesh dial, mesh accept — must call this and refuse the
+/// connection on failure, because the floor is an admission-time invariant the
+/// rest of the transport builds on: payloads are admitted for datagram
+/// carriage against the floor and are assumed to fit every packet the
+/// connection (and any later rebind target) will ever build. A peer whose
+/// advertised limit undercuts the floor is an unsupported configuration;
+/// refusing it outright at establishment is strictly better than degrading
+/// into a state where preserved unacked payloads no longer fit the link that
+/// is supposed to replay them.
+pub fn verify_datagram_budget(
+    connection: &quinn::Connection,
+) -> Result<(), DatagramBudgetTooSmall> {
+    let floor = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET;
+    let advertised = connection.max_datagram_size().unwrap_or(0);
+    if advertised < floor {
+        return Err(DatagramBudgetTooSmall { advertised, floor });
+    }
+    Ok(())
+}
+
 /// Requests but does not require a TLS client certificate from a peer dialing
 /// the relay's single listening endpoint ([`server_config`]), and accepts
 /// whatever certificate is presented without validating it against any

@@ -173,34 +173,17 @@ impl Link {
     /// identities carried end-to-end, so the dedup keyed on them stays valid across
     /// the connection swap.
     ///
-    /// Returns a staging copy of every preserved payload whose delivery now
-    /// belongs to the reliable control stream: those the **fresh**
-    /// connection's admission budget refuses (its peer may advertise a
-    /// smaller datagram limit than the connection that admitted them), plus
-    /// any diverted by an earlier rebind and not yet retired. Such a payload
-    /// is excluded from datagram refill — no longer fitting a packet, it must
-    /// not block the head of a line it cannot ride — and from the resume
-    /// anchor ([`oldest_replayable_seq`](Self::oldest_replayable_seq)), but
-    /// deliberately **stays in the unacked window**, where only the
-    /// peer-confirmed ack-beacon cursor retires it. The staging
-    /// copy is therefore disposable — the caller writes it to the control
-    /// stream, and if that connection dies before the relay provably
-    /// processed it (a locally-successful write proves nothing), the *next*
-    /// rebind returns the payload again; the peer's `(slot, seq)` dedup makes
-    /// any re-delivery harmless. Usually empty: first-party peers advertise
-    /// ample limits, and the guaranteed floor covers path-MTU movement. On a
-    /// connection with no datagram support at all, every preserved payload is
-    /// returned.
-    #[must_use = "returned payloads no longer ride datagrams and must be \
-                  staged for reliable-control delivery"]
-    pub fn rebind(&mut self, connection: quinn::Connection) -> Vec<Payload> {
+    /// A rebind target's datagram budget always covers the preserved window:
+    /// every establishment path refuses a connection whose budget undercuts
+    /// the guaranteed floor
+    /// ([`verify_datagram_budget`](crate::quic::verify_datagram_budget)), and
+    /// every preserved payload was admitted against that same floor.
+    pub fn rebind(&mut self, connection: quinn::Connection) {
         self.connection = connection;
         self.acks.reset_connection();
         // dedup preserved: it is what makes the reconnect a resume, not a restart.
         // ingress_slot preserved: the connection swapped, but the slot this edge is
         // authorized for did not, so the wire-slot rewrite must keep applying.
-        let admission = self.datagram_admission_budget().unwrap_or(0);
-        self.acks.divert_unacked_wider_than(admission)
     }
 
     /// Payloads sent but not yet known-delivered — the in-flight depth, and the
@@ -223,21 +206,42 @@ impl Link {
         self.acks.upstream_lost_packets()
     }
 
-    /// The lowest still-unacked payload seq this link's *datagram redundancy*
-    /// will replay for `slot` — control-diverted payloads excluded — or
-    /// `None` if nothing replayable is in flight. A driver presents it as the
-    /// own-slot resume anchor on a re-dial: the fresh relay bases the slot's
-    /// receive window there (see
-    /// [`anchor_receive_window`](Self::anchor_receive_window)) rather than at
-    /// 0, and every seq above it eventually reaches the relay (replayable
-    /// unacked seqs re-carry until confirmed), so the window's contiguous
-    /// prefix always catches up. A diverted seq must not anchor the window —
-    /// nothing replays the retention-aged seqs between it and the live
-    /// stream, and a window based on a permanent void eventually rejects the
-    /// live stream outright. See
+    /// The lowest still-unacked payload seq this link's datagram redundancy
+    /// will replay for `slot`, or `None` if nothing is in flight — the
+    /// **same-relay** resume anchor. The unacked window is sparse (selective
+    /// packet acks leave holes), so the contiguity a receive-window anchor
+    /// promises holds on a same-relay resume only because the relay seeds the
+    /// fresh window from its own turn ring (every acked hole is a seq it
+    /// received and recorded; see [`seed_delivered`](Self::seed_delivered)).
+    /// A re-home to a relay with no ring must anchor with
+    /// [`contiguous_replayable_anchor`](Self::contiguous_replayable_anchor)
+    /// instead. See
     /// [`AckManager::oldest_replayable_seq`](crate::ack_manager::AckManager::oldest_replayable_seq).
     pub fn oldest_replayable_seq(&self, slot: SlotId) -> Option<u64> {
         self.acks.oldest_replayable_seq(slot)
+    }
+
+    /// The lowest anchor a re-home resume may advertise for `slot`: the
+    /// retention `front` extended downward only through contiguously unacked
+    /// seqs. See
+    /// [`AckManager::contiguous_replayable_anchor`](crate::ack_manager::AckManager::contiguous_replayable_anchor)
+    /// for why a fresh relay's window must never be anchored below an acked
+    /// hole.
+    pub fn contiguous_replayable_anchor(&self, slot: SlotId, front: u64) -> u64 {
+        self.acks.contiguous_replayable_anchor(slot, front)
+    }
+
+    /// Marks `seq` as already delivered for `slot` without a payload arriving —
+    /// the resume-time seed for receipts that predate this connection. A relay
+    /// resuming a client seeds the fresh receive window with the seqs its own
+    /// turn ring already holds for the slot, so the acked holes above the
+    /// client's anchor (selective packet acks make the unacked window sparse,
+    /// and the client only replays what is still unacked) don't wedge the
+    /// window's contiguous prefix — and with it the beacon cursor, and
+    /// eventually the window itself, when the live stream runs a full receive
+    /// window past the stuck base.
+    pub fn seed_delivered(&mut self, slot: SlotId, seq: u64) {
+        self.dedup.mark_delivered(slot, seq);
     }
 
     /// The top of the contiguous run of payloads this link has delivered to its
@@ -849,6 +853,26 @@ impl Dedup {
     /// re-homed session needs this. A no-op when `anchor` is 0 (the default base is
     /// already 0) or when the slot has already received something — anchoring only a
     /// pristine slot means it never rewinds a prefix that is already forming.
+    /// Marks `seq` as already delivered for `slot` without a payload being
+    /// offered — the receive-window seed for receipts established outside
+    /// this connection (a resuming relay's own turn ring). Unlike an offer,
+    /// this enforces no window bound: seeds come from the local trusted
+    /// store, not the wire, and are bounded by that store's own size.
+    pub(crate) fn mark_delivered(&mut self, slot: SlotId, seq: u64) {
+        let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
+            delivered_through: None,
+            ahead: BTreeSet::new(),
+        });
+        match state.delivered_through {
+            Some(top) if seq <= top => {}
+            Some(top) if seq == top + 1 => state.advance_contiguous(seq),
+            None if seq == 0 => state.advance_contiguous(0),
+            _ => {
+                state.ahead.insert(seq);
+            }
+        }
+    }
+
     pub(crate) fn anchor(&mut self, slot: SlotId, anchor: u64) {
         let Some(prefix_top) = anchor.checked_sub(1) else {
             return;
@@ -1911,81 +1935,54 @@ mod tests {
         client.send(Some(small)).unwrap();
     }
 
-    /// A rebind can land on a connection whose peer advertises a smaller
-    /// datagram limit than the one that admitted the preserved unacked
-    /// window's payloads. Such a payload must be **diverted, not dropped**:
-    /// returned for reliable-control staging, excluded from datagram refill
-    /// (it can no longer fit a packet and must not block the head of the
-    /// line), excluded from the resume anchor (nothing replays the seqs
-    /// between an aged diverted turn and the live stream, so anchoring at it
-    /// would base the relay's receive window on a permanent void), yet kept
-    /// in the window — where a *second* connection failure re-returns it for
-    /// re-staging (a locally-successful control write proves nothing about
-    /// peer-side processing), and only the peer-confirmed beacon cursor
-    /// retires it. The retention ring only covers the newest turns, so for an
-    /// older preserved payload this loop is the only route.
+    /// The floor verification every establishment path runs: a peer whose
+    /// advertised datagram budget undercuts the guaranteed floor is an
+    /// unsupported configuration and must be refused whole — partially
+    /// serving it would let payloads admitted on one connection outgrow a
+    /// later one, stranding them.
     #[tokio::test]
-    async fn a_rebind_diverted_payload_survives_a_second_connection_failure() {
-        let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
-
-        // A wide-but-admissible turn and a small one ride connection A and
-        // stay unacked (the server never responds).
-        let wide_commands = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET - 64;
-        let wide = Payload {
-            seq: 5,
-            slot: 0,
-            commands: vec![0u8; wide_commands].into(),
-            ..Default::default()
-        };
-        assert!(client.payload_fits(&wide).unwrap());
-        client.send(Some(wide)).unwrap();
-        client.send(Some(turn(0, 6, 0x2A))).unwrap();
-        assert_eq!(client.payloads_in_flight(), 2);
-
-        // Connection A dies; the replacement's peer advertises 800 bytes. The
-        // wide turn is returned for control-stream staging but STAYS in the
-        // window (it keeps counting in flight) — while the resume anchor
-        // skips it: only the small turn, which datagram redundancy will
-        // actually replay, may base a fresh relay's receive window.
-        let (fresh_conn, _fresh_server_conn, _fresh_client_ep, _fresh_server_ep) =
+    async fn establishment_verification_refuses_an_under_floor_peer() {
+        let (small_conn, _server_conn, _client_ep, _server_ep) =
             connect_to_peer_with_datagram_limit(800).await;
-        let staged = client.rebind(fresh_conn);
-        assert_eq!(
-            staged.iter().map(|payload| payload.seq).collect::<Vec<_>>(),
-            vec![5],
-        );
-        assert_eq!(client.payloads_in_flight(), 2);
-        assert_eq!(client.oldest_replayable_seq(SlotId(0)), Some(6));
+        let refused = crate::quic::verify_datagram_budget(&small_conn);
+        assert!(refused.is_err(), "an 800-byte peer sits under the floor");
 
-        // The refill never offers the diverted turn to datagrams — a flush
-        // carries the small turn, unblocked by the head it can't ride.
-        let flushed = client.send(None).unwrap();
-        assert_eq!(flushed, 1, "the flush re-carries only the small turn");
+        let (normal, _b, _ea, _eb) = connected_connections().await;
+        crate::quic::verify_datagram_budget(&normal)
+            .expect("a default-config peer clears the floor");
+    }
 
-        // The staging connection also dies (its control write, successful or
-        // not, proved nothing). The next rebind returns the wide turn AGAIN
-        // for re-staging — the staged copy was disposable, the window copy is
-        // the durable one.
-        let (second_conn, _second_server_conn, _second_client_ep, _second_server_ep) =
-            connect_to_peer_with_datagram_limit(800).await;
-        let restaged = client.rebind(second_conn);
-        assert_eq!(
-            restaged
-                .iter()
-                .map(|payload| payload.seq)
-                .collect::<Vec<_>>(),
-            vec![5],
-        );
+    /// A resuming relay seeds the fresh receive window with the seqs its turn
+    /// ring already holds, so an acked hole above the client's sparse-window
+    /// anchor doesn't wedge the contiguous prefix. Without the seed, the
+    /// prefix here would stick at 5 forever — seq 6 is never re-sent — and
+    /// with it the beacon cursor, until the live stream exits the receive
+    /// window entirely.
+    #[tokio::test]
+    async fn a_seeded_receive_window_folds_acked_holes_into_the_prefix() {
+        let (mut sender, mut receiver, _ea, _eb) = connected_links().await;
 
-        // Only the peer-confirmed beacon cursor retires it; after that, a
-        // third rebind has nothing left to stage. (A fresh relay's beacon
-        // starts at the advertised anchor, so its first cursor already
-        // covers the below-anchor diverted seq.)
-        assert_eq!(client.retire_through(SlotId(0), 5), 1);
-        assert_eq!(client.oldest_replayable_seq(SlotId(0)), Some(6));
-        let (third_conn, _third_server_conn, _third_client_ep, _third_server_ep) =
-            connect_to_peer_with_datagram_limit(800).await;
-        assert!(client.rebind(third_conn).is_empty());
-        assert_eq!(client.payloads_in_flight(), 1);
+        // The resuming client anchors at its oldest unacked seq (5); the relay
+        // knows it already received 6 and seeds it.
+        receiver.anchor_receive_window(SlotId(0), 5);
+        receiver.seed_delivered(SlotId(0), 6);
+
+        // The replayed 5 arrives; the prefix folds through the seeded 6.
+        sender.send(Some(turn(0, 5, 0x55))).unwrap();
+        let got = receiver.recv().await.unwrap();
+        assert_eq!(got.fresh.len(), 1);
+        assert_eq!(receiver.delivered_through(SlotId(0)), Some(6));
+
+        // Live turns continue in order past the hole.
+        sender.send(Some(turn(0, 7, 0x77))).unwrap();
+        let got = receiver.recv().await.unwrap();
+        assert_eq!(got.fresh.len(), 1);
+        assert_eq!(receiver.delivered_through(SlotId(0)), Some(7));
+
+        // The seeded seq never re-delivers: a redundant copy of 6 arriving
+        // later (an old-connection straggler) is dropped as a duplicate.
+        sender.send(Some(turn(0, 6, 0x66))).unwrap();
+        let got = receiver.recv().await.unwrap();
+        assert_eq!(got.fresh.len(), 0, "the seeded seq is already delivered");
     }
 }

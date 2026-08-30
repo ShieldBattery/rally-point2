@@ -274,11 +274,6 @@ pub struct AckManager {
     /// The peer's recently-received packets, keyed by their packet seq. Drives
     /// the `ack` / `ack_bits` we send back.
     received_packets: ReceivedPacketHistory,
-    /// How many entries in `unacked_payloads` are control-diverted
-    /// ([`SentPayload::control_diverted`]). Kept exact by every mutation so
-    /// the all-fit fast path can require the window to be divert-free in O(1)
-    /// instead of scanning for flags.
-    control_diverted_count: usize,
     /// How the redundancy refill spends bytes and rotates coverage.
     policy: RecarryPolicy,
 }
@@ -297,7 +292,6 @@ impl AckManager {
             unacked_payloads: BTreeMap::new(),
             unacked_payload_wire_len: Some(0),
             received_packets: ReceivedPacketHistory::default(),
-            control_diverted_count: 0,
             policy,
         }
     }
@@ -353,30 +347,64 @@ impl AckManager {
         self.packet_seq
     }
 
-    /// The lowest still-unacked payload seq for `slot` that the datagram
-    /// redundancy pass will actually replay — control-diverted payloads are
-    /// deliberately excluded — or `None` if the slot has nothing replayable in
-    /// flight.
+    /// The lowest still-unacked payload seq for `slot` — the oldest seq the
+    /// datagram redundancy pass will replay over a rebound connection — or
+    /// `None` if nothing is in flight for it.
     ///
-    /// This is the anchor a resume handshake may safely advertise: a fresh
-    /// relay bases that slot's receive-window prefix here (see
-    /// [`Link::anchor_receive_window`](crate::Link::anchor_receive_window)),
-    /// and every seq from here on is guaranteed to eventually reach it —
-    /// replayable unacked seqs ride the redundancy pass until confirmed, so
-    /// any gap above the anchor closes and the relay's contiguous prefix
-    /// always catches up. A control-diverted seq must **not** anchor the
-    /// window: nothing replays the (long-acked, retention-aged) seqs between
-    /// it and the live stream, so a window based there would carry a permanent
-    /// void — the contiguous prefix could never pass it, and the live stream
-    /// would eventually run beyond the receive window's reach and break the
-    /// link. The diverted turn's own delivery rides the reliable control
-    /// stream instead and does not depend on the window (see
-    /// `divert_unacked_wider_than`).
+    /// This is the **same-relay** resume anchor: the relay bases that slot's
+    /// receive-window prefix here (see
+    /// [`Link::anchor_receive_window`](crate::Link::anchor_receive_window)).
+    /// Selective packet acks make the unacked window *sparse* — an acked seq
+    /// can sit between two unacked ones — so the seqs above this anchor are
+    /// NOT all replayable from here; the anchor's contiguity contract holds on
+    /// a same-relay resume only because the relay reconciles the acked holes
+    /// from its own turn ring (an acked seq is one it received and recorded),
+    /// seeding them as already delivered in the fresh receive window. A fresh
+    /// relay has no ring to reconcile from, so a **re-home** must anchor with
+    /// [`contiguous_replayable_anchor`](Self::contiguous_replayable_anchor)
+    /// instead.
     pub fn oldest_replayable_seq(&self, slot: SlotId) -> Option<u64> {
         self.unacked_payloads
             .range((slot, u64::MIN)..=(slot, u64::MAX))
-            .find(|(_, sent)| !sent.control_diverted)
+            .next()
             .map(|(&(_, seq), _)| seq)
+    }
+
+    /// The lowest anchor a **re-home** resume may advertise for `slot`: the
+    /// retention `front` extended downward only through *contiguously* unacked
+    /// seqs.
+    ///
+    /// A fresh relay's receive window treats the anchor as a promise that
+    /// every seq above it will arrive and close the window's contiguous
+    /// prefix. A re-home's replay sources are the unacked window (redundancy
+    /// re-carries it) and the retained ring (`[front..]`, re-injected on
+    /// resume) — and the unacked window is sparse: selective packet acks
+    /// leave holes that are in *neither* source once they age below `front`.
+    /// Anchoring below such a hole would base the window on a permanent void:
+    /// the prefix could never pass it, and the live stream would eventually
+    /// run a receive window's length beyond the base and be rejected. So the
+    /// anchor descends from `front` exactly as far as unacked seqs remain
+    /// contiguous, and no further. Unacked seqs below the first hole are
+    /// still replayed (redundancy doesn't consult the anchor); the fresh
+    /// relay discards them as below-base, which is the accepted trade: a
+    /// hole above them can only have aged out of retention if turn production
+    /// continued past it, which means the session was not wedged on anything
+    /// beneath it — the old relay had received and fanned those turns, and
+    /// the discarded replay was a duplicate.
+    pub fn contiguous_replayable_anchor(&self, slot: SlotId, front: u64) -> u64 {
+        let mut anchor = front;
+        for (&(_, seq), _) in self
+            .unacked_payloads
+            .range((slot, u64::MIN)..(slot, front))
+            .rev()
+        {
+            if seq + 1 == anchor {
+                anchor = seq;
+            } else {
+                break;
+            }
+        }
+        anchor
     }
 
     /// Builds the `ack_bits` field: bit `N` is set when the peer's packet
@@ -492,13 +520,6 @@ impl AckManager {
         let spacing = self.policy.spacing;
         let building_seq = packet.seq;
 
-        // Control-diverted payloads never compete for the refill: their
-        // delivery belongs to the reliable control stream, and — no longer
-        // fitting any datagram — they must not block the head of a line they
-        // cannot ride. Every path below skips them; the fast path requires a
-        // divert-free window outright, since its cached size covers the whole
-        // window.
-        //
         // When no spacing schedule filters the window and the whole window fits
         // under the cap, ranking cannot affect coverage: every candidate rides
         // this packet. Check that case from the cached encoded lengths and
@@ -509,7 +530,7 @@ impl AckManager {
         let all_candidates_fit = redundancy_cap
             .checked_sub(used)
             .is_some_and(|remaining| unacked_payload_wire_len <= remaining);
-        if spacing.is_none() && all_candidates_fit && self.control_diverted_count == 0 {
+        if spacing.is_none() && all_candidates_fit {
             packet.payloads.reserve(self.unacked_payloads.len());
             for sent in self.unacked_payloads.values() {
                 packet.payloads.push(sent.payload.clone());
@@ -520,7 +541,7 @@ impl AckManager {
             let mut due_wire_len = 0usize;
             let mut due_count = 0usize;
             for sent in self.unacked_payloads.values() {
-                if !sent.control_diverted && sent.is_due(spacing, building_seq) {
+                if sent.is_due(spacing, building_seq) {
                     due_wire_len += sent.wire_len;
                     due_count += 1;
                 }
@@ -535,7 +556,7 @@ impl AckManager {
                 // thinned the set.
                 packet.payloads.reserve(due_count);
                 for sent in self.unacked_payloads.values() {
-                    if sent.control_diverted || !sent.is_due(spacing, building_seq) {
+                    if !sent.is_due(spacing, building_seq) {
                         continue;
                     }
                     packet.payloads.push(sent.payload.clone());
@@ -568,7 +589,7 @@ impl AckManager {
                 let mut candidates: Vec<&SentPayload> = self
                     .unacked_payloads
                     .values()
-                    .filter(|sent| !sent.control_diverted && sent.is_due(spacing, building_seq))
+                    .filter(|sent| sent.is_due(spacing, building_seq))
                     .collect();
                 candidates.sort_by_key(|sent| std::cmp::Reverse(sent.waiting_age(building_seq)));
                 // The first (most overdue) candidate is capped by the datagram
@@ -638,7 +659,6 @@ impl AckManager {
                     send_count: 0,
                     last_carried_packet_seq: None,
                     registered_at_packet_seq: building_seq,
-                    control_diverted: false,
                     wire_len: payload_element_len(len),
                     payload: p,
                 },
@@ -754,16 +774,8 @@ impl AckManager {
         // the range front looks targeted, but pays a tree search/rebalance for
         // every retired entry and measures no better than this single traversal.
         let before = self.unacked_payloads.len();
-        let mut diverted_retired = 0usize;
         self.unacked_payloads
-            .retain(|&(candidate_slot, seq), sent| {
-                let keep = candidate_slot != slot || seq > through_seq;
-                if !keep && sent.control_diverted {
-                    diverted_retired += 1;
-                }
-                keep
-            });
-        self.control_diverted_count -= diverted_retired;
+            .retain(|&(candidate_slot, seq), _| candidate_slot != slot || seq > through_seq);
         let retired = before - self.unacked_payloads.len();
         if retired > 0 {
             // Computing the removed range's exact encoded size inside `retain`
@@ -773,43 +785,6 @@ impl AckManager {
             self.unacked_payload_wire_len = None;
         }
         retired
-    }
-
-    /// Marks every unacked payload whose lone-packet size exceeds
-    /// `admission_budget` as control-diverted, and returns a copy of **every**
-    /// diverted payload — newly and previously marked alike — ascending by
-    /// `(slot, seq)`.
-    ///
-    /// This is the rebind-time reclassification: the unacked window survives a
-    /// connection swap, but the fresh connection's admission budget can be
-    /// smaller than the one that admitted the window's payloads (a peer
-    /// advertising a small datagram limit). Left datagram-eligible, such a
-    /// payload would head every constrained refill without ever fitting a
-    /// packet — the fresh-free flushes included — gating all redundancy
-    /// forever. Diverted, it is excluded from the refill — and from the
-    /// resume anchor ([`oldest_replayable_seq`](Self::oldest_replayable_seq)):
-    /// nothing replays the seqs between an aged diverted turn and the live
-    /// stream, so anchoring a fresh relay's receive window at it would build
-    /// in a permanent void — while **staying in the window**, where only a
-    /// peer-confirmed retirement (the ack-beacon cursor) removes it. The
-    /// caller stages each returned copy for reliable-stream delivery — a
-    /// disposable copy, because this method returns every still-unretired
-    /// diverted payload again on the *next* rebind: a staging connection that
-    /// dies after a locally-successful write (which proves nothing about
-    /// peer-side processing) costs one rebind's delay, never the payload. The
-    /// peer dedups by origin `(slot, seq)`, so re-deliveries are harmless.
-    pub(crate) fn divert_unacked_wider_than(&mut self, admission_budget: usize) -> Vec<Payload> {
-        let mut staged = Vec::new();
-        for sent in self.unacked_payloads.values_mut() {
-            if !sent.control_diverted && lone_packet_len(&sent.payload) > admission_budget {
-                sent.control_diverted = true;
-                self.control_diverted_count += 1;
-            }
-            if sent.control_diverted {
-                staged.push(sent.payload.clone());
-            }
-        }
-        staged
     }
 
     /// Re-registers a payload as still-unacked so the redundancy pass re-carries
@@ -848,7 +823,6 @@ impl AckManager {
                     send_count: 0,
                     last_carried_packet_seq: None,
                     registered_at_packet_seq,
-                    control_diverted: false,
                     wire_len: payload_element_len(encoded_len),
                     payload,
                 },
@@ -860,13 +834,10 @@ impl AckManager {
     /// size exact. Replacement is defensive; normal origin seqs are unique.
     fn insert_unacked(&mut self, key: (SlotId, u64), sent: SentPayload) {
         let new_len = sent.wire_len;
-        if let Some(previous) = self.unacked_payloads.insert(key, sent) {
-            if let Some(total) = self.unacked_payload_wire_len.as_mut() {
-                *total = total.saturating_sub(previous.wire_len);
-            }
-            if previous.control_diverted {
-                self.control_diverted_count -= 1;
-            }
+        if let Some(previous) = self.unacked_payloads.insert(key, sent)
+            && let Some(total) = self.unacked_payload_wire_len.as_mut()
+        {
+            *total = total.saturating_sub(previous.wire_len);
         }
         if let Some(total) = self.unacked_payload_wire_len.as_mut() {
             *total = total.saturating_add(new_len);
@@ -877,9 +848,6 @@ impl AckManager {
         let removed = self.unacked_payloads.remove(key)?;
         if let Some(total) = self.unacked_payload_wire_len.as_mut() {
             *total = total.saturating_sub(removed.wire_len);
-        }
-        if removed.control_diverted {
-            self.control_diverted_count -= 1;
         }
         Some(removed)
     }
@@ -992,23 +960,6 @@ struct SentPayload {
     /// each starts at age zero and cannot indefinitely outrank an older
     /// payload whose age keeps growing.
     registered_at_packet_seq: u32,
-    /// Whether this payload's delivery has been handed to the reliable control
-    /// stream: a rebind found it wider than the fresh connection's admission
-    /// budget ([`AckManager::divert_unacked_wider_than`]). A diverted payload
-    /// never rides datagrams again (excluded from every refill, so it cannot
-    /// block the head of the line it can no longer fit, and from the resume
-    /// anchor via [`AckManager::oldest_replayable_seq`], so a fresh relay's
-    /// receive window never bases on the permanent void behind it), but it
-    /// deliberately **stays in the window**: it keeps counting against the
-    /// unacked-window cap, and only a peer-confirmed signal — the ack-beacon
-    /// cursor via [`AckManager::retire_payloads_through`] — retires it. The
-    /// control-stream staging copy is thereby disposable: a connection that
-    /// dies after a locally-successful write costs nothing, because the next
-    /// rebind returns every still-unretired diverted payload for re-staging.
-    /// Sticky: a later connection with a roomier budget does not un-divert it
-    /// (both paths delivering is a harmless dedup; flip-flopping delivery
-    /// ownership is not).
-    control_diverted: bool,
     /// Cached size of its complete repeated-field wire element, so refilling a
     /// packet and maintaining the aggregate do not recalculate its varint.
     wire_len: usize,
@@ -1545,35 +1496,6 @@ mod tests {
         // Retiring the oldest advances the answer to the next in flight.
         manager.retire_payloads_through(SlotId(0), 7);
         assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(8));
-    }
-
-    /// The resume anchor must skip control-diverted payloads: datagram
-    /// redundancy will never replay them, so a receive window based at an
-    /// aged diverted seq would carry a permanent void between it and the
-    /// live stream — the contiguous prefix could never pass it, and the live
-    /// stream would eventually run beyond the window's reach.
-    #[test]
-    fn oldest_replayable_seq_skips_control_diverted_payloads() {
-        let mut manager = AckManager::new();
-        let wide_commands = GUARANTEED_DATAGRAM_BUDGET - 64;
-        build_sent(
-            &mut manager,
-            Some(test_payload_sized(0, 5, wide_commands)),
-            1350,
-        );
-        build_sent(&mut manager, Some(test_payload(0, 6)), 1350);
-
-        // A shrunken admission diverts the wide payload; the anchor must now
-        // name the small one — the oldest seq redundancy will actually replay.
-        let staged = manager.divert_unacked_wider_than(800);
-        assert_eq!(staged.iter().map(|p| p.seq).collect::<Vec<_>>(), vec![5]);
-        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(6));
-        // The diverted payload still counts in flight; with everything
-        // diverted, there is nothing replayable to anchor at all.
-        assert_eq!(manager.payloads_in_flight(), 2);
-        let staged = manager.divert_unacked_wider_than(0);
-        assert_eq!(staged.len(), 2);
-        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), None);
     }
 
     #[test]
@@ -2219,5 +2141,37 @@ mod tests {
             .unwrap();
         assert_eq!(packet.ack, Some(99));
         assert_eq!(packet.ack_bits, 0b1011_1011_1011_1011_1011_1011_1011_1011);
+    }
+
+    /// The re-home anchor descends from the retention front only through
+    /// contiguously unacked seqs: an acked hole below the front is in neither
+    /// replay source (not unacked, aged out of retention), so anchoring
+    /// beneath it would base a fresh relay's receive window on a permanent
+    /// void. A fully contiguous unacked tail — the outgrown-retention case —
+    /// still extends the anchor all the way down.
+    #[test]
+    fn contiguous_replayable_anchor_stops_at_an_acked_hole() {
+        let mut manager = AckManager::new();
+        // Budget 0 suppresses redundancy so each seq rides exactly one packet
+        // and acks target seqs precisely.
+        for seq in 0..8u64 {
+            build_sent(&mut manager, Some(test_payload(0, seq)), 0);
+        }
+        // Ack packets 3 and 6 (each carried only its same-numbered seq):
+        // the unacked window is now sparse: {0, 1, 2, 4, 5, 7}.
+        manager
+            .handle_incoming(&incoming(0, Some(6), &[3]))
+            .unwrap();
+        assert_eq!(manager.payloads_in_flight(), 6);
+
+        // From front 8: seq 7 is unacked and contiguous; 6 is an acked hole.
+        assert_eq!(manager.contiguous_replayable_anchor(SlotId(0), 8), 7);
+        // From front 6: 5 and 4 extend; 3 is the hole.
+        assert_eq!(manager.contiguous_replayable_anchor(SlotId(0), 6), 4);
+        // From front 3: 2, 1, 0 are fully contiguous — the outgrown-retention
+        // shape — and the descent covers them all.
+        assert_eq!(manager.contiguous_replayable_anchor(SlotId(0), 3), 0);
+        // A front with nothing unacked below it stands unmoved.
+        assert_eq!(manager.contiguous_replayable_anchor(SlotId(1), 3), 3);
     }
 }

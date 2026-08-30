@@ -361,10 +361,18 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   the drop, the resumed stream is rejected as out-of-window the instant its seq passes the window (~4096
   turns, ~3 min in), dropping the link. Because every slot in a group crosses the window at the same absolute
   seq, that tears the whole group down at once. The client heads it off by naming, as its own-slot cursor,
-  the lowest seq it will actually re-send: **the oldest still-unacked seq on a same-relay resume** (the
-  AckManager re-carries the unacked window over the rebound connection, oldest-first — anchoring below it,
-  e.g. at the retention front, would strand a permanent prefix gap since a same-relay resume does not
-  re-inject the ring), and **the retention ring's front on a re-home** (which *does* re-inject that ring).
+  the lowest seq its re-send can make **contiguous** — the anchor is a promise that every seq above it will
+  arrive and close the window's prefix, and selective packet acks make the unacked window *sparse*, so the
+  bare oldest-unacked seq cannot honor it alone. On a **same-relay resume** the anchor is the oldest
+  still-unacked seq (anchoring higher, e.g. at the retention front, would strand the unacked tail below a
+  window a same-relay resume never re-injects the ring to fill), and the **relay closes the acked holes
+  itself**: every acked seq is one it received and recorded in its session turn ring, so it seeds those
+  receipts into the fresh window (`Link::seed_delivered`) right after applying the anchor. On a **re-home**
+  the replacement relay has no ring to seed from, so the anchor is the retention front extended downward
+  only through *contiguously* unacked seqs (`contiguous_replayable_anchor`); unacked seqs below the first
+  acked hole are still replayed but land below the window's base and are discarded — acceptable, because a
+  hole can only age out of retention while turn production continues past it, which means no peer was wedged
+  beneath it and the old relay had already fanned those turns.
   The relay reads the own-slot cursor (a slot never replays its own turns) as the window's base, so the
   resumed stream is accepted and the delivered prefix advances from there. The own-slot cursor rides the
   existing resume-cursor frame — additive, no handshake or frame-count change.
@@ -373,7 +381,7 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   the unacked window but kept here. On a re-home dial (only), the client re-injects the retained turns as
   unacked into the fresh link, so the replacement relay's empty ring re-carries them to peers, which dedup by
   origin `(slot, seq)`. This closes the window where the dead relay acked a turn but died before fanning it
-  out. An oversize (control-diverted) retained turn is staged for the fresh connection's reliable control
+  out. An oversize retained turn (one that rides the reliable control streams end to end, never datagrams) is staged for the fresh connection's reliable control
   stream and kept staged until its send succeeds, so a mid-drain stream failure retries it on the next
   session rather than losing it. An undecided drop-hold at relay death is deliberately lost — survivors
   re-wait the fresh 30s floor on the new relay.
@@ -1255,40 +1263,24 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   consumed as a recoverable race — so a floor-admitted payload whose transient envelope (a full
   conditions sidecar on a fallen-back path) outgrows the datagram registers anyway, fails the
   *datagram* send unrecorded, and rides the next sidecar-free flush. Payloads over the applicable
-  floor divert to the reliable control streams, which carry any size. Admission is re-judged at
-  every **rebind**: a replacement connection's peer may advertise a smaller limit than the one
-  that admitted the preserved unacked window, so the rebind marks any preserved payload the fresh
-  budget refuses as **control-diverted** — the one reclassification the otherwise
-  connection-constant admission ever performs, and a sticky one. A diverted payload is excluded
-  from datagram refill (it cannot block a head of line it can no longer ride) but stays in the
-  unacked window, which is what makes its control-stream delivery durable: every rebind re-stages
-  a fresh copy for the control stream (a locally-successful write proves nothing about peer-side
-  processing, so the staged copy is disposable and a second connection failure costs one rebind's
-  delay, never the payload), and only the peer-confirmed ack-beacon cursor retires it.
-  **A diverted seq must never anchor a resume handshake**, which is why the anchors read the
-  oldest *replayable* unacked seq (`oldest_replayable_seq`) rather than the oldest unacked: the
-  anchor's contract with the relay is that every seq above it will eventually arrive and close
-  the receive window's contiguous prefix, and replayable unacked seqs honor that (redundancy
-  re-carries them until confirmed; they are bounded fresh by the unacked-window and outage-buffer
-  caps, far inside the receive window) — while nothing replays the retention-aged, long-acked
-  seqs between an old diverted turn and the live stream, so a window based at one would carry a
-  permanent void, wedge its prefix, and ultimately reject the live stream as out-of-window.
-  Accepted trade, deliberately not engineered around: with the anchor above it, a fresh relay's
-  transport dedup treats the diverted turn's control-stream copy as already delivered. If the old
-  relay had fanned the turn out (only its ack was lost), nobody needed the copy and the session is
-  healthy; if it hadn't, every peer has been wedged at that turn since it was lost — a session the
-  stall-drop machinery is already ending — and no anchor choice could revive it, because the
-  turns between the diverted seq and retention are gone from every replay source. The whole path
-  is additionally fenced by reachability: diverting requires a peer whose advertised datagram
-  limit undercuts the guaranteed floor, which no first-party deployment configures. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  floor divert to the reliable control streams, which carry any size. Admission holds for a
+  connection's whole life because **every establishment path refuses an under-floor peer outright**
+  (`verify_datagram_budget`, run by the client dial, the relay's client accept, and both mesh
+  establishment directions): a peer whose advertised datagram limit undercuts the guaranteed floor
+  is an unsupported configuration, and refusing it at the door is strictly better than partially
+  serving it — a payload admitted on one connection could outgrow a later one, stranding it in an
+  unacked window whose link can no longer replay it. With the floor enforced at establishment,
+  every payload ever admitted for datagram carriage fits every packet of every connection the
+  session will use, rebinds included, so no rebind-time reclassification exists. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
   rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
   below backlog growth, and most-overdue-first is also the right priority there, approximating the
   oldest-first order the lockstep prefix actually needs. The delivery guarantee, stated
   precisely: **while its session lives, every payload keeps being retried on a bounded cadence
-  over a path that can carry it** — datagram-eligible payloads by the refill and the flushes,
-  control-diverted ones by per-rebind re-staging — with retirement only ever peer-confirmed. What
-  no mechanism promises is reviving a session whose replay sources no longer cover a gap (see the
-  divert anchor trade below). Accepted trade:
+  over a path that can carry it** — datagram payloads by the refill and the flushes, oversize
+  turns by the reliable control streams — with retirement only ever peer-confirmed. The one
+  scoped exception is a re-home anchor's below-the-hole replays, discarded under conditions where
+  no peer still needs them (see the resume-anchor contiguity rules in the reconnect section).
+  Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench

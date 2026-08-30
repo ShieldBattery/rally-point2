@@ -1619,6 +1619,18 @@ pub async fn run_slot_link(
             );
         }
         link.anchor_receive_window(slot, anchor);
+        // Reconcile the fresh receive window with what this relay already
+        // holds. The client's anchor is its oldest *unacked* seq, and
+        // selective packet acks make its unacked window sparse: seqs above
+        // the anchor that this relay acked will never be re-sent. Every acked
+        // seq was received and recorded in the session's turn ring, so seed
+        // those receipts into the new window — without them its contiguous
+        // prefix (and the ack-beacon cursor it drives) wedges at the first
+        // such hole, and once the live stream runs a full receive window past
+        // the stuck base the link is rejected as out-of-window.
+        for seq in turn_ring.recorded_seqs(&key, slot, anchor) {
+            link.seed_delivered(slot, seq);
+        }
     }
 
     // Replay to a reconnecting client the turns it missed while it was gone. A fresh

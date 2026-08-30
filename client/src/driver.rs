@@ -2749,14 +2749,8 @@ async fn reconnect_link(
                 // rebind, against the fresh connection's own datagram budget
                 // — mirroring the re-home path's own rebind-then-reinject
                 // order — though an oversize turn is definitionally oversize
-                // on any realistic path. Preserved unacked turns the fresh
-                // connection's admission refuses (a smaller peer-advertised
-                // datagram limit) come back from the rebind and take the same
-                // reliable-control path — retention only covers the newest
-                // turns, so this is the only route for an older preserved one.
-                for turn in link.rebind(fresh.connection().clone()) {
-                    stage_control_redivert(&mut state.pending_control_redivert, turn);
-                }
+                // on any realistic path.
+                link.rebind(fresh.connection().clone());
                 redivert_oversize_retention_on_same_relay_resume(link, state);
                 backoff.reset();
                 return Reconnected::Resumed;
@@ -2853,7 +2847,8 @@ async fn reconnect_link(
                                     // never sent).
                                     let mut rehome_cursors = cursors.clone();
                                     if let Some(anchor) = rehome_own_slot_anchor(
-                                        link.oldest_replayable_seq(own_slot),
+                                        link,
+                                        own_slot,
                                         state.retention.front().map(|turn| turn.seq),
                                     ) {
                                         rehome_cursors.push((own_slot, anchor));
@@ -2874,18 +2869,8 @@ async fn reconnect_link(
                                             // empty ring re-carries them to peers. Only now —
                                             // on a *successful* dial — does the driver adopt
                                             // the new relay id, so a failed dial never leaves
-                                            // it naming a relay it isn't homed on. Preserved
-                                            // unacked turns the fresh connection's admission
-                                            // refuses come back from the rebind and are staged
-                                            // for the control stream — retention only covers
-                                            // the newest turns, so an older preserved one has
-                                            // no other route.
-                                            for turn in link.rebind(fresh.connection().clone()) {
-                                                stage_control_redivert(
-                                                    &mut state.pending_control_redivert,
-                                                    turn,
-                                                );
-                                            }
+                                            // it naming a relay it isn't homed on.
+                                            link.rebind(fresh.connection().clone());
                                             reinject_retention(link, state);
                                             rc.target = ReconnectTarget {
                                                 endpoint,
@@ -2965,41 +2950,40 @@ async fn redivert_pending_control(
 }
 
 /// The own-slot receive-window anchor a re-home dial presents to the fresh relay:
-/// the oldest seq the client will actually re-send *over datagrams* once it
-/// resumes there. Two sources feed that re-send and the anchor must cover the
-/// lower of them —
+/// the retention front, extended downward only through *contiguously* unacked
+/// seqs (see [`Link::contiguous_replayable_anchor`]).
 ///
-/// - the rebound link keeps its replayable unacked window (`reset_connection`
-///   preserves it and the redundancy pass re-carries it oldest-first), whose
-///   oldest seq is `oldest_replayable`; and
-/// - [`reinject_retention`] re-adds the retained ring, whose oldest seq is
-///   `retention_front` (this can sit *below* `oldest_replayable` when the oldest
-///   turns were already acked — retention keeps them, the unacked window does
-///   not).
+/// Two sources feed the re-home's own-slot re-send: the rebound link's unacked
+/// window (redundancy re-carries it) and [`reinject_retention`]'s retained ring
+/// (`[front..]`). The anchor promises the fresh relay that every seq above it
+/// will arrive and close its receive window's contiguous prefix — and the
+/// unacked window is *sparse* (selective packet acks leave holes), so the
+/// promise only holds as far below the front as unacked seqs run contiguously.
+/// An acked hole below the front is in neither source; anchoring beneath one
+/// would base the window on a permanent void that eventually rejects the live
+/// stream as out-of-window. Unacked seqs below the first hole are still
+/// replayed and arrive below the relay's base, where they are discarded — the
+/// accepted trade: their hole can only have aged out of retention if turn
+/// production continued past it, which means no peer was wedged beneath it and
+/// the old relay had already fanned those turns.
 ///
-/// A control-diverted turn is deliberately in neither source: its delivery rides
-/// the reliable control stream, and nothing would replay the retention-aged seqs
-/// between an old diverted turn and the live stream — an anchor at its seq would
-/// base the relay's window on a permanent void, and once the live stream ran a
-/// receive-window's length past that base the relay would reject it and drop the
-/// link.
-///
-/// Anchoring at only the retention front (as this once did) strands the unacked
-/// tail below it whenever own-slot in-flight has outgrown the retention cap —
-/// [`UNACKED_WINDOW_CAP`] is twice [`RETENTION_TURN_CAP`], so 513..=1024 turns in
-/// flight is reachable under sustained forward-path loss (a relay degrading, then
-/// dying). Those turns are re-carried but the relay buries them below the window and
-/// never fans them to peers, permanently gapping the game — a comparator-visible
-/// desync at turn 1. `None` means neither source will re-send anything (a slot that
-/// never sent a turn), so the window correctly bases at 0 and no anchor is declared.
+/// The contiguous descent still covers the outgrown-retention case this helper
+/// has always guarded ([`UNACKED_WINDOW_CAP`] is twice [`RETENTION_TURN_CAP`]):
+/// sustained forward-path loss leaves 513..=1024 turns in flight *unacked and
+/// contiguous*, and the descent walks below the front through all of them —
+/// stranding none, exactly as the plain minimum once did, while refusing the
+/// sparse descent the minimum wrongly took. With no retention at all, the
+/// anchor falls back to the oldest unacked seq (a slot that never sent
+/// anything has neither source, and no anchor is declared: the window
+/// correctly bases at 0).
 fn rehome_own_slot_anchor(
-    oldest_replayable: Option<u64>,
+    link: &Link,
+    own_slot: SlotId,
     retention_front: Option<u64>,
 ) -> Option<u64> {
-    match (oldest_replayable, retention_front) {
-        (Some(unacked), Some(front)) => Some(unacked.min(front)),
-        (Some(unacked), None) => Some(unacked),
-        (None, front) => front,
+    match retention_front {
+        Some(front) => Some(link.contiguous_replayable_anchor(own_slot, front)),
+        None => link.oldest_replayable_seq(own_slot),
     }
 }
 
@@ -4462,34 +4446,32 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    #[test]
-    fn rehome_anchor_covers_the_unacked_tail_below_the_retention_front() {
-        // The bug this guards: on a re-home the rebound link keeps its unacked window
-        // AND re-injects the retention ring, so the oldest re-sent seq is the lower of
-        // the two. When own-slot in-flight has outgrown the retention cap the oldest
-        // unacked seq sits BELOW the retention front; anchoring at the front would
-        // strand every turn between them (re-carried, but buried below the fresh
-        // relay's window — a comparator-visible desync).
+    #[tokio::test]
+    async fn rehome_anchor_extends_below_the_front_only_through_contiguous_unacked() {
+        // The semantics of the contiguous descent (sparse windows, holes,
+        // outgrown retention) are pinned at the AckManager level; this covers
+        // the driver glue: the anchor comes from the link's contiguous
+        // extension when retention exists, and falls back to the oldest
+        // unacked seq when it does not.
+        let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
+        for seq in 0..3u64 {
+            client.send(Some(turn(seq, &[0x42]))).unwrap();
+        }
+        // Retention front at 1: the unacked run 0..=2 is contiguous, so the
+        // descent covers the full tail below the front.
         assert_eq!(
-            rehome_own_slot_anchor(Some(4300), Some(4788)),
-            Some(4300),
-            "in-flight past the retention cap: anchor at the oldest unacked, not the front",
+            rehome_own_slot_anchor(&client, SlotId(0), Some(1)),
+            Some(0),
+            "a contiguous unacked tail below the front extends the anchor",
         );
-        // The mirror case: the oldest turns were already acked (dropped from the
-        // window) but retention still holds them to re-supply, so the retention front
-        // is the lower — and load-bearing — bound.
+        // No retention: fall back to the oldest unacked seq.
         assert_eq!(
-            rehome_own_slot_anchor(Some(5000), Some(4788)),
-            Some(4788),
-            "acked-then-retained old turns: anchor at the retention front",
+            rehome_own_slot_anchor(&client, SlotId(0), None),
+            Some(0),
+            "without retention the oldest unacked seq anchors",
         );
-        // Equal bounds are a no-op either way.
-        assert_eq!(rehome_own_slot_anchor(Some(4788), Some(4788)), Some(4788));
-        // A single source: fall back to whichever will re-send.
-        assert_eq!(rehome_own_slot_anchor(None, Some(4788)), Some(4788));
-        assert_eq!(rehome_own_slot_anchor(Some(4300), None), Some(4300));
-        // Nothing to re-send: no anchor, the fresh relay's window bases at 0.
-        assert_eq!(rehome_own_slot_anchor(None, None), None);
+        // Neither source: no anchor.
+        assert_eq!(rehome_own_slot_anchor(&client, SlotId(3), None), None);
     }
 
     #[tokio::test]
@@ -4615,12 +4597,7 @@ mod tests {
         // control-stream redeliver — don't depend on which address it is),
         // then redivert.
         let (fresh_a, fresh_b, _fea, _feb) = connected_links().await;
-        let rebind_misfits = link.rebind(fresh_a.connection().clone());
-        assert_eq!(
-            rebind_misfits.len(),
-            0,
-            "the loopback peers share admission budgets; nothing reclassifies",
-        );
+        link.rebind(fresh_a.connection().clone());
         redivert_oversize_retention_on_same_relay_resume(&link, &mut state);
         assert_eq!(state.pending_control_redivert.len(), 1);
 

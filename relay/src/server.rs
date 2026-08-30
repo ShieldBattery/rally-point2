@@ -89,6 +89,11 @@ enum ConnError {
     /// The QUIC handshake itself failed.
     #[error("QUIC connection failed: {0}")]
     Connection(#[from] quinn::ConnectionError),
+    /// The peer's advertised datagram budget is under the guaranteed floor the
+    /// transport's admission and replay invariants assume — an unsupported
+    /// configuration, refused at establishment.
+    #[error(transparent)]
+    DatagramBudgetTooSmall(#[from] rally_point_transport::quic::DatagramBudgetTooSmall),
     /// The client did not finish the authorization handshake within the deadline.
     #[error("authorization handshake timed out")]
     AuthTimeout,
@@ -342,6 +347,16 @@ async fn serve_connection(
     mesh: crate::mesh::MeshState,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
+    // Refuse before any handshake or registration state exists: the
+    // transport's admission and replay invariants assume every connection's
+    // datagram budget meets the guaranteed floor, so a peer advertising less
+    // is an unsupported configuration — refused whole rather than partially
+    // served, mirroring the check the client dial runs on its own side.
+    if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
+        connection.close(0u32.into(), b"datagram budget under guaranteed floor");
+        return Err(ConnError::DatagramBudgetTooSmall(error));
+    }
+
     let handshake = auth::authenticate(&connection, registry, unix_now());
     let (authorized, resume_cursors, connection_epoch, mut handshake_send) =
         match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {

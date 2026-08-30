@@ -89,6 +89,14 @@ pub enum DialError {
     /// a bad challenge response, or the slot already taken).
     #[error("QUIC connection failed: {0}")]
     Connection(#[from] quinn::ConnectionError),
+    /// The relay's advertised datagram budget is under the guaranteed floor the
+    /// transport's admission and replay invariants assume — an unsupported peer
+    /// configuration, refused outright at establishment rather than partially
+    /// supported (see
+    /// [`verify_datagram_budget`](rally_point_transport::quic::verify_datagram_budget)).
+    /// Not retryable against the same relay.
+    #[error(transparent)]
+    DatagramBudgetTooSmall(#[from] rally_point_transport::quic::DatagramBudgetTooSmall),
     /// Framing the authorization token for the wire failed.
     #[error("framing the authorization token failed: {0}")]
     Token(#[from] HandshakeError),
@@ -227,6 +235,8 @@ impl ClientEndpoint {
             Err(_elapsed) => return Err(DialError::TimedOut { timeout }),
         };
 
+        rally_point_transport::quic::verify_datagram_budget(&connection)?;
+
         // A fresh dial presents no resume cursors: the relay replays nothing.
         match timeout_at(deadline, authorize(&connection, identity, &[])).await {
             Ok(result) => result.map(|()| Link::new(connection)),
@@ -269,6 +279,8 @@ impl ClientEndpoint {
             Ok(result) => result?,
             Err(_elapsed) => return Err(DialError::TimedOut { timeout }),
         };
+
+        rally_point_transport::quic::verify_datagram_budget(&connection)?;
 
         match timeout_at(deadline, authorize(&connection, identity, cursors)).await {
             Ok(Ok(())) => Ok(Link::new(connection)),
