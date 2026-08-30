@@ -353,20 +353,29 @@ impl AckManager {
         self.packet_seq
     }
 
-    /// The lowest still-unacked payload seq for `slot`, or `None` if the slot has
-    /// nothing in flight.
+    /// The lowest still-unacked payload seq for `slot` that the datagram
+    /// redundancy pass will actually replay — control-diverted payloads are
+    /// deliberately excluded — or `None` if the slot has nothing replayable in
+    /// flight.
     ///
-    /// This is the oldest seq the redundancy pass will re-carry over a rebound
-    /// connection (it repacks the unacked window oldest-seq-first within each slot),
-    /// so it is exactly the lowest seq a peer will receive from this slot after a
-    /// same-relay resume. A fresh relay uses it to anchor that slot's receive window
-    /// there instead of at 0, so a session resumed past the window is accepted and
-    /// its delivered prefix advances from the resume point (see
-    /// [`Link::anchor_receive_window`](crate::Link::anchor_receive_window)).
-    pub fn oldest_unacked_seq(&self, slot: SlotId) -> Option<u64> {
+    /// This is the anchor a resume handshake may safely advertise: a fresh
+    /// relay bases that slot's receive-window prefix here (see
+    /// [`Link::anchor_receive_window`](crate::Link::anchor_receive_window)),
+    /// and every seq from here on is guaranteed to eventually reach it —
+    /// replayable unacked seqs ride the redundancy pass until confirmed, so
+    /// any gap above the anchor closes and the relay's contiguous prefix
+    /// always catches up. A control-diverted seq must **not** anchor the
+    /// window: nothing replays the (long-acked, retention-aged) seqs between
+    /// it and the live stream, so a window based there would carry a permanent
+    /// void — the contiguous prefix could never pass it, and the live stream
+    /// would eventually run beyond the receive window's reach and break the
+    /// link. The diverted turn's own delivery rides the reliable control
+    /// stream instead and does not depend on the window (see
+    /// `divert_unacked_wider_than`).
+    pub fn oldest_replayable_seq(&self, slot: SlotId) -> Option<u64> {
         self.unacked_payloads
             .range((slot, u64::MIN)..=(slot, u64::MAX))
-            .next()
+            .find(|(_, sent)| !sent.control_diverted)
             .map(|(&(_, seq), _)| seq)
     }
 
@@ -777,8 +786,11 @@ impl AckManager {
     /// advertising a small datagram limit). Left datagram-eligible, such a
     /// payload would head every constrained refill without ever fitting a
     /// packet — the fresh-free flushes included — gating all redundancy
-    /// forever. Diverted, it is excluded from the refill while **staying in
-    /// the window**: its seq keeps anchoring resume handshakes, and only a
+    /// forever. Diverted, it is excluded from the refill — and from the
+    /// resume anchor ([`oldest_replayable_seq`](Self::oldest_replayable_seq)):
+    /// nothing replays the seqs between an aged diverted turn and the live
+    /// stream, so anchoring a fresh relay's receive window at it would build
+    /// in a permanent void — while **staying in the window**, where only a
     /// peer-confirmed retirement (the ack-beacon cursor) removes it. The
     /// caller stages each returned copy for reliable-stream delivery — a
     /// disposable copy, because this method returns every still-unretired
@@ -984,9 +996,10 @@ struct SentPayload {
     /// stream: a rebind found it wider than the fresh connection's admission
     /// budget ([`AckManager::divert_unacked_wider_than`]). A diverted payload
     /// never rides datagrams again (excluded from every refill, so it cannot
-    /// block the head of the line it can no longer fit), but it deliberately
-    /// **stays in the window**: its seq keeps anchoring resume handshakes via
-    /// [`AckManager::oldest_unacked_seq`], it keeps counting against the
+    /// block the head of the line it can no longer fit, and from the resume
+    /// anchor via [`AckManager::oldest_replayable_seq`], so a fresh relay's
+    /// receive window never bases on the permanent void behind it), but it
+    /// deliberately **stays in the window**: it keeps counting against the
     /// unacked-window cap, and only a peer-confirmed signal — the ack-beacon
     /// cursor via [`AckManager::retire_payloads_through`] — retires it. The
     /// control-stream staging copy is thereby disposable: a connection that
@@ -1512,10 +1525,10 @@ mod tests {
     }
 
     #[test]
-    fn oldest_unacked_seq_is_the_lowest_in_flight_per_slot() {
+    fn oldest_replayable_seq_is_the_lowest_in_flight_per_slot() {
         let mut manager = AckManager::new();
         // Nothing in flight yet.
-        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), None);
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), None);
 
         // No redundancy, so each payload rides one packet and stays in flight.
         for seq in [7u64, 8, 9] {
@@ -1524,14 +1537,43 @@ mod tests {
                 .unwrap();
         }
         manager.build_outgoing(Some(test_payload(1, 3)), 0).unwrap();
-        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(7));
-        assert_eq!(manager.oldest_unacked_seq(SlotId(1)), Some(3));
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(7));
+        assert_eq!(manager.oldest_replayable_seq(SlotId(1)), Some(3));
         // A slot with nothing in flight is still None.
-        assert_eq!(manager.oldest_unacked_seq(SlotId(2)), None);
+        assert_eq!(manager.oldest_replayable_seq(SlotId(2)), None);
 
         // Retiring the oldest advances the answer to the next in flight.
         manager.retire_payloads_through(SlotId(0), 7);
-        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(8));
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(8));
+    }
+
+    /// The resume anchor must skip control-diverted payloads: datagram
+    /// redundancy will never replay them, so a receive window based at an
+    /// aged diverted seq would carry a permanent void between it and the
+    /// live stream — the contiguous prefix could never pass it, and the live
+    /// stream would eventually run beyond the window's reach.
+    #[test]
+    fn oldest_replayable_seq_skips_control_diverted_payloads() {
+        let mut manager = AckManager::new();
+        let wide_commands = GUARANTEED_DATAGRAM_BUDGET - 64;
+        build_sent(
+            &mut manager,
+            Some(test_payload_sized(0, 5, wide_commands)),
+            1350,
+        );
+        build_sent(&mut manager, Some(test_payload(0, 6)), 1350);
+
+        // A shrunken admission diverts the wide payload; the anchor must now
+        // name the small one — the oldest seq redundancy will actually replay.
+        let staged = manager.divert_unacked_wider_than(800);
+        assert_eq!(staged.iter().map(|p| p.seq).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(6));
+        // The diverted payload still counts in flight; with everything
+        // diverted, there is nothing replayable to anchor at all.
+        assert_eq!(manager.payloads_in_flight(), 2);
+        let staged = manager.divert_unacked_wider_than(0);
+        assert_eq!(staged.len(), 2);
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), None);
     }
 
     #[test]
@@ -1582,7 +1624,7 @@ mod tests {
         manager
             .build_outgoing(Some(test_payload(0, 5)), MTU)
             .unwrap();
-        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(5));
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(5));
 
         // Slot 256 aliases onto slot 0 under a truncating cast; seq 3 would then
         // become slot 0's new oldest unacked seq.
@@ -1596,7 +1638,7 @@ mod tests {
 
         // Slot 0's bookkeeping is untouched: its oldest unacked seq is still 5, and
         // only the one genuine turn is in flight.
-        assert_eq!(manager.oldest_unacked_seq(SlotId(0)), Some(5));
+        assert_eq!(manager.oldest_replayable_seq(SlotId(0)), Some(5));
         assert_eq!(manager.payloads_in_flight(), 1);
         // The malformed payload rode no datagram either, so the packet carries only
         // the genuine slot-0 turn as redundancy.

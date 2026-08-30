@@ -1261,16 +1261,34 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   budget refuses as **control-diverted** — the one reclassification the otherwise
   connection-constant admission ever performs, and a sticky one. A diverted payload is excluded
   from datagram refill (it cannot block a head of line it can no longer ride) but stays in the
-  unacked window, which is what makes its control-stream delivery durable: its seq keeps anchoring
-  resume handshakes (`oldest_unacked_seq` feeds both the same-relay and re-home anchors, so a
-  later anchor never teaches the relay's fresh dedup to discard its retry), every rebind re-stages
+  unacked window, which is what makes its control-stream delivery durable: every rebind re-stages
   a fresh copy for the control stream (a locally-successful write proves nothing about peer-side
   processing, so the staged copy is disposable and a second connection failure costs one rebind's
-  delay, never the payload), and only the peer-confirmed ack-beacon cursor retires it. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  delay, never the payload), and only the peer-confirmed ack-beacon cursor retires it.
+  **A diverted seq must never anchor a resume handshake**, which is why the anchors read the
+  oldest *replayable* unacked seq (`oldest_replayable_seq`) rather than the oldest unacked: the
+  anchor's contract with the relay is that every seq above it will eventually arrive and close
+  the receive window's contiguous prefix, and replayable unacked seqs honor that (redundancy
+  re-carries them until confirmed; they are bounded fresh by the unacked-window and outage-buffer
+  caps, far inside the receive window) — while nothing replays the retention-aged, long-acked
+  seqs between an old diverted turn and the live stream, so a window based at one would carry a
+  permanent void, wedge its prefix, and ultimately reject the live stream as out-of-window.
+  Accepted trade, deliberately not engineered around: with the anchor above it, a fresh relay's
+  transport dedup treats the diverted turn's control-stream copy as already delivered. If the old
+  relay had fanned the turn out (only its ack was lost), nobody needed the copy and the session is
+  healthy; if it hadn't, every peer has been wedged at that turn since it was lost — a session the
+  stall-drop machinery is already ending — and no anchor choice could revive it, because the
+  turns between the diverted seq and retention are gone from every replay source. The whole path
+  is additionally fenced by reachability: diverting requires a peer whose advertised datagram
+  limit undercuts the guaranteed floor, which no first-party deployment configures. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
   rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
   below backlog growth, and most-overdue-first is also the right priority there, approximating the
-  oldest-first order the lockstep prefix actually needs. No loss pattern can strand a payload.
-  Accepted trade:
+  oldest-first order the lockstep prefix actually needs. The delivery guarantee, stated
+  precisely: **while its session lives, every payload keeps being retried on a bounded cadence
+  over a path that can carry it** — datagram-eligible payloads by the refill and the flushes,
+  control-diverted ones by per-rebind re-staging — with retirement only ever peer-confirmed. What
+  no mechanism promises is reviving a session whose replay sources no longer cover a gap (see the
+  divert anchor trade below). Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench

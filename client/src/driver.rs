@@ -2702,15 +2702,19 @@ async fn reconnect_link(
         // `Link` per connection), so a same-relay resume must anchor our own slot's
         // window too — otherwise a game past ~4096 turns re-dials into an
         // out-of-window rejection that closes the link. The anchor is the oldest seq
-        // we will actually re-send: the AckManager's oldest still-unacked seq, which
-        // the redundancy pass re-carries oldest-first over the rebound connection.
-        // With nothing unacked, it is the next seq we will produce (the buffered/live
-        // turns that flush on resume). NOT the retention ring's front — a same-relay
-        // resume does not re-inject that ring, so a lower anchor would strand a
-        // permanent prefix gap. (`cursors` stays peer-only; the re-home dial builds
-        // its own set below with the retention-front anchor, which it *does* re-inject.)
+        // the *datagram* re-send will actually replay: the AckManager's oldest
+        // replayable unacked seq, which the redundancy pass re-carries oldest-first
+        // over the rebound connection (a control-diverted turn deliberately does not
+        // anchor — its delivery rides the reliable control stream, and a window
+        // based on the void behind it could never close its contiguous prefix).
+        // With nothing replayable, it is the next seq we will produce (the
+        // buffered/live turns that flush on resume). NOT the retention ring's
+        // front — a same-relay resume does not re-inject that ring, so a lower
+        // anchor would strand a permanent prefix gap. (`cursors` stays peer-only;
+        // the re-home dial builds its own set below with the retention-front
+        // anchor, which it *does* re-inject.)
         let same_relay_anchor = link
-            .oldest_unacked_seq(own_slot)
+            .oldest_replayable_seq(own_slot)
             .unwrap_or(state.next_outbound_seq);
         let mut same_relay_cursors = cursors.clone();
         if same_relay_anchor > 0 {
@@ -2830,18 +2834,26 @@ async fn reconnect_link(
                                     // once it passed the window — dropping the link, and with
                                     // every re-homed slot crossing the window together, the
                                     // whole group. Declare our own-slot resume anchor at the
-                                    // oldest seq we will actually re-send, so the relay bases
-                                    // the window there and the resumed stream is accepted. Two
-                                    // sources feed that re-send: the rebound link keeps its
-                                    // unacked window (the redundancy pass re-carries it) and
-                                    // `reinject_retention` re-adds the retained ring, so the
-                                    // anchor is the lower of the oldest-unacked seq and the
-                                    // retention front (see `rehome_own_slot_anchor`). No source
-                                    // means nothing to re-send, so no anchor is needed (the
-                                    // window bases at 0, correct for a slot that never sent).
+                                    // oldest seq the *datagram* re-send will actually replay,
+                                    // so the relay bases the window there, the resumed stream
+                                    // is accepted, and every seq above the anchor eventually
+                                    // arrives (closing the window's contiguous prefix). Two
+                                    // sources feed that re-send: the rebound link's replayable
+                                    // unacked window (the redundancy pass re-carries it until
+                                    // confirmed) and `reinject_retention`'s retained ring, so
+                                    // the anchor is the lower of the oldest replayable seq and
+                                    // the retention front (see `rehome_own_slot_anchor`). A
+                                    // control-diverted turn deliberately does NOT anchor: it
+                                    // travels the reliable control stream, and nothing would
+                                    // replay the retention-aged seqs between an old diverted
+                                    // turn and the live stream — a window based there carries
+                                    // a permanent void and eventually rejects the live stream.
+                                    // No source means nothing to re-send, so no anchor is
+                                    // needed (the window bases at 0, correct for a slot that
+                                    // never sent).
                                     let mut rehome_cursors = cursors.clone();
                                     if let Some(anchor) = rehome_own_slot_anchor(
-                                        link.oldest_unacked_seq(own_slot),
+                                        link.oldest_replayable_seq(own_slot),
                                         state.retention.front().map(|turn| turn.seq),
                                     ) {
                                         rehome_cursors.push((own_slot, anchor));
@@ -2953,18 +2965,27 @@ async fn redivert_pending_control(
 }
 
 /// The own-slot receive-window anchor a re-home dial presents to the fresh relay:
-/// the oldest seq the client will actually re-send once it resumes there. Two
-/// sources feed that re-send and the anchor must cover the lower of them —
+/// the oldest seq the client will actually re-send *over datagrams* once it
+/// resumes there. Two sources feed that re-send and the anchor must cover the
+/// lower of them —
 ///
-/// - the rebound link keeps its unacked window (`reset_connection` preserves it and
-///   the redundancy pass re-carries it oldest-first), whose oldest seq is
-///   `oldest_unacked`; and
+/// - the rebound link keeps its replayable unacked window (`reset_connection`
+///   preserves it and the redundancy pass re-carries it oldest-first), whose
+///   oldest seq is `oldest_replayable`; and
 /// - [`reinject_retention`] re-adds the retained ring, whose oldest seq is
-///   `retention_front` (this can sit *below* `oldest_unacked` when the oldest turns
-///   were already acked — retention keeps them, the unacked window does not).
+///   `retention_front` (this can sit *below* `oldest_replayable` when the oldest
+///   turns were already acked — retention keeps them, the unacked window does
+///   not).
 ///
-/// Anchoring at only the retention front (as this once did) strands the unacked tail
-/// below it whenever own-slot in-flight has outgrown the retention cap —
+/// A control-diverted turn is deliberately in neither source: its delivery rides
+/// the reliable control stream, and nothing would replay the retention-aged seqs
+/// between an old diverted turn and the live stream — an anchor at its seq would
+/// base the relay's window on a permanent void, and once the live stream ran a
+/// receive-window's length past that base the relay would reject it and drop the
+/// link.
+///
+/// Anchoring at only the retention front (as this once did) strands the unacked
+/// tail below it whenever own-slot in-flight has outgrown the retention cap —
 /// [`UNACKED_WINDOW_CAP`] is twice [`RETENTION_TURN_CAP`], so 513..=1024 turns in
 /// flight is reachable under sustained forward-path loss (a relay degrading, then
 /// dying). Those turns are re-carried but the relay buries them below the window and
@@ -2972,10 +2993,10 @@ async fn redivert_pending_control(
 /// desync at turn 1. `None` means neither source will re-send anything (a slot that
 /// never sent a turn), so the window correctly bases at 0 and no anchor is declared.
 fn rehome_own_slot_anchor(
-    oldest_unacked: Option<u64>,
+    oldest_replayable: Option<u64>,
     retention_front: Option<u64>,
 ) -> Option<u64> {
-    match (oldest_unacked, retention_front) {
+    match (oldest_replayable, retention_front) {
         (Some(unacked), Some(front)) => Some(unacked.min(front)),
         (Some(unacked), None) => Some(unacked),
         (None, front) => front,
@@ -4745,7 +4766,7 @@ mod tests {
     async fn driver_sends_key_the_unacked_window_under_the_authorized_slot() {
         // The embedder leaves every outbound turn's slot at 0; the driver stamps its
         // own authorized slot at send. Without that stamp a client on slot 1 keys its
-        // in-flight turns under a phantom slot 0, so `oldest_unacked_seq(SlotId(1))`
+        // in-flight turns under a phantom slot 0, so `oldest_replayable_seq(SlotId(1))`
         // (what a same-relay resume anchors on) sees nothing. Stamped, the unacked
         // window keys under slot 1 and the anchor query finds the in-flight seqs.
         let (link, state, _peer, _ea, _eb) =
@@ -4753,12 +4774,12 @@ mod tests {
 
         assert_eq!(state.next_outbound_seq, 3, "three turns were produced");
         assert_eq!(
-            link.oldest_unacked_seq(SlotId(1)),
+            link.oldest_replayable_seq(SlotId(1)),
             Some(0),
             "the in-flight window keys under the authorized slot",
         );
         assert_eq!(
-            link.oldest_unacked_seq(SlotId(0)),
+            link.oldest_replayable_seq(SlotId(0)),
             None,
             "nothing is stranded under the wire-claim slot 0",
         );
@@ -4801,7 +4822,7 @@ mod tests {
         // The exact computation `reconnect_link` performs for the same-relay anchor.
         let own_slot = SlotId(1);
         let anchor = link
-            .oldest_unacked_seq(own_slot)
+            .oldest_replayable_seq(own_slot)
             .unwrap_or(state.next_outbound_seq);
 
         assert_eq!(
@@ -4840,7 +4861,7 @@ mod tests {
             2,
             "the authorized-slot cursor retires the driver's confirmed turns",
         );
-        assert_eq!(link.oldest_unacked_seq(SlotId(1)), Some(2));
+        assert_eq!(link.oldest_replayable_seq(SlotId(1)), Some(2));
         assert_eq!(link.payloads_in_flight(), 1);
     }
 

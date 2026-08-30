@@ -179,9 +179,10 @@ impl Link {
     /// smaller datagram limit than the connection that admitted them), plus
     /// any diverted by an earlier rebind and not yet retired. Such a payload
     /// is excluded from datagram refill — no longer fitting a packet, it must
-    /// not block the head of a line it cannot ride — but deliberately **stays
-    /// in the unacked window**: its seq keeps anchoring resume handshakes,
-    /// and only the peer-confirmed ack-beacon cursor retires it. The staging
+    /// not block the head of a line it cannot ride — and from the resume
+    /// anchor ([`oldest_replayable_seq`](Self::oldest_replayable_seq)), but
+    /// deliberately **stays in the unacked window**, where only the
+    /// peer-confirmed ack-beacon cursor retires it. The staging
     /// copy is therefore disposable — the caller writes it to the control
     /// stream, and if that connection dies before the relay provably
     /// processed it (a locally-successful write proves nothing), the *next*
@@ -222,14 +223,21 @@ impl Link {
         self.acks.upstream_lost_packets()
     }
 
-    /// The lowest still-unacked payload seq this link holds for `slot`, or `None`
-    /// if nothing is in flight for it. It is the oldest seq the redundancy pass will
-    /// re-carry over a rebound connection, so a driver presents it as its own-slot
-    /// resume anchor on a same-relay re-dial: the fresh relay bases the slot's
-    /// receive window there (see [`anchor_receive_window`](Self::anchor_receive_window))
-    /// rather than at 0, which a session past the window would otherwise trip.
-    pub fn oldest_unacked_seq(&self, slot: SlotId) -> Option<u64> {
-        self.acks.oldest_unacked_seq(slot)
+    /// The lowest still-unacked payload seq this link's *datagram redundancy*
+    /// will replay for `slot` — control-diverted payloads excluded — or
+    /// `None` if nothing replayable is in flight. A driver presents it as the
+    /// own-slot resume anchor on a re-dial: the fresh relay bases the slot's
+    /// receive window there (see
+    /// [`anchor_receive_window`](Self::anchor_receive_window)) rather than at
+    /// 0, and every seq above it eventually reaches the relay (replayable
+    /// unacked seqs re-carry until confirmed), so the window's contiguous
+    /// prefix always catches up. A diverted seq must not anchor the window —
+    /// nothing replays the retention-aged seqs between it and the live
+    /// stream, and a window based on a permanent void eventually rejects the
+    /// live stream outright. See
+    /// [`AckManager::oldest_replayable_seq`](crate::ack_manager::AckManager::oldest_replayable_seq).
+    pub fn oldest_replayable_seq(&self, slot: SlotId) -> Option<u64> {
+        self.acks.oldest_replayable_seq(slot)
     }
 
     /// The top of the contiguous run of payloads this link has delivered to its
@@ -1077,7 +1085,7 @@ mod tests {
     async fn same_relay_resume_anchor_from_oldest_unacked_accepts_a_past_window_stream() {
         // The same-relay reconnect fix, end to end at the transport layer: a client
         // deep into a game (unacked turns at a high absolute seq) sources its own-slot
-        // resume anchor from `oldest_unacked_seq` — exactly what the driver presents on
+        // resume anchor from `oldest_replayable_seq` — exactly what the driver presents on
         // a same-relay dial — and a fresh relay-side dedup anchored there accepts the
         // resumed stream that a from-zero window would reject as out-of-window (the
         // production blocker for any game past ~4096 turns).
@@ -1095,7 +1103,7 @@ mod tests {
             sender.send(Some(high(seq))).unwrap();
         }
         let anchor = sender
-            .oldest_unacked_seq(SlotId(0))
+            .oldest_replayable_seq(SlotId(0))
             .expect("turns are in flight");
         assert_eq!(
             anchor, 8000,
@@ -1373,7 +1381,7 @@ mod tests {
             sender.send(Some(turn(seq))).unwrap();
         }
         let anchor = sender
-            .oldest_unacked_seq(SlotId(0))
+            .oldest_replayable_seq(SlotId(0))
             .expect("turns are in flight");
         assert_eq!(
             anchor, 8000,
@@ -1908,8 +1916,10 @@ mod tests {
     /// window's payloads. Such a payload must be **diverted, not dropped**:
     /// returned for reliable-control staging, excluded from datagram refill
     /// (it can no longer fit a packet and must not block the head of the
-    /// line), yet kept in the window — where its seq still anchors resume
-    /// handshakes, a *second* connection failure re-returns it for
+    /// line), excluded from the resume anchor (nothing replays the seqs
+    /// between an aged diverted turn and the live stream, so anchoring at it
+    /// would base the relay's receive window on a permanent void), yet kept
+    /// in the window — where a *second* connection failure re-returns it for
     /// re-staging (a locally-successful control write proves nothing about
     /// peer-side processing), and only the peer-confirmed beacon cursor
     /// retires it. The retention ring only covers the newest turns, so for an
@@ -1934,8 +1944,9 @@ mod tests {
 
         // Connection A dies; the replacement's peer advertises 800 bytes. The
         // wide turn is returned for control-stream staging but STAYS in the
-        // window: it keeps counting in flight and keeps anchoring the resume
-        // handshake as the oldest unacked seq.
+        // window (it keeps counting in flight) — while the resume anchor
+        // skips it: only the small turn, which datagram redundancy will
+        // actually replay, may base a fresh relay's receive window.
         let (fresh_conn, _fresh_server_conn, _fresh_client_ep, _fresh_server_ep) =
             connect_to_peer_with_datagram_limit(800).await;
         let staged = client.rebind(fresh_conn);
@@ -1944,7 +1955,7 @@ mod tests {
             vec![5],
         );
         assert_eq!(client.payloads_in_flight(), 2);
-        assert_eq!(client.oldest_unacked_seq(SlotId(0)), Some(5));
+        assert_eq!(client.oldest_replayable_seq(SlotId(0)), Some(6));
 
         // The refill never offers the diverted turn to datagrams — a flush
         // carries the small turn, unblocked by the head it can't ride.
@@ -1967,9 +1978,11 @@ mod tests {
         );
 
         // Only the peer-confirmed beacon cursor retires it; after that, a
-        // third rebind has nothing left to stage.
+        // third rebind has nothing left to stage. (A fresh relay's beacon
+        // starts at the advertised anchor, so its first cursor already
+        // covers the below-anchor diverted seq.)
         assert_eq!(client.retire_through(SlotId(0), 5), 1);
-        assert_eq!(client.oldest_unacked_seq(SlotId(0)), Some(6));
+        assert_eq!(client.oldest_replayable_seq(SlotId(0)), Some(6));
         let (third_conn, _third_server_conn, _third_client_ep, _third_server_ep) =
             connect_to_peer_with_datagram_limit(800).await;
         assert!(client.rebind(third_conn).is_empty());
