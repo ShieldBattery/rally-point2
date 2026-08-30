@@ -274,6 +274,11 @@ pub struct AckManager {
     /// The peer's recently-received packets, keyed by their packet seq. Drives
     /// the `ack` / `ack_bits` we send back.
     received_packets: ReceivedPacketHistory,
+    /// How many entries in `unacked_payloads` are control-diverted
+    /// ([`SentPayload::control_diverted`]). Kept exact by every mutation so
+    /// the all-fit fast path can require the window to be divert-free in O(1)
+    /// instead of scanning for flags.
+    control_diverted_count: usize,
     /// How the redundancy refill spends bytes and rotates coverage.
     policy: RecarryPolicy,
 }
@@ -292,6 +297,7 @@ impl AckManager {
             unacked_payloads: BTreeMap::new(),
             unacked_payload_wire_len: Some(0),
             received_packets: ReceivedPacketHistory::default(),
+            control_diverted_count: 0,
             policy,
         }
     }
@@ -477,6 +483,13 @@ impl AckManager {
         let spacing = self.policy.spacing;
         let building_seq = packet.seq;
 
+        // Control-diverted payloads never compete for the refill: their
+        // delivery belongs to the reliable control stream, and — no longer
+        // fitting any datagram — they must not block the head of a line they
+        // cannot ride. Every path below skips them; the fast path requires a
+        // divert-free window outright, since its cached size covers the whole
+        // window.
+        //
         // When no spacing schedule filters the window and the whole window fits
         // under the cap, ranking cannot affect coverage: every candidate rides
         // this packet. Check that case from the cached encoded lengths and
@@ -487,7 +500,7 @@ impl AckManager {
         let all_candidates_fit = redundancy_cap
             .checked_sub(used)
             .is_some_and(|remaining| unacked_payload_wire_len <= remaining);
-        if spacing.is_none() && all_candidates_fit {
+        if spacing.is_none() && all_candidates_fit && self.control_diverted_count == 0 {
             packet.payloads.reserve(self.unacked_payloads.len());
             for sent in self.unacked_payloads.values() {
                 packet.payloads.push(sent.payload.clone());
@@ -498,7 +511,7 @@ impl AckManager {
             let mut due_wire_len = 0usize;
             let mut due_count = 0usize;
             for sent in self.unacked_payloads.values() {
-                if sent.is_due(spacing, building_seq) {
+                if !sent.control_diverted && sent.is_due(spacing, building_seq) {
                     due_wire_len += sent.wire_len;
                     due_count += 1;
                 }
@@ -513,7 +526,7 @@ impl AckManager {
                 // thinned the set.
                 packet.payloads.reserve(due_count);
                 for sent in self.unacked_payloads.values() {
-                    if !sent.is_due(spacing, building_seq) {
+                    if sent.control_diverted || !sent.is_due(spacing, building_seq) {
                         continue;
                     }
                     packet.payloads.push(sent.payload.clone());
@@ -546,7 +559,7 @@ impl AckManager {
                 let mut candidates: Vec<&SentPayload> = self
                     .unacked_payloads
                     .values()
-                    .filter(|sent| sent.is_due(spacing, building_seq))
+                    .filter(|sent| !sent.control_diverted && sent.is_due(spacing, building_seq))
                     .collect();
                 candidates.sort_by_key(|sent| std::cmp::Reverse(sent.waiting_age(building_seq)));
                 // The first (most overdue) candidate is capped by the datagram
@@ -616,6 +629,7 @@ impl AckManager {
                     send_count: 0,
                     last_carried_packet_seq: None,
                     registered_at_packet_seq: building_seq,
+                    control_diverted: false,
                     wire_len: payload_element_len(len),
                     payload: p,
                 },
@@ -731,8 +745,16 @@ impl AckManager {
         // the range front looks targeted, but pays a tree search/rebalance for
         // every retired entry and measures no better than this single traversal.
         let before = self.unacked_payloads.len();
+        let mut diverted_retired = 0usize;
         self.unacked_payloads
-            .retain(|&(candidate_slot, seq), _| candidate_slot != slot || seq > through_seq);
+            .retain(|&(candidate_slot, seq), sent| {
+                let keep = candidate_slot != slot || seq > through_seq;
+                if !keep && sent.control_diverted {
+                    diverted_retired += 1;
+                }
+                keep
+            });
+        self.control_diverted_count -= diverted_retired;
         let retired = before - self.unacked_payloads.len();
         if retired > 0 {
             // Computing the removed range's exact encoded size inside `retain`
@@ -744,29 +766,38 @@ impl AckManager {
         retired
     }
 
-    /// Removes and returns every unacked payload whose lone-packet size
-    /// exceeds `admission_budget` — ascending by `(slot, seq)`.
+    /// Marks every unacked payload whose lone-packet size exceeds
+    /// `admission_budget` as control-diverted, and returns a copy of **every**
+    /// diverted payload — newly and previously marked alike — ascending by
+    /// `(slot, seq)`.
     ///
     /// This is the rebind-time reclassification: the unacked window survives a
     /// connection swap, but the fresh connection's admission budget can be
     /// smaller than the one that admitted the window's payloads (a peer
-    /// advertising a small datagram limit). Left in the window, such a payload
-    /// would head every constrained refill without ever fitting a packet —
-    /// the fresh-free flushes included — gating all redundancy forever.
-    /// Extracted, the caller stages it for reliable-stream delivery, the path
-    /// already sized for what datagrams cannot carry; the peer dedups by
-    /// origin `(slot, seq)` regardless of which path delivers.
-    pub(crate) fn drain_unacked_wider_than(&mut self, admission_budget: usize) -> Vec<Payload> {
-        let keys: Vec<(SlotId, u64)> = self
-            .unacked_payloads
-            .iter()
-            .filter(|(_, sent)| lone_packet_len(&sent.payload) > admission_budget)
-            .map(|(key, _)| *key)
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| self.remove_unacked(&key))
-            .map(|sent| sent.payload)
-            .collect()
+    /// advertising a small datagram limit). Left datagram-eligible, such a
+    /// payload would head every constrained refill without ever fitting a
+    /// packet — the fresh-free flushes included — gating all redundancy
+    /// forever. Diverted, it is excluded from the refill while **staying in
+    /// the window**: its seq keeps anchoring resume handshakes, and only a
+    /// peer-confirmed retirement (the ack-beacon cursor) removes it. The
+    /// caller stages each returned copy for reliable-stream delivery — a
+    /// disposable copy, because this method returns every still-unretired
+    /// diverted payload again on the *next* rebind: a staging connection that
+    /// dies after a locally-successful write (which proves nothing about
+    /// peer-side processing) costs one rebind's delay, never the payload. The
+    /// peer dedups by origin `(slot, seq)`, so re-deliveries are harmless.
+    pub(crate) fn divert_unacked_wider_than(&mut self, admission_budget: usize) -> Vec<Payload> {
+        let mut staged = Vec::new();
+        for sent in self.unacked_payloads.values_mut() {
+            if !sent.control_diverted && lone_packet_len(&sent.payload) > admission_budget {
+                sent.control_diverted = true;
+                self.control_diverted_count += 1;
+            }
+            if sent.control_diverted {
+                staged.push(sent.payload.clone());
+            }
+        }
+        staged
     }
 
     /// Re-registers a payload as still-unacked so the redundancy pass re-carries
@@ -805,6 +836,7 @@ impl AckManager {
                     send_count: 0,
                     last_carried_packet_seq: None,
                     registered_at_packet_seq,
+                    control_diverted: false,
                     wire_len: payload_element_len(encoded_len),
                     payload,
                 },
@@ -816,10 +848,13 @@ impl AckManager {
     /// size exact. Replacement is defensive; normal origin seqs are unique.
     fn insert_unacked(&mut self, key: (SlotId, u64), sent: SentPayload) {
         let new_len = sent.wire_len;
-        if let Some(previous) = self.unacked_payloads.insert(key, sent)
-            && let Some(total) = self.unacked_payload_wire_len.as_mut()
-        {
-            *total = total.saturating_sub(previous.wire_len);
+        if let Some(previous) = self.unacked_payloads.insert(key, sent) {
+            if let Some(total) = self.unacked_payload_wire_len.as_mut() {
+                *total = total.saturating_sub(previous.wire_len);
+            }
+            if previous.control_diverted {
+                self.control_diverted_count -= 1;
+            }
         }
         if let Some(total) = self.unacked_payload_wire_len.as_mut() {
             *total = total.saturating_add(new_len);
@@ -830,6 +865,9 @@ impl AckManager {
         let removed = self.unacked_payloads.remove(key)?;
         if let Some(total) = self.unacked_payload_wire_len.as_mut() {
             *total = total.saturating_sub(removed.wire_len);
+        }
+        if removed.control_diverted {
+            self.control_diverted_count -= 1;
         }
         Some(removed)
     }
@@ -942,6 +980,22 @@ struct SentPayload {
     /// each starts at age zero and cannot indefinitely outrank an older
     /// payload whose age keeps growing.
     registered_at_packet_seq: u32,
+    /// Whether this payload's delivery has been handed to the reliable control
+    /// stream: a rebind found it wider than the fresh connection's admission
+    /// budget ([`AckManager::divert_unacked_wider_than`]). A diverted payload
+    /// never rides datagrams again (excluded from every refill, so it cannot
+    /// block the head of the line it can no longer fit), but it deliberately
+    /// **stays in the window**: its seq keeps anchoring resume handshakes via
+    /// [`AckManager::oldest_unacked_seq`], it keeps counting against the
+    /// unacked-window cap, and only a peer-confirmed signal — the ack-beacon
+    /// cursor via [`AckManager::retire_payloads_through`] — retires it. The
+    /// control-stream staging copy is thereby disposable: a connection that
+    /// dies after a locally-successful write costs nothing, because the next
+    /// rebind returns every still-unretired diverted payload for re-staging.
+    /// Sticky: a later connection with a roomier budget does not un-divert it
+    /// (both paths delivering is a harmless dedup; flip-flopping delivery
+    /// ownership is not).
+    control_diverted: bool,
     /// Cached size of its complete repeated-field wire element, so refilling a
     /// packet and maintaining the aggregate do not recalculate its varint.
     wire_len: usize,

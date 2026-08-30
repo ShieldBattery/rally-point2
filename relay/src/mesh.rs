@@ -2108,19 +2108,23 @@ async fn send_turn_over_link(
     }
     match link.send(mesh_session_key(key), Some(payload), conditions) {
         Ok(redundant) => Some(redundant > 0),
-        // The pre-check above diverts anything that can never ride a
-        // datagram, so this arm is reachable only if the path budget moved
-        // between the check and the send (no await separates them, so in
-        // practice it isn't). The payload was consumed by the failed send;
-        // log it loudly rather than pretend it was delivered.
+        // The pre-check above diverts anything that can never ride this
+        // session's datagrams, so this arm is the transient case: quinn's
+        // concurrently-running connection driver moved the live path budget
+        // between the check and the send, or a conditions sidecar crowded a
+        // floor-admitted turn out of a fallen-back datagram. Recoverable, not
+        // a loss: the send layer registered the fresh turn before the wire
+        // refused the bundle and recorded no carry, so returning
+        // "no redundancy" here leaves the maintenance flush armed and its
+        // sidecar-free packet re-carries the turn.
         Err(rally_point_transport::MeshLinkError::PayloadTooLarge { needed, budget }) => {
-            tracing::warn!(
+            tracing::debug!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
                 needed,
                 budget,
                 context,
-                "oversize turn slipped past the divert pre-check; dropped",
+                "bundle outgrew the live datagram budget; the flush re-carries it",
             );
             Some(false)
         }

@@ -173,16 +173,23 @@ impl Link {
     /// identities carried end-to-end, so the dedup keyed on them stays valid across
     /// the connection swap.
     ///
-    /// Returns the preserved payloads the **fresh** connection's admission
-    /// budget refuses — its peer may advertise a smaller datagram limit than
-    /// the connection that admitted them. Left in the window, such a payload
-    /// would head every constrained refill without ever fitting a packet
-    /// (fresh-free flushes included), gating all redundancy forever; the
-    /// caller must instead deliver each returned turn over the reliable
-    /// control stream, where the peer's `(slot, seq)` dedup makes a duplicate
-    /// harmless. Usually empty: first-party peers advertise ample limits, and
-    /// the guaranteed floor covers path-MTU movement. On a connection with no
-    /// datagram support at all, every preserved payload is returned.
+    /// Returns a staging copy of every preserved payload whose delivery now
+    /// belongs to the reliable control stream: those the **fresh**
+    /// connection's admission budget refuses (its peer may advertise a
+    /// smaller datagram limit than the connection that admitted them), plus
+    /// any diverted by an earlier rebind and not yet retired. Such a payload
+    /// is excluded from datagram refill — no longer fitting a packet, it must
+    /// not block the head of a line it cannot ride — but deliberately **stays
+    /// in the unacked window**: its seq keeps anchoring resume handshakes,
+    /// and only the peer-confirmed ack-beacon cursor retires it. The staging
+    /// copy is therefore disposable — the caller writes it to the control
+    /// stream, and if that connection dies before the relay provably
+    /// processed it (a locally-successful write proves nothing), the *next*
+    /// rebind returns the payload again; the peer's `(slot, seq)` dedup makes
+    /// any re-delivery harmless. Usually empty: first-party peers advertise
+    /// ample limits, and the guaranteed floor covers path-MTU movement. On a
+    /// connection with no datagram support at all, every preserved payload is
+    /// returned.
     #[must_use = "returned payloads no longer ride datagrams and must be \
                   staged for reliable-control delivery"]
     pub fn rebind(&mut self, connection: quinn::Connection) -> Vec<Payload> {
@@ -192,7 +199,7 @@ impl Link {
         // ingress_slot preserved: the connection swapped, but the slot this edge is
         // authorized for did not, so the wire-slot rewrite must keep applying.
         let admission = self.datagram_admission_budget().unwrap_or(0);
-        self.acks.drain_unacked_wider_than(admission)
+        self.acks.divert_unacked_wider_than(admission)
     }
 
     /// Payloads sent but not yet known-delivered — the in-flight depth, and the
@@ -1898,14 +1905,17 @@ mod tests {
 
     /// A rebind can land on a connection whose peer advertises a smaller
     /// datagram limit than the one that admitted the preserved unacked
-    /// window's payloads. Any preserved payload the fresh admission budget
-    /// refuses must come back out of the rebind for reliable-control staging —
-    /// left in the window, it would head every constrained refill without
-    /// ever fitting a packet (fresh-free flushes included), gating all
-    /// redundancy forever. The retention ring only covers the newest turns,
-    /// so for an older preserved payload the rebind drain is the only route.
+    /// window's payloads. Such a payload must be **diverted, not dropped**:
+    /// returned for reliable-control staging, excluded from datagram refill
+    /// (it can no longer fit a packet and must not block the head of the
+    /// line), yet kept in the window — where its seq still anchors resume
+    /// handshakes, a *second* connection failure re-returns it for
+    /// re-staging (a locally-successful control write proves nothing about
+    /// peer-side processing), and only the peer-confirmed beacon cursor
+    /// retires it. The retention ring only covers the newest turns, so for an
+    /// older preserved payload this loop is the only route.
     #[tokio::test]
-    async fn rebind_extracts_preserved_payloads_the_new_admission_refuses() {
+    async fn a_rebind_diverted_payload_survives_a_second_connection_failure() {
         let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
 
         // A wide-but-admissible turn and a small one ride connection A and
@@ -1922,21 +1932,47 @@ mod tests {
         client.send(Some(turn(0, 6, 0x2A))).unwrap();
         assert_eq!(client.payloads_in_flight(), 2);
 
-        // Connection A dies; the replacement's peer advertises 800 bytes.
+        // Connection A dies; the replacement's peer advertises 800 bytes. The
+        // wide turn is returned for control-stream staging but STAYS in the
+        // window: it keeps counting in flight and keeps anchoring the resume
+        // handshake as the oldest unacked seq.
         let (fresh_conn, _fresh_server_conn, _fresh_client_ep, _fresh_server_ep) =
             connect_to_peer_with_datagram_limit(800).await;
-        let drained = client.rebind(fresh_conn);
-
-        // The wide turn is extracted for control-stream staging; the small one
-        // stays in the window for ordinary datagram re-carry.
+        let staged = client.rebind(fresh_conn);
         assert_eq!(
-            drained
+            staged.iter().map(|payload| payload.seq).collect::<Vec<_>>(),
+            vec![5],
+        );
+        assert_eq!(client.payloads_in_flight(), 2);
+        assert_eq!(client.oldest_unacked_seq(SlotId(0)), Some(5));
+
+        // The refill never offers the diverted turn to datagrams — a flush
+        // carries the small turn, unblocked by the head it can't ride.
+        let flushed = client.send(None).unwrap();
+        assert_eq!(flushed, 1, "the flush re-carries only the small turn");
+
+        // The staging connection also dies (its control write, successful or
+        // not, proved nothing). The next rebind returns the wide turn AGAIN
+        // for re-staging — the staged copy was disposable, the window copy is
+        // the durable one.
+        let (second_conn, _second_server_conn, _second_client_ep, _second_server_ep) =
+            connect_to_peer_with_datagram_limit(800).await;
+        let restaged = client.rebind(second_conn);
+        assert_eq!(
+            restaged
                 .iter()
                 .map(|payload| payload.seq)
                 .collect::<Vec<_>>(),
             vec![5],
         );
+
+        // Only the peer-confirmed beacon cursor retires it; after that, a
+        // third rebind has nothing left to stage.
+        assert_eq!(client.retire_through(SlotId(0), 5), 1);
+        assert_eq!(client.oldest_unacked_seq(SlotId(0)), Some(6));
+        let (third_conn, _third_server_conn, _third_client_ep, _third_server_ep) =
+            connect_to_peer_with_datagram_limit(800).await;
+        assert!(client.rebind(third_conn).is_empty());
         assert_eq!(client.payloads_in_flight(), 1);
-        assert!(client.payload_fits(&turn(0, 6, 0x2A)).unwrap());
     }
 }
