@@ -172,12 +172,27 @@ impl Link {
     /// dedups that replay against turns already delivered. Payload seqs are origin
     /// identities carried end-to-end, so the dedup keyed on them stays valid across
     /// the connection swap.
-    pub fn rebind(&mut self, connection: quinn::Connection) {
+    ///
+    /// Returns the preserved payloads the **fresh** connection's admission
+    /// budget refuses — its peer may advertise a smaller datagram limit than
+    /// the connection that admitted them. Left in the window, such a payload
+    /// would head every constrained refill without ever fitting a packet
+    /// (fresh-free flushes included), gating all redundancy forever; the
+    /// caller must instead deliver each returned turn over the reliable
+    /// control stream, where the peer's `(slot, seq)` dedup makes a duplicate
+    /// harmless. Usually empty: first-party peers advertise ample limits, and
+    /// the guaranteed floor covers path-MTU movement. On a connection with no
+    /// datagram support at all, every preserved payload is returned.
+    #[must_use = "returned payloads no longer ride datagrams and must be \
+                  staged for reliable-control delivery"]
+    pub fn rebind(&mut self, connection: quinn::Connection) -> Vec<Payload> {
         self.connection = connection;
         self.acks.reset_connection();
         // dedup preserved: it is what makes the reconnect a resume, not a restart.
         // ingress_slot preserved: the connection swapped, but the slot this edge is
         // authorized for did not, so the wire-slot rewrite must keep applying.
+        let admission = self.datagram_admission_budget().unwrap_or(0);
+        self.acks.drain_unacked_wider_than(admission)
     }
 
     /// Payloads sent but not yet known-delivered — the in-flight depth, and the
@@ -1804,14 +1819,22 @@ mod tests {
     /// `send` refuses; the drivers treat that refusal as a recoverable bundle
     /// race, so the fresh turn would be neither registered for re-carry nor
     /// diverted — silently lost.
-    #[tokio::test]
-    async fn admission_respects_a_peer_advertised_datagram_limit() {
+    /// A client-side connection to a server that advertises `limit` as its
+    /// datagram receive size — the handshake constant that caps the client's
+    /// `max_datagram_size` toward it. The server connection and endpoints ride
+    /// along so they outlive the test body.
+    async fn connect_to_peer_with_datagram_limit(
+        limit: usize,
+    ) -> (
+        quinn::Connection,
+        quinn::Connection,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
         let (chain, key, ca) = self_signed();
         let mut server_cfg = server_config(chain, key).unwrap();
-        // The server advertises an 800-byte datagram limit; the client's
-        // max_datagram_size toward it lands just under that.
         let mut transport = quinn::TransportConfig::default();
-        transport.datagram_receive_buffer_size(Some(800));
+        transport.datagram_receive_buffer_size(Some(limit));
         server_cfg.transport_config(std::sync::Arc::new(transport));
 
         let mut roots = rustls::RootCertStore::empty();
@@ -1833,8 +1856,14 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
-        let _server_conn = accept.await.unwrap();
+        let server_conn = accept.await.unwrap();
+        (client_conn, server_conn, client_ep, server)
+    }
 
+    #[tokio::test]
+    async fn admission_respects_a_peer_advertised_datagram_limit() {
+        let (client_conn, _server_conn, _client_ep, _server_ep) =
+            connect_to_peer_with_datagram_limit(800).await;
         let mut client = Link::new(client_conn);
         let live = client
             .connection()
@@ -1865,5 +1894,49 @@ mod tests {
         let small = turn(0, 0, 0x11);
         assert!(client.payload_fits(&small).unwrap());
         client.send(Some(small)).unwrap();
+    }
+
+    /// A rebind can land on a connection whose peer advertises a smaller
+    /// datagram limit than the one that admitted the preserved unacked
+    /// window's payloads. Any preserved payload the fresh admission budget
+    /// refuses must come back out of the rebind for reliable-control staging —
+    /// left in the window, it would head every constrained refill without
+    /// ever fitting a packet (fresh-free flushes included), gating all
+    /// redundancy forever. The retention ring only covers the newest turns,
+    /// so for an older preserved payload the rebind drain is the only route.
+    #[tokio::test]
+    async fn rebind_extracts_preserved_payloads_the_new_admission_refuses() {
+        let (mut client, _server, _client_ep, _server_ep) = connected_links().await;
+
+        // A wide-but-admissible turn and a small one ride connection A and
+        // stay unacked (the server never responds).
+        let wide_commands = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET - 64;
+        let wide = Payload {
+            seq: 5,
+            slot: 0,
+            commands: vec![0u8; wide_commands].into(),
+            ..Default::default()
+        };
+        assert!(client.payload_fits(&wide).unwrap());
+        client.send(Some(wide)).unwrap();
+        client.send(Some(turn(0, 6, 0x2A))).unwrap();
+        assert_eq!(client.payloads_in_flight(), 2);
+
+        // Connection A dies; the replacement's peer advertises 800 bytes.
+        let (fresh_conn, _fresh_server_conn, _fresh_client_ep, _fresh_server_ep) =
+            connect_to_peer_with_datagram_limit(800).await;
+        let drained = client.rebind(fresh_conn);
+
+        // The wide turn is extracted for control-stream staging; the small one
+        // stays in the window for ordinary datagram re-carry.
+        assert_eq!(
+            drained
+                .iter()
+                .map(|payload| payload.seq)
+                .collect::<Vec<_>>(),
+            vec![5],
+        );
+        assert_eq!(client.payloads_in_flight(), 1);
+        assert!(client.payload_fits(&turn(0, 6, 0x2A)).unwrap());
     }
 }

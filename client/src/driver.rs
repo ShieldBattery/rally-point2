@@ -2745,8 +2745,14 @@ async fn reconnect_link(
                 // rebind, against the fresh connection's own datagram budget
                 // — mirroring the re-home path's own rebind-then-reinject
                 // order — though an oversize turn is definitionally oversize
-                // on any realistic path.
-                link.rebind(fresh.connection().clone());
+                // on any realistic path. Preserved unacked turns the fresh
+                // connection's admission refuses (a smaller peer-advertised
+                // datagram limit) come back from the rebind and take the same
+                // reliable-control path — retention only covers the newest
+                // turns, so this is the only route for an older preserved one.
+                for turn in link.rebind(fresh.connection().clone()) {
+                    stage_control_redivert(&mut state.pending_control_redivert, turn);
+                }
                 redivert_oversize_retention_on_same_relay_resume(link, state);
                 backoff.reset();
                 return Reconnected::Resumed;
@@ -2856,8 +2862,18 @@ async fn reconnect_link(
                                             // empty ring re-carries them to peers. Only now —
                                             // on a *successful* dial — does the driver adopt
                                             // the new relay id, so a failed dial never leaves
-                                            // it naming a relay it isn't homed on.
-                                            link.rebind(fresh.connection().clone());
+                                            // it naming a relay it isn't homed on. Preserved
+                                            // unacked turns the fresh connection's admission
+                                            // refuses come back from the rebind and are staged
+                                            // for the control stream — retention only covers
+                                            // the newest turns, so an older preserved one has
+                                            // no other route.
+                                            for turn in link.rebind(fresh.connection().clone()) {
+                                                stage_control_redivert(
+                                                    &mut state.pending_control_redivert,
+                                                    turn,
+                                                );
+                                            }
                                             reinject_retention(link, state);
                                             rc.target = ReconnectTarget {
                                                 endpoint,
@@ -2966,6 +2982,20 @@ fn rehome_own_slot_anchor(
     }
 }
 
+/// Stages one turn for reliable-control delivery unless an identical
+/// `(slot, seq)` is already staged — several rebind-time paths (retention
+/// re-injection, the oversize redivert, the rebind misfit drain) can each
+/// nominate the same turn, and one control-stream copy suffices (the peer
+/// dedups by origin identity anyway; the check just saves the bytes).
+fn stage_control_redivert(pending: &mut Vec<Payload>, turn: Payload) {
+    if !pending
+        .iter()
+        .any(|staged| staged.slot == turn.slot && staged.seq == turn.seq)
+    {
+        pending.push(turn);
+    }
+}
+
 fn reinject_retention(link: &mut Link, state: &mut LoopState) {
     let LoopState {
         retention,
@@ -2976,7 +3006,7 @@ fn reinject_retention(link: &mut Link, state: &mut LoopState) {
         if matches!(link.payload_fits(turn), Ok(true)) {
             link.reinject_unacked(turn.clone());
         } else {
-            pending_control_redivert.push(turn.clone());
+            stage_control_redivert(pending_control_redivert, turn.clone());
         }
     }
 }
@@ -3014,12 +3044,8 @@ fn redivert_oversize_retention_on_same_relay_resume(link: &Link, state: &mut Loo
         ..
     } = state;
     for turn in retention.iter() {
-        if matches!(link.payload_fits(turn), Ok(false))
-            && !pending_control_redivert
-                .iter()
-                .any(|staged| staged.slot == turn.slot && staged.seq == turn.seq)
-        {
-            pending_control_redivert.push(turn.clone());
+        if matches!(link.payload_fits(turn), Ok(false)) {
+            stage_control_redivert(pending_control_redivert, turn.clone());
         }
     }
 }
@@ -4568,7 +4594,12 @@ mod tests {
         // control-stream redeliver — don't depend on which address it is),
         // then redivert.
         let (fresh_a, fresh_b, _fea, _feb) = connected_links().await;
-        link.rebind(fresh_a.connection().clone());
+        let rebind_misfits = link.rebind(fresh_a.connection().clone());
+        assert_eq!(
+            rebind_misfits.len(),
+            0,
+            "the loopback peers share admission budgets; nothing reclassifies",
+        );
         redivert_oversize_retention_on_same_relay_resume(&link, &mut state);
         assert_eq!(state.pending_control_redivert.len(), 1);
 

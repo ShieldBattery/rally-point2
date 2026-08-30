@@ -744,6 +744,31 @@ impl AckManager {
         retired
     }
 
+    /// Removes and returns every unacked payload whose lone-packet size
+    /// exceeds `admission_budget` — ascending by `(slot, seq)`.
+    ///
+    /// This is the rebind-time reclassification: the unacked window survives a
+    /// connection swap, but the fresh connection's admission budget can be
+    /// smaller than the one that admitted the window's payloads (a peer
+    /// advertising a small datagram limit). Left in the window, such a payload
+    /// would head every constrained refill without ever fitting a packet —
+    /// the fresh-free flushes included — gating all redundancy forever.
+    /// Extracted, the caller stages it for reliable-stream delivery, the path
+    /// already sized for what datagrams cannot carry; the peer dedups by
+    /// origin `(slot, seq)` regardless of which path delivers.
+    pub(crate) fn drain_unacked_wider_than(&mut self, admission_budget: usize) -> Vec<Payload> {
+        let keys: Vec<(SlotId, u64)> = self
+            .unacked_payloads
+            .iter()
+            .filter(|(_, sent)| lone_packet_len(&sent.payload) > admission_budget)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.remove_unacked(&key))
+            .map(|sent| sent.payload)
+            .collect()
+    }
+
     /// Re-registers a payload as still-unacked so the redundancy pass re-carries
     /// it, **without** sending a packet — the re-inject half of a coordinator-
     /// mediated re-home.

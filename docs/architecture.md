@@ -1232,10 +1232,12 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   payload always fits — packing smaller candidates around a blocked head would reset that flush
   from packets the head can never ride, stranding it behind continuous traffic. (The flush serves
   it within one flush interval on the client edge and the relay's client-facing links; the mesh
-  checks per-session flush deadlines on a link-global maintenance tick, so its healthy-link
-  expectation is roughly two intervals — a stalled reliable control stream can hold the
-  maintenance branch up to its ten-second write timeout, after which the link resets and the
-  reconnect path re-carries.) That flush always having room is itself guaranteed statically:
+  checks per-session flush deadlines on a link-global maintenance pass serviced at the **top of
+  every driver-loop iteration** — not merely as a low-priority branch of its biased select, which
+  a saturated link's continuously-ready data branches could otherwise starve indefinitely — so its
+  healthy expectation is roughly two intervals even under sustained traffic. A stalled reliable
+  control stream can still hold one maintenance pass up to its ten-second write timeout, after
+  which the link resets and the reconnect path re-carries.) That flush always having room is itself guaranteed statically:
   datagram payloads are admitted against a **fixed floor budget** (`GUARANTEED_DATAGRAM_BUDGET`),
   never the live discovered `max_datagram_size()` — quinn's black-hole detector shrinks the live
   value back to the 1200-byte MTU floor under loss bursts, exactly the weather redundancy exists
@@ -1245,8 +1247,17 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   may legally be smaller than the floor, and which `payload_fits` and `send` must judge
   identically — a fits-then-refused skew silently drops the fresh turn), and the mesh reserves the
   wrapper costs riding every one of a session's packets, the `MeshPacket` overhead and the
-  session's tenant framing included. Payloads over the applicable floor divert to the reliable
-  control streams, which carry any size. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  session's tenant framing included. The pre-registration guards enforce **only** these stable
+  floors, never a re-sampled live budget: quinn's connection driver can shrink the live value
+  between a caller's preflight and its send with no await between them, and a refusal there is
+  consumed as a recoverable race — so a floor-admitted payload whose transient envelope (a full
+  conditions sidecar on a fallen-back path) outgrows the datagram registers anyway, fails the
+  *datagram* send unrecorded, and rides the next sidecar-free flush. Payloads over the applicable
+  floor divert to the reliable control streams, which carry any size. Admission is re-judged at
+  every **rebind**: a replacement connection's peer may advertise a smaller limit than the one
+  that admitted the preserved unacked window, so the rebind drains any preserved payload the fresh
+  budget refuses and the driver stages it for the control stream — the one reclassification the
+  otherwise connection-constant admission ever performs. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
   rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
   below backlog growth, and most-overdue-first is also the right priority there, approximating the
   oldest-first order the lockstep prefix actually needs. No loss pattern can strand a payload.

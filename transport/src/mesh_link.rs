@@ -484,15 +484,23 @@ impl MeshLink {
             .saturating_sub(conditions_overhead)
             .saturating_sub(tenant_overhead)
             .saturating_sub(MESH_PACKET_OVERHEAD);
-        // A payload that might someday be unable to ride a datagram is refused
+        // A payload that can never ride this session's datagrams is refused
         // *before* it is registered as unacked (mirroring `Link::send`) —
-        // against the session's admission floor as well as this send's
-        // budget, since the live budget can later shrink below what it reads
-        // today. Registered, every rebuilt bundle would try and fail to carry
-        // it while its seq holds a permanent gap in the peer's delivered
-        // prefix. This is the second line of defense — the caller pre-checks
-        // with [`payload_fits`](Self::payload_fits) and diverts oversize turns
-        // to the mesh control stream before ever calling `send`.
+        // against the session's stable admission floor, and deliberately NOT
+        // this send's conditions-bearing budget. The floor's inputs are
+        // connection-lifetime constants, but `packet_budget` re-samples the
+        // live datagram size, which quinn's connection driver can shrink
+        // between the caller's `payload_fits` preflight and this guard even
+        // with no await between them — and the callers consume a refusal here
+        // as a recoverable race, dropping the fresh turn outright. A
+        // floor-admitted payload whose current envelope (a full conditions
+        // sidecar atop a path-MTU fallback) has outgrown the datagram instead
+        // registers below and fails the *datagram* send — unrecorded, so the
+        // next sidecar-free flush re-carries it: a genuinely recoverable
+        // bundle race rather than a lost turn. This stays the second line of
+        // defense — the caller pre-checks with
+        // [`payload_fits`](Self::payload_fits) and diverts oversize turns to
+        // the mesh control stream before ever calling `send`.
         if let Some(p) = &payload {
             // A wire slot that doesn't fit a `SlotId` can't be tracked without
             // narrowing it onto a different, valid slot's bookkeeping, so it is
@@ -503,10 +511,7 @@ impl MeshLink {
                 return Err(MeshLinkError::MalformedSlot(p.slot));
             }
             let needed = crate::ack_manager::lone_packet_len(p);
-            let admission = packet_budget.min(packet_admission_floor(
-                datagram_budget,
-                key.tenant.as_deref(),
-            ));
+            let admission = packet_admission_floor(datagram_budget, key.tenant.as_deref());
             if needed > admission {
                 return Err(MeshLinkError::PayloadTooLarge {
                     needed,
@@ -783,6 +788,95 @@ mod tests {
         }
     }
 
+    /// Mesh links whose server side advertises `limit` as its datagram receive
+    /// size, capping the sender's `max_datagram_size` toward it — a stand-in
+    /// for any connection whose datagram budget sits near the payloads riding
+    /// it (a small peer limit, or a path fallen back to the MTU floor).
+    async fn connected_mesh_links_with_datagram_limit(
+        limit: usize,
+    ) -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoint) {
+        let (chain, key, ca) = self_signed();
+        let mut server_cfg = server_config(chain, key).unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport.datagram_receive_buffer_size(Some(limit));
+        server_cfg.transport_config(std::sync::Arc::new(transport));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let (dial_chain, dial_key, _) = self_signed();
+        let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
+
+        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client_conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accept.await.unwrap();
+
+        (
+            MeshLink::new(client_conn),
+            MeshLink::new(server_conn),
+            client,
+            server,
+        )
+    }
+
+    /// A floor-admitted payload whose *current* envelope is too large — a full
+    /// conditions sidecar on a datagram budget near the floor — must fail as a
+    /// recoverable bundle race (registered, datagram refused, unrecorded), not
+    /// be refused before registration: the pre-registration guard re-samples
+    /// the live budget, which can shrink between the caller's `payload_fits`
+    /// preflight and the send, and the callers consume that refusal by
+    /// dropping the fresh turn. The sidecar-free flush then recovers it.
+    #[tokio::test]
+    async fn a_conditions_crowded_send_downgrades_to_a_recoverable_bundle_race() {
+        let (mut sender, mut receiver, _client_ep, _server_ep) =
+            connected_mesh_links_with_datagram_limit(800).await;
+
+        let session = SessionId(3);
+        let key = MeshSessionKey::from(session);
+        sender.open_session(key.clone());
+        receiver.open_session(key.clone());
+
+        // Admissible against the session's floor, but too wide to share a
+        // datagram with the largest conditions sidecar at this budget.
+        let payload = Payload {
+            seq: 0,
+            slot: 0,
+            commands: vec![0u8; 700].into(),
+            ..Default::default()
+        };
+        assert!(sender.payload_fits(&payload, None, None).unwrap());
+
+        // The conditions-bearing send outgrows the datagram: refused by the
+        // wire, but the payload is registered (and the carry unrecorded).
+        match sender.send(key.clone(), Some(payload), Some(full_epoch_conditions())) {
+            Err(MeshLinkError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected a datagram-level PayloadTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            sender.payloads_in_flight(key.clone()),
+            1,
+            "the turn must be registered for re-carry, not dropped pre-registration",
+        );
+
+        // The sidecar-free flush recovers it.
+        assert_eq!(sender.send(key.clone(), None, None).unwrap(), 1);
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.delivery.fresh.len(), 1);
+        assert_eq!(received.delivery.fresh[0].seq, 0);
+    }
+
     /// The largest conditions sidecar a real game can produce, using the same
     /// field values as the relay hot-path benchmark. Each slot has a distinct,
     /// stable physical-connection generation, matching production rather than
@@ -861,16 +955,6 @@ mod tests {
         );
     }
 
-    /// The headline proof for tenant-scoped mesh sessions: two tenants happen
-    /// to use the *same* numeric session id on one `MeshLink`, plus a third,
-    /// tenant-less session also sharing that id (the legacy path an old peer,
-    /// or a caller with nothing to scope by, still uses) — all three coexist
-    /// with fully independent transport state and no cross-delivery. Mirrors
-    /// `two_sessions_on_one_link_do_not_cross_dedup_ack_or_retire`'s design
-    /// (identical `(slot, seq)` on every one of them), but demuxing by
-    /// `MeshSessionKey` instead of by distinct session ids — proving the
-    /// tenant (or its absence) is what disambiguates, not merely the numeric
-    /// id.
     /// A session's tenant framing rides *every* one of its packets, so mesh
     /// admission must reserve it out of the guaranteed floor. Without the
     /// reservation, a payload admitted near the bare floor on a large
@@ -921,6 +1005,16 @@ mod tests {
         sender.send(key, Some(turn(0, 0, 0x22)), None).unwrap();
     }
 
+    /// The headline proof for tenant-scoped mesh sessions: two tenants happen
+    /// to use the *same* numeric session id on one `MeshLink`, plus a third,
+    /// tenant-less session also sharing that id (the legacy path an old peer,
+    /// or a caller with nothing to scope by, still uses) — all three coexist
+    /// with fully independent transport state and no cross-delivery. Mirrors
+    /// `two_sessions_on_one_link_do_not_cross_dedup_ack_or_retire`'s design
+    /// (identical `(slot, seq)` on every one of them), but demuxing by
+    /// `MeshSessionKey` instead of by distinct session ids — proving the
+    /// tenant (or its absence) is what disambiguates, not merely the numeric
+    /// id.
     #[tokio::test]
     async fn two_tenants_sharing_a_session_id_exchange_turns_without_cross_delivery() {
         let (mut sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;

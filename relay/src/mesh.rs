@@ -2402,6 +2402,141 @@ pub async fn run_mesh_link(
         if !lease.is_current() {
             break MeshLinkExit::Superseded;
         }
+        // Service due maintenance synchronously, before selecting on the data
+        // paths. The select below is biased toward the hot branches, and a
+        // saturated link keeps them continuously ready — so if maintenance
+        // only ran as a (lower-priority) select branch, sustained traffic
+        // could postpone it without bound. Maintenance carries work that must
+        // not lose to throughput: the per-session fresh-free flushes (the only
+        // packets a wide payload blocked at the refill's head of line can ride
+        // — see the head-of-line gate in the transport's redundancy refill),
+        // the ack-cursor beacon that keeps unacked windows bounded, the
+        // window-cap check, and presence. Running the due check at the top of
+        // every loop iteration bounds its delay by one event's servicing time,
+        // independent of select polling order.
+        if maintenance
+            .deadline()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            let now = tokio::time::Instant::now();
+            let mut failed = None;
+            let mut window_exhausted = false;
+            let mut presence_updates = Vec::new();
+            let mut ack_cursor_frames = Vec::with_capacity(joined.len());
+
+            // One link-wide pass handles every periodic responsibility.
+            // Ordinary turn and control events can wake this select loop
+            // thousands of times a second; none of them scans `joined`.
+            for state in joined.values_mut() {
+                let key = mesh_session_key(&state.key);
+                let in_flight = link.payloads_in_flight(key.clone());
+                // Checked every link-wide tick, independent of this
+                // session's own flush deadline. See
+                // `MESH_UNACKED_WINDOW_CAP` for why this reads per session,
+                // not summed across the link.
+                if mesh_window_exhausted(in_flight) {
+                    window_exhausted = true;
+                    break;
+                }
+                if state.flush_deadline <= now {
+                    if in_flight > 0
+                        && let Err(error) = link.send(key, None, None)
+                    {
+                        failed = Some(error);
+                        break;
+                    }
+                    state.flush_deadline = now + routing::FLUSH_INTERVAL;
+                }
+
+                let live = local_live_players(&sessions, &state.key);
+                if presence_sent.get(&state.key.session) != Some(&live) {
+                    presence_updates.push((state.key.session, live));
+                }
+
+                if let Some(frame) = reconcile_ack_cursors(&link, &mut ack_cursors_sent, state) {
+                    ack_cursor_frames.push(frame);
+                }
+            }
+            if window_exhausted {
+                // The ack-cursor beacon (`reconcile_ack_cursors`, above)
+                // could not keep this session's window bounded -- a
+                // genuine forward gap, not lost reverse-path acks. Reset
+                // the whole link like the full-forward-queue case: the
+                // redial's Join/reconcile and resume-cursor exchange
+                // recover every session on it, including this one.
+                tracing::warn!("mesh unacked window exceeded cap; resetting link");
+                break MeshLinkExit::ConnectionFailed;
+            }
+            if let Some(error) = failed {
+                tracing::info!(%error, "mesh flush failed; closing link");
+                break MeshLinkExit::ConnectionFailed;
+            }
+            // Reconcile presence on the same cadence: push each joined
+            // session's live-player count when it differs from what the
+            // peer last heard. Riding the tick (rather than hooking every
+            // roster change into this task) keeps the roster paths free of
+            // mesh plumbing; the ≤150ms of staleness is nothing against
+            // the seconds-scale dwell of the buffer decisions presence
+            // feeds. This reliable push is also why a relay whose players
+            // have all left — and which therefore sends no datagrams at
+            // all — still gets its "I'm out" to the peer.
+            // Deadline-bounded like the control-stream writes: the
+            // presence stream is written inline here too, so a peer that
+            // stops reading it could suspend the whole loop. See
+            // `MESH_STREAM_WRITE_TIMEOUT`.
+            match await_while_current(
+                &lease,
+                tokio::time::timeout(
+                    MESH_STREAM_WRITE_TIMEOUT,
+                    push_presence_updates(&mut presence_tx, &mut presence_sent, &presence_updates),
+                ),
+            )
+            .await
+            {
+                LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                LeaseAwait::Completed(Ok(Ok(()))) => {}
+                LeaseAwait::Completed(Ok(Err(_)) | Err(_)) => {
+                    tracing::info!("mesh presence push failed or stalled; closing link");
+                    break MeshLinkExit::ConnectionFailed;
+                }
+            }
+            // Every cursor frame is still independently length-prefixed and
+            // decoded by the peer in this order; only the application write is
+            // coalesced. Keeping this direct and link-local avoids routing up to
+            // one frame per active session through our own control channel and
+            // revisiting each through the select loop. Deadline-bound like all
+            // other inline stream writes: a wedged peer resets the link rather
+            // than suspending every joined session.
+            match await_while_current(
+                &lease,
+                tokio::time::timeout(
+                    MESH_STREAM_WRITE_TIMEOUT,
+                    rally_point_transport::mesh_control_stream::send_mesh_control_frames(
+                        &mut control_send,
+                        &ack_cursor_frames,
+                    ),
+                ),
+            )
+            .await
+            {
+                LeaseAwait::Superseded => break MeshLinkExit::Superseded,
+                LeaseAwait::Completed(Ok(Ok(()))) => {}
+                LeaseAwait::Completed(Ok(Err(error))) => {
+                    tracing::info!(%error, "mesh ack-cursor batch send failed; closing link");
+                    break MeshLinkExit::ConnectionFailed;
+                }
+                LeaseAwait::Completed(Err(_)) => {
+                    tracing::warn!("mesh ack-cursor batch send stalled; closing link");
+                    break MeshLinkExit::ConnectionFailed;
+                }
+            }
+            // Delay the next pass from completion rather than trying to
+            // catch up missed ticks back-to-back after a slow stream write.
+            maintenance.complete_tick(tokio::time::Instant::now());
+            maintenance_sleep
+                .as_mut()
+                .reset(maintenance.deadline().expect("active maintenance timer"));
+        }
         // The idle-teardown deadline. Only armed once the link has served at
         // least one session and is now empty (`idle_since` is Some); otherwise
         // the fallback (a day out) keeps the branch dormant. Cancel-safe like
@@ -2414,6 +2549,20 @@ pub async fn run_mesh_link(
             biased;
             _ = lease.superseded.notified() => {
                 break MeshLinkExit::Superseded;
+            }
+            // `fan_out_to_mesh` found this shared forward queue full and
+            // notified: this reset must not lose to the continuously-ready hot
+            // branches below (biased select polls top-down), so it sits above
+            // them. A dropped fresh turn here never enters this link's
+            // `AckManager`, so its transport has nothing to re-carry on its
+            // own. Reset the link instead — the dial supervisor redials, the
+            // Join-time reconcile re-syncs leave state, and the resume-cursor
+            // exchange on the fresh link replays this relay's own
+            // locally-originated turns the peer's forward-gate is still
+            // missing, closing the gap this very reset opened.
+            _ = shutdown.notified() => {
+                tracing::info!("mesh forward queue was full; resetting link");
+                break MeshLinkExit::ConnectionFailed;
             }
             received = link.recv() => {
                 match received {
@@ -2646,143 +2795,11 @@ pub async fn run_mesh_link(
                     None => break MeshLinkExit::CommandChannelClosed,
                 }
             }
-            // `fan_out_to_mesh` found this shared forward queue full and
-            // notified: a dropped fresh turn here never enters this link's
-            // `AckManager`, so its transport has nothing to re-carry on its
-            // own. Reset the link instead — the dial supervisor redials, the
-            // Join-time reconcile re-syncs leave state, and the resume-cursor
-            // exchange on the fresh link replays this relay's own
-            // locally-originated turns the peer's forward-gate is still
-            // missing, closing the gap this very reset opened.
-            _ = shutdown.notified() => {
-                tracing::info!("mesh forward queue was full; resetting link");
-                break MeshLinkExit::ConnectionFailed;
-            }
             _ = &mut maintenance_sleep, if maintenance.deadline().is_some() => {
-                let now = tokio::time::Instant::now();
-                let mut failed = None;
-                let mut window_exhausted = false;
-                let mut presence_updates = Vec::new();
-                let mut ack_cursor_frames = Vec::with_capacity(joined.len());
-
-                // One link-wide pass handles every periodic responsibility.
-                // Ordinary turn and control events can wake this select loop
-                // thousands of times a second; none of them scans `joined`.
-                for state in joined.values_mut() {
-                    let key = mesh_session_key(&state.key);
-                    let in_flight = link.payloads_in_flight(key.clone());
-                    // Checked every link-wide tick, independent of this
-                    // session's own flush deadline. See
-                    // `MESH_UNACKED_WINDOW_CAP` for why this reads per session,
-                    // not summed across the link.
-                    if mesh_window_exhausted(in_flight) {
-                        window_exhausted = true;
-                        break;
-                    }
-                    if state.flush_deadline <= now {
-                        if in_flight > 0 && let Err(error) = link.send(key, None, None) {
-                            failed = Some(error);
-                            break;
-                        }
-                        state.flush_deadline = now + routing::FLUSH_INTERVAL;
-                    }
-
-                    let live = local_live_players(&sessions, &state.key);
-                    if presence_sent.get(&state.key.session) != Some(&live) {
-                        presence_updates.push((state.key.session, live));
-                    }
-
-                    if let Some(frame) = reconcile_ack_cursors(
-                        &link,
-                        &mut ack_cursors_sent,
-                        state,
-                    ) {
-                        ack_cursor_frames.push(frame);
-                    }
-                }
-                if window_exhausted {
-                    // The ack-cursor beacon (`reconcile_ack_cursors`, below)
-                    // could not keep this session's window bounded -- a
-                    // genuine forward gap, not lost reverse-path acks. Reset
-                    // the whole link like the full-forward-queue case: the
-                    // redial's Join/reconcile and resume-cursor exchange
-                    // recover every session on it, including this one.
-                    tracing::warn!("mesh unacked window exceeded cap; resetting link");
-                    break MeshLinkExit::ConnectionFailed;
-                }
-                if let Some(error) = failed {
-                    tracing::info!(%error, "mesh flush failed; closing link");
-                    break MeshLinkExit::ConnectionFailed;
-                }
-                // Reconcile presence on the same cadence: push each joined
-                // session's live-player count when it differs from what the
-                // peer last heard. Riding the tick (rather than hooking every
-                // roster change into this task) keeps the roster paths free of
-                // mesh plumbing; the ≤150ms of staleness is nothing against
-                // the seconds-scale dwell of the buffer decisions presence
-                // feeds. This reliable push is also why a relay whose players
-                // have all left — and which therefore sends no datagrams at
-                // all — still gets its "I'm out" to the peer.
-                // Deadline-bounded like the control-stream writes: the
-                // presence stream is written inline here too, so a peer that
-                // stops reading it could suspend the whole loop. See
-                // `MESH_STREAM_WRITE_TIMEOUT`.
-                match await_while_current(
-                    &lease,
-                    tokio::time::timeout(
-                        MESH_STREAM_WRITE_TIMEOUT,
-                        push_presence_updates(
-                            &mut presence_tx,
-                            &mut presence_sent,
-                            &presence_updates,
-                        ),
-                    ),
-                )
-                .await
-                {
-                    LeaseAwait::Superseded => break MeshLinkExit::Superseded,
-                    LeaseAwait::Completed(Ok(Ok(()))) => {}
-                    LeaseAwait::Completed(Ok(Err(_)) | Err(_)) => {
-                        tracing::info!("mesh presence push failed or stalled; closing link");
-                        break MeshLinkExit::ConnectionFailed;
-                    }
-                }
-                // Every cursor frame is still independently length-prefixed and
-                // decoded by the peer in this order; only the application write is
-                // coalesced. Keeping this direct and link-local avoids routing up to
-                // one frame per active session through our own control channel and
-                // revisiting each through the select loop. Deadline-bound like all
-                // other inline stream writes: a wedged peer resets the link rather
-                // than suspending every joined session.
-                match await_while_current(
-                    &lease,
-                    tokio::time::timeout(
-                        MESH_STREAM_WRITE_TIMEOUT,
-                        rally_point_transport::mesh_control_stream::send_mesh_control_frames(
-                            &mut control_send,
-                            &ack_cursor_frames,
-                        ),
-                    ),
-                )
-                .await
-                {
-                    LeaseAwait::Superseded => break MeshLinkExit::Superseded,
-                    LeaseAwait::Completed(Ok(Ok(()))) => {}
-                    LeaseAwait::Completed(Ok(Err(error))) => {
-                        tracing::info!(%error, "mesh ack-cursor batch send failed; closing link");
-                        break MeshLinkExit::ConnectionFailed;
-                    }
-                    LeaseAwait::Completed(Err(_)) => {
-                        tracing::warn!("mesh ack-cursor batch send stalled; closing link");
-                        break MeshLinkExit::ConnectionFailed;
-                    }
-                }
-                // Delay the next pass from completion rather than trying to
-                // catch up missed ticks back-to-back after a slow stream write.
-                maintenance.complete_tick(tokio::time::Instant::now());
-                maintenance_sleep
-                    .as_mut()
-                    .reset(maintenance.deadline().expect("active maintenance timer"));
+                // Just a wake-up: the due-maintenance pass at the top of
+                // the loop does the work, so an idle link still ticks on
+                // time. Every data event re-enters the loop top too, which
+                // is what keeps maintenance serviced under saturation.
                 continue;
             }
             // A presence report from the peer: how many live home clients it
