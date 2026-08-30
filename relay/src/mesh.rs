@@ -36,6 +36,7 @@ use rally_point_proto::messages::{
     SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use rally_point_transport::MeshSessionKey;
+use rally_point_transport::quinn;
 use tokio::sync::{Notify, mpsc};
 
 use crate::routing::{self, SessionKey};
@@ -331,6 +332,46 @@ pub fn resume_cursor_snapshot(registries: &SeenRegistries, key: &SessionKey) -> 
         .collect()
 }
 
+/// One slot's forward-gate receipt state, read for seeding a resumed
+/// connection's receive window: the contiguous forwarded prefix plus the
+/// sparse forwarded seqs above it. See [`slot_receipts`].
+pub struct SlotReceipts {
+    /// Top of the contiguous forwarded prefix, `None` before seq 0 arrives.
+    pub forwarded_through: Option<u64>,
+    /// Forwarded seqs above the prefix, sorted ascending.
+    pub ahead: Vec<u64>,
+}
+
+/// A snapshot of every turn seq the forward gate has ever recorded for
+/// `key`'s `slot` — the same session-lifetime registry
+/// [`mark_forwarded`](MeshSeen::mark_forwarded) writes, which survives
+/// connection replacement, covers pre-start traffic, and never evicts. That
+/// is what makes it the authoritative half of resume-window seeding: a turn
+/// the relay acknowledged to its client either passed the gate and is
+/// recorded here, or is still held by the provisional journal (whose overflow
+/// seals the slot against resuming at all), so a resumed connection's acked
+/// holes can always be closed from the two together.
+///
+/// A prefix collapsed by the sparse cap (the private
+/// `SlotSeen::collapse_to_cap`) is reported as-is, gaps and all: the gate
+/// already treats the swallowed gaps as seen (an arrival in one is dropped as
+/// a duplicate, the documented safe failure direction), so a receive window
+/// seeded to match merely mirrors that verdict one layer down rather than
+/// adding a new loss.
+pub fn slot_receipts(registries: &SeenRegistries, key: &SessionKey, slot: SlotId) -> SlotReceipts {
+    let roster = registries.lock();
+    let Some(state) = roster.get(key).and_then(|seen| seen.slots.get(&slot)) else {
+        return SlotReceipts {
+            forwarded_through: None,
+            ahead: Vec::new(),
+        };
+    };
+    SlotReceipts {
+        forwarded_through: state.forwarded_through,
+        ahead: state.ahead.iter().copied().collect(),
+    }
+}
+
 /// Whether `key` has ANY forward-gate history at all — an entry in the same
 /// registry [`resume_cursor_snapshot`] reads, regardless of whether any slot
 /// in it has formed a contiguous prefix yet. This is the `resuming` a
@@ -466,12 +507,55 @@ pub fn claim_mesh_link(
     })
 }
 
+/// The verdict of [`claim_verified_mesh_link`]: claimed and cleared to serve,
+/// or refused — with the two refusals distinguished so each edge maps them to
+/// its own retry policy (a superseded dial stops; an under-floor peer retries
+/// like any failed attempt).
+pub enum MeshLinkAdmission {
+    /// Verified and claimed: this attempt is now the peer's current link.
+    Claimed(MeshLinkLease),
+    /// The peer's advertised datagram budget undercuts the guaranteed floor —
+    /// an unsupported configuration, refused before it could claim anything.
+    UnderFloor(rally_point_transport::quic::DatagramBudgetTooSmall),
+    /// A newer attempt already claimed the peer.
+    Superseded,
+}
+
+/// Verifies `connection` clears the guaranteed datagram floor, then claims
+/// `attempt` as the current link to `peer_id`. The order is load-bearing:
+/// claiming supersedes the peer's current driver (advancing the generation
+/// and waking that driver to exit), so an attempt that is going to be refused
+/// must be refused BEFORE it can claim — otherwise an authenticated but
+/// misconfigured connection kills a healthy mesh link on its way to being
+/// rejected and leaves nothing serving the peer. Both mesh establishment
+/// directions admit through this one function so the ordering cannot drift
+/// between them.
+pub fn claim_verified_mesh_link(
+    mesh: &MeshState,
+    peer_id: RelayId,
+    attempt: &MeshLinkAttempt,
+    connection: &quinn::Connection,
+) -> MeshLinkAdmission {
+    if let Err(error) = rally_point_transport::quic::verify_datagram_budget(connection) {
+        return MeshLinkAdmission::UnderFloor(error);
+    }
+    match claim_mesh_link(mesh, peer_id, attempt) {
+        Some(lease) => MeshLinkAdmission::Claimed(lease),
+        None => MeshLinkAdmission::Superseded,
+    }
+}
+
 impl MeshLinkLease {
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    fn is_current(&self) -> bool {
+    /// Whether this lease still names the peer's current link — false once a
+    /// newer claim has superseded it. Drivers gate their work through the
+    /// gated `with_current` dispatch / the supersession notification rather
+    /// than polling this; it is the direct observable for asserting a refused
+    /// admission left the standing link untouched.
+    pub fn is_current(&self) -> bool {
         self.current.lock().generation == self.generation
     }
 
@@ -1677,13 +1761,6 @@ fn skin_frame(session: SessionId, skin: PlayerSkin) -> MeshControlFrame {
 /// the outgoing payload; when it has none — every non-authority relay, always
 /// — a stamp already on the turn is left untouched, so the authority's
 /// broadcast survives the hop across relays that merely forward it.
-// `turn_ring` is the 8th argument (the replay record, alongside the mesh path's
-// existing registries); bundling into a struct would touch every call site
-// (production and test) for one more reference, so this follows the same
-// escape hatch already used elsewhere in the crate (`SyncTracker::record` in
-// `consensus.rs`, `connect_and_stream` in `coordinator_client.rs`) rather than
-// that churn.
-#[allow(clippy::too_many_arguments)]
 pub fn forward_client_turn(
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -1839,9 +1916,10 @@ pub(crate) fn deliver_mesh_turn(
 /// for a duplicate already delivered through another ingress instance. `home`
 /// feeds both the delivery-tracking home stamp and the replay ring's
 /// [`crate::turn_ring::TurnOrigin`].
-// Same escape hatch as `forward_client_turn` just above (see its own comment): one
-// more reference (`home`) alongside its existing bundle-worthy set, not
-// worth the call-site churn of a struct.
+// Eight references, one over clippy's default: bundling them into a struct
+// would touch every call site (production and test) for one parameter's worth
+// of churn, the same trade `SyncTracker::record` in `consensus.rs` and
+// `connect_and_stream` in `coordinator_client.rs` make.
 #[allow(clippy::too_many_arguments)]
 fn deliver_turn_to_locals(
     sessions: &routing::Sessions,
@@ -4381,6 +4459,53 @@ mod tests {
             mark_seen(&registries, &key, SlotId(1), seq);
         }
         assert_eq!(forwarded_count(&registries, &key, SlotId(1)), None);
+    }
+
+    /// `slot_receipts` reports the forward gate's full receipt record —
+    /// prefix plus sparse ahead seqs — for resume-window seeding, and keeps
+    /// answering from a collapsed prefix: the gate already drops arrivals in
+    /// the swallowed gaps as duplicates, so a window seeded to match mirrors
+    /// that verdict rather than adding a new failure mode (contrast
+    /// `forwarded_count`, whose leave-count consumer must refuse a collapsed
+    /// prefix because an inflated count strands survivors).
+    #[test]
+    fn slot_receipts_report_the_prefix_and_the_sparse_ahead_even_collapsed() {
+        let registries = new_seen_registries();
+        let key = SessionKey {
+            tenant: rally_point_proto::control::TenantId("t".to_owned()),
+            session: rally_point_proto::ids::SessionId(2),
+        };
+
+        // No session, no slot: an empty record, not a panic.
+        let empty = slot_receipts(&registries, &key, SlotId(0));
+        assert_eq!(empty.forwarded_through, None);
+        assert!(empty.ahead.is_empty());
+
+        // Prefix 0..=2 with sparse receipts above it.
+        for seq in 0..3 {
+            mark_seen(&registries, &key, SlotId(0), seq);
+        }
+        mark_seen(&registries, &key, SlotId(0), 5);
+        mark_seen(&registries, &key, SlotId(0), 9);
+        let receipts = slot_receipts(&registries, &key, SlotId(0));
+        assert_eq!(receipts.forwarded_through, Some(2));
+        assert_eq!(receipts.ahead, vec![5, 9]);
+
+        // A collapsed prefix still answers — seeding from it mirrors the
+        // gate's own duplicate verdict for the swallowed gaps.
+        for seq in (0..).step_by(2).take(SPARSE_SEEN_CAP + 10) {
+            mark_seen(&registries, &key, SlotId(1), seq);
+        }
+        assert_eq!(forwarded_count(&registries, &key, SlotId(1)), None);
+        let collapsed = slot_receipts(&registries, &key, SlotId(1));
+        assert!(
+            collapsed.forwarded_through.is_some(),
+            "the collapsed prefix still seeds",
+        );
+        assert!(
+            collapsed.ahead.len() <= SPARSE_SEEN_CAP,
+            "the sparse remainder stays bounded",
+        );
     }
 
     #[test]

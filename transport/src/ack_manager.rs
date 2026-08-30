@@ -358,9 +358,10 @@ impl AckManager {
     /// can sit between two unacked ones — so the seqs above this anchor are
     /// NOT all replayable from here; the anchor's contiguity contract holds on
     /// a same-relay resume only because the relay reconciles the acked holes
-    /// from its own turn ring (an acked seq is one it received and recorded),
-    /// seeding them as already delivered in the fresh receive window. A fresh
-    /// relay has no ring to reconcile from, so a **re-home** must anchor with
+    /// from its own session-lifetime receipt records (an acked seq is one it
+    /// received and recorded), seeding them as already delivered in the fresh
+    /// receive window. A replacement relay has no first-hand ack history to
+    /// reconcile from, so a **re-home** must anchor with
     /// [`contiguous_replayable_anchor`](Self::contiguous_replayable_anchor)
     /// instead.
     pub fn oldest_replayable_seq(&self, slot: SlotId) -> Option<u64> {

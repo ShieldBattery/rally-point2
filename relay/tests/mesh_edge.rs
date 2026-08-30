@@ -322,6 +322,85 @@ async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoi
     )
 }
 
+/// A loopback connection whose PEER advertises an under-floor datagram budget
+/// (its `datagram_receive_buffer_size` caps what this side may send), for
+/// exercising establishment-time floor refusals. Returns the dialing side's
+/// connection plus both endpoints so the caller keeps them alive.
+async fn connection_with_peer_datagram_limit(
+    limit: usize,
+) -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+    let (chain, key, ca) = self_signed();
+    let mut server_cfg = server_config(chain, key).unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(limit));
+    server_cfg.transport_config(std::sync::Arc::new(transport));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca).unwrap();
+    let (dial_chain, dial_key, _) = self_signed();
+    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
+
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let mut client = quinn::Endpoint::client(bind).unwrap();
+    client.set_default_client_config(client_cfg);
+
+    let accept = {
+        let server = server.clone();
+        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+    };
+    let client_conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let _server_conn = accept.await.unwrap();
+    (client_conn, client, server)
+}
+
+/// An authenticated but under-floor connection must be refused BEFORE it can
+/// claim the peer's mesh-link slot: claiming supersedes the healthy driver
+/// currently serving the peer (advancing the generation and waking it to
+/// exit), so a refusal that came after the claim would kill the healthy link
+/// and then leave nothing in its place.
+#[tokio::test]
+async fn an_under_floor_mesh_attempt_never_supersedes_the_healthy_link() {
+    let mesh = mesh::new_mesh_state();
+    let peer = RelayId(3);
+    let healthy_attempt = mesh::new_mesh_link_attempt();
+    let healthy =
+        mesh::claim_mesh_link(&mesh, peer, &healthy_attempt).expect("the healthy link claims");
+
+    let (under_floor, _client_ep, _server_ep) = connection_with_peer_datagram_limit(800).await;
+    let refused_attempt = mesh::new_mesh_link_attempt();
+    match mesh::claim_verified_mesh_link(&mesh, peer, &refused_attempt, &under_floor) {
+        mesh::MeshLinkAdmission::UnderFloor(_) => {}
+        mesh::MeshLinkAdmission::Claimed(_) => {
+            panic!("an under-floor peer must not be admitted")
+        }
+        mesh::MeshLinkAdmission::Superseded => {
+            panic!("the refusal must come from the floor check, not the claim")
+        }
+    }
+    assert!(
+        healthy.is_current(),
+        "a refused under-floor attempt must leave the healthy link current",
+    );
+
+    // A floor-clearing newer attempt still supersedes normally, proving the
+    // verification gate refuses only what it should.
+    let (good_link, _peer_link, _ep_a, _ep_b) = mesh_link_pair().await;
+    let newer_attempt = mesh::new_mesh_link_attempt();
+    match mesh::claim_verified_mesh_link(&mesh, peer, &newer_attempt, good_link.connection()) {
+        mesh::MeshLinkAdmission::Claimed(_) => {}
+        _ => panic!("a floor-clearing attempt claims normally"),
+    }
+    assert!(
+        !healthy.is_current(),
+        "the newer verified claim supersedes the old link",
+    );
+}
+
 /// Connects a client to `relay` for `slot`, runs the authorization handshake,
 /// and returns the live connection plus the client endpoint (kept alive by the
 /// caller so the connection is not torn down when the endpoint drops).

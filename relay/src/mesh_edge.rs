@@ -489,20 +489,22 @@ pub async fn run_mesh_accept(
             // not when this task itself eventually ends.
             drop(accept_permit);
 
-            let Some(lease) = mesh::claim_mesh_link(&mesh, peer_id, &attempt) else {
-                connection.close(0u32.into(), b"superseded mesh link");
-                return;
+            // Verification precedes the claim inside `claim_verified_mesh_link`:
+            // an under-floor peer is refused before it can supersede (and kill)
+            // whatever healthy link currently serves this peer id.
+            let lease = match mesh::claim_verified_mesh_link(&mesh, peer_id, &attempt, &connection)
+            {
+                mesh::MeshLinkAdmission::Claimed(lease) => lease,
+                mesh::MeshLinkAdmission::UnderFloor(error) => {
+                    tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
+                    connection.close(0u32.into(), b"datagram budget under guaranteed floor");
+                    return;
+                }
+                mesh::MeshLinkAdmission::Superseded => {
+                    connection.close(0u32.into(), b"superseded mesh link");
+                    return;
+                }
             };
-
-            // Same floor invariant every establishment enforces (see
-            // `verify_datagram_budget`): a fleet peer advertising an
-            // under-floor datagram budget is misconfigured; refuse it and let
-            // the dial supervisor's ordinary retry own the fallout.
-            if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
-                tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
-                connection.close(0u32.into(), b"datagram budget under guaranteed floor");
-                return;
-            }
 
             let link = rally_point_transport::MeshLink::new(connection);
             let (tx, rx) = mesh::command_channel();
@@ -820,19 +822,23 @@ async fn dial_and_serve(
     let peer_control_rx =
         rally_point_transport::mesh_control_stream::spawn_mesh_control_reader(control_recv);
 
-    let Some(lease) = mesh::claim_mesh_link(mesh, *peer_id, &attempt) else {
-        connection.close(0u32.into(), b"superseded mesh link");
-        return DialOutcome::Stop;
+    // Verification precedes the claim inside `claim_verified_mesh_link`: an
+    // under-floor peer is refused before it can supersede (and kill) whatever
+    // healthy link currently serves this peer id. Retrying the same
+    // misconfigured peer is pointless but harmless, so an under-floor refusal
+    // surfaces as an ordinary failed attempt.
+    let lease = match mesh::claim_verified_mesh_link(mesh, *peer_id, &attempt, &connection) {
+        mesh::MeshLinkAdmission::Claimed(lease) => lease,
+        mesh::MeshLinkAdmission::UnderFloor(error) => {
+            tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
+            connection.close(0u32.into(), b"datagram budget under guaranteed floor");
+            return DialOutcome::Retry;
+        }
+        mesh::MeshLinkAdmission::Superseded => {
+            connection.close(0u32.into(), b"superseded mesh link");
+            return DialOutcome::Stop;
+        }
     };
-
-    // Same floor invariant every establishment enforces (see
-    // `verify_datagram_budget`); retrying the same misconfigured peer is
-    // pointless but harmless, so surface it as an ordinary failed attempt.
-    if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
-        tracing::warn!(peer = peer_id.0, %error, "refusing under-floor mesh peer");
-        connection.close(0u32.into(), b"datagram budget under guaranteed floor");
-        return DialOutcome::Retry;
-    }
 
     // A cheap handle kept past the link's move below, so a driver exit can still
     // read the connection's close reason (naming a protocol-version refusal).

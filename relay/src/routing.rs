@@ -1619,16 +1619,36 @@ pub async fn run_slot_link(
             );
         }
         link.anchor_receive_window(slot, anchor);
-        // Reconcile the fresh receive window with what this relay already
-        // holds. The client's anchor is its oldest *unacked* seq, and
-        // selective packet acks make its unacked window sparse: seqs above
-        // the anchor that this relay acked will never be re-sent. Every acked
-        // seq was received and recorded in the session's turn ring, so seed
-        // those receipts into the new window — without them its contiguous
-        // prefix (and the ack-beacon cursor it drives) wedges at the first
-        // such hole, and once the live stream runs a full receive window past
-        // the stuck base the link is rejected as out-of-window.
-        for seq in turn_ring.recorded_seqs(&key, slot, anchor) {
+        // Reconcile the fresh receive window with the receipts this relay
+        // already holds for the slot. The client's anchor is its oldest
+        // *unacked* seq, and selective packet acks make its unacked window
+        // sparse: a seq above the anchor that was acknowledged to the client
+        // will never be re-sent, so without a seed the fresh window's
+        // contiguous prefix (and the ack-beacon cursor it drives) would wedge
+        // at that hole until the live stream ran a full receive window past
+        // the stuck base and the link was rejected as out-of-window.
+        //
+        // Two session-lifetime stores together cover every seq this relay has
+        // ever acknowledged for the slot, across connection churn and every
+        // phase of the session's life: the provisional journal (turns
+        // accepted before a descriptor named the session; its overflow seals
+        // the slot against readmission, so no resumable slot has an evicted
+        // entry) and the forward gate's seen registry (every turn that passed
+        // the gate, pre-start included — unlike the bounded replay ring, it
+        // never evicts). The journal is read BEFORE the gate: a descriptor
+        // drain only ever moves entries journal → gate, so a turn in transit
+        // is seen by at least one of the two reads.
+        for seq in mesh_for_teardown
+            .provisional_turns
+            .held_turn_seqs(&key, slot)
+        {
+            link.seed_delivered(slot, seq);
+        }
+        let receipts = crate::mesh::slot_receipts(&mesh_for_teardown.seen, &key, slot);
+        if let Some(through) = receipts.forwarded_through {
+            link.seed_delivered_through(slot, through);
+        }
+        for seq in receipts.ahead {
             link.seed_delivered(slot, seq);
         }
     }

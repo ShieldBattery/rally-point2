@@ -2333,14 +2333,18 @@ struct LoopState {
     /// The running encoded-byte total of [`retention`](Self::retention), so the
     /// byte cap is enforced without re-summing the ring on every push.
     retention_bytes: usize,
-    /// Retained turns a **re-home** deferred to the fresh connection's reliable
-    /// control stream: turns too large to ride any datagram, staged here by
-    /// [`reinject_retention`] because re-injecting them into the unacked window
-    /// would strand them there forever (the redundancy pass always skips a payload
-    /// that can't fit a lone packet). [`session`](Driver::session) drains this onto
-    /// the control stream it opens on the new connection — the same divert path an
-    /// oversize turn takes when first sent. Empty on a same-relay resume (which
-    /// keeps the old relay's reliable-stream state) and after each drain.
+    /// Retained turns a resume deferred to the fresh connection's reliable
+    /// control stream: turns too large to ride any datagram, staged here
+    /// because re-injecting them into the unacked window would strand them
+    /// there forever (the redundancy pass always skips a payload that can't
+    /// fit a lone packet). A re-home stages them via [`reinject_retention`];
+    /// a same-relay resume stages every still-retained oversize turn too
+    /// ([`redivert_oversize_retention_on_same_relay_resume`]) — a
+    /// control-stream write carries no acknowledgment, so a drop between the
+    /// local write succeeding and the relay processing it is otherwise
+    /// invisible. [`session`](Driver::session) drains this onto the control
+    /// stream it opens on the new connection — the same divert path an
+    /// oversize turn takes when first sent — and it empties on each drain.
     pending_control_redivert: Vec<Payload>,
     /// Relay-stamped physical connection lifecycle per member. Kept across this
     /// client's own reconnect so a delayed connectivity frame from another
@@ -2704,22 +2708,22 @@ async fn reconnect_link(
         // out-of-window rejection that closes the link. The anchor is the oldest seq
         // the *datagram* re-send will actually replay: the AckManager's oldest
         // replayable unacked seq, which the redundancy pass re-carries oldest-first
-        // over the rebound connection (a control-diverted turn deliberately does not
-        // anchor — its delivery rides the reliable control stream, and a window
-        // based on the void behind it could never close its contiguous prefix).
-        // With nothing replayable, it is the next seq we will produce (the
-        // buffered/live turns that flush on resume). NOT the retention ring's
-        // front — a same-relay resume does not re-inject that ring, so a lower
-        // anchor would strand a permanent prefix gap. (`cursors` stays peer-only;
-        // the re-home dial builds its own set below with the retention-front
-        // anchor, which it *does* re-inject.)
-        let same_relay_anchor = link
-            .oldest_replayable_seq(own_slot)
-            .unwrap_or(state.next_outbound_seq);
-        let mut same_relay_cursors = cursors.clone();
-        if same_relay_anchor > 0 {
-            same_relay_cursors.push((own_slot, same_relay_anchor));
-        }
+        // over the rebound connection. With nothing replayable, it is the next seq
+        // we will produce (the buffered/live turns that flush on resume). NOT the
+        // retention ring's front — a same-relay resume does not re-inject that
+        // ring, so a lower anchor would strand a permanent prefix gap. Selective
+        // packet acks leave the unacked window sparse, so seqs above the anchor
+        // that were already acked will never be re-sent either; the relay closes
+        // those holes itself, seeding the fresh window from its session-lifetime
+        // receipt records. (`cursors` stays peer-only; the re-home dial builds its
+        // own set below with the retention-front anchor, which it *does*
+        // re-inject.)
+        let same_relay_cursors = same_relay_resume_cursors(
+            &cursors,
+            link.oldest_replayable_seq(own_slot),
+            own_slot,
+            state.next_outbound_seq,
+        );
         match rc
             .target
             .endpoint
@@ -2733,11 +2737,12 @@ async fn reconnect_link(
             .await
         {
             Ok(fresh) => {
-                // A same-relay resume: the old link's receive dedup and unacked
+                // A same-relay resume: the client-side receive dedup and unacked
                 // window carry over, and the datagram/ack path needs no
-                // retention re-injection — the same relay still holds this
-                // session's turn ring, and `same_relay_anchor` above already
-                // covers the unacked tail. An OVERSIZE turn is different: it
+                // retention re-injection — the rebound link's redundancy
+                // re-carries the unacked tail, and the relay seeds its fresh
+                // receive window's acked holes from its own session-lifetime
+                // receipt records. An OVERSIZE turn is different: it
                 // never rode the datagram/ack path at all (there is no
                 // per-turn acknowledgment for a control-stream write), so a
                 // drop between the local `write_all` succeeding and the relay
@@ -2835,13 +2840,9 @@ async fn reconnect_link(
                                     // sources feed that re-send: the rebound link's replayable
                                     // unacked window (the redundancy pass re-carries it until
                                     // confirmed) and `reinject_retention`'s retained ring, so
-                                    // the anchor is the lower of the oldest replayable seq and
-                                    // the retention front (see `rehome_own_slot_anchor`). A
-                                    // control-diverted turn deliberately does NOT anchor: it
-                                    // travels the reliable control stream, and nothing would
-                                    // replay the retention-aged seqs between an old diverted
-                                    // turn and the live stream — a window based there carries
-                                    // a permanent void and eventually rejects the live stream.
+                                    // the anchor is the retention front extended downward only
+                                    // through contiguously unacked seqs (see
+                                    // `rehome_own_slot_anchor` for the sparse-window trade).
                                     // No source means nothing to re-send, so no anchor is
                                     // needed (the window bases at 0, correct for a slot that
                                     // never sent).
@@ -2987,11 +2988,34 @@ fn rehome_own_slot_anchor(
     }
 }
 
+/// The cursor set a same-relay re-dial presents: every peer cursor plus this
+/// client's own-slot resume anchor — the oldest replayable unacked seq, or
+/// with nothing replayable the next seq this client will produce.
+///
+/// The own-slot cursor is ALWAYS included, an anchor of 0 included. Its value
+/// bases the relay's fresh receive window, but its *presence* is what makes
+/// the relay seed that window's acked holes from its session-lifetime receipt
+/// records — and an anchor of 0 with an acked seq 1 above it needs that
+/// seeding exactly as a nonzero anchor does. "0 is the window's default base
+/// anyway" must never optimize the cursor away: it would leave the seeding
+/// unrequested and wedge the resumed window's prefix on the first acked hole.
+fn same_relay_resume_cursors(
+    peer_cursors: &[(SlotId, u64)],
+    oldest_replayable: Option<u64>,
+    own_slot: SlotId,
+    next_outbound_seq: u64,
+) -> Vec<(SlotId, u64)> {
+    let mut cursors = peer_cursors.to_vec();
+    cursors.push((own_slot, oldest_replayable.unwrap_or(next_outbound_seq)));
+    cursors
+}
+
 /// Stages one turn for reliable-control delivery unless an identical
-/// `(slot, seq)` is already staged — several rebind-time paths (retention
-/// re-injection, the oversize redivert, the rebind misfit drain) can each
-/// nominate the same turn, and one control-stream copy suffices (the peer
-/// dedups by origin identity anyway; the check just saves the bytes).
+/// `(slot, seq)` is already staged — both rebind-time paths (the re-home's
+/// retention re-injection and the same-relay oversize redivert) can nominate
+/// the same turn across a run of failed resumes, and one control-stream copy
+/// suffices (the peer dedups by origin identity anyway; the check just saves
+/// the bytes).
 fn stage_control_redivert(pending: &mut Vec<Payload>, turn: Payload) {
     if !pending
         .iter()
@@ -3021,11 +3045,10 @@ fn reinject_retention(link: &mut Link, state: &mut LoopState) {
 /// [`reinject_retention`]'s oversize half.
 ///
 /// A same-relay resume deliberately does NOT touch the datagram/unacked
-/// window at all: the old relay's own turn ring is still intact for
-/// ordinary-sized turns, and `reconnect_link`'s `same_relay_anchor` already
-/// covers the unacked tail via the rebound link's own redundancy. Re-injecting
+/// window at all: the rebound link's own redundancy re-carries the unacked
+/// tail, and the relay covers everything it already received. Re-injecting
 /// the retention ring's ordinary-sized turns on top of that — as a re-home
-/// does — would risk a permanent prefix gap (see the `same_relay_anchor`
+/// does — would risk a permanent prefix gap (see the same-relay anchor
 /// comment in `reconnect_link`); that risk is real and this function does not
 /// touch it.
 ///
@@ -4529,10 +4552,10 @@ mod tests {
     #[tokio::test]
     async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
         // On a SAME-relay resume (unlike a re-home), ordinary-sized retained
-        // turns must NOT be touched at all — the old
-        // relay's own turn ring already covers them, and re-injecting them
+        // turns must NOT be touched at all — the relay already received
+        // everything it acked, and re-injecting them
         // into the datagram window risks the permanent prefix gap
-        // `reconnect_link`'s own `same_relay_anchor` comment describes. Only
+        // `reconnect_link`'s own same-relay anchor comment describes. Only
         // the oversize subset — which never rode the datagram/ack path and so
         // carries no such risk — gets staged for the resumed connection's
         // control stream.
@@ -4796,18 +4819,25 @@ mod tests {
         let (link, state, _peer, _ea, _eb) =
             drive_unacked_session(SlotId(1), &[&[0x01], &[0x02]]).await;
 
-        // The exact computation `reconnect_link` performs for the same-relay anchor.
+        // The exact cursor set `reconnect_link` presents on a same-relay re-dial.
         let own_slot = SlotId(1);
-        let anchor = link
-            .oldest_replayable_seq(own_slot)
-            .unwrap_or(state.next_outbound_seq);
+        let cursors = same_relay_resume_cursors(
+            &[],
+            link.oldest_replayable_seq(own_slot),
+            own_slot,
+            state.next_outbound_seq,
+        );
 
         assert_eq!(
-            anchor, 0,
-            "the anchor is the oldest in-flight seq, not next_outbound",
+            cursors,
+            vec![(own_slot, 0)],
+            "the anchor is the oldest in-flight seq, not next_outbound — and an \
+             anchor of 0 is still PRESENTED: the cursor's presence is what asks \
+             the relay to seed the fresh window's acked holes, which an anchor-0 \
+             resume needs exactly as a nonzero one does",
         );
         assert_ne!(
-            anchor, state.next_outbound_seq,
+            state.next_outbound_seq, 0,
             "the bug regressed: the anchor skipped past the in-flight turn",
         );
     }

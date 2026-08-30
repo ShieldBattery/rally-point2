@@ -338,27 +338,6 @@ impl TurnRing {
             .collect()
     }
 
-    /// The seqs this ring holds for one slot at or past `from` — the receipts
-    /// a resuming client's relay reconciles into the fresh connection's
-    /// receive window. Selective packet acks make the client's unacked window
-    /// sparse, so its resume anchor (its oldest unacked seq) can sit below
-    /// seqs it will never re-send because this relay already acked them; every
-    /// one of those is by definition recorded here, and seeding the window
-    /// with them keeps its contiguous prefix — and the ack-beacon cursor it
-    /// drives — from wedging on a hole no replay will fill.
-    pub fn recorded_seqs(&self, key: &SessionKey, slot: SlotId, from: u64) -> Vec<u64> {
-        let state = self.state.lock();
-        let Some(ring) = state.sessions.get(key) else {
-            return Vec::new();
-        };
-        ring.turns
-            .iter()
-            .filter(|entry| u8::try_from(entry.payload.slot).is_ok_and(|raw| SlotId(raw) == slot))
-            .filter(|entry| entry.payload.seq >= from)
-            .map(|entry| entry.payload.seq)
-            .collect()
-    }
-
     /// Drops a session's ring once the relay's last local slot for it leaves,
     /// mirroring how the roster group and lobby/chat state are dropped then.
     /// Idempotent.

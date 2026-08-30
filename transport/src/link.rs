@@ -211,9 +211,10 @@ impl Link {
     /// **same-relay** resume anchor. The unacked window is sparse (selective
     /// packet acks leave holes), so the contiguity a receive-window anchor
     /// promises holds on a same-relay resume only because the relay seeds the
-    /// fresh window from its own turn ring (every acked hole is a seq it
-    /// received and recorded; see [`seed_delivered`](Self::seed_delivered)).
-    /// A re-home to a relay with no ring must anchor with
+    /// fresh window from its session-lifetime receipt records (every acked
+    /// hole is a seq it received and recorded; see
+    /// [`seed_delivered`](Self::seed_delivered)). A re-home to a relay with
+    /// no first-hand ack history must anchor with
     /// [`contiguous_replayable_anchor`](Self::contiguous_replayable_anchor)
     /// instead. See
     /// [`AckManager::oldest_replayable_seq`](crate::ack_manager::AckManager::oldest_replayable_seq).
@@ -233,15 +234,24 @@ impl Link {
 
     /// Marks `seq` as already delivered for `slot` without a payload arriving —
     /// the resume-time seed for receipts that predate this connection. A relay
-    /// resuming a client seeds the fresh receive window with the seqs its own
-    /// turn ring already holds for the slot, so the acked holes above the
-    /// client's anchor (selective packet acks make the unacked window sparse,
-    /// and the client only replays what is still unacked) don't wedge the
-    /// window's contiguous prefix — and with it the beacon cursor, and
-    /// eventually the window itself, when the live stream runs a full receive
-    /// window past the stuck base.
+    /// resuming a client seeds the fresh receive window with the seqs it has
+    /// already received from the slot (its session-lifetime receipt records),
+    /// so the acked holes above the client's anchor (selective packet acks
+    /// make the unacked window sparse, and the client only replays what is
+    /// still unacked) don't wedge the window's contiguous prefix — and with it
+    /// the beacon cursor, and eventually the window itself, when the live
+    /// stream runs a full receive window past the stuck base.
     pub fn seed_delivered(&mut self, slot: SlotId, seq: u64) {
         self.dedup.mark_delivered(slot, seq);
+    }
+
+    /// The bulk form of [`seed_delivered`](Self::seed_delivered): marks every
+    /// seq up to and including `through` delivered for `slot` in one step, so
+    /// seeding a long contiguous receipt prefix costs O(out-of-order seeds)
+    /// rather than one call per seq. Never rewinds: a prefix already past
+    /// `through` is left where it is.
+    pub fn seed_delivered_through(&mut self, slot: SlotId, through: u64) {
+        self.dedup.mark_delivered_through(slot, through);
     }
 
     /// The top of the contiguous run of payloads this link has delivered to its
@@ -847,17 +857,12 @@ impl Dedup {
         }
     }
 
-    /// Anchors `slot`'s receive window at `anchor`: sets the delivered prefix top to
-    /// `anchor - 1` so the window's base becomes `anchor` and seqs below it are
-    /// treated as already delivered. See [`Link::anchor_receive_window`] for why a
-    /// re-homed session needs this. A no-op when `anchor` is 0 (the default base is
-    /// already 0) or when the slot has already received something — anchoring only a
-    /// pristine slot means it never rewinds a prefix that is already forming.
     /// Marks `seq` as already delivered for `slot` without a payload being
     /// offered — the receive-window seed for receipts established outside
-    /// this connection (a resuming relay's own turn ring). Unlike an offer,
-    /// this enforces no window bound: seeds come from the local trusted
-    /// store, not the wire, and are bounded by that store's own size.
+    /// this connection (a resuming relay's session-lifetime receipt records).
+    /// Unlike an offer, this enforces no window bound: seeds come from the
+    /// local trusted store, not the wire, and are bounded by that store's own
+    /// size.
     pub(crate) fn mark_delivered(&mut self, slot: SlotId, seq: u64) {
         let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
             delivered_through: None,
@@ -873,6 +878,34 @@ impl Dedup {
         }
     }
 
+    /// Bulk [`mark_delivered`](Self::mark_delivered): advances `slot`'s
+    /// delivered prefix to at least `through` (never rewinding one already
+    /// past it), drops out-of-order entries the new prefix swallowed, and
+    /// folds in any run left contiguous above it. Seeding a long contiguous
+    /// receipt prefix this way costs O(out-of-order entries), not one tree
+    /// operation per seq.
+    pub(crate) fn mark_delivered_through(&mut self, slot: SlotId, through: u64) {
+        let state = self.slots.entry(slot).or_insert_with(|| SlotDedup {
+            delivered_through: None,
+            ahead: BTreeSet::new(),
+        });
+        if state.delivered_through.is_none_or(|top| top < through) {
+            state.delivered_through = Some(through);
+        }
+        match through.checked_add(1) {
+            Some(above) => state.ahead = state.ahead.split_off(&above),
+            // A prefix at the u64 ceiling has no seq above it to keep.
+            None => state.ahead.clear(),
+        }
+        state.absorb_contiguous_run();
+    }
+
+    /// Anchors `slot`'s receive window at `anchor`: sets the delivered prefix top to
+    /// `anchor - 1` so the window's base becomes `anchor` and seqs below it are
+    /// treated as already delivered. See [`Link::anchor_receive_window`] for why a
+    /// re-homed session needs this. A no-op when `anchor` is 0 (the default base is
+    /// already 0) or when the slot has already received something — anchoring only a
+    /// pristine slot means it never rewinds a prefix that is already forming.
     pub(crate) fn anchor(&mut self, slot: SlotId, anchor: u64) {
         let Some(prefix_top) = anchor.checked_sub(1) else {
             return;
@@ -1984,5 +2017,40 @@ mod tests {
         sender.send(Some(turn(0, 6, 0x66))).unwrap();
         let got = receiver.recv().await.unwrap();
         assert_eq!(got.fresh.len(), 0, "the seeded seq is already delivered");
+    }
+
+    /// The bulk seed advances the prefix in one step, folds in the sparse
+    /// seeds its new prefix left contiguous, and never rewinds a prefix
+    /// already past it.
+    #[tokio::test]
+    async fn a_bulk_seed_folds_the_prefix_and_never_rewinds() {
+        let (mut sender, mut receiver, _ea, _eb) = connected_links().await;
+
+        receiver.seed_delivered(SlotId(0), 5);
+        receiver.seed_delivered(SlotId(0), 7);
+        receiver.seed_delivered_through(SlotId(0), 4);
+        assert_eq!(
+            receiver.delivered_through(SlotId(0)),
+            Some(5),
+            "the bulk prefix folds the sparse seed sitting right above it",
+        );
+        receiver.seed_delivered_through(SlotId(0), 6);
+        assert_eq!(
+            receiver.delivered_through(SlotId(0)),
+            Some(7),
+            "advancing over the gap folds the rest of the sparse run",
+        );
+        receiver.seed_delivered_through(SlotId(0), 2);
+        assert_eq!(
+            receiver.delivered_through(SlotId(0)),
+            Some(7),
+            "a lower bulk seed never rewinds the prefix",
+        );
+
+        // Live traffic continues in order past the seeded prefix.
+        sender.send(Some(turn(0, 8, 0x88))).unwrap();
+        let got = receiver.recv().await.unwrap();
+        assert_eq!(got.fresh.len(), 1);
+        assert_eq!(receiver.delivered_through(SlotId(0)), Some(8));
     }
 }

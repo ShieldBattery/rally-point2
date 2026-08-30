@@ -1894,6 +1894,89 @@ async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_close
     );
 }
 
+/// The bottom-of-stream resume shape: a client loses its very first turn (seq
+/// 0) while a later one (seq 1) reaches the relay, then reconnects. Its
+/// resume anchor — the oldest unacked seq — is 0, and the anchor must still
+/// be presented and honored: the fresh receive window's acked hole at seq 1
+/// is closed from the relay's own forward-gate receipts, not by any re-send
+/// (the client will never re-send an acked seq). Without the seed, the
+/// window's contiguous prefix — and the ack-beacon cursor it drives — wedges
+/// at 0 forever, no matter how far the live stream advances. This also pins
+/// the pre-start case: nothing here starts the session, so the bounded
+/// replay ring records nothing, and only the forward gate can seed.
+#[tokio::test]
+async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let endpoint = client_endpoint(&ca);
+    let session = SessionId(322);
+
+    let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+
+    // Slot 1's first connection delivers seq 1 and never seq 0 (lost on the
+    // way to the relay). Waiting for the fan-out to slot 0 proves the relay
+    // recorded seq 1 in its forward gate before the connection drops.
+    let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    slot1
+        .send(Some(Payload {
+            seq: 1,
+            slot: 0,
+            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let mut delivered = Vec::new();
+    while delivered.is_empty() {
+        delivered = slot0.recv().await.unwrap().fresh;
+    }
+    assert_eq!(delivered[0].slot, 1);
+    assert_eq!(delivered[0].seq, 1);
+    slot1.connection().close(0u32.into(), b"dropped");
+
+    // The reconnect presents the own-slot cursor at 0 — an anchor of 0 is a
+    // real, meaningful cursor, not an omittable default.
+    let slot1b = connect_slot_resuming(
+        &endpoint,
+        addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(1), 0)],
+    )
+    .await;
+    let mut beacons =
+        rally_point_transport::beacon::spawn_beacon_reader(slot1b.connection().clone());
+    let mut slot1b = slot1b;
+
+    // Replay the lost seq 0, then continue live past the acked hole at 1.
+    for seq in [0u64, 2] {
+        slot1b
+            .send(Some(Payload {
+                seq,
+                slot: 0,
+                commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+
+    // The relay's ack-beacon cursor for the slot must fold through the seeded
+    // seq 1 and reach 2. A wedged window reports 0 forever — the beacon only
+    // pushes on advance, so this times out instead of passing.
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match beacons.recv().await {
+                Some((SlotId(1), cursor)) if cursor >= 2 => break cursor,
+                Some(_) => continue,
+                None => panic!("the beacon stream ended before the cursor advanced"),
+            }
+        }
+    })
+    .await
+    .expect("the resumed window's prefix must fold through the seeded receipt");
+    assert_eq!(reached, 2);
+}
+
 /// A client presenting an absurd own-slot resume-cursor anchor (near the u64
 /// ceiling) is refused outright rather than let that value become the dedup
 /// window's base -- the real gate the transport-level saturating arithmetic

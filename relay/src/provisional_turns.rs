@@ -186,6 +186,15 @@ struct SessionPen {
     /// drain validates before replaying a journaled departure (see
     /// [`PennedIngress::Departure`]'s `revision`).
     departure_revisions: HashMap<SlotId, u64>,
+    /// The `(slot, seq)` of every turn in the batch a drain currently holds
+    /// privately (taken by [`ProvisionalTurnPen::begin_drain`] or
+    /// [`ProvisionalTurnPen::continue_drain`], not yet finished). Such a turn
+    /// has left the queue but not yet passed the forward gate, so a
+    /// [`held_turn_seqs`](ProvisionalTurnPen::held_turn_seqs) read during the
+    /// replay must still report it — every entry here was
+    /// transport-acknowledged at deposit, and a resume-seeding read that
+    /// missed one would leave a permanent hole in the resumed receive window.
+    in_flight_turns: Vec<(SlotId, u64)>,
 }
 
 impl SessionPen {
@@ -194,8 +203,21 @@ impl SessionPen {
             phase: Phase::Gathering(VecDeque::new()),
             sealed: std::collections::HashSet::new(),
             departure_revisions: HashMap::new(),
+            in_flight_turns: Vec::new(),
         }
     }
+}
+
+/// The `(slot, seq)` identity of every turn in a drain batch, for the pen's
+/// in-flight shadow.
+fn turn_identities(batch: &VecDeque<PennedIngress>) -> Vec<(SlotId, u64)> {
+    batch
+        .iter()
+        .filter_map(|entry| match entry {
+            PennedIngress::Turn(slot, payload) => Some((*slot, payload.seq)),
+            PennedIngress::Departure { .. } => None,
+        })
+        .collect()
 }
 
 /// One step of the drain loop — see [`ProvisionalTurnPen::continue_drain`].
@@ -485,6 +507,7 @@ impl ProvisionalTurnPen {
         match &mut pen.phase {
             Phase::Gathering(queue) => {
                 let batch = std::mem::take(queue);
+                pen.in_flight_turns = turn_identities(&batch);
                 pen.phase = Phase::Draining(VecDeque::new());
                 Some(batch.into())
             }
@@ -525,6 +548,12 @@ impl ProvisionalTurnPen {
             // to replay.
             return DrainStep::Done;
         };
+        // Whatever this step decides, the drainer has finished replaying the
+        // batch it previously held (the drain loop replays to completion
+        // before asking again), so that batch's in-flight shadow is done:
+        // every turn in it has passed the forward gate and is covered by the
+        // gate's own record now.
+        pen.in_flight_turns.clear();
         match &mut pen.phase {
             Phase::Draining(queue) if queue.is_empty() => {
                 pen.phase = Phase::Resolved;
@@ -533,7 +562,11 @@ impl ProvisionalTurnPen {
             // Like `begin_drain`, the taken batch stays charged until the
             // drainer releases it — the budget tracks resident memory, not
             // queue membership.
-            Phase::Draining(queue) => DrainStep::More(std::mem::take(queue).into()),
+            Phase::Draining(queue) => {
+                let batch = std::mem::take(queue);
+                pen.in_flight_turns = turn_identities(&batch);
+                DrainStep::More(batch.into())
+            }
             // Not draining (a retirement's discard plus fresh deposits
             // recreated Gathering, or already resolved): this drainer's
             // claim is gone either way.
@@ -570,6 +603,39 @@ impl ProvisionalTurnPen {
                 Phase::Gathering(queue) | Phase::Draining(queue) => !queue.is_empty(),
                 Phase::Resolved => false,
             })
+    }
+
+    /// Every turn seq this journal currently retains for `key`'s `slot`: the
+    /// queued deposits plus the batch a drain holds privately in flight. Each
+    /// was transport-acknowledged when it was deposited, so together with the
+    /// forward gate's own record (which a drained turn enters before it
+    /// leaves the in-flight shadow) this is the journal's half of the
+    /// receipts a resumed connection's receive window is seeded from. A
+    /// resume racing a drain reads this BEFORE the gate: entries only ever
+    /// move journal → gate, so the pair of reads in that order sees every
+    /// receipt in at least one of the two.
+    pub fn held_turn_seqs(&self, key: &SessionKey, slot: SlotId) -> Vec<u64> {
+        let guard = self.inner.state.lock();
+        let Some(pen) = guard.sessions.get(key) else {
+            return Vec::new();
+        };
+        let mut seqs: Vec<u64> = match &pen.phase {
+            Phase::Gathering(queue) | Phase::Draining(queue) => queue
+                .iter()
+                .filter_map(|entry| match entry {
+                    PennedIngress::Turn(s, payload) if *s == slot => Some(payload.seq),
+                    _ => None,
+                })
+                .collect(),
+            Phase::Resolved => Vec::new(),
+        };
+        seqs.extend(
+            pen.in_flight_turns
+                .iter()
+                .filter(|(s, _)| *s == slot)
+                .map(|&(_, seq)| seq),
+        );
+        seqs
     }
 
     /// Atomically discards `key`'s journal state IF it holds nothing — an
@@ -703,6 +769,55 @@ mod tests {
         assert!(
             pen.begin_drain(&key()).is_none(),
             "a resolved session refuses a second drain",
+        );
+    }
+
+    /// The receipt query reports every journaled turn for the slot — and
+    /// keeps reporting a batch a drain holds privately in flight, because
+    /// those turns have left the queue but not yet passed the forward gate:
+    /// a resume-seeding read during the replay window must still see them.
+    #[test]
+    fn held_turn_seqs_cover_the_queue_and_a_drains_in_flight_batch() {
+        let pen = ProvisionalTurnPen::default();
+        assert_eq!(pen.hold(&key(), turn(1, 4)), HoldOutcome::Held);
+        assert_eq!(pen.hold(&key(), turn(2, 9)), HoldOutcome::Held);
+        assert_eq!(pen.hold(&key(), turn(1, 5)), HoldOutcome::Held);
+        assert_eq!(
+            pen.held_turn_seqs(&key(), SlotId(1)),
+            vec![4, 5],
+            "queued deposits report per slot",
+        );
+
+        let batch = pen.begin_drain(&key()).expect("the drain claims");
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            pen.held_turn_seqs(&key(), SlotId(1)),
+            vec![4, 5],
+            "the in-flight batch still reports while the drainer replays it",
+        );
+        assert_eq!(pen.held_turn_seqs(&key(), SlotId(2)), vec![9]);
+
+        // A deposit landing mid-drain queues and reports alongside the
+        // in-flight batch.
+        assert_eq!(pen.hold(&key(), turn(1, 6)), HoldOutcome::Held);
+        assert_eq!(pen.held_turn_seqs(&key(), SlotId(1)), vec![6, 4, 5]);
+
+        // The next drain step retires the replayed batch's shadow and takes
+        // over the mid-drain deposit.
+        let DrainStep::More(next) = pen.continue_drain(&key()) else {
+            panic!("the mid-drain deposit forces another pass");
+        };
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            pen.held_turn_seqs(&key(), SlotId(1)),
+            vec![6],
+            "only the new in-flight batch remains visible",
+        );
+
+        assert!(matches!(pen.continue_drain(&key()), DrainStep::Done));
+        assert!(
+            pen.held_turn_seqs(&key(), SlotId(1)).is_empty(),
+            "a resolved journal retains no receipts — they all passed the gate",
         );
     }
 

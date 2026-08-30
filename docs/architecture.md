@@ -364,15 +364,23 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   the lowest seq its re-send can make **contiguous** — the anchor is a promise that every seq above it will
   arrive and close the window's prefix, and selective packet acks make the unacked window *sparse*, so the
   bare oldest-unacked seq cannot honor it alone. On a **same-relay resume** the anchor is the oldest
-  still-unacked seq (anchoring higher, e.g. at the retention front, would strand the unacked tail below a
-  window a same-relay resume never re-injects the ring to fill), and the **relay closes the acked holes
-  itself**: every acked seq is one it received and recorded in its session turn ring, so it seeds those
-  receipts into the fresh window (`Link::seed_delivered`) right after applying the anchor. On a **re-home**
-  the replacement relay has no ring to seed from, so the anchor is the retention front extended downward
-  only through *contiguously* unacked seqs (`contiguous_replayable_anchor`); unacked seqs below the first
+  still-unacked seq — presented even at 0, since its presence is what requests the seeding below — and the
+  **relay closes the acked holes itself**: it seeds the fresh window (`Link::seed_delivered`) from the two
+  session-lifetime stores that together hold every receipt it has ever acknowledged for the slot, at any
+  point in the session's life and across any connection churn. Those are the forward gate's seen registry
+  (every turn that passed the gate, pre-start included — unlike the bounded replay ring, it never evicts;
+  its sparse-cap collapse already treats swallowed gaps as delivered, so seeding from a collapsed prefix
+  mirrors the gate's documented failure direction rather than adding one) and the provisional journal
+  (turns accepted before a descriptor named the session — read before the gate, so a descriptor drain
+  moving entries journal → gate can't hide one from both reads, and a journal overflow seals its slot
+  against readmission, so no resumable slot ever lost an entry to it). On a **re-home** the replacement
+  relay seeds from the same stores (its gate may hold mesh-forwarded receipts for the slot), but has no
+  first-hand ack history, so the anchor itself carries the contract: the retention front extended downward
+  only through *contiguously* unacked seqs (`contiguous_replayable_anchor`). Unacked seqs below the first
   acked hole are still replayed but land below the window's base and are discarded — acceptable, because a
-  hole can only age out of retention while turn production continues past it, which means no peer was wedged
-  beneath it and the old relay had already fanned those turns.
+  hole can only age out of retention while turn production continues past it, which (by the game's lockstep
+  production, an assumption of the game model rather than a transport-enforced invariant) means no peer was
+  wedged beneath it and the old relay had already fanned those turns.
   The relay reads the own-slot cursor (a slot never replays its own turns) as the window's base, so the
   resumed stream is accepted and the delivered prefix advances from there. The own-slot cursor rides the
   existing resume-cursor frame — additive, no handshake or frame-count change.
@@ -1271,7 +1279,10 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   serving it — a payload admitted on one connection could outgrow a later one, stranding it in an
   unacked window whose link can no longer replay it. With the floor enforced at establishment,
   every payload ever admitted for datagram carriage fits every packet of every connection the
-  session will use, rebinds included, so no rebind-time reclassification exists. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
+  session will use, rebinds included, so no rebind-time reclassification exists. On the mesh, the
+  floor check runs BEFORE the attempt claims the peer's link slot (`claim_verified_mesh_link`):
+  claiming supersedes and wakes the peer's current driver, so a refusal ordered after it would
+  kill a healthy mesh link and leave nothing serving the peer. Under saturation the wait scales with the backlog (bounded by the unacked-window cap)
   rather than the spacing cap — a fixed cadence is impossible when redundancy service runs at or
   below backlog growth, and most-overdue-first is also the right priority there, approximating the
   oldest-first order the lockstep prefix actually needs. The delivery guarantee, stated
