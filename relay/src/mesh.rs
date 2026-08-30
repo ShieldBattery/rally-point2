@@ -3423,6 +3423,18 @@ fn dispatch_mesh_control_frame(
             if !crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave) {
                 return;
             }
+            mesh.decision_makers.flight_recorder().record(
+                &key,
+                crate::flight_recorder::FlightEvent::LeaveMeshAccepted {
+                    source_relay: peer_id.0,
+                    slot: slot.0,
+                    reason: leave.reason,
+                    apply_frame: leave.apply_at_frame,
+                    leave_seq: leave.leave_seq,
+                    finalized: leave.finalized,
+                    final_turn_count: leave.final_turn_count,
+                },
+            );
             // A peer authority's final leave also resolves any older local drop
             // hold for this subject. Keeping it would not permit resurrection --
             // atomic admission rejects the decided leave -- but it would let the
@@ -6949,6 +6961,34 @@ mod tests {
             inbox.try_recv_leave(),
             None,
             "no re-forward of a redundant copy"
+        );
+        let events: Vec<_> = makers
+            .flight_recorder()
+            .events(&key)
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::flight_recorder::FlightEvent::LeaveMeshAccepted { .. }
+                ))
+                .count(),
+            1,
+            "only the first consensus-accepted mesh copy is recorded: {events:?}",
+        );
+        assert!(
+            events.contains(&crate::flight_recorder::FlightEvent::LeaveMeshAccepted {
+                source_relay: 9,
+                slot: 0,
+                reason: first.reason,
+                apply_frame: first.apply_at_frame,
+                leave_seq: first.leave_seq,
+                finalized: first.finalized,
+                final_turn_count: first.final_turn_count,
+            })
         );
     }
 

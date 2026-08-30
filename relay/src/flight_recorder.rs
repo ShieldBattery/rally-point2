@@ -125,8 +125,47 @@ pub enum FlightEvent {
     LeaveDecided {
         slot: u8,
         kind: DepartureKind,
+        /// The exact native leave reason carried to clients. Older blobs omit
+        /// this field, so keep its zero default when decoding them.
+        #[serde(default)]
+        reason: u32,
         apply_frame: u32,
         leave_seq: u32,
+        /// Whether the decision carries a home-sealed final turn count.
+        #[serde(default)]
+        finalized: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_turn_count: Option<u64>,
+    },
+    /// This relay accepted a peer relay's synced leave into its consensus
+    /// cache. Only the first accepted copy is recorded; redundant or
+    /// conflicting copies are not local delivery decisions.
+    LeaveMeshAccepted {
+        source_relay: u64,
+        slot: u8,
+        reason: u32,
+        apply_frame: u32,
+        leave_seq: u32,
+        finalized: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_turn_count: Option<u64>,
+    },
+    /// One attempt to write a synced leave to a local survivor's reliable
+    /// control stream. `succeeded` means the QUIC stream write completed; it
+    /// does not claim that the client read or applied the directive.
+    LeaveControlWrite {
+        recipient: u8,
+        connection_epoch: u64,
+        slot: u8,
+        reason: u32,
+        apply_frame: u32,
+        leave_seq: u32,
+        finalized: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_turn_count: Option<u64>,
+        /// Reconnect reconciliation writes bypass the live fan-out queue.
+        replayed: bool,
+        succeeded: bool,
     },
     /// This relay (as session authority) queued a latency-buffer change.
     BufferDirective {
@@ -1614,8 +1653,38 @@ mod tests {
             FlightEvent::LeaveDecided {
                 slot: 1,
                 kind: DepartureKind::Dropped,
+                reason: 0x4000_0006,
                 apply_frame: 900,
                 leave_seq: 3,
+                finalized: true,
+                final_turn_count: Some(44),
+            },
+        );
+        recorder.record(
+            &k,
+            FlightEvent::LeaveMeshAccepted {
+                source_relay: 9,
+                slot: 1,
+                reason: 0x4000_0006,
+                apply_frame: 900,
+                leave_seq: 3,
+                finalized: true,
+                final_turn_count: Some(44),
+            },
+        );
+        recorder.record(
+            &k,
+            FlightEvent::LeaveControlWrite {
+                recipient: 2,
+                connection_epoch: 17,
+                slot: 1,
+                reason: 0x4000_0006,
+                apply_frame: 900,
+                leave_seq: 3,
+                finalized: true,
+                final_turn_count: Some(44),
+                replayed: false,
+                succeeded: true,
             },
         );
         recorder.record(&k, FlightEvent::SessionClosed);
@@ -1631,6 +1700,8 @@ mod tests {
         // The envelope is self-describing on the wire: version and tagged events.
         assert!(json.contains("\"version\": 1"));
         assert!(json.contains("\"event\": \"leave_decided\""));
+        assert!(json.contains("leave_mesh_accepted"));
+        assert!(json.contains("leave_control_write"));
         let back: FlightBlob = serde_json::from_str(&json).unwrap();
         assert_eq!(back, blob);
     }

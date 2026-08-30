@@ -743,8 +743,10 @@ surfaced at its apply frame — the leave-side mirror of the buffer `DirectiveTr
 When a desync, dispute, or stall is reported after the fact, someone has to reconstruct what the game's
 network actually did — and by then the session is gone from every live structure. The **flight recorder**
 is each relay's bounded, per-session black box: discrete **events** (slot connects/disconnects and
-resumes, decided leaves with their apply coordinates, buffer directives, detected desyncs, drop holds and
-requests, the session-start directive, a re-home landing, the close), periodic **link-health samples**
+resumes, decided leaves with their complete directive, peer-relay leave acceptance, each live or replayed
+leave-control write attempt with its recipient/connection epoch and outcome, buffer directives, detected
+desyncs, drop holds and requests, the session-start directive, a re-home landing, the close), periodic
+**link-health samples**
 (the same per-slot QUIC rtt/loss the slot links already publish for the latency-buffer decision-maker,
 folded together with per-slot turn-stream counters — validated/delivered turns, newest seq, dedup drops,
 oversize diverts — by a relay-wide 10s sampling tick).
@@ -763,6 +765,11 @@ far below any congestion window, so a window near its floor while turns queue po
 rather than the network. It **observes only**: no decision logic reads it,
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
+
+A successful leave-control write means the local QUIC stream accepted the complete frame. It does not
+claim the client read the frame or that the native game applied it; those later boundaries are recorded by
+the game DLL. Together with the authority decision and peer-acceptance events, the write event identifies
+the last relay-controlled hop without turning observability into another consensus input.
 
 A buffer directive carries the **derivation** behind it, not just the depth it landed on: the law's
 own terms (pairwise path, loss risk, burst), the additive cushion and stretch terms folded on top, the

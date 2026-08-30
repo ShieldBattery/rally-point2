@@ -1233,6 +1233,35 @@ pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
     }
 }
 
+/// Records one completed attempt to write a leave to a local client's control
+/// stream. A successful write only proves local QUIC acceptance; client receipt
+/// and native application are separate observations.
+fn record_leave_control_write(
+    decision_makers: &consensus::DecisionMakers,
+    key: &SessionKey,
+    recipient: SlotId,
+    connection_epoch: u64,
+    leave: &LeaveDirective,
+    replayed: bool,
+    succeeded: bool,
+) {
+    decision_makers.flight_recorder().record(
+        key,
+        crate::flight_recorder::FlightEvent::LeaveControlWrite {
+            recipient: recipient.0,
+            connection_epoch,
+            slot: leave.slot as u8,
+            reason: leave.reason,
+            apply_frame: leave.apply_at_frame,
+            leave_seq: leave.leave_seq,
+            finalized: leave.finalized,
+            final_turn_count: leave.final_turn_count,
+            replayed,
+            succeeded,
+        },
+    );
+}
+
 /// Drives one authorized client's link until it closes.
 ///
 /// Owns `link` outright and alternates between receiving its client's turns
@@ -1736,9 +1765,18 @@ pub async fn run_slot_link(
         if leave.slot == u32::from(slot.0) {
             continue;
         }
-        if let Err(error) =
-            rally_point_transport::control::send_control_leave(&mut control_send, leave).await
-        {
+        let result =
+            rally_point_transport::control::send_control_leave(&mut control_send, leave).await;
+        record_leave_control_write(
+            &decision_makers,
+            &key,
+            slot,
+            connection_epoch,
+            &leave,
+            true,
+            result.is_ok(),
+        );
+        if let Err(error) = result {
             tracing::info!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
@@ -1904,12 +1942,21 @@ pub async fn run_slot_link(
             pushed = leave_push_rx.recv(), if leave_push_alive => {
                 match pushed {
                     Some(leave) => {
-                        if let Err(error) = rally_point_transport::control::send_control_leave(
+                        let result = rally_point_transport::control::send_control_leave(
                             &mut control_send,
                             leave,
                         )
-                        .await
-                        {
+                        .await;
+                        record_leave_control_write(
+                            &decision_makers,
+                            &key,
+                            slot,
+                            connection_epoch,
+                            &leave,
+                            false,
+                            result.is_ok(),
+                        );
+                        if let Err(error) = result {
                             tracing::info!(
                                 tenant = key.tenant.as_ref(),
                                 session = key.session.0,

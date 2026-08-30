@@ -6932,8 +6932,11 @@ fn record_leave_event(registry: &DecisionMakers, key: &SessionKey, directive: &L
             } else {
                 DepartureKind::Left
             },
+            reason: directive.reason,
             apply_frame: directive.apply_at_frame,
             leave_seq: directive.leave_seq,
+            finalized: directive.finalized,
+            final_turn_count: directive.final_turn_count,
         },
     );
 }

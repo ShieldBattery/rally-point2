@@ -969,6 +969,26 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
         leave.reason, LEAVE_REASON_LEFT,
         "an intent-decided leave uses the native quit path's reason, not the drop one",
     );
+    let events: Vec<_> = makers
+        .flight_recorder()
+        .events(&key)
+        .into_iter()
+        .map(|record| record.event)
+        .collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            rally_point_relay::flight_recorder::FlightEvent::LeaveControlWrite {
+                recipient: 1,
+                slot: 0,
+                reason: LEAVE_REASON_LEFT,
+                replayed: false,
+                succeeded: true,
+                ..
+            }
+        )),
+        "the live write is recorded at the control-stream boundary: {events:?}",
+    );
 
     // The relay's confirmation that it processed the intent is closing the
     // departing client's own link.
@@ -1823,6 +1843,26 @@ async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
     assert!(
         saw_departed_connectivity,
         "the departed slot replays as connectivity-down before its leave",
+    );
+    let events: Vec<_> = makers
+        .flight_recorder()
+        .events(&key)
+        .into_iter()
+        .map(|record| record.event)
+        .collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            rally_point_relay::flight_recorder::FlightEvent::LeaveControlWrite {
+                recipient: 1,
+                slot: 0,
+                reason: LEAVE_REASON_LEFT,
+                replayed: true,
+                succeeded: true,
+                ..
+            }
+        )),
+        "the reconnect replay write is recorded at the control-stream boundary: {events:?}",
     );
 }
 
