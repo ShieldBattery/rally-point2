@@ -1040,10 +1040,11 @@ tenant's token-*verifying* key and its `kid`, so a consumer can key its verifyin
 
 ### Coordinator → tenant notifications (webhooks)
 
-The coordinator tells a tenant about three per-game facts its relays report up their control connections — a
-player **departure**, a **desync**, and a slot's end-of-game **result** — by POSTing a signed webhook to the
-tenant's configured URL. Each POST is **signed with the tenant's own key** (the same key that mints tokens,
-domain-separated `rp2-webhook-v1:`), not a shared secret, so there is nothing extra to provision or rotate.
+The coordinator tells a tenant about the per-game facts its relays report up their control connections — a
+player **departure**, a **desync**, a slot's end-of-game **result**, and the three load-progress facts below —
+by POSTing a signed webhook to the tenant's configured URL. Each POST is **signed with the tenant's own
+key** (the same key that mints tokens, domain-separated `rp2-webhook-v1:`), not a shared secret, so there is
+nothing extra to provision or rotate.
 Because every relay serving a session reports the same fact independently — redundancy against any one
 relay's coordinator link being down — the pipeline **dedups** on first sight; it prefers the correlation
 ids the relay stamped into the notice (from the descriptor it applied) over the coordinator's own in-memory
@@ -1053,6 +1054,25 @@ Delivery is **at-least-once with capped-backoff retry** and eventual give-up, be
 ignores a departure for a game it has a result for, so a never-delivered webhook degrades to result-based
 behavior, and the idempotent consumer absorbs the duplicate a restart-forgets-the-dedup-set redelivery
 produces.
+
+Three of the events describe a game's **load progress**, so the tenant can say *who* failed to load instead of
+inferring it from its own deadline expiring:
+
+- **`slotConnected`** — a slot's link activated on the relay that homes it: that player's client arrived. The
+  relay reports every activation, reconnects included (the notice's `resumed` says which), because only the
+  relay can see a re-dial at all; the coordinator keeps the ever-connected set and dedups the webhook on
+  `(tenant, session, slot)`, so a later reconnect updates its state without re-firing a notification.
+- **`sessionStarted`** — the session's authority relay observed every expected slot present and fired the
+  start directive, carrying the initial latency-buffer depth it sized. Only the authority reports it (a peer
+  adopting the directive off the mesh does not), so unlike a departure there is no per-relay redundancy here;
+  the dedup key is `(tenant, session)`.
+- **`slotStarted`** — a client reported that its own game loop has begun running, on a fieldless `GameStarted`
+  control frame the relay binds to the authenticated connection's slot (never a client-asserted one) and
+  stamps against its own timeline. One report per slot per link at the relay; deduped on
+  `(tenant, session, slot)` at the coordinator.
+
+Together they distinguish "never connected" from "connected but never finished loading", which is the whole
+point: these are the facts an attribution needs and a timeout cannot supply.
 
 ### Session lifecycle and reaps
 
@@ -1069,7 +1089,10 @@ cover sessions that cannot enter that path: a never-started session is retired a
 started session whose complete heartbeat rosters prove every assigned relay continuously empty is retired
 after the same grace. The latter is a defense-in-depth path for a lost close notice or an assigned relay
 whose own slot never connected; any occupied, partial, stale, re-homed, disconnected, or new-generation
-roster resets the proof. A positive roster or replacement process also reopens that relay's earlier
+roster resets the proof. A relay's `slotConnected` notice also marks a session **started** and disarms the
+never-started reap, exactly as a heartbeat's positive roster does — it is stronger evidence of the same fact,
+since a relay reports it only when a client's link is actually serving. A positive roster or replacement
+process also reopens that relay's earlier
 `SessionClosed` evidence until the whole serving set has closed, preserving the relay's short reconnect
 window. A re-home reopens terminal evidence for both the departed assignment and the resumed target, and
 installs that lifecycle boundary under the assignment lock before publishing resumed descriptors. A close
@@ -1081,6 +1104,16 @@ queue is created lazily) but its `sessionClosed` and reaps do not re-arm — the
 probe** (`POST
 /sessions/alive`, asking which of a set of sessions the coordinator still holds) is the backstop that
 force-reconciles the ones it no longer does.
+
+Beside it sits the **load-state pull** (`POST /session/load-state`), which answers one session's accumulated
+load progress: when it started, which slots ever connected, and which ever reported their game loop running.
+The tenant consults it when its own load deadline expires and it must decide whom to blame for a game that
+never got going — which makes the three load-progress webhooks an optimization feed and *this* the
+correctness signal, since it reads the coordinator's state directly rather than trusting that every
+notification arrived. Both slot lists are *ever*-sets (a slot that arrived and then dropped still appears —
+"who got here at all", not "who is here now", which `POST /presence/query` answers), and a session the
+coordinator holds nothing for answers `known: false` with empty lists: no information, never proof that
+nobody arrived.
 
 ### Active-player presence
 

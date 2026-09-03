@@ -201,6 +201,10 @@ pub enum FlightEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         initial_buffer_turns: Option<u32>,
     },
+    /// A local slot reported that its game loop began running — the client
+    /// finished loading and is stepping the simulation. Recorded once per slot
+    /// per link (a repeat on the same link is dropped before it reaches here).
+    SlotGameStarted { slot: u8 },
     /// A resumed (re-home) descriptor was applied — this relay took over an
     /// already-running session, seeded with the given number of
     /// already-decided departures.

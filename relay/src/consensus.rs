@@ -234,7 +234,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
     BufferBounds, DepartedSlot, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
-    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, TenantId,
+    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
+    SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
@@ -5461,10 +5462,12 @@ struct SessionExternalRefs {
 }
 
 /// A notice a relay sends up its coordinator control connection about a running
-/// game: a player departed, the game desynced, or a client reported its result.
-/// All ride one channel (the leave sites, the sync comparator, and the result
-/// ingress feed the same sender), so the reconnect buffering that guarantees a
-/// queued notice survives a coordinator restart is written once, not per kind.
+/// game: a slot connected, the session started, a client's game loop began, a
+/// player departed, the game desynced, or a client reported its result.
+/// All ride one channel (the leave sites, the sync comparator, the result and
+/// game-loop ingresses, and the slot-activation and coverage-latch sites all
+/// feed the same sender), so the reconnect buffering that guarantees a queued
+/// notice survives a coordinator restart is written once, not per kind.
 /// The coordinator client wraps each into the matching
 /// [`RelayToCoordinator`](rally_point_proto::control::RelayToCoordinator) frame
 /// when it forwards it.
@@ -5476,6 +5479,12 @@ pub enum RelayNotice {
     Desync(DesyncNotice),
     /// A client reported its end-of-game result, forwarded opaque.
     Result(ResultNotice),
+    /// A slot's link activated on this relay — the client arrived (or came back).
+    SlotConnected(SlotConnectedNotice),
+    /// This relay's authority coverage latch fired: the session started.
+    SessionStarted(SessionStartedNotice),
+    /// A client reported that its game loop began running.
+    SlotStarted(SlotStartedNotice),
     /// This relay tore down its last local state for a session. Fired after the
     /// session's departures have already gone up this same ordered channel, so
     /// the coordinator — which waits for every serving relay to report it — can
@@ -5589,6 +5598,21 @@ impl DecisionMakers {
     /// Fires a result notice (see [`emit_notice`](Self::emit_notice)).
     fn notify_result(&self, notice: ResultNotice) {
         self.emit_notice(RelayNotice::Result(notice));
+    }
+
+    /// Fires a slot-connected notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_slot_connected(&self, notice: SlotConnectedNotice) {
+        self.emit_notice(RelayNotice::SlotConnected(notice));
+    }
+
+    /// Fires a session-started notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_session_started(&self, notice: SessionStartedNotice) {
+        self.emit_notice(RelayNotice::SessionStarted(notice));
+    }
+
+    /// Fires a slot-started notice (see [`emit_notice`](Self::emit_notice)).
+    fn notify_slot_started(&self, notice: SlotStartedNotice) {
+        self.emit_notice(RelayNotice::SlotStarted(notice));
     }
 
     /// Fires a session-closed notice (see [`emit_notice`](Self::emit_notice)).
@@ -5767,6 +5791,113 @@ fn result_notice(
         session_frame: echo.session_frame,
         slot_frame: echo.slot_frame,
     }
+}
+
+/// Builds the slot-connected notice for a slot link that just activated: the
+/// slot, whether the dial presented resume cursors, and a wall-clock stamp read
+/// here. Stamps the session's `external_id` and the slot's `external_ref` the
+/// same way (and from the same store) as [`departure_notice`], so the notice is
+/// self-describing across a coordinator restart.
+fn slot_connected_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    resumed: bool,
+) -> SlotConnectedNotice {
+    let refs = registry.session_refs(key);
+    SlotConnectedNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        slot,
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        resumed,
+        connected_at_ms: now_ms(),
+    }
+}
+
+/// Builds the session-started notice for the coverage latch that just fired,
+/// carrying the depth the authority sized onto the directive and a wall-clock
+/// stamp read here. Stamps the session's `external_id` the same way (and from the
+/// same store) as [`departure_notice`].
+fn session_started_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    initial_buffer_turns: Option<u32>,
+) -> SessionStartedNotice {
+    let refs = registry.session_refs(key);
+    SessionStartedNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        started_at_ms: now_ms(),
+        initial_buffer_turns,
+    }
+}
+
+/// Builds the slot-started notice for a client's game-loop report: the reporting
+/// slot, a wall-clock arrival stamp, and the relay's view of where the report
+/// landed in the game timeline (both frames normally absent — a game announcing
+/// its loop has begun has usually not produced a framed turn). Stamps the
+/// session's `external_id` and the slot's `external_ref` the same way (and from
+/// the same store) as [`departure_notice`].
+fn slot_started_notice(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+) -> SlotStartedNotice {
+    let refs = registry.session_refs(key);
+    let (session_frame, slot_frame) = {
+        let makers = registry.lock();
+        match makers.get(key) {
+            Some(maker) => (
+                maker.session_frame().map(|f| f.0),
+                maker.slot_frame(slot).map(|f| f.0),
+            ),
+            None => (None, None),
+        }
+    };
+    SlotStartedNotice {
+        tenant: key.tenant.clone(),
+        session: key.session,
+        slot,
+        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        arrival_ms: now_ms(),
+        session_frame,
+        slot_frame,
+    }
+}
+
+/// Reports that `slot`'s link just activated on this relay, firing one
+/// slot-connected notice up the coordinator connection. `resumed` marks a dial
+/// that presented resume cursors (a reconnect or a re-home re-dial) apart from a
+/// first connect.
+///
+/// Fired on every activation, not just the first: the coordinator keeps the
+/// ever-connected set and dedups the tenant notification itself, and only the
+/// relay can see a reconnect at all. Unlike [`record_result`] this needs no
+/// decision-maker — nothing is retained here — so it reports even for a session
+/// run without descriptors, where the notice simply carries no correlation ids.
+pub fn record_slot_connected(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    resumed: bool,
+) {
+    registry.notify_slot_connected(slot_connected_notice(registry, key, slot, resumed));
+}
+
+/// Forwards a client's report that its game loop has started, firing one
+/// slot-started notice up the coordinator connection. `slot` is the authenticated
+/// connection's slot the frame arrived on, never a value from the wire.
+///
+/// The one-report-per-slot rule lives at the relay's client edge (the link that
+/// received the frame), so this retains nothing and — like
+/// [`record_slot_connected`] — needs no decision-maker; a session without one
+/// simply stamps no frame coordinates.
+pub fn record_slot_started(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) {
+    registry.notify_slot_started(slot_started_notice(registry, key, slot));
 }
 
 /// The current wall clock in unix epoch milliseconds — a result report's or a
@@ -5960,14 +6091,7 @@ pub fn note_slot_present(registry: &DecisionMakers, key: &SessionKey, slot: Slot
             None => None,
         }
     };
-    if let Some(initial_buffer_turns) = fired {
-        registry.flight.record(
-            key,
-            crate::flight_recorder::FlightEvent::SessionStart {
-                initial_buffer_turns,
-            },
-        );
-    }
+    note_start_latched(registry, key, fired);
     fired.is_some()
 }
 
@@ -5987,15 +6111,35 @@ pub fn reevaluate_session_start(registry: &DecisionMakers, key: &SessionKey) -> 
             None => None,
         }
     };
-    if let Some(initial_buffer_turns) = fired {
-        registry.flight.record(
-            key,
-            crate::flight_recorder::FlightEvent::SessionStart {
-                initial_buffer_turns,
-            },
-        );
-    }
+    note_start_latched(registry, key, fired);
     fired.is_some()
+}
+
+/// Records that `key`'s coverage latch just fired on this relay, with the depth
+/// the authority sized (`Some(depth)`) or none (`Some(None)`). `None` means the
+/// latch did not fire and nothing is recorded.
+///
+/// Every coverage-fired path funnels through here — the presence ingest, the
+/// mesh's presence receive, and the authority-churn re-evaluation all reach it
+/// through [`note_slot_present`] or [`reevaluate_session_start`] — so it is the
+/// one place the flight-recorder event is written and the one place the
+/// session-started notice fires. Deliberately *not* reached from
+/// [`adopt_session_start`](DecisionMaker::adopt_session_start) or
+/// [`mark_started`](DecisionMaker::mark_started): a peer relay adopting the
+/// authority's directive off the mesh made no decision to report, and reporting
+/// there would give the coordinator one notice per serving relay instead of one
+/// per session.
+fn note_start_latched(registry: &DecisionMakers, key: &SessionKey, fired: Option<Option<u32>>) {
+    let Some(initial_buffer_turns) = fired else {
+        return;
+    };
+    registry.flight.record(
+        key,
+        crate::flight_recorder::FlightEvent::SessionStart {
+            initial_buffer_turns,
+        },
+    );
+    registry.notify_session_started(session_started_notice(registry, key, initial_buffer_turns));
 }
 
 /// Whether `key`'s session-start directive has already been emitted — the guard
@@ -11418,6 +11562,15 @@ mod tests {
             RelayNotice::Departure(notice) => notice,
             RelayNotice::Desync(_) => panic!("expected a departure notice, got a desync"),
             RelayNotice::Result(_) => panic!("expected a departure notice, got a result"),
+            RelayNotice::SlotConnected(_) => {
+                panic!("expected a departure notice, got a slot-connected")
+            }
+            RelayNotice::SessionStarted(_) => {
+                panic!("expected a departure notice, got a session-started")
+            }
+            RelayNotice::SlotStarted(_) => {
+                panic!("expected a departure notice, got a slot-started")
+            }
             RelayNotice::SessionClosed { .. } => {
                 panic!("expected a departure notice, got a session-closed")
             }

@@ -254,6 +254,53 @@ async fn recv_meaningful(
     }
 }
 
+/// Reads the next coordinator notice that reports a game *event*, skipping the
+/// load-progress notices every slot activation fires. Panics on timeout or a
+/// closed channel. Tests asserting on a result or departure use this so the
+/// arrival notices that legitimately precede them do not fail the match.
+async fn recv_event_notice(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rally_point_relay::consensus::RelayNotice>,
+) -> rally_point_relay::consensus::RelayNotice {
+    use rally_point_relay::consensus::RelayNotice;
+    loop {
+        let notice = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a notice arrives before the timeout")
+            .expect("the notice channel stays open");
+        if !matches!(
+            notice,
+            RelayNotice::SlotConnected(_) | RelayNotice::SessionStarted(_)
+        ) {
+            return notice;
+        }
+    }
+}
+
+/// Asserts that no game-event notice arrives within `window`, tolerating the
+/// load-progress notices a slot activation fires. The counterpart of
+/// [`recv_event_notice`] for the tests that assert an inadmissible report is
+/// dropped silently.
+async fn assert_no_event_notice(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rally_point_relay::consensus::RelayNotice>,
+    window: Duration,
+    message: &str,
+) {
+    use rally_point_relay::consensus::RelayNotice;
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => return,
+            Ok(None) => return,
+            Ok(Some(RelayNotice::SlotConnected(_) | RelayNotice::SessionStarted(_))) => continue,
+            Ok(Some(other)) => panic!("{message}, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn fans_a_validated_turn_to_the_other_slot() {
     let tenant = make_tenant(KID, TENANT);
@@ -1228,10 +1275,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
 
     // The relay processes the stream in order, so the result notice fires before
     // the departure notice.
-    let first = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
-        .await
-        .expect("the result notice never arrived")
-        .expect("the notice channel closed early");
+    let first = recv_event_notice(&mut notice_rx).await;
     let RelayNotice::Result(result) = first else {
         panic!("expected the result notice first, got {first:?}");
     };
@@ -1247,10 +1291,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
     assert_eq!(result.slot_frame, Some(10));
     assert!(result.arrival_ms > 0, "a wall-clock arrival stamp is set");
 
-    let second = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
-        .await
-        .expect("the departure notice never arrived")
-        .expect("the notice channel closed early");
+    let second = recv_event_notice(&mut notice_rx).await;
     let RelayNotice::Departure(departure) = second else {
         panic!("expected the departure notice second, got {second:?}");
     };
@@ -1322,12 +1363,12 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
         .unwrap();
 
     // No result notice fires for the oversize report.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(400), notice_rx.recv())
-            .await
-            .is_err(),
+    assert_no_event_notice(
+        &mut notice_rx,
+        Duration::from_millis(400),
         "an oversize result payload must fire no notice",
-    );
+    )
+    .await;
 
     // The link is still up: a within-cap report on the same stream is accepted
     // and fires its notice — the first record for the slot, since the oversize
@@ -1335,10 +1376,7 @@ async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
     send_control_game_result(&mut ctrl0_send, vec![0x1u8, 0x2, 0x3].into())
         .await
         .unwrap();
-    let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
-        .await
-        .expect("the within-cap result never fired a notice — the link was torn down")
-        .expect("the notice channel closed early");
+    let notice = recv_event_notice(&mut notice_rx).await;
     let RelayNotice::Result(result) = notice else {
         panic!("expected a result notice, got {notice:?}");
     };
@@ -1398,12 +1436,12 @@ async fn an_empty_result_report_is_dropped_without_closing_the_link() {
         .unwrap();
 
     // No result notice fires for the empty report.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(400), notice_rx.recv())
-            .await
-            .is_err(),
+    assert_no_event_notice(
+        &mut notice_rx,
+        Duration::from_millis(400),
         "an empty result payload must fire no notice",
-    );
+    )
+    .await;
     assert!(
         consensus::result_for(&makers, &key, SlotId(0)).is_none(),
         "an empty result payload must never be retained",

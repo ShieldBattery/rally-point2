@@ -1,5 +1,6 @@
-//! Departure webhooks: the coordinator → tenant leg of the player-departure
-//! notification.
+//! Notice webhooks: the coordinator → tenant leg of the per-game facts relays
+//! report — a player departure, a desync, a result, a slot's arrival, a
+//! session's start, and a slot's game loop starting.
 //!
 //! A relay reports a mid-game departure up its control connection
 //! ([`rally_point_proto::control::RelayToCoordinator::Departure`]); the api layer
@@ -51,7 +52,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
 use rally_point_proto::control::{
-    DepartureKind, DepartureNotice, DesyncNotice, ResultNotice, TenantId,
+    DepartureKind, DepartureNotice, DesyncNotice, ResultNotice, SessionStartedNotice,
+    SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{SessionId, SlotId};
 use serde::Serialize;
@@ -78,6 +80,23 @@ pub type DesyncDedup = Arc<Mutex<HashSet<(TenantId, SessionId, u64)>>>;
 /// reports at most one result). Collapses the at-least-once redeliveries of one
 /// report to a single webhook.
 pub type ResultDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
+
+/// Slot arrivals already notified, keyed by `(tenant, session, slot)` — the
+/// sibling of [`DepartureDedup`] with the same key shape. A relay reports a slot
+/// connected on *every* activation (reconnects included) so the coordinator's
+/// ever-connected set follows the truth; this set is what keeps the tenant
+/// notification to the first arrival per slot.
+pub type SlotConnectedDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
+
+/// Session starts already notified, keyed by `(tenant, session)` — one start per
+/// session. Only the authority relay reports the latch, so this collapses
+/// at-least-once redeliveries (and a second authority's report after a
+/// promotion), not per-relay redundancy.
+pub type SessionStartedDedup = Arc<Mutex<HashSet<(TenantId, SessionId)>>>;
+
+/// Game-loop starts already notified, keyed by `(tenant, session, slot)` — one
+/// report per slot, the same key shape as [`ResultDedup`].
+pub type SlotStartedDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
 /// Sessions the coordinator has seen a desync for, keyed by `(tenant, session)` and
 /// stamped with when the mark was made. The flight-recorder sink reads this to pin a
@@ -106,18 +125,28 @@ pub struct NoticeDedup {
     pub desyncs: DesyncDedup,
     /// Result dedup by `(tenant, session, slot)`.
     pub results: ResultDedup,
+    /// Slot-arrival dedup by `(tenant, session, slot)`.
+    pub slot_connects: SlotConnectedDedup,
+    /// Session-start dedup by `(tenant, session)`.
+    pub session_starts: SessionStartedDedup,
+    /// Game-loop-start dedup by `(tenant, session, slot)`.
+    pub slot_starts: SlotStartedDedup,
     /// Desynced-session marks the flight-recorder sink reads to pin a recording's
     /// retention class. Not a dedup set — one mark per `(tenant, session)`, refreshed
     /// on every desync and pruned by [`DESYNC_MARK_TTL`], never by session retirement.
     pub desync_marks: DesyncMarks,
 }
 
-/// Creates an empty notice dedup set (departures + desyncs + results + desync marks).
+/// Creates an empty notice dedup set (departures + desyncs + results + slot
+/// arrivals + session starts + game-loop starts + desync marks).
 pub fn new_dedup() -> NoticeDedup {
     NoticeDedup {
         departures: Arc::new(Mutex::new(HashSet::new())),
         desyncs: Arc::new(Mutex::new(HashSet::new())),
         results: Arc::new(Mutex::new(HashSet::new())),
+        slot_connects: Arc::new(Mutex::new(HashSet::new())),
+        session_starts: Arc::new(Mutex::new(HashSet::new())),
+        slot_starts: Arc::new(Mutex::new(HashSet::new())),
         desync_marks: Arc::new(Mutex::new(HashMap::new())),
     }
 }
@@ -153,8 +182,8 @@ pub fn is_session_desynced(
 impl NoticeDedup {
     /// Drops every dedup entry for one `(tenant, session)`, called when the
     /// session's lifecycle state is removed — the point the coordinator declares
-    /// it is done with the session. Without this the three sets are insert-only
-    /// and grow for the process lifetime (a few tuples per session that ever ran).
+    /// it is done with the session. Without this the sets are insert-only and
+    /// grow for the process lifetime (a few tuples per session that ever ran).
     ///
     /// Pruning at removal means a late or replayed notice arriving *after* the
     /// session was reaped is no longer recognized as a duplicate, so it would
@@ -166,6 +195,11 @@ impl NoticeDedup {
         self.departures.lock().retain(|(t, s, _)| !matches(t, *s));
         self.desyncs.lock().retain(|(t, s, _)| !matches(t, *s));
         self.results.lock().retain(|(t, s, _)| !matches(t, *s));
+        self.slot_connects
+            .lock()
+            .retain(|(t, s, _)| !matches(t, *s));
+        self.session_starts.lock().retain(|(t, s)| !matches(t, *s));
+        self.slot_starts.lock().retain(|(t, s, _)| !matches(t, *s));
     }
 }
 
@@ -346,6 +380,67 @@ struct ResultWebhook {
     #[serde(skip_serializing_if = "Option::is_none")]
     external_ref: Option<String>,
     payload: String,
+    arrival_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_frame: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_frame: Option<u32>,
+}
+
+/// The JSON body POSTed to the tenant when a slot's client first arrives on a
+/// relay. Same camelCase convention and `event` discriminator as the other
+/// bodies. `resumed` reports whether *that* arrival was a re-dial rather than a
+/// first connect; since the webhook fires only on first sight per slot it is
+/// normally `false`, and `true` means the coordinator's first sight of the slot
+/// was itself a reconnect (a relay's coordinator link having been down over the
+/// original arrival). Optional fields are omitted when absent, never `null`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlotConnectedWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ref: Option<String>,
+    resumed: bool,
+    connected_at_ms: u64,
+}
+
+/// The JSON body POSTed to the tenant when a session starts — the authority
+/// relay observed every expected slot present. Same camelCase convention and
+/// `event` discriminator as the other bodies. `initialBufferTurns` is omitted
+/// when the authority sized no depth.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionStartedWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    started_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_buffer_turns: Option<u32>,
+}
+
+/// The JSON body POSTed to the tenant when a slot reports its game loop running.
+/// Same camelCase convention and `event` discriminator as the other bodies. The
+/// frame stamps are normally absent (a game announcing its loop has usually not
+/// produced a framed turn yet) and are omitted rather than sent as `null`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlotStartedWebhook {
+    event: &'static str,
+    tenant: String,
+    session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ref: Option<String>,
     arrival_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_frame: Option<u32>,
@@ -783,6 +878,254 @@ pub fn handle_result(
     );
 }
 
+/// Handles one relay's slot-connected notice.
+///
+/// A sibling of [`handle_departure`]: first sight of a `(tenant, session, slot)`
+/// resolves the arriving slot's correlation ids and the tenant's notify config,
+/// then spawns a signed webhook. Later activations of the same slot (reconnects,
+/// re-home re-dials) are duplicates here and fire nothing — the lifecycle
+/// accounting the api layer feeds first still records them, so the load-state
+/// pull stays current either way.
+///
+/// Correlation ids come notice-first, stored-session as fallback — the same rule
+/// as departures.
+pub fn handle_slot_connected(
+    setup: &SessionSetup,
+    dedup: &SlotConnectedDedup,
+    lifecycle: &Lifecycle,
+    notice: SlotConnectedNotice,
+) {
+    let is_new = dedup
+        .lock()
+        .insert((notice.tenant.clone(), notice.session, notice.slot));
+
+    let (config, external_id, stored) = match resolve_notice_prefix(
+        setup,
+        &notice.tenant,
+        notice.session,
+        notice.external_id.clone(),
+        is_new,
+    ) {
+        NoticePrefix::Duplicate => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "duplicate slot-connected notice; already handled",
+            );
+            return;
+        }
+        NoticePrefix::NoNotifyConfig => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "no notify config for tenant; dropping slot-connected",
+            );
+            return;
+        }
+        NoticePrefix::NoExternalId => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "no gameId ref from the notice or a stored session; dropping slot-connected",
+            );
+            return;
+        }
+        NoticePrefix::Resolved {
+            config,
+            external_id,
+            stored,
+        } => (config, external_id, stored),
+    };
+
+    let external_ref = notice.external_ref.clone().or_else(|| {
+        (*stored)
+            .as_ref()
+            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
+    });
+
+    let payload = SlotConnectedWebhook {
+        event: "slotConnected",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(external_id),
+        slot: notice.slot.0,
+        external_ref,
+        resumed: notice.resumed,
+        connected_at_ms: notice.connected_at_ms,
+    };
+
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "slotConnected",
+    );
+}
+
+/// Handles the authority relay's session-started notice.
+///
+/// A sibling of [`handle_departure`] keyed on `(tenant, session)` alone — a
+/// session starts once. Only the authority reports the latch, so a duplicate here
+/// is an at-least-once redelivery or a second authority's report after a
+/// promotion, both of which describe the same start.
+///
+/// The `external_id` comes notice-first, stored-session as fallback — the same
+/// rule as departures.
+pub fn handle_session_started(
+    setup: &SessionSetup,
+    dedup: &SessionStartedDedup,
+    lifecycle: &Lifecycle,
+    notice: SessionStartedNotice,
+) {
+    let is_new = dedup.lock().insert((notice.tenant.clone(), notice.session));
+
+    let (config, external_id) = match resolve_notice_prefix(
+        setup,
+        &notice.tenant,
+        notice.session,
+        notice.external_id.clone(),
+        is_new,
+    ) {
+        NoticePrefix::Duplicate => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                "duplicate session-started notice; already handled",
+            );
+            return;
+        }
+        NoticePrefix::NoNotifyConfig => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                "no notify config for tenant; dropping session-started",
+            );
+            return;
+        }
+        NoticePrefix::NoExternalId => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                "no gameId ref from the notice or a stored session; dropping session-started",
+            );
+            return;
+        }
+        NoticePrefix::Resolved {
+            config,
+            external_id,
+            ..
+        } => (config, external_id),
+    };
+
+    let payload = SessionStartedWebhook {
+        event: "sessionStarted",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(external_id),
+        started_at_ms: notice.started_at_ms,
+        initial_buffer_turns: notice.initial_buffer_turns,
+    };
+
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "sessionStarted",
+    );
+}
+
+/// Handles one relay's slot-started notice — a client's report that its game loop
+/// is running.
+///
+/// A sibling of [`handle_result`] with the same `(tenant, session, slot)` dedup
+/// key (a slot reports one game-loop start), the same notice-first correlation-id
+/// resolution, and the same best-effort drops.
+pub fn handle_slot_started(
+    setup: &SessionSetup,
+    dedup: &SlotStartedDedup,
+    lifecycle: &Lifecycle,
+    notice: SlotStartedNotice,
+) {
+    let is_new = dedup
+        .lock()
+        .insert((notice.tenant.clone(), notice.session, notice.slot));
+
+    let (config, external_id, stored) = match resolve_notice_prefix(
+        setup,
+        &notice.tenant,
+        notice.session,
+        notice.external_id.clone(),
+        is_new,
+    ) {
+        NoticePrefix::Duplicate => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "duplicate slot-started notice; already handled",
+            );
+            return;
+        }
+        NoticePrefix::NoNotifyConfig => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "no notify config for tenant; dropping slot-started",
+            );
+            return;
+        }
+        NoticePrefix::NoExternalId => {
+            tracing::debug!(
+                tenant = notice.tenant.as_ref(),
+                session = notice.session.0,
+                slot = notice.slot.0,
+                "no gameId ref from the notice or a stored session; dropping slot-started",
+            );
+            return;
+        }
+        NoticePrefix::Resolved {
+            config,
+            external_id,
+            stored,
+        } => (config, external_id, stored),
+    };
+
+    let external_ref = notice.external_ref.clone().or_else(|| {
+        (*stored)
+            .as_ref()
+            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
+    });
+
+    let payload = SlotStartedWebhook {
+        event: "slotStarted",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(external_id),
+        slot: notice.slot.0,
+        external_ref,
+        arrival_ms: notice.arrival_ms,
+        session_frame: notice.session_frame,
+        slot_frame: notice.slot_frame,
+    };
+
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        config,
+        &payload,
+        "slotStarted",
+    );
+}
+
 /// Serializes `payload` and enqueues its webhook onto the session's ordered
 /// dispatch queue ([`Lifecycle`]), so every notice for one `(tenant, session)` is
 /// delivered in the order it was enqueued — a notice's retry loop blocks the ones
@@ -1045,6 +1388,88 @@ mod tests {
 
     use super::*;
     use crate::registry;
+
+    /// The three load-progress bodies serialize to exactly the shapes the tenant
+    /// parses: camelCase keys, the `event` discriminator naming the kind, and
+    /// absent optionals omitted from the object rather than sent as `null` (the
+    /// consumer validates them as optional strings/numbers, and a literal `null`
+    /// fails that validation instead of reading as "absent").
+    #[test]
+    fn the_load_progress_webhook_bodies_serialize_to_their_documented_shapes() {
+        let connected = SlotConnectedWebhook {
+            event: "slotConnected",
+            tenant: "sb-staging".to_owned(),
+            session: 42,
+            external_id: Some("game-99".to_owned()),
+            slot: 1,
+            external_ref: Some("sb-user-7".to_owned()),
+            resumed: false,
+            connected_at_ms: 1_700_000_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&connected).unwrap(),
+            r#"{"event":"slotConnected","tenant":"sb-staging","session":42,"externalId":"game-99","slot":1,"externalRef":"sb-user-7","resumed":false,"connectedAtMs":1700000000000}"#,
+        );
+
+        let started = SessionStartedWebhook {
+            event: "sessionStarted",
+            tenant: "sb-staging".to_owned(),
+            session: 42,
+            external_id: Some("game-99".to_owned()),
+            started_at_ms: 1_700_000_000_000,
+            initial_buffer_turns: Some(6),
+        };
+        assert_eq!(
+            serde_json::to_string(&started).unwrap(),
+            r#"{"event":"sessionStarted","tenant":"sb-staging","session":42,"externalId":"game-99","startedAtMs":1700000000000,"initialBufferTurns":6}"#,
+        );
+
+        let slot_started = SlotStartedWebhook {
+            event: "slotStarted",
+            tenant: "sb-staging".to_owned(),
+            session: 42,
+            external_id: Some("game-99".to_owned()),
+            slot: 1,
+            external_ref: Some("sb-user-7".to_owned()),
+            arrival_ms: 1_700_000_000_000,
+            session_frame: Some(12),
+            slot_frame: Some(14),
+        };
+        assert_eq!(
+            serde_json::to_string(&slot_started).unwrap(),
+            r#"{"event":"slotStarted","tenant":"sb-staging","session":42,"externalId":"game-99","slot":1,"externalRef":"sb-user-7","arrivalMs":1700000000000,"sessionFrame":12,"slotFrame":14}"#,
+        );
+
+        // The minimal shapes: every optional absent, so each key is omitted.
+        let bare_started = SessionStartedWebhook {
+            event: "sessionStarted",
+            tenant: "sb-staging".to_owned(),
+            session: 42,
+            external_id: None,
+            started_at_ms: 7,
+            initial_buffer_turns: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare_started).unwrap(),
+            r#"{"event":"sessionStarted","tenant":"sb-staging","session":42,"startedAtMs":7}"#,
+        );
+
+        let bare_slot_started = SlotStartedWebhook {
+            event: "slotStarted",
+            tenant: "sb-staging".to_owned(),
+            session: 42,
+            external_id: None,
+            slot: 0,
+            external_ref: None,
+            arrival_ms: 7,
+            session_frame: None,
+            slot_frame: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare_slot_started).unwrap(),
+            r#"{"event":"slotStarted","tenant":"sb-staging","session":42,"slot":0,"arrivalMs":7}"#,
+        );
+    }
 
     /// One webhook the stand-in tenant received: the two signature headers
     /// (raw strings, unvalidated — verification is the test's job) plus the

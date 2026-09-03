@@ -1449,6 +1449,28 @@ pub enum RelayToCoordinator {
     /// at-least-once delivery can re-send one. The coordinator relays the bytes to
     /// the tenant as a webhook.
     Result(ResultNotice),
+    /// A slot's link became active on this relay: the client connected (or
+    /// reconnected) and its slot link is serving. Only the relay that homes the
+    /// slot sends it, on every activation, so the coordinator can tell the tenant
+    /// which players actually arrived instead of leaving it to infer arrival from
+    /// a load-deadline timeout. The coordinator keeps the ever-connected set and
+    /// dedups the webhook by `(tenant, session, slot)`, so a reconnect updates its
+    /// state without re-firing a notification.
+    SlotConnected(SlotConnectedNotice),
+    /// The session started: the authority relay's coverage latch fired, every
+    /// expected slot being present somewhere in the mesh. Only the authority
+    /// reports it — a peer adopting the directive off the mesh does not — so
+    /// exactly one relay sends it per session, and the coordinator dedups by
+    /// `(tenant, session)` against an at-least-once re-send.
+    SessionStarted(SessionStartedNotice),
+    /// A client reported that its game loop has started: the relay received the
+    /// fieldless frame on its control stream, bound it to the authenticated
+    /// connection's slot, and stamped its arrival against its own timeline. Only
+    /// the reporting slot's home relay sends it, and the relay accepts one per
+    /// slot per link lifetime; the coordinator dedups again by
+    /// `(tenant, session, slot)`. Together with `SlotConnected` this is what lets
+    /// a tenant attribute a stalled load to the slots that never got there.
+    SlotStarted(SlotStartedNotice),
     /// The relay tore down its last local state for a session — every slot it
     /// homed or held is gone. The coordinator, which assigned the session's
     /// serving relay set, waits for every serving relay to report this and then
@@ -1748,6 +1770,125 @@ pub struct ResultNotice {
     pub payload: Vec<u8>,
     /// Relay wall-clock at receipt, unix epoch milliseconds. Records when the
     /// relay observed the report, independent of when the webhook is delivered.
+    pub arrival_ms: u64,
+    /// The session's consensus coordinate (the slowest slot's observed frame)
+    /// when the report arrived. `None` before any slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_frame: Option<u32>,
+    /// The reporting slot's own newest observed frame when the report arrived.
+    /// `None` before that slot produced a framed turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_frame: Option<u32>,
+}
+
+/// A relay's report that a slot's link became active — the client connected (or
+/// reconnected) and its slot link is serving — sent up the relay control
+/// connection ([`RelayToCoordinator::SlotConnected`]).
+///
+/// Only the relay that homes the slot sends it, at the moment the slot link
+/// activates, and it fires on *every* activation, reconnects included:
+/// `resumed` distinguishes a re-dial that presented resume cursors from a fresh
+/// first connect. The coordinator keeps the ever-connected set and fires the
+/// webhook only on first sight per slot, so the repeats cost nothing beyond the
+/// frame.
+///
+/// Like [`DepartureNotice`] it carries its own `tenant`/`session`/`slot` because
+/// one control connection serves many sessions, and it stamps its own
+/// correlation ids from the relay's stored [`SessionDescriptor`] so the notice is
+/// self-describing across a coordinator restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotConnectedNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session the slot connected to.
+    pub session: SessionId,
+    /// The slot whose link activated — the authenticated connection's slot.
+    pub slot: SlotId,
+    /// The tenant's own id for the session, stamped by the relay from its stored
+    /// [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The tenant's own id for the connecting slot's player. Same source and
+    /// fallback as `external_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+    /// Whether the dial presented resume cursors — a reconnect or a re-home
+    /// re-dial — rather than being this slot's first connect to this relay.
+    pub resumed: bool,
+    /// Relay wall-clock at activation, unix epoch milliseconds. Records when the
+    /// relay observed the link come up, independent of when the webhook is
+    /// delivered.
+    pub connected_at_ms: u64,
+}
+
+/// A relay's report that a session started — every slot the descriptor listed as
+/// expected is present somewhere in the session's mesh, so the game may begin —
+/// sent up the relay control connection ([`RelayToCoordinator::SessionStarted`]).
+///
+/// Exactly one relay reports it: the session's authority, whose coverage latch
+/// fires the `SessionStart` directive. A peer relay that merely adopts the
+/// directive off the mesh reports nothing, so unlike a departure there is no
+/// per-relay redundancy here — the coordinator still dedups by
+/// `(tenant, session)` because at-least-once delivery can re-send one.
+///
+/// `initial_buffer_turns` is the latency-buffer depth the authority sized at the
+/// latch and stamped onto the directive, or `None` when it sized none (nothing
+/// observed and no hint supplied).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStartedNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session that started.
+    pub session: SessionId,
+    /// The tenant's own id for the session, stamped by the relay from its stored
+    /// [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Relay wall-clock at the coverage latch, unix epoch milliseconds.
+    pub started_at_ms: u64,
+    /// The initial latency-buffer depth the authority sized and stamped onto the
+    /// start directive. `None` when it sized none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_buffer_turns: Option<u32>,
+}
+
+/// A relay's forward of a client's report that its game loop has started, sent up
+/// the relay control connection ([`RelayToCoordinator::SlotStarted`]).
+///
+/// The client's own statement that it finished loading and is stepping the
+/// simulation, so the tenant can attribute a stalled load to the slots that never
+/// reported instead of guessing from a deadline. `slot` is the authenticated
+/// connection's slot the frame arrived on, never a client-asserted value. Only
+/// the reporting slot's home relay sends it (the fact never crosses the mesh),
+/// and the relay accepts one per slot per link lifetime; the coordinator dedups
+/// again by `(tenant, session, slot)`.
+///
+/// The stamps are the relay's own view of *when* the report landed in the game's
+/// timeline, mirroring [`ResultNotice`]'s: `arrival_ms` is relay wall-clock at
+/// receipt, `session_frame` the session's consensus coordinate then, and
+/// `slot_frame` the reporting slot's own newest observed frame. Both frames are
+/// normally absent here — a game announcing its loop has begun has usually not
+/// produced a framed turn yet — which is exactly why they are optional.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotStartedNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session the report is for.
+    pub session: SessionId,
+    /// The slot that reported — the authenticated connection's slot.
+    pub slot: SlotId,
+    /// The tenant's own id for the session, stamped by the relay from its stored
+    /// [`SessionDescriptor`]. Same source and fallback as
+    /// [`DepartureNotice::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The tenant's own id for the reporting slot's player. Same source and
+    /// fallback as `external_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+    /// Relay wall-clock at receipt, unix epoch milliseconds.
     pub arrival_ms: u64,
     /// The session's consensus coordinate (the slowest slot's observed frame)
     /// when the report arrived. `None` before any slot produced a framed turn.
@@ -3328,5 +3469,126 @@ mod tests {
         let json = r#"{"type":"result","tenant":"sb-staging","session":42,"slot":0,"payload":[1,2,3],"arrival_ms":7}"#;
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn slot_connected_roundtrips_json() {
+        let notice = SlotConnectedNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            slot: SlotId(1),
+            external_id: Some("game-99".to_owned()),
+            external_ref: Some("sb-user-7".to_owned()),
+            resumed: true,
+            connected_at_ms: 1_700_000_000_000,
+        };
+        let message = RelayToCoordinator::SlotConnected(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"slot_connected\""));
+        assert!(json.contains("\"resumed\":true"));
+        assert!(json.contains("\"connected_at_ms\":1700000000000"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn slot_connected_without_optionals_decodes() {
+        // A notice from a relay whose descriptor carried no correlation ids must
+        // still decode, leaving the coordinator's own fallbacks to fill them.
+        let json = r#"{"type":"slot_connected","tenant":"sb-staging","session":42,"slot":0,"resumed":false,"connected_at_ms":7}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::SlotConnected(notice) = decoded else {
+            panic!("decodes to the SlotConnected variant");
+        };
+        assert!(notice.external_id.is_none());
+        assert!(notice.external_ref.is_none());
+        assert!(!notice.resumed);
+        assert_eq!(notice.connected_at_ms, 7);
+    }
+
+    #[test]
+    fn session_started_roundtrips_json() {
+        let notice = SessionStartedNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            external_id: Some("game-99".to_owned()),
+            started_at_ms: 1_700_000_000_000,
+            initial_buffer_turns: Some(6),
+        };
+        let message = RelayToCoordinator::SessionStarted(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"session_started\""));
+        assert!(json.contains("\"initial_buffer_turns\":6"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn session_started_without_optionals_decodes() {
+        // An authority that sized no depth (and a descriptor with no gameId)
+        // still produces a decodable notice; the absent depth is distinct from a
+        // present zero.
+        let json =
+            r#"{"type":"session_started","tenant":"sb-staging","session":42,"started_at_ms":7}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::SessionStarted(notice) = decoded else {
+            panic!("decodes to the SessionStarted variant");
+        };
+        assert!(notice.external_id.is_none());
+        assert!(notice.initial_buffer_turns.is_none());
+        assert_eq!(notice.started_at_ms, 7);
+    }
+
+    #[test]
+    fn slot_started_roundtrips_json() {
+        let notice = SlotStartedNotice {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            slot: SlotId(3),
+            external_id: Some("game-99".to_owned()),
+            external_ref: Some("sb-user-7".to_owned()),
+            arrival_ms: 1_700_000_000_000,
+            session_frame: Some(12),
+            slot_frame: Some(14),
+        };
+        let message = RelayToCoordinator::SlotStarted(notice.clone());
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"slot_started\""));
+        assert!(json.contains("\"arrival_ms\":1700000000000"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn slot_started_without_optionals_decodes() {
+        // The common shape: a client announcing its loop before any framed turn,
+        // on a session whose descriptor carried no correlation ids.
+        let json =
+            r#"{"type":"slot_started","tenant":"sb-staging","session":42,"slot":0,"arrival_ms":7}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::SlotStarted(notice) = decoded else {
+            panic!("decodes to the SlotStarted variant");
+        };
+        assert!(notice.external_id.is_none());
+        assert!(notice.external_ref.is_none());
+        assert!(notice.session_frame.is_none());
+        assert!(notice.slot_frame.is_none());
+        assert_eq!(notice.arrival_ms, 7);
+    }
+
+    #[test]
+    fn the_load_progress_frames_decode_to_unknown_on_a_decoder_without_them() {
+        // Forward compatibility for all three load-progress up-frames: a decoder
+        // that predates them — here the down-direction `CoordinatorToRelay`,
+        // which has no such variants — folds each into `Unknown` rather than
+        // erroring, exactly as an older coordinator build would.
+        for json in [
+            r#"{"type":"slot_connected","tenant":"sb-staging","session":42,"slot":0,"resumed":false,"connected_at_ms":7}"#,
+            r#"{"type":"session_started","tenant":"sb-staging","session":42,"started_at_ms":7}"#,
+            r#"{"type":"slot_started","tenant":"sb-staging","session":42,"slot":0,"arrival_ms":7}"#,
+        ] {
+            let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+            assert_eq!(decoded, CoordinatorToRelay::Unknown);
+        }
     }
 }

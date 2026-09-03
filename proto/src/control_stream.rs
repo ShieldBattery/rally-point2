@@ -175,6 +175,25 @@ mod tests {
     }
 
     #[test]
+    fn game_started_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::GameStarted;
+
+        // The client's "my game loop is running" report rides the client-edge
+        // control frame only — it is client → relay, never fanned to anyone —
+        // and is fieldless, so the whole frame is just the oneof tag with an
+        // empty body.
+        let frame = ControlFrame {
+            kind: Some(control_frame::Kind::GameStarted(GameStarted {})),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
+
+        // Field 14, length-delimited, zero-length body.
+        assert_eq!(&encoded[CONTROL_LEN_PREFIX..], &[0x72, 0x00]);
+    }
+
+    #[test]
     fn game_chat_frames_round_trip_through_the_shared_framing() {
         use crate::messages::GameChat;
 

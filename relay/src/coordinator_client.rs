@@ -1424,6 +1424,9 @@ async fn send_notice(
         RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice.clone()),
         RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice.clone()),
         RelayNotice::Result(notice) => RelayToCoordinator::Result(notice.clone()),
+        RelayNotice::SlotConnected(notice) => RelayToCoordinator::SlotConnected(notice.clone()),
+        RelayNotice::SessionStarted(notice) => RelayToCoordinator::SessionStarted(notice.clone()),
+        RelayNotice::SlotStarted(notice) => RelayToCoordinator::SlotStarted(notice.clone()),
         RelayNotice::SessionClosed { tenant, session } => RelayToCoordinator::SessionClosed {
             tenant: tenant.clone(),
             session: *session,
@@ -2490,6 +2493,9 @@ mod tests {
             RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice),
             RelayNotice::Desync(notice) => RelayToCoordinator::Desync(notice),
             RelayNotice::Result(notice) => RelayToCoordinator::Result(notice),
+            RelayNotice::SlotConnected(notice) => RelayToCoordinator::SlotConnected(notice),
+            RelayNotice::SessionStarted(notice) => RelayToCoordinator::SessionStarted(notice),
+            RelayNotice::SlotStarted(notice) => RelayToCoordinator::SlotStarted(notice),
             RelayNotice::SessionClosed { tenant, session } => {
                 RelayToCoordinator::SessionClosed { tenant, session }
             }

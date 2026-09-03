@@ -1305,11 +1305,15 @@ pub async fn run_slot_link(
         .decision_makers
         .flight_recorder()
         .slot_counters(&key, slot);
+    // Any presented resume cursors mean a re-dial (a reconnect or a re-home),
+    // not this slot's first arrival. Read before the cursors are consumed below,
+    // and reported both to the recording and up the coordinator connection.
+    let resumed_dial = !resume_cursors.is_empty();
     mesh.decision_makers.flight_recorder().record(
         &key,
         crate::flight_recorder::FlightEvent::SlotConnected {
             slot: slot.0,
-            resumed: !resume_cursors.is_empty(),
+            resumed: resumed_dial,
         },
     );
     let crate::mesh::MeshState {
@@ -1356,6 +1360,13 @@ pub async fn run_slot_link(
         let handshake_sample = sample_slot_conditions(&link, slot, connection_epoch).conditions;
         crate::mesh::activate_conditions(&conditions, &key, slot, handshake_sample);
         let _ = consensus::ingest_local_condition(&decision_makers, &key, &handshake_sample);
+
+        // Tell the coordinator this slot's client is here, so the tenant can name
+        // who actually arrived instead of inferring it from a load deadline. Fired
+        // on every activation (a reconnect included); the coordinator keeps the
+        // ever-connected set and dedups the tenant notification itself. Inside the
+        // ingress section so a session retired mid-activation reports nothing.
+        consensus::record_slot_connected(&decision_makers, &key, slot, resumed_dial);
 
         // Announce this slot's presence to the mesh and record it into the session's
         // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -1558,6 +1569,11 @@ pub async fn run_slot_link(
     // once a clean leave was announced avoids a redundant "dropped" SlotDeparted
     // chasing the "left" one across the mesh (which is idempotent, but noise).
     let mut leave_announced = false;
+    // Whether this client has already reported its game loop started on this
+    // link. One report per slot per link: a repeat is dropped (the fact is
+    // already up the pipeline), and a reconnect starts a fresh link that may
+    // report again — harmless, since the coordinator dedups per slot.
+    let mut game_started_reported = false;
     // Whether we've received from this client since we last sent it a packet. Every
     // packet we send folds in the latest acks, so a forwarded turn clears this too,
     // and the flush only needs to carry acks when no forward has.
@@ -2509,6 +2525,34 @@ pub async fn run_slot_link(
                             );
                         } else {
                             consensus::record_result(&decision_makers, &key, slot, payload.to_vec());
+                        }
+                    }
+                    // The client's report that its game loop has started. Bound
+                    // to this authenticated connection's slot, never a value
+                    // from the wire (the frame carries none), stamped against
+                    // this relay's own timeline, and forwarded up the
+                    // coordinator pipeline so the tenant can attribute a
+                    // stalled load to the slots that never got here. At most one
+                    // per link: a repeat is a logged drop, not a link close —
+                    // a client repeating a purely informational report is not
+                    // worth ending a game over.
+                    Some(ControlInbound::GameStarted) => {
+                        if game_started_reported {
+                            tracing::debug!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                "dropping repeat game-started report on this link",
+                            );
+                        } else {
+                            game_started_reported = true;
+                            decision_makers.flight_recorder().record(
+                                &key,
+                                crate::flight_recorder::FlightEvent::SlotGameStarted {
+                                    slot: slot.0,
+                                },
+                            );
+                            consensus::record_slot_started(&decision_makers, &key, slot);
                         }
                     }
                     // The client's lobby command. Admit it against the relay's

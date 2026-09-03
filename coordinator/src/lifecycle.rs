@@ -136,6 +136,33 @@ pub(crate) fn dropped_notice_count() -> u64 {
 /// A `(tenant, session)` key for the per-session lifecycle map.
 type SessionRef = (TenantId, SessionId);
 
+/// What the coordinator knows about one session's load progress, as
+/// [`Lifecycle::load_state`] reports it.
+///
+/// Every field is an accumulated fact, never a live view: the slot sets record
+/// that a slot *ever* connected or *ever* reported its game loop, so a slot that
+/// arrived and then dropped still appears. That is what makes the answer useful
+/// for attributing a failed load — the tenant wants "who never got here", not
+/// "who is here right now" (which is what the presence store answers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLoadState {
+    /// Relay wall-clock (unix epoch ms) of the session's coverage latch. `None`
+    /// when no authority has reported the session started.
+    pub started_at_ms: Option<u64>,
+    /// Slots whose links ever activated, ascending.
+    pub connected_slots: Vec<SlotId>,
+    /// Slots that ever reported their game loop running, ascending.
+    pub started_slots: Vec<SlotId>,
+}
+
+/// A slot set as an ascending vector, so a load-state answer is deterministic
+/// rather than following the hash set's iteration order.
+fn sorted_slots(slots: &HashSet<SlotId>) -> Vec<SlotId> {
+    let mut sorted: Vec<SlotId> = slots.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted
+}
+
 /// One assigned relay's continuous proof that a session is empty.
 #[derive(Debug, Clone, Copy)]
 struct EmptyRosterEvidence {
@@ -201,6 +228,20 @@ struct SessionState {
     /// Player slots that have a result or a departure — the accounted set. Grows
     /// monotonically (a slot never un-accounts).
     accounted: HashSet<SlotId>,
+    /// Slots (player or observer) whose links have ever activated on a serving
+    /// relay, from the relays' slot-connected notices. Grows monotonically — the
+    /// question it answers is "did this player ever arrive", so a later
+    /// disconnect never removes an entry (live connectivity is the presence
+    /// store's job, not this set's).
+    connected_slots: HashSet<SlotId>,
+    /// Slots that have ever reported their game loop running. Grows
+    /// monotonically for the same reason as `connected_slots`.
+    started_slots: HashSet<SlotId>,
+    /// Relay wall-clock (unix epoch ms) of the session's coverage latch, from the
+    /// authority relay's session-started notice. First report wins — an
+    /// at-least-once re-send, or a second authority after a promotion, must not
+    /// move an instant the tenant may already have recorded.
+    started_at_ms: Option<u64>,
     /// Slots (player or observer) that have a departure record, each with the
     /// data a coordinator-mediated re-home seeds into a fresh relay's consensus
     /// ([`Lifecycle::departed_slots`]): the left-vs-dropped classification and
@@ -663,6 +704,75 @@ impl Lifecycle {
         self.mark_started(state);
         self.reevaluate_reaps(&tenant, session, state);
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// Records that a slot's link activated on a serving relay: adds the slot to
+    /// the ever-connected set and marks the session started.
+    ///
+    /// Stronger evidence of the same fact `on_presence_seen` records — a relay
+    /// only reports this when a client's link is actually serving — so it
+    /// disarms the never-started reap the same way. Unlike a heartbeat this
+    /// arrives once per activation rather than every ~10s, so it lazily creates a
+    /// webhook-only state (as `on_result` does) instead of ignoring an untracked
+    /// session: the tenant's load-state pull should still find the arrival after
+    /// a coordinator restart forgot the session.
+    pub fn on_slot_connected(&self, tenant: TenantId, session: SessionId, slot: SlotId) {
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((tenant.clone(), session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        state.connected_slots.insert(slot);
+        self.mark_started(state);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// Records the session's start instant from the authority relay's
+    /// session-started notice, and marks the session started. The first instant
+    /// wins: a re-send (or a second authority after a promotion) must not move a
+    /// value the tenant may already have recorded.
+    pub fn on_session_started(&self, tenant: TenantId, session: SessionId, started_at_ms: u64) {
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((tenant.clone(), session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        state.started_at_ms.get_or_insert(started_at_ms);
+        self.mark_started(state);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// Records that a slot reported its game loop running: adds the slot to the
+    /// ever-started set and marks the session started. Lazily creates a
+    /// webhook-only state for the same reason [`on_slot_connected`](Self::on_slot_connected)
+    /// does.
+    pub fn on_slot_started(&self, tenant: TenantId, session: SessionId, slot: SlotId) {
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((tenant.clone(), session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        state.started_slots.insert(slot);
+        self.mark_started(state);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
+    /// The session's load progress as the coordinator currently knows it: when it
+    /// started, which slots ever connected, and which ever reported their game
+    /// loop running. Both slot lists are sorted ascending.
+    ///
+    /// `None` when the coordinator holds no state for the session at all — it was
+    /// never created this lifetime (restart amnesia) or has already been reaped —
+    /// which the tenant must read as "no information", not as "nobody arrived". A
+    /// webhook-only state lazily created by an incoming notice answers with
+    /// whatever that notice recorded.
+    pub fn load_state(&self, tenant: &TenantId, session: SessionId) -> Option<SessionLoadState> {
+        self.inner
+            .sessions
+            .lock()
+            .get(&(tenant.clone(), session))
+            .map(|state| SessionLoadState {
+                started_at_ms: state.started_at_ms,
+                connected_slots: sorted_slots(&state.connected_slots),
+                started_slots: sorted_slots(&state.started_slots),
+            })
     }
 
     /// Records that some relay's heartbeat reported at least one connected
@@ -1281,6 +1391,9 @@ impl Lifecycle {
             player_slots: HashSet::new(),
             observer_slots: HashSet::new(),
             accounted: HashSet::new(),
+            connected_slots: HashSet::new(),
+            started_slots: HashSet::new(),
+            started_at_ms: None,
             departures: HashMap::new(),
             closed_relays: HashMap::new(),
             session_closed_enqueued: false,

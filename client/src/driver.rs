@@ -40,6 +40,14 @@
 //! result has gone out first, so the result frame precedes the intent on the one
 //! ordered control stream; the leave-intent safety timeout still bounds the hold.
 //!
+//! The driver also announces that the game's loop has begun running. The game
+//! signals once on [`TurnChannels::game_started`] and the driver writes a
+//! `GameStarted` control frame, at most one per session — the relay forwards the
+//! fact up its coordinator pipeline so the tenant can name the slots that
+//! finished loading instead of inferring a failed load from a deadline. Purely
+//! informational, so a failed send is logged and the driver keeps running, the
+//! same treatment a result report gets.
+//!
 //! The driver also carries the game's in-game chat, the mid-game counterpart to
 //! lobby commands: the game authors a message on [`TurnChannels::chat_out`] and
 //! the driver writes it up the control stream at once — no drain to wait behind,
@@ -79,8 +87,8 @@ use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payloa
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
-    send_control_lobby, send_control_phase_applied, send_control_request_drop, send_control_skin,
-    send_control_turn, spawn_control_reader,
+    send_control_game_started, send_control_lobby, send_control_phase_applied,
+    send_control_request_drop, send_control_skin, send_control_turn, spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::{mpsc, watch};
@@ -110,6 +118,11 @@ const LEAVE_INTENT_CHANNEL_CAPACITY: usize = 1;
 /// end-of-game report at most once, so capacity 1 is enough; the driver sends
 /// the first payload and drops any extra.
 const RESULT_CHANNEL_CAPACITY: usize = 1;
+
+/// Depth of the game → driver game-started channel. The game announces its loop
+/// once, so capacity 1 is enough; the driver sends the first signal and drops
+/// any extra.
+const GAME_STARTED_CHANNEL_CAPACITY: usize = 1;
 
 /// Depth of each lobby-command channel between the game thread and the driver.
 /// Lobby commands flow only during pre-game setup — a burst of slot/color
@@ -254,6 +267,14 @@ pub struct TurnChannels {
     /// intent frame on the wire. Left `false` when no result is expected, and the
     /// intent is not held at all.
     pub result_expected: Arc<AtomicBool>,
+    /// Signals that the game's loop has begun running — the match data is loaded
+    /// and the simulation is stepping. The driver writes one `GameStarted` control
+    /// frame on the first signal and drops every later one, so a caller may signal
+    /// without tracking whether it already did. Best-effort: a failed write is
+    /// logged and the driver keeps running, since the frame only feeds the
+    /// tenant's load attribution. Dropping this sender without ever signaling is
+    /// harmless — nothing is sent and nothing waits on it.
+    pub game_started: mpsc::Sender<()>,
     /// Lobby commands this game authored, to send up to the relay for the other
     /// members. The driver wraps each in a `LobbyCommand` and writes it up the
     /// reliable control stream at once — the relay stamps the authoring slot, so
@@ -407,6 +428,9 @@ pub struct LinkDriver {
     /// Whether the game will produce a result report; holds a pending leave
     /// intent until the result is sent so the result frame precedes it.
     result_expected: Arc<AtomicBool>,
+    /// The game thread's signal that its loop has begun running, to announce up
+    /// the control stream once.
+    game_started: mpsc::Receiver<()>,
     /// Lobby commands the game authored, to send up the control stream.
     lobby_out: mpsc::Receiver<Vec<u8>>,
     /// Lobby commands other members authored (relay-stamped with their author
@@ -532,6 +556,8 @@ impl LinkDriver {
         // The game hands over its result report at most once.
         let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
         let result_expected = Arc::new(AtomicBool::new(false));
+        // The game announces its loop starting at most once.
+        let (game_started_tx, game_started_rx) = mpsc::channel(GAME_STARTED_CHANNEL_CAPACITY);
         // Lobby commands flow in both directions during pre-game setup.
         let (lobby_out_tx, lobby_out_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
         let (lobby_in_tx, lobby_in_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
@@ -565,6 +591,7 @@ impl LinkDriver {
             leave_intent: leave_intent_rx,
             result: result_rx,
             result_expected: Arc::clone(&result_expected),
+            game_started: game_started_rx,
             lobby_out: lobby_out_rx,
             lobby_in: lobby_in_tx,
             chat_out: chat_out_rx,
@@ -584,6 +611,7 @@ impl LinkDriver {
             leave_intent: leave_intent_tx,
             result: result_tx,
             result_expected,
+            game_started: game_started_tx,
             lobby_out: lobby_out_tx,
             lobby_in: lobby_in_rx,
             chat_out: chat_out_tx,
@@ -613,6 +641,7 @@ impl LinkDriver {
             leave_intent,
             result,
             result_expected,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -631,6 +660,7 @@ impl LinkDriver {
             leaves,
             leave_intent,
             result,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -717,6 +747,7 @@ impl LinkDriver {
             leave_intent,
             result,
             result_expected,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -735,6 +766,7 @@ impl LinkDriver {
             leaves,
             leave_intent,
             result,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -872,6 +904,10 @@ impl LinkDriver {
             leaves,
             leave_intent,
             result,
+            // Bound apart from `LoopState::game_started`, which records the
+            // opposite direction: the relay's start directive arriving, not this
+            // client's own announcement going out.
+            game_started: game_started_out,
             lobby_out,
             lobby_in,
             chat_out,
@@ -893,6 +929,7 @@ impl LinkDriver {
             next_outbound_seq,
             announcer,
             outbound_buffer,
+            game_started_sent,
             game_started,
             retention,
             retention_bytes,
@@ -1038,6 +1075,12 @@ impl LinkDriver {
         // would either spin on a closed channel or just poll a channel that will
         // never produce anything else.
         let mut leave_intent_alive = true;
+
+        // Mirrors `leave_intent_alive`: the game announces its loop starting at
+        // most once, so the branch is disarmed on the channel's first resolution
+        // (the signal, or the sender dropping without one) to keep an
+        // always-ready `None` from spinning the loop.
+        let mut game_started_alive = true;
 
         // Mirrors `leave_intent_alive`: the game hands over a result at most
         // once, so this disarms on the channel's first resolution — the payload,
@@ -1195,6 +1238,14 @@ impl LinkDriver {
                         Some(ControlInbound::GameResult(_)) => {
                             tracing::warn!(
                                 "ignoring unexpected relay-sent game-result control frame"
+                            );
+                        }
+                        // Likewise a game-started report only ever travels client
+                        // → relay; a client never receives one back, so ignore a
+                        // stray one.
+                        Some(ControlInbound::GameStarted) => {
+                            tracing::warn!(
+                                "ignoring unexpected relay-sent game-started control frame"
                             );
                         }
                         // A drop request only ever travels client → relay; a client
@@ -1667,6 +1718,26 @@ impl LinkDriver {
                         None => result_alive = false,
                     }
                 }
+                // The game announced that its loop has begun running. Write the
+                // fieldless `GameStarted` frame up the control stream at once —
+                // the fact is only useful while it is fresh, and there is nothing
+                // to drain behind it. Written at most once for the whole session
+                // (a reconnect must not re-announce), and best-effort: a failed
+                // write is logged and the driver keeps running, exactly as a
+                // failed result report is. Disarmed on the channel's first
+                // resolution, like the leave-intent and result branches.
+                signal = game_started_out.recv(), if game_started_alive => {
+                    game_started_alive = false;
+                    if signal.is_some() && !*game_started_sent {
+                        *game_started_sent = true;
+                        if let Err(error) = send_control_game_started(&mut control_send).await {
+                            tracing::debug!(
+                                %error,
+                                "game-started send failed; dropping the announcement"
+                            );
+                        }
+                    }
+                }
                 // A lobby command the game authored during setup. Send it up the
                 // reliable control stream at once — setup runs before any turn
                 // barrier exists, so there is nothing to drain behind. The relay
@@ -1910,6 +1981,14 @@ impl LinkDriver {
         }
         if leave_intent.try_recv().is_ok() {
             announcer.arm(LEAVE_INTENT_TIMEOUT);
+        }
+        if game_started_out.try_recv().is_ok() && !*game_started_sent {
+            // Mirrors the live arm: best-effort, latched either way so a
+            // reconnect cannot re-announce.
+            *game_started_sent = true;
+            if let Err(error) = send_control_game_started(&mut control_send).await {
+                tracing::debug!(%error, "game-started send failed at teardown; dropping it");
+            }
         }
         if let Ok(payload) = result.try_recv()
             && !announcer.result_sent()
@@ -2285,6 +2364,7 @@ struct GameSeam {
     leaves: mpsc::Sender<LeaveDirective>,
     leave_intent: mpsc::Receiver<()>,
     result: mpsc::Receiver<Vec<u8>>,
+    game_started: mpsc::Receiver<()>,
     lobby_out: mpsc::Receiver<Vec<u8>>,
     lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
     chat_out: mpsc::Receiver<ChatOut>,
@@ -2321,6 +2401,11 @@ struct LoopState {
     /// Turns the game produced while the link was down, flushed in order when the
     /// next session comes up.
     outbound_buffer: VecDeque<Payload>,
+    /// Whether this client's own `GameStarted` announcement has been written.
+    /// Latched here rather than per-connection so the frame goes out once for the
+    /// whole session: the game signals its loop starting once, and a reconnect
+    /// must not re-announce it.
+    game_started_sent: bool,
     /// Whether the relay's `SessionStart` directive has passed through the driver —
     /// the game has started. Gates escalation to coordinator-mediated failover: the
     /// driver only ever re-homes an in-game session, never a still-forming lobby.
@@ -2382,6 +2467,7 @@ impl LoopState {
             next_outbound_seq: 0,
             announcer: LeaveAnnouncer::new(result_expected),
             outbound_buffer: VecDeque::new(),
+            game_started_sent: false,
             game_started: false,
             retention: VecDeque::new(),
             retention_bytes: 0,
@@ -4448,6 +4534,7 @@ mod tests {
             leaves: _leaves,
             leave_intent: _leave_intent,
             result: _result,
+            game_started: _game_started,
             lobby_out: _lobby_out,
             lobby_in: _lobby_in,
             chat_out: _chat_out,
@@ -4694,6 +4781,7 @@ mod tests {
             leave_intent,
             result,
             result_expected,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -4712,6 +4800,7 @@ mod tests {
             leaves,
             leave_intent,
             result,
+            game_started,
             lobby_out,
             lobby_in,
             chat_out,
@@ -5855,6 +5944,49 @@ mod tests {
             }
             other => panic!("expected a result frame, got {other:?}"),
         }
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_game_started_signal_writes_exactly_one_frame() {
+        // The game announces its loop starting; the driver writes one
+        // `GameStarted` frame. A second signal writes nothing — proven by
+        // following it with a leave intent and seeing that frame arrive next,
+        // with no second GameStarted in between.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+
+        // Watch the control stream the way the relay does.
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        chan_a.game_started.send(()).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("the game-started frame never arrived")
+            .expect("control reader ended early");
+        assert!(
+            matches!(frame, ControlInbound::GameStarted),
+            "expected a game-started frame, got {frame:?}",
+        );
+
+        // A second announcement is dropped: the next frame on the wire is the
+        // leave intent signalled after it, not another GameStarted.
+        chan_a.game_started.send(()).await.unwrap();
+        chan_a.leave_intent.send(()).await.unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("the leave intent never arrived")
+            .expect("control reader ended early");
+        assert!(
+            matches!(next, ControlInbound::LeaveIntent),
+            "a repeat game-started must be dropped, got {next:?}",
+        );
 
         drop(chan_a.outbound);
         drop(chan_a.inbound);

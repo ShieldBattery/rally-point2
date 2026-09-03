@@ -377,6 +377,17 @@ message ControlFrame {
     // misrepresenting adoption can only advance its own command — send
     // timing it already controls outright. See `PhaseApplied`.
     PhaseApplied phase_applied = 13;
+
+    // A client's announcement that its game loop has begun running (client →
+    // relay only): the match's data is loaded and the simulation is stepping,
+    // so the tenant can mark the slot loaded rather than inferring it from a
+    // load-deadline timeout. Like `game_result` it rides up the reliable stream
+    // opaque of any client-asserted identity — the relay binds it to the
+    // authenticated connection's slot, never a slot named in the frame — and
+    // the relay stamps arrival against its own timeline before forwarding the
+    // fact up the coordinator pipeline. Accepted at most once per slot per
+    // link; a repeat is dropped without closing the link. See `GameStarted`.
+    GameStarted game_started = 14;
   }
 }
 
@@ -534,6 +545,16 @@ message LeaveDirective {
 // the client's confirmation that the relay processed this is the relay closing
 // the link, not a reply frame.
 message LeaveIntent {}
+
+// A client's report that its game loop has started (client → relay only), sent
+// on the reliable control stream. Deliberately fieldless, for the same reason
+// `LeaveIntent` is: the relay already knows which slot is reporting from the
+// authenticated connection the frame arrived on, and the fact itself carries no
+// further detail — the relay's own arrival stamp and frame coordinates are what
+// place it in the session's timeline. The relay accepts one per slot per link
+// lifetime and drops a repeat without closing the link, the same structural-only
+// validation it gives a `GameResult`.
+message GameStarted {}
 
 // A surviving member's manual request that the session drop a disconnected slot,
 // carried client -> relay and then relay -> relay across the mesh. A

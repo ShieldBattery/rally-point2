@@ -287,6 +287,7 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/session/create", post(create_session))
         .route("/session/rehome", post(rehome_session))
         .route("/sessions/alive", post(sessions_alive))
+        .route("/session/load-state", post(session_load_state))
         .route("/presence/query", post(presence_query))
         .route("/flight/blobs", post(flight_blobs))
         .route("/flight/blob", post(flight_blob))
@@ -711,6 +712,92 @@ async fn sessions_alive(
         })
         .collect();
     Ok(Json(SessionsAliveResponse { alive }))
+}
+
+/// Request body for `POST /session/load-state`: the session whose load progress
+/// to read, in the coordinator's `(tenant, session)` id space.
+#[derive(Debug, Deserialize)]
+struct SessionLoadStateRequest {
+    /// The tenant the app server is acting for — must match the request signature.
+    tenant: TenantId,
+    /// The session, in the coordinator's `(tenant, session)` id space.
+    session: u64,
+}
+
+/// Response body for `POST /session/load-state`: what the coordinator knows about
+/// the session's load progress. camelCase, the tenant's own convention (like the
+/// webhook bodies), unlike the snake_case control-plane request above.
+///
+/// `known` is `false` — with both lists empty and no `startedAtMs` — when the
+/// coordinator holds no state for the session at all. That is "no information",
+/// never "nobody arrived": a coordinator restart or a completed reap both read
+/// this way.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionLoadStateResponse {
+    known: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    connected_slots: Vec<u8>,
+    started_slots: Vec<u8>,
+}
+
+/// Session load-progress read: which slots ever connected, which ever reported
+/// their game loop running, and when the session started.
+///
+/// The tenant consults this when its **own** load deadline expires and it must
+/// decide whom to blame for a game that never got going. The `slotConnected` /
+/// `sessionStarted` / `slotStarted` webhooks carry the same facts as they happen,
+/// but they are an optimization feed — best-effort, at-least-once, droppable —
+/// so this pull is the correctness signal for load attribution: it reads the
+/// coordinator's accumulated state directly rather than trusting that every
+/// notification arrived.
+///
+/// Both slot lists are **ever**-sets, ascending: a slot that connected and then
+/// dropped still appears, because the question is who got here at all, not who is
+/// here now (`POST /presence/query` answers the latter).
+///
+/// Same tenant request-signature auth as `POST /session/create` (see the module
+/// docs); the `tenant` in the body must match the tenant the signature verifies
+/// under. As live-game machinery this is refused only for a revoked tenant, not a
+/// suspended one — a suspended tenant's running games still need adjudicating.
+async fn session_load_state(
+    State(state): State<CoordinatorState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionLoadStateResponse>, StatusCode> {
+    let request: SessionLoadStateRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_tenant_request(
+        &state.setup,
+        &request.tenant,
+        &method,
+        &uri,
+        &headers,
+        &body,
+        TenantAccess::LiveGame,
+    )?;
+
+    let response = match state
+        .lifecycle
+        .load_state(&request.tenant, SessionId(request.session))
+    {
+        Some(load) => SessionLoadStateResponse {
+            known: true,
+            started_at_ms: load.started_at_ms,
+            connected_slots: load.connected_slots.iter().map(|s| s.0).collect(),
+            started_slots: load.started_slots.iter().map(|s| s.0).collect(),
+        },
+        None => SessionLoadStateResponse {
+            known: false,
+            started_at_ms: None,
+            connected_slots: Vec::new(),
+            started_slots: Vec::new(),
+        },
+    };
+    Ok(Json(response))
 }
 
 /// The most user refs one presence query may ask about, so a caller cannot make
@@ -2671,6 +2758,54 @@ fn note_inbound(
             notify::handle_result(setup, &notices.results, lifecycle, notice);
             InboundAction::None
         }
+        Ok(RelayToCoordinator::SlotConnected(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    slot = notice.slot.0,
+                    "slot-connected notice from a relay not serving the session; rejecting",
+                );
+                return InboundAction::None;
+            }
+            lifecycle.on_slot_connected(notice.tenant.clone(), notice.session, notice.slot);
+            notify::handle_slot_connected(setup, &notices.slot_connects, lifecycle, notice);
+            InboundAction::None
+        }
+        Ok(RelayToCoordinator::SessionStarted(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    "session-started notice from a relay not serving the session; rejecting",
+                );
+                return InboundAction::None;
+            }
+            lifecycle.on_session_started(
+                notice.tenant.clone(),
+                notice.session,
+                notice.started_at_ms,
+            );
+            notify::handle_session_started(setup, &notices.session_starts, lifecycle, notice);
+            InboundAction::None
+        }
+        Ok(RelayToCoordinator::SlotStarted(notice)) => {
+            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    tenant = notice.tenant.as_ref(),
+                    session = notice.session.0,
+                    slot = notice.slot.0,
+                    "slot-started notice from a relay not serving the session; rejecting",
+                );
+                return InboundAction::None;
+            }
+            lifecycle.on_slot_started(notice.tenant.clone(), notice.session, notice.slot);
+            notify::handle_slot_started(setup, &notices.slot_starts, lifecycle, notice);
+            InboundAction::None
+        }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
             if !registry::generation_is_current(setup.registry(), relay_id, generation) {
                 tracing::debug!(
@@ -3053,6 +3188,9 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)
                         | RelayToCoordinator::Result(_)
+                        | RelayToCoordinator::SlotConnected(_)
+                        | RelayToCoordinator::SessionStarted(_)
+                        | RelayToCoordinator::SlotStarted(_)
                         | RelayToCoordinator::SessionClosed { .. }
                         | RelayToCoordinator::FlightUploadRequest { .. }
                         | RelayToCoordinator::FlightUploadDone { .. }
@@ -3853,6 +3991,109 @@ mod tests {
                 .unwrap();
         let resp = signed_post(app, "/sessions/alive", &big_body, &TEST_CLIENT_SEED).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn session_load_state_reports_arrivals_and_answers_unknown_for_a_session_it_lost() {
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        // Slot 1 arrived and started; slot 0 arrived but never reported a game
+        // loop — exactly the attribution the endpoint exists to serve. Recorded
+        // out of slot order to prove the answer is sorted, not insertion-ordered.
+        state
+            .lifecycle
+            .on_slot_connected(tenant.clone(), SessionId(5), SlotId(1));
+        state
+            .lifecycle
+            .on_slot_connected(tenant.clone(), SessionId(5), SlotId(0));
+        state
+            .lifecycle
+            .on_session_started(tenant.clone(), SessionId(5), 1_700_000_000_000);
+        state
+            .lifecycle
+            .on_slot_started(tenant.clone(), SessionId(5), SlotId(1));
+        let app = router(state);
+
+        let req_body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 5 })).unwrap();
+        let resp = signed_post(
+            app.clone(),
+            "/session/load-state",
+            &req_body,
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // The exact wire shape the tenant parses: camelCase, absent optionals
+        // omitted rather than sent as null.
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":true,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["known"], serde_json::json!(true));
+        assert_eq!(json["startedAtMs"], serde_json::json!(1_700_000_000_000u64));
+        assert_eq!(
+            json["connectedSlots"].as_array().unwrap(),
+            &vec![serde_json::json!(0), serde_json::json!(1)],
+            "both arrivals are reported, ascending",
+        );
+        assert_eq!(
+            json["startedSlots"].as_array().unwrap(),
+            &vec![serde_json::json!(1)],
+            "only the slot that reported its game loop is started",
+        );
+
+        // A session the coordinator holds nothing for answers "no information",
+        // never "nobody arrived": known false with empty lists.
+        let unknown_body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 6 })).unwrap();
+        let resp = signed_post(app, "/session/load-state", &unknown_body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"connectedSlots":[],"startedSlots":[]}"#,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["known"], serde_json::json!(false));
+        assert!(json.get("startedAtMs").is_none(), "absent, never null");
+        assert!(json["connectedSlots"].as_array().unwrap().is_empty());
+        assert!(json["startedSlots"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_load_state_rejects_an_unsigned_request() {
+        // The read is past the same tenant-signature gate as every other
+        // tenant-facing endpoint: an unsigned body never reaches the lifecycle.
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 5 })).unwrap();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/session/load-state")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -15,8 +15,9 @@
 //! machinery: a relay pushes a `LeaveDirective` down to a surviving client,
 //! and a client pushes a `LeaveIntent` up to announce its own clean
 //! departure. A client also pushes a `GameResult` up with its end-of-game
-//! report. The reader skips a frame kind it doesn't know, so the channel can
-//! grow chat/resync frames without a wire break.
+//! report, and a `GameStarted` up when its game loop begins running. The reader
+//! skips a frame kind it doesn't know, so the channel can grow chat/resync
+//! frames without a wire break.
 
 use prost::Message;
 use prost::bytes::Bytes;
@@ -24,9 +25,9 @@ use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
 };
 use rally_point_proto::messages::{
-    ControlFrame, GameChat, GameResult, LeaveDirective, LeaveIntent, LobbyCommand, Payload,
-    PhaseApplied, PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart,
-    SlotConnectivity, control_frame,
+    ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LobbyCommand,
+    Payload, PhaseApplied, PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop,
+    SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -39,9 +40,10 @@ use tokio::sync::mpsc;
 /// members down), but never `LeaveIntent` — a client never receives its own intent
 /// back, so the client edge ignores one, mirroring how the relay edge ignores a
 /// stray `Leave`.
-/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`, `Lobby`,
-/// `Chat`, and `Skin` arrive (a client sends all six up); a relay never receives
-/// a `Leave` from another relay on this stream, so the relay edge ignores one.
+/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`,
+/// `GameStarted`, `Lobby`, `Chat`, and `Skin` arrive (a client sends all seven
+/// up); a relay never receives a `Leave` from another relay on this stream, so
+/// the relay edge ignores one.
 /// Unlike every other kind, `Lobby`, `Chat`, and `Skin` are legitimate in *both*
 /// directions — their `slot` field's authority just flips with direction (see
 /// [`LobbyCommand`], [`GameChat`], and [`PlayerSkin`]'s docs).
@@ -62,6 +64,11 @@ pub enum ControlInbound {
     /// opaque here; the relay reading a client's stream stamps and forwards them,
     /// and any other edge ignores a stray one just as it does a `LeaveIntent`.
     GameResult(Bytes),
+    /// A client's report that its game loop has started (client → relay only).
+    /// Fieldless: the relay binds it to the authenticated connection's slot, so
+    /// there is nothing on the wire to surface. Any other edge ignores a stray
+    /// one just as it does a `LeaveIntent`.
+    GameStarted,
     /// A lobby command one member authored, in both directions. Client → relay
     /// carries this client's own lobby command (the relay ignores the frame's
     /// `slot` and stamps the authenticated one); relay → client carries another
@@ -231,6 +238,9 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                     kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
                 } => ControlInbound::GameResult(payload),
                 ControlFrame {
+                    kind: Some(control_frame::Kind::GameStarted(GameStarted {})),
+                } => ControlInbound::GameStarted,
+                ControlFrame {
                     kind: Some(control_frame::Kind::LobbyCommand(command)),
                 } => ControlInbound::Lobby(command),
                 ControlFrame {
@@ -341,6 +351,24 @@ pub async fn send_control_game_result(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Announces that a client's game loop has started up the control stream
+/// (client → relay). Sent once, the moment the game begins stepping its
+/// simulation, and never acked: like a result report it is a best-effort
+/// optimization feed — it lets the tenant attribute a stalled load to the slots
+/// that never reported instead of guessing from a deadline — so an error here
+/// (the stream or connection gone) needs no recovery, and the caller logs and
+/// continues rather than treating it as a link failure.
+pub async fn send_control_game_started(
+    control_send: &mut quinn::SendStream,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::GameStarted(GameStarted {})),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;
