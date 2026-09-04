@@ -1065,7 +1065,10 @@ inferring it from its own deadline expiring:
 - **`sessionStarted`** — the session's authority relay observed every expected slot present and fired the
   start directive, carrying the initial latency-buffer depth it sized. Only the authority reports it (a peer
   adopting the directive off the mesh does not), so unlike a departure there is no per-relay redundancy here;
-  the dedup key is `(tenant, session)`.
+  the dedup key is `(tenant, session)`. A peer that adopts the directive does stamp the adoption instant on
+  its own maker, so that every relay which knows the session started can restate *an* instant on its beat;
+  the coordinator keeps the first it is told, so the authority's earlier stamp wins wherever it arrives and
+  the peer's stands in only when the authority's notice was lost and the authority died before a beat.
 - **`slotStarted`** — a client reported that its own game loop has begun running, on a fieldless `GameStarted`
   control frame the relay binds to the authenticated connection's slot (never a client-asserted one) and
   stamps against its own timeline. The client treats "my loop is running" as session state and re-asserts it
@@ -1080,11 +1083,21 @@ The webhooks are the **fast path**, not the record. A notice is dropped from the
 WebSocket send succeeds, so a coordinator that dies between receiving one and committing it — or that simply
 restarts — has lost it. What makes the facts durable is that every relay **heartbeat carries the session's
 whole retained load state**: the slots that ever connected there, the slots that ever reported their game
-loop, and the instant that relay's own coverage latch fired. The relay retains all three on the session's
+loop, and the instant that relay learned the session started. The relay retains all three on the session's
 decision-maker and restates them on every beat, declaratively, exactly as it does the live roster — so a lost
 notice costs at most one beat, and the coordinator merges each beat into the same accumulated sets the pull
-below reads. Merging a beat fires no webhook: those facts were notified when they happened, and re-notifying
+below reads. It merges the entry's *currently connected* slots as ever-connected too: a slot connected now
+necessarily connected at some point, which covers a `slotConnected` notice lost before the relay had a maker
+to retain it. Merging a beat fires no webhook: those facts were notified when they happened, and re-notifying
 them every ten seconds would flood the feed.
+
+A beat names **every session the relay holds a decision-maker for**, not only the occupied ones. A maker
+lives from the descriptor apply that created it until the session retires, which outlasts every local link —
+so a relay whose slots have all disconnected keeps restating what it learned while they were here, which is
+exactly when the coordinator has no other source for it. Such an entry names no connected slot, and an entry
+with no connected slots means precisely what omitting the session means: this relay holds nobody. Presence
+records nothing from it, and the empty-session reap counts it as the same complete-roster proof of
+emptiness, so restating a finished session's record can never keep that session alive.
 
 ### Session lifecycle and reaps
 
@@ -1125,13 +1138,23 @@ correctness signal, since it reads the coordinator's state directly rather than 
 notification arrived. Both slot lists are *ever*-sets (a slot that arrived and then dropped still appears —
 "who got here at all", not "who is here now", which `POST /presence/query` answers).
 
-`known: true` means the coordinator has held the session **since it created it**, so the sets cover its whole
-life and are complete up to heartbeat latency (~10 s) — which is what lets the tenant treat an *absent* slot
-as evidence that player never got there. Anything else answers `known: false` with empty lists: the session
-was created against a coordinator that has since restarted, or it has already been reaped. That stays
-`false` even when notices and heartbeats have since lazily rebuilt state for it, because those sets start
-wherever the coordinator came up rather than at the session's beginning. `known: false` is no information,
-never proof that nobody arrived.
+The sets are **positive evidence and always safe to merge**, so the pull answers with everything the
+coordinator holds whatever their provenance. What takes qualifying is reading a slot's *absence* as proof it
+never arrived, and two fields gate exactly that.
+
+`known: true` means the coordinator has held the session **since it created it** (so the sets start at the
+session's beginning, not wherever a restarted process came up) *and* every serving relay has restated its own
+view at least once (so an empty set means "nobody arrived", not "nobody has spoken yet"). `freshAsOfMs` says
+how far that reaches: the coordinator's own receipt time for the oldest of the serving relays' most recent
+restatements — the record is complete for everything before it and may be missing up to a beat (~10 s) after
+it. A tenant whose load deadline is at `T` therefore treats the answer as decisive once `freshAsOfMs >= T`,
+and may re-read until the watermark passes its cutoff. The stamp is the coordinator's clock rather than a
+relay's, because wall time is what the tenant compares it against. A re-home rescopes freshness with the
+assignment: both endpoints must earn a watermark again from a beat under the new one.
+
+`known: false` — a coordinator that restarted and forgot, a reaped session, or one whose serving relays have
+not all beaten yet — is no information *about who is missing*. It is never proof that nobody arrived, and the
+facts the answer carries alongside it are as real as any other.
 
 ### Active-player presence
 
@@ -1139,12 +1162,15 @@ App servers need to ask "is user U in a live game right now" — to block an in-
 re-queueing — and the coordinator is the one place that can answer it: relays see connections, the tenant
 sees its own session bookkeeping, but only the coordinator holds both the fleet's live view and the
 slot→user refs the tenant supplied at session creation. Presence **rides the heartbeat** the relay already
-sends: each beat carries the relay's live roster — every session with a connected slot, and those slots —
-rather than standing up a new channel, because the beat is already the relay's periodic liveness signal on
+sends: each beat carries the relay's live roster — the slots connected right now, on the entry for each
+session the relay holds — rather than standing up a new channel, because the beat is already the relay's
+periodic liveness signal on
 an off-hot-path connection, and piggybacking means presence can never be alive while liveness is dead (or
 vice versa). Each beat carries the **whole current roster** (declarative, like the descriptor sets going
 the other way): a lost or reordered beat is corrected by the next one, and the payload is bounded by the
-relay's live slots. A `roster_complete` marker distinguishes an authoritative full snapshot from a legacy
+relay's sessions and their slots. An entry naming no connected slot contributes no presence at all — it is
+there for the load state it restates, and says the same thing about occupancy that omitting the session
+says. A `roster_complete` marker distinguishes an authoritative full snapshot from a legacy
 or coordinator-truncated roster. Its absence decodes as false, so a rolling deploy can still consume
 positive presence from an older relay without treating omitted sessions as proof of emptiness; older
 coordinators ignore the additive marker.

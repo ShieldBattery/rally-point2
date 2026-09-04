@@ -1539,19 +1539,19 @@ pub enum RelayToCoordinator {
     Unknown,
 }
 
-/// One session's connected slots on one relay, as carried in a
+/// What one relay holds for one session, as carried in a
 /// [`RelayToCoordinator::Heartbeat`]'s roster.
 ///
-/// A slot appears exactly while its client's link is registered on the relay —
-/// the same liveness the relay's own drain path keys on — so the coordinator's
-/// presence store tracks "connected to a relay now", nothing softer. Deliberately
-/// slot-granular and PII-free: the relay never learns user identity, and the
-/// coordinator resolves slots to the tenant's own user refs from the session
-/// request it already holds.
+/// A slot appears in `slots` exactly while its client's link is registered on the
+/// relay — the same liveness the relay's own drain path keys on — so the
+/// coordinator's presence store tracks "connected to a relay now", nothing
+/// softer. Deliberately slot-granular and PII-free: the relay never learns user
+/// identity, and the coordinator resolves slots to the tenant's own user refs
+/// from the session request it already holds.
 ///
 /// Beside the live roster it carries the relay's **retained load state** for the
 /// session: which slots ever connected, which ever reported their game loop
-/// running, and when the relay latched the session started. Those are cumulative
+/// running, and when the relay learned the session started. Those are cumulative
 /// facts, not a live view, and every beat restates them in full — which is what
 /// makes them durable where the matching notices are not: a notice is dropped
 /// once its send succeeds, so a coordinator that dies between receiving one and
@@ -1559,13 +1559,21 @@ pub enum RelayToCoordinator {
 /// beat. All three are optional on the wire: a relay that predates them omits
 /// them, a coordinator that predates them ignores them, and a session running
 /// without a decision-maker has nothing to report.
+///
+/// An entry with **no** connected slots is therefore ordinary rather than
+/// contradictory: the relay still holds the session (and its retained facts)
+/// while every local link is gone. It says the same thing about occupancy that
+/// leaving the session out of the roster entirely says — nobody is here — so a
+/// coordinator must read the two identically and take the load state as the only
+/// added claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPresence {
     /// The tenant the session belongs to.
     pub tenant: TenantId,
-    /// The session with connected slots on the reporting relay.
+    /// The session the reporting relay is describing.
     pub session: SessionId,
     /// The slots whose clients are connected to the reporting relay right now.
+    /// Empty for a session the relay still holds but has no live link into.
     pub slots: Vec<SlotId>,
     /// Every slot whose link has activated on the reporting relay at any point
     /// in the session, ascending. A slot that connected and then dropped stays
@@ -1577,10 +1585,13 @@ pub struct SessionPresence {
     /// relay, ascending. Monotonic for the same reason as `ever_connected`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started: Vec<SlotId>,
-    /// Relay wall-clock (unix epoch milliseconds) of the session's coverage
-    /// latch, set only on the relay whose own authority latch fired. `None`
-    /// everywhere else — a peer that adopted the start directive off the mesh
-    /// reports no instant, so exactly one relay's beats carry one.
+    /// Relay wall-clock (unix epoch milliseconds) for the session's start, as the
+    /// reporting relay knows it: its own coverage latch where that fired,
+    /// otherwise the moment it adopted the authority's start directive off the
+    /// mesh. `None` on a relay that has not seen the session start at all. The
+    /// coordinator keeps the first instant reported, so the authority's earlier
+    /// stamp wins wherever it arrives and a peer's later one only stands in when
+    /// it never does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
 }

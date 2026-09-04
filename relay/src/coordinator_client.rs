@@ -560,13 +560,17 @@ impl OutboundQueues {
 /// reconnects, so a beat reads current state independent of any reconnect, and a
 /// beat snapshots all of it at send time.
 pub struct HeartbeatSources {
-    /// The live roster; each beat carries its connected slots as [`SessionPresence`]
-    /// entries (tenant/session/slot only — the relay holds no user identity to leak).
+    /// The live roster; each beat carries a session's connected slots on its
+    /// [`SessionPresence`] entry (tenant/session/slot only — the relay holds no
+    /// user identity to leak).
     pub sessions: Sessions,
-    /// The per-session decision-makers, read for the load state each roster entry
-    /// carries alongside its connected slots: which of the session's slots ever
-    /// connected here, which ever reported their game loop running, and when this
-    /// relay latched the session started. Restating it every beat is what makes it
+    /// The per-session decision-makers. These, not the live roster, decide which
+    /// sessions a beat names — a maker outlives the links that fed it, so a
+    /// session whose local slots have all left keeps restating what it learned
+    /// while they were here. Each entry's load state is read from its maker:
+    /// which of the session's slots ever connected
+    /// here, which ever reported their game loop running, and when this relay
+    /// learned the session started. Restating it every beat is what makes it
     /// durable — the matching notices are dropped once sent, so a coordinator that
     /// lost one, or restarted, recovers within a beat.
     pub decision_makers: Arc<crate::consensus::DecisionMakers>,
@@ -1386,31 +1390,54 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Snapshots the relay's live roster into the [`SessionPresence`] entries a
-/// heartbeat carries — one per session with a connected slot, tenant/session/slot
-/// only (the relay holds no user identity to leak), each carrying the session's
-/// retained load state alongside.
+/// Snapshots what this relay holds for each session into the [`SessionPresence`]
+/// entries a heartbeat carries: its currently-connected slots and the load state
+/// it has retained, tenant/session/slot only (the relay holds no user identity to
+/// leak).
+///
+/// An entry goes up for **every session this relay holds a decision-maker for**,
+/// not only the occupied ones. A maker outlives the links that fed it, while the
+/// live roster drops a session the moment its last local slot leaves — so keying
+/// the beat on the roster alone would silently stop restating the load state of a
+/// session whose slots have all disconnected, exactly when the coordinator most
+/// needs it (that relay learned who arrived, and the game is still running
+/// elsewhere). Such an entry names no connected slot, which the coordinator reads
+/// exactly as it reads an omission: no presence, and complete-roster proof that
+/// the relay holds nobody for the session. A session with connected slots but no
+/// maker (a provisional admission no descriptor ever claimed) still gets its
+/// entry, with the load fields empty.
 ///
 /// The roster is the whole current truth every time, load state included: a beat
 /// restates every session's full sets rather than reporting what changed, so a
-/// lost or reordered beat is corrected by the next one. A session running without
-/// a decision-maker has nothing retained and reports the load fields empty, which
-/// omits them from the wire entirely.
+/// lost or reordered beat is corrected by the next one.
 fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
-    crate::routing::live_slots(&sources.sessions)
+    let mut live: HashMap<SessionKey, _> = crate::routing::live_slots(&sources.sessions)
         .into_iter()
-        .map(|(key, slots)| {
-            let load = crate::consensus::retained_load_state(&sources.decision_makers, &key);
-            SessionPresence {
-                tenant: key.tenant,
-                session: key.session,
-                slots,
-                ever_connected: load.ever_connected,
-                started: load.started,
-                started_at_ms: load.started_at_ms,
-            }
-        })
-        .collect()
+        .collect();
+    let mut roster: Vec<SessionPresence> =
+        crate::consensus::retained_load_states(&sources.decision_makers)
+            .into_iter()
+            .map(|(key, load)| {
+                let slots = live.remove(&key).unwrap_or_default();
+                SessionPresence {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slots,
+                    ever_connected: load.ever_connected,
+                    started: load.started,
+                    started_at_ms: load.started_at_ms,
+                }
+            })
+            .collect();
+    roster.extend(live.into_iter().map(|(key, slots)| SessionPresence {
+        tenant: key.tenant,
+        session: key.session,
+        slots,
+        ever_connected: Vec::new(),
+        started: Vec::new(),
+        started_at_ms: None,
+    }));
+    roster
 }
 
 /// Snapshots the region-ping cache into the [`RegionRttReport`] entries a heartbeat
@@ -3236,8 +3263,9 @@ mod tests {
                         rally_point_proto::ids::SlotId(3),
                     ],
                     started: vec![rally_point_proto::ids::SlotId(3)],
-                    // This relay never latched a start of its own, so it reports
-                    // no instant — only the authority whose latch fired does.
+                    // The session never started on this relay — neither its own
+                    // coverage latch nor an adopted directive — so it has no
+                    // instant to restate.
                     started_at_ms: None,
                 }],
                 region_rtts: vec![],
@@ -3245,6 +3273,71 @@ mod tests {
             "the beat names the registered (tenant, session, slot) and the \
              session's retained load state",
         );
+    }
+
+    #[test]
+    fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
+        // A relay's makers, not its live roster, decide which sessions a beat
+        // names. The roster drops a session the moment its last local slot leaves,
+        // while the game runs on elsewhere — so keying the beat on the roster
+        // would stop restating exactly the facts (who arrived here, who started)
+        // the coordinator has no other durable source for.
+        use rally_point_proto::ids::SlotId;
+
+        let sessions: Sessions = Arc::default();
+        let decision_makers = Arc::new(crate::consensus::new_decision_makers());
+        let _ = crate::consensus::sync_maker(
+            &decision_makers,
+            &key(7),
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+        crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+
+        // The slot's link ends: the routing group goes with it, the maker stays.
+        drop(registration);
+        assert!(crate::routing::live_slots(&sessions).is_empty());
+
+        let sources = HeartbeatSources {
+            sessions: Arc::clone(&sessions),
+            decision_makers: Arc::clone(&decision_makers),
+            region_rtt_cache: RegionRttCache::default(),
+        };
+        assert_eq!(
+            heartbeat_presence(&sources),
+            vec![SessionPresence {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(7),
+                slots: vec![],
+                ever_connected: vec![SlotId(0)],
+                started: vec![SlotId(0)],
+                started_at_ms: None,
+            }],
+            "the session is still named, with no connected slot and its retained sets",
+        );
+
+        // A session with a connected slot but no maker (a provisional admission no
+        // descriptor ever claimed) is named too, with nothing retained.
+        let (mut unclaimed, _unclaimed_inbox) =
+            crate::routing::register(&sessions, &key(8), SlotId(1)).expect("slot 1 registers");
+        unclaimed.disarm();
+        let roster = heartbeat_presence(&sources);
+        assert_eq!(roster.len(), 2);
+        let unclaimed = roster
+            .iter()
+            .find(|entry| entry.session == SessionId(8))
+            .expect("the maker-less session is on the beat");
+        assert_eq!(unclaimed.slots, vec![SlotId(1)]);
+        assert!(unclaimed.ever_connected.is_empty() && unclaimed.started.is_empty());
     }
 
     // --- Protocol-version refusal backoff ---

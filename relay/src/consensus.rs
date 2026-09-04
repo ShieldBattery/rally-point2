@@ -1633,11 +1633,11 @@ pub struct DecisionMaker {
     /// monotonically and is restated on every heartbeat, for the same reasons as
     /// `connected_slots`.
     started_slots: HashSet<SlotId>,
-    /// Relay wall-clock (unix epoch milliseconds) at this relay's own coverage
-    /// latch, restated on every heartbeat. Set only where the latch actually
-    /// fires here, so a peer that adopted the authority's directive off the mesh
-    /// leaves it `None` and exactly one relay's beats carry an instant. First
-    /// write wins, matching the latch itself.
+    /// Relay wall-clock (unix epoch milliseconds) for the session's start,
+    /// restated on every heartbeat: this relay's own coverage latch where the
+    /// latch fires here, otherwise the moment it adopted the authority's
+    /// directive off the mesh. `None` until the session starts here. First write
+    /// wins, matching the latch itself.
     started_at_ms: Option<u64>,
     /// One-shot latch: a resumed (rehome) descriptor has named this session.
     /// After a rehome no single relay's forward gate provably covers
@@ -4561,9 +4561,11 @@ impl DecisionMaker {
         self.started_slots.insert(slot);
     }
 
-    /// Records the wall-clock instant this relay's own coverage latch fired, for
-    /// the heartbeat to restate. First write wins: the latch is a one-shot, and a
-    /// later authority's own latch must not move an instant already reported.
+    /// Records the wall-clock instant this relay learned the session started, for
+    /// the heartbeat to restate — its own coverage latch on the authority, the
+    /// adoption of the authority's directive on a peer. First write wins: the
+    /// latch is a one-shot, and a later authority's own latch must not move an
+    /// instant already reported.
     pub fn note_started_at_ms(&mut self, started_at_ms: u64) {
         self.started_at_ms.get_or_insert(started_at_ms);
     }
@@ -5138,8 +5140,16 @@ impl DecisionMaker {
     /// initial depth must never resize a live game. The depth is clamped
     /// defensively (bounds plus the game-sync-safe ceiling), though the
     /// authority already clamped it before stamping.
+    ///
+    /// Also stamps this relay's own wall clock as the session's start instant, so
+    /// every relay that knows the session started can restate one on its
+    /// heartbeat. The coordinator keeps the first instant it is told, so the
+    /// authority's own (earlier) stamp wins wherever it arrives; this slightly
+    /// later stand-in is what a tenant gets when the authority's notice was lost
+    /// and the authority died before a beat could restate it.
     pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
         self.latch_started();
+        self.note_started_at_ms(now_ms());
         if let Some(depth) = initial_buffer_turns {
             let clamped = self.game_safe_clamp(depth);
             self.buffer = BufferSize(clamped);
@@ -5921,7 +5931,7 @@ fn slot_started_notice(
 
 /// One session's load state as this relay has retained it: the slots whose links
 /// ever activated here, the slots that ever reported their game loop running,
-/// and the instant this relay's own coverage latch fired. Both slot lists are
+/// and the instant this relay learned the session started. Both slot lists are
 /// ascending, so a heartbeat's wire output is deterministic rather than following
 /// a hash set's iteration order.
 ///
@@ -5935,8 +5945,9 @@ pub struct RetainedLoadState {
     pub ever_connected: Vec<SlotId>,
     /// Slots that ever reported their game loop running here, ascending.
     pub started: Vec<SlotId>,
-    /// Relay wall-clock (unix epoch milliseconds) of this relay's own coverage
-    /// latch. `None` on a relay that never latched a start itself.
+    /// Relay wall-clock (unix epoch milliseconds) for the session's start, as
+    /// this relay knows it. `None` on a relay that has not seen the session
+    /// start at all.
     pub started_at_ms: Option<u64>,
 }
 
@@ -5948,16 +5959,22 @@ fn sorted_slots(slots: &HashSet<SlotId>) -> Vec<SlotId> {
     sorted
 }
 
-/// The load state `key`'s decision-maker has retained, for the heartbeat builder.
-/// Empty for a session run without a maker (no descriptor): there is nothing
-/// retained to report, and an empty set is exactly what "this relay knows of no
-/// arrivals" means on the wire.
-pub fn retained_load_state(registry: &DecisionMakers, key: &SessionKey) -> RetainedLoadState {
+/// Every session this relay holds a decision-maker for, paired with the load
+/// state that maker has retained — the heartbeat builder's session universe.
+///
+/// A maker lives from the descriptor apply that created it until the session
+/// retires, which outlasts every local link: a session whose slots have all
+/// disconnected still has its retained state restated on every beat while the
+/// game runs on elsewhere, which is the only way the coordinator hears facts this
+/// relay learned before its last slot left. A session run without a maker (no
+/// descriptor) is absent here and carries no retained state at all, which is
+/// exactly what "this relay knows of no arrivals" means on the wire.
+pub fn retained_load_states(registry: &DecisionMakers) -> Vec<(SessionKey, RetainedLoadState)> {
     registry
         .lock()
-        .get(key)
-        .map(DecisionMaker::load_state)
-        .unwrap_or_default()
+        .iter()
+        .map(|(key, maker)| (key.clone(), maker.load_state()))
+        .collect()
 }
 
 /// Reports that `slot`'s link just activated on this relay: retains the slot in
@@ -6241,9 +6258,9 @@ fn note_start_latched(registry: &DecisionMakers, key: &SessionKey, fired: Option
     );
     let notice = session_started_notice(registry, key, initial_buffer_turns);
     // Retain the same instant the notice carries, so every heartbeat restates it
-    // and a lost notice costs nothing. Only this path retains one: a peer relay
-    // adopting the directive off the mesh made no decision to report, so its
-    // beats leave the instant absent and exactly one relay's carry it.
+    // and a lost notice costs nothing. A peer adopting the directive off the mesh
+    // retains its own, later, adoption instant; the coordinator keeps the first
+    // instant reported, so this authored one wins wherever it arrives.
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.note_started_at_ms(notice.started_at_ms);
     }
@@ -14806,6 +14823,17 @@ mod tests {
         assert!(!reevaluate_session_start(&registry, &k));
     }
 
+    /// One session's retained load state, picked out of the whole-registry
+    /// snapshot every heartbeat is built from. Default for a session with no
+    /// maker, which the snapshot never names.
+    fn load_state_of(registry: &DecisionMakers, key: &SessionKey) -> RetainedLoadState {
+        retained_load_states(registry)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, load)| load)
+            .unwrap_or_default()
+    }
+
     #[test]
     fn retained_load_state_outlives_the_links_it_was_recorded_from() {
         // The heartbeat's durability rests on this: the sets are cumulative, so a
@@ -14836,7 +14864,7 @@ mod tests {
             note_slot_present(&registry, &k, SlotId(2)),
             "the last expected slot fires the coverage latch",
         );
-        let latched_at = retained_load_state(&registry, &k).started_at_ms;
+        let latched_at = load_state_of(&registry, &k).started_at_ms;
         assert!(
             latched_at.is_some(),
             "the relay whose own latch fired stamps the instant it reports",
@@ -14846,7 +14874,7 @@ mod tests {
         assert!(remove_slot_for_epoch(&registry, &k, SlotId(1), None));
         assert!(remove_slot_for_epoch(&registry, &k, SlotId(2), None));
 
-        let load = retained_load_state(&registry, &k);
+        let load = load_state_of(&registry, &k);
         assert_eq!(
             load.ever_connected,
             vec![SlotId(1), SlotId(2)],
@@ -14861,7 +14889,7 @@ mod tests {
         // A reconnect re-reports an arrival; the union absorbs it unchanged.
         record_slot_connected(&registry, &k, SlotId(1), true);
         assert_eq!(
-            retained_load_state(&registry, &k).ever_connected,
+            load_state_of(&registry, &k).ever_connected,
             load.ever_connected
         );
     }
@@ -14875,16 +14903,16 @@ mod tests {
         let k = key();
         record_slot_connected(&registry, &k, SlotId(0), false);
         record_slot_started(&registry, &k, SlotId(0));
-        assert_eq!(
-            retained_load_state(&registry, &k),
-            RetainedLoadState::default()
-        );
+        assert_eq!(load_state_of(&registry, &k), RetainedLoadState::default());
     }
 
     #[test]
-    fn a_peer_adopting_the_start_directive_retains_no_start_instant() {
-        // Only the relay whose own coverage latch fired stamps an instant, so
-        // exactly one relay's heartbeats carry one however many serve the session.
+    fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
+        // The authority's notice can be lost and the authority can die before its
+        // next beat, leaving no relay to restate the start it decided. A peer that
+        // adopted the directive stamps its own clock, so some relay always has an
+        // instant to restate; the coordinator keeps the first it is told, so the
+        // authority's earlier stamp still wins wherever it arrives.
         let registry = new_decision_makers();
         let k = key();
         let expected: HashSet<SlotId> = [SlotId(0)].into_iter().collect();
@@ -14900,9 +14928,18 @@ mod tests {
             None,
             false,
         );
+        let before = now_ms();
         adopt_session_start(&registry, &k, Some(4));
         assert!(session_started(&registry, &k));
-        assert_eq!(retained_load_state(&registry, &k).started_at_ms, None);
+        let adopted_at = load_state_of(&registry, &k)
+            .started_at_ms
+            .expect("the adopting peer stamps an instant of its own");
+        assert!(adopted_at >= before, "stamped from this relay's own clock");
+
+        // The directive is re-delivered (an authority handoff re-firing it, a
+        // late slot's re-push) — the first instant stands.
+        adopt_session_start(&registry, &k, Some(4));
+        assert_eq!(load_state_of(&registry, &k).started_at_ms, Some(adopted_at));
     }
 
     // -- Initial buffer depth sized at the coverage latch --

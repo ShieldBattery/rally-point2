@@ -209,7 +209,8 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Flight recordings no longer ride this connection (a relay uploads them straight to
 /// object storage via a presigned URL), so the cap is sized to the largest frame that
 /// actually does: a relay's heartbeat roster. A heartbeat carries up to
-/// [`MAX_HEARTBEAT_SESSIONS`] session entries — each a tenant id (at most
+/// [`MAX_HEARTBEAT_SESSIONS`] session entries — one per session the relay holds,
+/// each a tenant id (at most
 /// [`token::MAX_STRING_LEN`](rally_point_proto::token::MAX_STRING_LEN) = 255 bytes), a
 /// session id, up to [`MAX_HEARTBEAT_SESSION_SLOTS`] connected slot numbers, and the
 /// session's retained load state (that same slot ceiling again for each of its two
@@ -731,22 +732,36 @@ struct SessionLoadStateRequest {
 /// the session's load progress. camelCase, the tenant's own convention (like the
 /// webhook bodies), unlike the snake_case control-plane request above.
 ///
-/// `known: true` means the coordinator has held the session **since it created
-/// it**, so the two sets cover the session's whole life and are complete up to
-/// heartbeat latency (~10s, since every relay's beat restates its retained load
-/// state). That completeness is what lets the tenant read an *absent* slot as
-/// evidence the player never got there.
+/// `connectedSlots` / `startedSlots` / `startedAtMs` are always whatever the
+/// coordinator has accumulated, `known` or not: they are positive evidence, and
+/// the tenant merges them with its own regardless. `known` and `freshAsOfMs` gate
+/// only the *negative* inference — reading a slot's **absence** from the sets as
+/// proof that player never got there.
 ///
-/// `known` is `false` — with both lists empty and no `startedAtMs` — for a
-/// session this coordinator did not create: it restarted and forgot, or the
-/// session has been reaped. That is "no information", never "nobody arrived", and
-/// it stays `false` even once notices or heartbeats have lazily created a state,
-/// because those start wherever the coordinator came up rather than at the
-/// session's beginning.
+/// `known: true` means the coordinator has held the session **since it created
+/// it** (so the sets start at the session's beginning, not wherever a restarted
+/// process came up) and every serving relay has restated its own view at least
+/// once (so an empty set means "nobody arrived", not "nobody has spoken yet").
+///
+/// `freshAsOfMs` bounds how far that completeness reaches: it is the coordinator's
+/// receipt time, unix epoch milliseconds, of the oldest of the serving relays'
+/// most recent restatements — so the record is complete for everything that
+/// happened before it, and may still be missing up to a beat (~10s) after it.
+/// Absent whenever some serving relay has not reported the session this
+/// coordinator lifetime, which is exactly when `known` is `false`. A tenant whose
+/// own load deadline is at `T` should treat the answer as decisive only once
+/// `freshAsOfMs >= T`, and may re-read until it is (or until it decides to stop
+/// waiting).
+///
+/// `known: false` is "no information about who is missing" — never "nobody
+/// arrived". A coordinator that restarted, a reaped session, and a session whose
+/// relays have not beaten yet all read that way.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
     known: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fresh_as_of_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at_ms: Option<u64>,
     connected_slots: Vec<u8>,
@@ -769,6 +784,9 @@ struct SessionLoadStateResponse {
 /// here now (`POST /presence/query` answers the latter). They are fed by both the
 /// relays' notices as they happen and every relay heartbeat, which restates its
 /// whole retained load state — so a notice lost in flight costs at most a beat.
+/// That beat of lag is what `freshAsOfMs` measures: the sets are always safe to
+/// merge, but a slot's absence only means "never arrived" for events before the
+/// watermark, which is why a tenant with a hard deadline polls until it passes.
 ///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs); the `tenant` in the body must match the tenant the signature verifies
@@ -798,13 +816,17 @@ async fn session_load_state(
         .load_state(&request.tenant, SessionId(request.session))
     {
         Some(load) => SessionLoadStateResponse {
-            known: true,
+            known: load.known,
+            fresh_as_of_ms: load.fresh_as_of_ms,
             started_at_ms: load.started_at_ms,
             connected_slots: load.connected_slots.iter().map(|s| s.0).collect(),
             started_slots: load.started_slots.iter().map(|s| s.0).collect(),
         },
+        // The coordinator holds nothing at all for the session: never created
+        // here and no notice or beat has arrived for it, or it has been reaped.
         None => SessionLoadStateResponse {
             known: false,
+            fresh_as_of_ms: None,
             started_at_ms: None,
             connected_slots: Vec::new(),
             started_slots: Vec::new(),
@@ -2540,18 +2562,22 @@ enum InboundAction {
     DrainRequested,
 }
 
-/// The most sessions a single heartbeat's roster may name. No relay's live
-/// session count is tracked anywhere the coordinator could size this exactly,
-/// so this is a generous ceiling rather than a tight one: bounding the
+/// The most sessions a single heartbeat's roster may name — every session the
+/// relay still holds, not only the occupied ones (a session whose local slots
+/// have all left keeps restating its retained load state until it retires). No
+/// relay's session count is tracked anywhere the coordinator could size this
+/// exactly, so this is a generous ceiling rather than a tight one: bounding the
 /// per-beat iteration cost against a roster a relay never legitimately grows
 /// close to, while leaving enormous headroom over any real deployment.
 const MAX_HEARTBEAT_SESSIONS: usize = 4096;
 
-/// The most connected slots a single session entry in a heartbeat's roster may
-/// name — [`session::MAX_SLOT`] plus one, the same ceiling a session's own
-/// slots are validated against at creation. A heartbeat's roster carries no
-/// such validation on the wire, so an entry naming more slots than a session
-/// could ever legitimately have is definitely forged, not just generous.
+/// The most slots a single session entry in a heartbeat's roster may name in any
+/// one of its three slot lists — [`session::MAX_SLOT`] plus one, the same ceiling
+/// a session's own slots are validated against at creation. A heartbeat's roster
+/// carries no such validation on the wire, so an entry naming more slots than a
+/// session could ever legitimately have is definitely forged, not just generous.
+/// (An entry naming *no* connected slot is ordinary: the relay holds the session
+/// but no live link into it.)
 const MAX_HEARTBEAT_SESSION_SLOTS: usize = session::MAX_SLOT as usize + 1;
 
 /// The most backbone round-trip reports a single heartbeat may carry. A
@@ -2712,8 +2738,10 @@ fn note_inbound(
                 // path to the tenant's webhook, this is what the load-state read
                 // answers from. It fires no webhook of its own — the facts here
                 // have already been notified, and re-notifying them every beat
-                // would flood the feed.
-                lifecycle.on_heartbeat_load_state(&sessions);
+                // would flood the feed. The receipt stamp is this coordinator's
+                // own wall clock, because the freshness watermark it feeds is
+                // compared against wall time by the tenant reading it.
+                lifecycle.on_heartbeat_load_state(relay_id, &sessions, now_unix_ms());
                 // Backbone RTTs fold in under the same generation fence as presence: a
                 // stale connection's beat describes a superseded view, so its measured
                 // pairs must not overwrite what the live connection reports. Unlike the
@@ -4026,7 +4054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_load_state_reports_arrivals_and_answers_unknown_for_a_session_it_lost() {
+    async fn session_load_state_reports_arrivals_and_gates_completeness_on_the_relays() {
         let state = state_with_relay_and_tenant();
         let tenant = TenantId("sb-test".to_owned());
         state.lifecycle.register_session(
@@ -4051,31 +4079,56 @@ mod tests {
         state
             .lifecycle
             .on_slot_started(tenant.clone(), SessionId(5), SlotId(1));
-        // Kept past the router build for the restart-amnesia case at the end.
+        // Kept past the router build for the beats and the restart-amnesia case.
         let lifecycle = state.lifecycle.clone();
         let app = router(state);
 
         let req_body =
             serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 5 })).unwrap();
-        let resp = signed_post(
-            app.clone(),
-            "/session/load-state",
-            &req_body,
-            &TEST_CLIENT_SEED,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let load_state = async |app: axum::Router| {
+            let resp = signed_post(app, "/session/load-state", &req_body, &TEST_CLIENT_SEED).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+
+        // The serving relay has not restated the session yet, so nothing is
+        // complete — but the facts the notices carried are still answered with,
+        // because the tenant merges positive evidence either way.
+        let body = load_state(app.clone()).await;
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+            "known false still carries every fact the coordinator holds",
+        );
+
+        // The serving relay's beat restates what it holds — here an entry naming
+        // nothing, which adds no facts and is purely the relay saying "this is all
+        // I have". That completes the picture and dates it.
+        lifecycle.on_heartbeat_load_state(
+            RelayId(1),
+            &[rally_point_proto::control::SessionPresence {
+                tenant: tenant.clone(),
+                session: SessionId(5),
+                slots: vec![],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
+            }],
+            1_700_000_005_000,
+        );
+
+        let body = load_state(app.clone()).await;
         // The exact wire shape the tenant parses: camelCase, absent optionals
         // omitted rather than sent as null.
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":true,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+            r#"{"known":true,"freshAsOfMs":1700000005000,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
         );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["known"], serde_json::json!(true));
+        assert_eq!(json["freshAsOfMs"], serde_json::json!(1_700_000_005_000u64));
         assert_eq!(json["startedAtMs"], serde_json::json!(1_700_000_000_000u64));
         assert_eq!(
             json["connectedSlots"].as_array().unwrap(),
@@ -4110,14 +4163,14 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["known"], serde_json::json!(false));
         assert!(json.get("startedAtMs").is_none(), "absent, never null");
+        assert!(json.get("freshAsOfMs").is_none(), "absent, never null");
         assert!(json["connectedSlots"].as_array().unwrap().is_empty());
         assert!(json["startedSlots"].as_array().unwrap().is_empty());
 
-        // A session this coordinator never created but has since accumulated
-        // facts for — restart amnesia, with a relay still reporting — reads the
-        // same way. Its sets start wherever the coordinator came up, so answering
-        // them would let the tenant read an absent slot as a player who never
-        // arrived.
+        // A session this coordinator never created but has since accumulated facts
+        // for — restart amnesia, with a relay still reporting — answers with those
+        // facts and no completeness claim: its sets start wherever the coordinator
+        // came up, so an absent slot says nothing about who arrived.
         lifecycle.on_slot_connected(tenant.clone(), SessionId(7), SlotId(0));
         lifecycle.on_slot_started(tenant, SessionId(7), SlotId(0));
         let lost_body =
@@ -4129,8 +4182,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":false,"connectedSlots":[],"startedSlots":[]}"#,
-            "an incomplete set is no answer at all",
+            r#"{"known":false,"connectedSlots":[0],"startedSlots":[0]}"#,
+            "the facts stand; only the read-absence-as-proof claim is withheld",
         );
     }
 
@@ -4814,11 +4867,13 @@ mod tests {
         assert_eq!(
             lifecycle.load_state(&tenant, session),
             Some(crate::lifecycle::SessionLoadState {
+                known: false,
+                fresh_as_of_ms: None,
                 started_at_ms: None,
                 connected_slots: vec![],
                 started_slots: vec![],
             }),
-            "a stale connection's beat records nothing",
+            "a stale connection's beat records nothing, freshness included",
         );
 
         note_inbound_frame(
@@ -4830,13 +4885,26 @@ mod tests {
             &beat,
             &rtt,
         );
+        let load = lifecycle
+            .load_state(&tenant, session)
+            .expect("the session was created here");
         assert_eq!(
-            lifecycle.load_state(&tenant, session),
-            Some(crate::lifecycle::SessionLoadState {
-                started_at_ms: Some(1_700_000_000_000),
-                connected_slots: vec![SlotId(0), SlotId(1)],
-                started_slots: vec![SlotId(1)],
-            }),
+            (
+                load.started_at_ms,
+                load.connected_slots,
+                load.started_slots,
+                load.known
+            ),
+            (
+                Some(1_700_000_000_000),
+                vec![SlotId(0), SlotId(1)],
+                vec![SlotId(1)],
+                true,
+            ),
+        );
+        assert!(
+            load.fresh_as_of_ms.is_some(),
+            "the only serving relay has now restated the session",
         );
         assert!(
             notices.slot_connects.lock().is_empty()
@@ -4980,8 +5048,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
+    #[tokio::test]
+    async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
         // Relay 1 (untagged) serves session_a; relay 2 (region-b) serves
         // session_b. Relay 2's beat legitimately reports session_b and also
         // forges session_a's slot -- only the forged entry is dropped.
@@ -5095,8 +5163,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heartbeat_session_roster_beyond_the_cap_is_truncated() {
+    #[tokio::test]
+    async fn heartbeat_session_roster_beyond_the_cap_is_truncated() {
         let reg = registry::new_registry();
         let generation = registry::enroll(
             &reg,
@@ -5141,8 +5209,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heartbeat_session_slot_list_beyond_the_cap_is_truncated() {
+    #[tokio::test]
+    async fn heartbeat_session_slot_list_beyond_the_cap_is_truncated() {
         let reg = registry::new_registry();
         let generation = registry::enroll(
             &reg,

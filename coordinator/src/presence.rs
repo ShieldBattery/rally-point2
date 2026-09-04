@@ -201,6 +201,21 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_naming_no_slots_reports_no_presence() {
+        // A relay keeps naming a session after its last local slot leaves, so it
+        // can go on restating the load state it retained for it. Presence is a
+        // live view, so such an entry must contribute nothing — exactly as
+        // leaving the session out of the roster does.
+        let store = new_store();
+        let now = Instant::now();
+        apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), now);
+        assert_eq!(fresh_now(&store, now), vec![(SessionId(1), SlotId(0))]);
+
+        apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[]), now);
+        assert!(fresh_now(&store, now).is_empty());
+    }
+
+    #[test]
     fn a_stale_generations_beat_cannot_clobber_a_newer_connections_entries() {
         // The reconnect race, at the store level: the relay's new connection
         // (generation 8) reported the slot; a late beat from its old connection

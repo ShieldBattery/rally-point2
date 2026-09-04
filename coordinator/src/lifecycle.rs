@@ -139,15 +139,34 @@ type SessionRef = (TenantId, SessionId);
 /// What the coordinator knows about one session's load progress, as
 /// [`Lifecycle::load_state`] reports it.
 ///
-/// Every field is an accumulated fact, never a live view: the slot sets record
-/// that a slot *ever* connected or *ever* reported its game loop, so a slot that
-/// arrived and then dropped still appears. That is what makes the answer useful
-/// for attributing a failed load — the tenant wants "who never got here", not
-/// "who is here right now" (which is what the presence store answers).
+/// The accumulated facts are never a live view: the slot sets record that a slot
+/// *ever* connected or *ever* reported its game loop, so a slot that arrived and
+/// then dropped still appears. That is what makes the answer useful for
+/// attributing a failed load — the caller wants "who never got here", not "who is
+/// here right now" (which is what the presence store answers).
+///
+/// They are also only ever *positive* evidence, and always safe to merge. What
+/// takes qualifying is reading a slot's **absence** as proof it never arrived,
+/// which needs the record to be complete: `known` and `fresh_as_of_ms` say how far
+/// that holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoadState {
-    /// Relay wall-clock (unix epoch ms) of the session's coverage latch. `None`
-    /// when no authority has reported the session started.
+    /// Whether an absent slot may be read as a slot that never arrived: the
+    /// session was created against this coordinator (so the sets start at its
+    /// beginning, not wherever a restarted process came up) **and** every serving
+    /// relay has restated its own view at least once (so the sets are not merely
+    /// empty-because-nobody-has-spoken-yet).
+    pub known: bool,
+    /// The freshness watermark: the coordinator's own receipt time (unix epoch ms)
+    /// before which every serving relay's facts are folded in — the minimum over
+    /// the serving set of each relay's most recent session-carrying heartbeat.
+    /// `None` while some serving relay has not reported the session at all this
+    /// coordinator lifetime. The record is complete for events before it and may
+    /// still be missing a beat's worth after it.
+    pub fresh_as_of_ms: Option<u64>,
+    /// Relay wall-clock (unix epoch ms) of the session's start — the earliest
+    /// instant any relay reported for it. `None` when no relay has reported the
+    /// session started.
     pub started_at_ms: Option<u64>,
     /// Slots whose links ever activated, ascending.
     pub connected_slots: Vec<SlotId>,
@@ -245,10 +264,24 @@ struct SessionState {
     /// Slots that have ever reported their game loop running. Grows
     /// monotonically for the same reason as `connected_slots`.
     started_slots: HashSet<SlotId>,
-    /// Relay wall-clock (unix epoch ms) of the session's coverage latch, from the
-    /// authority relay's session-started notice. First report wins — an
-    /// at-least-once re-send, or a second authority after a promotion, must not
-    /// move an instant the tenant may already have recorded.
+    /// Per-relay coordinator receipt time (unix epoch ms) of the most recent
+    /// heartbeat from that relay that carried an entry for this session — an entry
+    /// of *any* shape, including one naming no connected slot and no retained
+    /// facts, because the entry itself is the relay saying "everything I hold for
+    /// this session is in this beat". The minimum over `serving_relays` is the
+    /// freshness watermark [`SessionLoadState`] reports; a serving relay missing
+    /// here has never restated the session this coordinator lifetime, so nothing
+    /// about the record's completeness can be claimed yet.
+    ///
+    /// Only an already-tracked session records one — a beat never creates a state
+    /// just to stamp it (see [`Lifecycle::on_heartbeat_load_state`]). Entries for
+    /// relays that leave the serving set are dropped with the assignment.
+    load_reported_at_ms: HashMap<RelayId, u64>,
+    /// Relay wall-clock (unix epoch ms) of the session's start, from the authority
+    /// relay's session-started notice or any relay's heartbeat restatement. First
+    /// report wins — an at-least-once re-send, a second authority after a
+    /// promotion, or a peer's later adoption instant must not move an instant the
+    /// tenant may already have recorded.
     started_at_ms: Option<u64>,
     /// Slots (player or observer) that have a departure record, each with the
     /// data a coordinator-mediated re-home seeds into a fresh relay's consensus
@@ -310,6 +343,23 @@ impl SessionState {
                 .serving_relays
                 .iter()
                 .all(|r| self.closed_relays.contains_key(r))
+    }
+
+    /// The freshness watermark for this session's load record: the receipt time
+    /// every serving relay's restatement is at least as new as, so every load
+    /// event before it is already folded in. `None` while any serving relay has
+    /// yet to report the session — including a state with no serving set at all
+    /// (one lazily created by a notice), which cannot even say whose reports it
+    /// is missing.
+    fn fresh_as_of_ms(&self) -> Option<u64> {
+        if self.serving_relays.is_empty() {
+            return None;
+        }
+        let mut watermark = u64::MAX;
+        for relay in &self.serving_relays {
+            watermark = watermark.min(*self.load_reported_at_ms.get(relay)?);
+        }
+        Some(watermark)
     }
 
     /// The player slots not yet accounted (no result and no departure).
@@ -522,6 +572,12 @@ impl Lifecycle {
         state.player_slots = player_slots;
         state.observer_slots = observer_slots;
         state.closed_relays.clear();
+        // Load-state freshness is scoped to the assignment this call establishes.
+        // Anything restated before it described a different serving set (or a
+        // previous incarnation of this session id), so every relay re-earns its
+        // watermark from a beat made under this assignment. The accumulated facts
+        // themselves are kept: they are positive evidence whenever they arrived.
+        state.load_reported_at_ms.clear();
         // If this state existed only as a webhook-only entry (a departure/result
         // arrived before its registration), it now has the normal all-relays-
         // closed removal path, so its idle reap no longer applies.
@@ -585,6 +641,9 @@ impl Lifecycle {
     /// target's resumed descriptor may now admit a different homed group. The API
     /// invokes this under the assignment lock before publishing those descriptors,
     /// so subsequent terminal notices are unambiguously scoped to the new set.
+    /// Load-state freshness is assignment-scoped the same way: a restatement made
+    /// under the old assignment says nothing about what the new one holds, so both
+    /// endpoints must earn their watermark again from a beat.
     pub fn on_rehome(&self, tenant: &TenantId, session: SessionId, dead: RelayId, r_new: RelayId) {
         let mut sessions = self.inner.sessions.lock();
         let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
@@ -596,6 +655,7 @@ impl Lifecycle {
             // after `prepare_rehome` and before the assignment lock was acquired.
             self.reset_empty_evidence(state);
             state.closed_relays.remove(&dead);
+            state.load_reported_at_ms.remove(&dead);
             return;
         }
         let Some(pos) = state.serving_relays.iter().position(|&id| id == dead) else {
@@ -606,10 +666,12 @@ impl Lifecycle {
         self.reset_empty_evidence(state);
         // Assignment-scoped evidence leaves with the relay.
         state.closed_relays.remove(&dead);
+        state.load_reported_at_ms.remove(&dead);
         // A resumed descriptor changes what the target may serve, even when it was
         // already a member. Drop its prior close evidence before the new descriptor
         // is published; a later close then belongs to the resumed assignment.
         state.closed_relays.remove(&r_new);
+        state.load_reported_at_ms.remove(&r_new);
         if state.serving_relays.contains(&r_new) {
             state.serving_relays.remove(pos);
         } else {
@@ -738,10 +800,11 @@ impl Lifecycle {
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
-    /// Records the session's start instant from the authority relay's
-    /// session-started notice, and marks the session started. The first instant
-    /// wins: a re-send (or a second authority after a promotion) must not move a
-    /// value the tenant may already have recorded.
+    /// Records the session's start instant — from the authority relay's
+    /// session-started notice, or from any relay restating one on its heartbeat —
+    /// and marks the session started. The first instant wins: a re-send, a second
+    /// authority after a promotion, or a peer reporting when it adopted the
+    /// directive must not move a value the tenant may already have recorded.
     pub fn on_session_started(&self, tenant: TenantId, session: SessionId, started_at_ms: u64) {
         let mut sessions = self.inner.sessions.lock();
         let state = sessions
@@ -770,29 +833,42 @@ impl Lifecycle {
     /// started, which slots ever connected, and which ever reported their game
     /// loop running. Both slot lists are sorted ascending.
     ///
-    /// `Some` **only** for a session this coordinator lifetime created via
-    /// [`register_session`](Self::register_session), because only then are the
-    /// sets complete for the session's whole life — which is what lets a caller
-    /// treat a slot's *absence* as evidence it never arrived. `None` otherwise:
-    /// the session was never created here (restart amnesia, even if notices or
-    /// heartbeats have since lazily created a state for it) or has already been
-    /// reaped. That is "no information", never "nobody arrived".
+    /// `Some` for every session the coordinator holds any state for, whatever
+    /// built that state: the facts it has accumulated are positive evidence and
+    /// worth answering with regardless. `None` only when it holds nothing at all —
+    /// the session was never created here and no notice or beat has arrived for
+    /// it, or it has already been reaped.
+    ///
+    /// [`SessionLoadState::known`] is the separate question of whether the caller
+    /// may read a slot's *absence* from the sets as proof it never arrived, and
+    /// [`SessionLoadState::fresh_as_of_ms`] bounds how recently that holds. Both
+    /// gate only the negative inference; the sets themselves stand either way.
     pub fn load_state(&self, tenant: &TenantId, session: SessionId) -> Option<SessionLoadState> {
         self.inner
             .sessions
             .lock()
             .get(&(tenant.clone(), session))
-            .filter(|state| state.created_here)
-            .map(|state| SessionLoadState {
-                started_at_ms: state.started_at_ms,
-                connected_slots: sorted_slots(&state.connected_slots),
-                started_slots: sorted_slots(&state.started_slots),
+            .map(|state| {
+                let fresh_as_of_ms = state.fresh_as_of_ms();
+                SessionLoadState {
+                    // A session created elsewhere (restart amnesia) accumulated
+                    // its sets from wherever this process came up, not from the
+                    // session's beginning, so an absent slot proves nothing about
+                    // it however fresh the relays' restatements are.
+                    known: state.created_here && fresh_as_of_ms.is_some(),
+                    fresh_as_of_ms,
+                    started_at_ms: state.started_at_ms,
+                    connected_slots: sorted_slots(&state.connected_slots),
+                    started_slots: sorted_slots(&state.started_slots),
+                }
             })
     }
 
-    /// Folds the load state a relay's heartbeat restated into the sessions'
+    /// Folds the load state `relay`'s heartbeat restated into the sessions'
     /// records: the ever-connected and ever-started slot sets union in, and the
-    /// first start instant seen wins.
+    /// first start instant seen wins. `received_at_ms` is the coordinator's own
+    /// clock at receipt, which then stamps each named session's freshness
+    /// watermark.
     ///
     /// The notices carrying these facts are dropped once their send succeeds, so a
     /// coordinator that died between receiving one and committing it — or that
@@ -802,12 +878,29 @@ impl Lifecycle {
     /// Deliberately fires no webhook: these are re-statements of facts already
     /// notified, and the tenant's feed must not repeat them every ten seconds.
     ///
+    /// The entry's *currently connected* slots union in as ever-connected too: a
+    /// slot connected now necessarily connected at some point, which recovers a
+    /// slot-connected notice lost before the relay had a maker to retain it in the
+    /// set the beat restates.
+    ///
+    /// The watermark is stamped after the facts are folded, and only onto a
+    /// session the coordinator already tracks. Creating a state here would spin one
+    /// up (with its own drain task) for every session on every beat — the leak
+    /// [`on_presence_seen`](Self::on_presence_seen) documents — and it would buy
+    /// nothing: a watermark only ever qualifies a completeness claim the state must
+    /// have been created here to make at all.
+    ///
     /// The caller applies the same fences as the rest of the beat — a stale
     /// control connection's roster is dropped whole, and an entry for a session
     /// the relay does not serve is rejected — before anything reaches here.
-    pub fn on_heartbeat_load_state(&self, sessions: &[SessionPresence]) {
+    pub fn on_heartbeat_load_state(
+        &self,
+        relay: RelayId,
+        sessions: &[SessionPresence],
+        received_at_ms: u64,
+    ) {
         for session in sessions {
-            for &slot in &session.ever_connected {
+            for &slot in session.slots.iter().chain(&session.ever_connected) {
                 self.on_slot_connected(session.tenant.clone(), session.session, slot);
             }
             for &slot in &session.started {
@@ -815,6 +908,12 @@ impl Lifecycle {
             }
             if let Some(started_at_ms) = session.started_at_ms {
                 self.on_session_started(session.tenant.clone(), session.session, started_at_ms);
+            }
+        }
+        let mut states = self.inner.sessions.lock();
+        for session in sessions {
+            if let Some(state) = states.get_mut(&(session.tenant.clone(), session.session)) {
+                state.load_reported_at_ms.insert(relay, received_at_ms);
             }
         }
     }
@@ -1438,6 +1537,7 @@ impl Lifecycle {
             accounted: HashSet::new(),
             connected_slots: HashSet::new(),
             started_slots: HashSet::new(),
+            load_reported_at_ms: HashMap::new(),
             started_at_ms: None,
             departures: HashMap::new(),
             closed_relays: HashMap::new(),
@@ -2766,17 +2866,29 @@ mod tests {
         lc.register_session(
             tid(),
             s,
-            setup.serving_relays(&tid(), s),
+            vec![RelayId(1), RelayId(2)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
         );
 
-        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], Some(1_700_000_000_000))]);
-        // A second relay's beat for the same session: its own slot unions in, and
-        // its later latch instant never displaces the first one recorded.
-        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[0], &[0], &[], Some(1_700_000_009_999))]);
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[1], &[1], &[1], Some(1_700_000_000_000))],
+            1_000,
+        );
+        // The second serving relay's beat: its own slot unions in, and its later
+        // latch instant never displaces the first one recorded.
+        lc.on_heartbeat_load_state(
+            RelayId(2),
+            &[heartbeat_load(s, &[0], &[0], &[], Some(1_700_000_009_999))],
+            2_000,
+        );
         // A re-statement of what is already recorded changes nothing.
-        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], None)]);
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[1], &[1], &[1], None)],
+            3_000,
+        );
 
         let load = lc
             .load_state(&tid(), s)
@@ -2791,34 +2903,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_state_is_unknown_for_a_session_this_coordinator_never_created() {
+    async fn a_beat_reads_a_live_slot_as_proof_it_ever_connected() {
+        // A relay restates the ever-connected set it retained, but a slot that is
+        // connected right now necessarily connected at some point — folding the
+        // live roster in too recovers a slot-connected notice lost before the
+        // relay had a decision-maker to retain it in.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::new(setup.clone());
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[1], &[], &[], None)],
+            1_000,
+        );
+
+        let load = lc.load_state(&tid(), s).expect("created here");
+        assert_eq!(load.connected_slots, vec![SlotId(1)]);
+    }
+
+    #[tokio::test]
+    async fn the_freshness_watermark_is_the_oldest_serving_relays_restatement() {
+        // Completeness is a claim about every serving relay, so it cannot outrun
+        // the slowest of them: until each has restated the session, an absent slot
+        // may be one nobody has spoken for yet rather than one that never arrived.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::new(setup.clone());
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        // Relay 1 has beaten; relay 2 has not been heard from at all.
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[0], &[0], &[], None)],
+            1_000,
+        );
+        let load = lc.load_state(&tid(), s).expect("created here");
+        assert_eq!(load.fresh_as_of_ms, None);
+        assert!(
+            !load.known,
+            "a serving relay that has never reported blocks the completeness claim",
+        );
+        assert_eq!(
+            load.connected_slots,
+            vec![SlotId(0)],
+            "positive evidence is answered with regardless",
+        );
+
+        // Relay 2's first beat completes the picture, dated at the older of the
+        // two receipts — everything before it is folded in from both relays.
+        lc.on_heartbeat_load_state(
+            RelayId(2),
+            &[heartbeat_load(s, &[1], &[1], &[], None)],
+            2_000,
+        );
+        let load = lc.load_state(&tid(), s).expect("created here");
+        assert_eq!(load.fresh_as_of_ms, Some(1_000));
+        assert!(load.known);
+
+        // Relay 1 beats again; the watermark advances to relay 2's, now the
+        // oldest. An entry naming nothing at all still refreshes it: the entry
+        // itself is the relay restating everything it holds.
+        lc.on_heartbeat_load_state(RelayId(1), &[heartbeat_load(s, &[], &[], &[], None)], 3_000);
+        assert_eq!(
+            lc.load_state(&tid(), s).unwrap().fresh_as_of_ms,
+            Some(2_000),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_beat_never_creates_a_session_state_just_to_stamp_freshness() {
+        // Heartbeats arrive for every live session every ~10s from every relay
+        // serving it. A beat carrying no facts must leave an untracked session
+        // untracked, or a coordinator restart would leak a state (and its drain
+        // task) per pre-existing session on the very next beat.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::new(setup.clone());
+
+        lc.on_heartbeat_load_state(RelayId(1), &[heartbeat_load(s, &[], &[], &[], None)], 1_000);
+        assert!(!lc.contains_state(&tid(), s));
+        assert!(lc.load_state(&tid(), s).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_this_coordinator_never_created_answers_its_facts_but_not_known() {
         // Restart amnesia: notices and beats for a session set up against a
-        // previous process still lazily create a state (its facts are worth
-        // keeping), but the sets start wherever this process came up. Answering
-        // them would let a tenant read an absent slot as a no-show, so the read
-        // reports no information at all until the session is registered here.
+        // previous process still lazily create a state, and the facts they carry
+        // are answered with — the caller merges positive evidence either way. What
+        // it must not do is claim completeness: those sets start wherever this
+        // process came up, so an absent slot proves nothing.
         let (setup, s) = setup_with_relay_and_session();
         let lc = Lifecycle::new(setup.clone());
 
         lc.on_slot_connected(tid(), s, SlotId(0));
-        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], Some(7))]);
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[1], &[1], &[1], Some(7))],
+            500,
+        );
         assert!(lc.contains_state(&tid(), s), "the facts are still recorded");
-        assert!(
-            lc.load_state(&tid(), s).is_none(),
-            "an incomplete set is no answer at all",
+        let load = lc
+            .load_state(&tid(), s)
+            .expect("the facts are answered with");
+        assert_eq!(load.connected_slots, vec![SlotId(0), SlotId(1)]);
+        assert_eq!(load.started_slots, vec![SlotId(1)]);
+        assert_eq!(load.started_at_ms, Some(7));
+        assert!(!load.known, "an incomplete set cannot answer for absence");
+        assert_eq!(
+            load.fresh_as_of_ms, None,
+            "a lazily created state has no serving set to be complete against",
         );
 
         // Registering the session hands this coordinator the whole picture from
-        // here on, and the read starts answering — including what it had already
-        // accumulated.
+        // here on — including what it had already accumulated — and one beat from
+        // the serving relay is then enough to make the record answerable.
         lc.register_session(
             tid(),
             s,
-            setup.serving_relays(&tid(), s),
+            vec![RelayId(1)],
             HashSet::from([SlotId(0), SlotId(1)]),
             HashSet::new(),
         );
+        assert!(
+            !lc.load_state(&tid(), s).unwrap().known,
+            "registration alone proves nothing about what the relays hold",
+        );
+        lc.on_heartbeat_load_state(
+            RelayId(1),
+            &[heartbeat_load(s, &[1], &[1], &[1], None)],
+            1_000,
+        );
         let load = lc.load_state(&tid(), s).expect("created here now");
+        assert!(load.known);
+        assert_eq!(load.fresh_as_of_ms, Some(1_000));
         assert_eq!(load.connected_slots, vec![SlotId(0), SlotId(1)]);
     }
 
@@ -2883,6 +3111,71 @@ mod tests {
                 .all(|descriptor| descriptor.session != s),
             "the stale descriptor is retired with membership",
         );
+    }
+
+    #[tokio::test]
+    async fn an_entry_with_no_connected_slots_reaps_exactly_as_an_omission_does() {
+        // A relay keeps a session on its beat after that session's last local slot
+        // leaves, so it can go on restating the load state it retained. Such an
+        // entry must say nothing about occupancy: the empty-session reap has to
+        // read it as the relay reporting nobody, exactly as leaving the session out
+        // of the roster does — otherwise a relay holding a finished session's
+        // record would keep the session alive for as long as it ran.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::with_test_tunables(
+            setup.clone(),
+            HOUR,
+            HOUR,
+            HOUR,
+            NOTICE_QUEUE_CAPACITY,
+            HOUR,
+            EmptyReapTunables {
+                grace: SHORT,
+                freshness: HOUR,
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        lc.on_relay_enrolled(RelayId(1), 7);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            7,
+            &[heartbeat_session(s, &[0])],
+            true,
+            Instant::now(),
+        );
+
+        // The slot's link ends. The relay still names the session, now with no
+        // connected slot and the facts it retained while the slot was here.
+        let vacated = [heartbeat_load(s, &[], &[0], &[0], Some(1_700_000_000_000))];
+        lc.on_relay_heartbeat(RelayId(1), 7, &vacated, true, Instant::now());
+        lc.on_heartbeat_load_state(RelayId(1), &vacated, 1_000);
+
+        assert_eq!(
+            lc.metrics_census().sessions[&tid()].empty_grace,
+            1,
+            "the entry is empty-roster evidence, exactly as an omission is",
+        );
+        let load = lc.load_state(&tid(), s).expect("created here");
+        assert_eq!(
+            (load.connected_slots, load.started_slots),
+            (vec![SlotId(0)], vec![SlotId(0)]),
+            "and its retained facts are still folded in",
+        );
+
+        timeout(SHORT * 5, async {
+            while lc.contains_state(&tid(), s) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the vacated session is reaped on the same grace as an omitted one");
     }
 
     #[tokio::test]
