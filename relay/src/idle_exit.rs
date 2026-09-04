@@ -237,7 +237,7 @@ mod tests {
         // Populated: a held slot means the relay is serving, so it must not exit
         // even though it is unenrolled.
         let (guard, _inbox) =
-            routing::register(&sessions, &key(1), SlotId(0)).expect("slot 0 registers");
+            routing::register(&sessions, &key(1), SlotId(0), 1).expect("slot 0 registers");
 
         // Unenrolled throughout: the sender is kept alive so the receiver reads a
         // steady `false`.

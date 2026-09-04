@@ -1452,6 +1452,26 @@ async fn write_control_frames(
                 sink.send(Message::Text(frame.into())).await?;
             }
 
+            // A fence task finished: send its answer. Ranked with the ask arm
+            // below and for the same reason, but deliberately ABOVE it: finishing
+            // an answer frees the fence permit its task holds, while taking a
+            // fresh ask consumes one. Draining answers first keeps a saturated
+            // relay recycling permits instead of preferring new probing over
+            // work already paid for. This half holds `answers_tx` for the
+            // connection's whole life, so the channel yields a real answer or
+            // pends — never `None` — and the arm needs no guard.
+            answer = answers_rx.recv() => {
+                let answer = answer
+                    .expect("the write half holds an answer sender for the connection's life");
+                let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                    request_id: answer.request_id,
+                    state: answer.state,
+                    fenced: answer.fenced,
+                })
+                .expect("a load-state snapshot always serializes");
+                sink.send(Message::Text(frame.into())).await?;
+            }
+
             // A load-state request the read half routed here. Ranked BELOW the
             // heartbeat and every lifecycle-bearing arm above it deliberately: a
             // load-state read is tenant-driven and can arrive in bursts, while
@@ -1466,28 +1486,14 @@ async fn write_control_frames(
             // unrelated tenant's read. The spawned fence snapshots after its
             // probes resolve — still strictly after the request arrived, which is
             // the ordering the coordinator's claim rests on — and hands the
-            // finished answer back through `answers` for this half to send.
+            // finished answer back through `answers` for this half to send, or
+            // sheds the ask outright when this relay is already fencing as much as
+            // it will at once.
             ask = load_state_rx.recv(), if load_state_open => {
                 match ask {
-                    Some(ask) => spawn_load_state_answer(&heartbeat.sources, ask, answers_tx.clone()),
+                    Some(ask) => start_load_state_answer(&heartbeat.sources, ask, &answers_tx),
                     None => load_state_open = false,
                 }
-            }
-
-            // A fence task finished: send its answer. Ranked with the ask arm and
-            // for the same reason. This half holds `answers_tx` for the
-            // connection's whole life, so the channel yields a real answer or
-            // pends — never `None` — and the arm needs no guard.
-            answer = answers_rx.recv() => {
-                let answer = answer
-                    .expect("the write half holds an answer sender for the connection's life");
-                let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
-                    request_id: answer.request_id,
-                    state: answer.state,
-                    fenced: answer.fenced,
-                })
-                .expect("a load-state snapshot always serializes");
-                sink.send(Message::Text(frame.into())).await?;
             }
 
             // Pull the next shipment while under the concurrency cap, then send its
@@ -1600,6 +1606,11 @@ fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
 /// empty lists, which is this relay attesting that it knows of no arrival rather
 /// than declining to answer.
 ///
+/// Also hands back the connection epoch behind each connected slot, read under the
+/// same roster lock as the slot list itself, so a caller comparing two snapshots
+/// sees one consistent membership per read rather than a slot list from one instant
+/// and epochs from another.
+///
 /// Takes the two handles it reads rather than the whole heartbeat sources, so the
 /// fence task — which outlives any borrow of the connection's sources — can take
 /// the same snapshot from its own clones.
@@ -1607,10 +1618,13 @@ fn session_load_snapshot(
     sessions: &Sessions,
     decision_makers: &crate::consensus::DecisionMakers,
     key: SessionKey,
-) -> SessionPresence {
-    let slots = crate::routing::live_session_slots(sessions, &key);
+) -> (SessionPresence, Vec<(SlotId, u64)>) {
+    let links = crate::routing::live_session_slot_epochs(sessions, &key);
     let load = crate::consensus::retained_load_state(decision_makers, &key);
-    presence_entry(key, slots, load)
+    (
+        presence_entry(key, links.iter().map(|(slot, _)| *slot).collect(), load),
+        links,
+    )
 }
 
 /// A finished load-state answer, handed from a fence task back to the write half
@@ -1627,6 +1641,32 @@ struct LoadStateAnswer {
     fenced: bool,
 }
 
+/// Starts one routed load-state ask's fence, or sheds it when this relay is already
+/// running its cap of fences.
+///
+/// The seat is what bounds the probing. The ask channel cannot: it is drained the
+/// instant a question arrives, so its depth caps questions *queued*, and the answer
+/// channel bounds answers already finished. A fence, by contrast, occupies a task
+/// for as long as its clients take to reply, and nothing upstream throttles that —
+/// so a permit is taken before the task exists and held until it ends. An ask that
+/// finds every seat taken costs nothing at all: no task, no probe, no answer, which
+/// the coordinator reads as this relay not having attested, the same reading a slow
+/// or disconnected relay gets.
+fn start_load_state_answer(
+    sources: &HeartbeatSources,
+    ask: LoadStateAsk,
+    answers: &Sender<LoadStateAnswer>,
+) {
+    let Some(permit) = sources.load_fence.try_start() else {
+        tracing::debug!(
+            request_id = ask.request_id,
+            "shedding a load-state ask: every fence seat on this relay is taken",
+        );
+        return;
+    };
+    spawn_load_state_answer(sources, ask, answers.clone(), permit);
+}
+
 /// Runs one load-state answer's fence off the control connection's write half and
 /// hands the finished answer back over `answers`.
 ///
@@ -1636,15 +1676,23 @@ struct LoadStateAnswer {
 /// read. An answer that cannot be queued back — the writer gone, or already holding
 /// as many answers as questions were admitted — is dropped, which the coordinator
 /// reads as this relay not having attested.
+///
+/// `permit` is this fence's seat under the relay's active-fence cap, taken by the
+/// caller before the task exists and released only when the task ends. The task can
+/// outlive anyone's interest in it — the coordinator stops waiting on its own
+/// deadline, and a request it has already retired can still be in flight here — so
+/// the permit, not the asker, is what bounds the probing this relay does at once.
 fn spawn_load_state_answer(
     sources: &HeartbeatSources,
     ask: LoadStateAsk,
     answers: Sender<LoadStateAnswer>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let sessions = Arc::clone(&sources.sessions);
     let decision_makers = Arc::clone(&sources.decision_makers);
     let fence = sources.load_fence.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         let (state, fenced) =
             fenced_load_state_snapshot(&sessions, &decision_makers, &fence, ask.key).await;
         if answers
@@ -1675,13 +1723,28 @@ fn spawn_load_state_answer(
 /// still behind it. The snapshot is taken **after** the acks, since a probe may
 /// have delivered a report in the meantime.
 ///
-/// The verdict is `true` only when both hold:
+/// A probe answers for one *link*, not one seat: it is issued against the
+/// connection epoch the slot held when the roster was read, delivered only to that
+/// connection, and acked only by it. That is what lets a membership change during
+/// the wait be detected rather than papered over — a client that (re)connects
+/// mid-fence would otherwise show up in the final snapshot as live, unstarted and
+/// unprobed, with a report of its own possibly still queued.
 ///
-/// - every probed slot acked within [`LOAD_STATE_FENCE_TIMEOUT`] — a probe no
-///   stream would take, or one that went unanswered, leaves that slot unfenced; and
+/// The verdict is `true` only when all of these hold:
+///
+/// - every probe issued was acked within [`LOAD_STATE_FENCE_TIMEOUT`] — a probe no
+///   stream would take, or one that went unanswered, leaves that slot unfenced;
+/// - every slot live at the *end* that has not started acked a probe issued
+///   against the epoch it still holds, so a slot that arrived mid-fence (never
+///   probed) and one whose link was replaced after acking (probed on the epoch
+///   before) both spoil the verdict; and
 /// - no slot this relay has ever seen connect is now disconnected without having
 ///   started. Such a slot has no stream to probe and its client may be holding a
 ///   report for the stream it opens next, so it can never be fenced.
+///
+/// So any membership change across the fence yields `false` and the tenant's next
+/// read simply asks again — the answer's facts are unaffected, only the licence to
+/// read its absences as proof.
 ///
 /// A slot that never connected here is not probed and does not spoil the verdict:
 /// no client ever held a stream to this relay for it, so there is nothing of its to
@@ -1698,21 +1761,23 @@ async fn fenced_load_state_snapshot(
         .collect();
     let mut probes = Vec::new();
     let mut every_probe_acked = true;
-    for slot in crate::routing::live_session_slots(sessions, &key) {
+    for (slot, connection_epoch) in crate::routing::live_session_slot_epochs(sessions, &key) {
         if started.contains(&slot) {
             continue;
         }
-        let pending = fence.probe(&key, slot);
+        let pending = fence.probe(&key, slot, connection_epoch);
         if crate::routing::deliver_load_state_probe_to_slot(
             sessions,
             &key,
             slot,
+            connection_epoch,
             pending.probe_id(),
         ) {
-            probes.push(pending);
+            probes.push((slot, connection_epoch, pending));
         } else {
-            // Nothing carried the probe — the slot's link ended under us, or its
-            // push queue is full — so no ack can ever come for it.
+            // Nothing carried the probe — the link ended under us, a reconnect
+            // took the seat, or the push queue is full — so no ack can ever come
+            // for it.
             every_probe_acked = false;
         }
     }
@@ -1720,23 +1785,34 @@ async fn fenced_load_state_snapshot(
     // absolute deadline, so the fence costs at most one timeout however many slots
     // this relay homes and however many of them are slow.
     let deadline = Instant::now() + LOAD_STATE_FENCE_TIMEOUT;
-    for probe in &mut probes {
-        if !matches!(
+    let mut acked: HashMap<SlotId, u64> = HashMap::new();
+    for (slot, connection_epoch, probe) in &mut probes {
+        if matches!(
             tokio::time::timeout_at(deadline, probe.recv()).await,
             Ok(true)
         ) {
+            acked.insert(*slot, *connection_epoch);
+        } else {
             every_probe_acked = false;
         }
     }
 
     // Re-read: an acked probe may have delivered a `GameStarted` ahead of its ack,
-    // and that is precisely the fact the fence exists to capture.
-    let state = session_load_snapshot(sessions, decision_makers, key);
+    // and that is precisely the fact the fence exists to capture. The epochs come
+    // back with it, so the roster this is judged against is the one that exists
+    // now, not the one the probes went out to.
+    let (state, links) = session_load_snapshot(sessions, decision_makers, key);
+    let every_live_link_fenced = links
+        .iter()
+        .all(|(slot, epoch)| state.started.contains(slot) || acked.get(slot) == Some(epoch));
     let unfenceable = state
         .ever_connected
         .iter()
         .any(|slot| !state.slots.contains(slot) && !state.started.contains(slot));
-    (state, every_probe_acked && !unfenceable)
+    (
+        state,
+        every_probe_acked && every_live_link_fenced && !unfenceable,
+    )
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and
@@ -2473,9 +2549,9 @@ mod tests {
         let sessions: crate::routing::Sessions = std::sync::Arc::default();
         let mesh_links = crate::mesh::new_mesh_links();
 
-        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
             .expect("slot 0 registers into an empty roster");
-        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1), 1)
             .expect("slot 1 registers into an empty roster");
         assert!(
             !crate::consensus::note_slot_present(&makers, &key(1), SlotId(0)),
@@ -2537,7 +2613,7 @@ mod tests {
         .with_broadcast(sessions.clone(), mesh_links);
 
         let (mut guard, inbox) =
-            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)
                 .expect("slot 0 registers");
         guard.disarm();
         let shutdown = inbox.shutdown_handle();
@@ -3018,7 +3094,7 @@ mod tests {
         // A held slot blocks the drain even with an empty applied set (e.g. a
         // post-restart session the coordinator no longer tracks).
         let (_guard, _inbox) =
-            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+            crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)
                 .expect("slot 0 registers");
         assert!(
             !drained_idle(&sessions, &applied),
@@ -3516,7 +3592,7 @@ mod tests {
         // so the slot stays registered for the test's duration.
         let sessions: Sessions = Arc::default();
         let (mut guard, _inbox) =
-            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3))
+            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
                 .expect("slot 3 registers");
         guard.disarm();
 
@@ -3639,7 +3715,7 @@ mod tests {
             false,
         );
         let (registration, _inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
         crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
 
@@ -3669,7 +3745,7 @@ mod tests {
         // A session with a connected slot but no maker (a provisional admission no
         // descriptor ever claimed) is named too, with nothing retained.
         let (mut unclaimed, _unclaimed_inbox) =
-            crate::routing::register(&sessions, &key(8), SlotId(1)).expect("slot 1 registers");
+            crate::routing::register(&sessions, &key(8), SlotId(1), 1).expect("slot 1 registers");
         unclaimed.disarm();
         let roster = heartbeat_presence(&sources);
         assert_eq!(roster.len(), 2);
@@ -3717,7 +3793,7 @@ mod tests {
         // is here and running.
         let sessions: Sessions = Arc::default();
         let (mut guard, _inbox) =
-            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3))
+            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
                 .expect("slot 3 registers");
         guard.disarm();
         let decision_makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
@@ -3825,7 +3901,7 @@ mod tests {
             false,
         );
         let (_registration, _inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
         crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
 
@@ -3836,7 +3912,7 @@ mod tests {
             load_fence: crate::load_fence::LoadStateFence::new(),
         };
         assert_eq!(
-            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)),
+            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
             heartbeat_presence(&sources)
                 .into_iter()
                 .find(|entry| entry.session == SessionId(7))
@@ -3864,25 +3940,35 @@ mod tests {
         (sessions, decision_makers)
     }
 
+    /// The connection epoch a fence fixture's link registers on, and the one a
+    /// client that dials back in takes. Any two distinct values do — an epoch is an
+    /// equality fence, not an ordering key.
+    const LINK_EPOCH: u64 = 0x51;
+    const REPLACEMENT_EPOCH: u64 = 0x52;
+
     #[tokio::test]
     async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
         // The fence's positive case: the one slot that could be holding a report
-        // back answers the probe, so the snapshot's absences may be read as proof.
+        // back answers the probe on the link the probe went down, and the roster is
+        // unchanged either side of the wait, so the snapshot's absences may be read
+        // as proof.
         use rally_point_proto::ids::SlotId;
 
         let (sessions, decision_makers) = fence_fixture();
         let fence = crate::load_fence::LoadStateFence::new();
         let (mut registration, mut inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
         registration.disarm();
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
 
         // Stand in for slot 0's link task: take the probe off its push queue and
-        // resolve it exactly as `run_slot_link` does on the client's ack.
+        // resolve it exactly as `run_slot_link` does on the client's ack, with the
+        // epoch that link carries.
         let ack = async {
             loop {
                 if let Some(probe_id) = inbox.try_recv_load_state_probe() {
-                    assert!(fence.resolve(probe_id, &key(7), SlotId(0)));
+                    assert!(fence.resolve(probe_id, &key(7), SlotId(0), LINK_EPOCH));
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -3898,6 +3984,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_that_arrives_mid_fence_leaves_the_answer_unfenced() {
+        // A client that dials in after the roster was read is live and unstarted in
+        // the snapshot without ever having been asked anything, and it is not
+        // "away", so the ever-connected check passes it. Its own `GameStarted` may
+        // be queued in its driver right now — exactly what the fence exists to rule
+        // out — so the membership change alone withholds the claim.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (mut registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
+        registration.disarm();
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+
+        let ack = async {
+            loop {
+                if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                    // Slot 1 connects while slot 0's probe is outstanding.
+                    let (mut late, _late_inbox) =
+                        crate::routing::register(&sessions, &key(7), SlotId(1), LINK_EPOCH)
+                            .expect("slot 1 registers");
+                    late.disarm();
+                    assert!(fence.resolve(probe_id, &key(7), SlotId(0), LINK_EPOCH));
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let ((state, fenced), ()) = tokio::join!(
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
+            ack,
+        );
+        assert!(
+            !fenced,
+            "a slot nobody probed cannot be vouched for, however promptly the rest answered",
+        );
+        assert_eq!(
+            state.slots,
+            vec![SlotId(0), SlotId(1)],
+            "the arrival is still reported; only the negative inference is withheld",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_replaced_after_acking_leaves_the_answer_unfenced() {
+        // The ack spoke for one stream's position. The client then dialed back in,
+        // and the new stream has its own queue of owed reports that the old one's
+        // ack says nothing about — so the same slot on a new epoch is as unfenced
+        // as one that never answered, even though the seat never looked empty.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
+        // Left armed: dropping it is how this test ends the link that acked.
+        let mut original = Some(registration);
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+
+        let ack = async {
+            loop {
+                if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                    assert!(fence.resolve(probe_id, &key(7), SlotId(0), LINK_EPOCH));
+                    drop(original.take());
+                    let (mut reconnect, _reconnect_inbox) =
+                        crate::routing::register(&sessions, &key(7), SlotId(0), REPLACEMENT_EPOCH)
+                            .expect("the reconnect claims the seat");
+                    reconnect.disarm();
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let ((state, fenced), ()) = tokio::join!(
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
+            ack,
+        );
+        assert!(
+            !fenced,
+            "an ack from the connection before the reconnect fences nothing"
+        );
+        assert_eq!(
+            state.slots,
+            vec![SlotId(0)],
+            "the seat is occupied throughout, so nothing but the epoch gives the swap away",
+        );
+    }
+
+    #[tokio::test]
     async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
         // Silence is not an ack. The slot's facts still go up — the answer is as
         // real as any other — but nothing licenses reading its absence from
@@ -3908,7 +4086,8 @@ mod tests {
         let (sessions, decision_makers) = fence_fixture();
         let fence = crate::load_fence::LoadStateFence::new();
         let (mut registration, mut inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
         registration.disarm();
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
 
@@ -3931,7 +4110,8 @@ mod tests {
         let (sessions, decision_makers) = fence_fixture();
         let fence = crate::load_fence::LoadStateFence::new();
         let (mut registration, mut inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
         registration.disarm();
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
         crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
@@ -3956,7 +4136,8 @@ mod tests {
         let (sessions, decision_makers) = fence_fixture();
         let fence = crate::load_fence::LoadStateFence::new();
         let (registration, _inbox) =
-            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
         crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
         // The link ends: the guard deregisters the slot, leaving it ever-connected
         // and not live.
@@ -3983,6 +4164,69 @@ mod tests {
         assert!(state.slots.is_empty() && state.ever_connected.is_empty());
     }
 
+    #[tokio::test]
+    async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
+        // The bound that actually holds. The ask channel is drained the instant a
+        // question arrives, so its depth caps questions queued, not probing under
+        // way; the seat caps the probing. An ask that finds none costs nothing —
+        // no task, no probe, no answer — and the coordinator reads that silence as
+        // this relay not having attested.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (mut registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
+        registration.disarm();
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+        let sources = HeartbeatSources {
+            sessions: Arc::clone(&sessions),
+            decision_makers: Arc::clone(&decision_makers),
+            region_rtt_cache: RegionRttCache::default(),
+            load_fence: fence.clone(),
+        };
+        let (answers_tx, mut answers_rx) =
+            tokio::sync::mpsc::channel::<LoadStateAnswer>(LOAD_STATE_ASK_CAPACITY);
+
+        let mut seats: Vec<_> = (0..crate::load_fence::MAX_ACTIVE_LOAD_FENCES)
+            .map(|_| fence.try_start().expect("a fence under the cap starts"))
+            .collect();
+        start_load_state_answer(
+            &sources,
+            LoadStateAsk {
+                request_id: 1,
+                key: key(7),
+            },
+            &answers_tx,
+        );
+        // A fence task registers and delivers every probe before its first await,
+        // so one turn of the scheduler is enough for a spawned one to be visible.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fence.pending_count(),
+            0,
+            "a shed ask starts no fence, so nothing was probed",
+        );
+        assert!(inbox.try_recv_load_state_probe().is_none());
+        assert!(answers_rx.try_recv().is_err(), "and it produces no answer");
+
+        // The control: with a seat free the same ask does probe, so the silence
+        // above is the cap and not the harness.
+        seats.pop();
+        start_load_state_answer(
+            &sources,
+            LoadStateAsk {
+                request_id: 2,
+                key: key(7),
+            },
+            &answers_tx,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(fence.pending_count(), 1);
+        assert!(inbox.try_recv_load_state_probe().is_some());
+    }
+
     #[test]
     fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
         // Empty is a real answer — "I know of no arrival here" — and is exactly
@@ -3996,7 +4240,7 @@ mod tests {
             load_fence: crate::load_fence::LoadStateFence::new(),
         };
         assert_eq!(
-            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)),
+            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
             SessionPresence {
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),

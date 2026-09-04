@@ -4173,7 +4173,7 @@ mod tests {
             claim_mesh_link(&mesh, peer, &current).expect("current link replaces old");
 
         let (mut guard, mut inbox) =
-            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+            routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
         guard.disarm();
         let joined = joined_state(&links, &key);
         let stale_e1 = slot_connectivity_frame(key.session, SlotId(0), true, Some(11));
@@ -4695,8 +4695,8 @@ mod tests {
 
         // Slot 0 is the one that actually left; slot 1 is the surviving peer
         // that should hear about it.
-        let (_reg0, _inbox0) = routing::register(&sessions, &key, SlotId(0)).unwrap();
-        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1)).unwrap();
+        let (_reg0, _inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
+        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
         let (_forward_rx, mut control_rx) = register_link_channels(&mesh_links, &key);
 
         let real_leave = LeaveDirective {
@@ -4870,7 +4870,7 @@ mod tests {
         let turn_ring = crate::turn_ring::TurnRing::new();
         let key = control_key();
         let (_registration, mut local) =
-            routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
+            routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");
         let (mut peer_b_rx, _peer_b_control_rx) = register_link_channels(&links, &key);
         let (mut peer_c_rx, _peer_c_control_rx) = register_link_channels(&links, &key);
         let mut mesh_state = new_mesh_state();
@@ -4934,7 +4934,7 @@ mod tests {
             false,
         );
         let (_registration, mut local) =
-            routing::register(&sessions, &key, SlotId(1)).expect("local slot registers");
+            routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");
         let (mut peer_b_rx, mut peer_b_control_rx) = register_link_channels(&links, &key);
         let (mut peer_c_rx, mut peer_c_control_rx) = register_link_channels(&links, &key);
         let payload = Payload {
@@ -5919,7 +5919,7 @@ mod tests {
             false,
         );
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(1)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");
         let (mut peer_rx, _peer_ctl_rx) = register_link_channels(&mesh_state.links, &key);
 
         // Slot 0's leave is decided (a peer authority's directive observed).
@@ -6079,7 +6079,7 @@ mod tests {
             rally_point_proto::ids::GameFrameCount(50),
         );
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(0), 1).expect("survivor registers");
 
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
         joined.insert(
@@ -6171,7 +6171,7 @@ mod tests {
             rally_point_proto::ids::GameFrameCount(40),
         );
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(0), 1).expect("survivor registers");
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
         joined.insert(
@@ -6282,7 +6282,7 @@ mod tests {
             rally_point_proto::ids::GameFrameCount(40),
         );
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(0), 1).expect("survivor registers");
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
         joined.insert(
@@ -6375,7 +6375,7 @@ mod tests {
             true,
         );
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(0)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(0), 1).expect("survivor registers");
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
         let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
         joined.insert(
@@ -6477,7 +6477,7 @@ mod tests {
         let mesh_state = new_mesh_state();
         mesh_state.provisional_turns.arm();
         let (_reg, inbox) =
-            routing::register(&sessions, &key, SlotId(1)).expect("the flooder registers");
+            routing::register(&sessions, &key, SlotId(1), 1).expect("the flooder registers");
         let shutdown = inbox.shutdown_handle();
 
         for seq in 0..=(crate::provisional_turns::PER_SESSION_CAP as u64) {
@@ -6547,7 +6547,7 @@ mod tests {
         let key = control_key();
         let mesh_state = new_mesh_state();
         let (_reg, mut survivor) =
-            routing::register(&sessions, &key, SlotId(1)).expect("survivor registers");
+            routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");
 
         mesh_state.gates.retire(&key);
         deliver_mesh_turn(
@@ -6712,7 +6712,7 @@ mod tests {
 
         // A local routing slot (slot 5) that must receive the fanned change.
         let (mut guard, mut inbox) =
-            routing::register(&sessions, &key, SlotId(5)).expect("slot 5 registers");
+            routing::register(&sessions, &key, SlotId(5), 1).expect("slot 5 registers");
         guard.disarm();
         // A peer mesh link that must NOT hear an echo of the received change.
         let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
@@ -6783,7 +6783,7 @@ mod tests {
         let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
 
         let (mut guard, mut inbox) =
-            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+            routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
         guard.disarm();
         let mut joined = HashMap::new();
         joined.insert(
@@ -6885,10 +6885,10 @@ mod tests {
         // A local survivor (slot 5) that must hear an accepted leave and must
         // NOT hear a rejected, conflicting one.
         let (mut guard, mut inbox) =
-            routing::register(&sessions, &key, SlotId(5)).expect("slot 5 registers");
+            routing::register(&sessions, &key, SlotId(5), 1).expect("slot 5 registers");
         guard.disarm();
         let (mut subject_guard, mut subject_inbox) =
-            routing::register(&sessions, &key, SlotId(0)).expect("subject slot registers");
+            routing::register(&sessions, &key, SlotId(0), 1).expect("subject slot registers");
         subject_guard.disarm();
         let subject_shutdown = subject_inbox.shutdown_handle();
 
@@ -7119,7 +7119,7 @@ mod tests {
         ));
 
         let (mut guard, mut inbox) =
-            routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+            routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
         guard.disarm();
         let joined = joined_state(&mesh_links, &key);
         let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
@@ -7188,7 +7188,7 @@ mod tests {
                 11,
             ));
             let (mut guard, mut inbox) =
-                routing::register(&sessions, &key, SlotId(5)).expect("local survivor registers");
+                routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
             guard.disarm();
             let joined = joined_state(&mesh_links, &key);
             let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
@@ -7595,8 +7595,8 @@ mod tests {
         let delay = std::time::Duration::from_millis(120);
         let (sessions, seen, decision_makers, turn_ring, key, labels) = region_label_relay(delay);
 
-        let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0)).unwrap();
-        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1)).unwrap();
+        let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
+        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
 
         let turn = |seq: u64, frame: u32| Payload {
             seq,
@@ -7650,7 +7650,7 @@ mod tests {
         // A slot registering after the release reads the map off the maker and is
         // pushed it directly — the path a late or reconnecting slot's link task
         // takes, so it is not left without labels every other member holds.
-        let (_reg2, mut inbox2) = routing::register(&sessions, &key, SlotId(2)).unwrap();
+        let (_reg2, mut inbox2) = routing::register(&sessions, &key, SlotId(2), 1).unwrap();
         let late = consensus::released_region_labels(&decision_makers, &key)
             .expect("the gate is open, so a late slot has labels to receive");
         routing::deliver_region_labels_to_slot(&sessions, &key, SlotId(2), late);
@@ -7667,7 +7667,7 @@ mod tests {
 
         let delay = std::time::Duration::from_millis(80);
         let (sessions, seen, decision_makers, turn_ring, key, labels) = region_label_relay(delay);
-        let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0)).unwrap();
+        let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
 
         consensus::mark_session_started(&decision_makers, &key);
         std::thread::sleep(delay + std::time::Duration::from_millis(30));

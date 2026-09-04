@@ -420,7 +420,7 @@ mod tests {
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let sessions: Sessions = Arc::default();
         let (mut guard, inbox) =
-            routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+            routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)
                 .expect("slot 0 registers");
         guard.disarm();
         let reap_signal = inbox.provisional_reap_handle();
@@ -461,7 +461,7 @@ mod tests {
         let sessions: Sessions = Arc::default();
 
         let (mut guard, inbox) =
-            routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0))
+            routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)
                 .expect("slot 0 registers");
         guard.disarm();
         let reap_signal = inbox.provisional_reap_handle();

@@ -37,11 +37,20 @@
 //! multiply the fleet-wide traffic by the number of requests in flight.
 //!
 //! Sharing a round is sound only because a joining read checks *when* the round it
-//! joined put its questions out: a round dispatched before the joiner even asked
-//! covers less than the joiner needs, so such a joiner waits for that round to
-//! finish and then runs (or joins) the next one, which necessarily dispatches after
+//! joined put its questions out: a round that began asking before the joiner even
+//! asked covers less than the joiner needs, so such a joiner waits for that round
+//! to finish and then runs (or joins) the next one, which necessarily begins after
 //! it asked. That costs at most one extra wait and never weakens the ordering claim
 //! the answer carries.
+//!
+//! The instant a round is judged by is taken **before its first question goes out**,
+//! not after its last. A relay asked early can snapshot and answer while the round
+//! is still putting questions to the rest of the fleet, so an instant stamped at the
+//! end of that fan-out can postdate a read that arrived after the earliest snapshot
+//! was already taken — and that read would then accept a round missing exactly the
+//! interval it asked about. Stamping before the first question makes the instant a
+//! lower bound on every snapshot the round collects, which is what the joiner's
+//! comparison needs it to be.
 //!
 //! # Shape
 //!
@@ -57,14 +66,16 @@
 //! outlives no reconnect worth speaking of.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{SessionPresence, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 /// How long a load-state read waits for the serving relays' snapshots before
 /// answering with whatever arrived.
@@ -169,11 +180,12 @@ pub struct AttestedSnapshot {
 /// joiners hands the same two sets to each.
 #[derive(Debug, Clone)]
 pub struct AttestRound {
-    /// When the round finished putting its questions to the relays. Every answer
-    /// it collects is snapshotted after this instant, so a read that asked before
-    /// it is fully covered — and one that asked *after* it must not use this
-    /// round, because a fact from the interval between would be missing.
-    pub dispatched_at: Instant,
+    /// The instant the round was taken **before** it asked its first relay
+    /// anything. Every answer it collects is snapshotted after this, so a read that
+    /// arrived before it is fully covered — and one that arrived after it must not
+    /// use this round, because a fact from the interval between could be missing
+    /// from the snapshot of a relay that answered early.
+    pub started_before_any_request: Instant,
     /// The relays that answered inside the round's deadline.
     pub attested: Arc<HashSet<RelayId>>,
     /// The relays whose answer was fenced — a subset of `attested`.
@@ -342,9 +354,10 @@ impl LoadStateAttest {
     /// cancelled mid-round leaves the next caller free to lead rather than wedging
     /// the session.
     ///
-    /// A joiner must still check the round's `dispatched_at` against its own arrival
-    /// (see the module docs): a round already dispatched when it joined answers a
-    /// question older than the one it asked.
+    /// A joiner must still check the round's `started_before_any_request` against its
+    /// own arrival (see the module docs): a round that had begun asking before it
+    /// joined answers a question older than the one it asked. [`shared_round`] is
+    /// that whole protocol; prefer it to driving this by hand.
     pub fn begin_round(&self, tenant: &TenantId, session: SessionId) -> RoundEntry {
         let key = (tenant.clone(), session);
         let mut state = self.inner.state.lock();
@@ -417,6 +430,54 @@ impl Drop for RoundLeader {
     /// session with an entry nobody will ever fill. Idempotent with `publish`.
     fn drop(&mut self) {
         self.inner.state.lock().rounds.remove(&self.key);
+    }
+}
+
+/// Obtains an attestation round that covers a read arriving now: leads a fresh one
+/// by calling `run_round`, or shares the round already running for the session.
+///
+/// Sharing is what keeps a tenant polling one session from multiplying the
+/// fleet-wide fanout by its requests in flight. It is sound only with the arrival
+/// check here: a round that had already begun asking when this read arrived answers
+/// an *older* question than this one, and everything the relays learned in between
+/// could be missing from it — so such a joiner waits that round out and takes the
+/// next one, which necessarily begins after it asked. That costs at most one extra
+/// wait: the next round starts after the one just finished, and therefore after this
+/// read arrived.
+///
+/// `run_round` must stamp the round it returns with the instant taken before it
+/// asked its first relay anything; the comparison here is only as sound as that
+/// stamp.
+pub async fn shared_round<F, Fut>(
+    attest: &LoadStateAttest,
+    tenant: &TenantId,
+    session: SessionId,
+    run_round: F,
+) -> AttestRound
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = AttestRound>,
+{
+    let asked_at = Instant::now();
+    loop {
+        match attest.begin_round(tenant, session) {
+            RoundEntry::Leader(leader) => {
+                let round = run_round().await;
+                leader.publish(round.clone());
+                return round;
+            }
+            RoundEntry::Joined(watch) => {
+                if let Some(round) = joined_round(watch).await
+                    && round.started_before_any_request >= asked_at
+                {
+                    return round;
+                }
+                // Either the leader left without an outcome, or the round it ran
+                // began before this read arrived. Round again: the entry is gone by
+                // now, so this read leads or joins a round that starts after it
+                // asked.
+            }
+        }
     }
 }
 
@@ -617,15 +678,116 @@ mod tests {
         assert!(matches!(other, RoundEntry::Leader(_)));
         assert_eq!(attest.round_count(), 2);
 
-        let dispatched_at = Instant::now();
+        let started_before_any_request = Instant::now();
         leader.publish(AttestRound {
-            dispatched_at,
+            started_before_any_request,
             attested: Arc::new(HashSet::from([RelayId(1)])),
             fenced: Arc::new(HashSet::from([RelayId(1)])),
         });
         let joined = joined_round(watch).await.expect("the round published");
-        assert_eq!(joined.dispatched_at, dispatched_at);
+        assert_eq!(
+            joined.started_before_any_request,
+            started_before_any_request
+        );
         assert_eq!(*joined.attested, HashSet::from([RelayId(1)]));
+    }
+
+    /// A round stamped as having begun at `started`, carrying `relay` as its one
+    /// attesting and fenced answerer.
+    fn round_started_at(started: Instant, relay: RelayId) -> AttestRound {
+        AttestRound {
+            started_before_any_request: started,
+            attested: Arc::new(HashSet::from([relay])),
+            fenced: Arc::new(HashSet::from([relay])),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_that_arrived_mid_round_leads_its_own() {
+        // The interleaving the boundary exists for: the leader takes its instant and
+        // asks relay 1, which snapshots and answers; a read arrives; only then is
+        // relay 2 asked. Relay 1's snapshot predates the second read entirely, so
+        // the round cannot answer it however late the fan-out finished — the read
+        // waits the round out and runs one of its own.
+        let attest = LoadStateAttest::new();
+        let rounds_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let joiner = tokio::spawn({
+            let attest = attest.clone();
+            let rounds_run = Arc::clone(&rounds_run);
+            async move {
+                // Arrives while the leader's round is mid-fan-out.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                shared_round(&attest, &tid(), SessionId(5), || {
+                    rounds_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::future::ready(round_started_at(Instant::now(), RelayId(2)))
+                })
+                .await
+            }
+        });
+
+        let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+            panic!("the first caller leads");
+        };
+        // The boundary, taken before the first relay is asked.
+        let started_before_any_request = Instant::now();
+        // Relay 1 answers, the joiner arrives, relay 2 is asked, the round finishes.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        leader.publish(round_started_at(started_before_any_request, RelayId(1)));
+
+        let joined = joiner.await.expect("the joining read finishes");
+        assert_eq!(
+            *joined.attested,
+            HashSet::from([RelayId(2)]),
+            "the joiner answered from its own round, not the one it arrived into",
+        );
+        assert_eq!(
+            rounds_run.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and it ran exactly one round of its own",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_arrived_before_the_boundary_shares_the_round() {
+        // The other side of the same rule, and the reason sharing is worth having:
+        // a read already waiting when the round took its instant is covered by every
+        // snapshot that round collects, so it answers from the shared outcome and
+        // costs the fleet no questions of its own.
+        let attest = LoadStateAttest::new();
+        let rounds_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+            panic!("the first caller leads");
+        };
+        let joiner = tokio::spawn({
+            let attest = attest.clone();
+            let rounds_run = Arc::clone(&rounds_run);
+            async move {
+                shared_round(&attest, &tid(), SessionId(5), || {
+                    rounds_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::future::ready(round_started_at(Instant::now(), RelayId(2)))
+                })
+                .await
+            }
+        });
+
+        // Let the joiner arrive and park on the round, then take the boundary and
+        // run the fan-out.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        leader.publish(round_started_at(Instant::now(), RelayId(1)));
+
+        let joined = joiner.await.expect("the joining read finishes");
+        assert_eq!(
+            *joined.attested,
+            HashSet::from([RelayId(1)]),
+            "the joiner answers from the round it shared",
+        );
+        assert_eq!(
+            rounds_run.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "and asks the fleet nothing of its own",
+        );
     }
 
     #[tokio::test]

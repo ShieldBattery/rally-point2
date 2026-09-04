@@ -441,6 +441,12 @@ pub struct SlotEntry {
     /// client's echoed ack against the fence. Purely a question about stream
     /// position — nothing here reaches the game.
     probe_push: mpsc::Sender<u64>,
+    /// The lifecycle epoch of the QUIC connection this entry was registered for —
+    /// the same value its link task carries and stamps on everything it publishes.
+    /// A reconnect registers a *fresh* entry with a new epoch, so `(slot, epoch)`
+    /// names one link generation where `slot` alone names only a seat that a
+    /// different connection may have taken over in the meantime.
+    connection_epoch: u64,
     shutdown: Arc<Notify>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
@@ -611,10 +617,17 @@ impl Drop for SlotRegistration {
 ///
 /// Refusing a duplicate keeps two connections from claiming one slot; a real
 /// reconnect/takeover path is a later concern.
+///
+/// `connection_epoch` is the dialing connection's lifecycle epoch, recorded on the
+/// entry so a reader can tell this registration apart from the one a reconnect
+/// makes for the same slot. Pass the same value the slot's [`run_slot_link`] is
+/// given: the entry and its link task are one generation, and anything that
+/// resolves an answer from that link matches the pair.
 pub fn register(
     sessions: &Sessions,
     key: &SessionKey,
     slot: SlotId,
+    connection_epoch: u64,
 ) -> Option<(SlotRegistration, SlotInbox)> {
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
     // The forward queue's aggregate resident bytes, shared between the fan-out
@@ -664,6 +677,7 @@ pub fn register(
                 region_push: region_tx,
                 phase_push: phase_tx,
                 probe_push: probe_tx,
+                connection_epoch,
                 shutdown: Arc::clone(&shutdown),
                 provisional_reap: Arc::clone(&provisional_reap),
             },
@@ -754,16 +768,26 @@ pub fn live_slots(sessions: &Sessions) -> Vec<(SessionKey, Vec<SlotId>)> {
         .collect()
 }
 
-/// The slots currently registered for one session, ascending — [`live_slots`] for
-/// a single key, without cloning the whole roster to find it.
-pub fn live_session_slots(sessions: &Sessions, key: &SessionKey) -> Vec<SlotId> {
+/// The slots currently registered for one session paired with the connection epoch
+/// each is registered on, ascending by slot — [`live_slots`] for a single key,
+/// without cloning the whole roster to find it, and carrying the link generation
+/// alongside the seat.
+///
+/// The epoch is what makes two reads of this comparable across a reconnect: a slot
+/// present in both with the *same* epoch was continuously the same link, while the
+/// same slot with a different epoch is a second connection that took the seat over
+/// in between.
+pub fn live_session_slot_epochs(sessions: &Sessions, key: &SessionKey) -> Vec<(SlotId, u64)> {
     let roster = sessions.lock();
     let Some(slots) = roster.get(key) else {
         return Vec::new();
     };
-    let mut slot_ids: Vec<SlotId> = slots.keys().copied().collect();
-    slot_ids.sort_by_key(|s| s.0);
-    slot_ids
+    let mut links: Vec<(SlotId, u64)> = slots
+        .iter()
+        .map(|(slot, entry)| (*slot, entry.connection_epoch))
+        .collect();
+    links.sort_by_key(|(slot, _)| slot.0);
+    links
 }
 
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
@@ -1106,18 +1130,26 @@ pub(crate) fn deliver_session_start_to_slot(
     }
 }
 
-/// Pushes a load-state fence probe carrying `probe_id` down `slot`'s control
-/// stream, returning whether it was queued.
+/// Pushes a load-state fence probe carrying `probe_id` down the control stream of
+/// the link registered for `slot` on `connection_epoch`, returning whether it was
+/// queued.
 ///
-/// `false` means there is no fence for this slot and the caller must read it as
-/// unfenced: the slot is no longer registered (its link ended between the caller
-/// reading the roster and this call), or its push queue is full. Never blocks —
-/// the caller is the relay's coordinator connection, which must not be parked by
-/// one slow client.
+/// The epoch is what makes this target one *link* rather than one seat. A slot the
+/// caller read from the roster can be replaced by a reconnect before this call
+/// runs, and the replacement is a different client stream with its own queue of
+/// owed reports — probing it would answer a question about a connection the caller
+/// never asked about. So a registration whose epoch differs is treated exactly like
+/// an absent one.
+///
+/// `false` means there is no fence for this link and the caller must read it as
+/// unfenced: the slot is no longer registered, the registration is a different
+/// connection's, or the push queue is full. Never blocks — the caller is the
+/// relay's coordinator connection, which must not be parked by one slow client.
 pub(crate) fn deliver_load_state_probe_to_slot(
     sessions: &Sessions,
     key: &SessionKey,
     slot: SlotId,
+    connection_epoch: u64,
     probe_id: u64,
 ) -> bool {
     let sender = {
@@ -1125,6 +1157,7 @@ pub(crate) fn deliver_load_state_probe_to_slot(
         roster
             .get(key)
             .and_then(|slots| slots.get(&slot))
+            .filter(|entry| entry.connection_epoch == connection_epoch)
             .map(|entry| entry.probe_push.clone())
     };
     sender.is_some_and(|tx| tx.try_send(probe_id).is_ok())
@@ -2722,9 +2755,11 @@ pub async fn run_slot_link(
                     // had signalled is already handled above. An ack for a probe
                     // the relay no longer holds — a repeat, or one whose fence
                     // already lapsed — resolves nothing and is dropped without
-                    // closing the link.
+                    // closing the link. The epoch is this task's own, so the ack
+                    // fences the connection the probe was actually written to and
+                    // never a later one that took the same seat.
                     Some(ControlInbound::LoadStateProbeAck(probe_id)) => {
-                        if !load_fence.resolve(probe_id, &key, slot) {
+                        if !load_fence.resolve(probe_id, &key, slot, connection_epoch) {
                             tracing::debug!(
                                 tenant = key.tenant.as_ref(),
                                 session = key.session.0,
@@ -4239,17 +4274,17 @@ mod tests {
     #[test]
     fn an_occupied_slot_is_refused() {
         let sessions: Sessions = Arc::default();
-        let (_guard, _inbox) = register(&sessions, &key(), SlotId(0)).expect("first registers");
-        assert!(register(&sessions, &key(), SlotId(0)).is_none());
+        let (_guard, _inbox) = register(&sessions, &key(), SlotId(0), 1).expect("first registers");
+        assert!(register(&sessions, &key(), SlotId(0), 1).is_none());
     }
 
     #[test]
     fn dropping_an_armed_registration_frees_the_slot() {
         let sessions: Sessions = Arc::default();
-        let (guard, _inbox) = register(&sessions, &key(), SlotId(0)).expect("first registers");
+        let (guard, _inbox) = register(&sessions, &key(), SlotId(0), 1).expect("first registers");
         drop(guard);
         // The slot — and the now-empty group — are gone, so it registers anew.
-        assert!(register(&sessions, &key(), SlotId(0)).is_some());
+        assert!(register(&sessions, &key(), SlotId(0), 1).is_some());
     }
 
     #[test]
@@ -4257,8 +4292,8 @@ mod tests {
         let sessions: Sessions = Arc::default();
         assert!(live_slots(&sessions).is_empty(), "a fresh roster is empty");
 
-        let (mut g1, _i1) = register(&sessions, &key(), SlotId(2)).expect("slot 2 registers");
-        let (mut g0, _i0) = register(&sessions, &key(), SlotId(0)).expect("slot 0 registers");
+        let (mut g1, _i1) = register(&sessions, &key(), SlotId(2), 1).expect("slot 2 registers");
+        let (mut g0, _i0) = register(&sessions, &key(), SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
         g1.disarm();
 
@@ -4270,6 +4305,46 @@ mod tests {
             vec![SlotId(0), SlotId(2)],
             "the group's connected slots, in sorted order",
         );
+    }
+
+    #[test]
+    fn a_fence_probe_reaches_only_the_link_generation_it_names() {
+        // A slot read from the roster can be replaced by a reconnect before the
+        // probe is delivered. The replacement is a different client stream with its
+        // own queue of owed reports, so it must not receive — and therefore cannot
+        // ack — a probe issued against the connection it displaced.
+        let sessions: Sessions = Arc::default();
+        let (registration, mut inbox) =
+            register(&sessions, &key(), SlotId(0), 0x51).expect("slot 0 registers");
+
+        assert!(deliver_load_state_probe_to_slot(
+            &sessions,
+            &key(),
+            SlotId(0),
+            0x51,
+            7
+        ));
+        assert_eq!(inbox.try_recv_load_state_probe(), Some(7));
+
+        // The link ends and the client dials back in on a fresh epoch.
+        drop((registration, inbox));
+        let (mut reconnect, mut reconnect_inbox) =
+            register(&sessions, &key(), SlotId(0), 0x52).expect("the reconnect claims the seat");
+        reconnect.disarm();
+
+        assert!(
+            !deliver_load_state_probe_to_slot(&sessions, &key(), SlotId(0), 0x51, 8),
+            "the seat is occupied, but not by the connection the probe names",
+        );
+        assert_eq!(reconnect_inbox.try_recv_load_state_probe(), None);
+        assert!(deliver_load_state_probe_to_slot(
+            &sessions,
+            &key(),
+            SlotId(0),
+            0x52,
+            9
+        ));
+        assert_eq!(reconnect_inbox.try_recv_load_state_probe(), Some(9));
     }
 
     /// A refused admission's light teardown removes exactly the scaffolding
@@ -4306,7 +4381,7 @@ mod tests {
         mesh.gates.reopen(&k);
 
         // An occupied roster owns the session's state: kept.
-        let (_reg, _inbox) = register(&sessions, &k, SlotId(0)).expect("registers");
+        let (_reg, _inbox) = register(&sessions, &k, SlotId(0), 1).expect("registers");
         assert!(mesh.provisional_turns.reserve(&k));
         abandon_refused_admission(&sessions, &mesh, &k);
         assert_eq!(
@@ -4328,7 +4403,7 @@ mod tests {
         let mesh = crate::mesh::new_mesh_state();
         mesh.provisional_turns.arm();
         let k = key();
-        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("the leaver registers");
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("the leaver registers");
         g1.disarm();
         // Admission marks the undescribed session for the provisional sweep.
         assert!(
@@ -4379,9 +4454,9 @@ mod tests {
         let sessions: Sessions = Arc::default();
         let mesh = crate::mesh::new_mesh_state();
         let k = key();
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
-        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         g1.disarm();
         let flight = mesh.decision_makers.flight_recorder().clone();
 
@@ -4424,7 +4499,7 @@ mod tests {
         let sessions: Sessions = Arc::default();
         let mesh = crate::mesh::new_mesh_state();
         let k = key();
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
 
         crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
@@ -4474,7 +4549,7 @@ mod tests {
         consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(50));
         crate::presence::set_order(&mesh.presence, &k, vec![Candidate::SelfRelay]);
 
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
         // The serve path reports own presence right after registering; without a
         // live report the session is never `ever_live` and the abandoned-expiry
@@ -4549,7 +4624,7 @@ mod tests {
         );
         consensus::mark_session_started(&mesh.decision_makers, &k);
 
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
         crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
 
@@ -4611,7 +4686,7 @@ mod tests {
             false,
         );
 
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
         // A pre-start turn passed the forward gate: seq 1 was received and
         // transport-acked while seq 0 never arrived — the acked hole the
@@ -4647,7 +4722,7 @@ mod tests {
         // is freed — so the coordinated-drain wait converges when the last slot leaves.
         let sessions: Sessions = Arc::default();
         assert!(!holds_any_slots(&sessions), "a fresh roster holds no slots");
-        let (guard, _inbox) = register(&sessions, &key(), SlotId(0)).expect("slot 0 registers");
+        let (guard, _inbox) = register(&sessions, &key(), SlotId(0), 1).expect("slot 0 registers");
         assert!(holds_any_slots(&sessions), "a registered slot is held");
         drop(guard);
         assert!(
@@ -4661,28 +4736,30 @@ mod tests {
         // disarm hands the slot's lifetime to the link task: dropping the guard must
         // not free it, so a concurrent reconnect is still refused.
         let sessions: Sessions = Arc::default();
-        let (mut guard, _inbox) = register(&sessions, &key(), SlotId(0)).expect("first registers");
+        let (mut guard, _inbox) =
+            register(&sessions, &key(), SlotId(0), 1).expect("first registers");
         guard.disarm();
         drop(guard);
-        assert!(register(&sessions, &key(), SlotId(0)).is_none());
+        assert!(register(&sessions, &key(), SlotId(0), 1).is_none());
     }
 
     #[test]
     fn freeing_one_slot_leaves_a_peer_in_the_same_group() {
         let sessions: Sessions = Arc::default();
-        let (slot0, _inbox0) = register(&sessions, &key(), SlotId(0)).expect("slot 0 registers");
-        let (_slot1, _inbox1) = register(&sessions, &key(), SlotId(1)).expect("slot 1 registers");
+        let (slot0, _inbox0) = register(&sessions, &key(), SlotId(0), 1).expect("slot 0 registers");
+        let (_slot1, _inbox1) =
+            register(&sessions, &key(), SlotId(1), 1).expect("slot 1 registers");
         drop(slot0);
         // Slot 0 is reclaimable; slot 1 is untouched.
-        assert!(register(&sessions, &key(), SlotId(0)).is_some());
-        assert!(register(&sessions, &key(), SlotId(1)).is_none());
+        assert!(register(&sessions, &key(), SlotId(0), 1).is_some());
+        assert!(register(&sessions, &key(), SlotId(1), 1).is_none());
     }
 
     #[tokio::test]
     async fn close_slots_signals_a_held_slot_and_is_a_no_op_for_an_absent_one() {
         let sessions: Sessions = Arc::default();
         let k = key();
-        let (mut g0, inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
+        let (mut g0, inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
         g0.disarm();
 
         // Closing a slot this relay does not hold (slot 5) is a no-op — no panic,
@@ -4713,9 +4790,9 @@ mod tests {
         let k = key();
         // Source (0), a healthy peer (1) we keep drained, and a peer (2) we never
         // drain so its queue fills. Disarm the guards — the test owns the roster.
-        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
-        let (mut g2, inbox2) = register(&sessions, &k, SlotId(2)).expect("slot 2 registers");
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
+        let (mut g2, inbox2) = register(&sessions, &k, SlotId(2), 1).expect("slot 2 registers");
         g0.disarm();
         g1.disarm();
         g2.disarm();
@@ -4753,8 +4830,8 @@ mod tests {
         // be byte-isolated: the count bound is what governs honest lagging traffic.
         let sessions: Sessions = Arc::default();
         let k = key();
-        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         g0.disarm();
         g1.disarm();
 
@@ -4782,8 +4859,8 @@ mod tests {
         // byte-isolated well before it reaches the payload-count bound.
         let sessions: Sessions = Arc::default();
         let k = key();
-        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         g0.disarm();
         g1.disarm();
 
@@ -4825,8 +4902,8 @@ mod tests {
         // the budget accepts again once its turns are drained.
         let sessions: Sessions = Arc::default();
         let k = key();
-        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         g0.disarm();
         g1.disarm();
 
@@ -4903,7 +4980,8 @@ mod tests {
         );
 
         // A local client to fan out to.
-        let (mut guard, mut inbox) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut guard, mut inbox) =
+            register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         guard.disarm();
 
         // A turn stamped by the authority arrives over the mesh.
@@ -5079,7 +5157,7 @@ mod tests {
             departing,
             rally_point_proto::ids::GameFrameCount(50),
         );
-        let (mut guard, inbox) = register(&sessions, key, survivor).expect("survivor registers");
+        let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
         guard.disarm();
         (sessions, mesh_links, makers, seen, inbox)
     }
@@ -5264,7 +5342,7 @@ mod tests {
             rally_point_proto::ids::GameFrameCount(50),
         );
 
-        let (mut guard, inbox) = register(&sessions, key, survivor).expect("survivor registers");
+        let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
         guard.disarm();
         (sessions, mesh_links, makers, inbox)
     }
@@ -5605,7 +5683,7 @@ mod tests {
         // announcement below -- mirroring a concurrent `serve_connection`
         // acquiring the roster lock first.
         let (mut reconnect_guard, _reconnect_inbox) =
-            register(&sessions, &k, SlotId(1)).expect("the reconnect claims the roster seat");
+            register(&sessions, &k, SlotId(1), 1).expect("the reconnect claims the roster seat");
         reconnect_guard.disarm();
 
         // The disconnect's teardown -- unaware the seat was already reclaimed --
@@ -5729,8 +5807,8 @@ mod tests {
         consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
         presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
 
-        let (mut g0, _i0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, _i1) = register(&sessions, &k, SlotId(1)).expect("slot 1 registers");
+        let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
         g0.disarm();
         g1.disarm();
         let _ = consensus::note_slot_present(&makers, &k, SlotId(0));
@@ -5796,7 +5874,7 @@ mod tests {
         // Slot 0 re-registers while its drop is still held: register, then claim +
         // reinstate atomically as the server does, then report presence — which
         // re-promotes.
-        let (mut r0, _ri0) = register(&sessions, &k, SlotId(0)).expect("slot 0 re-registers");
+        let (mut r0, _ri0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 re-registers");
         r0.disarm();
         assert!(
             holds.take_if_pending(&k, SlotId(0), || consensus::reinstate_slot(
@@ -5817,7 +5895,7 @@ mod tests {
         );
 
         // Slot 1 re-registers too.
-        let (mut r1, _ri1) = register(&sessions, &k, SlotId(1)).expect("slot 1 re-registers");
+        let (mut r1, _ri1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 re-registers");
         r1.disarm();
         assert!(
             holds.take_if_pending(&k, SlotId(1), || consensus::reinstate_slot(
@@ -5857,8 +5935,8 @@ mod tests {
     async fn connectivity_fans_to_every_local_slot() {
         let k = key();
         let sessions: Sessions = Arc::default();
-        let (mut g0, mut inbox0) = register(&sessions, &k, SlotId(0)).expect("slot 0 registers");
-        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(3)).expect("slot 3 registers");
+        let (mut g0, mut inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
+        let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(3), 1).expect("slot 3 registers");
         g0.disarm();
         g1.disarm();
 
@@ -6163,7 +6241,7 @@ mod tests {
             ))
         );
         let (_registration, _inbox) =
-            register(&sessions, &k, SlotId(0)).expect("the returning slot registers");
+            register(&sessions, &k, SlotId(0), 1).expect("the returning slot registers");
         crate::presence::record_own(&presence, &k, 1);
         reconcile_abandon(
             &sessions,
@@ -6217,7 +6295,7 @@ mod tests {
             ))
         );
         let (_registration, _inbox) =
-            register(&sessions, &k, SlotId(0)).expect("the returning slot registers");
+            register(&sessions, &k, SlotId(0), 1).expect("the returning slot registers");
         crate::presence::record_own(&presence, &k, 1);
 
         // ...and the expiry callback fires anyway (the ordering where its sleep
@@ -6285,7 +6363,7 @@ mod tests {
         drop_slot(&makers, &holds, &k, SlotId(1));
         // Slot 0 is still connected: the session is not empty session-wide.
         let (_registration, _inbox) =
-            register(&sessions, &k, SlotId(0)).expect("the live slot registers");
+            register(&sessions, &k, SlotId(0), 1).expect("the live slot registers");
         crate::presence::record_own(&presence, &k, 1);
 
         reconcile_abandon(
@@ -6457,8 +6535,8 @@ mod tests {
             None,
             false,
         );
-        let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0)).unwrap();
-        let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1)).unwrap();
+        let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0), 1).unwrap();
+        let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).unwrap();
 
         let turn_us: u64 = 41_667;
         let base = Instant::now();

@@ -30,11 +30,24 @@
 //! never connected here holds nothing to fence — no client ever had a stream to
 //! this relay for it — so its absence needs no probe to be attestable.
 //!
+//! # A probe names a connection, not a seat
+//!
+//! Everything above is a claim about one *stream*, so every probe is bound to the
+//! link generation it went down: the session, the slot, and that connection's
+//! lifecycle epoch. A client that reconnects takes the same slot back on a fresh
+//! stream whose queue of owed reports the old stream's ack says nothing about, so
+//! an ack that comes up on a different epoch is discarded exactly like one from a
+//! different slot. Whoever fences compares the same triple on both sides of the
+//! wait: a slot present before and after with the same epoch was the same link
+//! throughout, and any other pairing is a membership change the fence cannot
+//! vouch across.
+//!
 //! # Shape
 //!
 //! One map of outstanding probes keyed by probe id, behind a plain (non-async)
-//! mutex: every critical section is a short, await-free insert or lookup. Clone
-//! the fence cheaply (state is behind one `Arc`) to share it between the
+//! mutex: every critical section is a short, await-free insert or lookup, plus a
+//! semaphore capping how many fences run at once ([`MAX_ACTIVE_LOAD_FENCES`]).
+//! Clone the fence cheaply (state is behind one `Arc`) to share it between the
 //! coordinator connection that probes and the slot-link tasks that resolve.
 //!
 //! Nothing here is retried or replayed: a probe is meaningful only to the
@@ -47,22 +60,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::routing::SessionKey;
 
+/// How many load-state fences this relay runs at once.
+///
+/// A fence occupies a task for up to its whole timeout while it waits on game
+/// clients, so without a cap the only thing between a burst of reads and an
+/// unbounded pile of waiting tasks is how fast the coordinator asks. A permit is
+/// taken *before* a fence starts and held for its whole life, so what this bounds
+/// is the probing in flight, not the answers already finished. Sized well above the
+/// sessions one relay serves at once, so reaching it means reads are arriving
+/// faster than clients answer them — at which point shedding is the honest
+/// response: an unanswered question reads as "did not attest", exactly like a relay
+/// that is slow or gone, and the caller's next read gets a fresh chance.
+pub const MAX_ACTIVE_LOAD_FENCES: usize = 32;
+
 /// The relay's load-state fence broker.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LoadStateFence {
     inner: Arc<Inner>,
 }
 
-#[derive(Default)]
+impl Default for LoadStateFence {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                next_probe_id: AtomicU64::new(0),
+                pending: Mutex::new(HashMap::new()),
+                active: Arc::new(Semaphore::new(MAX_ACTIVE_LOAD_FENCES)),
+            }),
+        }
+    }
+}
+
 struct Inner {
     /// Mints probe ids, strictly increasing for the relay process's lifetime so
     /// an id is never reused and a late ack can never match a later probe.
     next_probe_id: AtomicU64,
     pending: Mutex<HashMap<u64, PendingProbe>>,
+    /// One permit per fence allowed to run at once (see
+    /// [`MAX_ACTIVE_LOAD_FENCES`]). Held for the fence's whole life, so a fence
+    /// whose asker has already given up still occupies its permit until it
+    /// actually finishes — which is the point: the cost being bounded is the
+    /// waiting, and abandoned waiting costs the same as awaited waiting.
+    active: Arc<Semaphore>,
 }
 
 /// One outstanding probe: who it was sent to, and where the ack goes.
@@ -74,6 +117,11 @@ struct PendingProbe {
     /// The probed slot, as the relay authenticated it on the link the probe went
     /// down.
     slot: SlotId,
+    /// The lifecycle epoch of the link the probe went down. A probe asks about one
+    /// client stream's position, and a reconnect opens a *new* stream with its own
+    /// queue of owed reports, so an ack arriving on a different connection answers
+    /// a different question and is discarded.
+    connection_epoch: u64,
     ack: oneshot::Sender<()>,
 }
 
@@ -117,10 +165,18 @@ impl LoadStateFence {
         Self::default()
     }
 
-    /// Registers a probe for `slot` in `key`, returning the handle that carries
-    /// its id and waits for its ack. The caller sends the frame itself; nothing
-    /// is reserved on the slot's link here.
-    pub fn probe(&self, key: &SessionKey, slot: SlotId) -> PendingAck {
+    /// Takes one of the [`MAX_ACTIVE_LOAD_FENCES`] permits, or `None` when they
+    /// are all held. Hold the returned permit for the fence's whole life — it is
+    /// what bounds the probing in flight — and shed the ask when it is `None`.
+    pub fn try_start(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.inner.active).try_acquire_owned().ok()
+    }
+
+    /// Registers a probe for `slot` in `key` on link generation
+    /// `connection_epoch`, returning the handle that carries its id and waits for
+    /// its ack. The caller sends the frame itself; nothing is reserved on the
+    /// slot's link here.
+    pub fn probe(&self, key: &SessionKey, slot: SlotId, connection_epoch: u64) -> PendingAck {
         let probe_id = self.inner.next_probe_id.fetch_add(1, Ordering::Relaxed);
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner.pending.lock().insert(
@@ -128,6 +184,7 @@ impl LoadStateFence {
             PendingProbe {
                 key: key.clone(),
                 slot,
+                connection_epoch,
                 ack: ack_tx,
             },
         );
@@ -142,18 +199,26 @@ impl LoadStateFence {
     /// it matched an outstanding probe.
     ///
     /// An ack is accepted only when its id names a probe that is still
-    /// outstanding **and** that probe went to this exact slot of this exact
-    /// session. Anything else — an id already acked, an id from an earlier
-    /// fence, an id another slot's probe owns — is discarded rather than
-    /// honored: the fence's whole value is that each slot answered for itself,
-    /// so one client must never be able to ack in another's name. `key` and
-    /// `slot` are the values the relay authenticated on the link the ack arrived
-    /// on, never anything the frame carried.
-    pub fn resolve(&self, probe_id: u64, key: &SessionKey, slot: SlotId) -> bool {
+    /// outstanding **and** that probe went down this exact link: the same
+    /// session, the same slot, and the same connection epoch. Anything else — an
+    /// id already acked, an id from an earlier fence, an id another slot's probe
+    /// owns, an id acked on the connection that replaced the probed one — is
+    /// discarded rather than honored: the fence's whole value is that each client
+    /// stream answered for its own position, so neither another client nor a
+    /// later connection of the same client may ack in its name. `key`, `slot` and
+    /// `connection_epoch` are the values the relay authenticated on the link the
+    /// ack arrived on, never anything the frame carried.
+    pub fn resolve(
+        &self,
+        probe_id: u64,
+        key: &SessionKey,
+        slot: SlotId,
+        connection_epoch: u64,
+    ) -> bool {
         let mut pending = self.inner.pending.lock();
-        let matches = pending
-            .get(&probe_id)
-            .is_some_and(|probe| probe.key == *key && probe.slot == slot);
+        let matches = pending.get(&probe_id).is_some_and(|probe| {
+            probe.key == *key && probe.slot == slot && probe.connection_epoch == connection_epoch
+        });
         if !matches {
             return false;
         }
@@ -190,37 +255,46 @@ mod tests {
         }
     }
 
+    /// A link generation to probe on. Any two distinct values would do — the
+    /// epoch is an equality fence, not an ordering key.
+    const EPOCH: u64 = 0xa1;
+    const REPLACEMENT_EPOCH: u64 = 0xb2;
+
     #[tokio::test]
     async fn an_ack_from_the_probed_slot_releases_its_waiter() {
         let fence = LoadStateFence::new();
-        let mut pending = fence.probe(&key(5), SlotId(2));
-        assert!(fence.resolve(pending.probe_id(), &key(5), SlotId(2)));
+        let mut pending = fence.probe(&key(5), SlotId(2), EPOCH);
+        assert!(fence.resolve(pending.probe_id(), &key(5), SlotId(2), EPOCH));
         assert!(pending.recv().await);
     }
 
     #[tokio::test]
-    async fn an_ack_never_matches_another_slot_session_or_fence() {
+    async fn an_ack_never_matches_another_slot_session_fence_or_connection() {
         let fence = LoadStateFence::new();
-        let mut pending = fence.probe(&key(5), SlotId(2));
+        let mut pending = fence.probe(&key(5), SlotId(2), EPOCH);
         let probe_id = pending.probe_id();
 
         // Another slot on the same session acking in slot 2's name.
-        assert!(!fence.resolve(probe_id, &key(5), SlotId(3)));
+        assert!(!fence.resolve(probe_id, &key(5), SlotId(3), EPOCH));
         // The right slot, the wrong session.
-        assert!(!fence.resolve(probe_id, &key(6), SlotId(2)));
+        assert!(!fence.resolve(probe_id, &key(6), SlotId(2), EPOCH));
+        // The right slot of the right session, on the connection that replaced
+        // the probed one: a different stream, holding whatever the game signalled
+        // since, so it cannot answer for the stream that was asked.
+        assert!(!fence.resolve(probe_id, &key(5), SlotId(2), REPLACEMENT_EPOCH));
         // An id nobody is waiting on.
-        assert!(!fence.resolve(probe_id.wrapping_add(1), &key(5), SlotId(2)));
+        assert!(!fence.resolve(probe_id.wrapping_add(1), &key(5), SlotId(2), EPOCH));
         // None of that consumed the probe, and the real ack still lands.
-        assert!(fence.resolve(probe_id, &key(5), SlotId(2)));
+        assert!(fence.resolve(probe_id, &key(5), SlotId(2), EPOCH));
         assert!(pending.recv().await);
         // A second ack for the same id is stale: the probe is consumed.
-        assert!(!fence.resolve(probe_id, &key(5), SlotId(2)));
+        assert!(!fence.resolve(probe_id, &key(5), SlotId(2), EPOCH));
     }
 
     #[tokio::test]
     async fn a_waiter_that_gives_up_retires_its_probe() {
         let fence = LoadStateFence::new();
-        let pending = fence.probe(&key(5), SlotId(2));
+        let pending = fence.probe(&key(5), SlotId(2), EPOCH);
         let probe_id = pending.probe_id();
         assert_eq!(fence.pending_count(), 1);
 
@@ -231,8 +305,29 @@ mod tests {
             "the map tracks running fences only"
         );
         assert!(
-            !fence.resolve(probe_id, &key(5), SlotId(2)),
+            !fence.resolve(probe_id, &key(5), SlotId(2), EPOCH),
             "an ack for an abandoned fence is discarded",
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_capped_number_of_fences_may_run_at_once() {
+        // The bound is on fences *running*, so a permit is unavailable while its
+        // fence is alive however long that fence waits, and is free again the
+        // moment it finishes.
+        let fence = LoadStateFence::new();
+        let permits: Vec<_> = (0..MAX_ACTIVE_LOAD_FENCES)
+            .map(|_| fence.try_start().expect("a fence under the cap starts"))
+            .collect();
+        assert!(
+            fence.try_start().is_none(),
+            "a fence over the cap is shed rather than queued",
+        );
+
+        drop(permits);
+        assert!(
+            fence.try_start().is_some(),
+            "a finished fence frees its permit for the next ask",
         );
     }
 }

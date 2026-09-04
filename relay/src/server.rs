@@ -455,10 +455,9 @@ async fn serve_connection(
     // a concurrent descriptor retirement, so a stale dial can neither slip in
     // behind the sweep (recreating roster/seen state for a session with no
     // lifecycle left) nor land between the check and the register.
-    let Some(registered) = mesh
-        .gates
-        .with_ingress(&key, || routing::register(&sessions, &key, authorized.slot))
-    else {
+    let Some(registered) = mesh.gates.with_ingress(&key, || {
+        routing::register(&sessions, &key, authorized.slot, connection_epoch)
+    }) else {
         connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
         return Err(ConnError::SessionRetired {
             tenant: key.tenant,

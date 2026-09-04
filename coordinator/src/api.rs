@@ -879,42 +879,18 @@ async fn session_load_state(
 }
 
 /// Obtains an attestation round covering this read: leads a fresh one, or shares the
-/// round already running for the session.
-///
-/// Sharing is what keeps a tenant polling one session from multiplying the
-/// fleet-wide fanout by its requests in flight. It is sound only with the arrival
-/// check below: a round that had already dispatched its questions when this read
-/// arrived answers an *older* question than this one, and everything the relays
-/// learned in between would be missing from it — so such a joiner waits that round
-/// out and takes the next one, which necessarily dispatches after it asked. That
-/// costs at most one extra wait: the next round starts after the one just finished,
-/// and therefore after this read arrived.
+/// round already running for the session (see [`crate::attest::shared_round`] for
+/// why sharing is sound and what a joiner has to check).
 async fn attest_round(
     state: &CoordinatorState,
     tenant: &TenantId,
     session: SessionId,
     serving: &[RelayId],
 ) -> crate::attest::AttestRound {
-    let asked_at = std::time::Instant::now();
-    loop {
-        match state.setup.attest().begin_round(tenant, session) {
-            crate::attest::RoundEntry::Leader(leader) => {
-                let round = attest_serving_relays(state, tenant, session, serving).await;
-                leader.publish(round.clone());
-                return round;
-            }
-            crate::attest::RoundEntry::Joined(watch) => {
-                if let Some(round) = crate::attest::joined_round(watch).await
-                    && round.dispatched_at >= asked_at
-                {
-                    return round;
-                }
-                // Either the leader left without an outcome, or the round it ran
-                // predates this read. Round again: the entry is gone by now, so this
-                // read leads or joins a round that starts after it asked.
-            }
-        }
-    }
+    crate::attest::shared_round(state.setup.attest(), tenant, session, || {
+        attest_serving_relays(state, tenant, session, serving)
+    })
+    .await
 }
 
 /// Asks every relay in `serving` for its snapshot of the session and reports which
@@ -933,6 +909,12 @@ async fn attest_serving_relays(
     session: SessionId,
     serving: &[RelayId],
 ) -> crate::attest::AttestRound {
+    // Taken BEFORE the first question is queued, so it is a lower bound on every
+    // snapshot this round collects. Stamping it after the fan-out instead would let
+    // it postdate a read that arrived after the earliest-asked relay had already
+    // snapshotted, and that read would then accept a round blind to the interval it
+    // asked about.
+    let started_before_any_request = tokio::time::Instant::now();
     let mut pending: Vec<_> = serving
         .iter()
         .filter_map(|&relay| {
@@ -943,10 +925,6 @@ async fn attest_serving_relays(
                 .map(|waiter| (relay, waiter))
         })
         .collect();
-    // Stamped once every question is queued, so it is the instant *all* of this
-    // round's answers are ordered after — the boundary a read joining this round has
-    // to clear.
-    let dispatched_at = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + LOAD_STATE_ATTEST_TIMEOUT;
     let mut attested = std::collections::HashSet::new();
     let mut fenced = std::collections::HashSet::new();
@@ -959,7 +937,7 @@ async fn attest_serving_relays(
         }
     }
     crate::attest::AttestRound {
-        dispatched_at,
+        started_before_any_request,
         attested: std::sync::Arc::new(attested),
         fenced: std::sync::Arc::new(fenced),
     }

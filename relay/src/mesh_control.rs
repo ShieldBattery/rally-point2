@@ -1509,9 +1509,9 @@ mod tests {
 
         // The survivor — and the departed subject itself — both admitted
         // before any descriptor arrived (provisional admission).
-        let (_reg, mut inbox) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        let (_reg, mut inbox) = crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
         let (_subject_reg, subject_inbox) =
-            crate::routing::register(&sessions, &key(1), SlotId(1)).unwrap();
+            crate::routing::register(&sessions, &key(1), SlotId(1), 1).unwrap();
         let subject_shutdown = subject_inbox.shutdown_handle();
 
         let mut desc = descriptor(1, &[]);
@@ -1564,7 +1564,8 @@ mod tests {
             .with_broadcast(sessions.clone(), mesh_state.links.clone())
             .with_turn_path(mesh_state.clone());
 
-        let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        let (_reg, mut survivor) =
+            crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
         crate::mesh::forward_client_turn(
             &sessions,
             &mesh_state,
@@ -1608,7 +1609,8 @@ mod tests {
             .with_broadcast(sessions.clone(), mesh_state.links.clone())
             .with_turn_path(mesh_state.clone());
 
-        let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        let (_reg, mut survivor) =
+            crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
         // The departed subject dials provisionally and originates a turn past
         // its sealed count before the descriptor lands.
         crate::mesh::forward_client_turn(
@@ -1666,7 +1668,8 @@ mod tests {
             .with_broadcast(sessions.clone(), mesh_state.links.clone())
             .with_turn_path(mesh_state.clone());
 
-        let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0)).unwrap();
+        let (_reg, mut survivor) =
+            crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
         // The leaver plays two framed turns and cleanly leaves, all before the
         // descriptor arrives — everything lands in the journal.
         for seq in 0..2 {
@@ -1949,9 +1952,9 @@ mod tests {
         // Seat slots {0, 1} in the roster, as registration does before a link
         // task runs — hold the guards and inboxes so the slots stay registered
         // and the delivered start directive can be observed.
-        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
             .expect("slot 0 registers into an empty roster");
-        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+        let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1), 1)
             .expect("slot 1 registers into an empty roster");
 
         // Each slot's announce raced ahead of the descriptor: with no maker yet,
@@ -1997,7 +2000,7 @@ mod tests {
         let sessions = Sessions::default();
         let mesh_links = crate::mesh::new_mesh_links();
 
-        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0))
+        let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
             .expect("slot 0 registers into an empty roster");
         assert!(
             !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
@@ -2022,7 +2025,7 @@ mod tests {
         // Slot 1 dials and announces after the descriptor applied: this completes
         // the expected set and starts the session, exactly as the live announce
         // path does. No premature start came from the reconcile.
-        let (_reg1, _inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1))
+        let (_reg1, _inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1), 1)
             .expect("slot 1 registers after the descriptor applied");
         assert!(
             consensus::note_slot_present(&makers, &key(1), SlotId(1)),

@@ -1162,9 +1162,19 @@ So before it snapshots, a relay **fences** the session against its own clients: 
 connected and not yet started gets a small probe down that slot's control stream, and the relay waits for the
 echoed acknowledgement. The client answers a probe by writing any report it owes *and then* the ack, on that
 same stream; because the stream is ordered, an ack that arrives proves nothing of that slot's is still behind
-it. The snapshot is taken after the acks, since a probe may have delivered a report on the way. The relay
-answers `fenced: true` only when every probed slot acked inside its (deliberately shorter than the
-coordinator's) wait, and the coordinator requires that of every serving relay before it will say `known`.
+it. The snapshot is taken after the acks, since a probe may have delivered a report on the way. The
+coordinator requires a fenced answer from every serving relay before it will say `known`.
+
+A probe answers for one *link*, never for a seat. Every probe is issued against the connection epoch the slot
+held when the roster was read, delivered only to that connection, and accepted only from it — a client that
+reconnects takes its slot back on a fresh stream whose queue of owed reports the old stream's ack says
+nothing about. So the relay reads the roster again after the acks and answers `fenced: true` only when every
+probe it issued was acked inside its (deliberately shorter than the coordinator's) wait, every slot still
+live and not started acked on the epoch it *still* holds, and no slot it has ever seen connect is away. Any
+membership change across the fence therefore withholds the claim: a client that dials in mid-fence is live
+and unprobed, and one that reconnects after acking is live on an epoch nothing answered for. Both would
+otherwise slip through looking fenced while holding a report. The answer's facts are unaffected either way —
+only the licence to read its absences as proof — and the tenant's next read simply asks again.
 
 Two kinds of slot never get probed, for opposite reasons. A slot that has connected here and is disconnected
 now has no stream to probe and a client that may be holding a report for the stream it opens next, so it can
@@ -1196,12 +1206,20 @@ The exchange is **bounded on every side**, because one read is fleet-wide work a
 It is rate-limited per **tenant** (a small burst over a thirty-a-minute refill, answered `429` with
 `Retry-After` when spent) rather than per session, since the cost is the fanout and not the session named.
 Concurrent reads of one session **share a round of questions**: the first leads, later ones await its
-outcome — and a caller whose read arrived *after* that round put its questions out waits it through and takes
-the next one instead, because a round dispatched before a caller asked answers an older question than the one
-it asked. That costs at most one extra wait and keeps a burst of reads to two rounds rather than one each.
-Every queue the questions travel is bounded and non-blocking: a coordinator-side channel to a relay whose
-writer is behind, and the relay-side channel from its reader to its writer, both shed the question rather
-than queue it, and a shed question reads exactly like a silent relay. On both sides the load-state arms sit
+outcome — and a caller whose read arrived *after* that round began asking waits it through and takes the next
+one instead, because a round that started before a caller asked answers an older question than the one it
+asked. The instant a round is judged by is taken **before its first question goes out**, not after its last:
+a relay asked early can snapshot and answer while the round is still fanning out to the rest of the fleet, so
+an instant stamped at the end of the fan-out can postdate a read that arrived after the earliest snapshot was
+already taken, and that read would then accept a round blind to the interval it asked about. Stamped before
+the first question, the instant is a lower bound on every snapshot the round collects, which is exactly what
+the joiner's comparison needs. Sharing costs at most one extra wait and keeps a burst of reads to two rounds
+rather than one each. Every queue the questions travel is bounded and non-blocking: a coordinator-side
+channel to a relay whose writer is behind, and the relay-side channel from its reader to its writer, both
+shed the question rather than queue it, and a shed question reads exactly like a silent relay. The relay caps
+the fences it runs at once as well, taking a seat before it starts one and holding it until that fence ends —
+the ask channels bound questions *queued*, but a fence occupies a task for as long as its clients take to
+reply, so only a seat bounds the probing itself; an ask that finds none is shed like any other. On both sides the load-state arms sit
 *below* liveness and lifecycle traffic in the writers' priority order — a delayed heartbeat or descriptor
 costs a relay correctness, while a delayed read costs a caller a retry — and the coordinator drops a queued
 question outright once the read waiting on it has gone. The relay likewise answers off its control
