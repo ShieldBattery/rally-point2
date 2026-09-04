@@ -55,7 +55,7 @@ use rally_point_proto::version::{
     CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -124,8 +124,9 @@ struct WriterRoutes {
     challenge_rx: UnboundedReceiver<[u8; 32]>,
     /// A routed flight-upload grant or refusal for the writer's upload machinery.
     flight_grant_rx: UnboundedReceiver<FlightGrant>,
-    /// A routed load-state request for the writer to answer with a snapshot send.
-    load_state_rx: UnboundedReceiver<LoadStateAsk>,
+    /// A routed load-state request for the writer to fence and answer with a
+    /// snapshot send.
+    load_state_rx: Receiver<LoadStateAsk>,
 }
 
 /// The read half's routes to the write half: the frames it decodes but cannot act
@@ -136,16 +137,41 @@ struct ReaderRoutes {
     /// Where a flight-upload grant or refusal goes, to the half that owns the
     /// parked shipment and its upload lifecycle.
     flight_grant_tx: UnboundedSender<FlightGrant>,
-    /// Where a load-state request goes to be snapshotted and answered.
-    load_state_tx: UnboundedSender<LoadStateAsk>,
+    /// Where a load-state request goes to be fenced, snapshotted, and answered.
+    /// Bounded ([`LOAD_STATE_ASK_CAPACITY`]): a full channel drops the question
+    /// rather than parking the read half.
+    load_state_tx: Sender<LoadStateAsk>,
 }
+
+/// How long a load-state answer waits for its fence probes' acknowledgements
+/// before snapshotting with whatever came back.
+///
+/// A probe is one small frame each way on a stream the client is already holding
+/// open, so a healthy client answers within a round-trip's worth of scheduling.
+/// This is sized for a client that is momentarily busy rather than one that is
+/// gone, and it must fit comfortably *inside* the coordinator's own attestation
+/// window: past that window the coordinator has stopped waiting, so a longer
+/// fence would only turn a would-be fenced answer into no answer at all.
+pub const LOAD_STATE_FENCE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Depth of the read half → write half load-state ask channel.
+///
+/// Bounded, and deliberately: the coordinator fans a read out to every relay
+/// serving a session, and a relay whose writer is momentarily behind must not
+/// accumulate questions a caller has long stopped waiting for. A full channel
+/// drops the ask, which the coordinator reads as this relay not having attested
+/// — the same reading a slow or disconnected relay gets — rather than blocking
+/// the read half, which would stall descriptor application behind a load-state
+/// read.
+const LOAD_STATE_ASK_CAPACITY: usize = 64;
 
 /// A coordinator's [`CoordinatorToRelay::LoadStateRequest`], routed from the read
 /// half to the write half (answering it is a send, and only the writer sends).
 ///
 /// The whole point of the exchange is ordering: the answer must be built from what
 /// this relay holds *after* the request arrived, so the routed ask carries only the
-/// question and the writer snapshots the state itself at send time.
+/// question and the writer's fence task snapshots the state itself, after its
+/// probes are answered.
 struct LoadStateAsk {
     /// The coordinator's correlation id, echoed back on the snapshot.
     request_id: u64,
@@ -604,6 +630,12 @@ pub struct HeartbeatSources {
     /// The measured region round-trip cache the ping loop writes; each beat carries
     /// its current medians.
     pub region_rtt_cache: RegionRttCache,
+    /// The load-state fence broker the slot-link tasks resolve clients' probe
+    /// acknowledgements against. A heartbeat never touches it — only an attested
+    /// load-state answer fences — but it lives here because it is read from
+    /// exactly the same handles, and against exactly the same session state, the
+    /// snapshot beside it is built from.
+    pub load_fence: crate::load_fence::LoadStateFence,
 }
 
 /// What each heartbeat carries and how often it goes up.
@@ -939,9 +971,11 @@ async fn connect_and_stream(
     let (flight_grant_tx, flight_grant_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // A load-state request is read on the read half but answered by the write half,
-    // which owns every send and the heartbeat sources the snapshot is built from —
-    // the same shape as the challenge channel.
-    let (load_state_tx, load_state_rx) = tokio::sync::mpsc::unbounded_channel();
+    // which owns every send and the heartbeat sources the snapshot is built from.
+    // Unlike the challenge and grant channels this one is bounded: a load-state read
+    // is a tenant-driven fan-out, so a backed-up writer must shed questions rather
+    // than queue them behind a caller that has already given up.
+    let (load_state_tx, load_state_rx) = tokio::sync::mpsc::channel(LOAD_STATE_ASK_CAPACITY);
 
     // Run both halves until either ends; the first to finish is the connection's
     // outcome, and dropping the other closes its half of the socket. There is no
@@ -1087,14 +1121,22 @@ async fn read_control_frames(
                         // coordinator's completeness claim to hold, and routing an
                         // already-decoded question preserves that: nothing this relay
                         // learns from here on can be excluded from the answer, only
-                        // included. A dropped receiver means the write half is gone and
-                        // the connection is ending, so a failed route is a harmless
-                        // no-op — the coordinator reads the missing answer as this
-                        // relay not having attested.
-                        let _ = load_state_tx.send(LoadStateAsk {
-                            request_id,
-                            key: SessionKey { tenant, session },
-                        });
+                        // included. Offered without blocking: a full queue (a writer
+                        // behind on a burst of reads) or a dropped receiver (the write
+                        // half gone, the connection ending) drops the question, which
+                        // the coordinator reads as this relay not having attested.
+                        if load_state_tx
+                            .try_send(LoadStateAsk {
+                                request_id,
+                                key: SessionKey { tenant, session },
+                            })
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                request_id,
+                                "dropping a load-state request: the writer is behind or gone",
+                            );
+                        }
                     }
                     other => apply_message(
                         &apply_targets.control,
@@ -1210,6 +1252,14 @@ async fn write_control_frames(
     let (put_done_tx, mut put_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<flight_upload::FlightPutDone>();
 
+    // Finished load-state answers coming back from the fence tasks this half
+    // spawns. Bounded by the same cap the inbound ask channel carries, so the
+    // number of answers in flight can never exceed the number of questions that
+    // were admitted; a fence whose answer cannot be queued drops it, which the
+    // coordinator reads as this relay not having attested.
+    let (answers_tx, mut answers_rx) =
+        tokio::sync::mpsc::channel::<LoadStateAnswer>(LOAD_STATE_ASK_CAPACITY);
+
     // Re-request every shipment parked from a prior connection: mint a fresh id and
     // grant deadline for each and re-send its small upload request. This re-arms the
     // per-connection scratch (`request`/`stage`) a reconnect invalidated, so a grant
@@ -1296,25 +1346,6 @@ async fn write_control_frames(
                         answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id).await?;
                     }
                     None => challenge_open = false,
-                }
-            }
-
-            // A load-state request the read half routed here. Answered immediately
-            // from the state this relay already holds — a tenant is blocked on the
-            // coordinator's read while it waits, and its whole value is that the
-            // snapshot is ordered after the request. Below notices (a webhook-bearing
-            // frame still outranks it) and above the flight arms.
-            ask = load_state_rx.recv(), if load_state_open => {
-                match ask {
-                    Some(ask) => {
-                        let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
-                            request_id: ask.request_id,
-                            state: session_load_snapshot(&heartbeat.sources, ask.key),
-                        })
-                        .expect("a load-state snapshot always serializes");
-                        sink.send(Message::Text(frame.into())).await?;
-                    }
-                    None => load_state_open = false,
                 }
             }
 
@@ -1418,6 +1449,44 @@ async fn write_control_frames(
                     region_rtts: heartbeat_region_rtts(&heartbeat.sources.region_rtt_cache),
                 })
                 .expect("a heartbeat always serializes");
+                sink.send(Message::Text(frame.into())).await?;
+            }
+
+            // A load-state request the read half routed here. Ranked BELOW the
+            // heartbeat and every lifecycle-bearing arm above it deliberately: a
+            // load-state read is tenant-driven and can arrive in bursts, while
+            // liveness and webhook-bearing frames are what the fleet's own health
+            // depends on — a read that waits a scheduling turn costs a caller
+            // nothing it cannot recover by reading again, whereas a delayed beat
+            // costs the connection.
+            //
+            // Fenced off this task rather than inline: answering waits on
+            // acknowledgements from game clients, and parking the connection's
+            // only sender on a client round-trip would stall liveness behind an
+            // unrelated tenant's read. The spawned fence snapshots after its
+            // probes resolve — still strictly after the request arrived, which is
+            // the ordering the coordinator's claim rests on — and hands the
+            // finished answer back through `answers` for this half to send.
+            ask = load_state_rx.recv(), if load_state_open => {
+                match ask {
+                    Some(ask) => spawn_load_state_answer(&heartbeat.sources, ask, answers_tx.clone()),
+                    None => load_state_open = false,
+                }
+            }
+
+            // A fence task finished: send its answer. Ranked with the ask arm and
+            // for the same reason. This half holds `answers_tx` for the
+            // connection's whole life, so the channel yields a real answer or
+            // pends — never `None` — and the arm needs no guard.
+            answer = answers_rx.recv() => {
+                let answer = answer
+                    .expect("the write half holds an answer sender for the connection's life");
+                let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                    request_id: answer.request_id,
+                    state: answer.state,
+                    fenced: answer.fenced,
+                })
+                .expect("a load-state snapshot always serializes");
                 sink.send(Message::Text(frame.into())).await?;
             }
 
@@ -1530,14 +1599,144 @@ fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
 /// A session this relay holds nothing for — no maker, no live slot — snapshots to
 /// empty lists, which is this relay attesting that it knows of no arrival rather
 /// than declining to answer.
-fn session_load_snapshot(sources: &HeartbeatSources, key: SessionKey) -> SessionPresence {
-    let slots = crate::routing::live_slots(&sources.sessions)
-        .into_iter()
-        .find(|(live_key, _)| *live_key == key)
-        .map(|(_, slots)| slots)
-        .unwrap_or_default();
-    let load = crate::consensus::retained_load_state(&sources.decision_makers, &key);
+///
+/// Takes the two handles it reads rather than the whole heartbeat sources, so the
+/// fence task — which outlives any borrow of the connection's sources — can take
+/// the same snapshot from its own clones.
+fn session_load_snapshot(
+    sessions: &Sessions,
+    decision_makers: &crate::consensus::DecisionMakers,
+    key: SessionKey,
+) -> SessionPresence {
+    let slots = crate::routing::live_session_slots(sessions, &key);
+    let load = crate::consensus::retained_load_state(decision_makers, &key);
     presence_entry(key, slots, load)
+}
+
+/// A finished load-state answer, handed from a fence task back to the write half
+/// that sends it. Carries the fence verdict beside the snapshot because the two are
+/// one claim: the sets say what this relay saw, and `fenced` says whether it could
+/// rule out a slot's report still sitting in that slot's client.
+struct LoadStateAnswer {
+    /// The coordinator's correlation id, echoed back on the snapshot.
+    request_id: u64,
+    /// What this relay holds for the session, read after the fence resolved.
+    state: SessionPresence,
+    /// Whether every slot that could be holding something back was proven not to
+    /// be (see [`fenced_load_state_snapshot`]).
+    fenced: bool,
+}
+
+/// Runs one load-state answer's fence off the control connection's write half and
+/// hands the finished answer back over `answers`.
+///
+/// Spawned rather than awaited inline because fencing waits on acknowledgements
+/// from game clients: parking the connection's only sender on a client round-trip
+/// would stall heartbeats and webhook-bearing notices behind an unrelated tenant's
+/// read. An answer that cannot be queued back — the writer gone, or already holding
+/// as many answers as questions were admitted — is dropped, which the coordinator
+/// reads as this relay not having attested.
+fn spawn_load_state_answer(
+    sources: &HeartbeatSources,
+    ask: LoadStateAsk,
+    answers: Sender<LoadStateAnswer>,
+) {
+    let sessions = Arc::clone(&sources.sessions);
+    let decision_makers = Arc::clone(&sources.decision_makers);
+    let fence = sources.load_fence.clone();
+    tokio::spawn(async move {
+        let (state, fenced) =
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, ask.key).await;
+        if answers
+            .try_send(LoadStateAnswer {
+                request_id: ask.request_id,
+                state,
+                fenced,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                request_id = ask.request_id,
+                "dropping a load-state answer: the control connection's writer is behind or gone",
+            );
+        }
+    });
+}
+
+/// Fences the session against its own clients, then snapshots it — the answer to a
+/// coordinator load-state question, plus whether that answer's *absences* may be
+/// trusted.
+///
+/// A slot's `GameStarted` travels its own ordered control stream, independently of
+/// the coordinator's question, so what this relay has observed is not by itself
+/// what has happened. Every slot this relay homes that has connected and not yet
+/// started is therefore probed on that stream and waited for: the client writes any
+/// report it owes ahead of its ack, so an ack proves nothing of that slot's is
+/// still behind it. The snapshot is taken **after** the acks, since a probe may
+/// have delivered a report in the meantime.
+///
+/// The verdict is `true` only when both hold:
+///
+/// - every probed slot acked within [`LOAD_STATE_FENCE_TIMEOUT`] — a probe no
+///   stream would take, or one that went unanswered, leaves that slot unfenced; and
+/// - no slot this relay has ever seen connect is now disconnected without having
+///   started. Such a slot has no stream to probe and its client may be holding a
+///   report for the stream it opens next, so it can never be fenced.
+///
+/// A slot that never connected here is not probed and does not spoil the verdict:
+/// no client ever held a stream to this relay for it, so there is nothing of its to
+/// be queued anywhere and its absence is attestable as it stands.
+async fn fenced_load_state_snapshot(
+    sessions: &Sessions,
+    decision_makers: &crate::consensus::DecisionMakers,
+    fence: &crate::load_fence::LoadStateFence,
+    key: SessionKey,
+) -> (SessionPresence, bool) {
+    let started: HashSet<SlotId> = crate::consensus::retained_load_state(decision_makers, &key)
+        .started
+        .into_iter()
+        .collect();
+    let mut probes = Vec::new();
+    let mut every_probe_acked = true;
+    for slot in crate::routing::live_session_slots(sessions, &key) {
+        if started.contains(&slot) {
+            continue;
+        }
+        let pending = fence.probe(&key, slot);
+        if crate::routing::deliver_load_state_probe_to_slot(
+            sessions,
+            &key,
+            slot,
+            pending.probe_id(),
+        ) {
+            probes.push(pending);
+        } else {
+            // Nothing carried the probe — the slot's link ended under us, or its
+            // push queue is full — so no ack can ever come for it.
+            every_probe_acked = false;
+        }
+    }
+    // Every probe goes out before any ack is waited on, and all of them share one
+    // absolute deadline, so the fence costs at most one timeout however many slots
+    // this relay homes and however many of them are slow.
+    let deadline = Instant::now() + LOAD_STATE_FENCE_TIMEOUT;
+    for probe in &mut probes {
+        if !matches!(
+            tokio::time::timeout_at(deadline, probe.recv()).await,
+            Ok(true)
+        ) {
+            every_probe_acked = false;
+        }
+    }
+
+    // Re-read: an acked probe may have delivered a `GameStarted` ahead of its ack,
+    // and that is precisely the fact the fence exists to capture.
+    let state = session_load_snapshot(sessions, decision_makers, key);
+    let unfenceable = state
+        .ever_connected
+        .iter()
+        .any(|slot| !state.slots.contains(slot) && !state.started.contains(slot));
+    (state, every_probe_acked && !unfenceable)
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and
@@ -2762,6 +2961,7 @@ mod tests {
                 sessions: Arc::default(),
                 decision_makers: Arc::new(crate::consensus::new_decision_makers()),
                 region_rtt_cache: RegionRttCache::default(),
+                load_fence: crate::load_fence::LoadStateFence::new(),
             },
             interval,
         }
@@ -3373,6 +3573,7 @@ mod tests {
                     sessions: Arc::clone(&sessions),
                     decision_makers,
                     region_rtt_cache: RegionRttCache::default(),
+                    load_fence: crate::load_fence::LoadStateFence::new(),
                 },
                 interval: Duration::from_millis(50), // beat quickly so the test observes one
             },
@@ -3450,6 +3651,7 @@ mod tests {
             sessions: Arc::clone(&sessions),
             decision_makers: Arc::clone(&decision_makers),
             region_rtt_cache: RegionRttCache::default(),
+            load_fence: crate::load_fence::LoadStateFence::new(),
         };
         assert_eq!(
             heartbeat_presence(&sources),
@@ -3564,6 +3766,7 @@ mod tests {
                     sessions: Arc::clone(&sessions),
                     decision_makers,
                     region_rtt_cache: RegionRttCache::default(),
+                    load_fence: crate::load_fence::LoadStateFence::new(),
                 },
                 // Long enough that the snapshot is not merely a beat in disguise.
                 interval: Duration::from_secs(3600),
@@ -3592,6 +3795,10 @@ mod tests {
                     started: vec![rally_point_proto::ids::SlotId(3)],
                     started_at_ms: None,
                 },
+                // Slot 2 arrived here and is gone: no stream to probe, and its
+                // client may be holding a report for the stream it opens next, so
+                // this answer's absences carry no proof.
+                fenced: false,
             },
         );
     }
@@ -3626,14 +3833,154 @@ mod tests {
             sessions: Arc::clone(&sessions),
             decision_makers: Arc::clone(&decision_makers),
             region_rtt_cache: RegionRttCache::default(),
+            load_fence: crate::load_fence::LoadStateFence::new(),
         };
         assert_eq!(
-            session_load_snapshot(&sources, key(7)),
+            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)),
             heartbeat_presence(&sources)
                 .into_iter()
                 .find(|entry| entry.session == SessionId(7))
                 .expect("the session is on the beat"),
         );
+    }
+
+    /// A session with a decision-maker and no bounds worth speaking of — enough for
+    /// the retained load state a fence reads and re-reads.
+    fn fence_fixture() -> (Sessions, Arc<crate::consensus::DecisionMakers>) {
+        let sessions: Sessions = Arc::default();
+        let decision_makers = Arc::new(crate::consensus::new_decision_makers());
+        let _ = crate::consensus::sync_maker(
+            &decision_makers,
+            &key(7),
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        (sessions, decision_makers)
+    }
+
+    #[tokio::test]
+    async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
+        // The fence's positive case: the one slot that could be holding a report
+        // back answers the probe, so the snapshot's absences may be read as proof.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (mut registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        registration.disarm();
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+
+        // Stand in for slot 0's link task: take the probe off its push queue and
+        // resolve it exactly as `run_slot_link` does on the client's ack.
+        let ack = async {
+            loop {
+                if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                    assert!(fence.resolve(probe_id, &key(7), SlotId(0)));
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let ((state, fenced), ()) = tokio::join!(
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
+            ack,
+        );
+        assert!(fenced, "every slot that could hold something back acked");
+        assert_eq!(state.slots, vec![SlotId(0)]);
+        assert!(state.started.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
+        // Silence is not an ack. The slot's facts still go up — the answer is as
+        // real as any other — but nothing licenses reading its absence from
+        // `started` as proof its game never began. This one waits out a real
+        // `LOAD_STATE_FENCE_TIMEOUT`, which is what a stuck client costs.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (mut registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        registration.disarm();
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+
+        let (state, fenced) =
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+        assert!(!fenced, "an unanswered probe leaves its slot unfenced");
+        assert_eq!(state.slots, vec![SlotId(0)]);
+        assert!(
+            inbox.try_recv_load_state_probe().is_some(),
+            "the probe was written to the slot's stream even though it went unanswered",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_started_slot_is_not_probed_at_all() {
+        // A slot that already reported has nothing left to owe, so the fence spends
+        // no probe on it and the answer is fenced outright.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (mut registration, mut inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        registration.disarm();
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+        crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+
+        let (state, fenced) =
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+        assert!(fenced);
+        assert_eq!(state.started, vec![SlotId(0)]);
+        assert!(
+            inbox.try_recv_load_state_probe().is_none(),
+            "a slot with nothing left to report is not probed",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_connected_and_then_dropped_can_never_be_fenced() {
+        // There is no stream to probe and the client may be holding its report for
+        // the stream it opens next, so this relay cannot vouch for the slot's
+        // absence however promptly everything else answers.
+        use rally_point_proto::ids::SlotId;
+
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+        // The link ends: the guard deregisters the slot, leaving it ever-connected
+        // and not live.
+        drop(registration);
+
+        let (state, fenced) =
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+        assert!(!fenced);
+        assert!(state.slots.is_empty());
+        assert_eq!(state.ever_connected, vec![SlotId(0)]);
+    }
+
+    #[tokio::test]
+    async fn a_slot_that_never_connected_here_needs_no_fence() {
+        // Nothing this relay serves is holding anything for a slot no client ever
+        // opened a stream for, so its absence is attestable as it stands — which is
+        // the whole point of answering an empty session at all.
+        let (sessions, decision_makers) = fence_fixture();
+        let fence = crate::load_fence::LoadStateFence::new();
+
+        let (state, fenced) =
+            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+        assert!(fenced, "an absence with no client behind it needs no probe");
+        assert!(state.slots.is_empty() && state.ever_connected.is_empty());
     }
 
     #[test]
@@ -3646,9 +3993,10 @@ mod tests {
             sessions: Arc::default(),
             decision_makers: Arc::new(crate::consensus::new_decision_makers()),
             region_rtt_cache: RegionRttCache::default(),
+            load_fence: crate::load_fence::LoadStateFence::new(),
         };
         assert_eq!(
-            session_load_snapshot(&sources, key(7)),
+            session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)),
             SessionPresence {
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),
@@ -4555,7 +4903,8 @@ mod tests {
         let (_drain_tx, mut drain_rx) = watch::channel(false);
         let (_challenge_tx, challenge_rx) = mpsc::unbounded_channel::<[u8; 32]>();
         let (_flight_grant_tx, flight_grant_rx) = mpsc::unbounded_channel::<FlightGrant>();
-        let (_load_state_tx, load_state_rx) = mpsc::unbounded_channel::<LoadStateAsk>();
+        let (_load_state_tx, load_state_rx) =
+            mpsc::channel::<LoadStateAsk>(LOAD_STATE_ASK_CAPACITY);
 
         let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlConnStats::new());
         let heartbeat = heartbeat(Duration::from_secs(3600));

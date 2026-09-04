@@ -388,6 +388,31 @@ message ControlFrame {
     // fact up the coordinator pipeline. Accepted at most once per slot per
     // link; a repeat is dropped without closing the link. See `GameStarted`.
     GameStarted game_started = 14;
+
+    // A relay-authored fence probe on this client's control stream (relay →
+    // client only), asking the client to acknowledge the stream's current
+    // position. The relay sends one before it answers the coordinator's
+    // load-state question for a slot that has connected but not yet reported
+    // its game loop running, and waits for the matching
+    // `LoadStateProbeAck` before it snapshots. Because this stream is ordered,
+    // a `GameStarted` the client had already queued (or writes on receiving the
+    // probe) is on the wire ahead of the ack, so an ack proves the relay is not
+    // about to be told something the snapshot claims never happened. Carries no
+    // load state of its own and is never surfaced to the game: the only thing
+    // asked of the client is the ack. A client that predates the frame skips it
+    // and never acks, which the relay reads as an unfenced slot rather than as
+    // a fenced one. See `LoadStateProbe`.
+    LoadStateProbe load_state_probe = 15;
+
+    // A client's acknowledgement of a `LoadStateProbe` (client → relay only),
+    // echoing the probe's id so the relay matches it to the probe it sent and
+    // ignores one for a probe it no longer holds. The client writes it on the
+    // same stream the probe arrived on, AFTER any `GameStarted` it owes, which
+    // is the whole ordering guarantee the fence rests on. Client-asserted only
+    // in its id: the relay binds the ack to the authenticated connection's
+    // slot, never to a slot named in the frame, exactly as it stamps a
+    // `LobbyCommand` author. See `LoadStateProbeAck`.
+    LoadStateProbeAck load_state_probe_ack = 16;
   }
 }
 
@@ -555,6 +580,37 @@ message LeaveIntent {}
 // lifetime and drops a repeat without closing the link, the same structural-only
 // validation it gives a `GameResult`.
 message GameStarted {}
+
+// A relay's fence probe on a client's reliable control stream (relay → client
+// only): "acknowledge where this stream is right now."
+//
+// The relay sends one to each slot it homes that has connected but not yet
+// reported its game loop running, immediately before it answers a coordinator
+// load-state question, and waits for the matching `LoadStateProbeAck`. The
+// probe carries nothing but its id, and the client's only obligation is to
+// write any `GameStarted` it owes and then the ack, both on this same ordered
+// stream. That ordering is the point: a report the game had already handed its
+// client cannot still be behind the ack, so a snapshot taken after the ack
+// cannot claim that slot never started while its report is queued in the
+// client.
+message LoadStateProbe {
+  // The relay's correlation id for this probe, fresh per probe and echoed back
+  // on the ack. Fixed-width because it is an opaque handle rather than a small
+  // counted quantity, so varint compaction buys nothing.
+  fixed64 probe_id = 1;
+}
+
+// A client's acknowledgement of a `LoadStateProbe` (client → relay only).
+//
+// The relay treats it as proof of stream position and nothing else: it names no
+// slot (the relay binds the ack to the authenticated connection) and carries no
+// load state (the relay reads that from what the stream delivered ahead of it).
+// An ack for a probe the relay no longer holds — a repeat, or one from a probe
+// whose fence already timed out — is dropped without closing the link.
+message LoadStateProbeAck {
+  // The probe's id, echoed verbatim.
+  fixed64 probe_id = 1;
+}
 
 // A surviving member's manual request that the session drop a disconnected slot,
 // carried client -> relay and then relay -> relay across the mesh. A

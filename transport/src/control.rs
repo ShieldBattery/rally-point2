@@ -15,9 +15,11 @@
 //! machinery: a relay pushes a `LeaveDirective` down to a surviving client,
 //! and a client pushes a `LeaveIntent` up to announce its own clean
 //! departure. A client also pushes a `GameResult` up with its end-of-game
-//! report, and a `GameStarted` up when its game loop begins running. The reader
-//! skips a frame kind it doesn't know, so the channel can grow chat/resync
-//! frames without a wire break.
+//! report, and a `GameStarted` up when its game loop begins running — the latter
+//! being why the relay can push a `LoadStateProbe` down and read the echoed ack
+//! as proof no such report is still queued in the client. The reader skips a
+//! frame kind it doesn't know, so the channel can grow chat/resync frames
+//! without a wire break.
 
 use prost::Message;
 use prost::bytes::Bytes;
@@ -25,26 +27,20 @@ use rally_point_proto::control_stream::{
     CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
 };
 use rally_point_proto::messages::{
-    ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LobbyCommand,
-    Payload, PhaseApplied, PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop,
-    SessionStart, SlotConnectivity, control_frame,
+    ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LoadStateProbe,
+    LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective, PlayerSkin,
+    RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
 /// A frame surfaced from the reliable control stream to its consumer.
 ///
 /// The stream carries more than one kind now, so the reader hands back a tagged
-/// value rather than a bare payload. On the client edge `OversizeTurn`, `Leave`,
-/// `Lobby`, `Chat`, and `Skin` arrive (the relay forwards oversize turns, pushes
-/// leaves down, and fans lobby commands, chat messages, and skin blobs from other
-/// members down), but never `LeaveIntent` — a client never receives its own intent
-/// back, so the client edge ignores one, mirroring how the relay edge ignores a
-/// stray `Leave`.
-/// On the relay edge, `OversizeTurn`, `LeaveIntent`, `GameResult`,
-/// `GameStarted`, `Lobby`, `Chat`, and `Skin` arrive (a client sends all seven
-/// up); a relay never receives a `Leave` from another relay on this stream, so
-/// the relay edge ignores one.
-/// Unlike every other kind, `Lobby`, `Chat`, and `Skin` are legitimate in *both*
+/// value rather than a bare payload. Most kinds travel one way only, and each
+/// variant's own doc names which: an edge that receives one travelling the wrong
+/// way ignores it rather than tearing the stream down, exactly as the client edge
+/// ignores a stray `LeaveIntent` and the relay edge a stray `Leave`.
+/// Unlike the rest, `Lobby`, `Chat`, and `Skin` are legitimate in *both*
 /// directions — their `slot` field's authority just flips with direction (see
 /// [`LobbyCommand`], [`GameChat`], and [`PlayerSkin`]'s docs).
 #[derive(Debug)]
@@ -140,6 +136,17 @@ pub enum ControlInbound {
     /// delay; a client never receives one back, so the client edge ignores a
     /// stray one just as it does a `LeaveIntent`.
     PhaseApplied(u32),
+    /// A relay's load-state fence probe (relay → client only), carrying the
+    /// probe id to echo. The client answers it by writing any `GameStarted` it
+    /// owes and then the ack, in that order on this same stream. A relay never
+    /// receives one from a client, so the relay edge ignores a stray one just as
+    /// it does a `Leave`.
+    LoadStateProbe(u64),
+    /// A client's acknowledgement of a load-state fence probe (client → relay
+    /// only), surfacing the echoed probe id. The relay binds it to the
+    /// authenticated connection's slot; a client never receives one back, so the
+    /// client edge ignores a stray one just as it does a `LeaveIntent`.
+    LoadStateProbeAck(u64),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -272,6 +279,13 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
                 ControlFrame {
                     kind: Some(control_frame::Kind::PhaseApplied(PhaseApplied { delay_us })),
                 } => ControlInbound::PhaseApplied(delay_us),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::LoadStateProbe(LoadStateProbe { probe_id })),
+                } => ControlInbound::LoadStateProbe(probe_id),
+                ControlFrame {
+                    kind:
+                        Some(control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck { probe_id })),
+                } => ControlInbound::LoadStateProbeAck(probe_id),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -556,6 +570,46 @@ pub async fn send_control_phase_applied(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::PhaseApplied(PhaseApplied { delay_us })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Writes a load-state fence probe down a client's control stream (relay →
+/// client). The relay sends one per probed slot and waits for the echoed
+/// acknowledgement before it snapshots that session; an error means the stream
+/// is gone, so the caller has no fence for that slot and must read the slot as
+/// unfenced rather than treat the failure as a link failure — the probe is a
+/// question about the stream, not traffic the game depends on.
+pub async fn send_control_load_state_probe(
+    control_send: &mut quinn::SendStream,
+    probe_id: u64,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LoadStateProbe(LoadStateProbe {
+            probe_id,
+        })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Acknowledges a load-state fence probe up the control stream (client →
+/// relay), echoing the probe id verbatim. It must be written **after** any
+/// `GameStarted` the client owes, on this same stream, because the relay reads
+/// its arrival as proof that nothing the client had already queued is still
+/// behind it. An error means the stream is gone, in which case the relay's fence
+/// simply times out — the safe reading of silence.
+pub async fn send_control_load_state_probe_ack(
+    control_send: &mut quinn::SendStream,
+    probe_id: u64,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck {
+            probe_id,
+        })),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

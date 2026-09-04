@@ -433,6 +433,14 @@ pub struct SlotEntry {
     /// there is no session-wide map to share. Each message carries the whole
     /// commanded delay (absolute, newest wins), so a repeat is idempotent.
     phase_push: mpsc::Sender<PhaseDirective>,
+    /// Load-state fence probe ids to push down THIS client's reliable control
+    /// stream. Fed by [`deliver_load_state_probe_to_slot`] when this relay is
+    /// about to answer a coordinator load-state question and needs to rule out a
+    /// report of this slot's still queued in its client; drained by this slot's
+    /// link task, which writes a `LoadStateProbe` frame and later resolves the
+    /// client's echoed ack against the fence. Purely a question about stream
+    /// position — nothing here reaches the game.
+    probe_push: mpsc::Sender<u64>,
     shutdown: Arc<Notify>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
@@ -460,6 +468,9 @@ pub struct SlotInbox {
     /// Send-phase directives to push down this client's control stream (see
     /// [`SlotEntry::phase_push`]).
     phase_push_rx: mpsc::Receiver<PhaseDirective>,
+    /// Load-state fence probes to push down this client's control stream (see
+    /// [`SlotEntry::probe_push`]).
+    probe_push_rx: mpsc::Receiver<u64>,
     shutdown: Arc<Notify>,
     /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
     provisional_reap: Arc<Notify>,
@@ -516,6 +527,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn try_recv_start(&mut self) -> Option<Option<u32>> {
         self.start_push_rx.try_recv().ok()
+    }
+
+    /// Non-blockingly pulls the next load-state fence probe pushed to this slot,
+    /// for a cross-module test that stands in for the slot's link task and acks
+    /// the probe. `None` when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_load_state_probe(&mut self) -> Option<u64> {
+        self.probe_push_rx.try_recv().ok()
     }
 
     /// Non-blockingly pulls the next region-label map pushed to this slot, for a
@@ -619,6 +638,11 @@ pub fn register(
     // seconds between corrections, plus a connect-time re-push); the same small
     // channel suits them.
     let (phase_tx, phase_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    // Fence probes are rarer than any of the above (one per load-state read the
+    // tenant makes, and only while this slot has connected without starting);
+    // the same small channel suits them, and a full one simply leaves the slot
+    // unfenced rather than blocking the relay's coordinator connection.
+    let (probe_tx, probe_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
     let provisional_reap = Arc::new(Notify::new());
     {
@@ -639,6 +663,7 @@ pub fn register(
                 conn_push: conn_tx,
                 region_push: region_tx,
                 phase_push: phase_tx,
+                probe_push: probe_tx,
                 shutdown: Arc::clone(&shutdown),
                 provisional_reap: Arc::clone(&provisional_reap),
             },
@@ -660,6 +685,7 @@ pub fn register(
         conn_push_rx: conn_rx,
         region_push_rx: region_rx,
         phase_push_rx: phase_rx,
+        probe_push_rx: probe_rx,
         shutdown,
         provisional_reap,
     };
@@ -726,6 +752,18 @@ pub fn live_slots(sessions: &Sessions) -> Vec<(SessionKey, Vec<SlotId>)> {
             (key.clone(), slot_ids)
         })
         .collect()
+}
+
+/// The slots currently registered for one session, ascending — [`live_slots`] for
+/// a single key, without cloning the whole roster to find it.
+pub fn live_session_slots(sessions: &Sessions, key: &SessionKey) -> Vec<SlotId> {
+    let roster = sessions.lock();
+    let Some(slots) = roster.get(key) else {
+        return Vec::new();
+    };
+    let mut slot_ids: Vec<SlotId> = slots.keys().copied().collect();
+    slot_ids.sort_by_key(|s| s.0);
+    slot_ids
 }
 
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
@@ -1068,6 +1106,30 @@ pub(crate) fn deliver_session_start_to_slot(
     }
 }
 
+/// Pushes a load-state fence probe carrying `probe_id` down `slot`'s control
+/// stream, returning whether it was queued.
+///
+/// `false` means there is no fence for this slot and the caller must read it as
+/// unfenced: the slot is no longer registered (its link ended between the caller
+/// reading the roster and this call), or its push queue is full. Never blocks —
+/// the caller is the relay's coordinator connection, which must not be parked by
+/// one slow client.
+pub(crate) fn deliver_load_state_probe_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    probe_id: u64,
+) -> bool {
+    let sender = {
+        let roster = sessions.lock();
+        roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .map(|entry| entry.probe_push.clone())
+    };
+    sender.is_some_and(|tx| tx.try_send(probe_id).is_ok())
+}
+
 /// Delivers the session-start directive session-wide: fans it to every local
 /// slot ([`fan_out_session_start`]) and broadcasts it across the mesh so every
 /// peer relay fans it to its own local slots ([`crate::mesh::fan_out_session_start`]).
@@ -1290,6 +1352,7 @@ pub async fn run_slot_link(
         mut conn_push_rx,
         mut region_push_rx,
         mut phase_push_rx,
+        mut probe_push_rx,
         shutdown,
         provisional_reap,
     } = inbox;
@@ -1325,6 +1388,7 @@ pub async fn run_slot_link(
         skins,
         drop_holds,
         turn_ring,
+        load_fence,
         ..
     } = mesh;
 
@@ -1486,6 +1550,9 @@ pub async fn run_slot_link(
     // Mirrors `leave_push_alive` for the send-phase push channel, disarmed
     // defensively the same way.
     let mut phase_push_alive = true;
+    // Mirrors `leave_push_alive` for the load-state fence-probe push channel,
+    // disarmed defensively the same way.
+    let mut probe_push_alive = true;
     // A session whose release gate opened before this slot's link came up has
     // labels every other member already holds, and no later gate opening will
     // fire for it — so push the map straight down this slot. The gate's own
@@ -2013,6 +2080,36 @@ pub async fn run_slot_link(
                         }
                     }
                     None => start_push_alive = false,
+                }
+            }
+            // A load-state fence probe for this client, to push down its reliable
+            // control stream: this relay is about to tell the coordinator what it
+            // holds for the session and needs the client to confirm the stream's
+            // position first. Unlike every other push here, a write failure does
+            // NOT end the link — the probe asks a question about the stream rather
+            // than delivering anything the game depends on, and a link that is
+            // genuinely gone surfaces through the paths that matter. The fence
+            // simply never hears this slot's ack and reads it as unfenced.
+            pushed = probe_push_rx.recv(), if probe_push_alive => {
+                match pushed {
+                    Some(probe_id) => {
+                        if let Err(error) =
+                            rally_point_transport::control::send_control_load_state_probe(
+                                &mut control_send,
+                                probe_id,
+                            )
+                            .await
+                        {
+                            tracing::debug!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                %error,
+                                "load-state fence probe write failed; leaving the slot unfenced",
+                            );
+                        }
+                    }
+                    None => probe_push_alive = false,
                 }
             }
             // A slot-connectivity change for this client, to push down its reliable
@@ -2615,6 +2712,37 @@ pub async fn run_slot_link(
                                 crate::mesh::fan_out_skin(&mesh_links, &key, skin);
                             }
                         }
+                    }
+                    // The client's acknowledgement of a load-state fence probe.
+                    // Bound to this authenticated connection's slot and session,
+                    // never to anything the frame carries, so no client can ack in
+                    // another's name. Its arrival is the whole fence: this stream
+                    // is ordered, and the client writes any `GameStarted` it owes
+                    // ahead of the ack, so everything of this slot's that the game
+                    // had signalled is already handled above. An ack for a probe
+                    // the relay no longer holds — a repeat, or one whose fence
+                    // already lapsed — resolves nothing and is dropped without
+                    // closing the link.
+                    Some(ControlInbound::LoadStateProbeAck(probe_id)) => {
+                        if !load_fence.resolve(probe_id, &key, slot) {
+                            tracing::debug!(
+                                tenant = key.tenant.as_ref(),
+                                session = key.session.0,
+                                slot = slot.0,
+                                probe_id,
+                                "dropping a load-state fence ack for an unknown probe",
+                            );
+                        }
+                    }
+                    // A fence probe only ever travels relay → client; a relay never
+                    // receives one, so ignore a stray one.
+                    Some(ControlInbound::LoadStateProbe(_)) => {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "ignoring unexpected client-sent load-state probe control frame",
+                        );
                     }
                     // The client's manual request to drop a disconnected slot. The
                     // requester is this authenticated connection's slot, never a

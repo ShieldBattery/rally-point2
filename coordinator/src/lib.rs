@@ -89,6 +89,7 @@ pub mod notify;
 pub mod pair_rtts;
 pub mod presence;
 pub mod provision;
+pub mod rate_limit;
 pub mod regions;
 pub mod registry;
 pub mod rehome;

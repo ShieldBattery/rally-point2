@@ -80,7 +80,7 @@ use axum::{
     },
     http::{
         HeaderMap, Method, StatusCode, Uri,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
         request::Parts,
     },
     response::{IntoResponse, Response},
@@ -740,20 +740,22 @@ struct SessionLoadStateRequest {
 /// reading a slot's **absence** from the sets as proof that player never got there.
 ///
 /// `known: true` means every relay serving the session produced a snapshot **after
-/// this request reached it**, and that the coordinator has held the session since it
-/// created it with no break in the relay memory covering it. So everything that had
-/// happened by the time the caller sent this request is in the sets, and an absent
-/// slot may be read as a player who never arrived. No clock on either side takes
-/// part in that claim: it rests on the ordering of the exchange, not on comparing
-/// timestamps across hosts.
+/// this request reached it**, that each of those relays had **fenced** the session
+/// against its own clients when it did, and that the coordinator has held the
+/// session since it created it with no break in the relay memory covering it. So
+/// everything that had happened by the time the caller sent this request is in the
+/// sets, and an absent slot may be read as a player who never arrived. No clock on
+/// either side takes part in that claim: it rests on the ordering of the exchange,
+/// not on comparing timestamps across hosts.
 ///
 /// `known: false` is "no information about who is missing" — never "nobody
 /// arrived". A relay that did not answer in time, a relay with no live control
-/// connection, a coordinator that restarted, a reaped session, and a session whose
-/// serving relays changed under it (a re-home, or a relay that restarted its
-/// process — either destroys memory nothing later can reconstruct) all read that
-/// way. The answer is cheap to repeat, so a caller with time left may simply read
-/// again; one whose deadline has passed decides on the positive facts alone.
+/// connection, a relay that could not fence one of its slots, a coordinator that
+/// restarted, a reaped session, and a session whose serving relays changed under it
+/// (a re-home, or a relay that restarted its process — either destroys memory
+/// nothing later can reconstruct) all read that way. The answer is cheap to repeat,
+/// so a caller with time left may simply read again; one whose deadline has passed
+/// decides on the positive facts alone.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
@@ -791,6 +793,13 @@ struct SessionLoadStateResponse {
 /// relay silent past [`LOAD_STATE_ATTEST_TIMEOUT`], or holding no control
 /// connection at all, simply did not answer.
 ///
+/// The read is **rate-limited per tenant** ([`LoadStateLimiter`]), because the cost
+/// it imposes is fleet-wide rather than per-session: each read questions every relay
+/// serving the named session and holds a fence open on each while it answers. A
+/// refused read is a `429` carrying `Retry-After`. Concurrent reads of the *same*
+/// session share one round of questions, so a caller with several requests in flight
+/// for one session multiplies nothing.
+///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs); the `tenant` in the body must match the tenant the signature verifies
 /// under. As live-game machinery this is refused only for a revoked tenant, not a
@@ -801,7 +810,7 @@ async fn session_load_state(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<SessionLoadStateResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let request: SessionLoadStateRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     verify_tenant_request(
@@ -813,6 +822,14 @@ async fn session_load_state(
         &body,
         TenantAccess::LiveGame,
     )?;
+    let limiter = state.setup.load_state_limiter();
+    if !limiter.check(&request.tenant) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(RETRY_AFTER, limiter.retry_after_secs().to_string())],
+        )
+            .into_response());
+    }
     let session = SessionId(request.session);
 
     // The coordinator holds nothing at all for the session: never created here and
@@ -824,11 +841,11 @@ async fn session_load_state(
             started_at_ms: None,
             connected_slots: Vec::new(),
             started_slots: Vec::new(),
-        }));
+        })
+        .into_response());
     };
 
-    let attested =
-        attest_serving_relays(&state, &request.tenant, session, &before.serving_relays).await;
+    let round = attest_round(&state, &request.tenant, session, &before.serving_relays).await;
     // Re-read after the exchange so the answer carries whatever the snapshots added.
     // A session retired while the relays were answering leaves nothing to re-read,
     // and the snapshots that landed went into a record that no longer exists — so
@@ -839,51 +856,113 @@ async fn session_load_state(
             started_at_ms: before.started_at_ms,
             connected_slots: before.connected_slots.iter().map(|s| s.0).collect(),
             started_slots: before.started_slots.iter().map(|s| s.0).collect(),
-        }));
+        })
+        .into_response());
     };
     // A session with no serving relays has nobody who could attest, so it can never
-    // complete — the same reason a state no registration built cannot.
-    let every_relay_attested =
-        !before.serving_relays.is_empty() && attested == before.serving_relays.len();
+    // complete — the same reason a state no registration built cannot. Membership in
+    // `fenced` implies membership in `attested`, so this one check covers both:
+    // every serving relay answered, and every answer ruled out a report still queued
+    // in one of that relay's clients.
+    let every_relay_fenced = !before.serving_relays.is_empty()
+        && before
+            .serving_relays
+            .iter()
+            .all(|relay| round.fenced.contains(relay));
     Ok(Json(SessionLoadStateResponse {
-        known: after.created_here && after.attestable && every_relay_attested,
+        known: after.created_here && after.attestable && every_relay_fenced,
         started_at_ms: after.started_at_ms,
         connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
         started_slots: after.started_slots.iter().map(|s| s.0).collect(),
-    }))
+    })
+    .into_response())
 }
 
-/// Asks every relay in `serving` for its snapshot of the session and returns how
-/// many of them answered. Each answer is merged where it is received, so this only
-/// has to count them.
+/// Obtains an attestation round covering this read: leads a fresh one, or shares the
+/// round already running for the session.
+///
+/// Sharing is what keeps a tenant polling one session from multiplying the
+/// fleet-wide fanout by its requests in flight. It is sound only with the arrival
+/// check below: a round that had already dispatched its questions when this read
+/// arrived answers an *older* question than this one, and everything the relays
+/// learned in between would be missing from it — so such a joiner waits that round
+/// out and takes the next one, which necessarily dispatches after it asked. That
+/// costs at most one extra wait: the next round starts after the one just finished,
+/// and therefore after this read arrived.
+async fn attest_round(
+    state: &CoordinatorState,
+    tenant: &TenantId,
+    session: SessionId,
+    serving: &[RelayId],
+) -> crate::attest::AttestRound {
+    let asked_at = std::time::Instant::now();
+    loop {
+        match state.setup.attest().begin_round(tenant, session) {
+            crate::attest::RoundEntry::Leader(leader) => {
+                let round = attest_serving_relays(state, tenant, session, serving).await;
+                leader.publish(round.clone());
+                return round;
+            }
+            crate::attest::RoundEntry::Joined(watch) => {
+                if let Some(round) = crate::attest::joined_round(watch).await
+                    && round.dispatched_at >= asked_at
+                {
+                    return round;
+                }
+                // Either the leader left without an outcome, or the round it ran
+                // predates this read. Round again: the entry is gone by now, so this
+                // read leads or joins a round that starts after it asked.
+            }
+        }
+    }
+}
+
+/// Asks every relay in `serving` for its snapshot of the session and reports which
+/// of them answered, and which of those fenced. Each answer is merged where it is
+/// received, so this only has to record who produced one.
 ///
 /// Every request goes out before any answer is waited on, and all of them share one
 /// absolute deadline, so the whole exchange costs at most
 /// [`LOAD_STATE_ATTEST_TIMEOUT`] however many relays serve the session and however
-/// many of them are slow. A relay that cannot be reached at all (no live control
-/// connection) is never asked and counts exactly like one that stayed silent: it
-/// did not attest.
+/// many of them are slow. A relay that cannot be reached at all — no live control
+/// connection, or a control connection whose question queue is full — is never asked
+/// and counts exactly like one that stayed silent: it did not attest.
 async fn attest_serving_relays(
     state: &CoordinatorState,
     tenant: &TenantId,
     session: SessionId,
     serving: &[RelayId],
-) -> usize {
+) -> crate::attest::AttestRound {
     let mut pending: Vec<_> = serving
         .iter()
-        .filter_map(|&relay| state.setup.attest().request(relay, tenant, session))
+        .filter_map(|&relay| {
+            state
+                .setup
+                .attest()
+                .request(relay, tenant, session)
+                .map(|waiter| (relay, waiter))
+        })
         .collect();
+    // Stamped once every question is queued, so it is the instant *all* of this
+    // round's answers are ordered after — the boundary a read joining this round has
+    // to clear.
+    let dispatched_at = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + LOAD_STATE_ATTEST_TIMEOUT;
-    let mut attested = 0;
-    for waiter in &mut pending {
-        if matches!(
-            tokio::time::timeout_at(deadline, waiter.recv()).await,
-            Ok(Some(_))
-        ) {
-            attested += 1;
+    let mut attested = std::collections::HashSet::new();
+    let mut fenced = std::collections::HashSet::new();
+    for (relay, waiter) in &mut pending {
+        if let Ok(Some(snapshot)) = tokio::time::timeout_at(deadline, waiter.recv()).await {
+            attested.insert(*relay);
+            if snapshot.fenced {
+                fenced.insert(*relay);
+            }
         }
     }
-    attested
+    crate::attest::AttestRound {
+        dispatched_at,
+        attested: std::sync::Arc::new(attested),
+        fenced: std::sync::Arc::new(fenced),
+    }
 }
 
 /// The most user refs one presence query may ask about, so a caller cannot make
@@ -1934,7 +2013,10 @@ struct WriterSources {
     reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
     /// Load-state questions addressed to this relay, each answered with one request
     /// frame down the connection.
-    load_state: tokio::sync::mpsc::UnboundedReceiver<LoadStateAsk>,
+    load_state: tokio::sync::mpsc::Receiver<LoadStateAsk>,
+    /// The attestation broker the questions above come from, so the writer can drop
+    /// one whose waiter has already gone before spending a frame on it.
+    attest: crate::attest::LoadStateAttest,
     /// The reader's directives to emit a drain exchange's set-then-ack.
     drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
     /// Ready flight-upload grant/refusal frames the reader minted (a presign runs off
@@ -1995,6 +2077,7 @@ async fn push_and_watch(
         mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
         reaps: setup.reaps().subscribe(relay_id),
         load_state: setup.attest().subscribe(relay_id),
+        attest: setup.attest().clone(),
         drain,
         grants,
         tenant_keys: tenant::all_verifying_keys(setup.tenants()),
@@ -2016,13 +2099,14 @@ async fn push_and_watch(
 /// connect-time sequence in a fixed order — tenant keys, region beacons (when any),
 /// the initial descriptor set, the initial mesh-peer set — strictly before any
 /// steady-state push, then serves a `biased` priority loop: the drain exchange
-/// first, then the latest-wins descriptor watch, the mesh-peer watch, the load-state
-/// questions, the flight-upload grants, and the reap receiver last. A load-state
-/// question has a tenant's read blocked on its answer and costs one small frame, so
-/// it outranks the grants; both sit below the descriptor/mesh pushes, which neither
-/// may preempt (a grant gates a relay's upload progress, but not ahead of a
-/// session-start descriptor). Returns (ending the connection) when a send stalls or
-/// errors, a watch closes on shutdown, or the reader ends.
+/// first, then the latest-wins descriptor watch, the mesh-peer watch, the
+/// flight-upload grants, the reap receiver, and the load-state questions last. Every
+/// arm above the last is fleet machinery whose delay costs a relay correctness or a
+/// session its teardown; a load-state question is tenant-driven, arrives in bursts,
+/// and is cheap for its caller to repeat, so it yields to all of them — and a
+/// question whose waiter has since gone is dropped rather than sent. Returns (ending
+/// the connection) when a send stalls or errors, a watch closes on shutdown, or the
+/// reader ends.
 ///
 /// The connect-time descriptor set is always the full set (it seeds the relay's
 /// baseline), but the steady-state descriptor arm sends only what changed — a
@@ -2043,6 +2127,7 @@ async fn run_writer(
         mesh_peers: mesh_peers_rx,
         reaps,
         load_state: load_state_rx,
+        attest,
         drain: drain_rx,
         grants: grants_rx,
         tenant_keys,
@@ -2195,22 +2280,6 @@ async fn run_writer(
                     break;
                 }
             }
-            ask = load_state_rx.recv() => {
-                // A load-state question for this relay, from a tenant read blocked on
-                // the answer. `None` means the broker replaced this connection's
-                // channel (a reconnect took over) or is gone, so this half ends too.
-                let Some(ask) = ask else { break };
-                let frame = control_frame(&CoordinatorToRelay::LoadStateRequest {
-                    tenant: ask.tenant,
-                    session: ask.session,
-                    request_id: ask.request_id,
-                });
-                if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
-                    .await
-                {
-                    break;
-                }
-            }
             grant = grants_rx.recv() => {
                 // A ready flight-upload grant or refusal the reader (or a presign it
                 // spawned) minted. `None` means every sender is gone — the reader ended
@@ -2234,6 +2303,37 @@ async fn run_writer(
                 // subscription — treat it as end-of-stream and stop selecting.
                 let Some(first) = first else { break };
                 if !send_coalesced_reaps(write_half, reaps, first, relay_id, liveness_timeout).await
+                {
+                    break;
+                }
+            }
+            ask = load_state_rx.recv() => {
+                // A load-state question for this relay, from a tenant read blocked on
+                // the answer. `None` means the broker replaced this connection's
+                // channel (a reconnect took over) or is gone, so this half ends too.
+                //
+                // Ranked LAST deliberately. Every arm above it is the fleet's own
+                // machinery — a drain exchange, the descriptor set, the mesh-peer
+                // set, an upload grant, a reap directive — where a delayed frame
+                // costs a relay correctness or a session its teardown. A load-state
+                // read is tenant-driven, arrives in bursts, and is cheap to repeat,
+                // so it yields to all of them.
+                let Some(ask) = ask else { break };
+                // A question nobody is waiting for is not worth a frame or the
+                // relay's fence: the read that made it timed out, or its HTTP
+                // request was cancelled, and either retires the request as it
+                // leaves. Queued asks outlive their waiters precisely because this
+                // arm yields to everything above it.
+                if !attest.is_pending(ask.request_id) {
+                    continue;
+                }
+                let frame = control_frame(&CoordinatorToRelay::LoadStateRequest {
+                    tenant: ask.tenant,
+                    session: ask.session,
+                    request_id: ask.request_id,
+                });
+                if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
+                    .await
                 {
                     break;
                 }
@@ -2965,8 +3065,12 @@ fn note_inbound(
             handle_flight_upload_done(inbound, flight, request);
             InboundAction::None
         }
-        Ok(RelayToCoordinator::LoadStateSnapshot { request_id, state }) => {
-            handle_load_state_snapshot(inbound, request_id, state);
+        Ok(RelayToCoordinator::LoadStateSnapshot {
+            request_id,
+            state,
+            fenced,
+        }) => {
+            handle_load_state_snapshot(inbound, request_id, state, fenced);
             InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
@@ -3300,6 +3404,7 @@ fn handle_load_state_snapshot(
     inbound: &ControlInbound<'_>,
     request_id: u64,
     mut snapshot: rally_point_proto::control::SessionPresence,
+    fenced: bool,
 ) {
     let relay_id = inbound.relay_id;
     bound_session_slot_lists(relay_id, &mut snapshot);
@@ -3318,7 +3423,14 @@ fn handle_load_state_snapshot(
     if inbound
         .setup
         .attest()
-        .resolve(request_id, relay_id, snapshot)
+        .resolve(
+            request_id,
+            relay_id,
+            crate::attest::AttestedSnapshot {
+                state: snapshot,
+                fenced,
+            },
+        )
         .is_err()
     {
         tracing::debug!(
@@ -4238,6 +4350,17 @@ mod tests {
         relay: RelayId,
         snapshot: rally_point_proto::control::SessionPresence,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_relay_attesting_as(state, relay, snapshot, true)
+    }
+
+    /// [`spawn_attesting_relay`] with the fence verdict spelled out, so a test can
+    /// stand in a relay that answers but could not fence.
+    fn spawn_relay_attesting_as(
+        state: &CoordinatorState,
+        relay: RelayId,
+        snapshot: rally_point_proto::control::SessionPresence,
+        fenced: bool,
+    ) -> tokio::task::JoinHandle<()> {
         let setup = state.setup.clone();
         let notices = state.notices.clone();
         let lifecycle = state.lifecycle.clone();
@@ -4251,6 +4374,7 @@ mod tests {
                     serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
                         request_id: ask.request_id,
                         state: snapshot.clone(),
+                        fenced,
                     })
                     .expect("a snapshot serializes")
                     .into(),
@@ -4308,6 +4432,179 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             r#"{"known":true,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
+        // A relay that answers promptly but could not fence one of its slots is not
+        // silent — its facts merge and return like anyone's — but it cannot rule out
+        // a report queued in that slot's client, so absence stops being proof.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1), RelayId(2)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        let _one = spawn_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[1], &[1], None),
+        );
+        let _two = spawn_relay_attesting_as(
+            &state,
+            RelayId(2),
+            load_snapshot(&tenant, SessionId(5), &[0], &[], None),
+            false,
+        );
+        let app = router(state);
+
+        let body = read_load_state(app, 5).await;
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+            "both relays' positives stand; only the negative inference is withheld",
+        );
+    }
+
+    /// Stands a relay's control connection in for the load-state exchange, holding
+    /// each answer until `gate` is notified and reporting every question it received
+    /// over the returned channel — the shape a test needs to observe how many rounds
+    /// of questions a burst of reads actually cost.
+    fn spawn_gated_attesting_relay(
+        state: &CoordinatorState,
+        relay: RelayId,
+        snapshot: rally_point_proto::control::SessionPresence,
+        gate: std::sync::Arc<tokio::sync::Notify>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<u64>,
+    ) {
+        let setup = state.setup.clone();
+        let notices = state.notices.clone();
+        let lifecycle = state.lifecycle.clone();
+        let mut asks = setup.attest().subscribe(relay);
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let regions = RegionsConfig::default();
+            let store = pair_rtts::new_store();
+            let rtt = idle_rtt_ingest(&regions, &store);
+            while let Some(ask) = asks.recv().await {
+                let _ = seen_tx.send(ask.request_id);
+                gate.notified().await;
+                let frame = Message::Text(
+                    serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                        request_id: ask.request_id,
+                        state: snapshot.clone(),
+                        fenced: true,
+                    })
+                    .expect("a snapshot serializes")
+                    .into(),
+                );
+                note_inbound_frame(&setup, &notices, &lifecycle, relay, 0, &frame, &rtt);
+            }
+        });
+        (handle, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_one_session_cost_fewer_rounds_than_reads() {
+        // The fanout bound. Three overlapping reads of one session must not put
+        // three rounds of questions to the fleet: the two that arrive while the
+        // first round is running wait it out and then share a single round of their
+        // own — one they can actually use, since it dispatches after they asked.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            std::collections::HashSet::new(),
+        );
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (_relay, mut questions) = spawn_gated_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[0], &[0], None),
+            std::sync::Arc::clone(&gate),
+        );
+        let app = router(state);
+
+        // The first read leads a round and parks on the gated relay.
+        let first = tokio::spawn(read_load_state(app.clone(), 5));
+        questions
+            .recv()
+            .await
+            .expect("the first read's question reaches the relay");
+
+        // Two more arrive while that round is still open; give them time to join it
+        // before anything is released.
+        let second = tokio::spawn(read_load_state(app.clone(), 5));
+        let third = tokio::spawn(read_load_state(app, 5));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Release everything: the first round completes, then the one round the
+        // other two share.
+        let releaser = tokio::spawn(async move {
+            loop {
+                gate.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        for read in [first, second, third] {
+            let body = read.await.expect("the read completes");
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                r#"{"known":true,"connectedSlots":[0],"startedSlots":[0]}"#,
+            );
+        }
+        releaser.abort();
+
+        let mut rounds = 1;
+        while questions.try_recv().is_ok() {
+            rounds += 1;
+        }
+        assert_eq!(
+            rounds, 2,
+            "the two joiners shared one round rather than each running their own",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_reading_past_its_rate_limit_gets_a_429_with_a_retry_after() {
+        // The read questions every relay serving the named session and holds a fence
+        // open on each, so the limit is the tenant's rather than the session's: a
+        // caller cannot buy a fresh burst by naming a different session.
+        let state = state_with_relay_and_tenant();
+        let state = CoordinatorState {
+            setup: state.setup.clone().with_load_state_limiter(
+                crate::rehome::LoadStateLimiter::new(1, Duration::from_secs(60)),
+            ),
+            ..state
+        };
+        let app = router(state);
+
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 5 })).unwrap();
+        let resp = signed_post(app.clone(), "/session/load-state", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A different session, and therefore a request the per-session re-home limit
+        // would have admitted: this one still spends the tenant's last token.
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 6 })).unwrap();
+        let resp = signed_post(app, "/session/load-state", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .expect("a refused read says when to come back"),
+            "60",
+            "the header names the injected limiter's own refill interval",
         );
     }
 
@@ -4465,6 +4762,7 @@ mod tests {
             serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
                 request_id: ask.request_id,
                 state: load_snapshot(&tenant, SessionId(5), &[0], &[], None),
+                fenced: true,
             })
             .unwrap()
             .into(),

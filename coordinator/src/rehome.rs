@@ -1,69 +1,76 @@
-//! Rate limiting for the coordinator-mediated re-home endpoint.
+//! Rate limiting for the coordinator-mediated re-home endpoint and the load-state
+//! read.
 //!
-//! `POST /session/rehome` is tenant-authenticated (the tenant's app server signs
-//! each request; game clients never call the coordinator directly), and the app
-//! server may legitimately re-ask every few seconds while a session's home relay
-//! is unreachable — so the limit is lenient, a small burst with a slow refill,
-//! sized only to stop a misbehaving caller from hammering the endpoint. The limit
-//! is per `(tenant, session)`: one session's re-asking never starves another's,
-//! and the bucket is keyed on the *authenticated* tenant (whose signature the
-//! request verified under) and the session it named.
+//! Both are tenant-authenticated (the tenant's app server signs each request; game
+//! clients never call the coordinator directly) and both are cheap to re-ask, so
+//! both limits are lenient — sized only to stop a misbehaving caller from hammering
+//! the endpoint. They differ in what they key on, which is what decides whose
+//! traffic can starve whose.
 //!
-//! The buckets are held in-memory behind a plain mutex; every critical section is
-//! a short, await-free token check. A coordinator restart forgets them, which only
-//! grants a fresh burst — harmless for a rate limit that exists to bound abuse, not
-//! to enforce correctness. Idle buckets are pruned lazily on access so the map
-//! stays bounded by the sessions currently re-homing.
+//! `POST /session/rehome` is limited per `(tenant, session)`: an app server may
+//! legitimately re-ask every few seconds while a session's home relay is
+//! unreachable, and one session's re-asking must never starve another's.
+//!
+//! `POST /session/load-state` is limited per **tenant**, because the cost it bounds
+//! is fleet-wide rather than per-session: each read fans a question out to every
+//! relay serving the named session and holds each one's writer while it answers, so
+//! a tenant reading a thousand different sessions hard is exactly the load worth
+//! capping. A refused read is a `429`; the answer is a snapshot the caller can
+//! simply take again.
+//!
+//! Both are built on the shared [`KeyedTokenBuckets`](crate::rate_limit) machinery:
+//! in-memory buckets behind a plain mutex, pruned lazily on access and hard-capped
+//! by cardinality. A coordinator restart forgets them, which only grants a fresh
+//! burst — harmless for limits that exist to bound abuse, not to enforce
+//! correctness.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::SessionId;
+
+use crate::rate_limit::KeyedTokenBuckets;
 
 /// Burst capacity: how many re-home requests one session may make back-to-back
 /// before it must wait for the bucket to refill. Three covers an app server that
 /// re-asks a couple of times across a brief outage without tripping the limit.
 pub const REHOME_BURST: u32 = 3;
 
-/// How often one token refills. An app server may legitimately re-ask about every
-/// five seconds while a relay is unreachable, so the steady-state rate matches that.
+/// How often one re-home token refills. An app server may legitimately re-ask about
+/// every five seconds while a relay is unreachable, so the steady-state rate matches
+/// that.
 pub const REHOME_REFILL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Hard cap on the number of live buckets. The time-window idle eviction alone only
-/// bounds the map by `O(rate x window)`, so an authenticated caller spraying unique
-/// garbage session ids at high rate could hold many thousands of buckets between
-/// eviction sweeps. This cap bounds the map by cardinality regardless of rate: when
-/// an insert would exceed it, the stalest bucket(s) are evicted to make room. A few
-/// thousand comfortably covers every session a real coordinator re-homes at once
-/// while keeping the worst-case memory footprint small.
+/// Hard cap on the number of live re-home buckets. The time-window idle eviction
+/// alone only bounds the map by `O(rate x window)`, so an authenticated caller
+/// spraying unique garbage session ids at high rate could hold many thousands of
+/// buckets between eviction sweeps. This cap bounds the map by cardinality
+/// regardless of rate. A few thousand comfortably covers every session a real
+/// coordinator re-homes at once while keeping the worst-case memory footprint small.
 pub const REHOME_BUCKET_CAP: usize = 4096;
 
-/// The key of one session's rate-limit bucket: which session, for which tenant.
-type BucketKey = (TenantId, SessionId);
+/// Burst capacity for the load-state read: how many reads one tenant may make
+/// back-to-back before it must wait. Ten covers a tenant whose load deadlines expire
+/// together for a batch of games — a matchmaking wave adjudicating several stalled
+/// loads at once — without letting a polling loop run free.
+pub const LOAD_STATE_BURST: u32 = 10;
 
-/// A token bucket for one `(tenant, session)`.
-struct Bucket {
-    /// Tokens available now, fractional so a partial refill accrues between
-    /// requests rather than being lost.
-    tokens: f64,
-    /// When the tokens were last refilled — the anchor the next check accrues from.
-    last_refill: Instant,
-}
+/// How often one load-state token refills: thirty reads a minute in steady state.
+/// The read answers a question a tenant asks once its own load deadline expired, so
+/// a healthy tenant spends far less than this; the rate is what a caller re-reading
+/// after an incomplete answer can sustain without the fleet feeling it.
+pub const LOAD_STATE_REFILL_INTERVAL: Duration = Duration::from_millis(2000);
 
-/// The per-session re-home rate limiter, shared across every request handler.
-/// Clone it cheaply (the state is behind one `Arc`) to hand a copy to the router
-/// state.
+/// Hard cap on the number of live load-state buckets. Keyed per tenant, so this is
+/// bounded by enrolled tenants rather than by anything a caller supplies; the cap is
+/// a backstop, not a working limit.
+pub const LOAD_STATE_BUCKET_CAP: usize = 4096;
+
+/// The per-session re-home rate limiter, shared across every request handler. Clone
+/// it cheaply to hand a copy to the router state.
 #[derive(Clone)]
 pub struct RehomeLimiter {
-    buckets: Arc<Mutex<HashMap<BucketKey, Bucket>>>,
-    burst: u32,
-    refill_interval: Duration,
-    /// Hard cap on live bucket count — [`REHOME_BUCKET_CAP`] in production; a test
-    /// injects a small one to exercise the cardinality eviction cheaply.
-    bucket_cap: usize,
+    buckets: KeyedTokenBuckets<(TenantId, SessionId)>,
 }
 
 impl Default for RehomeLimiter {
@@ -85,16 +92,12 @@ impl RehomeLimiter {
     /// the cardinality eviction with a handful of keys rather than several thousand.
     pub fn with_bucket_cap(burst: u32, refill_interval: Duration, bucket_cap: usize) -> Self {
         Self {
-            buckets: Arc::new(Mutex::new(HashMap::new())),
-            burst,
-            refill_interval,
-            bucket_cap: bucket_cap.max(1),
+            buckets: KeyedTokenBuckets::new(burst, refill_interval, bucket_cap),
         }
     }
 
     /// Whether a re-home request for `(tenant, session)` is admitted now,
-    /// consuming a token if so. A fresh session starts with a full burst. Refills
-    /// accrue at one token per [`refill_interval`](Self::new) up to the burst cap.
+    /// consuming a token if so.
     pub fn check(&self, tenant: &TenantId, session: SessionId) -> bool {
         self.check_at(tenant, session, Instant::now())
     }
@@ -102,72 +105,67 @@ impl RehomeLimiter {
     /// [`check`](Self::check) against an explicit clock, so a test can advance time
     /// deterministically rather than sleeping.
     pub fn check_at(&self, tenant: &TenantId, session: SessionId, now: Instant) -> bool {
-        let refill_per_sec = 1.0 / self.refill_interval.as_secs_f64();
-        let burst = f64::from(self.burst);
-        let mut buckets = self.buckets.lock();
-        // Evict idle buckets lazily: a bucket untouched long enough to have
-        // refilled from empty all the way back to its full burst is
-        // indistinguishable from a never-seen session, so dropping it loses no
-        // state and keeps the map bounded by the sessions actively re-homing. The
-        // idle threshold is (burst + 1) refill intervals — the time to refill from
-        // empty to full, plus a one-interval margin. This is the "pruned lazily on
-        // access" the module docstring promises; it runs on every check, which is
-        // fine for a map bounded by live re-homing sessions.
-        let evict_after = self.refill_interval * self.burst.saturating_add(1);
-        buckets.retain(|_, b| now.saturating_duration_since(b.last_refill) < evict_after);
-        // Hard cardinality cap: if admitting a *new* session would exceed the cap
-        // (idle eviction above didn't free enough — a high-rate spray of unique keys
-        // keeps every bucket fresh), evict the stalest bucket(s) — oldest
-        // `last_refill` — to make room. A stale bucket has refilled toward full, so
-        // dropping it only grants a fresh burst, never refuses a live survivor; the
-        // spray can never push a legitimate active session out because an active
-        // session's bucket is by definition newer than the sprayer's oldest. Never
-        // refuse the check outright — a full map must not become a DoS on the
-        // sessions actually re-homing.
-        let bucket_key = (tenant.clone(), session);
-        if !buckets.contains_key(&bucket_key) {
-            while buckets.len() >= self.bucket_cap {
-                let Some(stalest) = buckets
-                    .iter()
-                    .min_by_key(|(_, bucket)| bucket.last_refill)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                buckets.remove(&stalest);
-            }
-        }
-        let bucket = buckets.entry(bucket_key).or_insert(Bucket {
-            tokens: burst,
-            last_refill: now,
-        });
-        // Accrue refill for the elapsed time, capped at the burst.
-        let elapsed = now
-            .saturating_duration_since(bucket.last_refill)
-            .as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * refill_per_sec).min(burst);
-        bucket.last_refill = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        self.buckets.check_at(&(tenant.clone(), session), now)
     }
 
     /// Drops every bucket for `session` — called when the session closes, so the
     /// map stays bounded by the coordinator's live re-homing sessions.
     pub fn forget(&self, tenant: &TenantId, session: SessionId) {
         self.buckets
-            .lock()
-            .retain(|(t, s), _| !(t == tenant && *s == session));
+            .retain_not(|(t, s)| t == tenant && *s == session);
     }
 
     /// The number of live buckets — a test hook for asserting idle eviction and
     /// close-time forgetting actually bound the map.
     #[cfg(test)]
     fn bucket_count(&self) -> usize {
-        self.buckets.lock().len()
+        self.buckets.bucket_count()
+    }
+}
+
+/// The per-tenant load-state read rate limiter, shared across every request
+/// handler. Clone it cheaply to hand a copy to the router state.
+#[derive(Clone)]
+pub struct LoadStateLimiter {
+    buckets: KeyedTokenBuckets<TenantId>,
+    refill_interval: Duration,
+}
+
+impl Default for LoadStateLimiter {
+    fn default() -> Self {
+        Self::new(LOAD_STATE_BURST, LOAD_STATE_REFILL_INTERVAL)
+    }
+}
+
+impl LoadStateLimiter {
+    /// Builds a limiter with the given burst and refill interval, using the
+    /// production bucket cap ([`LOAD_STATE_BUCKET_CAP`]). Production uses
+    /// [`LOAD_STATE_BURST`]/[`LOAD_STATE_REFILL_INTERVAL`] (via [`Default`]); tests
+    /// inject their own so they need not wait real seconds.
+    pub fn new(burst: u32, refill_interval: Duration) -> Self {
+        Self {
+            buckets: KeyedTokenBuckets::new(burst, refill_interval, LOAD_STATE_BUCKET_CAP),
+            refill_interval,
+        }
+    }
+
+    /// Whether a load-state read for `tenant` is admitted now, consuming a token if
+    /// so. A refused read is answered `429` with a `Retry-After`.
+    pub fn check(&self, tenant: &TenantId) -> bool {
+        self.check_at(tenant, Instant::now())
+    }
+
+    /// [`check`](Self::check) against an explicit clock, so a test can advance time
+    /// deterministically rather than sleeping.
+    pub fn check_at(&self, tenant: &TenantId, now: Instant) -> bool {
+        self.buckets.check_at(tenant, now)
+    }
+
+    /// How long a refused caller should wait before re-reading: one refill
+    /// interval, rounded up to whole seconds because `Retry-After` counts in
+    /// seconds and rounding down would invite an immediately-refused retry.
+    pub fn retry_after_secs(&self) -> u64 {
+        self.refill_interval.as_secs().max(1)
     }
 }
 
@@ -177,6 +175,39 @@ mod tests {
 
     fn tid() -> TenantId {
         TenantId("sb-test".to_owned())
+    }
+
+    #[test]
+    fn load_state_reads_are_limited_per_tenant_not_per_session() {
+        // The cost a load-state read imposes is fleet-wide — one read fans out to
+        // every relay serving the named session — so the bucket must be the
+        // tenant's, and reading a fresh session id must not buy a fresh burst.
+        let limiter = LoadStateLimiter::new(2, Duration::from_secs(2));
+        let t0 = Instant::now();
+        assert!(limiter.check_at(&tid(), t0));
+        assert!(limiter.check_at(&tid(), t0));
+        assert!(
+            !limiter.check_at(&tid(), t0),
+            "the tenant's burst is spent whatever session it read",
+        );
+        // Another tenant is untouched.
+        assert!(limiter.check_at(&TenantId("sb-other".to_owned()), t0));
+        // One refill interval later, exactly one token is back.
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(limiter.check_at(&tid(), t1));
+        assert!(!limiter.check_at(&tid(), t1));
+    }
+
+    #[test]
+    fn the_production_load_state_limit_is_thirty_reads_a_minute() {
+        // The advertised steady-state rate, asserted against the constants rather
+        // than restated in prose only.
+        assert_eq!(
+            Duration::from_secs(60).as_millis() / LOAD_STATE_REFILL_INTERVAL.as_millis(),
+            30,
+        );
+        assert_eq!(LOAD_STATE_BURST, 10);
+        assert_eq!(LoadStateLimiter::default().retry_after_secs(), 2);
     }
 
     #[test]

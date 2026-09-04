@@ -145,6 +145,32 @@ mod tests {
     }
 
     #[test]
+    fn load_state_fence_frames_round_trip_through_the_shared_framing() {
+        use crate::messages::{LoadStateProbe, LoadStateProbeAck};
+
+        // The fence is two frames whose whole content is one correlation id, so
+        // the id surviving the framing verbatim in both directions is the only
+        // thing there is to check.
+        let probe = ControlFrame {
+            kind: Some(control_frame::Kind::LoadStateProbe(LoadStateProbe {
+                probe_id: u64::MAX,
+            })),
+        };
+        let encoded = encode_frame(&probe).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, probe);
+
+        let ack = ControlFrame {
+            kind: Some(control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck {
+                probe_id: u64::MAX,
+            })),
+        };
+        let encoded = encode_frame(&ack).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, ack);
+    }
+
+    #[test]
     fn lobby_command_frames_round_trip_through_the_shared_framing() {
         use crate::messages::LobbyCommand;
 
@@ -259,10 +285,13 @@ mod tests {
 
     #[test]
     fn an_unknown_frame_kind_decodes_with_the_oneof_unset() {
-        // A frame kind a newer peer added: field 15, some bytes. It must
-        // decode (kind = None) so the reader can skip it, not a stream-fatal
-        // decode error.
-        let unknown = [0x7A, 0x03, 1, 2, 3]; // field 15, wire type 2, len 3
+        // A frame kind a newer peer added: a field number past every one this
+        // build knows, carrying some bytes. It must decode (kind = None) so the
+        // reader can skip it, not fail the stream. The field number has to stay
+        // ahead of the last one `ControlFrame` actually assigns — a number the
+        // oneof now claims would decode as that kind (or fail to) instead of
+        // exercising the skip.
+        let unknown = [0x8A, 0x01, 0x03, 1, 2, 3]; // field 17, wire type 2, len 3
         let frame: ControlFrame = decode_frame(&unknown).unwrap();
         assert_eq!(frame.kind, None);
     }

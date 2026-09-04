@@ -1154,6 +1154,26 @@ can say which side of a caller's deadline a fact fell on, and the comparison wou
 clocks besides. The heartbeat's restatements remain the durable *repair* path — they recover a dropped notice
 or a coordinator restart within a beat — but they carry no ordering, so they never gate completeness.
 
+Observing the relay is not, on its own, enough. A client's own `GameStarted` travels *its* ordered control
+stream, independently of the coordinator's question, so a relay can honestly snapshot "slot 3 has not
+started" while slot 3's report sits queued in its client's driver, in flight, or parked waiting for the
+stream the driver opens next — and the coordinator would then vouch for a record that is wrong about slot 3.
+So before it snapshots, a relay **fences** the session against its own clients: every slot it homes that has
+connected and not yet started gets a small probe down that slot's control stream, and the relay waits for the
+echoed acknowledgement. The client answers a probe by writing any report it owes *and then* the ack, on that
+same stream; because the stream is ordered, an ack that arrives proves nothing of that slot's is still behind
+it. The snapshot is taken after the acks, since a probe may have delivered a report on the way. The relay
+answers `fenced: true` only when every probed slot acked inside its (deliberately shorter than the
+coordinator's) wait, and the coordinator requires that of every serving relay before it will say `known`.
+
+Two kinds of slot never get probed, for opposite reasons. A slot that has connected here and is disconnected
+now has no stream to probe and a client that may be holding a report for the stream it opens next, so it can
+never be fenced — its presence in the ever-connected set with no live link is itself enough to withhold the
+claim. A slot that has *never* connected to this relay holds nothing to fence: no client ever opened a stream
+to it for that slot, so there is nothing anywhere that could be queued, and its absence is attestable exactly
+as it stands. That asymmetry is what keeps the read useful — the common answer a tenant wants is "these
+players never arrived at all", and it is precisely the never-arrived case that needs no fence.
+
 Two further conditions ride with the answers. The coordinator must have held the session **since it created
 it** (a restarted process's sets start wherever it came up, not at the session's beginning), and the relay
 memory covering the session must be unbroken. Retained load state lives in a relay process; when a serving
@@ -1165,11 +1185,28 @@ build sends and which can therefore never claim continuity). Either kind of brea
 completeness claim permanently; nothing restores it, because nothing can recover what was lost.
 
 `known: false` — a relay that did not answer inside the request's short deadline, a relay holding no control
-connection, a coordinator that restarted and forgot, a reaped session, a re-homed or restarted serving relay
-— is no information *about who is missing*. It is never proof that nobody arrived, and the facts the answer
-carries alongside it are as real as any other. Every snapshot that does arrive is merged and returned whether
-or not the set completes, so one silent relay costs the claim and never its peers' facts. The read is cheap
-to repeat, so a caller with time left may simply ask again.
+connection, a relay that could not fence one of its slots, a coordinator that restarted and forgot, a reaped
+session, a re-homed or restarted serving relay — is no information *about who is missing*. It is never proof
+that nobody arrived, and the facts the answer carries alongside it are as real as any other. Every snapshot
+that does arrive is merged and returned whether or not the set completes, so one silent or unfenced relay
+costs the claim and never its peers' facts. The read is cheap to repeat, so a caller with time left may
+simply ask again.
+
+The exchange is **bounded on every side**, because one read is fleet-wide work a tenant can ask for at will.
+It is rate-limited per **tenant** (a small burst over a thirty-a-minute refill, answered `429` with
+`Retry-After` when spent) rather than per session, since the cost is the fanout and not the session named.
+Concurrent reads of one session **share a round of questions**: the first leads, later ones await its
+outcome — and a caller whose read arrived *after* that round put its questions out waits it through and takes
+the next one instead, because a round dispatched before a caller asked answers an older question than the one
+it asked. That costs at most one extra wait and keeps a burst of reads to two rounds rather than one each.
+Every queue the questions travel is bounded and non-blocking: a coordinator-side channel to a relay whose
+writer is behind, and the relay-side channel from its reader to its writer, both shed the question rather
+than queue it, and a shed question reads exactly like a silent relay. On both sides the load-state arms sit
+*below* liveness and lifecycle traffic in the writers' priority order — a delayed heartbeat or descriptor
+costs a relay correctness, while a delayed read costs a caller a retry — and the coordinator drops a queued
+question outright once the read waiting on it has gone. The relay likewise answers off its control
+connection's writer rather than on it, since fencing waits on game clients and no tenant's read may park the
+connection the fleet's own health rides.
 
 ### Active-player presence
 

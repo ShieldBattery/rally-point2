@@ -1604,6 +1604,33 @@ pub enum RelayToCoordinator {
         /// roster entry carries, so the coordinator merges an attested snapshot
         /// through exactly the path a restated one takes.
         state: SessionPresence,
+        /// Whether this relay could rule out a fact still queued *in a client*
+        /// when it took the snapshot.
+        ///
+        /// Observing the relay is not enough on its own. A client's own
+        /// `GameStarted` travels its ordered control stream independently of the
+        /// coordinator's question, so the relay can snapshot "this slot has not
+        /// started" while that slot's report sits in its client's driver. Before
+        /// snapshotting, the relay therefore probes every slot it homes that has
+        /// connected and not yet started, over that slot's own ordered control
+        /// stream, and waits for the echoed acknowledgement: because the stream
+        /// is ordered and the client writes any owed report ahead of the ack,
+        /// an ack proves nothing is behind it.
+        ///
+        /// True only when **every** probed slot acked in time *and* no slot the
+        /// relay has ever seen connect is currently disconnected without having
+        /// started. A disconnected slot cannot be probed, and its client may
+        /// hold a report parked for its next stream, so it can never be fenced;
+        /// a slot that never connected here holds nothing to fence, so its
+        /// absence is attestable. False is not a refusal — the snapshot's facts
+        /// are as real as any other's — it only means the *absence* of a slot
+        /// from this snapshot must not be read as that slot never having
+        /// started.
+        ///
+        /// Additive: a relay build that predates the fence omits it and reads as
+        /// `false`, so it can never claim a fence it did not run.
+        #[serde(default, skip_serializing_if = "is_false")]
+        fenced: bool,
     },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
@@ -3075,6 +3102,7 @@ mod tests {
                 started: vec![SlotId(1)],
                 started_at_ms: Some(1_700_000_000_000),
             },
+            fenced: true,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"load_state_snapshot\""));
@@ -3097,12 +3125,26 @@ mod tests {
                 started: vec![],
                 started_at_ms: None,
             },
+            fenced: false,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("ever_connected"));
         assert!(!json.contains("started_at_ms"));
+        assert!(!json.contains("fenced"));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn a_snapshot_from_a_relay_predating_the_fence_decodes_unfenced() {
+        // The additive field's whole point: a relay that never ran a fence omits it,
+        // and must never be read as having claimed one.
+        let json = r#"{"type":"load_state_snapshot","request_id":3,"state":{"tenant":"sb-staging","session":7,"slots":[]}}"#;
+        let back: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        let RelayToCoordinator::LoadStateSnapshot { fenced, .. } = back else {
+            panic!("decodes as a snapshot");
+        };
+        assert!(!fenced);
     }
 
     #[test]

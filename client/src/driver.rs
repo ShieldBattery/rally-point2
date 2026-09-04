@@ -91,8 +91,9 @@ use rally_point_proto::messages::{GameChat, LeaveDirective, LobbyCommand, Payloa
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{
     ControlInbound, ControlSendError, send_control_chat, send_control_game_result,
-    send_control_game_started, send_control_lobby, send_control_phase_applied,
-    send_control_request_drop, send_control_skin, send_control_turn, spawn_control_reader,
+    send_control_game_started, send_control_load_state_probe_ack, send_control_lobby,
+    send_control_phase_applied, send_control_request_drop, send_control_skin, send_control_turn,
+    spawn_control_reader,
 };
 use rally_point_transport::{Link, LinkError, quinn};
 use tokio::sync::{mpsc, watch};
@@ -1021,13 +1022,20 @@ impl LinkDriver {
         // per slot, so a repeat is absorbed. Best-effort like every send of it: a
         // failure leaves the fact pending for the next stream rather than ending
         // the session over a report nothing depends on.
-        if *game_started_announced
-            && let Err(error) = send_control_game_started(&mut control_send).await
-        {
-            tracing::debug!(
-                %error,
-                "re-asserting the game-started announcement failed; retrying on the next stream"
-            );
+        //
+        // Whether the frame actually made it onto THIS stream is tracked
+        // separately from the retained fact: a relay fence probe answers the
+        // question "is anything this client owes still unwritten here", which a
+        // re-assertion whose write failed leaves as yes.
+        let mut game_started_on_stream = false;
+        if *game_started_announced {
+            match send_control_game_started(&mut control_send).await {
+                Ok(()) => game_started_on_stream = true,
+                Err(error) => tracing::debug!(
+                    %error,
+                    "re-asserting the game-started announcement failed; retrying on the next stream"
+                ),
+            }
         }
         // Flush any turns the game produced while the link was down, in seq order,
         // before live turns resume. On a fresh dial the buffer is empty; on a
@@ -1493,6 +1501,53 @@ impl LinkDriver {
                                 );
                             }
                         }
+                        // A relay fence probe: the relay is about to tell the
+                        // coordinator what it holds for this session and needs to
+                        // rule out a report of ours still sitting unwritten. Drain
+                        // the game's announcement channel and write any owed
+                        // `GameStarted` FIRST, then the ack. The stream is ordered,
+                        // so a report the game had signalled at any point before
+                        // this probe was handled is on the wire ahead of the ack,
+                        // and the relay can read the ack as "nothing of this slot's
+                        // is behind it". That reading only holds if the report
+                        // actually went out, so a failed report write withholds the
+                        // ack: the relay's fence then lapses, which it reads as this
+                        // slot being unfenced — the safe direction — and the report
+                        // stays owed for the next stream. The ack write itself is
+                        // best-effort for the same reason. Answering consumes the
+                        // signal, so the live arm below has nothing left to re-send.
+                        Some(ControlInbound::LoadStateProbe(probe_id)) => {
+                            if game_started_out.try_recv().is_ok() {
+                                *game_started_announced = true;
+                            }
+                            if *game_started_announced && !game_started_on_stream {
+                                match send_control_game_started(&mut control_send).await {
+                                    Ok(()) => game_started_on_stream = true,
+                                    Err(error) => tracing::debug!(
+                                        %error,
+                                        "game-started send ahead of a fence ack failed; withholding the ack"
+                                    ),
+                                }
+                            }
+                            let report_owed = *game_started_announced && !game_started_on_stream;
+                            if !report_owed
+                                && let Err(error) =
+                                    send_control_load_state_probe_ack(&mut control_send, probe_id)
+                                        .await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    "load-state fence ack send failed; dropping the ack"
+                                );
+                            }
+                        }
+                        // A fence ack only ever travels client → relay; a client
+                        // never receives one back, so ignore a stray one.
+                        Some(ControlInbound::LoadStateProbeAck(_)) => {
+                            tracing::warn!(
+                                "ignoring unexpected relay-sent load-state probe-ack control frame"
+                            );
+                        }
                         // A phase-applied ack only ever travels client → relay;
                         // a client never receives one back, so ignore a stray
                         // one.
@@ -1748,18 +1803,20 @@ impl LinkDriver {
                 // once: it is only useful while fresh, and there is nothing to
                 // drain behind it. Best-effort, like a result report: a failed
                 // write is logged and left to the next stream's re-assertion. The
-                // already-announced case is a no-op because this stream's own
-                // re-assertion has already carried it. Disarmed on the channel's
-                // first resolution, like the leave-intent and result branches.
+                // already-announced case is a no-op: this stream's own
+                // re-assertion, or a fence probe answered ahead of it, has already
+                // carried the frame. Disarmed on the channel's first resolution,
+                // like the leave-intent and result branches.
                 signal = game_started_out.recv(), if game_started_alive => {
                     game_started_alive = false;
                     if signal.is_some() && !*game_started_announced {
                         *game_started_announced = true;
-                        if let Err(error) = send_control_game_started(&mut control_send).await {
-                            tracing::debug!(
+                        match send_control_game_started(&mut control_send).await {
+                            Ok(()) => game_started_on_stream = true,
+                            Err(error) => tracing::debug!(
                                 %error,
                                 "game-started send failed; retrying on the next stream"
-                            );
+                            ),
                         }
                     }
                 }
@@ -6017,6 +6074,113 @@ mod tests {
         assert!(
             matches!(next, ControlInbound::LeaveIntent),
             "a repeat game-started must be dropped, got {next:?}",
+        );
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_fence_probe_pushes_a_signalled_game_started_ahead_of_its_ack() {
+        // The fence's whole claim: whatever the game had signalled before the
+        // probe was handled is on the wire AHEAD of the ack, so a relay that has
+        // seen the ack cannot still be owed the report. The signal here is
+        // deliberately not given time to be picked up by the live arm — it is
+        // raced against the probe — because that race is the case the fence
+        // exists for.
+        use rally_point_transport::control::send_control_load_state_probe;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+
+        chan_a.game_started.send(()).await.unwrap();
+        send_control_load_state_probe(&mut peer_control_send, 0xABCD)
+            .await
+            .unwrap();
+
+        let first = next_control_frame(&mut control_rx, "no frame answered the fence probe").await;
+        assert!(
+            matches!(first, ControlInbound::GameStarted),
+            "the owed report must precede the ack, got {first:?}",
+        );
+        let second = next_control_frame(&mut control_rx, "the fence ack never arrived").await;
+        assert!(
+            matches!(second, ControlInbound::LoadStateProbeAck(0xABCD)),
+            "expected the fence ack echoing the probe id, got {second:?}",
+        );
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_fence_probe_with_nothing_owed_is_answered_by_the_ack_alone() {
+        // A slot whose game has not started owes nothing, so the ack stands on
+        // its own — the relay must be able to tell "nothing queued" from "a
+        // report is on its way". Proven by following the ack with a leave intent
+        // and seeing that arrive next, with no GameStarted in between.
+        use rally_point_transport::control::send_control_load_state_probe;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+
+        send_control_load_state_probe(&mut peer_control_send, 7)
+            .await
+            .unwrap();
+        let frame = next_control_frame(&mut control_rx, "the fence ack never arrived").await;
+        assert!(
+            matches!(frame, ControlInbound::LoadStateProbeAck(7)),
+            "expected the fence ack, got {frame:?}",
+        );
+
+        chan_a.leave_intent.send(()).await.unwrap();
+        let next = next_control_frame(&mut control_rx, "the leave intent never arrived").await;
+        assert!(
+            matches!(next, ControlInbound::LeaveIntent),
+            "an unstarted slot must announce nothing before its ack, got {next:?}",
+        );
+
+        drop(chan_a.outbound);
+        drop(chan_a.inbound);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_game_started_after_an_unfenced_probe_still_reaches_the_relay() {
+        // Answering a probe must not consume the announcement path: a slot that
+        // starts after the fence ran still reports, on the ordinary live path, so
+        // a later read sees it.
+        use rally_point_transport::control::send_control_load_state_probe;
+
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let task = tokio::spawn(driver_a.run());
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+        let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+
+        send_control_load_state_probe(&mut peer_control_send, 1)
+            .await
+            .unwrap();
+        let frame = next_control_frame(&mut control_rx, "the fence ack never arrived").await;
+        assert!(
+            matches!(frame, ControlInbound::LoadStateProbeAck(1)),
+            "expected the fence ack, got {frame:?}",
+        );
+
+        chan_a.game_started.send(()).await.unwrap();
+        let frame =
+            next_control_frame(&mut control_rx, "the later game-started never arrived").await;
+        assert!(
+            matches!(frame, ControlInbound::GameStarted),
+            "expected the game-started frame, got {frame:?}",
         );
 
         drop(chan_a.outbound);

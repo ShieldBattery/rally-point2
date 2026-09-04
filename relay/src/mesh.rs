@@ -774,6 +774,13 @@ pub struct MeshState {
     /// (`main.rs`); disarmed (every test constructor), the funnel behaves
     /// exactly as before. See [`crate::provisional_turns`].
     pub provisional_turns: crate::provisional_turns::ProvisionalTurnPen,
+    /// The load-state fence broker: the outstanding stream-position probes this
+    /// relay has sent its local slots while answering a coordinator load-state
+    /// question. Bundled here because the slot-link tasks are where the clients'
+    /// acks land and this is the bundle those tasks already receive — it has no
+    /// per-session lifecycle of its own and is not a mesh concern. See
+    /// [`crate::load_fence`].
+    pub load_fence: crate::load_fence::LoadStateFence,
 }
 
 /// Creates a `MeshState` with empty registries for a relay that has no peer-relay
@@ -855,6 +862,7 @@ pub fn new_mesh_state_with_timings(
         ),
         gates: crate::session_gate::SessionGates::default(),
         provisional_turns: crate::provisional_turns::ProvisionalTurnPen::default(),
+        load_fence: crate::load_fence::LoadStateFence::new(),
     }
 }
 /// The channel that pushes a turn to a peer-relay's mesh-link task. Tagged with
@@ -4763,6 +4771,7 @@ mod tests {
             lobby: lobby.clone(),
             chat: chat.clone(),
             skins: skins.clone(),
+            load_fence: crate::load_fence::LoadStateFence::new(),
             // A zero unlock floor so a held drop is "past the floor" from the first
             // instant, letting a `RequestDrop` dispatch test drive the honor path
             // without a real wait. Tests that only hold and release a drop are

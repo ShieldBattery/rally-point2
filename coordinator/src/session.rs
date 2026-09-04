@@ -41,7 +41,7 @@ use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::presence::PresenceStore;
 use crate::provision::WarmTargets;
 use crate::registry::{self, RelayRegistry, SessionSetupError, cert_fingerprint};
-use crate::rehome::RehomeLimiter;
+use crate::rehome::{LoadStateLimiter, RehomeLimiter};
 use crate::tenant::{self, TenantStore};
 
 /// The relay ids serving one session, keyed by `(tenant, session)`.
@@ -415,6 +415,13 @@ pub struct SessionSetup {
     /// the same point it retires the session's other per-session state, keeping the
     /// bucket map bounded by live re-homing sessions.
     rehome_limiter: RehomeLimiter,
+    /// The per-tenant rate limiter for the tenant-authenticated load-state read
+    /// (`POST /session/load-state`). Keyed on the tenant rather than the session
+    /// because the cost it bounds is fleet-wide — each read questions every relay
+    /// serving the named session — so a caller reading a thousand different
+    /// sessions is exactly the load worth capping. Nothing retires its buckets at
+    /// session close: they are per-tenant and pruned by their own idle sweep.
+    load_state_limiter: LoadStateLimiter,
     /// Linearizes an assignment's registry-read→commit span against a relay's drain
     /// mark, closing the coordinated-drain race. The window is: [`create_session`]
     /// (and [`rehome`]) reads the registry to pick a relay, then commits — records
@@ -508,6 +515,7 @@ impl SessionSetup {
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter,
+            load_state_limiter: LoadStateLimiter::default(),
             assignment_lock: Arc::new(Mutex::new(())),
             create_idempotency: Arc::new(Mutex::new(HashMap::new())),
             provision: ProvisionGate::dormant(),
@@ -722,6 +730,20 @@ impl SessionSetup {
     /// and the lifecycle can drop a closed session's bucket.
     pub fn rehome_limiter(&self) -> &RehomeLimiter {
         &self.rehome_limiter
+    }
+
+    /// The per-tenant load-state read rate limiter, so the api handler can charge a
+    /// token and answer a refused read with the interval to retry after.
+    pub fn load_state_limiter(&self) -> &LoadStateLimiter {
+        &self.load_state_limiter
+    }
+
+    /// Replaces the load-state read limiter, so a test can inject a smaller burst or
+    /// shorter refill than production's without waiting real seconds.
+    #[must_use]
+    pub fn with_load_state_limiter(mut self, limiter: LoadStateLimiter) -> Self {
+        self.load_state_limiter = limiter;
+        self
     }
 
     /// Locks the assignment lock — the outermost lock that linearizes an

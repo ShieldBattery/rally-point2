@@ -111,6 +111,7 @@ fn heartbeat(interval: Duration) -> coordinator_client::HeartbeatConfig {
             sessions: std::sync::Arc::default(),
             decision_makers: std::sync::Arc::new(consensus::new_decision_makers()),
             region_rtt_cache: region_ping::RegionRttCache::default(),
+            load_fence: rally_point_relay::load_fence::LoadStateFence::new(),
         },
         interval,
     }
