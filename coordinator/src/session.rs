@@ -36,6 +36,7 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
 
+use crate::attest::LoadStateAttest;
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::presence::PresenceStore;
 use crate::provision::WarmTargets;
@@ -387,6 +388,10 @@ pub struct SessionSetup {
     /// reconnect. Drained by the relay's control connection alongside the
     /// descriptor set.
     reaps: RelayReaps,
+    /// The load-state attestation broker — the per-relay question channel the
+    /// control connections drain and the correlation map the load-state read waits
+    /// on. Held here alongside the other per-relay outboxes it is shaped after.
+    attest: LoadStateAttest,
     /// Active-player presence — the connected slots relays report on their
     /// heartbeats. Fed by the relay control connections, read by the tenant's
     /// `POST /presence/query`. Held here alongside the registry it is fenced
@@ -498,6 +503,7 @@ impl SessionSetup {
             session_refs: Arc::new(Mutex::new(HashMap::new())),
             descriptors: RelayDescriptors::new(),
             reaps: RelayReaps::new(),
+            attest: LoadStateAttest::new(),
             presence: crate::presence::new_store(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
@@ -569,6 +575,12 @@ impl SessionSetup {
     /// the reap policies push `CloseSlot` directives into it).
     pub fn reaps(&self) -> &RelayReaps {
         &self.reaps
+    }
+
+    /// Exposes the load-state attestation broker (the control connection drains a
+    /// relay's questions and resolves its answers; the load-state read asks).
+    pub fn attest(&self) -> &LoadStateAttest {
+        &self.attest
     }
 
     /// Exposes the active-player presence store (the control connection applies

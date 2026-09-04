@@ -86,6 +86,14 @@ pub struct RelayRegistry {
     /// relay is included, draining ones too: the set governs new mesh-link
     /// admission, not liveness, and a draining relay still serves live links.
     mesh_peers: Arc<watch::Sender<Vec<MeshPeerIdentity>>>,
+    /// The process identity ([`RelayHello::boot_id`]) each relay id last enrolled
+    /// with, remembered **across deregistration** — unlike `relays`, whose entry a
+    /// dropped control connection removes. That outliving is the whole point: the
+    /// question this answers is whether the process behind a reconnect is the one
+    /// that was here before, which is unanswerable from state the disconnect erased.
+    /// A recorded `None` is a relay that enrolled without a boot id (a build that
+    /// predates the field), which can never claim continuity.
+    boot_ids: Arc<Mutex<HashMap<RelayId, Option<u64>>>>,
 }
 
 impl Default for RelayRegistry {
@@ -94,8 +102,21 @@ impl Default for RelayRegistry {
             relays: Arc::default(),
             next_generation: Arc::default(),
             mesh_peers: Arc::new(watch::channel(Vec::new()).0),
+            boot_ids: Arc::default(),
         }
     }
+}
+
+/// Whether a relay's enroll continues the process that was enrolled under its id
+/// before, as [`note_boot_id`] judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootLineage {
+    /// The same process as last time — its in-memory state survived, so whatever it
+    /// retained before the reconnect it still holds.
+    Continuous,
+    /// A different process, or one that cannot prove it is the same. Everything the
+    /// previous process held and had not reported is gone.
+    Broken,
 }
 
 /// The SHA-256 fingerprint of a relay's DER-encoded certificate — the compact
@@ -162,6 +183,38 @@ pub fn enroll(registry: &RelayRegistry, hello: RelayHello) -> u64 {
     let cert_fingerprint = cert_fingerprint(&hello.cert_der);
     let mut relays = registry.relays.lock();
     insert_locked(registry, &mut relays, hello, cert_fingerprint)
+}
+
+/// Records the process identity `id` just enrolled with and reports whether it
+/// continues the process previously seen under that id.
+///
+/// The judgement is deliberately one-sided: only a boot id that *matches* a
+/// remembered one proves continuity. A different value is a restart; an absent one
+/// (a relay build that predates the field) proves nothing and is read the same way,
+/// because a coordinator that guessed continuity here would let a session claim a
+/// completeness its relays cannot back. A relay id never seen before is
+/// continuous by default — with no prior process, there is no memory to have lost,
+/// and nothing this coordinator holds predates the enroll.
+///
+/// Call once per accepted enroll, after the registry mutation; a refused enroll
+/// changes nothing and must not update the memory.
+pub fn note_boot_id(registry: &RelayRegistry, id: RelayId, boot_id: Option<u64>) -> BootLineage {
+    let previous = registry.boot_ids.lock().insert(id, boot_id);
+    match (previous, boot_id) {
+        (Some(Some(previous)), Some(current)) if previous == current => BootLineage::Continuous,
+        (None, Some(_)) => BootLineage::Continuous,
+        _ => BootLineage::Broken,
+    }
+}
+
+/// Drops `id`'s remembered process identity, for a relay id that has been
+/// **permanently** retired — the same narrow contract
+/// [`RelayReaps::forget`](crate::descriptors::RelayReaps::forget) documents. An id
+/// that could still legitimately re-enroll must keep its memory, since forgetting
+/// it would make the next reconnect read as a first enroll and silently claim a
+/// continuity nothing verified. Idempotent.
+pub fn forget_boot_id(registry: &RelayRegistry, id: RelayId) {
+    registry.boot_ids.lock().remove(&id);
 }
 
 /// Refusal from [`try_enroll`]: the id is already enrolled by a live control
@@ -938,5 +991,78 @@ mod tests {
         // An unconditional remove shrinks it too.
         remove(&reg, RelayId(2));
         assert!(mesh_peers(&reg).is_empty());
+    }
+
+    #[test]
+    fn a_repeated_boot_id_is_the_only_thing_that_proves_continuity() {
+        let reg = new_registry();
+        // A relay id never seen before has no prior process to have lost anything.
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(7)),
+            BootLineage::Continuous,
+        );
+        // The same process redialing.
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(7)),
+            BootLineage::Continuous,
+        );
+        // A restart: a different process behind the same id.
+        assert_eq!(note_boot_id(&reg, RelayId(1), Some(8)), BootLineage::Broken);
+        // And the new value is what the next enroll is judged against.
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(8)),
+            BootLineage::Continuous,
+        );
+    }
+
+    #[test]
+    fn an_absent_boot_id_never_proves_continuity_in_either_direction() {
+        // A relay build that predates the field cannot say whether its memory
+        // survived, and neither can the coordinator on its behalf — so its every
+        // enroll reads as a restart, and an enroll that follows one cannot lean on
+        // it either.
+        let reg = new_registry();
+        assert_eq!(note_boot_id(&reg, RelayId(1), None), BootLineage::Broken);
+        assert_eq!(note_boot_id(&reg, RelayId(1), None), BootLineage::Broken);
+        assert_eq!(note_boot_id(&reg, RelayId(1), Some(7)), BootLineage::Broken);
+        assert_eq!(note_boot_id(&reg, RelayId(1), None), BootLineage::Broken);
+    }
+
+    #[test]
+    fn boot_id_memory_is_per_relay_and_outlives_deregistration() {
+        // The registry entry goes away when a control connection drops; the process
+        // identity must not, or every reconnect would read as a first enroll and
+        // silently claim a continuity nothing verified.
+        let reg = new_registry();
+        let generation = enroll(&reg, hello(1, 14901));
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(7)),
+            BootLineage::Continuous,
+        );
+        assert_eq!(
+            note_boot_id(&reg, RelayId(2), Some(9)),
+            BootLineage::Continuous
+        );
+        assert!(remove_if_current(&reg, RelayId(1), generation));
+
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(7)),
+            BootLineage::Continuous,
+        );
+        assert_eq!(note_boot_id(&reg, RelayId(1), Some(8)), BootLineage::Broken);
+        assert_eq!(
+            note_boot_id(&reg, RelayId(2), Some(9)),
+            BootLineage::Continuous,
+            "another relay's memory is untouched",
+        );
+
+        // Only a permanently retired id may be forgotten, at which point it reads
+        // as one never seen.
+        forget_boot_id(&reg, RelayId(1));
+        assert_eq!(
+            note_boot_id(&reg, RelayId(1), Some(99)),
+            BootLineage::Continuous,
+        );
+        forget_boot_id(&reg, RelayId(1));
     }
 }

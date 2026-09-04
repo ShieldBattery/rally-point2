@@ -1140,21 +1140,36 @@ notification arrived. Both slot lists are *ever*-sets (a slot that arrived and t
 
 The sets are **positive evidence and always safe to merge**, so the pull answers with everything the
 coordinator holds whatever their provenance. What takes qualifying is reading a slot's *absence* as proof it
-never arrived, and two fields gate exactly that.
+never arrived, and `known` gates exactly that.
 
-`known: true` means the coordinator has held the session **since it created it** (so the sets start at the
-session's beginning, not wherever a restarted process came up) *and* every serving relay has restated its own
-view at least once (so an empty set means "nobody arrived", not "nobody has spoken yet"). `freshAsOfMs` says
-how far that reaches: the coordinator's own receipt time for the oldest of the serving relays' most recent
-restatements — the record is complete for everything before it and may be missing up to a beat (~10 s) after
-it. A tenant whose load deadline is at `T` therefore treats the answer as decisive once `freshAsOfMs >= T`,
-and may re-read until the watermark passes its cutoff. The stamp is the coordinator's clock rather than a
-relay's, because wall time is what the tenant compares it against. A re-home rescopes freshness with the
-assignment: both endpoints must earn a watermark again from a beat under the new one.
+The read is an **exchange, not a lookup**. On each request the coordinator asks every relay serving the
+session, down the control connection each already holds, what it holds for that session; the relay snapshots
+its retained load state plus its live roster and answers with the request's own correlation id. Because the
+relay builds that snapshot *after* the request reached it, everything it had observed before the caller sent
+the read is in the answer. `known: true` therefore means every serving relay produced a snapshot after this
+request arrived — so an absent slot is a player who never got there — and it says so without any clock on
+either side taking part. That is why the exchange exists rather than a freshness stamp: a heartbeat is
+snapshotted on the relay and received an unknown interval later, so no receipt time the coordinator writes
+can say which side of a caller's deadline a fact fell on, and the comparison would span two hosts' wall
+clocks besides. The heartbeat's restatements remain the durable *repair* path — they recover a dropped notice
+or a coordinator restart within a beat — but they carry no ordering, so they never gate completeness.
 
-`known: false` — a coordinator that restarted and forgot, a reaped session, or one whose serving relays have
-not all beaten yet — is no information *about who is missing*. It is never proof that nobody arrived, and the
-facts the answer carries alongside it are as real as any other.
+Two further conditions ride with the answers. The coordinator must have held the session **since it created
+it** (a restarted process's sets start wherever it came up, not at the session's beginning), and the relay
+memory covering the session must be unbroken. Retained load state lives in a relay process; when a serving
+relay is replaced by a re-home, or comes back as a new process, whatever it saw and had not yet restated is
+gone, and no later snapshot can vouch for that interval. The coordinator watches for the second case with a
+`boot_id` on the relay hello — a value drawn once per relay process — so a control connection redialing (same
+value, memory intact) is told apart from a restart (a different value, or none at all, which an older relay
+build sends and which can therefore never claim continuity). Either kind of break clears the session's
+completeness claim permanently; nothing restores it, because nothing can recover what was lost.
+
+`known: false` — a relay that did not answer inside the request's short deadline, a relay holding no control
+connection, a coordinator that restarted and forgot, a reaped session, a re-homed or restarted serving relay
+— is no information *about who is missing*. It is never proof that nobody arrived, and the facts the answer
+carries alongside it are as real as any other. Every snapshot that does arrive is merged and returned whether
+or not the set completes, so one silent relay costs the claim and never its peers' facts. The read is cheap
+to repeat, so a caller with time left may simply ask again.
 
 ### Active-player presence
 

@@ -49,7 +49,7 @@ use rally_point_proto::control::{
     CoordinatorToRelay, DescriptorKey, ENROLL_POP_CONTEXT, MeshPeerIdentity, RegionRttReport,
     RelayHello, RelayToCoordinator, SessionDescriptor, SessionPresence,
 };
-use rally_point_proto::ids::RelayId;
+use rally_point_proto::ids::{RelayId, SlotId};
 use rally_point_proto::version::{
     CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
     CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
@@ -66,7 +66,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 use crate::auth::SharedRegistry;
-use crate::consensus::RelayNotice;
+use crate::consensus::{RelayNotice, RetainedLoadState};
 use crate::flight_recorder::FlightShipment;
 use crate::mesh_control::MeshControl;
 use crate::region_ping::{RegionPingTargets, RegionRttCache};
@@ -124,6 +124,33 @@ struct WriterRoutes {
     challenge_rx: UnboundedReceiver<[u8; 32]>,
     /// A routed flight-upload grant or refusal for the writer's upload machinery.
     flight_grant_rx: UnboundedReceiver<FlightGrant>,
+    /// A routed load-state request for the writer to answer with a snapshot send.
+    load_state_rx: UnboundedReceiver<LoadStateAsk>,
+}
+
+/// The read half's routes to the write half: the frames it decodes but cannot act
+/// on, because acting on each of them is a *send* and only the writer sends.
+struct ReaderRoutes {
+    /// Where a mid-stream identity-challenge nonce goes to be answered.
+    challenge_tx: UnboundedSender<[u8; 32]>,
+    /// Where a flight-upload grant or refusal goes, to the half that owns the
+    /// parked shipment and its upload lifecycle.
+    flight_grant_tx: UnboundedSender<FlightGrant>,
+    /// Where a load-state request goes to be snapshotted and answered.
+    load_state_tx: UnboundedSender<LoadStateAsk>,
+}
+
+/// A coordinator's [`CoordinatorToRelay::LoadStateRequest`], routed from the read
+/// half to the write half (answering it is a send, and only the writer sends).
+///
+/// The whole point of the exchange is ordering: the answer must be built from what
+/// this relay holds *after* the request arrived, so the routed ask carries only the
+/// question and the writer snapshots the state itself at send time.
+struct LoadStateAsk {
+    /// The coordinator's correlation id, echoed back on the snapshot.
+    request_id: u64,
+    /// The session to snapshot.
+    key: SessionKey,
 }
 
 /// A coordinator's answer to a [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
@@ -911,13 +938,29 @@ async fn connect_and_stream(
     // half routes it here — the same shape as the challenge channel.
     let (flight_grant_tx, flight_grant_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // A load-state request is read on the read half but answered by the write half,
+    // which owns every send and the heartbeat sources the snapshot is built from —
+    // the same shape as the challenge channel.
+    let (load_state_tx, load_state_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // Run both halves until either ends; the first to finish is the connection's
     // outcome, and dropping the other closes its half of the socket. There is no
     // spawned task to leak, and the caller-owned `outbound` slots — mutated in place
     // by the writer through `&mut` — carry whatever stayed undelivered straight back
     // to the caller no matter which half ended the connection.
     tokio::select! {
-        result = read_control_frames(stream, apply_targets, relay_id, challenge_tx, flight_grant_tx, read_stats, control_connected) => result,
+        result = read_control_frames(
+            stream,
+            apply_targets,
+            relay_id,
+            ReaderRoutes {
+                challenge_tx,
+                flight_grant_tx,
+                load_state_tx,
+            },
+            read_stats,
+            control_connected,
+        ) => result,
         result = write_control_frames(
             sink,
             outbound,
@@ -928,6 +971,7 @@ async fn connect_and_stream(
             WriterRoutes {
                 challenge_rx,
                 flight_grant_rx,
+                load_state_rx,
             },
         ) => result,
     }
@@ -941,10 +985,11 @@ async fn connect_and_stream(
 /// strictly in arrival order, a descriptor push the coordinator sends just before a
 /// `DrainAck` has already updated the applied set by the time the ack fires.
 ///
-/// A mid-stream `IdentityChallenge`'s answer is a send, so it is routed to the
-/// write half through `challenge_tx` rather than answered here. A `Close` (or the
-/// stream ending, or a read/decode error) ends the connection with the same
-/// classification a close carries anywhere.
+/// A frame whose handling is itself a *send* — a mid-stream `IdentityChallenge`, a
+/// flight-upload grant, a `LoadStateRequest` — is routed to the write half through
+/// `routes` rather than answered here. A `Close` (or the stream ending, or a
+/// read/decode error) ends the connection with the same classification a close
+/// carries anywhere.
 ///
 /// The first successfully decoded application frame reports the control connection
 /// established through `control_connected`: an accepted enroll always leads with a
@@ -957,11 +1002,15 @@ async fn read_control_frames(
     + Unpin,
     apply_targets: &ControlApplyTargets,
     relay_id: RelayId,
-    challenge_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
-    flight_grant_tx: UnboundedSender<FlightGrant>,
+    routes: ReaderRoutes,
     stats: ControlConnStats,
     control_connected: &watch::Sender<bool>,
 ) -> Result<ControlDisconnect, ControlError> {
+    let ReaderRoutes {
+        challenge_tx,
+        flight_grant_tx,
+        load_state_tx,
+    } = routes;
     // Set once, on the first decoded application frame: it is the accepted-enroll
     // signal (see this function's doc). The reconnect loop clears it uniformly on
     // disconnect, so it never carries a stale reading into the next connection.
@@ -1026,6 +1075,26 @@ async fn read_control_frames(
                         // The coordinator refused the upload: route the refusal so the
                         // write half drops the parked recording and unparks the slot.
                         let _ = flight_grant_tx.send(FlightGrant::Refused { request });
+                    }
+                    CoordinatorToRelay::LoadStateRequest {
+                        tenant,
+                        session,
+                        request_id,
+                    } => {
+                        // Answering is a send, so route the question to the write
+                        // half, which snapshots the session's state at send time. The
+                        // snapshot must be taken *after* this request arrived for the
+                        // coordinator's completeness claim to hold, and routing an
+                        // already-decoded question preserves that: nothing this relay
+                        // learns from here on can be excluded from the answer, only
+                        // included. A dropped receiver means the write half is gone and
+                        // the connection is ending, so a failed route is a harmless
+                        // no-op — the coordinator reads the missing answer as this
+                        // relay not having attested.
+                        let _ = load_state_tx.send(LoadStateAsk {
+                            request_id,
+                            key: SessionKey { tenant, session },
+                        });
                     }
                     other => apply_message(
                         &apply_targets.control,
@@ -1092,6 +1161,7 @@ async fn write_control_frames(
     let WriterRoutes {
         mut challenge_rx,
         mut flight_grant_rx,
+        mut load_state_rx,
     } = routes;
     // Split the caller-owned queues into their fields. The park/clear discipline
     // below mutates these in place, so whatever stays parked here is exactly what the
@@ -1126,6 +1196,8 @@ async fn write_control_frames(
     let mut challenge_open = true;
     // The read half likewise holds the flight-grant sender for the connection's life.
     let mut flight_grant_open = true;
+    // And likewise the load-state sender.
+    let mut load_state_open = true;
 
     // The flight uploads' per-connection state. `next_request` mints a fresh
     // correlation id per request on THIS connection, so a stale grant from a prior one
@@ -1224,6 +1296,25 @@ async fn write_control_frames(
                         answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id).await?;
                     }
                     None => challenge_open = false,
+                }
+            }
+
+            // A load-state request the read half routed here. Answered immediately
+            // from the state this relay already holds — a tenant is blocked on the
+            // coordinator's read while it waits, and its whole value is that the
+            // snapshot is ordered after the request. Below notices (a webhook-bearing
+            // frame still outranks it) and above the flight arms.
+            ask = load_state_rx.recv(), if load_state_open => {
+                match ask {
+                    Some(ask) => {
+                        let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                            request_id: ask.request_id,
+                            state: session_load_snapshot(&heartbeat.sources, ask.key),
+                        })
+                        .expect("a load-state snapshot always serializes");
+                        sink.send(Message::Text(frame.into())).await?;
+                    }
+                    None => load_state_open = false,
                 }
             }
 
@@ -1419,25 +1510,49 @@ fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
             .into_iter()
             .map(|(key, load)| {
                 let slots = live.remove(&key).unwrap_or_default();
-                SessionPresence {
-                    tenant: key.tenant,
-                    session: key.session,
-                    slots,
-                    ever_connected: load.ever_connected,
-                    started: load.started,
-                    started_at_ms: load.started_at_ms,
-                }
+                presence_entry(key, slots, load)
             })
             .collect();
-    roster.extend(live.into_iter().map(|(key, slots)| SessionPresence {
+    roster.extend(
+        live.into_iter()
+            .map(|(key, slots)| presence_entry(key, slots, RetainedLoadState::default())),
+    );
+    roster
+}
+
+/// Snapshots what this relay holds for **one** session, in the same
+/// [`SessionPresence`] shape a heartbeat's roster entry carries — the answer to a
+/// [`CoordinatorToRelay::LoadStateRequest`].
+///
+/// Reads exactly the two sources a beat reads, so an attested snapshot and a
+/// restated one describe the session identically: the session's currently-connected
+/// slots from the live roster, and its retained load state from its decision-maker.
+/// A session this relay holds nothing for — no maker, no live slot — snapshots to
+/// empty lists, which is this relay attesting that it knows of no arrival rather
+/// than declining to answer.
+fn session_load_snapshot(sources: &HeartbeatSources, key: SessionKey) -> SessionPresence {
+    let slots = crate::routing::live_slots(&sources.sessions)
+        .into_iter()
+        .find(|(live_key, _)| *live_key == key)
+        .map(|(_, slots)| slots)
+        .unwrap_or_default();
+    let load = crate::consensus::retained_load_state(&sources.decision_makers, &key);
+    presence_entry(key, slots, load)
+}
+
+/// Assembles one [`SessionPresence`] from a session's key, its connected slots, and
+/// the load state its decision-maker retained — the single place the wire shape is
+/// built, so a heartbeat's roster entry and an attested snapshot can never drift
+/// apart in what they report.
+fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) -> SessionPresence {
+    SessionPresence {
         tenant: key.tenant,
         session: key.session,
         slots,
-        ever_connected: Vec::new(),
-        started: Vec::new(),
-        started_at_ms: None,
-    }));
-    roster
+        ever_connected: load.ever_connected,
+        started: load.started,
+        started_at_ms: load.started_at_ms,
+    }
 }
 
 /// Snapshots the region-ping cache into the [`RegionRttReport`] entries a heartbeat
@@ -1662,6 +1777,24 @@ pub fn sign_enroll_proof(
     None
 }
 
+/// Draws this relay process's identity — the value its every
+/// [`RelayHello`] carries as `boot_id`, telling the coordinator a redialing control
+/// connection apart from a restarted process whose retained per-session state is
+/// gone.
+///
+/// Call exactly once at startup and reuse the result for the process's whole life:
+/// a value that changed mid-process would read as a restart, and one that survived
+/// a restart would falsely claim the relay's memory did. `None` when the system RNG
+/// refuses, which leaves the hello unstamped — the coordinator then assumes no
+/// continuity, the same conservative reading it applies to a relay build that
+/// predates the field.
+pub fn new_boot_id() -> Option<u64> {
+    let rng = ring::rand::SystemRandom::new();
+    ring::rand::generate::<[u8; 8]>(&rng)
+        .ok()
+        .map(|bytes| u64::from_le_bytes(bytes.expose()))
+}
+
 /// Applies one decoded control message to the Join source.
 ///
 /// A descriptor set reconciles membership and records its apply lag and size into
@@ -1752,6 +1885,12 @@ fn apply_message(
         }
         CoordinatorToRelay::FlightUploadRefused { .. } => {
             tracing::debug!("ignoring a FlightUploadRefused received outside the upload handshake");
+        }
+        // The connection loop intercepts LoadStateRequest (it routes the question to
+        // the write half, which snapshots and answers) before delegating here, so
+        // this arm is only a defensive no-op for a stray one.
+        CoordinatorToRelay::LoadStateRequest { .. } => {
+            tracing::debug!("ignoring a LoadStateRequest received outside the snapshot route");
         }
         CoordinatorToRelay::Unknown => {
             tracing::debug!("ignoring an unrecognized coordinator control message");
@@ -3340,6 +3479,187 @@ mod tests {
         assert!(unclaimed.ever_connected.is_empty() && unclaimed.started.is_empty());
     }
 
+    #[tokio::test]
+    async fn a_load_state_request_is_answered_on_the_control_connection() {
+        // The exchange the coordinator's completeness claim rests on: the relay
+        // answers the question it was asked, from the state it holds, echoing the
+        // correlation id back so the answer belongs to that request and no other.
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
+
+        // Stand-in coordinator: enroll the relay, push a load-state request, then
+        // read frames until the snapshot arrives (a heartbeat may precede it).
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _hello = accept_enroll(&mut ws).await;
+            let request = serde_json::to_string(&CoordinatorToRelay::LoadStateRequest {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(7),
+                request_id: 99,
+            })
+            .unwrap();
+            ws.send(Message::Text(request.into())).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                if text.contains("\"type\":\"load_state_snapshot\"") {
+                    let _ = frame_tx.send(text.to_string());
+                    return;
+                }
+            }
+        });
+
+        // What this relay holds for the session: slot 2 arrived and dropped, slot 3
+        // is here and running.
+        let sessions: Sessions = Arc::default();
+        let (mut guard, _inbox) =
+            crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3))
+                .expect("slot 3 registers");
+        guard.disarm();
+        let decision_makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
+        let _ = crate::consensus::sync_maker(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        for slot in [2u8, 3] {
+            crate::consensus::record_slot_connected(
+                &decision_makers,
+                &key(7),
+                rally_point_proto::ids::SlotId(slot),
+                false,
+            );
+        }
+        crate::consensus::record_slot_started(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::ids::SlotId(3),
+        );
+
+        let control = MeshControl::new(
+            RelayId(1),
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+        );
+        let (drain_rx, drain_acked) = no_drain();
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            apply_targets(control, drain_acked),
+            OutboundQueues::new(
+                mpsc::unbounded_channel().1,
+                no_flight(),
+                ControlConnStats::new(),
+            ),
+            HeartbeatConfig {
+                sources: HeartbeatSources {
+                    sessions: Arc::clone(&sessions),
+                    decision_makers,
+                    region_rtt_cache: RegionRttCache::default(),
+                },
+                // Long enough that the snapshot is not merely a beat in disguise.
+                interval: Duration::from_secs(3600),
+            },
+            drain_rx,
+            no_connected(),
+            backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        ));
+
+        let text = tokio::time::timeout(Duration::from_secs(5), frame_rx)
+            .await
+            .expect("the relay answers promptly")
+            .expect("the stand-in coordinator forwards the snapshot");
+        assert_eq!(
+            serde_json::from_str::<RelayToCoordinator>(&text).unwrap(),
+            RelayToCoordinator::LoadStateSnapshot {
+                request_id: 99,
+                state: SessionPresence {
+                    tenant: TenantId(TENANT.to_owned()),
+                    session: SessionId(7),
+                    slots: vec![rally_point_proto::ids::SlotId(3)],
+                    ever_connected: vec![
+                        rally_point_proto::ids::SlotId(2),
+                        rally_point_proto::ids::SlotId(3),
+                    ],
+                    started: vec![rally_point_proto::ids::SlotId(3)],
+                    started_at_ms: None,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
+        // An attested snapshot and a heartbeat's roster entry describe a session
+        // identically — they read the same live roster and the same retained maker
+        // state. What differs is only what the reader may assume about ordering.
+        use rally_point_proto::ids::SlotId;
+
+        let sessions: Sessions = Arc::default();
+        let decision_makers = Arc::new(crate::consensus::new_decision_makers());
+        let _ = crate::consensus::sync_maker(
+            &decision_makers,
+            &key(7),
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        let (_registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0)).expect("slot 0 registers");
+        crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+        crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+
+        let sources = HeartbeatSources {
+            sessions: Arc::clone(&sessions),
+            decision_makers: Arc::clone(&decision_makers),
+            region_rtt_cache: RegionRttCache::default(),
+        };
+        assert_eq!(
+            session_load_snapshot(&sources, key(7)),
+            heartbeat_presence(&sources)
+                .into_iter()
+                .find(|entry| entry.session == SessionId(7))
+                .expect("the session is on the beat"),
+        );
+    }
+
+    #[test]
+    fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
+        // Empty is a real answer — "I know of no arrival here" — and is exactly
+        // what a relay that never held the session has to say. The coordinator's
+        // completeness claim rests on the difference between this and silence, and
+        // silence is never produced here: every question gets an answer.
+        let sources = HeartbeatSources {
+            sessions: Arc::default(),
+            decision_makers: Arc::new(crate::consensus::new_decision_makers()),
+            region_rtt_cache: RegionRttCache::default(),
+        };
+        assert_eq!(
+            session_load_snapshot(&sources, key(7)),
+            SessionPresence {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(7),
+                slots: vec![],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
+            },
+        );
+    }
+
     // --- Protocol-version refusal backoff ---
 
     /// Spawns a stand-in coordinator that, for every control connection, reads the
@@ -4235,6 +4555,7 @@ mod tests {
         let (_drain_tx, mut drain_rx) = watch::channel(false);
         let (_challenge_tx, challenge_rx) = mpsc::unbounded_channel::<[u8; 32]>();
         let (_flight_grant_tx, flight_grant_rx) = mpsc::unbounded_channel::<FlightGrant>();
+        let (_load_state_tx, load_state_rx) = mpsc::unbounded_channel::<LoadStateAsk>();
 
         let mut outbound = OutboundQueues::new(notices_rx, flight_rx, ControlConnStats::new());
         let heartbeat = heartbeat(Duration::from_secs(3600));
@@ -4252,6 +4573,7 @@ mod tests {
             WriterRoutes {
                 challenge_rx,
                 flight_grant_rx,
+                load_state_rx,
             },
         );
         assert!(

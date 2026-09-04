@@ -5977,6 +5977,22 @@ pub fn retained_load_states(registry: &DecisionMakers) -> Vec<(SessionKey, Retai
         .collect()
 }
 
+/// The load state one session's decision-maker has retained, or the empty state
+/// for a session this relay holds no maker for.
+///
+/// Empty is a real answer, not a missing one: a relay with no maker for the session
+/// has learned nothing about who arrived there, which is exactly what empty sets
+/// say. The distinction that matters to the coordinator is between this relay
+/// answering and this relay not answering at all, never between an empty answer and
+/// an absent maker.
+pub fn retained_load_state(registry: &DecisionMakers, key: &SessionKey) -> RetainedLoadState {
+    registry
+        .lock()
+        .get(key)
+        .map(|maker| maker.load_state())
+        .unwrap_or_default()
+}
+
 /// Reports that `slot`'s link just activated on this relay: retains the slot in
 /// the session's ever-connected set and fires one slot-connected notice up the
 /// coordinator connection. `resumed` marks a dial that presented resume cursors

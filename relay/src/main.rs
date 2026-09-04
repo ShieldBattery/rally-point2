@@ -594,6 +594,16 @@ async fn main() -> Result<()> {
             if let Some(token) = &cli.enroll_token {
                 relay_hello = relay_hello.with_enroll_token(token.clone());
             }
+            // This process's own identity, drawn once here and repeated on every
+            // hello the reconnect loop sends. It lets the coordinator tell a redial
+            // (our retained per-session state is intact) from a restart (it is gone),
+            // which is what bounds how far back a load-state snapshot from us can
+            // vouch. Left unstamped if the system RNG refuses, which the coordinator
+            // reads as no continuity — conservative, and the load-state read is the
+            // only thing affected.
+            if let Some(boot_id) = coordinator_client::new_boot_id() {
+                relay_hello = relay_hello.with_boot_id(boot_id);
+            }
             tracing::info!(
                 relay_id = our_id,
                 advertise = %advertise_addr,

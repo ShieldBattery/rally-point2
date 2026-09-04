@@ -16,6 +16,10 @@
 //!   coordinator side of the control connection. Holds each relay's current
 //!   session-descriptor set behind a watch channel and pushes it down the
 //!   relay's open control connection whenever it changes.
+//! - **attest** ([`attest`]) — on-demand load-state attestation: the coordinator
+//!   asks a session's serving relays what they hold for it and correlates their
+//!   answers, so a load-state read's completeness rests on every relay having
+//!   answered *this* question rather than on comparing two hosts' clocks.
 //! - **notify** ([`notify`]) — the departure-webhook leg: dedup the departure
 //!   notices relays report up their control connections, enrich each with the
 //!   session's stored correlation ids + the tenant's notify config, and POST a
@@ -74,6 +78,7 @@
 
 pub mod acme;
 pub mod api;
+pub mod attest;
 pub mod descriptors;
 pub mod flight_store;
 pub mod identity;

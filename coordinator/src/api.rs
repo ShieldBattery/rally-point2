@@ -103,6 +103,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
+use crate::attest::{LOAD_STATE_ATTEST_TIMEOUT, LoadStateAsk};
 use crate::descriptors::SlotClose;
 use crate::flight_store::{self, S3FlightStore};
 use crate::identity;
@@ -733,35 +734,30 @@ struct SessionLoadStateRequest {
 /// webhook bodies), unlike the snake_case control-plane request above.
 ///
 /// `connectedSlots` / `startedSlots` / `startedAtMs` are always whatever the
-/// coordinator has accumulated, `known` or not: they are positive evidence, and
-/// the tenant merges them with its own regardless. `known` and `freshAsOfMs` gate
-/// only the *negative* inference — reading a slot's **absence** from the sets as
-/// proof that player never got there.
+/// coordinator has accumulated, `known` or not: they are positive evidence, and the
+/// tenant merges them with its own regardless. Both slot sets are always present,
+/// empty when nothing is known. `known` gates only the *negative* inference —
+/// reading a slot's **absence** from the sets as proof that player never got there.
 ///
-/// `known: true` means the coordinator has held the session **since it created
-/// it** (so the sets start at the session's beginning, not wherever a restarted
-/// process came up) and every serving relay has restated its own view at least
-/// once (so an empty set means "nobody arrived", not "nobody has spoken yet").
-///
-/// `freshAsOfMs` bounds how far that completeness reaches: it is the coordinator's
-/// receipt time, unix epoch milliseconds, of the oldest of the serving relays'
-/// most recent restatements — so the record is complete for everything that
-/// happened before it, and may still be missing up to a beat (~10s) after it.
-/// Absent whenever some serving relay has not reported the session this
-/// coordinator lifetime, which is exactly when `known` is `false`. A tenant whose
-/// own load deadline is at `T` should treat the answer as decisive only once
-/// `freshAsOfMs >= T`, and may re-read until it is (or until it decides to stop
-/// waiting).
+/// `known: true` means every relay serving the session produced a snapshot **after
+/// this request reached it**, and that the coordinator has held the session since it
+/// created it with no break in the relay memory covering it. So everything that had
+/// happened by the time the caller sent this request is in the sets, and an absent
+/// slot may be read as a player who never arrived. No clock on either side takes
+/// part in that claim: it rests on the ordering of the exchange, not on comparing
+/// timestamps across hosts.
 ///
 /// `known: false` is "no information about who is missing" — never "nobody
-/// arrived". A coordinator that restarted, a reaped session, and a session whose
-/// relays have not beaten yet all read that way.
+/// arrived". A relay that did not answer in time, a relay with no live control
+/// connection, a coordinator that restarted, a reaped session, and a session whose
+/// serving relays changed under it (a re-home, or a relay that restarted its
+/// process — either destroys memory nothing later can reconstruct) all read that
+/// way. The answer is cheap to repeat, so a caller with time left may simply read
+/// again; one whose deadline has passed decides on the positive facts alone.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
     known: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fresh_as_of_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at_ms: Option<u64>,
     connected_slots: Vec<u8>,
@@ -781,12 +777,19 @@ struct SessionLoadStateResponse {
 ///
 /// Both slot lists are **ever**-sets, ascending: a slot that connected and then
 /// dropped still appears, because the question is who got here at all, not who is
-/// here now (`POST /presence/query` answers the latter). They are fed by both the
-/// relays' notices as they happen and every relay heartbeat, which restates its
-/// whole retained load state — so a notice lost in flight costs at most a beat.
-/// That beat of lag is what `freshAsOfMs` measures: the sets are always safe to
-/// merge, but a slot's absence only means "never arrived" for events before the
-/// watermark, which is why a tenant with a hard deadline polls until it passes.
+/// here now (`POST /presence/query` answers the latter).
+///
+/// The read is an **exchange**, not a lookup of whatever happened to have arrived.
+/// The coordinator asks every relay serving the session, over the control
+/// connection each already holds, what it holds for that session; each relay
+/// snapshots and answers with the request's own correlation id. A snapshot is built
+/// after the request reached the relay, so anything the relay had observed before
+/// the caller sent this read is in it — which is what makes a complete set of
+/// answers evidence about *absence*, with no clock comparison anywhere. Every
+/// snapshot that arrives is merged whether or not the set completes, so a silent
+/// relay costs the completeness claim and never the facts its peers reported. A
+/// relay silent past [`LOAD_STATE_ATTEST_TIMEOUT`], or holding no control
+/// connection at all, simply did not answer.
 ///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs); the `tenant` in the body must match the tenant the signature verifies
@@ -810,29 +813,77 @@ async fn session_load_state(
         &body,
         TenantAccess::LiveGame,
     )?;
+    let session = SessionId(request.session);
 
-    let response = match state
-        .lifecycle
-        .load_state(&request.tenant, SessionId(request.session))
-    {
-        Some(load) => SessionLoadStateResponse {
-            known: load.known,
-            fresh_as_of_ms: load.fresh_as_of_ms,
-            started_at_ms: load.started_at_ms,
-            connected_slots: load.connected_slots.iter().map(|s| s.0).collect(),
-            started_slots: load.started_slots.iter().map(|s| s.0).collect(),
-        },
-        // The coordinator holds nothing at all for the session: never created
-        // here and no notice or beat has arrived for it, or it has been reaped.
-        None => SessionLoadStateResponse {
+    // The coordinator holds nothing at all for the session: never created here and
+    // no notice or beat has arrived for it, or it has been reaped. Nobody to ask,
+    // and nothing to answer with.
+    let Some(before) = state.lifecycle.load_state(&request.tenant, session) else {
+        return Ok(Json(SessionLoadStateResponse {
             known: false,
-            fresh_as_of_ms: None,
             started_at_ms: None,
             connected_slots: Vec::new(),
             started_slots: Vec::new(),
-        },
+        }));
     };
-    Ok(Json(response))
+
+    let attested =
+        attest_serving_relays(&state, &request.tenant, session, &before.serving_relays).await;
+    // Re-read after the exchange so the answer carries whatever the snapshots added.
+    // A session retired while the relays were answering leaves nothing to re-read,
+    // and the snapshots that landed went into a record that no longer exists — so
+    // the pre-exchange facts are answered with, and no claim is made over them.
+    let Some(after) = state.lifecycle.load_state(&request.tenant, session) else {
+        return Ok(Json(SessionLoadStateResponse {
+            known: false,
+            started_at_ms: before.started_at_ms,
+            connected_slots: before.connected_slots.iter().map(|s| s.0).collect(),
+            started_slots: before.started_slots.iter().map(|s| s.0).collect(),
+        }));
+    };
+    // A session with no serving relays has nobody who could attest, so it can never
+    // complete — the same reason a state no registration built cannot.
+    let every_relay_attested =
+        !before.serving_relays.is_empty() && attested == before.serving_relays.len();
+    Ok(Json(SessionLoadStateResponse {
+        known: after.created_here && after.attestable && every_relay_attested,
+        started_at_ms: after.started_at_ms,
+        connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
+        started_slots: after.started_slots.iter().map(|s| s.0).collect(),
+    }))
+}
+
+/// Asks every relay in `serving` for its snapshot of the session and returns how
+/// many of them answered. Each answer is merged where it is received, so this only
+/// has to count them.
+///
+/// Every request goes out before any answer is waited on, and all of them share one
+/// absolute deadline, so the whole exchange costs at most
+/// [`LOAD_STATE_ATTEST_TIMEOUT`] however many relays serve the session and however
+/// many of them are slow. A relay that cannot be reached at all (no live control
+/// connection) is never asked and counts exactly like one that stayed silent: it
+/// did not attest.
+async fn attest_serving_relays(
+    state: &CoordinatorState,
+    tenant: &TenantId,
+    session: SessionId,
+    serving: &[RelayId],
+) -> usize {
+    let mut pending: Vec<_> = serving
+        .iter()
+        .filter_map(|&relay| state.setup.attest().request(relay, tenant, session))
+        .collect();
+    let deadline = tokio::time::Instant::now() + LOAD_STATE_ATTEST_TIMEOUT;
+    let mut attested = 0;
+    for waiter in &mut pending {
+        if matches!(
+            tokio::time::timeout_at(deadline, waiter.recv()).await,
+            Ok(Some(_))
+        ) {
+            attested += 1;
+        }
+    }
+    attested
 }
 
 /// The most user refs one presence query may ask about, so a caller cannot make
@@ -1607,6 +1658,8 @@ async fn serve_relay_control(
         .capabilities
         .iter()
         .any(|c| c == rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1);
+    // Read out before the hello is consumed by the enroll below.
+    let boot_id = hello.boot_id;
     // The enrollment's registry mutation and the capability-transition
     // snapshot run under the assignment lock, so they land wholly before or
     // wholly after any in-flight rehome's capability-check → descriptor-commit
@@ -1623,6 +1676,21 @@ async fn serve_relay_control(
         let _assign = setup.lock_assignment();
         let result =
             lifecycle.enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello));
+        // Whether this is the process that was here before, or a new one whose
+        // memory starts empty. A break costs every session this relay serves its
+        // completeness claim: the facts the old process held and never restated are
+        // gone, and no snapshot from this one can cover that interval. Judged under
+        // the assignment lock so it cannot land between a create's relay pick and
+        // its commit and demote a session whose whole life postdates this enroll. A
+        // session committed but not yet registered is likewise unaffected: its
+        // create has not answered the tenant, so no client holds a token for it and
+        // the relay can have observed nothing about it to lose. A refused enroll
+        // changes nothing and must not update the memory.
+        if result.is_ok()
+            && registry::note_boot_id(registry, relay_id, boot_id) == registry::BootLineage::Broken
+        {
+            lifecycle.on_relay_lineage_break(relay_id);
+        }
         let evict = match &result {
             Ok(generation) => {
                 // Sessions whose recorded build-class cohort no longer
@@ -1864,6 +1932,9 @@ struct WriterSources {
     mesh_peers: tokio::sync::watch::Receiver<Vec<MeshPeerIdentity>>,
     /// This relay's reap directives, coalesced per session before each is sent.
     reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
+    /// Load-state questions addressed to this relay, each answered with one request
+    /// frame down the connection.
+    load_state: tokio::sync::mpsc::UnboundedReceiver<LoadStateAsk>,
     /// The reader's directives to emit a drain exchange's set-then-ack.
     drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
     /// Ready flight-upload grant/refusal frames the reader minted (a presign runs off
@@ -1923,6 +1994,7 @@ async fn push_and_watch(
         descriptors: setup.descriptors().subscribe(relay_id),
         mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
         reaps: setup.reaps().subscribe(relay_id),
+        load_state: setup.attest().subscribe(relay_id),
         drain,
         grants,
         tenant_keys: tenant::all_verifying_keys(setup.tenants()),
@@ -1944,12 +2016,13 @@ async fn push_and_watch(
 /// connect-time sequence in a fixed order — tenant keys, region beacons (when any),
 /// the initial descriptor set, the initial mesh-peer set — strictly before any
 /// steady-state push, then serves a `biased` priority loop: the drain exchange
-/// first, then the latest-wins descriptor watch, the mesh-peer watch, the
-/// flight-upload grants, and the reap receiver last. The grants sit below the
-/// descriptor/mesh pushes (a grant gates a relay's upload progress but must not
-/// preempt a session-start descriptor) and above reaps. Returns (ending the
-/// connection) when a send stalls or errors, a watch closes on shutdown, or the
-/// reader ends.
+/// first, then the latest-wins descriptor watch, the mesh-peer watch, the load-state
+/// questions, the flight-upload grants, and the reap receiver last. A load-state
+/// question has a tenant's read blocked on its answer and costs one small frame, so
+/// it outranks the grants; both sit below the descriptor/mesh pushes, which neither
+/// may preempt (a grant gates a relay's upload progress, but not ahead of a
+/// session-start descriptor). Returns (ending the connection) when a send stalls or
+/// errors, a watch closes on shutdown, or the reader ends.
 ///
 /// The connect-time descriptor set is always the full set (it seeds the relay's
 /// baseline), but the steady-state descriptor arm sends only what changed — a
@@ -1969,6 +2042,7 @@ async fn run_writer(
         descriptors: rx,
         mesh_peers: mesh_peers_rx,
         reaps,
+        load_state: load_state_rx,
         drain: drain_rx,
         grants: grants_rx,
         tenant_keys,
@@ -2117,6 +2191,22 @@ async fn run_writer(
                     "mesh-peers",
                 )
                 .await
+                {
+                    break;
+                }
+            }
+            ask = load_state_rx.recv() => {
+                // A load-state question for this relay, from a tenant read blocked on
+                // the answer. `None` means the broker replaced this connection's
+                // channel (a reconnect took over) or is gone, so this half ends too.
+                let Some(ask) = ask else { break };
+                let frame = control_frame(&CoordinatorToRelay::LoadStateRequest {
+                    tenant: ask.tenant,
+                    session: ask.session,
+                    request_id: ask.request_id,
+                });
+                if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
+                    .await
                 {
                     break;
                 }
@@ -2571,13 +2661,13 @@ enum InboundAction {
 /// close to, while leaving enormous headroom over any real deployment.
 const MAX_HEARTBEAT_SESSIONS: usize = 4096;
 
-/// The most slots a single session entry in a heartbeat's roster may name in any
-/// one of its three slot lists — [`session::MAX_SLOT`] plus one, the same ceiling
-/// a session's own slots are validated against at creation. A heartbeat's roster
-/// carries no such validation on the wire, so an entry naming more slots than a
-/// session could ever legitimately have is definitely forged, not just generous.
-/// (An entry naming *no* connected slot is ordinary: the relay holds the session
-/// but no live link into it.)
+/// The most slots a single relay-reported session entry may name in any one of its
+/// three slot lists — [`session::MAX_SLOT`] plus one, the same ceiling a session's
+/// own slots are validated against at creation. Such an entry (a heartbeat's roster
+/// entry, or an attested load-state snapshot) carries no length validation on the
+/// wire, so one naming more slots than a session could ever legitimately have is
+/// definitely forged, not just generous. (An entry naming *no* connected slot is
+/// ordinary: the relay holds the session but no live link into it.)
 const MAX_HEARTBEAT_SESSION_SLOTS: usize = session::MAX_SLOT as usize + 1;
 
 /// The most backbone round-trip reports a single heartbeat may carry. A
@@ -2653,28 +2743,7 @@ fn note_inbound(
                 complete_roster = false;
             }
             for session in &mut sessions {
-                // Each of the three slot lists is bounded by the same ceiling: a
-                // session cannot have more slots than that, so a longer list is
-                // forged (or a relay bug) whether it names the connected slots or
-                // the ever-connected/ever-started ones.
-                for (label, slots) in [
-                    ("connected", &mut session.slots),
-                    ("ever-connected", &mut session.ever_connected),
-                    ("started", &mut session.started),
-                ] {
-                    if slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
-                        tracing::warn!(
-                            relay_id = relay_id.0,
-                            tenant = session.tenant.as_ref(),
-                            session = session.session.0,
-                            list = label,
-                            reported = slots.len(),
-                            cap = MAX_HEARTBEAT_SESSION_SLOTS,
-                            "heartbeat session slot list exceeds the per-session cap; truncating",
-                        );
-                        slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
-                    }
-                }
+                bound_session_slot_lists(relay_id, session);
             }
             if region_rtts.len() > MAX_HEARTBEAT_REGION_RTTS {
                 tracing::warn!(
@@ -2735,13 +2804,14 @@ fn note_inbound(
                 // The beat also restates each session's accumulated load state,
                 // which is the durable record behind the droppable slot-connected
                 // / session-started / slot-started notices: the notice is the fast
-                // path to the tenant's webhook, this is what the load-state read
-                // answers from. It fires no webhook of its own — the facts here
-                // have already been notified, and re-notifying them every beat
-                // would flood the feed. The receipt stamp is this coordinator's
-                // own wall clock, because the freshness watermark it feeds is
-                // compared against wall time by the tenant reading it.
-                lifecycle.on_heartbeat_load_state(relay_id, &sessions, now_unix_ms());
+                // path to the tenant's webhook, this is what repairs the record
+                // when one is lost or a restart forgets it. It fires no webhook of
+                // its own — the facts here have already been notified, and
+                // re-notifying them every beat would flood the feed. A beat says
+                // nothing about *when* the relay observed any of it, which is why
+                // the load-state read asks its own question rather than reading a
+                // beat's arrival as a deadline.
+                lifecycle.merge_load_state(&sessions);
                 // Backbone RTTs fold in under the same generation fence as presence: a
                 // stale connection's beat describes a superseded view, so its measured
                 // pairs must not overwrite what the live connection reports. Unlike the
@@ -2893,6 +2963,10 @@ fn note_inbound(
         }
         Ok(RelayToCoordinator::FlightUploadDone { request }) => {
             handle_flight_upload_done(inbound, flight, request);
+            InboundAction::None
+        }
+        Ok(RelayToCoordinator::LoadStateSnapshot { request_id, state }) => {
+            handle_load_state_snapshot(inbound, request_id, state);
             InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.
@@ -3173,6 +3247,88 @@ fn handle_flight_upload_done(
     }
 }
 
+/// Truncates each of a session entry's three slot lists to
+/// [`MAX_HEARTBEAT_SESSION_SLOTS`], logging what was cut.
+///
+/// A session cannot have more slots than that ceiling, so a longer list is forged
+/// (or a relay bug) whether it names the connected slots or the
+/// ever-connected/ever-started ones. Applied to every relay-supplied session entry
+/// — a heartbeat's roster and an attested load-state snapshot alike — since both
+/// arrive on the wire with no length limit of their own and both feed the same
+/// accumulated sets. Truncated rather than rejected: the legitimate entries that
+/// precede the excess are still worth folding in.
+fn bound_session_slot_lists(
+    relay_id: RelayId,
+    session: &mut rally_point_proto::control::SessionPresence,
+) {
+    for (label, slots) in [
+        ("connected", &mut session.slots),
+        ("ever-connected", &mut session.ever_connected),
+        ("started", &mut session.started),
+    ] {
+        if slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
+            tracing::warn!(
+                relay_id = relay_id.0,
+                tenant = session.tenant.as_ref(),
+                session = session.session.0,
+                list = label,
+                reported = slots.len(),
+                cap = MAX_HEARTBEAT_SESSION_SLOTS,
+                "relay-reported session slot list exceeds the per-session cap; truncating",
+            );
+            slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+        }
+    }
+}
+
+/// Handles one relay's [`RelayToCoordinator::LoadStateSnapshot`]: the attested
+/// answer to a load-state question the coordinator put to this relay.
+///
+/// The snapshot is folded into the session's record through exactly the path a
+/// heartbeat's restatement takes — positive facts only, no webhook — and then
+/// delivered to the read still waiting on it, which is what lets that read conclude
+/// this relay has now answered for itself.
+///
+/// Two gates precede both. A snapshot for a session this relay does not serve is
+/// rejected, the same membership rule every other notice's arm applies: without it
+/// an enrolled relay could name a victim `(tenant, session, slot)` and forge an
+/// arrival into that session's record. And the broker accepts the correlation id
+/// only when it names an outstanding request made to *this* relay for *this*
+/// session, so one relay can never answer in another's name, and a late answer from
+/// a read that already gave up finds nothing to resolve.
+fn handle_load_state_snapshot(
+    inbound: &ControlInbound<'_>,
+    request_id: u64,
+    mut snapshot: rally_point_proto::control::SessionPresence,
+) {
+    let relay_id = inbound.relay_id;
+    bound_session_slot_lists(relay_id, &mut snapshot);
+    if !relay_serves_session(inbound.setup, relay_id, &snapshot.tenant, snapshot.session) {
+        tracing::warn!(
+            relay_id = relay_id.0,
+            tenant = snapshot.tenant.as_ref(),
+            session = snapshot.session.0,
+            "load-state snapshot from a relay not serving the session; rejecting",
+        );
+        return;
+    }
+    inbound
+        .lifecycle
+        .merge_load_state(std::slice::from_ref(&snapshot));
+    if inbound
+        .setup
+        .attest()
+        .resolve(request_id, relay_id, snapshot)
+        .is_err()
+    {
+        tracing::debug!(
+            relay_id = relay_id.0,
+            request_id,
+            "load-state snapshot for an unknown or already-answered request; ignoring",
+        );
+    }
+}
+
 /// Warns that a recording arrived with no store configured, at most once per
 /// [`NO_STORE_WARN_INTERVAL_SECS`] — an operator who wired relays to ship but forgot the
 /// store config should see it, without one log line per dropped recording. A racing pair
@@ -3254,6 +3410,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::SessionClosed { .. }
                         | RelayToCoordinator::FlightUploadRequest { .. }
                         | RelayToCoordinator::FlightUploadDone { .. }
+                        | RelayToCoordinator::LoadStateSnapshot { .. }
                         | RelayToCoordinator::IdentityProof { .. }
                         | RelayToCoordinator::Unknown,
                     ) => {
@@ -4053,8 +4210,175 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// A roster/snapshot entry for `session` naming the slots that ever connected
+    /// and the slots that ever started.
+    fn load_snapshot(
+        tenant: &TenantId,
+        session: SessionId,
+        ever_connected: &[u8],
+        started: &[u8],
+        started_at_ms: Option<u64>,
+    ) -> rally_point_proto::control::SessionPresence {
+        rally_point_proto::control::SessionPresence {
+            tenant: tenant.clone(),
+            session,
+            slots: vec![],
+            ever_connected: ever_connected.iter().map(|&s| SlotId(s)).collect(),
+            started: started.iter().map(|&s| SlotId(s)).collect(),
+            started_at_ms,
+        }
+    }
+
+    /// Stands a relay's control connection in for the load-state exchange: drains
+    /// the questions addressed to `relay` and answers each with `snapshot`, through
+    /// the same inbound path a real connection's reader takes. The returned handle
+    /// is aborted by the test to model a relay going away.
+    fn spawn_attesting_relay(
+        state: &CoordinatorState,
+        relay: RelayId,
+        snapshot: rally_point_proto::control::SessionPresence,
+    ) -> tokio::task::JoinHandle<()> {
+        let setup = state.setup.clone();
+        let notices = state.notices.clone();
+        let lifecycle = state.lifecycle.clone();
+        let mut asks = setup.attest().subscribe(relay);
+        tokio::spawn(async move {
+            let regions = RegionsConfig::default();
+            let store = pair_rtts::new_store();
+            let rtt = idle_rtt_ingest(&regions, &store);
+            while let Some(ask) = asks.recv().await {
+                let frame = Message::Text(
+                    serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                        request_id: ask.request_id,
+                        state: snapshot.clone(),
+                    })
+                    .expect("a snapshot serializes")
+                    .into(),
+                );
+                note_inbound_frame(&setup, &notices, &lifecycle, relay, 0, &frame, &rtt);
+            }
+        })
+    }
+
+    /// Posts a signed load-state read for `session` and returns the raw body.
+    async fn read_load_state(app: axum::Router, session: u64) -> axum::body::Bytes {
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": session }))
+                .unwrap();
+        let resp = signed_post(app, "/session/load-state", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn session_load_state_reports_arrivals_and_gates_completeness_on_the_relays() {
+    async fn every_serving_relay_attesting_makes_the_answer_complete() {
+        // The causal barrier: both serving relays snapshot after this read's own
+        // request reached them, so the union of their answers covers everything
+        // that had happened before the read was sent — and an absent slot may be
+        // read as a player who never arrived.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1), RelayId(2)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        // Each relay knows only its own slot; the answer is their union. Recorded
+        // out of slot order to prove the answer is sorted, not insertion-ordered.
+        let _one = spawn_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[1], &[1], Some(1_700_000_000_000)),
+        );
+        let _two = spawn_attesting_relay(
+            &state,
+            RelayId(2),
+            load_snapshot(&tenant, SessionId(5), &[0], &[], None),
+        );
+        let app = router(state);
+
+        let body = read_load_state(app, 5).await;
+        // The exact wire shape the tenant parses: camelCase, absent optionals
+        // omitted rather than sent as null, and no freshness stamp anywhere —
+        // completeness is the exchange, not a clock.
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":true,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn one_silent_relay_costs_the_claim_but_not_the_others_facts() {
+        // The distinction the whole design turns on: a relay that does not answer
+        // is not a relay answering "nothing". Its peer's positives are merged and
+        // returned; only the right to read an absence as proof is withheld.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1), RelayId(2)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        let _one = spawn_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[1], &[1], None),
+        );
+        // Relay 2 holds a connection but never answers: subscribed, never drained.
+        let _silent = state.setup.attest().subscribe(RelayId(2));
+        let app = router(state);
+
+        let body = tokio::time::timeout(LOAD_STATE_ATTEST_TIMEOUT * 2, read_load_state(app, 5))
+            .await
+            .expect("the read answers on its own deadline rather than hanging");
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"connectedSlots":[1],"startedSlots":[1]}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_with_no_control_connection_never_attests() {
+        // Nothing to ask means nothing answered. The session's other facts stand;
+        // the claim does not.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state.lifecycle.register_session(
+            tenant.clone(),
+            SessionId(5),
+            vec![RelayId(1), RelayId(2)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        state
+            .lifecycle
+            .on_slot_connected(tenant.clone(), SessionId(5), SlotId(0));
+        // Only relay 1 is connected; relay 2 has never subscribed.
+        let _one = spawn_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[], &[], None),
+        );
+        let app = router(state);
+
+        let body = read_load_state(app, 5).await;
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"connectedSlots":[0],"startedSlots":[]}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_lineage_withholds_the_claim_even_when_every_relay_attests() {
+        // The serving relay answers promptly and completely, but it came back as a
+        // new process: whatever the old one saw and never restated is gone, and no
+        // snapshot from this one can cover that interval.
         let state = state_with_relay_and_tenant();
         let tenant = TenantId("sb-test".to_owned());
         state.lifecycle.register_session(
@@ -4064,127 +4388,113 @@ mod tests {
             std::collections::HashSet::from([SlotId(0), SlotId(1)]),
             std::collections::HashSet::new(),
         );
-        // Slot 1 arrived and started; slot 0 arrived but never reported a game
-        // loop — exactly the attribution the endpoint exists to serve. Recorded
-        // out of slot order to prove the answer is sorted, not insertion-ordered.
-        state
-            .lifecycle
-            .on_slot_connected(tenant.clone(), SessionId(5), SlotId(1));
-        state
-            .lifecycle
-            .on_slot_connected(tenant.clone(), SessionId(5), SlotId(0));
-        state
-            .lifecycle
-            .on_session_started(tenant.clone(), SessionId(5), 1_700_000_000_000);
-        state
-            .lifecycle
-            .on_slot_started(tenant.clone(), SessionId(5), SlotId(1));
-        // Kept past the router build for the beats and the restart-amnesia case.
-        let lifecycle = state.lifecycle.clone();
+        state.lifecycle.on_relay_lineage_break(RelayId(1));
+        let _one = spawn_attesting_relay(
+            &state,
+            RelayId(1),
+            load_snapshot(&tenant, SessionId(5), &[1], &[], None),
+        );
         let app = router(state);
 
-        let req_body =
-            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 5 })).unwrap();
-        let load_state = async |app: axum::Router| {
-            let resp = signed_post(app, "/session/load-state", &req_body, &TEST_CLIENT_SEED).await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap()
-        };
-
-        // The serving relay has not restated the session yet, so nothing is
-        // complete — but the facts the notices carried are still answered with,
-        // because the tenant merges positive evidence either way.
-        let body = load_state(app.clone()).await;
+        let body = read_load_state(app, 5).await;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
-            "known false still carries every fact the coordinator holds",
+            r#"{"known":false,"connectedSlots":[1],"startedSlots":[]}"#,
+            "the facts the snapshot carried still stand",
         );
+    }
 
-        // The serving relay's beat restates what it holds — here an entry naming
-        // nothing, which adds no facts and is purely the relay saying "this is all
-        // I have". That completes the picture and dates it.
-        lifecycle.on_heartbeat_load_state(
-            RelayId(1),
-            &[rally_point_proto::control::SessionPresence {
-                tenant: tenant.clone(),
-                session: SessionId(5),
-                slots: vec![],
-                ever_connected: vec![],
-                started: vec![],
-                started_at_ms: None,
-            }],
-            1_700_000_005_000,
-        );
-
-        let body = load_state(app.clone()).await;
-        // The exact wire shape the tenant parses: camelCase, absent optionals
-        // omitted rather than sent as null.
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            r#"{"known":true,"freshAsOfMs":1700000005000,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
-        );
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["known"], serde_json::json!(true));
-        assert_eq!(json["freshAsOfMs"], serde_json::json!(1_700_000_005_000u64));
-        assert_eq!(json["startedAtMs"], serde_json::json!(1_700_000_000_000u64));
-        assert_eq!(
-            json["connectedSlots"].as_array().unwrap(),
-            &vec![serde_json::json!(0), serde_json::json!(1)],
-            "both arrivals are reported, ascending",
-        );
-        assert_eq!(
-            json["startedSlots"].as_array().unwrap(),
-            &vec![serde_json::json!(1)],
-            "only the slot that reported its game loop is started",
-        );
-
-        // A session the coordinator holds nothing for answers "no information",
-        // never "nobody arrived": known false with empty lists.
-        let unknown_body =
-            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 6 })).unwrap();
-        let resp = signed_post(
-            app.clone(),
-            "/session/load-state",
-            &unknown_body,
-            &TEST_CLIENT_SEED,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn a_session_the_coordinator_holds_nothing_for_answers_no_information() {
+        // Never "nobody arrived": known false, empty sets, absent optionals omitted
+        // rather than sent as null.
+        let state = state_with_relay_and_tenant();
+        let app = router(state);
+        let body = read_load_state(app, 6).await;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             r#"{"known":false,"connectedSlots":[],"startedSlots":[]}"#,
         );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["known"], serde_json::json!(false));
         assert!(json.get("startedAtMs").is_none(), "absent, never null");
-        assert!(json.get("freshAsOfMs").is_none(), "absent, never null");
-        assert!(json["connectedSlots"].as_array().unwrap().is_empty());
-        assert!(json["startedSlots"].as_array().unwrap().is_empty());
+    }
 
-        // A session this coordinator never created but has since accumulated facts
-        // for — restart amnesia, with a relay still reporting — answers with those
-        // facts and no completeness claim: its sets start wherever the coordinator
-        // came up, so an absent slot says nothing about who arrived.
-        lifecycle.on_slot_connected(tenant.clone(), SessionId(7), SlotId(0));
-        lifecycle.on_slot_started(tenant, SessionId(7), SlotId(0));
-        let lost_body =
-            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 7 })).unwrap();
-        let resp = signed_post(app, "/session/load-state", &lost_body, &TEST_CLIENT_SEED).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn a_session_this_coordinator_never_created_answers_its_facts_only() {
+        // Restart amnesia, with a relay still reporting: the accumulated facts are
+        // answered with, and no completeness claim is made — the sets start
+        // wherever this process came up, so an absent slot says nothing.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        state
+            .lifecycle
+            .on_slot_connected(tenant.clone(), SessionId(7), SlotId(0));
+        state
+            .lifecycle
+            .on_slot_started(tenant, SessionId(7), SlotId(0));
+        let app = router(state);
+
+        let body = read_load_state(app, 7).await;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             r#"{"known":false,"connectedSlots":[0],"startedSlots":[0]}"#,
             "the facts stand; only the read-absence-as-proof claim is withheld",
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
+        // A correlation id is a handle to one relay's answer. A relay answering
+        // under an id that is not its own must not complete the set for the relay
+        // that was actually asked — otherwise one relay could vouch for another's
+        // silence, which is exactly the claim the exchange exists to prevent.
+        let state = state_with_relay_and_tenant();
+        let tenant = TenantId("sb-test".to_owned());
+        let attest = state.setup.attest().clone();
+        let mut asks_one = attest.subscribe(RelayId(1));
+        let _asks_two = attest.subscribe(RelayId(2));
+        let one = attest
+            .request(RelayId(1), &tenant, SessionId(5))
+            .expect("relay 1 is connected");
+        let ask = asks_one.recv().await.expect("the question was queued");
+
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let frame = Message::Text(
+            serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
+                request_id: ask.request_id,
+                state: load_snapshot(&tenant, SessionId(5), &[0], &[], None),
+            })
+            .unwrap()
+            .into(),
+        );
+        note_inbound_frame(
+            &state.setup,
+            &state.notices,
+            &state.lifecycle,
+            RelayId(2),
+            0,
+            &frame,
+            &rtt,
+        );
+
+        // Relay 2's positives are still merged — they are facts about the session
+        // whoever reports them — but relay 1's request is untouched.
+        assert_eq!(
+            state
+                .lifecycle
+                .load_state(&tenant, SessionId(5))
+                .expect("the merge created the state")
+                .connected_slots,
+            vec![SlotId(0)],
+        );
+        assert_eq!(
+            attest.pending_count(),
+            1,
+            "relay 1 is still waiting to be answered",
+        );
+        drop(one);
     }
 
     #[tokio::test]
@@ -4867,13 +5177,14 @@ mod tests {
         assert_eq!(
             lifecycle.load_state(&tenant, session),
             Some(crate::lifecycle::SessionLoadState {
-                known: false,
-                fresh_as_of_ms: None,
+                created_here: true,
+                attestable: true,
+                serving_relays: vec![RelayId(1)],
                 started_at_ms: None,
                 connected_slots: vec![],
                 started_slots: vec![],
             }),
-            "a stale connection's beat records nothing, freshness included",
+            "a stale connection's beat records nothing at all",
         );
 
         note_inbound_frame(
@@ -4889,22 +5200,12 @@ mod tests {
             .load_state(&tenant, session)
             .expect("the session was created here");
         assert_eq!(
-            (
-                load.started_at_ms,
-                load.connected_slots,
-                load.started_slots,
-                load.known
-            ),
+            (load.started_at_ms, load.connected_slots, load.started_slots),
             (
                 Some(1_700_000_000_000),
                 vec![SlotId(0), SlotId(1)],
                 vec![SlotId(1)],
-                true,
             ),
-        );
-        assert!(
-            load.fresh_as_of_ms.is_some(),
-            "the only serving relay has now restated the session",
         );
         assert!(
             notices.slot_connects.lock().is_empty()

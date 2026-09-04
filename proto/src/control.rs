@@ -212,6 +212,20 @@ pub struct RelayHello {
     /// Additive, so a tokenless hello stays byte-identical to the pre-token form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enroll_token: Option<String>,
+    /// A random value the relay chooses **once per process** and repeats on every
+    /// hello that process sends — its process identity, distinct from the stable
+    /// `relay_id` an operator assigns.
+    ///
+    /// It exists so the coordinator can tell a control connection redialing (the
+    /// same process, whose in-memory state is intact) from a relay that restarted
+    /// (a fresh process, whose retained per-session state is gone). Only the latter
+    /// is a break in what the relay can still vouch for. Absent from a relay build
+    /// that predates the field, which is indistinguishable from a restart — a
+    /// coordinator reading an absent value can never conclude memory survived, so
+    /// it must assume it did not. Additive, so a hello without one stays
+    /// byte-identical to the pre-boot-id form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<u64>,
 }
 
 impl RelayHello {
@@ -240,6 +254,7 @@ impl RelayHello {
             relay_addrs: Vec::new(),
             region: None,
             enroll_token: None,
+            boot_id: None,
         }
     }
 
@@ -284,6 +299,16 @@ impl RelayHello {
     /// enroll; once its certificate is bound the coordinator ignores the token.
     pub fn with_enroll_token(mut self, token: String) -> Self {
         self.enroll_token = Some(token);
+        self
+    }
+
+    /// Stamps this hello with the relay process's own identity (see
+    /// [`boot_id`](Self::boot_id)). The value must be drawn once at process start
+    /// and repeated on every hello that process sends: a value that changed while
+    /// the process lived would read to the coordinator as a restart, and one that
+    /// survived a restart would falsely claim the relay's memory did.
+    pub fn with_boot_id(mut self, boot_id: u64) -> Self {
+        self.boot_id = Some(boot_id);
         self
     }
 }
@@ -1326,6 +1351,32 @@ pub enum CoordinatorToRelay {
         /// The relay's correlation id from the request this refuses.
         request: u64,
     },
+    /// Asks the relay to answer, right now, with everything it holds for one
+    /// session's load state — the causal barrier behind
+    /// `POST /session/load-state`'s completeness claim.
+    ///
+    /// The relay replies with a [`RelayToCoordinator::LoadStateSnapshot`] carrying
+    /// `request_id` back, built from state it already holds, so the reply is
+    /// ordered strictly after this request arrived. Anything the relay observed
+    /// before the request is therefore in the snapshot, and the coordinator needs
+    /// no stamp from either host's clock to know it.
+    ///
+    /// A relay that does not hold the session answers with empty lists — that is
+    /// an attestation of "nothing here", not a refusal. A relay whose build
+    /// predates this variant decodes it as [`Unknown`](Self::Unknown) and never
+    /// answers at all, which the coordinator must read as *did not attest* rather
+    /// than as an empty answer. Answering is stateless, so a repeat request (a
+    /// tenant re-reading) just draws a fresh snapshot.
+    LoadStateRequest {
+        /// The tenant the session belongs to.
+        tenant: TenantId,
+        /// The session whose load state to snapshot.
+        session: SessionId,
+        /// The coordinator's correlation id, fresh per request, echoed back on the
+        /// snapshot so the coordinator matches an answer to the request it made and
+        /// discards one for a request it no longer holds.
+        request_id: u64,
+    },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
     /// (rather than erroring), so the relay skips it and keeps the connection. The
@@ -1533,6 +1584,27 @@ pub enum RelayToCoordinator {
         /// The correlation id from the request whose upload completed.
         request: u64,
     },
+    /// Answers a [`CoordinatorToRelay::LoadStateRequest`]: everything this relay
+    /// holds for the named session, snapshotted after the request arrived.
+    ///
+    /// The reply is what makes the coordinator's completeness claim causal rather
+    /// than clock-based: because the relay builds it from state it already holds
+    /// and sends it in place, every fact the relay had observed before the request
+    /// landed is in it. A session this relay does not hold answers with empty
+    /// lists — it attests that it holds nothing, which is a different statement
+    /// from staying silent.
+    ///
+    /// Additive, so a coordinator that predates the variant decodes it as
+    /// [`Unknown`](Self::Unknown) and skips it; such a coordinator never sends the
+    /// request in the first place.
+    LoadStateSnapshot {
+        /// The coordinator's correlation id from the request this answers.
+        request_id: u64,
+        /// What the relay holds for the session — the same shape a heartbeat's
+        /// roster entry carries, so the coordinator merges an attested snapshot
+        /// through exactly the path a restated one takes.
+        state: SessionPresence,
+    },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
@@ -1540,7 +1612,10 @@ pub enum RelayToCoordinator {
 }
 
 /// What one relay holds for one session, as carried in a
-/// [`RelayToCoordinator::Heartbeat`]'s roster.
+/// [`RelayToCoordinator::Heartbeat`]'s roster and in the
+/// [`RelayToCoordinator::LoadStateSnapshot`] that answers a coordinator's
+/// on-demand request. Both carry the same shape because they carry the same
+/// claim; they differ only in what ordering the reader may assume about it.
 ///
 /// A slot appears in `slots` exactly while its client's link is registered on the
 /// relay — the same liveness the relay's own drain path keys on — so the
@@ -2022,6 +2097,7 @@ mod tests {
             relay_addrs: vec![],
             region: None,
             enroll_token: None,
+            boot_id: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         // An unset window bottom stays off the wire (a one-version window).
@@ -2972,6 +3048,117 @@ mod tests {
         let json = r#"{"type":"flight_upload_grant","request":1,"url":"https://x/y"}"#;
         let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
         assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
+    fn load_state_request_roundtrips_json() {
+        let message = CoordinatorToRelay::LoadStateRequest {
+            tenant: TenantId("sb-staging".to_owned()),
+            session: SessionId(42),
+            request_id: 9,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"load_state_request\""));
+        let back: CoordinatorToRelay = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn load_state_snapshot_roundtrips_json() {
+        let message = RelayToCoordinator::LoadStateSnapshot {
+            request_id: 9,
+            state: SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                slots: vec![SlotId(1)],
+                ever_connected: vec![SlotId(0), SlotId(1)],
+                started: vec![SlotId(1)],
+                started_at_ms: Some(1_700_000_000_000),
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"type\":\"load_state_snapshot\""));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
+        // The "I hold nothing for this session" attestation: every optional list
+        // stays off the wire, so it is byte-cheap to answer for a session the relay
+        // does not hold — and still decodes to the empty sets that say so.
+        let message = RelayToCoordinator::LoadStateSnapshot {
+            request_id: 1,
+            state: SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(1),
+                slots: vec![],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("ever_connected"));
+        assert!(!json.contains("started_at_ms"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn load_state_request_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // A relay that predates the request decodes it as `Unknown` and answers
+        // nothing at all — which is why the coordinator reads a missing answer as
+        // "did not attest" rather than as an empty snapshot.
+        let json =
+            r#"{"type":"load_state_request","tenant":"sb-staging","session":42,"request_id":9}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown);
+    }
+
+    #[test]
+    fn load_state_snapshot_decodes_to_unknown_on_a_decoder_without_the_variant() {
+        // The mirror direction: a coordinator that predates the snapshot skips it
+        // rather than tearing the connection down.
+        let json = r#"{"type":"load_state_snapshot","request_id":9,"state":{"tenant":"sb-staging","session":42,"slots":[]}}"#;
+        let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, CoordinatorToRelay::Unknown);
+    }
+
+    #[test]
+    fn relay_hello_boot_id_roundtrips_and_stays_off_the_wire_when_absent() {
+        // A relay that stamps its process identity carries it; one that predates
+        // the field keeps the hello byte-identical to the pre-boot-id form, and its
+        // absence decodes to None — the value a coordinator must read as "cannot
+        // vouch for continuity".
+        let stamped = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        )
+        .with_boot_id(0xDEAD_BEEF_1234_5678);
+        let json = serde_json::to_string(&stamped).unwrap();
+        assert!(json.contains(&format!("\"boot_id\":{}", 0xDEAD_BEEF_1234_5678u64)));
+        assert_eq!(serde_json::from_str::<RelayHello>(&json).unwrap(), stamped);
+
+        let plain = RelayHello::new(
+            RelayId(7),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xAA; 4],
+        );
+        assert!(!serde_json::to_string(&plain).unwrap().contains("boot_id"));
+        let legacy = r#"{
+            "relay_id":7,
+            "relay_addr":"127.0.0.1:14900",
+            "protocol":2,
+            "cert_der":[1,2,3]
+        }"#;
+        assert_eq!(
+            serde_json::from_str::<RelayHello>(legacy).unwrap().boot_id,
+            None,
+        );
     }
 
     #[test]
