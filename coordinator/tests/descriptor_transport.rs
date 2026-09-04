@@ -27,7 +27,7 @@ use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
 use rally_point_proto::version::{
     CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
 };
-use rally_point_relay::consensus::RelayNotice;
+use rally_point_relay::consensus::{self, RelayNotice};
 use rally_point_relay::coordinator_client;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::mesh_control::MeshControl;
@@ -107,8 +107,11 @@ fn no_outbound() -> coordinator_client::OutboundQueues {
 /// A heartbeat over an empty roster and RTT cache at the given interval.
 fn heartbeat(interval: Duration) -> coordinator_client::HeartbeatConfig {
     coordinator_client::HeartbeatConfig {
-        sessions: std::sync::Arc::default(),
-        region_rtt_cache: region_ping::RegionRttCache::default(),
+        sources: coordinator_client::HeartbeatSources {
+            sessions: std::sync::Arc::default(),
+            decision_makers: std::sync::Arc::new(consensus::new_decision_makers()),
+            region_rtt_cache: region_ping::RegionRttCache::default(),
+        },
         interval,
     }
 }

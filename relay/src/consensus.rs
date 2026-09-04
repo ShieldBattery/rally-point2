@@ -1622,6 +1622,23 @@ pub struct DecisionMaker {
     /// re-covering after churn never re-fires and a late-registering local slot
     /// still gets a re-push.
     started: bool,
+    /// Every slot whose link has activated on this relay for the session. Grows
+    /// monotonically — a slot that connected and then dropped stays, because the
+    /// question this answers is whether the player ever arrived, not who is here
+    /// now (`live_slots` answers that). Retained so every heartbeat can restate
+    /// the whole set: the matching notice is dropped once its send succeeds, so
+    /// the beat is what survives a coordinator losing or forgetting one.
+    connected_slots: HashSet<SlotId>,
+    /// Every slot whose game-loop report this relay accepted. Grows
+    /// monotonically and is restated on every heartbeat, for the same reasons as
+    /// `connected_slots`.
+    started_slots: HashSet<SlotId>,
+    /// Relay wall-clock (unix epoch milliseconds) at this relay's own coverage
+    /// latch, restated on every heartbeat. Set only where the latch actually
+    /// fires here, so a peer that adopted the authority's directive off the mesh
+    /// leaves it `None` and exactly one relay's beats carry an instant. First
+    /// write wins, matching the latch itself.
+    started_at_ms: Option<u64>,
     /// One-shot latch: a resumed (rehome) descriptor has named this session.
     /// After a rehome no single relay's forward gate provably covers
     /// everything every survivor consumed — the replaced relay can have
@@ -2879,6 +2896,9 @@ impl DecisionMaker {
             homed_slots: HashSet::new(),
             live_slots: HashSet::new(),
             started: false,
+            connected_slots: HashSet::new(),
+            started_slots: HashSet::new(),
+            started_at_ms: None,
             resumed: false,
             finalized_drops_enabled: false,
             finalizing_drops: HashSet::new(),
@@ -4527,6 +4547,36 @@ impl DecisionMaker {
         self.results.get(&slot)
     }
 
+    /// Records that `slot`'s link activated on this relay, into the ever-connected
+    /// set the heartbeat restates. Idempotent: a reconnect re-inserts a slot the
+    /// set already holds, and nothing ever removes one.
+    pub fn note_slot_connected(&mut self, slot: SlotId) {
+        self.connected_slots.insert(slot);
+    }
+
+    /// Records that `slot` reported its game loop running, into the ever-started
+    /// set the heartbeat restates. Idempotent for the same reason as
+    /// [`note_slot_connected`](Self::note_slot_connected).
+    pub fn note_slot_started(&mut self, slot: SlotId) {
+        self.started_slots.insert(slot);
+    }
+
+    /// Records the wall-clock instant this relay's own coverage latch fired, for
+    /// the heartbeat to restate. First write wins: the latch is a one-shot, and a
+    /// later authority's own latch must not move an instant already reported.
+    pub fn note_started_at_ms(&mut self, started_at_ms: u64) {
+        self.started_at_ms.get_or_insert(started_at_ms);
+    }
+
+    /// This session's retained load state, as every heartbeat carries it.
+    pub fn load_state(&self) -> RetainedLoadState {
+        RetainedLoadState {
+            ever_connected: sorted_slots(&self.connected_slots),
+            started: sorted_slots(&self.started_slots),
+            started_at_ms: self.started_at_ms,
+        }
+    }
+
     /// Caches a synced leave this relay observed authored by the session's
     /// authority (a peer relay's `LeaveDirective` off the mesh), so a later
     /// promotion re-broadcasts it verbatim. First writer wins; a conflicting
@@ -5869,34 +5919,84 @@ fn slot_started_notice(
     }
 }
 
-/// Reports that `slot`'s link just activated on this relay, firing one
-/// slot-connected notice up the coordinator connection. `resumed` marks a dial
-/// that presented resume cursors (a reconnect or a re-home re-dial) apart from a
-/// first connect.
+/// One session's load state as this relay has retained it: the slots whose links
+/// ever activated here, the slots that ever reported their game loop running,
+/// and the instant this relay's own coverage latch fired. Both slot lists are
+/// ascending, so a heartbeat's wire output is deterministic rather than following
+/// a hash set's iteration order.
+///
+/// This is the durable half of the load-progress reporting: the matching notices
+/// are dropped the moment their send succeeds, while every heartbeat restates
+/// this in full, so a coordinator that lost a notice — or restarted — converges
+/// on the truth within one beat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedLoadState {
+    /// Slots whose links ever activated on this relay, ascending.
+    pub ever_connected: Vec<SlotId>,
+    /// Slots that ever reported their game loop running here, ascending.
+    pub started: Vec<SlotId>,
+    /// Relay wall-clock (unix epoch milliseconds) of this relay's own coverage
+    /// latch. `None` on a relay that never latched a start itself.
+    pub started_at_ms: Option<u64>,
+}
+
+/// A slot set as an ascending vector, so what a heartbeat reports is
+/// deterministic rather than hash-set ordered.
+fn sorted_slots(slots: &HashSet<SlotId>) -> Vec<SlotId> {
+    let mut sorted: Vec<SlotId> = slots.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// The load state `key`'s decision-maker has retained, for the heartbeat builder.
+/// Empty for a session run without a maker (no descriptor): there is nothing
+/// retained to report, and an empty set is exactly what "this relay knows of no
+/// arrivals" means on the wire.
+pub fn retained_load_state(registry: &DecisionMakers, key: &SessionKey) -> RetainedLoadState {
+    registry
+        .lock()
+        .get(key)
+        .map(DecisionMaker::load_state)
+        .unwrap_or_default()
+}
+
+/// Reports that `slot`'s link just activated on this relay: retains the slot in
+/// the session's ever-connected set and fires one slot-connected notice up the
+/// coordinator connection. `resumed` marks a dial that presented resume cursors
+/// (a reconnect or a re-home re-dial) apart from a first connect.
 ///
 /// Fired on every activation, not just the first: the coordinator keeps the
 /// ever-connected set and dedups the tenant notification itself, and only the
-/// relay can see a reconnect at all. Unlike [`record_result`] this needs no
-/// decision-maker — nothing is retained here — so it reports even for a session
-/// run without descriptors, where the notice simply carries no correlation ids.
+/// relay can see a reconnect at all. The retained set is what every heartbeat
+/// restates, so the fact survives a lost notice; the notice is only the fast
+/// path. A session run without a decision-maker (no descriptor) retains nothing
+/// and still reports, with a notice that simply carries no correlation ids.
 pub fn record_slot_connected(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
     resumed: bool,
 ) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_slot_connected(slot);
+    }
     registry.notify_slot_connected(slot_connected_notice(registry, key, slot, resumed));
 }
 
-/// Forwards a client's report that its game loop has started, firing one
-/// slot-started notice up the coordinator connection. `slot` is the authenticated
-/// connection's slot the frame arrived on, never a value from the wire.
+/// Forwards a client's report that its game loop has started: retains the slot in
+/// the session's ever-started set and fires one slot-started notice up the
+/// coordinator connection. `slot` is the authenticated connection's slot the
+/// frame arrived on, never a value from the wire.
 ///
 /// The one-report-per-slot rule lives at the relay's client edge (the link that
-/// received the frame), so this retains nothing and — like
-/// [`record_slot_connected`] — needs no decision-maker; a session without one
-/// simply stamps no frame coordinates.
+/// received the frame), so a repeat never reaches here; the retained set is a
+/// union regardless, and — like [`record_slot_connected`] — a session with no
+/// decision-maker retains nothing, reports anyway, and stamps no frame
+/// coordinates.
 pub fn record_slot_started(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_slot_started(slot);
+    }
     registry.notify_slot_started(slot_started_notice(registry, key, slot));
 }
 
@@ -6139,7 +6239,15 @@ fn note_start_latched(registry: &DecisionMakers, key: &SessionKey, fired: Option
             initial_buffer_turns,
         },
     );
-    registry.notify_session_started(session_started_notice(registry, key, initial_buffer_turns));
+    let notice = session_started_notice(registry, key, initial_buffer_turns);
+    // Retain the same instant the notice carries, so every heartbeat restates it
+    // and a lost notice costs nothing. Only this path retains one: a peer relay
+    // adopting the directive off the mesh made no decision to report, so its
+    // beats leave the instant absent and exactly one relay's carry it.
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_started_at_ms(notice.started_at_ms);
+    }
+    registry.notify_session_started(notice);
 }
 
 /// Whether `key`'s session-start directive has already been emitted — the guard
@@ -14696,6 +14804,105 @@ mod tests {
         // Even a later promotion never re-fires: the latch is already set.
         let _ = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
         assert!(!reevaluate_session_start(&registry, &k));
+    }
+
+    #[test]
+    fn retained_load_state_outlives_the_links_it_was_recorded_from() {
+        // The heartbeat's durability rests on this: the sets are cumulative, so a
+        // slot that arrived, reported its game loop, and then lost its link is
+        // still reported as having got there — which is exactly the evidence a
+        // tenant needs to attribute a load nobody finished.
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(1), SlotId(2)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::SelfRelay,
+            HashSet::new(),
+            expected,
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+
+        record_slot_connected(&registry, &k, SlotId(2), false);
+        record_slot_connected(&registry, &k, SlotId(1), false);
+        record_slot_started(&registry, &k, SlotId(2));
+        assert!(!note_slot_present(&registry, &k, SlotId(1)));
+        assert!(
+            note_slot_present(&registry, &k, SlotId(2)),
+            "the last expected slot fires the coverage latch",
+        );
+        let latched_at = retained_load_state(&registry, &k).started_at_ms;
+        assert!(
+            latched_at.is_some(),
+            "the relay whose own latch fired stamps the instant it reports",
+        );
+
+        // Both slots' links end.
+        assert!(remove_slot_for_epoch(&registry, &k, SlotId(1), None));
+        assert!(remove_slot_for_epoch(&registry, &k, SlotId(2), None));
+
+        let load = retained_load_state(&registry, &k);
+        assert_eq!(
+            load.ever_connected,
+            vec![SlotId(1), SlotId(2)],
+            "both arrivals survive their links, ascending",
+        );
+        assert_eq!(load.started, vec![SlotId(2)]);
+        assert_eq!(
+            load.started_at_ms, latched_at,
+            "the latch instant is unmoved by anything after it",
+        );
+
+        // A reconnect re-reports an arrival; the union absorbs it unchanged.
+        record_slot_connected(&registry, &k, SlotId(1), true);
+        assert_eq!(
+            retained_load_state(&registry, &k).ever_connected,
+            load.ever_connected
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_maker_retains_no_load_state() {
+        // A session run without a descriptor has no maker to retain anything. It
+        // still reports its facts as notices; the heartbeat simply carries empty
+        // sets for it, which omits the fields from the wire entirely.
+        let registry = new_decision_makers();
+        let k = key();
+        record_slot_connected(&registry, &k, SlotId(0), false);
+        record_slot_started(&registry, &k, SlotId(0));
+        assert_eq!(
+            retained_load_state(&registry, &k),
+            RetainedLoadState::default()
+        );
+    }
+
+    #[test]
+    fn a_peer_adopting_the_start_directive_retains_no_start_instant() {
+        // Only the relay whose own coverage latch fired stamps an instant, so
+        // exactly one relay's heartbeats carry one however many serve the session.
+        let registry = new_decision_makers();
+        let k = key();
+        let expected: HashSet<SlotId> = [SlotId(0)].into_iter().collect();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::Peer,
+            HashSet::new(),
+            expected,
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        adopt_session_start(&registry, &k, Some(4));
+        assert!(session_started(&registry, &k));
+        assert_eq!(retained_load_state(&registry, &k).started_at_ms, None);
     }
 
     // -- Initial buffer depth sized at the coverage latch --

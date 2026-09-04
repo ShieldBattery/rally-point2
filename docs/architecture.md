@@ -1068,11 +1068,23 @@ inferring it from its own deadline expiring:
   the dedup key is `(tenant, session)`.
 - **`slotStarted`** — a client reported that its own game loop has begun running, on a fieldless `GameStarted`
   control frame the relay binds to the authenticated connection's slot (never a client-asserted one) and
-  stamps against its own timeline. One report per slot per link at the relay; deduped on
-  `(tenant, session, slot)` at the coordinator.
+  stamps against its own timeline. The client treats "my loop is running" as session state and re-asserts it
+  on every control stream it opens — the initial one and each reconnect's — because nothing acknowledges a
+  control-stream write and the relay's own latch dies with the link that held it. One report per slot per
+  link at the relay; deduped on `(tenant, session, slot)` at the coordinator, so the repeats are absorbed.
 
 Together they distinguish "never connected" from "connected but never finished loading", which is the whole
 point: these are the facts an attribution needs and a timeout cannot supply.
+
+The webhooks are the **fast path**, not the record. A notice is dropped from the relay's queue once its
+WebSocket send succeeds, so a coordinator that dies between receiving one and committing it — or that simply
+restarts — has lost it. What makes the facts durable is that every relay **heartbeat carries the session's
+whole retained load state**: the slots that ever connected there, the slots that ever reported their game
+loop, and the instant that relay's own coverage latch fired. The relay retains all three on the session's
+decision-maker and restates them on every beat, declaratively, exactly as it does the live roster — so a lost
+notice costs at most one beat, and the coordinator merges each beat into the same accumulated sets the pull
+below reads. Merging a beat fires no webhook: those facts were notified when they happened, and re-notifying
+them every ten seconds would flood the feed.
 
 ### Session lifecycle and reaps
 
@@ -1111,9 +1123,15 @@ The tenant consults it when its own load deadline expires and it must decide who
 never got going — which makes the three load-progress webhooks an optimization feed and *this* the
 correctness signal, since it reads the coordinator's state directly rather than trusting that every
 notification arrived. Both slot lists are *ever*-sets (a slot that arrived and then dropped still appears —
-"who got here at all", not "who is here now", which `POST /presence/query` answers), and a session the
-coordinator holds nothing for answers `known: false` with empty lists: no information, never proof that
-nobody arrived.
+"who got here at all", not "who is here now", which `POST /presence/query` answers).
+
+`known: true` means the coordinator has held the session **since it created it**, so the sets cover its whole
+life and are complete up to heartbeat latency (~10 s) — which is what lets the tenant treat an *absent* slot
+as evidence that player never got there. Anything else answers `known: false` with empty lists: the session
+was created against a coordinator that has since restarted, or it has already been reaped. That stays
+`false` even when notices and heartbeats have since lazily rebuilt state for it, because those sets start
+wherever the coordinator came up rather than at the session's beginning. `known: false` is no information,
+never proof that nobody arrived.
 
 ### Active-player presence
 

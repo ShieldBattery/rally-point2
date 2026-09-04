@@ -638,8 +638,11 @@ async fn main() -> Result<()> {
                     drain_acked: drain_acked_tx.clone(),
                 },
                 coordinator_client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
-                Arc::clone(&sessions),
-                region_rtt_cache.clone(),
+                coordinator_client::HeartbeatSources {
+                    sessions: Arc::clone(&sessions),
+                    decision_makers: Arc::clone(&mesh_state.decision_makers),
+                    region_rtt_cache: region_rtt_cache.clone(),
+                },
                 drain_rx.clone(),
                 control_connected_tx,
             ));

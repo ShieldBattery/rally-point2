@@ -42,11 +42,15 @@
 //!
 //! The driver also announces that the game's loop has begun running. The game
 //! signals once on [`TurnChannels::game_started`] and the driver writes a
-//! `GameStarted` control frame, at most one per session — the relay forwards the
-//! fact up its coordinator pipeline so the tenant can name the slots that
-//! finished loading instead of inferring a failed load from a deadline. Purely
-//! informational, so a failed send is logged and the driver keeps running, the
-//! same treatment a result report gets.
+//! `GameStarted` control frame — the relay forwards the fact up its coordinator
+//! pipeline so the tenant can name the slots that finished loading instead of
+//! inferring a failed load from a deadline. The signal is retained as session
+//! state and re-asserted on every control stream the driver opens, so an
+//! announcement that raced a link drop still lands on the next connection; the
+//! relay accepts one per link and the coordinator dedups per slot, so the repeats
+//! cost nothing. Purely informational, so a failed send is logged, left to the
+//! next stream, and the driver keeps running — the same treatment a result report
+//! gets.
 //!
 //! The driver also carries the game's in-game chat, the mid-game counterpart to
 //! lobby commands: the game authors a message on [`TurnChannels::chat_out`] and
@@ -268,12 +272,15 @@ pub struct TurnChannels {
     /// intent is not held at all.
     pub result_expected: Arc<AtomicBool>,
     /// Signals that the game's loop has begun running — the match data is loaded
-    /// and the simulation is stepping. The driver writes one `GameStarted` control
-    /// frame on the first signal and drops every later one, so a caller may signal
-    /// without tracking whether it already did. Best-effort: a failed write is
-    /// logged and the driver keeps running, since the frame only feeds the
-    /// tenant's load attribution. Dropping this sender without ever signaling is
-    /// harmless — nothing is sent and nothing waits on it.
+    /// and the simulation is stepping. A caller may signal without tracking
+    /// whether it already did: the driver retains the fact for the session and
+    /// writes one `GameStarted` control frame per connection, so a signal that
+    /// raced a link drop (or arrived while the driver was re-dialing) still
+    /// reaches the relay on the next one. Best-effort: a failed write is logged
+    /// and retried on the next connection, and the driver keeps running
+    /// regardless, since the frame only feeds the tenant's load attribution.
+    /// Dropping this sender without ever signaling is harmless — nothing is sent
+    /// and nothing waits on it.
     pub game_started: mpsc::Sender<()>,
     /// Lobby commands this game authored, to send up to the relay for the other
     /// members. The driver wraps each in a `LobbyCommand` and writes it up the
@@ -929,7 +936,7 @@ impl LinkDriver {
             next_outbound_seq,
             announcer,
             outbound_buffer,
-            game_started_sent,
+            game_started_announced,
             game_started,
             retention,
             retention_bytes,
@@ -1004,6 +1011,23 @@ impl LinkDriver {
             redivert_pending_control(&mut control_send, pending_control_redivert).await
         {
             return announcer.absorb_link_close(Err(DriverError::from(error)));
+        }
+        // Re-assert the game's own "my loop is running" announcement on this
+        // connection's fresh control stream. The fact is session state, not link
+        // state, so every stream carries it: an announcement whose write raced a
+        // link drop — or one the game made while the driver was between links —
+        // would otherwise be lost, since nothing acknowledges a control-stream
+        // write. The relay latches one report per link and the coordinator dedups
+        // per slot, so a repeat is absorbed. Best-effort like every send of it: a
+        // failure leaves the fact pending for the next stream rather than ending
+        // the session over a report nothing depends on.
+        if *game_started_announced
+            && let Err(error) = send_control_game_started(&mut control_send).await
+        {
+            tracing::debug!(
+                %error,
+                "re-asserting the game-started announcement failed; retrying on the next stream"
+            );
         }
         // Flush any turns the game produced while the link was down, in seq order,
         // before live turns resume. On a fresh dial the buffer is empty; on a
@@ -1718,22 +1742,23 @@ impl LinkDriver {
                         None => result_alive = false,
                     }
                 }
-                // The game announced that its loop has begun running. Write the
-                // fieldless `GameStarted` frame up the control stream at once —
-                // the fact is only useful while it is fresh, and there is nothing
-                // to drain behind it. Written at most once for the whole session
-                // (a reconnect must not re-announce), and best-effort: a failed
-                // write is logged and the driver keeps running, exactly as a
-                // failed result report is. Disarmed on the channel's first
-                // resolution, like the leave-intent and result branches.
+                // The game announced that its loop has begun running. Retain the
+                // fact for the session — every later control stream re-asserts it
+                // — and write the fieldless `GameStarted` frame up this one at
+                // once: it is only useful while fresh, and there is nothing to
+                // drain behind it. Best-effort, like a result report: a failed
+                // write is logged and left to the next stream's re-assertion. The
+                // already-announced case is a no-op because this stream's own
+                // re-assertion has already carried it. Disarmed on the channel's
+                // first resolution, like the leave-intent and result branches.
                 signal = game_started_out.recv(), if game_started_alive => {
                     game_started_alive = false;
-                    if signal.is_some() && !*game_started_sent {
-                        *game_started_sent = true;
+                    if signal.is_some() && !*game_started_announced {
+                        *game_started_announced = true;
                         if let Err(error) = send_control_game_started(&mut control_send).await {
                             tracing::debug!(
                                 %error,
-                                "game-started send failed; dropping the announcement"
+                                "game-started send failed; retrying on the next stream"
                             );
                         }
                     }
@@ -1982,10 +2007,12 @@ impl LinkDriver {
         if leave_intent.try_recv().is_ok() {
             announcer.arm(LEAVE_INTENT_TIMEOUT);
         }
-        if game_started_out.try_recv().is_ok() && !*game_started_sent {
-            // Mirrors the live arm: best-effort, latched either way so a
-            // reconnect cannot re-announce.
-            *game_started_sent = true;
+        if game_started_out.try_recv().is_ok() && !*game_started_announced {
+            // The game closed its seam with the announcement still unread, so
+            // this is the only stream that will ever carry it — there is no next
+            // one to re-assert on. Retained anyway, so the whole session agrees
+            // on the fact, and written best-effort like the live arm.
+            *game_started_announced = true;
             if let Err(error) = send_control_game_started(&mut control_send).await {
                 tracing::debug!(%error, "game-started send failed at teardown; dropping it");
             }
@@ -2401,11 +2428,13 @@ struct LoopState {
     /// Turns the game produced while the link was down, flushed in order when the
     /// next session comes up.
     outbound_buffer: VecDeque<Payload>,
-    /// Whether this client's own `GameStarted` announcement has been written.
-    /// Latched here rather than per-connection so the frame goes out once for the
-    /// whole session: the game signals its loop starting once, and a reconnect
-    /// must not re-announce it.
-    game_started_sent: bool,
+    /// Whether the game has announced that its loop is running. Retained here
+    /// rather than per-connection because it is a fact about the session, not
+    /// about one link: once set, every control stream the driver opens re-asserts
+    /// it, so an announcement whose write raced a link drop still reaches the
+    /// relay. The relay latches one report per link and the coordinator dedups per
+    /// slot, so re-asserting costs nothing beyond the frame.
+    game_started_announced: bool,
     /// Whether the relay's `SessionStart` directive has passed through the driver —
     /// the game has started. Gates escalation to coordinator-mediated failover: the
     /// driver only ever re-homes an in-game session, never a still-forming lobby.
@@ -2467,7 +2496,7 @@ impl LoopState {
             next_outbound_seq: 0,
             announcer: LeaveAnnouncer::new(result_expected),
             outbound_buffer: VecDeque::new(),
-            game_started_sent: false,
+            game_started_announced: false,
             game_started: false,
             retention: VecDeque::new(),
             retention_bytes: 0,
@@ -5953,9 +5982,11 @@ mod tests {
     #[tokio::test]
     async fn a_game_started_signal_writes_exactly_one_frame() {
         // The game announces its loop starting; the driver writes one
-        // `GameStarted` frame. A second signal writes nothing — proven by
-        // following it with a leave intent and seeing that frame arrive next,
-        // with no second GameStarted in between.
+        // `GameStarted` frame on the connection. A second signal on the same
+        // connection writes nothing — proven by following it with a leave intent
+        // and seeing that frame arrive next, with no second GameStarted in
+        // between. (A *fresh* connection does re-assert it; that is a separate
+        // test.)
         let (link_a, link_b, _ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         let task = tokio::spawn(driver_a.run());
@@ -5991,6 +6022,116 @@ mod tests {
         drop(chan_a.outbound);
         drop(chan_a.inbound);
         let _ = task.await;
+    }
+
+    /// Runs one session over `link`/`seam`/`state` in its own task, handing all
+    /// three back when it ends — the shape a test needs to drive two consecutive
+    /// links (a reconnect) while watching the wire in between.
+    fn spawn_session(
+        mut link: Link,
+        mut seam: GameSeam,
+        mut state: LoopState,
+    ) -> tokio::task::JoinHandle<(Result<(), DriverError>, Link, GameSeam, LoopState)> {
+        tokio::spawn(async move {
+            let result =
+                LinkDriver::session_body(&mut link, &mut seam, &mut state, SlotId(0)).await;
+            (result, link, seam, state)
+        })
+    }
+
+    /// Awaits the next control frame `control_rx` delivers, failing the test with
+    /// `context` if none arrives.
+    async fn next_control_frame(
+        control_rx: &mut mpsc::Receiver<ControlInbound>,
+        context: &str,
+    ) -> ControlInbound {
+        tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{context}"))
+            .expect("control reader ended early")
+    }
+
+    #[tokio::test]
+    async fn a_game_started_announcement_is_reasserted_on_the_reconnects_control_stream() {
+        // The relay latches the report per link, so its copy dies with the link
+        // that carried it. The announcement is a fact about the session, so the
+        // driver re-asserts it on every control stream it opens — without that, a
+        // report delivered moments before a drop leaves the tenant looking at a
+        // slot that never started.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (link, seam, state) = into_session_parts(driver_a);
+        let mut control_rx = spawn_control_reader(link_b.connection().clone());
+
+        chan_a.game_started.send(()).await.unwrap();
+        let session = spawn_session(link, seam, state);
+        let frame =
+            next_control_frame(&mut control_rx, "the game-started frame never arrived").await;
+        assert!(
+            matches!(frame, ControlInbound::GameStarted),
+            "expected a game-started frame, got {frame:?}",
+        );
+
+        // The link dies under the driver, exactly as a real outage does; the game
+        // seam stays open, so the reconnect path would re-dial here.
+        link_b.connection().close(0u32.into(), b"outage");
+        let (result, mut link, seam, state) = session.await.unwrap();
+        assert!(result.is_err(), "the closed connection ends the session");
+
+        // The re-dial: a fresh connection rebound in place, keeping the loop state
+        // — which is where the announcement lives.
+        let (link_c, link_d, _ec, _ed) = connected_links().await;
+        link.rebind(link_c.connection().clone());
+        let mut control_rx = spawn_control_reader(link_d.connection().clone());
+        let session = spawn_session(link, seam, state);
+
+        let frame =
+            next_control_frame(&mut control_rx, "the announcement was never re-asserted").await;
+        assert!(
+            matches!(frame, ControlInbound::GameStarted),
+            "the fresh control stream must carry the announcement again, got {frame:?}",
+        );
+
+        drop(chan_a);
+        let _ = session.await;
+    }
+
+    #[tokio::test]
+    async fn a_game_started_signal_during_the_reconnect_gap_is_delivered_on_the_next_link() {
+        // The game's loop can start while the driver is between links. Nothing is
+        // listening then, so the signal waits in its channel and the next session
+        // picks it up — losing it would be indistinguishable from a client that
+        // never loaded.
+        let (link_a, link_b, _ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = LinkDriver::new(link_a);
+        let (link, seam, state) = into_session_parts(driver_a);
+
+        let session = spawn_session(link, seam, state);
+        link_b.connection().close(0u32.into(), b"outage");
+        let (result, mut link, seam, state) = session.await.unwrap();
+        assert!(result.is_err(), "the closed connection ends the session");
+
+        // Between links: the game announces its loop with no connection to carry
+        // it.
+        chan_a.game_started.send(()).await.unwrap();
+
+        let (link_c, link_d, _ec, _ed) = connected_links().await;
+        link.rebind(link_c.connection().clone());
+        let mut control_rx = spawn_control_reader(link_d.connection().clone());
+        let session = spawn_session(link, seam, state);
+
+        let frame = next_control_frame(
+            &mut control_rx,
+            "a signal made during the outage never reached the relay",
+        )
+        .await;
+        assert!(
+            matches!(frame, ControlInbound::GameStarted),
+            "expected a game-started frame, got {frame:?}",
+        );
+
+        drop(chan_a);
+        let _ = session.await;
     }
 
     #[tokio::test]

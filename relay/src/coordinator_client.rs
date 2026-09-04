@@ -556,16 +556,29 @@ impl OutboundQueues {
     }
 }
 
-/// What each heartbeat carries and how often it goes up. A beat snapshots the live
-/// roster and the measured region round-trips at send time; both handles are held
-/// across reconnects so a beat reads current state independent of any reconnect.
-pub struct HeartbeatConfig {
+/// The live state each heartbeat reports on. Every handle is held across
+/// reconnects, so a beat reads current state independent of any reconnect, and a
+/// beat snapshots all of it at send time.
+pub struct HeartbeatSources {
     /// The live roster; each beat carries its connected slots as [`SessionPresence`]
     /// entries (tenant/session/slot only — the relay holds no user identity to leak).
     pub sessions: Sessions,
+    /// The per-session decision-makers, read for the load state each roster entry
+    /// carries alongside its connected slots: which of the session's slots ever
+    /// connected here, which ever reported their game loop running, and when this
+    /// relay latched the session started. Restating it every beat is what makes it
+    /// durable — the matching notices are dropped once sent, so a coordinator that
+    /// lost one, or restarted, recovers within a beat.
+    pub decision_makers: Arc<crate::consensus::DecisionMakers>,
     /// The measured region round-trip cache the ping loop writes; each beat carries
     /// its current medians.
     pub region_rtt_cache: RegionRttCache,
+}
+
+/// What each heartbeat carries and how often it goes up.
+pub struct HeartbeatConfig {
+    /// The state a beat reports.
+    pub sources: HeartbeatSources,
     /// How often a beat goes up. Well under the coordinator's liveness deadline, and
     /// the send doubles as the relay's own dead-coordinator detector.
     pub interval: Duration,
@@ -645,8 +658,8 @@ impl From<tokio_tungstenite::tungstenite::Error> for ControlError {
 /// `apply_targets` are the shared handles inbound coordinator pushes are applied
 /// into ([`ControlApplyTargets`]); `outbound` is the caller-owned notice and flight
 /// queues the connection ships up ([`OutboundQueues`], which documents the
-/// park-across-reconnect discipline); `sessions` and `region_rtt_cache` are what
-/// each heartbeat carries; `drain` (with `apply_targets.drain_acked`) is the
+/// park-across-reconnect discipline); `heartbeat_sources` is what each heartbeat
+/// reports on; `drain` (with `apply_targets.drain_acked`) is the
 /// coordinated-drain seam; `control_connected` reports whether this relay is
 /// enrolled and receiving coordinator pushes — set `true` on the first inbound
 /// application frame (which an accepted enroll always sends and a refusal never
@@ -663,8 +676,7 @@ pub async fn run_descriptor_subscriber(
     enroll: EnrollConfig,
     apply_targets: ControlApplyTargets,
     outbound: OutboundQueues,
-    sessions: Sessions,
-    region_rtt_cache: RegionRttCache,
+    heartbeat_sources: HeartbeatSources,
     drain: watch::Receiver<bool>,
     control_connected: watch::Sender<bool>,
 ) {
@@ -673,8 +685,7 @@ pub async fn run_descriptor_subscriber(
         apply_targets,
         outbound,
         HeartbeatConfig {
-            sessions,
-            region_rtt_cache,
+            sources: heartbeat_sources,
             interval: HEARTBEAT_INTERVAL,
         },
         drain,
@@ -1308,8 +1319,8 @@ async fn write_control_frames(
                 // scale option, not needed at these payload sizes.
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
                     roster_complete: true,
-                    sessions: heartbeat_presence(&heartbeat.sessions),
-                    region_rtts: heartbeat_region_rtts(&heartbeat.region_rtt_cache),
+                    sessions: heartbeat_presence(&heartbeat.sources),
+                    region_rtts: heartbeat_region_rtts(&heartbeat.sources.region_rtt_cache),
                 })
                 .expect("a heartbeat always serializes");
                 sink.send(Message::Text(frame.into())).await?;
@@ -1377,14 +1388,27 @@ fn now_unix_ms() -> u64 {
 
 /// Snapshots the relay's live roster into the [`SessionPresence`] entries a
 /// heartbeat carries — one per session with a connected slot, tenant/session/slot
-/// only (the relay holds no user identity to leak).
-fn heartbeat_presence(sessions: &Sessions) -> Vec<SessionPresence> {
-    crate::routing::live_slots(sessions)
+/// only (the relay holds no user identity to leak), each carrying the session's
+/// retained load state alongside.
+///
+/// The roster is the whole current truth every time, load state included: a beat
+/// restates every session's full sets rather than reporting what changed, so a
+/// lost or reordered beat is corrected by the next one. A session running without
+/// a decision-maker has nothing retained and reports the load fields empty, which
+/// omits them from the wire entirely.
+fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
+    crate::routing::live_slots(&sources.sessions)
         .into_iter()
-        .map(|(key, slots)| SessionPresence {
-            tenant: key.tenant,
-            session: key.session,
-            slots,
+        .map(|(key, slots)| {
+            let load = crate::consensus::retained_load_state(&sources.decision_makers, &key);
+            SessionPresence {
+                tenant: key.tenant,
+                session: key.session,
+                slots,
+                ever_connected: load.ever_connected,
+                started: load.started,
+                started_at_ms: load.started_at_ms,
+            }
         })
         .collect()
 }
@@ -2568,8 +2592,11 @@ mod tests {
     /// the common case for tests not asserting on heartbeat content.
     fn heartbeat(interval: Duration) -> HeartbeatConfig {
         HeartbeatConfig {
-            sessions: Arc::default(),
-            region_rtt_cache: RegionRttCache::default(),
+            sources: HeartbeatSources {
+                sessions: Arc::default(),
+                decision_makers: Arc::new(crate::consensus::new_decision_makers()),
+                region_rtt_cache: RegionRttCache::default(),
+            },
             interval,
         }
     }
@@ -3127,6 +3154,40 @@ mod tests {
                 .expect("slot 3 registers");
         guard.disarm();
 
+        // The session's decision-maker holds the load state the beat restates:
+        // slot 2 arrived and dropped again (so it is off the live roster but
+        // still ever-connected), slot 3 arrived and reported its game loop.
+        let decision_makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
+        let _ = crate::consensus::sync_maker(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        crate::consensus::record_slot_connected(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::ids::SlotId(2),
+            false,
+        );
+        crate::consensus::record_slot_connected(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::ids::SlotId(3),
+            false,
+        );
+        crate::consensus::record_slot_started(
+            &decision_makers,
+            &key(7),
+            rally_point_proto::ids::SlotId(3),
+        );
+
         let control = MeshControl::new(
             RelayId(1),
             std::sync::Arc::default(),
@@ -3142,8 +3203,11 @@ mod tests {
                 ControlConnStats::new(),
             ),
             HeartbeatConfig {
-                sessions: Arc::clone(&sessions),
-                region_rtt_cache: RegionRttCache::default(),
+                sources: HeartbeatSources {
+                    sessions: Arc::clone(&sessions),
+                    decision_makers,
+                    region_rtt_cache: RegionRttCache::default(),
+                },
                 interval: Duration::from_millis(50), // beat quickly so the test observes one
             },
             drain_rx,
@@ -3167,10 +3231,19 @@ mod tests {
                     tenant: TenantId(TENANT.to_owned()),
                     session: SessionId(7),
                     slots: vec![rally_point_proto::ids::SlotId(3)],
+                    ever_connected: vec![
+                        rally_point_proto::ids::SlotId(2),
+                        rally_point_proto::ids::SlotId(3),
+                    ],
+                    started: vec![rally_point_proto::ids::SlotId(3)],
+                    // This relay never latched a start of its own, so it reports
+                    // no instant — only the authority whose latch fired does.
+                    started_at_ms: None,
                 }],
                 region_rtts: vec![],
             },
-            "the beat names the registered (tenant, session, slot)",
+            "the beat names the registered (tenant, session, slot) and the \
+             session's retained load state",
         );
     }
 

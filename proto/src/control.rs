@@ -1548,6 +1548,17 @@ pub enum RelayToCoordinator {
 /// slot-granular and PII-free: the relay never learns user identity, and the
 /// coordinator resolves slots to the tenant's own user refs from the session
 /// request it already holds.
+///
+/// Beside the live roster it carries the relay's **retained load state** for the
+/// session: which slots ever connected, which ever reported their game loop
+/// running, and when the relay latched the session started. Those are cumulative
+/// facts, not a live view, and every beat restates them in full — which is what
+/// makes them durable where the matching notices are not: a notice is dropped
+/// once its send succeeds, so a coordinator that dies between receiving one and
+/// committing it — or simply restarts — recovers the whole truth from the next
+/// beat. All three are optional on the wire: a relay that predates them omits
+/// them, a coordinator that predates them ignores them, and a session running
+/// without a decision-maker has nothing to report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPresence {
     /// The tenant the session belongs to.
@@ -1556,6 +1567,22 @@ pub struct SessionPresence {
     pub session: SessionId,
     /// The slots whose clients are connected to the reporting relay right now.
     pub slots: Vec<SlotId>,
+    /// Every slot whose link has activated on the reporting relay at any point
+    /// in the session, ascending. A slot that connected and then dropped stays
+    /// here — the question it answers is "did this player ever arrive", which
+    /// `slots` (connected *now*) cannot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ever_connected: Vec<SlotId>,
+    /// Every slot that has reported its game loop running to the reporting
+    /// relay, ascending. Monotonic for the same reason as `ever_connected`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started: Vec<SlotId>,
+    /// Relay wall-clock (unix epoch milliseconds) of the session's coverage
+    /// latch, set only on the relay whose own authority latch fired. `None`
+    /// everywhere else — a peer that adopted the start directive off the mesh
+    /// reports no instant, so exactly one relay's beats carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
 }
 
 /// Whether a departing player left cleanly or was dropped, classified by the
@@ -2610,6 +2637,9 @@ mod tests {
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
                 slots: vec![SlotId(0), SlotId(3)],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
             }],
             region_rtts: vec![],
         };
@@ -2619,6 +2649,59 @@ mod tests {
         assert!(json.contains("\"roster_complete\":true"));
         let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
+    }
+
+    #[test]
+    fn a_load_state_bearing_heartbeat_roundtrips_json() {
+        // A beat for a session mid-load: two slots connected, one of them already
+        // running its game loop, and this relay is the authority that latched the
+        // start. The whole retained state rides every beat, which is what makes it
+        // the durable record behind the droppable notices.
+        let message = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: vec![SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                slots: vec![SlotId(0), SlotId(3)],
+                ever_connected: vec![SlotId(0), SlotId(3)],
+                started: vec![SlotId(3)],
+                started_at_ms: Some(1_700_000_000_000),
+            }],
+            region_rtts: vec![],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"ever_connected\":[0,3]"));
+        assert!(json.contains("\"started\":[3]"));
+        assert!(json.contains("\"started_at_ms\":1700000000000"));
+        let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    #[test]
+    fn a_heartbeat_without_load_state_omits_the_fields_and_decodes() {
+        // A relay that predates the load-state fields — or one running a session
+        // with no decision-maker to retain any — sends a roster entry that is
+        // byte-identical to the pre-load-state shape, and a decoder that has the
+        // fields reads it as "nothing reported" rather than erroring.
+        let message = RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: vec![SessionPresence {
+                tenant: TenantId("sb-staging".to_owned()),
+                session: SessionId(42),
+                slots: vec![SlotId(0)],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
+            }],
+            region_rtts: vec![],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("ever_connected"));
+        assert!(!json.contains("started"));
+
+        let json = r#"{"type":"heartbeat","roster_complete":true,"sessions":[{"tenant":"sb-staging","session":42,"slots":[0]}]}"#;
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -2709,6 +2792,9 @@ mod tests {
                 tenant: TenantId("sb-staging".to_owned()),
                 session: SessionId(42),
                 slots: vec![SlotId(0)],
+                ever_connected: vec![],
+                started: vec![],
+                started_at_ms: None,
             }],
             region_rtts: vec![],
         })

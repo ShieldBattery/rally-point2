@@ -167,6 +167,9 @@ mod tests {
             tenant: tenant(),
             session: SessionId(session),
             slots: slots.iter().map(|&s| SlotId(s)).collect(),
+            ever_connected: vec![],
+            started: vec![],
+            started_at_ms: None,
         }]
     }
 

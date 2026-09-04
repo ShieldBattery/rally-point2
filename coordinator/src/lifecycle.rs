@@ -220,6 +220,14 @@ struct SessionState {
     /// for a session this coordinator lifetime never created (restart amnesia). The
     /// reap fans a `CloseSlot` out to all of these.
     serving_relays: Vec<RelayId>,
+    /// Whether `register_session` created this state — the session was set up
+    /// against *this* coordinator process, so everything it has accumulated since
+    /// covers the session's whole life. `false` for a state lazily created by an
+    /// arriving notice or heartbeat for a session this process never created
+    /// (restart amnesia), where the accumulated sets start wherever the coordinator
+    /// happened to come up. Only the load-state read distinguishes the two: an
+    /// absent slot is evidence of a no-show only in the first case.
+    created_here: bool,
     /// The session's player (non-observer) slots — the reap accounting universe.
     player_slots: HashSet<SlotId>,
     /// The session's observer slots — never accounted (they don't report), reaped
@@ -507,6 +515,10 @@ impl Lifecycle {
             .entry((tenant.clone(), session))
             .or_insert_with(|| self.new_state(Vec::new()));
         state.serving_relays = serving_relays;
+        // This coordinator has held the session since its creation, so what it
+        // accumulates for it is complete rather than whatever notices happened to
+        // find it. Only the load-state read cares (see `load_state`).
+        state.created_here = true;
         state.player_slots = player_slots;
         state.observer_slots = observer_slots;
         state.closed_relays.clear();
@@ -758,21 +770,53 @@ impl Lifecycle {
     /// started, which slots ever connected, and which ever reported their game
     /// loop running. Both slot lists are sorted ascending.
     ///
-    /// `None` when the coordinator holds no state for the session at all — it was
-    /// never created this lifetime (restart amnesia) or has already been reaped —
-    /// which the tenant must read as "no information", not as "nobody arrived". A
-    /// webhook-only state lazily created by an incoming notice answers with
-    /// whatever that notice recorded.
+    /// `Some` **only** for a session this coordinator lifetime created via
+    /// [`register_session`](Self::register_session), because only then are the
+    /// sets complete for the session's whole life — which is what lets a caller
+    /// treat a slot's *absence* as evidence it never arrived. `None` otherwise:
+    /// the session was never created here (restart amnesia, even if notices or
+    /// heartbeats have since lazily created a state for it) or has already been
+    /// reaped. That is "no information", never "nobody arrived".
     pub fn load_state(&self, tenant: &TenantId, session: SessionId) -> Option<SessionLoadState> {
         self.inner
             .sessions
             .lock()
             .get(&(tenant.clone(), session))
+            .filter(|state| state.created_here)
             .map(|state| SessionLoadState {
                 started_at_ms: state.started_at_ms,
                 connected_slots: sorted_slots(&state.connected_slots),
                 started_slots: sorted_slots(&state.started_slots),
             })
+    }
+
+    /// Folds the load state a relay's heartbeat restated into the sessions'
+    /// records: the ever-connected and ever-started slot sets union in, and the
+    /// first start instant seen wins.
+    ///
+    /// The notices carrying these facts are dropped once their send succeeds, so a
+    /// coordinator that died between receiving one and committing it — or that
+    /// restarted — would otherwise have lost it for good. The heartbeat restates
+    /// every session's whole state on every beat, which makes this the durable
+    /// record the load-state read serves; the notices remain the fast path.
+    /// Deliberately fires no webhook: these are re-statements of facts already
+    /// notified, and the tenant's feed must not repeat them every ten seconds.
+    ///
+    /// The caller applies the same fences as the rest of the beat — a stale
+    /// control connection's roster is dropped whole, and an entry for a session
+    /// the relay does not serve is rejected — before anything reaches here.
+    pub fn on_heartbeat_load_state(&self, sessions: &[SessionPresence]) {
+        for session in sessions {
+            for &slot in &session.ever_connected {
+                self.on_slot_connected(session.tenant.clone(), session.session, slot);
+            }
+            for &slot in &session.started {
+                self.on_slot_started(session.tenant.clone(), session.session, slot);
+            }
+            if let Some(started_at_ms) = session.started_at_ms {
+                self.on_session_started(session.tenant.clone(), session.session, started_at_ms);
+            }
+        }
     }
 
     /// Records that some relay's heartbeat reported at least one connected
@@ -1388,6 +1432,7 @@ impl Lifecycle {
         tokio::spawn(drain_queue(rx, tenants));
         SessionState {
             serving_relays,
+            created_here: false,
             player_slots: HashSet::new(),
             observer_slots: HashSet::new(),
             accounted: HashSet::new(),
@@ -2664,6 +2709,9 @@ mod tests {
             tenant: tid(),
             session,
             slots: slots.iter().copied().map(SlotId).collect(),
+            ever_connected: vec![],
+            started: vec![],
+            started_at_ms: None,
         }
     }
 
@@ -2690,6 +2738,88 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// A roster entry carrying load state alongside the connected slots.
+    fn heartbeat_load(
+        session: SessionId,
+        connected: &[u8],
+        ever_connected: &[u8],
+        started: &[u8],
+        started_at_ms: Option<u64>,
+    ) -> SessionPresence {
+        SessionPresence {
+            ever_connected: ever_connected.iter().copied().map(SlotId).collect(),
+            started: started.iter().copied().map(SlotId).collect(),
+            started_at_ms,
+            ..heartbeat_session(session, connected)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_load_state_accumulates_and_the_first_start_instant_wins() {
+        // The beat is the durable record: it restates each relay's whole retained
+        // state, so what the load-state read answers converges on the union of
+        // every serving relay's view even if not one notice ever arrived.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::new(setup.clone());
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+
+        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], Some(1_700_000_000_000))]);
+        // A second relay's beat for the same session: its own slot unions in, and
+        // its later latch instant never displaces the first one recorded.
+        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[0], &[0], &[], Some(1_700_000_009_999))]);
+        // A re-statement of what is already recorded changes nothing.
+        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], None)]);
+
+        let load = lc
+            .load_state(&tid(), s)
+            .expect("the session was created here");
+        assert_eq!(load.connected_slots, vec![SlotId(0), SlotId(1)]);
+        assert_eq!(load.started_slots, vec![SlotId(1)]);
+        assert_eq!(
+            load.started_at_ms,
+            Some(1_700_000_000_000),
+            "the first instant reported wins; a tenant may already have recorded it",
+        );
+    }
+
+    #[tokio::test]
+    async fn load_state_is_unknown_for_a_session_this_coordinator_never_created() {
+        // Restart amnesia: notices and beats for a session set up against a
+        // previous process still lazily create a state (its facts are worth
+        // keeping), but the sets start wherever this process came up. Answering
+        // them would let a tenant read an absent slot as a no-show, so the read
+        // reports no information at all until the session is registered here.
+        let (setup, s) = setup_with_relay_and_session();
+        let lc = Lifecycle::new(setup.clone());
+
+        lc.on_slot_connected(tid(), s, SlotId(0));
+        lc.on_heartbeat_load_state(&[heartbeat_load(s, &[1], &[1], &[1], Some(7))]);
+        assert!(lc.contains_state(&tid(), s), "the facts are still recorded");
+        assert!(
+            lc.load_state(&tid(), s).is_none(),
+            "an incomplete set is no answer at all",
+        );
+
+        // Registering the session hands this coordinator the whole picture from
+        // here on, and the read starts answering — including what it had already
+        // accumulated.
+        lc.register_session(
+            tid(),
+            s,
+            setup.serving_relays(&tid(), s),
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        let load = lc.load_state(&tid(), s).expect("created here now");
+        assert_eq!(load.connected_slots, vec![SlotId(0), SlotId(1)]);
     }
 
     #[tokio::test]

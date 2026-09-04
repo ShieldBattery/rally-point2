@@ -211,9 +211,12 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// actually does: a relay's heartbeat roster. A heartbeat carries up to
 /// [`MAX_HEARTBEAT_SESSIONS`] session entries — each a tenant id (at most
 /// [`token::MAX_STRING_LEN`](rally_point_proto::token::MAX_STRING_LEN) = 255 bytes), a
-/// session id, and up to [`MAX_HEARTBEAT_SESSION_SLOTS`] slot numbers — plus up to
-/// [`MAX_HEARTBEAT_REGION_RTTS`] region-RTT entries. Even at a generous ~512 bytes per
-/// session entry that worst case is comfortably under 2 MiB, so this bounds every
+/// session id, up to [`MAX_HEARTBEAT_SESSION_SLOTS`] connected slot numbers, and the
+/// session's retained load state (that same slot ceiling again for each of its two
+/// slot sets, plus a start stamp) — plus up to [`MAX_HEARTBEAT_REGION_RTTS`]
+/// region-RTT entries. Even at a generous ~512 bytes per session entry — a real
+/// tenant id is a short label, nowhere near the 255-byte ceiling — that worst case
+/// stays under 2 MiB, so this bounds every
 /// legitimate inbound frame with headroom. Left unset, axum/tungstenite default to
 /// 64 MiB / 16 MiB — high enough that a single connection could pin tens of megabytes
 /// per frame it merely claims to be sending, before any application-level check ever
@@ -728,10 +731,18 @@ struct SessionLoadStateRequest {
 /// the session's load progress. camelCase, the tenant's own convention (like the
 /// webhook bodies), unlike the snake_case control-plane request above.
 ///
-/// `known` is `false` — with both lists empty and no `startedAtMs` — when the
-/// coordinator holds no state for the session at all. That is "no information",
-/// never "nobody arrived": a coordinator restart or a completed reap both read
-/// this way.
+/// `known: true` means the coordinator has held the session **since it created
+/// it**, so the two sets cover the session's whole life and are complete up to
+/// heartbeat latency (~10s, since every relay's beat restates its retained load
+/// state). That completeness is what lets the tenant read an *absent* slot as
+/// evidence the player never got there.
+///
+/// `known` is `false` — with both lists empty and no `startedAtMs` — for a
+/// session this coordinator did not create: it restarted and forgot, or the
+/// session has been reaped. That is "no information", never "nobody arrived", and
+/// it stays `false` even once notices or heartbeats have lazily created a state,
+/// because those start wherever the coordinator came up rather than at the
+/// session's beginning.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
@@ -755,7 +766,9 @@ struct SessionLoadStateResponse {
 ///
 /// Both slot lists are **ever**-sets, ascending: a slot that connected and then
 /// dropped still appears, because the question is who got here at all, not who is
-/// here now (`POST /presence/query` answers the latter).
+/// here now (`POST /presence/query` answers the latter). They are fed by both the
+/// relays' notices as they happen and every relay heartbeat, which restates its
+/// whole retained load state — so a notice lost in flight costs at most a beat.
 ///
 /// Same tenant request-signature auth as `POST /session/create` (see the module
 /// docs); the `tenant` in the body must match the tenant the signature verifies
@@ -2614,16 +2627,27 @@ fn note_inbound(
                 complete_roster = false;
             }
             for session in &mut sessions {
-                if session.slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
-                    tracing::warn!(
-                        relay_id = relay_id.0,
-                        tenant = session.tenant.as_ref(),
-                        session = session.session.0,
-                        reported = session.slots.len(),
-                        cap = MAX_HEARTBEAT_SESSION_SLOTS,
-                        "heartbeat session slot list exceeds the per-session cap; truncating",
-                    );
-                    session.slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+                // Each of the three slot lists is bounded by the same ceiling: a
+                // session cannot have more slots than that, so a longer list is
+                // forged (or a relay bug) whether it names the connected slots or
+                // the ever-connected/ever-started ones.
+                for (label, slots) in [
+                    ("connected", &mut session.slots),
+                    ("ever-connected", &mut session.ever_connected),
+                    ("started", &mut session.started),
+                ] {
+                    if slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
+                        tracing::warn!(
+                            relay_id = relay_id.0,
+                            tenant = session.tenant.as_ref(),
+                            session = session.session.0,
+                            list = label,
+                            reported = slots.len(),
+                            cap = MAX_HEARTBEAT_SESSION_SLOTS,
+                            "heartbeat session slot list exceeds the per-session cap; truncating",
+                        );
+                        slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+                    }
                 }
             }
             if region_rtts.len() > MAX_HEARTBEAT_REGION_RTTS {
@@ -2682,6 +2706,14 @@ fn note_inbound(
                     complete_roster,
                     std::time::Instant::now(),
                 );
+                // The beat also restates each session's accumulated load state,
+                // which is the durable record behind the droppable slot-connected
+                // / session-started / slot-started notices: the notice is the fast
+                // path to the tenant's webhook, this is what the load-state read
+                // answers from. It fires no webhook of its own — the facts here
+                // have already been notified, and re-notifying them every beat
+                // would flood the feed.
+                lifecycle.on_heartbeat_load_state(&sessions);
                 // Backbone RTTs fold in under the same generation fence as presence: a
                 // stale connection's beat describes a superseded view, so its measured
                 // pairs must not overwrite what the live connection reports. Unlike the
@@ -4019,6 +4051,8 @@ mod tests {
         state
             .lifecycle
             .on_slot_started(tenant.clone(), SessionId(5), SlotId(1));
+        // Kept past the router build for the restart-amnesia case at the end.
+        let lifecycle = state.lifecycle.clone();
         let app = router(state);
 
         let req_body =
@@ -4058,7 +4092,13 @@ mod tests {
         // never "nobody arrived": known false with empty lists.
         let unknown_body =
             serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 6 })).unwrap();
-        let resp = signed_post(app, "/session/load-state", &unknown_body, &TEST_CLIENT_SEED).await;
+        let resp = signed_post(
+            app.clone(),
+            "/session/load-state",
+            &unknown_body,
+            &TEST_CLIENT_SEED,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -4072,6 +4112,26 @@ mod tests {
         assert!(json.get("startedAtMs").is_none(), "absent, never null");
         assert!(json["connectedSlots"].as_array().unwrap().is_empty());
         assert!(json["startedSlots"].as_array().unwrap().is_empty());
+
+        // A session this coordinator never created but has since accumulated
+        // facts for — restart amnesia, with a relay still reporting — reads the
+        // same way. Its sets start wherever the coordinator came up, so answering
+        // them would let the tenant read an absent slot as a player who never
+        // arrived.
+        lifecycle.on_slot_connected(tenant.clone(), SessionId(7), SlotId(0));
+        lifecycle.on_slot_started(tenant, SessionId(7), SlotId(0));
+        let lost_body =
+            serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "session": 7 })).unwrap();
+        let resp = signed_post(app, "/session/load-state", &lost_body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"known":false,"connectedSlots":[],"startedSlots":[]}"#,
+            "an incomplete set is no answer at all",
+        );
     }
 
     #[tokio::test]
@@ -4546,6 +4606,22 @@ mod tests {
         )
     }
 
+    /// A roster entry naming slot 0 connected and no load state — the common
+    /// shape for tests that only care that the session is on the beat.
+    fn session_presence(
+        tenant: TenantId,
+        session: SessionId,
+    ) -> rally_point_proto::control::SessionPresence {
+        rally_point_proto::control::SessionPresence {
+            tenant,
+            session,
+            slots: vec![SlotId(0)],
+            ever_connected: vec![],
+            started: vec![],
+            started_at_ms: None,
+        }
+    }
+
     /// A `Heartbeat` framed as an inbound control message, carrying the given
     /// `(region, rtt_ms)` backbone measurements and an empty session roster.
     fn heartbeat_with_rtts(rtts: &[(&str, u32)]) -> Message {
@@ -4685,6 +4761,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_tenant() {
+        // The durability half of load reporting: the beat restates the relay's
+        // whole retained state, so the load-state read is right even if every
+        // notice was lost. It must stay silent to the tenant, though — these facts
+        // were already notified, and re-firing them every beat would flood the
+        // feed.
+        let (setup, notices, lifecycle, session) =
+            setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
+        let tenant = TenantId("sb-test".to_owned());
+        lifecycle.register_session(
+            tenant.clone(),
+            session,
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+            std::collections::HashSet::new(),
+        );
+        let hello = RelayHello::new(
+            RelayId(1),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
+            ProtocolVersion::CURRENT,
+            vec![0xC1; 4],
+        );
+        let stale_generation = registry::enroll(setup.registry(), hello.clone());
+        let generation = registry::enroll(setup.registry(), hello);
+        lifecycle.on_relay_enrolled(RelayId(1), generation);
+
+        let regions = RegionsConfig::default();
+        let store = pair_rtts::new_store();
+        let rtt = idle_rtt_ingest(&regions, &store);
+        let beat = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
+            tenant: tenant.clone(),
+            session,
+            // Slot 0 arrived and dropped again; slot 1 is here and running.
+            slots: vec![SlotId(1)],
+            ever_connected: vec![SlotId(0), SlotId(1)],
+            started: vec![SlotId(1)],
+            started_at_ms: Some(1_700_000_000_000),
+        }]);
+
+        // A beat from a superseded connection describes a stale view and is
+        // dropped whole — load state included.
+        note_inbound_frame(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            stale_generation,
+            &beat,
+            &rtt,
+        );
+        assert_eq!(
+            lifecycle.load_state(&tenant, session),
+            Some(crate::lifecycle::SessionLoadState {
+                started_at_ms: None,
+                connected_slots: vec![],
+                started_slots: vec![],
+            }),
+            "a stale connection's beat records nothing",
+        );
+
+        note_inbound_frame(
+            &setup,
+            &notices,
+            &lifecycle,
+            RelayId(1),
+            generation,
+            &beat,
+            &rtt,
+        );
+        assert_eq!(
+            lifecycle.load_state(&tenant, session),
+            Some(crate::lifecycle::SessionLoadState {
+                started_at_ms: Some(1_700_000_000_000),
+                connected_slots: vec![SlotId(0), SlotId(1)],
+                started_slots: vec![SlotId(1)],
+            }),
+        );
+        assert!(
+            notices.slot_connects.lock().is_empty()
+                && notices.session_starts.lock().is_empty()
+                && notices.slot_starts.lock().is_empty(),
+            "the beat is the durable record, never a notification source",
+        );
+    }
+
+    #[tokio::test]
     async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch() {
         let (setup, notices, lifecycle, session) =
             setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
@@ -4709,11 +4871,7 @@ mod tests {
         let regions = RegionsConfig::default();
         let store = pair_rtts::new_store();
         let rtt = idle_rtt_ingest(&regions, &store);
-        let occupied = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
-            tenant: tenant.clone(),
-            session,
-            slots: vec![SlotId(0)],
-        }]);
+        let occupied = heartbeat_with_sessions(vec![session_presence(tenant.clone(), session)]);
         note_inbound_frame(
             &setup,
             &notices,
@@ -4805,11 +4963,7 @@ mod tests {
         let rtt = idle_rtt_ingest(&regions, &store);
         let tenant = TenantId("sb-test".to_owned());
 
-        let beat = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
-            tenant: tenant.clone(),
-            session,
-            slots: vec![SlotId(0)],
-        }]);
+        let beat = heartbeat_with_sessions(vec![session_presence(tenant.clone(), session)]);
         note_inbound_frame(
             &setup,
             &notices,
@@ -4918,16 +5072,8 @@ mod tests {
         let rtt = idle_rtt_ingest(&regions, &store);
 
         let beat = heartbeat_with_sessions(vec![
-            rally_point_proto::control::SessionPresence {
-                tenant: tenant.clone(),
-                session: session_b,
-                slots: vec![SlotId(0)],
-            },
-            rally_point_proto::control::SessionPresence {
-                tenant: tenant.clone(),
-                session: session_a,
-                slots: vec![SlotId(0)],
-            },
+            session_presence(tenant.clone(), session_b),
+            session_presence(tenant.clone(), session_a),
         ]);
         note_inbound_frame(
             &setup,
@@ -4974,11 +5120,7 @@ mod tests {
         // could cap how many entries land.
         let overshoot = MAX_HEARTBEAT_SESSIONS + 5;
         let sessions: Vec<_> = (0..overshoot as u64)
-            .map(|id| rally_point_proto::control::SessionPresence {
-                tenant: tenant.clone(),
-                session: SessionId(id),
-                slots: vec![SlotId(0)],
-            })
+            .map(|id| session_presence(tenant.clone(), SessionId(id)))
             .collect();
         let beat = heartbeat_with_sessions(sessions);
 
@@ -5025,6 +5167,9 @@ mod tests {
             tenant: tenant.clone(),
             session: SessionId(1),
             slots,
+            ever_connected: vec![],
+            started: vec![],
+            started_at_ms: None,
         }]);
 
         note_inbound_frame(
@@ -5595,11 +5740,7 @@ mod tests {
     /// The heartbeat roster naming `session`'s slot 0 — what relay 1's beat
     /// carries while that slot's client is connected.
     fn slot0_roster(session: SessionId) -> Vec<rally_point_proto::control::SessionPresence> {
-        vec![rally_point_proto::control::SessionPresence {
-            tenant: TenantId("sb-test".to_owned()),
-            session,
-            slots: vec![SlotId(0)],
-        }]
+        vec![session_presence(TenantId("sb-test".to_owned()), session)]
     }
 
     /// The signed presence-query body `{tenant, users}`.
