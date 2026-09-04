@@ -468,7 +468,7 @@ where
             }
             RoundEntry::Joined(watch) => {
                 if let Some(round) = joined_round(watch).await
-                    && round.started_before_any_request >= asked_at
+                    && round_answers_read(round.started_before_any_request, asked_at)
                 {
                     return round;
                 }
@@ -479,6 +479,18 @@ where
             }
         }
     }
+}
+
+/// Whether a shared round that began at `round_started` can answer a read that
+/// arrived at `asked_at`: only if it began strictly after. The clock is monotonic
+/// but not strictly increasing, so two causally ordered samples can read equal —
+/// and an equal stamp cannot tell a round that began before this read from one
+/// that began after it. Equality is therefore treated as the older case and the
+/// read waits for the next round; the cost is one extra round in a window a
+/// high-resolution clock almost never produces, against a claim that must hold
+/// always.
+fn round_answers_read(round_started: Instant, asked_at: Instant) -> bool {
+    round_started > asked_at
 }
 
 /// Awaits the outcome of a round this caller joined, or `None` if its leader left
@@ -690,6 +702,22 @@ mod tests {
             started_before_any_request
         );
         assert_eq!(*joined.attested, HashSet::from([RelayId(1)]));
+    }
+
+    #[test]
+    fn a_round_stamped_at_the_very_instant_a_read_arrived_does_not_answer_it() {
+        // Equal samples of a monotonic clock cannot order the two events, so the
+        // read must not take the round; only a strictly later boundary can.
+        let asked_at = Instant::now();
+        assert!(!round_answers_read(asked_at, asked_at));
+        assert!(!round_answers_read(
+            asked_at - Duration::from_nanos(1),
+            asked_at
+        ));
+        assert!(round_answers_read(
+            asked_at + Duration::from_nanos(1),
+            asked_at
+        ));
     }
 
     /// A round stamped as having begun at `started`, carrying `relay` as its one
