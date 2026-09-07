@@ -25,7 +25,7 @@ use rally_point_proto::ids::SlotId;
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
 };
-use rally_point_transport::{Link, quic, quinn, rustls};
+use rally_point_transport::{Link, noq, quic, rustls};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::time::{Instant, timeout_at};
 
@@ -59,7 +59,7 @@ const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 /// can dial more than once (a relay's different address families, say, or a
 /// re-dial after a drop).
 pub struct ClientEndpoint {
-    endpoint: quinn::Endpoint,
+    endpoint: noq::Endpoint,
 }
 
 /// Why a client endpoint could not be built.
@@ -83,12 +83,12 @@ pub enum DialError {
     /// Starting the QUIC connection failed (a bad address, or the endpoint is
     /// shutting down) — the connection never began.
     #[error("starting the QUIC connection failed: {0}")]
-    Connect(#[from] quinn::ConnectError),
+    Connect(#[from] noq::ConnectError),
     /// The QUIC connection failed during the handshake — including the relay
     /// closing it because authorization was refused (an unknown or expired token,
     /// a bad challenge response, or the slot already taken).
     #[error("QUIC connection failed: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// The relay's advertised datagram budget is under the guaranteed floor the
     /// transport's admission and replay invariants assume — an unsupported peer
     /// configuration, refused outright at establishment rather than partially
@@ -102,10 +102,10 @@ pub enum DialError {
     Token(#[from] HandshakeError),
     /// Writing a handshake message to the relay failed.
     #[error("writing a handshake message failed: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] noq::WriteError),
     /// Reading a handshake message from the relay failed.
     #[error("reading a handshake message failed: {0}")]
-    Read(#[from] quinn::ReadExactError),
+    Read(#[from] noq::ReadExactError),
     /// The relay replied on the handshake stream with something other than its
     /// acknowledgement byte. A conforming relay never does this — it acknowledges
     /// or closes the connection — so this guards against a misbehaving peer.
@@ -158,31 +158,27 @@ impl ClientEndpoint {
 
         // std's UdpSocket can't clear IPV6_V6ONLY (set by default on Windows), and
         // a v6-only socket can't reach IPv4 relays — so build the dual-stack socket
-        // by hand and hand it to quinn.
+        // by hand and hand it to noq.
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_only_v6(false)?;
         let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, port).into();
         socket.bind(&bind.into())?;
 
-        let runtime = quinn::default_runtime().ok_or(EndpointError::NoRuntime)?;
-        let endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket.into(),
-            runtime,
-        )?;
+        let runtime = noq::default_runtime().ok_or(EndpointError::NoRuntime)?;
+        let endpoint =
+            noq::Endpoint::new(noq::EndpointConfig::default(), None, socket.into(), runtime)?;
         endpoint.set_default_client_config(config);
         Ok(Self { endpoint })
     }
 
     /// Wraps an endpoint the caller has already built and configured with a client
     /// config (a custom socket, or one shared across roles).
-    pub fn from_endpoint(endpoint: quinn::Endpoint) -> Self {
+    pub fn from_endpoint(endpoint: noq::Endpoint) -> Self {
         Self { endpoint }
     }
 
     /// The underlying QUIC endpoint.
-    pub fn endpoint(&self) -> &quinn::Endpoint {
+    pub fn endpoint(&self) -> &noq::Endpoint {
         &self.endpoint
     }
 
@@ -242,7 +238,7 @@ impl ClientEndpoint {
             Ok(result) => result.map(|()| Link::new(connection)),
             Err(_elapsed) => {
                 connection.close(
-                    quinn::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
+                    noq::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
                     b"authorization timed out",
                 );
                 Err(DialError::TimedOut { timeout })
@@ -297,7 +293,7 @@ impl ClientEndpoint {
             }
             Err(_elapsed) => {
                 connection.close(
-                    quinn::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
+                    noq::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
                     b"authorization timed out",
                 );
                 Err(DialError::TimedOut { timeout })
@@ -309,11 +305,11 @@ impl ClientEndpoint {
 /// Whether the relay closed `connection` with its slot-departed application code —
 /// the terminal "the game moved on without you" refusal, as opposed to a live
 /// double-connect refusal or any transport-level failure.
-fn refused_as_departed(connection: &quinn::Connection) -> bool {
+fn refused_as_departed(connection: &noq::Connection) -> bool {
     matches!(
         connection.close_reason(),
-        Some(quinn::ConnectionError::ApplicationClosed(ref close))
-            if close.error_code == quinn::VarInt::from_u32(SLOT_DEPARTED_CLOSE)
+        Some(noq::ConnectionError::ApplicationClosed(ref close))
+            if close.error_code == noq::VarInt::from_u32(SLOT_DEPARTED_CLOSE)
     )
 }
 
@@ -321,7 +317,7 @@ fn refused_as_departed(connection: &quinn::Connection) -> bool {
 /// connection: present the token, answer the relay's challenge, and confirm the
 /// acknowledgement.
 async fn authorize(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     identity: &Identity,
     cursors: &[(SlotId, u64)],
 ) -> Result<(), DialError> {

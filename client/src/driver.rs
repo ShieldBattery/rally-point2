@@ -95,7 +95,7 @@ use rally_point_transport::control::{
     send_control_phase_applied, send_control_request_drop, send_control_skin, send_control_turn,
     spawn_control_reader,
 };
-use rally_point_transport::{Link, LinkError, quinn};
+use rally_point_transport::{Link, LinkError, noq};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 
@@ -2209,7 +2209,7 @@ enum OutboundSend {
 #[allow(clippy::too_many_arguments)]
 async fn send_game_turn(
     link: &mut Link,
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     announcer: &LeaveAnnouncer,
     next_outbound_seq: &mut u64,
     retention: &mut VecDeque<Payload>,
@@ -2349,7 +2349,7 @@ fn release_ready(
 /// static cursor (a genuine forward gap) sends nothing — the cap handles that.
 async fn flush_delivered_cursors(
     link: &Link,
-    beacon_send: &mut quinn::SendStream,
+    beacon_send: &mut noq::SendStream,
     beacon_writer: &mut BeaconWriter,
     next_seq: &HashMap<SlotId, u64>,
 ) {
@@ -3119,7 +3119,7 @@ async fn reconnect_link(
 /// seq. The clone is cheap next to that risk (these turns are rare and the batch
 /// tiny), and paid only while turns remain to send.
 async fn redivert_pending_control(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     pending: &mut Vec<Payload>,
 ) -> Result<(), ControlSendError> {
     while let Some(turn) = pending.first().cloned() {
@@ -3287,7 +3287,7 @@ fn redivert_oversize_retention_on_same_relay_resume(link: &Link, state: &mut Loo
 /// Best-effort classification of a dial failure as a TLS certificate / pin
 /// rejection — a relay that restarted with a fresh keypair, which no same-relay
 /// retry can ever get past, so escalation need not wait out the timed window. It
-/// inspects the crypto-handshake markers quinn/rustls surface; a miss only defers
+/// inspects the crypto-handshake markers noq/rustls surface; a miss only defers
 /// escalation to the [`ESCALATE_AFTER`] fallback rather than breaking it, so the
 /// classifier is deliberately conservative.
 fn is_cert_rejection(error: &DialError) -> bool {
@@ -3501,7 +3501,7 @@ mod tests {
     use rally_point_proto::beacon;
     use rally_point_transport::quic::{client_config, server_config};
     use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rally_point_transport::{quinn, rustls};
+    use rally_point_transport::{noq, rustls};
 
     use super::*;
 
@@ -3740,7 +3740,7 @@ mod tests {
 
     /// Brings up a loopback QUIC connection and wraps each end in a [`Link`]. The
     /// endpoints are returned so the caller keeps them alive for the test.
-    async fn connected_links() -> (Link, Link, quinn::Endpoint, quinn::Endpoint) {
+    async fn connected_links() -> (Link, Link, noq::Endpoint, noq::Endpoint) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
 
@@ -3749,9 +3749,9 @@ mod tests {
         let client_cfg = client_config(roots).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -3979,7 +3979,7 @@ mod tests {
             .await
             .expect("the old connection was never closed after classification");
         assert!(
-            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            matches!(closed, noq::ConnectionError::ApplicationClosed(_)),
             "closed deliberately by the reconnect loop, not lost: {closed:?}",
         );
 
@@ -4949,7 +4949,7 @@ mod tests {
     async fn drive_unacked_session(
         own_slot: SlotId,
         turns: &[&[u8]],
-    ) -> (Link, LoopState, Link, quinn::Endpoint, quinn::Endpoint) {
+    ) -> (Link, LoopState, Link, noq::Endpoint, noq::Endpoint) {
         let (link_a, link_b, ea, eb) = connected_links().await;
         let (driver_a, chan_a) = LinkDriver::new(link_a);
         // Buffer every turn (channel depth is ample) and then drop the sender, so
@@ -5134,9 +5134,7 @@ mod tests {
         {
             let (link_a, _link_b, _ea, _eb) = connected_links().await;
             let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
-            link_a
-                .connection()
-                .close(quinn::VarInt::from_u32(0), b"boom");
+            link_a.connection().close(noq::VarInt::from_u32(0), b"boom");
             let result = redivert_pending_control(&mut control_send, &mut pending).await;
             assert!(result.is_err(), "a send over a dead connection must fail");
             assert_eq!(
@@ -5596,7 +5594,7 @@ mod tests {
             .await
             .expect("the ended driver never closed its connection");
         assert!(
-            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            matches!(closed, noq::ConnectionError::ApplicationClosed(_)),
             "closed deliberately by the driver, not lost: {closed:?}",
         );
     }
@@ -5795,7 +5793,7 @@ mod tests {
         // anything. Meanwhile the driver keeps producing turns. Each goes out and
         // stays unacked — genuine forward-path loss.
         //
-        // We must drain the raw datagrams off the wire or quinn's datagram buffer
+        // We must drain the raw datagrams off the wire or noq's datagram buffer
         // fills and the connection stalls before the cap is reached. But we never
         // feed them to `link_b.recv()`, so no delivered_through advances.
         let drainer = {
@@ -5972,7 +5970,7 @@ mod tests {
         // its channels.
         link_b
             .connection()
-            .close(quinn::VarInt::from_u32(0), b"leave processed");
+            .close(noq::VarInt::from_u32(0), b"leave processed");
 
         match tokio::time::timeout(Duration::from_secs(5), task).await {
             Ok(joined) => assert!(

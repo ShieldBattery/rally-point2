@@ -169,7 +169,7 @@ const CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// returning `None` — the caller has nothing more useful to add and only needs
 /// to know reading is over, not why.
 pub(crate) async fn read_one_frame<M: Message + Default>(
-    recv: &mut quinn::RecvStream,
+    recv: &mut noq::RecvStream,
     label: &str,
 ) -> Option<M> {
     let mut prefix = [0u8; CONTROL_LEN_PREFIX];
@@ -216,7 +216,7 @@ pub(crate) async fn read_one_frame<M: Message + Default>(
 /// stream is not itself a link failure (that surfaces via the datagram path),
 /// but any oversize turn that later needed it will stall the game, so the
 /// driver logs it.
-pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<ControlInbound> {
+pub fn spawn_control_reader(connection: noq::Connection) -> mpsc::Receiver<ControlInbound> {
     let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let Ok((_send_half, mut recv)) = connection.accept_bi().await else {
@@ -307,7 +307,7 @@ pub fn spawn_control_reader(connection: quinn::Connection) -> mpsc::Receiver<Con
 /// re-carrying it, so it cannot be silently dropped without desyncing
 /// lockstep.
 pub async fn send_control_turn(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     payload: Payload,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -325,7 +325,7 @@ pub async fn send_control_turn(
 /// stalls the game and stops the datagram turn stream, so the reliable stream is
 /// the only path that still reaches a stalled survivor.
 pub async fn send_control_leave(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     leave: LeaveDirective,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -343,7 +343,7 @@ pub async fn send_control_leave(
 /// connection) is already gone, in which case the departure needs no
 /// announcing — the relay will observe the link death directly.
 pub async fn send_control_leave_intent(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::LeaveIntent(LeaveIntent {})),
@@ -360,7 +360,7 @@ pub async fn send_control_leave_intent(
 /// gone) needs no recovery — the relay reasons the game's outcome from the
 /// departure that follows regardless.
 pub async fn send_control_game_result(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     payload: Bytes,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -379,7 +379,7 @@ pub async fn send_control_game_result(
 /// (the stream or connection gone) needs no recovery, and the caller logs and
 /// continues rather than treating it as a link failure.
 pub async fn send_control_game_started(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameStarted(GameStarted {})),
@@ -398,7 +398,7 @@ pub async fn send_control_game_started(
 /// — a dropped setup command would leave a member's pre-game state incomplete,
 /// so it cannot be silently dropped.
 pub async fn send_control_lobby(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     command: LobbyCommand,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -419,7 +419,7 @@ pub async fn send_control_lobby(
 /// `Err` here rather than propagating it as a fatal error, the same treatment
 /// it gives a failed `GameResult` send.
 pub async fn send_control_chat(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     chat: GameChat,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -441,7 +441,7 @@ pub async fn send_control_chat(
 /// an `Err` here rather than propagating it as a fatal error, the same treatment
 /// it gives a failed `GameChat` send.
 pub async fn send_control_skin(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     skin: PlayerSkin,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -462,7 +462,7 @@ pub async fn send_control_skin(
 /// it more than once (a re-push on a late slot, an authority handoff); the client
 /// dedups, so a repeat costs only a frame.
 pub async fn send_control_session_start(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     initial_buffer_turns: Option<u32>,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -482,7 +482,7 @@ pub async fn send_control_session_start(
 /// leave or session-start push. The relay may send several over a game (a slot
 /// can flip more than once), and a client that missed one simply never sees it.
 pub async fn send_control_connectivity(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     slot: u8,
     connected: bool,
     connection_epoch: Option<u64>,
@@ -509,7 +509,7 @@ pub async fn send_control_connectivity(
 /// caller logs and continues rather than treating an error as a link failure,
 /// the same treatment a `GameChat` send gets.
 pub async fn send_control_request_drop(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     slot: u32,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -531,7 +531,7 @@ pub async fn send_control_request_drop(
 /// client. An error means the stream is gone, which the caller treats as that
 /// client having left, exactly like a leave or session-start push.
 pub async fn send_control_region_labels(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     labels: Vec<RegionLabel>,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -549,7 +549,7 @@ pub async fn send_control_region_labels(
 /// the caller treats as that client having left, exactly like a leave or
 /// session-start push.
 pub async fn send_control_phase_directive(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     directive: PhaseDirective,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -565,7 +565,7 @@ pub async fn send_control_phase_directive(
 /// stream is gone; the caller treats a lost acknowledgement as best-effort —
 /// the relay simply parks the slot's command, the safe reading of silence.
 pub async fn send_control_phase_applied(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     delay_us: u32,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -583,7 +583,7 @@ pub async fn send_control_phase_applied(
 /// unfenced rather than treat the failure as a link failure — the probe is a
 /// question about the stream, not traffic the game depends on.
 pub async fn send_control_load_state_probe(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     probe_id: u64,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -603,7 +603,7 @@ pub async fn send_control_load_state_probe(
 /// behind it. An error means the stream is gone, in which case the relay's fence
 /// simply times out — the safe reading of silence.
 pub async fn send_control_load_state_probe_ack(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     probe_id: u64,
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
@@ -626,5 +626,5 @@ pub enum ControlSendError {
     Frame(#[from] ControlStreamError),
     /// The stream is gone (the connection dropped or the peer stopped it).
     #[error("control stream write failed: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] noq::WriteError),
 }

@@ -24,7 +24,7 @@ use rally_point_relay::auth::{HANDSHAKE_OK, Registry};
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, server_config};
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rally_point_transport::{Link, quinn, rustls};
+use rally_point_transport::{Link, noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -125,7 +125,7 @@ fn start_relay_with_mesh(
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(server::serve(
         endpoint,
@@ -139,10 +139,10 @@ fn start_relay_with_mesh(
 
 /// A client endpoint trusting `ca`. One endpoint can dial the relay for several
 /// slots; the caller keeps it alive for as long as its connections are needed.
-fn client_endpoint(ca: &CertificateDer<'static>) -> quinn::Endpoint {
+fn client_endpoint(ca: &CertificateDer<'static>) -> noq::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).unwrap();
-    let endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     endpoint.set_default_client_config(client_config(roots).unwrap());
     endpoint
 }
@@ -169,7 +169,7 @@ fn registry_for(tenants: &[&Tenant]) -> Registry {
 /// per-peer-slot delivery position a reconnecting client resumes from; a fresh dial
 /// passes an empty slice.
 async fn handshake(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     token: &SignedToken,
     signing_key: &Keypair,
     resume_cursors: &[(SlotId, u64)],
@@ -206,7 +206,7 @@ async fn handshake(
 /// cursors), and returns the connection wrapped as a transport link ready to carry
 /// turns.
 async fn connect_slot(
-    endpoint: &quinn::Endpoint,
+    endpoint: &noq::Endpoint,
     addr: SocketAddr,
     tenant: &Tenant,
     session: SessionId,
@@ -218,7 +218,7 @@ async fn connect_slot(
 /// [`connect_slot`] presenting `resume_cursors`, so a reconnect test can ask the
 /// relay to replay the turns it missed from each named peer slot.
 async fn connect_slot_resuming(
-    endpoint: &quinn::Endpoint,
+    endpoint: &noq::Endpoint,
     addr: SocketAddr,
     tenant: &Tenant,
     session: SessionId,
@@ -823,7 +823,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let relay = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let relay = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = relay.local_addr().unwrap();
     tokio::spawn(server::serve_with_max_pending(
         relay,
@@ -873,7 +873,7 @@ async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end(
     let (chain, key_der, ca) = self_signed();
     let server_cfg = server_config(chain, key_der).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let sessions = routing::Sessions::default();
     tokio::spawn(server::serve(
@@ -1550,7 +1550,7 @@ async fn a_dead_control_stream_reader_closes_the_slot_link() {
     // The relay closes the whole connection in response.
     expect_closed(&mut slot0).await;
     match slot0.connection().closed().await {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             CONTROL_STREAM_LOST_CLOSE,
             "the relay closes with the control-stream-lost code",
@@ -2297,10 +2297,10 @@ async fn an_absurd_resume_anchor_is_refused_not_applied() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     match close {
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
+        Some(noq::ConnectionError::ApplicationClosed(close)) => {
             assert_eq!(
                 close.error_code,
-                quinn::VarInt::from_u32(0x09),
+                noq::VarInt::from_u32(0x09),
                 "closed with the dedicated resume-anchor-invalid code",
             );
         }
@@ -2376,7 +2376,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
         "a decided-departure re-register is never acknowledged",
     );
     match redial.closed().await {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             SLOT_DEPARTED_CLOSE,
             "the re-register is refused with the terminal departed close code",
@@ -2415,7 +2415,7 @@ async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
         "a ceiling-refused admission is never acknowledged",
     );
     match dial.closed().await {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             PROVISIONAL_CAPACITY_CLOSE,
             "refused with the distinct retryable capacity close code",
@@ -2480,7 +2480,7 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
         "a slot not homed on this relay is never acknowledged",
     );
     match redial.closed().await {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             SLOT_NOT_HOMED_CLOSE,
             "the misrouted slot is refused with the not-homed close code",
@@ -2518,7 +2518,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     let (chain, key_der, ca) = self_signed();
     let server_cfg = server_config(chain, key_der).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let sessions = routing::Sessions::default();
     tokio::spawn(server::serve(
@@ -2551,7 +2551,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
         .await
         .expect("the client observes the connection end within the deadline")
     {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             PROVISIONAL_EXPIRED_CLOSE,
             "reaped with the provisional-expired close code",
@@ -2578,7 +2578,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
         .await
         .expect("the redialed connection also ends within a fresh deadline")
     {
-        quinn::ConnectionError::ApplicationClosed(app) => assert_eq!(
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
             PROVISIONAL_EXPIRED_CLOSE,
             "the redial is reaped with the same close code, on its own new window",
@@ -2765,7 +2765,7 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     let (chain, key_der, ca) = self_signed();
     let server_cfg = server_config(chain, key_der).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let sessions = routing::Sessions::default();
     tokio::spawn(server::serve(
@@ -2846,7 +2846,7 @@ async fn with_no_sweep_running_a_provisional_session_is_never_reaped() {
     let (chain, key_der, ca) = self_signed();
     let server_cfg = server_config(chain, key_der).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let sessions = routing::Sessions::default();
     tokio::spawn(server::serve(

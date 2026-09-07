@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_transport::Link;
-use rally_point_transport::quinn::{self, VarInt};
+use rally_point_transport::noq::{self, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry, RegistryReader};
@@ -88,7 +88,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 enum ConnError {
     /// The QUIC handshake itself failed.
     #[error("QUIC connection failed: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// The peer's advertised datagram budget is under the guaranteed floor the
     /// transport's admission and replay invariants assume — an unsupported
     /// configuration, refused at establishment.
@@ -157,9 +157,9 @@ pub enum ServerError {
 /// The IPv6 wildcard accepts both address families. Concrete IPv6 addresses stay
 /// IPv6-only because Windows rejects dual-stack binds to addresses such as `::1`.
 pub fn bind_endpoint(
-    server_config: quinn::ServerConfig,
+    server_config: noq::ServerConfig,
     listen: SocketAddr,
-) -> std::io::Result<quinn::Endpoint> {
+) -> std::io::Result<noq::Endpoint> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(listen),
         socket2::Type::DGRAM,
@@ -170,9 +170,9 @@ pub fn bind_endpoint(
     }
     socket.bind(&listen.into())?;
     let runtime =
-        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
-    quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
+        noq::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    noq::Endpoint::new(
+        noq::EndpointConfig::default(),
         Some(server_config),
         socket.into(),
         runtime,
@@ -188,11 +188,11 @@ pub fn bind_endpoint(
 /// a verification in flight.
 pub async fn run(
     listen: SocketAddr,
-    server_config: quinn::ServerConfig,
+    server_config: noq::ServerConfig,
     registry: RegistryReader,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
-    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
 ) -> Result<(), ServerError> {
     let endpoint = bind_endpoint(server_config, listen)?;
     serve_reader(
@@ -215,11 +215,11 @@ pub async fn run(
 /// to the same local slots. `mesh_accept` receives peer-relay connections
 /// dispatched by the ALPN check; pass `None` if the relay isn't meshed.
 pub async fn serve(
-    endpoint: quinn::Endpoint,
+    endpoint: noq::Endpoint,
     registry: Arc<Registry>,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
-    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
 ) {
     serve_with_max_pending(
         endpoint,
@@ -247,11 +247,11 @@ pub async fn serve(
 ///   If `mesh_accept` is `None`, the connection is closed — the relay isn't
 ///   configured for mesh.
 pub async fn serve_with_max_pending(
-    endpoint: quinn::Endpoint,
+    endpoint: noq::Endpoint,
     registry: Arc<Registry>,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
-    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
     max_pending_handshakes: usize,
 ) {
     serve_reader(
@@ -272,11 +272,11 @@ pub async fn serve_with_max_pending(
 /// the connection's lifetime — a replacement landing mid-handshake never tears an
 /// in-flight verification.
 async fn serve_reader(
-    endpoint: quinn::Endpoint,
+    endpoint: noq::Endpoint,
     registry: RegistryReader,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
-    mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
     max_pending_handshakes: usize,
 ) {
     if let Ok(addr) = endpoint.local_addr() {
@@ -314,7 +314,7 @@ async fn serve_reader(
             let alpn = connection
                 .handshake_data()
                 .and_then(|data| {
-                    data.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
+                    data.downcast_ref::<noq::crypto::rustls::HandshakeData>()
                         .and_then(|hd| hd.protocol.clone())
                 })
                 .unwrap_or_default();
@@ -338,7 +338,7 @@ async fn serve_reader(
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(connection)) => {
                             tracing::info!(
-                                remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
+                                remote = ?connection.path(noq::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                                 "mesh accept queue full; refusing connection",
                             );
                             connection.close(
@@ -368,7 +368,7 @@ async fn serve_reader(
 /// Authorizes one incoming client connection, wires it into routing, and serves
 /// its turns until it closes. The TLS handshake is already complete (the accept
 async fn serve_connection(
-    connection: quinn::Connection,
+    connection: noq::Connection,
     registry: &Registry,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,

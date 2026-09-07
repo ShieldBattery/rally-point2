@@ -437,7 +437,7 @@ impl AckManager {
     /// redundancy the same way. The result is truly ack-only only when nothing
     /// is due (or none of it fits).
     ///
-    /// `max_packet_len` is the live datagram budget (e.g. quinn's
+    /// `max_packet_len` is the live datagram budget (e.g. noq's
     /// `max_datagram_size()`); pass the current value each call so the bundle
     /// tracks path MTU changes.
     ///
@@ -893,7 +893,7 @@ fn payload_element_len(payload_len: usize) -> usize {
 /// moment of its life — the admission ceiling for datagram-carried payloads.
 ///
 /// Admission must be judged against a floor, never the *live*
-/// `max_datagram_size()`: quinn's path-MTU discovery raises the live budget,
+/// `max_datagram_size()`: noq's path-MTU discovery raises the live budget,
 /// and its black-hole detector lowers it back to the configured minimum after
 /// suspicious loss — precisely the weather the redundancy layer exists for. A
 /// payload admitted against a discovered budget can therefore out-size every
@@ -902,7 +902,7 @@ fn payload_element_len(payload_len: usize) -> usize {
 /// included — and the payload strands silently while its seq wedges the
 /// peer's delivered prefix.
 ///
-/// The floor is static by construction: quinn clamps `min_mtu` to at least
+/// The floor is static by construction: noq clamps `min_mtu` to at least
 /// 1200 bytes (the QUIC-guaranteed datagram size; its setter refuses lower),
 /// and 1200 minus the worst-case short-header overhead (first byte, a 20-byte
 /// connection id, 4-byte packet number, 16-byte AEAD tag, ~3-byte datagram

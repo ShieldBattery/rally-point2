@@ -62,5 +62,4 @@ mod recarry_sim;
 
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.
-/// The `quinn` name is the compatibility alias for the noq dependency.
-pub use {quinn, rustls};
+pub use {noq, rustls};

@@ -23,7 +23,7 @@ use rally_point_relay::auth::HANDSHAKE_OK;
 use rally_point_relay::config;
 use rally_point_relay::server;
 use rally_point_transport::quic::client_config;
-use rally_point_transport::{Link, quinn, rustls};
+use rally_point_transport::{Link, noq, rustls};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const KID: &str = "smoke-key-1";
@@ -45,7 +45,7 @@ async fn a_client_connects_through_a_self_signed_relay_and_exchanges_a_turn() ->
 
     let server_config = config::server_config_from_self_signed(&cert).map_err(|e| e.to_string())?;
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::server(server_config, bind)?;
+    let endpoint = noq::Endpoint::server(server_config, bind)?;
     let addr = endpoint.local_addr()?;
     tokio::spawn(server::serve(
         endpoint,
@@ -58,7 +58,7 @@ async fn a_client_connects_through_a_self_signed_relay_and_exchanges_a_turn() ->
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.ca.clone()).unwrap();
     let client_cfg = client_config(roots).unwrap();
-    let client_endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let client_endpoint = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     client_endpoint.set_default_client_config(client_cfg);
 
     let tenant_pair = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
@@ -97,12 +97,12 @@ async fn a_client_connects_through_a_self_signed_relay_and_exchanges_a_turn() ->
 }
 
 async fn connect_client(
-    endpoint: &quinn::Endpoint,
+    endpoint: &noq::Endpoint,
     addr: SocketAddr,
     tenant_pair: &Ed25519KeyPair,
     session: SessionId,
     slot: SlotId,
-) -> Result<(quinn::Connection, SignedToken, Ed25519KeyPair), AnyError> {
+) -> Result<(noq::Connection, SignedToken, Ed25519KeyPair), AnyError> {
     let rng = ring::rand::SystemRandom::new();
     let client_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let client_key = Ed25519KeyPair::from_pkcs8(client_pkcs8.as_ref()).unwrap();
@@ -130,7 +130,7 @@ async fn connect_client(
 }
 
 async fn authorize(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     token: &SignedToken,
     signing_key: &Ed25519KeyPair,
 ) -> Result<(), AnyError> {

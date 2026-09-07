@@ -36,7 +36,7 @@ use rally_point_proto::messages::{
     SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
 };
 use rally_point_transport::MeshSessionKey;
-use rally_point_transport::quinn;
+use rally_point_transport::noq;
 use tokio::sync::{Notify, mpsc};
 
 use crate::routing::{self, SessionKey};
@@ -410,7 +410,7 @@ pub fn new_mesh_links() -> MeshLinks {
 }
 /// Per-session, per-slot network conditions a relay's home-client links
 /// observe, gathered for the latency-buffer decision-maker. Each
-/// `run_slot_link` task publishes its own client's quinn path stats here;
+/// `run_slot_link` task publishes its own client's noq path stats here;
 /// `run_mesh_link` snapshots the session's slots to build the outgoing
 /// [`LinkConditions`] sidecar on each forwarded datagram.
 ///
@@ -534,7 +534,7 @@ pub fn claim_verified_mesh_link(
     mesh: &MeshState,
     peer_id: RelayId,
     attempt: &MeshLinkAttempt,
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
 ) -> MeshLinkAdmission {
     if let Err(error) = rally_point_transport::quic::verify_datagram_budget(connection) {
         return MeshLinkAdmission::UnderFloor(error);
@@ -594,7 +594,7 @@ pub fn new_conditions_registry() -> ConditionsRegistry {
 }
 
 /// Activates `conditions` for `key`'s `slot`, replacing any prior connection
-/// generation. Called by `run_slot_link` after sampling its client's quinn path
+/// generation. Called by `run_slot_link` after sampling its client's noq path
 /// stats. Idempotent in the sense that a re-publish overwrites the stale
 /// sample — conditions are per-moment, and the latest is always what the
 /// mesh attaches.
@@ -2066,7 +2066,7 @@ pub type MeshLinkHandle = (RelayId, u64, mpsc::UnboundedSender<MeshCommand>);
 /// codebase holds elsewhere, mirroring [`PresenceIo`](crate::presence::PresenceIo).
 pub struct MeshControlIo {
     /// The send half of the bidirectional control stream — outbound frames.
-    pub tx: rally_point_transport::quinn::SendStream,
+    pub tx: rally_point_transport::noq::SendStream,
     /// The peer's control frames, assembled off its recv half by a reader task.
     pub rx: mpsc::Receiver<MeshControlFrame>,
 }
@@ -2140,7 +2140,7 @@ fn resume_replay_for_frame(
 /// failure, and reports that it carried no redundancy.
 async fn send_turn_over_link(
     link: &mut rally_point_transport::MeshLink,
-    control_send: &mut rally_point_transport::quinn::SendStream,
+    control_send: &mut rally_point_transport::noq::SendStream,
     key: &SessionKey,
     payload: Payload,
     conditions: Option<LinkConditions>,
@@ -2195,7 +2195,7 @@ async fn send_turn_over_link(
     match link.send(mesh_session_key(key), Some(payload), conditions) {
         Ok(redundant) => Some(redundant > 0),
         // The pre-check above diverts anything that can never ride this
-        // session's datagrams, so this arm is the transient case: quinn's
+        // session's datagrams, so this arm is the transient case: noq's
         // concurrently-running connection driver moved the live path budget
         // between the check and the send, or a conditions sidecar crowded a
         // floor-admitted turn out of a fallen-back datagram. Recoverable, not
@@ -2234,7 +2234,7 @@ async fn send_turn_over_link(
 /// replay re-carried an unacked turn; `None` means a link-fatal error.
 async fn send_resume_replay(
     link: &mut rally_point_transport::MeshLink,
-    control_send: &mut rally_point_transport::quinn::SendStream,
+    control_send: &mut rally_point_transport::noq::SendStream,
     conditions: &ConditionsRegistry,
     key: &SessionKey,
     payloads: Vec<Payload>,
@@ -3952,10 +3952,10 @@ fn local_live_players(sessions: &routing::Sessions, key: &SessionKey) -> u32 {
 /// An `Err` means the stream (and so the connection) is gone; the caller exits
 /// with `ConnectionFailed` like any other send failure.
 async fn push_presence_updates(
-    presence_tx: &mut rally_point_transport::quinn::SendStream,
+    presence_tx: &mut rally_point_transport::noq::SendStream,
     presence_sent: &mut HashMap<SessionId, u32>,
     updates: &[(SessionId, u32)],
-) -> Result<(), rally_point_transport::quinn::WriteError> {
+) -> Result<(), rally_point_transport::noq::WriteError> {
     for &(session_id, live) in updates {
         let frame = rally_point_proto::mesh::MeshPresence {
             session: session_id,
@@ -4014,10 +4014,10 @@ pub(crate) fn rtt_us(rtt: std::time::Duration) -> u32 {
 /// The mesh link's smoothed round-trip time in microseconds — the hop across
 /// the backbone a remote slot's turns travel, added to each remote slot's
 /// effective path in the decision-maker.
-fn link_rtt_us(connection: &rally_point_transport::quinn::Connection) -> u32 {
+fn link_rtt_us(connection: &rally_point_transport::noq::Connection) -> u32 {
     rtt_us(
         connection
-            .path_stats(rally_point_transport::quinn::PathId::ZERO)
+            .path_stats(rally_point_transport::noq::PathId::ZERO)
             .unwrap_or_default()
             .rtt,
     )
@@ -4041,13 +4041,13 @@ struct MeshRttCache {
 impl MeshRttCache {
     fn get_or_refresh(
         &mut self,
-        connection: &rally_point_transport::quinn::Connection,
+        connection: &rally_point_transport::noq::Connection,
         now: tokio::time::Instant,
     ) -> u32 {
         self.get_or_refresh_with(now, || link_rtt_us(connection))
     }
 
-    /// The cache policy separated from the quinn stats read so deterministic
+    /// The cache policy separated from the noq stats read so deterministic
     /// tests can advance an explicit clock and count samples.
     fn get_or_refresh_with(
         &mut self,
@@ -8090,13 +8090,13 @@ mod tests {
     /// `MeshLink` from, not a live peer on the other end.
     async fn connected_mesh_link() -> (
         rally_point_transport::MeshLink,
-        rally_point_transport::quinn::Endpoint,
-        rally_point_transport::quinn::Endpoint,
+        rally_point_transport::noq::Endpoint,
+        rally_point_transport::noq::Endpoint,
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
 
+        use rally_point_transport::noq;
         use rally_point_transport::quic::{mesh_client_config, server_config};
-        use rally_point_transport::quinn;
 
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
@@ -8106,9 +8106,9 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -8335,13 +8335,13 @@ mod tests {
     pub(crate) async fn connected_mesh_link_pair() -> (
         rally_point_transport::MeshLink,
         rally_point_transport::MeshLink,
-        rally_point_transport::quinn::Endpoint,
-        rally_point_transport::quinn::Endpoint,
+        rally_point_transport::noq::Endpoint,
+        rally_point_transport::noq::Endpoint,
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
 
+        use rally_point_transport::noq;
         use rally_point_transport::quic::{mesh_client_config, server_config};
-        use rally_point_transport::quinn;
 
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
@@ -8351,9 +8351,9 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {

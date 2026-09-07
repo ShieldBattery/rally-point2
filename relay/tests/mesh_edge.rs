@@ -28,7 +28,7 @@ use rally_point_relay::routing::{SessionKey, Sessions};
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, mesh_client_config, server_config};
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rally_point_transport::{Link, MeshLink, quinn, rustls};
+use rally_point_transport::{Link, MeshLink, noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -117,7 +117,7 @@ fn mint_token(
 }
 
 async fn handshake(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     token: &SignedToken,
     signing_key: &Keypair,
 ) -> Result<(), AnyError> {
@@ -155,7 +155,7 @@ struct Relay {
     ca: CertificateDer<'static>,
     sessions: Sessions,
     mesh: mesh::MeshState,
-    mesh_rx: mpsc::Receiver<quinn::Connection>,
+    mesh_rx: mpsc::Receiver<noq::Connection>,
 }
 
 impl Relay {
@@ -163,7 +163,7 @@ impl Relay {
         let (chain, key, ca) = self_signed();
         let cfg = server_config(chain, key).unwrap();
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let endpoint = quinn::Endpoint::server(cfg, bind).unwrap();
+        let endpoint = noq::Endpoint::server(cfg, bind).unwrap();
         let addr = endpoint.local_addr().unwrap();
         let sessions: Sessions = Arc::default();
         let mesh = mesh::new_mesh_state();
@@ -287,9 +287,9 @@ fn spawn_mesh_link_timed(
 }
 
 /// Brings up a loopback mesh connection pair (two `MeshLink`s over one real
-/// quinn connection negotiated on `MESH_ALPN`), reusing the test's self-signed
+/// noq connection negotiated on `MESH_ALPN`), reusing the test's self-signed
 /// cert helper. Both endpoints are returned so the caller keeps them alive.
-async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoint) {
+async fn mesh_link_pair() -> (MeshLink, MeshLink, noq::Endpoint, noq::Endpoint) {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let mut roots = rustls::RootCertStore::empty();
@@ -298,9 +298,9 @@ async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoi
     let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
     let server_addr = server.local_addr().unwrap();
-    let client = quinn::Endpoint::client(bind).unwrap();
+    let client = noq::Endpoint::client(bind).unwrap();
     client.set_default_client_config(client_cfg);
 
     let accept = {
@@ -328,10 +328,10 @@ async fn mesh_link_pair() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoi
 /// connection plus both endpoints so the caller keeps them alive.
 async fn connection_with_peer_datagram_limit(
     limit: usize,
-) -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+) -> (noq::Connection, noq::Endpoint, noq::Endpoint) {
     let (chain, key, ca) = self_signed();
     let mut server_cfg = server_config(chain, key).unwrap();
-    let mut transport = quinn::TransportConfig::default();
+    let mut transport = noq::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(limit));
     server_cfg.transport_config(std::sync::Arc::new(transport));
     let mut roots = rustls::RootCertStore::empty();
@@ -340,9 +340,9 @@ async fn connection_with_peer_datagram_limit(
     let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
     let server_addr = server.local_addr().unwrap();
-    let client = quinn::Endpoint::client(bind).unwrap();
+    let client = noq::Endpoint::client(bind).unwrap();
     client.set_default_client_config(client_cfg);
 
     let accept = {
@@ -409,14 +409,14 @@ async fn connect_client(
     tenant: &Tenant,
     session: SessionId,
     slot: SlotId,
-) -> Result<(quinn::Connection, quinn::Endpoint), AnyError> {
+) -> Result<(noq::Connection, noq::Endpoint), AnyError> {
     let client_key = keypair();
     let token = mint_token(tenant, session, slot, client_key.public);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay.ca.clone()).unwrap();
     let client_cfg = client_config(roots).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = quinn::Endpoint::client(bind).unwrap();
+    let endpoint = noq::Endpoint::client(bind).unwrap();
     endpoint.set_default_client_config(client_cfg);
     let connection = endpoint.connect(relay.addr, "localhost")?.await?;
     handshake(&connection, &token, &client_key).await?;
@@ -428,9 +428,9 @@ async fn connect_client(
 /// pushes down (lobby commands from the other members). Mirrors what a real
 /// `LinkDriver` sets up on the control stream.
 async fn open_lobby_streams(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
 ) -> (
-    quinn::SendStream,
+    noq::SendStream,
     mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) {
     let (send, _our_recv) = connection.open_bi().await.unwrap();
@@ -472,7 +472,7 @@ async fn next_non_connectivity(
 }
 
 /// Reads one fixed-width presence frame from a raw mesh presence stream.
-async fn next_mesh_presence(stream: &mut quinn::RecvStream) -> MeshPresence {
+async fn next_mesh_presence(stream: &mut noq::RecvStream) -> MeshPresence {
     let mut frame = [0; MESH_PRESENCE_LEN];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut frame))
         .await
@@ -520,14 +520,14 @@ async fn mesh_two_relays(
 ) -> (
     mpsc::UnboundedSender<mesh::MeshCommand>,
     mpsc::UnboundedSender<mesh::MeshCommand>,
-    quinn::Endpoint,
+    noq::Endpoint,
 ) {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1114,7 +1114,7 @@ async fn player_skin_reaches_a_cross_relay_peer_and_replays_to_a_late_joiner()
 /// A link that served a session, went empty, and stayed empty past
 /// `idle_timeout` tears down with [`mesh::MeshLinkExit::Idle`]. Joins a
 /// session, leaves it, and waits past a short real-duration timeout — no
-/// `tokio::time::pause`/`advance` (that would trip quinn's own 10s idle
+/// `tokio::time::pause`/`advance` (that would trip noq's own 10s idle
 /// timeout before the 200ms app-level one, surfacing `ConnectionFailed`
 /// instead of `Idle`).
 #[tokio::test]
@@ -1135,7 +1135,7 @@ async fn idle_link_tears_down_after_timeout_post_session() -> Result<(), AnyErro
     // Keep mesh_b alive so the QUIC connection doesn't close — dropping the
     // peer's Connection handle closes it from the other side, and A's driver
     // would exit `ConnectionFailed` instead of `Idle`. mesh_b isn't driven
-    // (no recv loop); quinn's endpoint processes keepalive ACKs internally.
+    // (no recv loop); noq's endpoint processes keepalive ACKs internally.
     let _peer_alive = mesh_b;
 
     // Join, then leave — arming the idle timer on the transition to empty.
@@ -1200,7 +1200,7 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1228,7 +1228,7 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     roots.add(relay_a.ca.clone()).unwrap();
     let client_cfg = client_config(roots).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let client_ep = quinn::Endpoint::client(bind).unwrap();
+    let client_ep = noq::Endpoint::client(bind).unwrap();
     client_ep.set_default_client_config(client_cfg);
 
     let conn_slot0 = client_ep
@@ -1244,7 +1244,7 @@ async fn cross_relay_turn_delivery_is_exactly_once() -> Result<(), AnyError> {
     let mut roots_b = rustls::RootCertStore::empty();
     roots_b.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b = client_config(roots_b).unwrap();
-    let client_ep_b = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b = noq::Endpoint::client(bind).unwrap();
     client_ep_b.set_default_client_config(client_cfg_b);
     let conn_slot1 = client_ep_b
         .connect(relay_b.addr, "localhost")
@@ -1311,7 +1311,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1339,7 +1339,7 @@ async fn cross_relay_oversize_turn_diverts_over_the_mesh_control_stream() -> Res
     let mut roots_b = rustls::RootCertStore::empty();
     roots_b.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b = client_config(roots_b).unwrap();
-    let client_ep_b = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b = noq::Endpoint::client(bind).unwrap();
     client_ep_b.set_default_client_config(client_cfg_b);
     let conn_slot1 = client_ep_b
         .connect(relay_b.addr, "localhost")
@@ -1420,7 +1420,7 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1453,7 +1453,7 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     roots_a.add(relay_a.ca.clone()).unwrap();
     let client_cfg_a = client_config(roots_a).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let client_ep_a = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_a = noq::Endpoint::client(bind).unwrap();
     client_ep_a.set_default_client_config(client_cfg_a);
     let conn_slot0 = client_ep_a
         .connect(relay_a.addr, "localhost")
@@ -1468,7 +1468,7 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     let mut roots_b1 = rustls::RootCertStore::empty();
     roots_b1.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b1 = client_config(roots_b1).unwrap();
-    let client_ep_b1 = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b1 = noq::Endpoint::client(bind).unwrap();
     client_ep_b1.set_default_client_config(client_cfg_b1);
     let conn_slot1 = client_ep_b1
         .connect(relay_b.addr, "localhost")
@@ -1484,7 +1484,7 @@ async fn two_sessions_on_one_mesh_link_do_not_cross_wire() -> Result<(), AnyErro
     let mut roots_b2 = rustls::RootCertStore::empty();
     roots_b2.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b2 = client_config(roots_b2).unwrap();
-    let client_ep_b2 = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b2 = noq::Endpoint::client(bind).unwrap();
     client_ep_b2.set_default_client_config(client_cfg_b2);
     let conn_slot0_game2 = client_ep_b2
         .connect(relay_b.addr, "localhost")
@@ -1550,7 +1550,7 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1581,7 +1581,7 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     roots_a.add(relay_a.ca.clone()).unwrap();
     let client_cfg_a = client_config(roots_a).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let client_ep_a = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_a = noq::Endpoint::client(bind).unwrap();
     client_ep_a.set_default_client_config(client_cfg_a);
     let conn_s1_a = client_ep_a
         .connect(relay_a.addr, "localhost")
@@ -1596,7 +1596,7 @@ async fn a_session_joined_after_the_link_is_running_delivers() -> Result<(), Any
     let mut roots_b = rustls::RootCertStore::empty();
     roots_b.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b = client_config(roots_b).unwrap();
-    let client_ep_b = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b = noq::Endpoint::client(bind).unwrap();
     client_ep_b.set_default_client_config(client_cfg_b);
     let conn_s1_b = client_ep_b
         .connect(relay_b.addr, "localhost")
@@ -1687,7 +1687,7 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     let (dial_chain, dial_key, _) = self_signed();
     let mesh_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mesh_ep = quinn::Endpoint::client(bind).unwrap();
+    let mesh_ep = noq::Endpoint::client(bind).unwrap();
     mesh_ep.set_default_client_config(mesh_cfg);
     let conn_a = mesh_ep
         .connect(relay_b.addr, "localhost")
@@ -1735,7 +1735,7 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     roots_a.add(relay_a.ca.clone()).unwrap();
     let client_cfg_a = client_config(roots_a).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let client_ep_a = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_a = noq::Endpoint::client(bind).unwrap();
     client_ep_a.set_default_client_config(client_cfg_a);
     let conn_slot0 = client_ep_a
         .connect(relay_a.addr, "localhost")
@@ -1750,7 +1750,7 @@ async fn a_colliding_join_across_tenants_is_refused_on_the_live_driver() -> Resu
     let mut roots_b = rustls::RootCertStore::empty();
     roots_b.add(relay_b.ca.clone()).unwrap();
     let client_cfg_b = client_config(roots_b).unwrap();
-    let client_ep_b = quinn::Endpoint::client(bind).unwrap();
+    let client_ep_b = noq::Endpoint::client(bind).unwrap();
     client_ep_b.set_default_client_config(client_cfg_b);
     let conn_slot1 = client_ep_b
         .connect(relay_b.addr, "localhost")

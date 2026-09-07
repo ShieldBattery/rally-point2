@@ -63,7 +63,7 @@ use rally_point_proto::messages::{
 };
 use rally_point_transport::beacon::{BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::ControlInbound;
-use rally_point_transport::quinn::VarInt;
+use rally_point_transport::noq::VarInt;
 use rally_point_transport::{Link, LinkError, Received};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
@@ -1938,7 +1938,7 @@ pub async fn run_slot_link(
                 // cannot advance the game and would merely rotate the same
                 // cumulative counters through the decision-maker again. During
                 // active play a fresh turn arrives every game step, keeping the
-                // published conditions current; Quinn stats do not change while
+                // published conditions current; Noq stats do not change while
                 // idle, so a quiet slot's last sample stays valid. Sampling once
                 // per packet (not per payload) is enough — all fresh payloads in
                 // one packet share the same connection path.
@@ -4202,7 +4202,7 @@ fn should_sample_active_conditions(received: &Received) -> bool {
 fn sample_slot_conditions(link: &Link, slot: SlotId, connection_epoch: u64) -> SampledLink {
     let path = link
         .connection()
-        .path_stats(rally_point_transport::quinn::PathId::ZERO)
+        .path_stats(rally_point_transport::noq::PathId::ZERO)
         .unwrap_or_default();
     SampledLink {
         conditions: SlotConditions {

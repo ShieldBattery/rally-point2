@@ -1,7 +1,7 @@
 //! One mesh link: a shared QUIC connection carrying every game two relays
 //! jointly serve, with per-session transport state.
 //!
-//! A [`MeshLink`] owns one `quinn::Connection` and a registry of [`SessionLink`]
+//! A [`MeshLink`] owns one `noq::Connection` and a registry of [`SessionLink`]
 //! instances — one per game active on that relay-pair. Every datagram on the
 //! connection is a [`MeshPacket`]: a
 //! session id (plus an optional tenant) and the per-link [`Packet`] for that
@@ -95,7 +95,7 @@ fn tenant_element_len(tenant: &str) -> usize {
 /// It is the outer datagram floor —
 /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET),
 /// further capped by the live budget's peer-advertised component, a
-/// handshake constant quinn permits to be arbitrarily small — minus the
+/// handshake constant noq permits to be arbitrarily small — minus the
 /// wrapper costs that accompany *every* one of the session's packets: the
 /// `MeshPacket` overhead and the session's own tenant framing (up to 258
 /// bytes for a maximum-length 255-byte tenant id, which would otherwise eat
@@ -190,7 +190,7 @@ pub fn should_dial_mesh(our_id: RelayId, peer_id: RelayId) -> bool {
 /// with [`close_session`](Self::close_session) when its game ends or its
 /// peer-relay counterpart for that session goes away.
 pub struct MeshLink {
-    connection: quinn::Connection,
+    connection: noq::Connection,
     sessions: HashMap<MeshSessionKey, SessionLink>,
 }
 
@@ -214,10 +214,10 @@ pub enum MeshLinkError {
     DatagramsUnsupported,
     /// The QUIC connection ended.
     #[error("QUIC connection lost: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// A datagram could not be queued for sending.
     #[error("sending datagram failed: {0}")]
-    Send(#[from] quinn::SendDatagramError),
+    Send(#[from] noq::SendDatagramError),
     /// A datagram did not fit the path's current budget. With the tiny turns of
     /// a lockstep game this should never happen; it is surfaced rather than
     /// retried forever.
@@ -311,7 +311,7 @@ impl MeshLink {
     /// Wraps an established relay ↔ relay QUIC connection as a mesh link with no
     /// sessions yet. Open sessions with [`open_session`](Self::open_session) as
     /// games join this relay-pair.
-    pub fn new(connection: quinn::Connection) -> Self {
+    pub fn new(connection: noq::Connection) -> Self {
         Self {
             connection,
             sessions: HashMap::new(),
@@ -319,7 +319,7 @@ impl MeshLink {
     }
 
     /// The underlying QUIC connection. Shared across every session on this link.
-    pub fn connection(&self) -> &quinn::Connection {
+    pub fn connection(&self) -> &noq::Connection {
         &self.connection
     }
 
@@ -489,7 +489,7 @@ impl MeshLink {
         // against the session's stable admission floor, and deliberately NOT
         // this send's conditions-bearing budget. The floor's inputs are
         // connection-lifetime constants, but `packet_budget` re-samples the
-        // live datagram size, which quinn's connection driver can shrink
+        // live datagram size, which noq's connection driver can shrink
         // between the caller's `payload_fits` preflight and this guard even
         // with no await between them — and the callers consume a refusal here
         // as a recoverable race, dropping the fresh turn outright. A
@@ -541,7 +541,7 @@ impl MeshLink {
                 }
                 Ok(redundant)
             }
-            Err(quinn::SendDatagramError::TooLarge) => Err(MeshLinkError::PayloadTooLarge {
+            Err(noq::SendDatagramError::TooLarge) => Err(MeshLinkError::PayloadTooLarge {
                 needed: datagram_len,
                 budget: datagram_budget,
             }),
@@ -555,7 +555,7 @@ impl MeshLink {
     /// `conditions` sidecar and the `tenant` string that would accompany it,
     /// and the `MeshPacket` wrapper's own overhead) and the session's
     /// packet admission floor (`packet_admission_floor`). The floor is what keeps an admitted payload
-    /// re-carryable forever: the live budget shrinks when quinn's black-hole
+    /// re-carryable forever: the live budget shrinks when noq's black-hole
     /// detector reacts to loss, and a payload admitted against a discovered
     /// budget could out-size every later packet (see
     /// [`GUARANTEED_DATAGRAM_BUDGET`](crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET)).
@@ -745,7 +745,7 @@ mod tests {
     /// Brings up a loopback QUIC connection negotiated on `MESH_ALPN` and wraps
     /// each end in a `MeshLink`. Both endpoints are returned so the caller keeps
     /// them alive for the test.
-    async fn connected_mesh_links() -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoint) {
+    async fn connected_mesh_links() -> (MeshLink, MeshLink, noq::Endpoint, noq::Endpoint) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
 
@@ -755,9 +755,9 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -794,10 +794,10 @@ mod tests {
     /// it (a small peer limit, or a path fallen back to the MTU floor).
     async fn connected_mesh_links_with_datagram_limit(
         limit: usize,
-    ) -> (MeshLink, MeshLink, quinn::Endpoint, quinn::Endpoint) {
+    ) -> (MeshLink, MeshLink, noq::Endpoint, noq::Endpoint) {
         let (chain, key, ca) = self_signed();
         let mut server_cfg = server_config(chain, key).unwrap();
-        let mut transport = quinn::TransportConfig::default();
+        let mut transport = noq::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(limit));
         server_cfg.transport_config(std::sync::Arc::new(transport));
 
@@ -807,9 +807,9 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -1338,7 +1338,7 @@ mod tests {
         let tiny_commands = 4;
 
         // Drain the receiver in the background so its datagram buffer can't
-        // backpressure the sender's sends (quinn datagrams are bounded).
+        // backpressure the sender's sends (noq datagrams are bounded).
         let drain = tokio::spawn(async move {
             // Withhold acks: never send anything back, so the sender's
             // unacked_payloads set grows and every send re-carries them all.
@@ -1389,7 +1389,7 @@ mod tests {
         receiver.open_session(session);
 
         // Two home-client link stats, the shape a relay would gather from its
-        // own quinn connections: slot 0 at 12ms RTT with 3/1000 lost; slot 1
+        // own noq connections: slot 0 at 12ms RTT with 3/1000 lost; slot 1
         // at 45ms with 10/500 lost.
         let conditions = LinkConditions {
             slots: vec![
@@ -1689,7 +1689,7 @@ mod tests {
     /// as the sender keeps producing. Mirrors the client edge's own
     /// `forward_path_sustained_loss_trips_the_unacked_window_cap`
     /// (`client::driver`) at `MeshLink` granularity: the peer's connection
-    /// drains raw datagrams (so quinn's own buffer can't stall the sender)
+    /// drains raw datagrams (so noq's own buffer can't stall the sender)
     /// but never turns them into a `MeshLink`, so nothing is ever sent back.
     #[tokio::test]
     async fn sustained_forward_loss_grows_a_sessions_unacked_window_without_a_beacon_to_rescue_it()

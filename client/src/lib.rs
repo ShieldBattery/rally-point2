@@ -1,6 +1,6 @@
 //! `rally-point-client` — the portable netcode v2 client transport.
 //!
-//! This crate owns the wire side of the game seam: a quinn QUIC client that
+//! This crate owns the wire side of the game seam: a noq QUIC client that
 //! sends SC:R turns as datagrams and carries chat/control/resync over reliable
 //! streams, with app-level forward recovery and a "home relay unreachable →
 //! reconnect + resync from turn X" path.

@@ -61,7 +61,7 @@ use rally_point_proto::token::{
     ClientPublicKey, ConnectionChallenge, KeyId, MAX_STRING_LEN, PUBLIC_KEY_LEN, SIGNATURE_LEN,
     SignedToken, TokenError,
 };
-use rally_point_transport::quinn;
+use rally_point_transport::noq;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use tokio::sync::watch;
@@ -312,13 +312,13 @@ pub enum AuthError {
     Rng,
     /// The QUIC connection failed while opening the handshake stream.
     #[error("handshake connection error: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// Reading the token or challenge response from the handshake stream failed.
     #[error("handshake read error: {0}")]
-    Read(#[from] quinn::ReadExactError),
+    Read(#[from] noq::ReadExactError),
     /// Writing the challenge or acknowledgement to the handshake stream failed.
     #[error("handshake write error: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] noq::WriteError),
 }
 
 /// Verifies a presented token against the registry and the clock, yielding the
@@ -396,18 +396,10 @@ pub fn verify_challenge(
 /// succeeds, so only an authenticated client's cursors are ever parsed; the count
 /// is bounded, so a hostile client cannot make the relay read an unbounded frame.
 pub async fn authenticate(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     registry: &Registry,
     now_unix_secs: u64,
-) -> Result<
-    (
-        AuthorizedClient,
-        HashMap<SlotId, u64>,
-        u64,
-        quinn::SendStream,
-    ),
-    AuthError,
-> {
+) -> Result<(AuthorizedClient, HashMap<SlotId, u64>, u64, noq::SendStream), AuthError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
     let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
@@ -462,7 +454,7 @@ pub async fn authenticate(
 /// a bounded entry count, then that many `(slot, cursor)` entries. Every length is
 /// checked before it is read, so a hostile count cannot force an unbounded read.
 async fn read_resume_cursors(
-    recv: &mut quinn::RecvStream,
+    recv: &mut noq::RecvStream,
 ) -> Result<HashMap<SlotId, u64>, AuthError> {
     let mut count_buf = [0u8; handshake::RESUME_CURSOR_COUNT_PREFIX_LEN];
     recv.read_exact(&mut count_buf).await?;

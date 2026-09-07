@@ -45,7 +45,7 @@ const RECEIVE_WINDOW: u64 = 4096;
 
 /// A single transport link over one QUIC connection.
 pub struct Link {
-    connection: quinn::Connection,
+    connection: noq::Connection,
     acks: AckManager,
     dedup: Dedup,
     /// The slot every incoming payload on this link is authorized as, or `None` on
@@ -65,10 +65,10 @@ pub enum LinkError {
     DatagramsUnsupported,
     /// The QUIC connection ended.
     #[error("QUIC connection lost: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// A datagram could not be queued for sending.
     #[error("sending datagram failed: {0}")]
-    Send(#[from] quinn::SendDatagramError),
+    Send(#[from] noq::SendDatagramError),
     /// A datagram did not fit the path's current budget, so it was refused. With the
     /// tiny turns of a lockstep game this should never happen; it is surfaced (rather
     /// than retried forever) so the caller fails fast — an undeliverable turn can't
@@ -113,7 +113,7 @@ impl Link {
     /// and the relay↔relay mesh links (which trust their peer relay's per-slot
     /// demux). A single-slot ingress edge — the relay's link to one authorized game
     /// client — uses [`with_ingress_slot`](Self::with_ingress_slot) instead.
-    pub fn new(connection: quinn::Connection) -> Self {
+    pub fn new(connection: noq::Connection) -> Self {
         Self {
             connection,
             acks: AckManager::new(),
@@ -145,7 +145,7 @@ impl Link {
     /// Only single-ingress edges rebind; the multi-slot links built by
     /// [`new`](Self::new) must not, as they legitimately demux several slots off the
     /// wire slot.
-    pub fn with_ingress_slot(connection: quinn::Connection, slot: SlotId) -> Self {
+    pub fn with_ingress_slot(connection: noq::Connection, slot: SlotId) -> Self {
         Self {
             connection,
             acks: AckManager::new(),
@@ -155,7 +155,7 @@ impl Link {
     }
 
     /// The underlying QUIC connection.
-    pub fn connection(&self) -> &quinn::Connection {
+    pub fn connection(&self) -> &noq::Connection {
         &self.connection
     }
 
@@ -178,7 +178,7 @@ impl Link {
     /// the guaranteed floor
     /// ([`verify_datagram_budget`](crate::quic::verify_datagram_budget)), and
     /// every preserved payload was admitted against that same floor.
-    pub fn rebind(&mut self, connection: quinn::Connection) {
+    pub fn rebind(&mut self, connection: noq::Connection) {
         self.connection = connection;
         self.acks.reset_connection();
         // dedup preserved: it is what makes the reconnect a resume, not a restart.
@@ -310,7 +310,7 @@ impl Link {
     /// floor covers the path-MTU component of the live `max_datagram_size()`,
     /// which discovery raises and the black-hole detector shrinks back — but
     /// never below the floor. The live value's *other* component, the peer's
-    /// advertised datagram limit, is a handshake transport parameter quinn
+    /// advertised datagram limit, is a handshake transport parameter noq
     /// permits to be arbitrarily small; it never changes after the handshake,
     /// so taking the minimum keeps admission both safe against a small peer
     /// limit and stable over time.
@@ -447,7 +447,7 @@ impl Link {
                 self.acks.record_sent(&packet);
                 Ok(redundant)
             }
-            Err(quinn::SendDatagramError::TooLarge) => Err(LinkError::PayloadTooLarge {
+            Err(noq::SendDatagramError::TooLarge) => Err(LinkError::PayloadTooLarge {
                 needed: datagram_len,
                 budget,
             }),
@@ -1499,10 +1499,10 @@ mod tests {
     /// endpoints (kept alive by the caller). The caller wraps each connection as a
     /// [`Link`] however the test needs — [`Link::new`] or [`Link::with_ingress_slot`].
     async fn connected_connections() -> (
-        quinn::Connection,
-        quinn::Connection,
-        quinn::Endpoint,
-        quinn::Endpoint,
+        noq::Connection,
+        noq::Connection,
+        noq::Endpoint,
+        noq::Endpoint,
     ) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
@@ -1512,9 +1512,9 @@ mod tests {
         let client_cfg = client_config(roots).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -1533,7 +1533,7 @@ mod tests {
 
     /// Brings up a loopback QUIC connection and wraps each end in a plain [`Link`].
     /// The endpoints are returned so the caller keeps them alive for the test.
-    async fn connected_links() -> (Link, Link, quinn::Endpoint, quinn::Endpoint) {
+    async fn connected_links() -> (Link, Link, noq::Endpoint, noq::Endpoint) {
         let (client_conn, server_conn, client, server) = connected_connections().await;
         (
             Link::new(client_conn),
@@ -1846,7 +1846,7 @@ mod tests {
 
     /// Datagram admission is judged against the guaranteed floor, never the
     /// live discovered budget: a payload sized between the two must be refused
-    /// (diverted by the caller), because path-MTU shrink — quinn's black-hole
+    /// (diverted by the caller), because path-MTU shrink — noq's black-hole
     /// response to the loss weather redundancy exists for — could otherwise
     /// leave it registered but too wide for every later packet, flushes
     /// included, stranding it while its seq wedges the peer's prefix.
@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     /// A peer may advertise a datagram limit *below* the guaranteed floor —
-    /// quinn permits an arbitrarily small handshake value — and admission
+    /// noq permits an arbitrarily small handshake value — and admission
     /// must then judge against that limit, exactly as `send` enforces it. A
     /// `payload_fits` that ignored the peer limit would approve a payload
     /// `send` refuses; the drivers treat that refusal as a recoverable bundle
@@ -1898,14 +1898,14 @@ mod tests {
     async fn connect_to_peer_with_datagram_limit(
         limit: usize,
     ) -> (
-        quinn::Connection,
-        quinn::Connection,
-        quinn::Endpoint,
-        quinn::Endpoint,
+        noq::Connection,
+        noq::Connection,
+        noq::Endpoint,
+        noq::Endpoint,
     ) {
         let (chain, key, ca) = self_signed();
         let mut server_cfg = server_config(chain, key).unwrap();
-        let mut transport = quinn::TransportConfig::default();
+        let mut transport = noq::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(limit));
         server_cfg.transport_config(std::sync::Arc::new(transport));
 
@@ -1914,9 +1914,9 @@ mod tests {
         let client_cfg = client_config(roots).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client_ep = quinn::Endpoint::client(bind).unwrap();
+        let client_ep = noq::Endpoint::client(bind).unwrap();
         client_ep.set_default_client_config(client_cfg);
 
         let accept = {

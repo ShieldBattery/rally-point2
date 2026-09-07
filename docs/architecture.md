@@ -97,7 +97,7 @@ in-order delivery: packets may arrive in any order, and that is fine. (The per-p
 identity that matters; the packet `seq` is bookkeeping for acks.)
 
 > **Why our own `seq` and acks, not QUIC's?** QUIC's datagram extension is deliberately
-> fire-and-forget: a datagram carries no application-visible sequence number, and quinn surfaces no
+> fire-and-forget: a datagram carries no application-visible sequence number, and noq surfaces no
 > per-datagram delivery receipt. QUIC does ack at its own *packet-number* level for congestion control
 > and loss detection, but that isn't exposed — and it would be the wrong granularity anyway, because we
 > retire *payloads* and a payload rides several packets via redundancy. So the payload identity (`seq`)
@@ -1421,7 +1421,7 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   pair can approach twenty seconds — after which a timed-out write resets the link and the
   reconnect path re-carries.) That flush always having room is itself guaranteed statically:
   datagram payloads are admitted against a **fixed floor budget** (`GUARANTEED_DATAGRAM_BUDGET`),
-  never the live discovered `max_datagram_size()` — quinn's black-hole detector shrinks the live
+  never the live discovered `max_datagram_size()` — noq's black-hole detector shrinks the live
   value back to the 1200-byte MTU floor under loss bursts, exactly the weather redundancy exists
   for, and a payload admitted against a discovered budget could out-size every later packet,
   flushes included, and strand silently. Each link type derives its admission number from the
@@ -1430,7 +1430,7 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   identically — a fits-then-refused skew silently drops the fresh turn), and the mesh reserves the
   wrapper costs riding every one of a session's packets, the `MeshPacket` overhead and the
   session's tenant framing included. The pre-registration guards enforce **only** these stable
-  floors, never a re-sampled live budget: quinn's connection driver can shrink the live value
+  floors, never a re-sampled live budget: noq's connection driver can shrink the live value
   between a caller's preflight and its send with no await between them, and a refusal there is
   consumed as a recoverable race — so a floor-admitted payload whose transient envelope (a full
   conditions sidecar on a fallen-back path) outgrows the datagram registers anyway, fails the

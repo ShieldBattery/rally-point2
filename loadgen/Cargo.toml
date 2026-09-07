@@ -19,7 +19,7 @@ workspace = true
 [dependencies]
 # The same client transport the game DLL links: dial, credentials, LinkDriver.
 # Re-exports rally-point-proto (control/token/messages) and rally-point-transport
-# (quinn/rustls), so the harness depends on one client surface.
+# (noq/rustls), so the harness depends on one client surface.
 rally-point-client = { workspace = true }
 rally-point-proto = { workspace = true }
 # Multi-thread runtime, the conductor's ramp timer, and per-player tasks.

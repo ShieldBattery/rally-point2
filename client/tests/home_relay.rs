@@ -22,7 +22,7 @@ use rally_point_relay::auth::Registry;
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, server_config};
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rally_point_transport::{quinn, rustls};
+use rally_point_transport::{noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -124,7 +124,7 @@ fn start_relay_with_mesh(
 ) -> (SocketAddr, CertificateDer<'static>) {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
-    let endpoint = quinn::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(server::serve(
         endpoint,
@@ -143,10 +143,10 @@ fn start_relay_with_mesh(
 fn start_relay_killable(
     registry: Registry,
     mesh: rally_point_relay::mesh::MeshState,
-) -> (SocketAddr, CertificateDer<'static>, quinn::Endpoint) {
+) -> (SocketAddr, CertificateDer<'static>, noq::Endpoint) {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
-    let endpoint = quinn::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = noq::Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(server::serve(
         endpoint.clone(),
@@ -175,7 +175,7 @@ fn registry_for(tenants: &[&Tenant]) -> Registry {
 fn client_endpoint(ca: &CertificateDer<'static>) -> ClientEndpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).unwrap();
-    let endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     endpoint.set_default_client_config(client_config(roots).unwrap());
     ClientEndpoint::from_endpoint(endpoint)
 }
@@ -849,7 +849,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
 
     // Sever slot 0's link. Its driver must surface its own disconnect, not close the
     // channels.
-    conn0.close(quinn::VarInt::from_u32(0), b"simulated network drop");
+    conn0.close(noq::VarInt::from_u32(0), b"simulated network drop");
     wait_connectivity(&mut chan0.connectivity, (SlotId(0), false)).await;
 
     // While slot 0 is away, slot 1 produces two more turns; the relay records them
@@ -965,7 +965,7 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
 
     // Sever slot 0's link — a network drop, not a clean leave. Slot 1 hears the
     // disconnect; the relay records the departure and marks the drop hold.
-    conn0.close(quinn::VarInt::from_u32(0), b"simulated network drop");
+    conn0.close(noq::VarInt::from_u32(0), b"simulated network drop");
     wait_connectivity(&mut chan1.connectivity, (SlotId(0), false)).await;
 
     // Pre-unlock: the survivor requests the drop, but the hold has not stood past
@@ -1172,7 +1172,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
 
     // Relay A dies: closing its endpoint drops both client links and makes re-dials
     // to A fail, so each driver escalates to its re-home provider.
-    endpoint_a.close(quinn::VarInt::from_u32(0), b"relay A down");
+    endpoint_a.close(noq::VarInt::from_u32(0), b"relay A down");
 
     // Each driver surfaces its own disconnect, then re-homes onto relay B.
     wait_connectivity(&mut chan0.connectivity, (SlotId(0), false)).await;
@@ -1360,7 +1360,7 @@ async fn connect_times_out_when_the_peer_stalls_during_authorization() {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let stalled = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let stalled = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = stalled.local_addr().unwrap();
     tokio::spawn(async move {
         // Accept the connection and the handshake stream, then keep both stream

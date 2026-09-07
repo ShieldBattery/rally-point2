@@ -39,7 +39,7 @@ use rally_point_relay::routing::{SessionKey, Sessions};
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, server_config};
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rally_point_transport::{Link, quinn, rustls};
+use rally_point_transport::{Link, noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -140,7 +140,7 @@ fn mint_token(
 }
 
 async fn handshake(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     token: &SignedToken,
     signing_key: &Keypair,
 ) -> Result<(), AnyError> {
@@ -180,7 +180,7 @@ struct Relay {
     ca: CertificateDer<'static>,
     sessions: Sessions,
     mesh: mesh::MeshState,
-    mesh_accept_rx: mpsc::Receiver<quinn::Connection>,
+    mesh_accept_rx: mpsc::Receiver<noq::Connection>,
 }
 
 impl Relay {
@@ -188,7 +188,7 @@ impl Relay {
         let (chain, key, ca) = self_signed();
         let cfg = server_config(chain, key).unwrap();
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let endpoint = quinn::Endpoint::server(cfg, bind).unwrap();
+        let endpoint = noq::Endpoint::server(cfg, bind).unwrap();
         let addr = endpoint.local_addr().unwrap();
         let sessions: Sessions = Arc::default();
         let mesh = mesh::new_mesh_state();
@@ -237,7 +237,7 @@ async fn connect_client(
     roots.add(ca.clone()).unwrap();
     let cfg = client_config(roots).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let ep = quinn::Endpoint::client(bind).unwrap();
+    let ep = noq::Endpoint::client(bind).unwrap();
     ep.set_default_client_config(cfg);
     let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
     handshake(&conn, &token, &client_key).await?;
@@ -1495,7 +1495,7 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     let cfg = rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)
         .map_err(|e| format!("building mesh client config: {e}"))?;
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let ep = quinn::Endpoint::client(bind)?;
+    let ep = noq::Endpoint::client(bind)?;
     ep.set_default_client_config(cfg);
     let connection = ep.connect(relay_b.addr, "localhost")?.await?;
 
@@ -1508,10 +1508,10 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     // The acceptor refuses with the protocol-mismatch application close...
     let reason = connection.closed().await;
     match reason {
-        quinn::ConnectionError::ApplicationClosed(close) => {
+        noq::ConnectionError::ApplicationClosed(close) => {
             assert_eq!(
                 close.error_code,
-                quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
+                noq::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
                 "the close carries the protocol-mismatch code",
             );
         }
@@ -1536,14 +1536,14 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
 /// acceptor answers.
 async fn dial_and_send_hello(
     addr: SocketAddr,
-    cfg: quinn::ClientConfig,
+    cfg: noq::ClientConfig,
     relay_id: RelayId,
-) -> Result<quinn::Connection, AnyError> {
+) -> Result<noq::Connection, AnyError> {
     use rally_point_proto::mesh::MeshHello;
     use rally_point_proto::version::ProtocolVersion;
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let ep = quinn::Endpoint::client(bind)?;
+    let ep = noq::Endpoint::client(bind)?;
     ep.set_default_client_config(cfg);
     let connection = ep.connect(addr, "localhost")?.await?;
     let mut hello_stream = connection.open_uni().await?;
@@ -1553,13 +1553,13 @@ async fn dial_and_send_hello(
 }
 
 /// Asserts `connection` was application-closed with `expected_code`.
-async fn expect_mesh_close(connection: &quinn::Connection, expected_code: u32) {
+async fn expect_mesh_close(connection: &noq::Connection, expected_code: u32) {
     let reason = connection.closed().await;
     match reason {
-        quinn::ConnectionError::ApplicationClosed(close) => {
+        noq::ConnectionError::ApplicationClosed(close) => {
             assert_eq!(
                 close.error_code,
-                quinn::VarInt::from_u32(expected_code),
+                noq::VarInt::from_u32(expected_code),
                 "unexpected close code (reason: {:?})",
                 close.reason,
             );
@@ -1574,7 +1574,7 @@ async fn expect_mesh_close(connection: &quinn::Connection, expected_code: u32) {
 /// exists to refuse once enforcement is active. `mesh_client_config` cannot
 /// express this any more (it always presents a certificate), so this builds the
 /// TLS config by hand, mirroring `quic.rs`'s own stale-ALPN tests.
-fn mesh_client_config_without_a_certificate(roots: rustls::RootCertStore) -> quinn::ClientConfig {
+fn mesh_client_config_without_a_certificate(roots: rustls::RootCertStore) -> noq::ClientConfig {
     let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -1584,8 +1584,8 @@ fn mesh_client_config_without_a_certificate(roots: rustls::RootCertStore) -> qui
     .with_no_client_auth();
     tls.alpn_protocols = vec![rally_point_transport::quic::MESH_ALPN.to_vec()];
     let client =
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a valid TLS 1.3 config");
-    quinn::ClientConfig::new(Arc::new(client))
+        noq::crypto::rustls::QuicClientConfig::try_from(tls).expect("a valid TLS 1.3 config");
+    noq::ClientConfig::new(Arc::new(client))
 }
 
 /// With no coordinator ever having pushed a fleet-peer set (the dev/loopback

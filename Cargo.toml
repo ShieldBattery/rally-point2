@@ -27,10 +27,10 @@ tokio = { version = "1.52", features = [
   "sync",
   "time",
 ] }
-# QUIC via maintained noq, kept under the quinn alias for transport consumers.
+# QUIC via the maintained noq implementation.
 # Pin the rustls + ring backend rather than aws-lc-rs to avoid the C/NASM toolchain
 # requirement on Windows MSVC; `client` also builds for `i686-pc-windows-msvc`.
-quinn = { package = "noq", version = "1.2.0", default-features = false, features = [
+noq = { version = "1.2.0", default-features = false, features = [
   "runtime-tokio",
   "rustls-ring",
   "tracing-log",
@@ -39,9 +39,9 @@ bytes = "1.12"
 byteorder = "1.5"
 # Dual-stack UDP socket construction for the client endpoint: std's UdpSocket
 # can't clear IPV6_V6ONLY, which a v6 socket needs to also reach IPv4 relays.
-# Already in the tree transitively via quinn; pinned to the same major.
+# Already in the tree transitively via noq; pinned to the same major.
 socket2 = "0.6"
-# TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the quinn
+# TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the noq
 # backend and keep the 32-bit client build free of a C/NASM toolchain.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # PEM cert/key file reading for the relay binary (loads --cert/--key files).

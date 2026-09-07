@@ -40,7 +40,7 @@ use std::collections::HashMap;
 
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::mesh::{MESH_PRESENCE_LEN, MeshPresence};
-use rally_point_transport::quinn;
+use rally_point_transport::noq;
 use tokio::sync::mpsc;
 
 use crate::consensus::{Authority, DecisionMakers};
@@ -259,7 +259,7 @@ pub struct PresenceIo {
     /// The reliable uni-stream carrying this relay's own reports to the peer.
     /// On the dial side this is the hello stream, kept open past the hello; on
     /// the accept side it is a stream of its own.
-    pub tx: quinn::SendStream,
+    pub tx: noq::SendStream,
     /// The peer's reports, assembled off its stream by the reader task.
     pub rx: mpsc::Receiver<MeshPresence>,
 }
@@ -280,7 +280,7 @@ const PRESENCE_CHANNEL_CAPACITY: usize = 64;
 /// the channel, whose `recv` is cancel-safe. The task ends (dropping its
 /// sender) when the stream closes or errors; the connection's own failure
 /// surfaces separately through the datagram path.
-pub fn spawn_presence_reader(stream: quinn::RecvStream) -> mpsc::Receiver<MeshPresence> {
+pub fn spawn_presence_reader(stream: noq::RecvStream) -> mpsc::Receiver<MeshPresence> {
     let (tx, rx) = mpsc::channel(PRESENCE_CHANNEL_CAPACITY);
     tokio::spawn(read_presence_frames(stream, tx));
     rx
@@ -294,7 +294,7 @@ pub fn spawn_presence_reader(stream: quinn::RecvStream) -> mpsc::Receiver<MeshPr
 /// directly. Accepting lazily inside the task means a peer that never opens
 /// its stream just parks the reader harmlessly.
 pub fn spawn_presence_reader_accepting(
-    connection: quinn::Connection,
+    connection: noq::Connection,
 ) -> mpsc::Receiver<MeshPresence> {
     let (tx, rx) = mpsc::channel(PRESENCE_CHANNEL_CAPACITY);
     tokio::spawn(async move {
@@ -308,7 +308,7 @@ pub fn spawn_presence_reader_accepting(
 
 /// Reads fixed-size presence frames until the stream ends or the driver drops
 /// its receiver.
-async fn read_presence_frames(mut stream: quinn::RecvStream, tx: mpsc::Sender<MeshPresence>) {
+async fn read_presence_frames(mut stream: noq::RecvStream, tx: mpsc::Sender<MeshPresence>) {
     let mut frame = [0u8; MESH_PRESENCE_LEN];
     while stream.read_exact(&mut frame).await.is_ok() {
         if tx.send(MeshPresence::decode(frame)).await.is_err() {

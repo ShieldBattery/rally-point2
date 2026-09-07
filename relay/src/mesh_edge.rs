@@ -77,8 +77,8 @@ use rally_point_proto::version::{
     self, MESH_CLOSE_CERT_MISMATCH, MESH_CLOSE_NO_CLIENT_CERT, MESH_CLOSE_PROTOCOL_MISMATCH,
     MESH_CLOSE_UNKNOWN_PEER, ProtocolVersion,
 };
+use rally_point_transport::noq;
 use rally_point_transport::quic::cert_fingerprint;
-use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Semaphore, mpsc};
@@ -144,13 +144,13 @@ static MESH_ACCEPT_PERMITS: Semaphore = Semaphore::const_new(MESH_ACCEPT_CONCURR
 enum MeshHelloError {
     /// Opening or accepting the hello stream failed (the connection dropped).
     #[error("mesh hello stream error: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(#[from] noq::ConnectionError),
     /// Writing the hello to the stream failed.
     #[error("mesh hello write error: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] noq::WriteError),
     /// Reading the hello from the stream failed.
     #[error("mesh hello read error: {0}")]
-    Read(#[from] quinn::ReadExactError),
+    Read(#[from] noq::ReadExactError),
     /// The peer connected but did not send its hello within the deadline.
     #[error("mesh hello not received within the deadline")]
     Timeout,
@@ -162,9 +162,9 @@ enum MeshHelloError {
 /// service for the link's lifetime carrying this relay's presence frames (the
 /// dialer's report channel; see [`presence`](crate::presence)).
 async fn send_mesh_hello(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     our_id: RelayId,
-) -> Result<quinn::SendStream, MeshHelloError> {
+) -> Result<noq::SendStream, MeshHelloError> {
     let mut stream = connection.open_uni().await?;
     let hello = MeshHello::new(our_id, ProtocolVersion::CURRENT);
     stream.write_all(&hello.encode()).await?;
@@ -178,8 +178,8 @@ async fn send_mesh_hello(
 /// its presence frames follow the hello — so the acceptor hands it to a
 /// presence reader rather than dropping it.
 async fn recv_mesh_hello(
-    connection: &quinn::Connection,
-) -> Result<(MeshHello, quinn::RecvStream), MeshHelloError> {
+    connection: &noq::Connection,
+) -> Result<(MeshHello, noq::RecvStream), MeshHelloError> {
     let read = async {
         let mut stream = connection.accept_uni().await?;
         let mut frame = [0u8; MESH_HELLO_LEN];
@@ -289,7 +289,7 @@ impl std::fmt::Display for MeshPeerAuthRefusal {
 /// path (`--mesh-peer`, no coordinator) never receives a fleet push and stays
 /// exactly as unauthenticated as it was before peer-identity pinning existed.
 fn verify_mesh_peer_identity(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     peer_id: RelayId,
     fleet_peers: &FleetMeshPeersReader,
     require_peer_auth: bool,
@@ -352,7 +352,7 @@ fn verify_mesh_peer_identity(
 /// the default (and how the dev/loopback static `--mesh-peer` path, which never
 /// receives a fleet push, keeps working with no peer-identity checks at all).
 pub async fn run_mesh_accept(
-    mut mesh_accept: mpsc::Receiver<quinn::Connection>,
+    mut mesh_accept: mpsc::Receiver<noq::Connection>,
     sessions: Sessions,
     mesh: MeshState,
     links: mpsc::Sender<mesh::MeshLinkHandle>,
@@ -370,7 +370,7 @@ pub async fn run_mesh_accept(
         // bound is the rest of the waiting room, and the ALPN dispatch sheds
         // on overflow past that — so a burst of anonymous dials can never
         // accumulate one parked permit-waiting task per connection, each
-        // pinning a live `quinn::Connection`. The permit moves into the task
+        // pinning a live `noq::Connection`. The permit moves into the task
         // and is dropped there before the link driver takes over, never held
         // across the established link's own lifetime.
         let accept_permit = MESH_ACCEPT_PERMITS
@@ -401,7 +401,7 @@ pub async fn run_mesh_accept(
                             "refusing mesh peer: no common protocol version",
                         );
                         connection.close(
-                            quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
+                            noq::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
                             b"protocol version mismatch",
                         );
                         return;
@@ -419,12 +419,12 @@ pub async fn run_mesh_accept(
             {
                 tracing::warn!(
                     peer_id = peer_id.0,
-                    remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
+                    remote = ?connection.path(noq::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                     reason = %refusal,
                     "refusing mesh peer: identity check failed",
                 );
                 connection.close(
-                    quinn::VarInt::from_u32(refusal.close_code()),
+                    noq::VarInt::from_u32(refusal.close_code()),
                     refusal.reason_bytes(),
                 );
                 return;
@@ -432,7 +432,7 @@ pub async fn run_mesh_accept(
 
             tracing::info!(
                 peer_id = peer_id.0,
-                remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
+                remote = ?connection.path(noq::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                 "mesh link established (accept side)",
             );
 
@@ -607,7 +607,7 @@ pub async fn run_mesh_dial_with(
     // Build the client config + endpoint once and reuse them across redials. Both
     // are terminal on failure — a bad TLS config or an unbindable client socket
     // won't fix itself by retrying, so there's nothing to supervise. The endpoint
-    // outlives every connection dialed from it (a quinn `Endpoint` closes its
+    // outlives every connection dialed from it (a noq `Endpoint` closes its
     // connections when dropped), so keeping it on this task's stack for the whole
     // supervisor loop keeps each attempt's connection alive while its driver runs.
     let mesh_cfg = match rally_point_transport::quic::mesh_client_config(roots, cert_chain, key) {
@@ -618,7 +618,7 @@ pub async fn run_mesh_dial_with(
         }
     };
     let bind: SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, 0).into();
-    let endpoint = match quinn::Endpoint::client(bind) {
+    let endpoint = match noq::Endpoint::client(bind) {
         Ok(ep) => ep,
         Err(error) => {
             tracing::error!(%error, "binding mesh dial endpoint; not dialing peer");
@@ -649,11 +649,11 @@ pub async fn run_mesh_dial_with(
 /// reason rather than any one operation's error: the acceptor closes right after
 /// reading our hello, so the refusal surfaces as whichever stream operation
 /// happened to fail next, and this names it regardless of which that was.
-fn refused_for_protocol_mismatch(connection: &quinn::Connection) -> bool {
+fn refused_for_protocol_mismatch(connection: &noq::Connection) -> bool {
     matches!(
         connection.close_reason(),
-        Some(quinn::ConnectionError::ApplicationClosed(close))
-            if close.error_code == quinn::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH)
+        Some(noq::ConnectionError::ApplicationClosed(close))
+            if close.error_code == noq::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH)
     )
 }
 
@@ -661,7 +661,7 @@ fn refused_for_protocol_mismatch(connection: &quinn::Connection) -> bool {
 /// peer's protocol-version refusal distinctly (at warn — a deploy fixes it, not a
 /// redial) and falling back to the ordinary retry line otherwise.
 fn log_dial_retry(
-    connection: &quinn::Connection,
+    connection: &noq::Connection,
     peer_id: RelayId,
     context: &str,
     error: &dyn std::fmt::Display,
@@ -705,7 +705,7 @@ enum DialOutcome {
 /// [`CommandChannelClosed`](mesh::MeshLinkExit::CommandChannelClosed) shutdown is
 /// intentional and stops the supervisor.
 async fn dial_and_serve(
-    endpoint: &quinn::Endpoint,
+    endpoint: &noq::Endpoint,
     target: &DialTarget,
     sessions: &Sessions,
     mesh: &MeshState,
@@ -772,7 +772,7 @@ async fn dial_and_serve(
     tracing::info!(
         our_id = our_id.0,
         peer_id = peer_id.0,
-        remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
+        remote = ?connection.path(noq::PathId::ZERO).and_then(|path| path.remote_address().ok()),
         "mesh link established (dial side)",
     );
 
@@ -939,10 +939,10 @@ mod tests {
     /// the returned endpoints but is never made to speak, so the accepted
     /// connection just sits there as a stalled, unauthenticated mesh peer.
     async fn silent_mesh_connection() -> (
-        quinn::Connection,
-        quinn::Connection,
-        quinn::Endpoint,
-        quinn::Endpoint,
+        noq::Connection,
+        noq::Connection,
+        noq::Endpoint,
+        noq::Endpoint,
     ) {
         use rally_point_transport::quic::mesh_client_config;
 
@@ -954,16 +954,16 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
             let server = server.clone();
             tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
         };
-        // Returned, not just dropped here: quinn's `Connection` triggers an
+        // Returned, not just dropped here: noq's `Connection` triggers an
         // implicit close of that side when its last handle drops, which
         // would immediately end the "silent" connection this helper exists
         // to hold open.
@@ -1054,7 +1054,7 @@ mod tests {
         // End the connection outright (rather than waiting the full
         // `MESH_HELLO_TIMEOUT`) so `recv_mesh_hello` fails fast and the task
         // returns, releasing its permit.
-        silent_conn.close(quinn::VarInt::from_u32(0), b"test done");
+        silent_conn.close(noq::VarInt::from_u32(0), b"test done");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             MESH_ACCEPT_PERMITS.available_permits(),
@@ -1093,8 +1093,8 @@ mod tests {
             MESH_ACCEPT_CONCURRENCY - 2,
             "both waiting connections were admitted once slots freed",
         );
-        parked_conn.close(quinn::VarInt::from_u32(0), b"test done");
-        queued_conn.close(quinn::VarInt::from_u32(0), b"test done");
+        parked_conn.close(noq::VarInt::from_u32(0), b"test done");
+        queued_conn.close(noq::VarInt::from_u32(0), b"test done");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             MESH_ACCEPT_PERMITS.available_permits(),

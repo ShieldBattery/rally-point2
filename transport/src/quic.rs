@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
+use noq::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -117,11 +117,11 @@ const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// (no PINGs) times out — a clean drop detector. QUIC negotiates the idle timeout
 /// as the minimum of both ends, so setting it on the dial side governs without
 /// touching `server_config`, and one side's keepalive keeps both idle timers reset.
-fn keepalive_transport_config() -> quinn::TransportConfig {
-    let mut config = quinn::TransportConfig::default();
+fn keepalive_transport_config() -> noq::TransportConfig {
+    let mut config = noq::TransportConfig::default();
     config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
     config.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("10s fits in a VarInt"),
+        noq::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("10s fits in a VarInt"),
     ));
     config
 }
@@ -178,9 +178,7 @@ pub struct DatagramBudgetTooSmall {
 /// refusing it outright at establishment is strictly better than degrading
 /// into a state where preserved unacked payloads no longer fit the link that
 /// is supposed to replay them.
-pub fn verify_datagram_budget(
-    connection: &quinn::Connection,
-) -> Result<(), DatagramBudgetTooSmall> {
+pub fn verify_datagram_budget(connection: &noq::Connection) -> Result<(), DatagramBudgetTooSmall> {
     let floor = crate::ack_manager::GUARANTEED_DATAGRAM_BUDGET;
     let advertised = connection.max_datagram_size().unwrap_or(0);
     if advertised < floor {
@@ -300,7 +298,7 @@ impl ClientCertVerifier for RequestClientCert {
 pub fn server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Result<quinn::ServerConfig, TlsError> {
+) -> Result<noq::ServerConfig, TlsError> {
     let provider = ring_provider();
     let client_verifier = Arc::new(RequestClientCert {
         provider: Arc::clone(&provider),
@@ -312,13 +310,13 @@ pub fn server_config(
     tls.alpn_protocols = vec![ALPN.to_vec(), MESH_ALPN.to_vec()];
 
     let server = QuicServerConfig::try_from(tls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(server)))
+    Ok(noq::ServerConfig::with_crypto(Arc::new(server)))
 }
 
 /// Builds the client-edge QUIC config, trusting the given root certificates to
 /// authenticate the relay it dials. Negotiates the client-edge [`ALPN`], so the
 /// connection carries `Packet` datagrams — never `MeshPacket`.
-pub fn client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig, TlsError> {
+pub fn client_config(roots: rustls::RootCertStore) -> Result<noq::ClientConfig, TlsError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -326,7 +324,7 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<quinn::ClientConfig
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(client));
+    let mut config = noq::ClientConfig::new(Arc::new(client));
     // Keepalive + short idle timeout on the client edge: keeps a stalled-but-alive
     // client connected (so a drop doesn't idle-time-out the survivors) while a dead
     // client is detected fast. See `keepalive_transport_config`.
@@ -353,7 +351,7 @@ pub fn mesh_client_config(
     roots: rustls::RootCertStore,
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Result<quinn::ClientConfig, TlsError> {
+) -> Result<noq::ClientConfig, TlsError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -361,7 +359,7 @@ pub fn mesh_client_config(
     tls.alpn_protocols = vec![MESH_ALPN.to_vec()];
 
     let client = QuicClientConfig::try_from(tls)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(client));
+    let mut config = noq::ClientConfig::new(Arc::new(client));
     config.transport_config(Arc::new(keepalive_transport_config()));
     Ok(config)
 }
@@ -385,7 +383,7 @@ mod tests {
         (vec![cert_der.clone()], key_der, cert_der)
     }
 
-    /// Proves the pinned quinn + rustls + ring stack actually completes a
+    /// Proves the pinned noq + rustls + ring stack actually completes a
     /// handshake and carries a datagram over loopback — the foundation every
     /// link is built on. `client_config` presents no TLS client certificate (a
     /// game client never does), so this also proves `RequestClientCert`'s
@@ -401,10 +399,10 @@ mod tests {
         let client_cfg = client_config(roots).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let server_task = tokio::spawn(async move {
@@ -441,10 +439,10 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain.clone(), dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let server_task = tokio::spawn(async move {
@@ -486,7 +484,7 @@ mod tests {
         let server_cfg = server_config(chain, key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Keep the endpoint and the incoming connection alive and drive the
@@ -508,9 +506,9 @@ mod tests {
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"rp2/0".to_vec()];
         let mismatched_cfg =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+            noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;
@@ -541,7 +539,7 @@ mod tests {
         let server_cfg = server_config(chain, key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let server_task = tokio::spawn(async move {
@@ -560,9 +558,9 @@ mod tests {
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"rp2-mesh/0".to_vec()];
         let mismatched_cfg =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+            noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;

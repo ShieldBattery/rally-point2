@@ -42,7 +42,7 @@ use rally_point_relay::provisional;
 use rally_point_relay::region_ping;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::{DEFAULT_PORT, server};
-use rally_point_transport::quinn;
+use rally_point_transport::noq;
 
 /// Validating netcode v2 relay.
 #[derive(Debug, Parser)]
@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
     // generation, MeshCommand sender)` — the peer id targets joins and the
     // generation rejects late registration from an older physical link.
     let mesh_accept = if let Some(our_id) = cli.relay_id {
-        let (mesh_accept_tx, mesh_accept_rx) = tokio::sync::mpsc::channel::<quinn::Connection>(8);
+        let (mesh_accept_tx, mesh_accept_rx) = tokio::sync::mpsc::channel::<noq::Connection>(8);
         let (links_tx, mut links_rx) = tokio::sync::mpsc::channel::<mesh::MeshLinkHandle>(8);
 
         // The fleet mesh-peer map: the coordinator pushes the currently-enrolled

@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::token::KeyId;
+use rally_point_transport::noq;
 use rally_point_transport::quic;
-use rally_point_transport::quinn;
 use rally_point_transport::rustls::RootCertStore;
 use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -159,10 +159,10 @@ pub fn registry_from_tenant_key(key: &TenantKey) -> Registry {
     registry
 }
 
-/// Builds a `quinn::ServerConfig` from a self-signed cert (dev/loopback).
+/// Builds a `noq::ServerConfig` from a self-signed cert (dev/loopback).
 pub fn server_config_from_self_signed(
     cert: &SelfSignedCert,
-) -> color_eyre::Result<quinn::ServerConfig> {
+) -> color_eyre::Result<noq::ServerConfig> {
     // PrivateKeyDer doesn't impl Clone, so re-serialize from the raw DER.
     let key = rally_point_transport::rustls::pki_types::PrivateKeyDer::try_from(
         cert.key.secret_der().to_vec(),

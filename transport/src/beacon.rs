@@ -110,7 +110,7 @@ impl BeaconWriter {
     /// failure leaves `last_sent` unchanged; the link is already failing, and
     /// retaining the old cursor truth is the conservative state if its caller
     /// gets another chance to flush before teardown.
-    pub async fn flush<I>(&mut self, beacon_send: &mut quinn::SendStream, delivered_through: I)
+    pub async fn flush<I>(&mut self, beacon_send: &mut noq::SendStream, delivered_through: I)
     where
         I: IntoIterator<Item = (SlotId, u64)>,
     {
@@ -177,7 +177,7 @@ fn close_cell(cell: &Weak<CursorCell>) {
 /// would lose the consumed bytes and desync the framing, handing a garbage
 /// `(slot, cursor)` to `retire_through`. This task assembles complete frames and
 /// folds them; [`BeaconCursors::recv`] in the driver's `select!` is cancel-safe.
-pub fn spawn_beacon_reader(connection: quinn::Connection) -> BeaconCursors {
+pub fn spawn_beacon_reader(connection: noq::Connection) -> BeaconCursors {
     let inner = Arc::new(CursorCell {
         pending: Mutex::new(HashMap::new()),
         notify: Notify::new(),
@@ -264,10 +264,10 @@ mod tests {
     /// endpoints (kept alive by the caller). The first connection is the beacon
     /// writer (opens the uni-stream), the second is handed to the reader.
     async fn connected_connections() -> (
-        quinn::Connection,
-        quinn::Connection,
-        quinn::Endpoint,
-        quinn::Endpoint,
+        noq::Connection,
+        noq::Connection,
+        noq::Endpoint,
+        noq::Endpoint,
     ) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
@@ -277,9 +277,9 @@ mod tests {
         let client_cfg = client_config(roots).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {

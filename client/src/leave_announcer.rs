@@ -30,7 +30,7 @@ use std::time::Duration;
 use rally_point_proto::messages::Payload;
 use rally_point_transport::Link;
 use rally_point_transport::control::{ControlSendError, send_control_leave_intent};
-use rally_point_transport::quinn;
+use rally_point_transport::noq;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -138,7 +138,7 @@ impl LeaveAnnouncer {
     /// Transitions to `Sent` on the write.
     pub(crate) async fn maybe_send(
         &mut self,
-        control_send: &mut quinn::SendStream,
+        control_send: &mut noq::SendStream,
         outbound: &mpsc::Receiver<Payload>,
         held_empty: bool,
         link: &Link,
@@ -158,7 +158,7 @@ impl LeaveAnnouncer {
     /// Transitions to `Sent`.
     pub(crate) async fn force_send(
         &mut self,
-        control_send: &mut quinn::SendStream,
+        control_send: &mut noq::SendStream,
     ) -> Result<(), ControlSendError> {
         send_control_leave_intent(control_send).await?;
         self.state = LeaveState::Sent;

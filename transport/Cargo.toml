@@ -21,7 +21,7 @@ thiserror = { workspace = true }
 # The QUIC stack the per-link transport runs on, plus its TLS config. Pinned to
 # the ring crypto provider so this (and the client that links it) builds for the
 # 32-bit game DLL without a C/NASM toolchain.
-quinn = { workspace = true }
+noq = { workspace = true }
 rustls = { workspace = true }
 # Only for `quic::cert_fingerprint` (the SHA-256 the mesh-accept path pins a
 # dialing peer's certificate against). Already compiled into this crate

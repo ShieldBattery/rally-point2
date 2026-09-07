@@ -57,7 +57,7 @@ const MESH_CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// stream closes or the driver drops its receiver; either surfaces as `None` on
 /// the driver's `recv()`, which the driver treats as the peer's control stream
 /// going quiet (not itself a link failure — that surfaces via the datagram path).
-pub fn spawn_mesh_control_reader(recv: quinn::RecvStream) -> mpsc::Receiver<MeshControlFrame> {
+pub fn spawn_mesh_control_reader(recv: noq::RecvStream) -> mpsc::Receiver<MeshControlFrame> {
     let (tx, rx) = mpsc::channel(MESH_CONTROL_CHANNEL_CAPACITY);
     tokio::spawn(read_mesh_control_frames(recv, tx));
     rx
@@ -71,7 +71,7 @@ pub fn spawn_mesh_control_reader(recv: quinn::RecvStream) -> mpsc::Receiver<Mesh
 /// harmlessly. The accepted send half is unused (each side writes only on the
 /// stream it opened) and dropped.
 pub fn spawn_mesh_control_reader_accepting(
-    connection: quinn::Connection,
+    connection: noq::Connection,
 ) -> mpsc::Receiver<MeshControlFrame> {
     let (tx, rx) = mpsc::channel(MESH_CONTROL_CHANNEL_CAPACITY);
     tokio::spawn(async move {
@@ -87,7 +87,7 @@ pub fn spawn_mesh_control_reader_accepting(
 /// `tx` until the stream ends, a framing violation is hit, or the consumer drops
 /// its receiver. The empty establishment/keepalive frame is dropped rather than
 /// forwarded.
-async fn read_mesh_control_frames(mut recv: quinn::RecvStream, tx: mpsc::Sender<MeshControlFrame>) {
+async fn read_mesh_control_frames(mut recv: noq::RecvStream, tx: mpsc::Sender<MeshControlFrame>) {
     loop {
         let Some(frame) = read_one_frame::<MeshControlFrame>(&mut recv, "mesh control").await
         else {
@@ -111,7 +111,7 @@ async fn read_mesh_control_frames(mut recv: quinn::RecvStream, tx: mpsc::Sender<
 /// it as a link failure — like an oversize turn, this frame has no redundancy
 /// re-carrying it, and a dropped leave leaves a survivor stalled.
 pub async fn send_mesh_control_frame(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     frame: &MeshControlFrame,
 ) -> Result<(), MeshControlSendError> {
     let encoded = encode_frame(frame)?;
@@ -130,7 +130,7 @@ pub async fn send_mesh_control_frame(
 /// is size-checked before the stream is touched, so an invalid frame cannot
 /// leave a partially written batch on the stream.
 pub async fn send_mesh_control_frames(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
     frames: &[MeshControlFrame],
 ) -> Result<(), MeshControlSendError> {
     let encoded = encode_mesh_control_frames(frames)?;
@@ -169,7 +169,7 @@ fn encode_mesh_control_frames(frames: &[MeshControlFrame]) -> Result<Vec<u8>, Co
 /// opens the stream — otherwise the acceptor's bounded `accept_bi` would time out
 /// on a link that carries no leaves. The reader drops it on receipt.
 pub async fn establish_mesh_control(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut noq::SendStream,
 ) -> Result<(), MeshControlSendError> {
     send_mesh_control_frame(control_send, &MeshControlFrame::default()).await
 }
@@ -184,7 +184,7 @@ pub enum MeshControlSendError {
     Frame(#[from] ControlStreamError),
     /// The stream is gone (the connection dropped or the peer stopped it).
     #[error("mesh control stream write failed: {0}")]
-    Write(#[from] quinn::WriteError),
+    Write(#[from] noq::WriteError),
 }
 
 #[cfg(test)]
@@ -211,10 +211,10 @@ mod tests {
     }
 
     async fn connected_mesh_connections() -> (
-        quinn::Connection,
-        quinn::Connection,
-        quinn::Endpoint,
-        quinn::Endpoint,
+        noq::Connection,
+        noq::Connection,
+        noq::Endpoint,
+        noq::Endpoint,
     ) {
         let (chain, key, ca) = self_signed();
         let server_cfg = server_config(chain, key).unwrap();
@@ -225,9 +225,9 @@ mod tests {
         let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
 
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let client = quinn::Endpoint::client(bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -334,7 +334,7 @@ mod tests {
             .await
             .expect("peer accepted the established stream")
             .unwrap();
-        let stop_code = quinn::VarInt::from_u32(23);
+        let stop_code = noq::VarInt::from_u32(23);
         peer_recv.stop(stop_code).unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), send.stopped())
@@ -350,7 +350,7 @@ mod tests {
                 &[ack_cursors_frame(9, SlotId(3), 88)],
             )
             .await,
-            Err(MeshControlSendError::Write(quinn::WriteError::Stopped(code)))
+            Err(MeshControlSendError::Write(noq::WriteError::Stopped(code)))
                 if code == stop_code,
         ));
     }

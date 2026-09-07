@@ -1,6 +1,6 @@
 [package]
 name = "rally-point-client"
-description = "Portable netcode v2 client transport (quinn datagrams + reliable control + forward recovery), consumed by the ShieldBattery game DLL."
+description = "Portable netcode v2 client transport (noq datagrams + reliable control + forward recovery), consumed by the ShieldBattery game DLL."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

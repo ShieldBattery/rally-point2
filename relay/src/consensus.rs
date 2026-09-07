@@ -903,7 +903,7 @@ enum CounterUpdate {
     /// from the loss windows -- they re-anchored past it -- instead of being
     /// differenced in.
     OutageRebaselined,
-    /// Loss detection advanced for the current sent-packet endpoint. Quinn may
+    /// Loss detection advanced for the current sent-packet endpoint. Noq may
     /// declare an already-sent packet lost after the endpoint was sampled, so
     /// this refines that endpoint without rotating it.
     LossAdvanced,
@@ -917,7 +917,7 @@ enum CounterUpdate {
 
 impl SlotState {
     /// Clears observations that belong to one physical client connection while
-    /// retaining the slot's game-progress history. A reconnect starts Quinn's
+    /// retaining the slot's game-progress history. A reconnect starts Noq's
     /// RTT and packet counters over, but it is still the same game participant:
     /// its last validated frame remains part of the session coordinate.
     fn reset_link_conditions(&mut self) {
@@ -1108,7 +1108,7 @@ impl SlotState {
     /// therefore bounded and brief: at most the gap's own handful of sends,
     /// until the credit's deadlines pass. The worst case of under-banking is
     /// the original spike this mechanism exists to prevent. (Gating on send
-    /// pacing was tried and is unsound: Quinn's congestion collapse plus PTO
+    /// pacing was tried and is unsound: Noq's congestion collapse plus PTO
     /// backoff drives a dead path's *actual* wire rate below any fixed
     /// threshold as a fade lengthens, misclassifying exactly the gaps that
     /// matter.)
@@ -3414,7 +3414,7 @@ impl DecisionMaker {
             // Sender RTT is instantaneous rather than cumulative, but a
             // counter-regressing sidecar is known to be stale as a whole and
             // must not advance the sample-count-based window. Equal counters
-            // may still carry a changed RTT (Quinn updates smoothed RTT without
+            // may still carry a changed RTT (Noq updates smoothed RTT without
             // necessarily sending another packet), but an exact duplicate must
             // not age the window. A `0` (no measurement) is skipped by `push`.
             // Clamp peer-reported values on ingress so an unclamped
@@ -9503,7 +9503,7 @@ mod tests {
         assert_eq!(slot_loss_rate(&maker, 0), Some(10.0 / 30.0));
     }
 
-    /// Quinn can declare a packet lost after the sent-packet endpoint containing
+    /// Noq can declare a packet lost after the sent-packet endpoint containing
     /// it was sampled. A higher lost count at the same sent count refines the
     /// current endpoint immediately, and the loss then counts exactly once in
     /// the windows -- it declines as clean packets accumulate rather than
@@ -10226,7 +10226,7 @@ mod tests {
         assert_eq!(maker.target(), Some(4));
     }
 
-    /// Quinn declares an outage's losses only once acks resume -- the gap
+    /// Noq declares an outage's losses only once acks resume -- the gap
     /// sample itself usually shows the dead-path sends still undeclared, and
     /// the lost counter jumps one or two samples later. Those late
     /// declarations belong to the outage: they are absorbed against the
@@ -10323,7 +10323,7 @@ mod tests {
     }
 
     /// The absorption pool covers only the brief post-resume window in which
-    /// quinn resolves the outage's losses. Loss past that horizon is priced
+    /// noq resolves the outage's losses. Loss past that horizon is priced
     /// as the weather it is, leftover pool or not.
     #[test]
     fn the_outage_absorption_pool_expires() {
@@ -10531,7 +10531,7 @@ mod tests {
         );
     }
 
-    /// On a genuinely dead path Quinn's congestion window collapses and PTO
+    /// On a genuinely dead path Noq's congestion window collapses and PTO
     /// backoff throttles *actual* transmissions to a handful of packets
     /// however hard the maintenance flush queues -- so dead-path handling
     /// must not depend on the gap's send volume. The few throttled sends
@@ -10550,7 +10550,7 @@ mod tests {
         let step = Duration::from_millis(42);
         ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
 
-        // A 5s blackout during which Quinn actually transmitted only ten
+        // A 5s blackout during which Noq actually transmitted only ten
         // congestion/PTO-limited packets, none declared lost yet at resume.
         let resume = start + Duration::from_secs(5);
         assert_eq!(

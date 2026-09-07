@@ -48,7 +48,7 @@ use crate::ack_manager::{AckManager, CarrySpacing, RecarryPolicy};
 /// One game turn at the SC:R rate, in milliseconds.
 const TURN_MS: f64 = 1000.0 / 24.0;
 
-/// The datagram budget handed to `build_outgoing` — quinn's
+/// The datagram budget handed to `build_outgoing` — noq's
 /// `max_datagram_size()` for a typical path MTU.
 const DATAGRAM_BUDGET: usize = 1350;
 
