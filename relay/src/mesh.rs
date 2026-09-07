@@ -4015,7 +4015,12 @@ pub(crate) fn rtt_us(rtt: std::time::Duration) -> u32 {
 /// the backbone a remote slot's turns travel, added to each remote slot's
 /// effective path in the decision-maker.
 fn link_rtt_us(connection: &rally_point_transport::quinn::Connection) -> u32 {
-    rtt_us(connection.stats().path.rtt)
+    rtt_us(
+        connection
+            .path_stats(rally_point_transport::quinn::PathId::ZERO)
+            .unwrap_or_default()
+            .rtt,
+    )
 }
 
 /// Maximum age of the relay-pair RTT used to ingest remote conditions. RTT is
@@ -8103,7 +8108,7 @@ mod tests {
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -8348,7 +8353,7 @@ mod tests {
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {

@@ -165,7 +165,7 @@ impl ClientEndpoint {
         socket.bind(&bind.into())?;
 
         let runtime = quinn::default_runtime().ok_or(EndpointError::NoRuntime)?;
-        let mut endpoint = quinn::Endpoint::new(
+        let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             None,
             socket.into(),

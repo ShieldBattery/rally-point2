@@ -96,7 +96,7 @@ fn self_signed() -> (
 fn start_relay_on(bind: SocketAddr, registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
-    let endpoint = quinn::Endpoint::server(server_cfg, bind).unwrap();
+    let endpoint = server::bind_endpoint(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(server::serve(
         endpoint,
@@ -175,7 +175,7 @@ fn registry_for(tenants: &[&Tenant]) -> Registry {
 fn client_endpoint(ca: &CertificateDer<'static>) -> ClientEndpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).unwrap();
-    let mut endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     endpoint.set_default_client_config(client_config(roots).unwrap());
     ClientEndpoint::from_endpoint(endpoint)
 }
@@ -1417,6 +1417,22 @@ async fn bind_dials_an_ipv6_relay() {
         outcome.is_ok(),
         "dual-stack bind failed to dial IPv6 relay: {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
+    let tenant = make_tenant(KID, TENANT);
+    let (addr, ca) = start_relay_on((Ipv6Addr::UNSPECIFIED, 0).into(), registry_for(&[&tenant]));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca).unwrap();
+    let endpoint = ClientEndpoint::bind(roots).unwrap();
+
+    let ipv4 = (Ipv4Addr::LOCALHOST, addr.port()).into();
+    let ipv6 = (Ipv6Addr::LOCALHOST, addr.port()).into();
+    let id0 = identity_for(&tenant, SessionId(8), SlotId(0));
+    let id1 = identity_for(&tenant, SessionId(8), SlotId(1));
+    let _link0 = endpoint.connect(ipv4, "localhost", &id0).await.unwrap();
+    let _link1 = endpoint.connect(ipv6, "localhost", &id1).await.unwrap();
 }
 
 /// The relay-computed initial buffer depth stamped onto SessionStart reaches the

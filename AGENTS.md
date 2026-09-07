@@ -66,7 +66,8 @@ Full rationale in `docs/architecture.md`. The ones easy to break by accident:
 
 ## Gotchas (will bite you)
 
-- QUIC is **quinn + rustls + ring**, not the default aws-lc-rs — pinned to avoid a
+- QUIC is **noq + rustls + ring**, with noq imported and re-exported as `quinn`.
+  Keep the ring backend instead of aws-lc-rs to avoid a
   C/NASM toolchain on the 32-bit Windows build. Don't revert the backend.
 - `client` must build for `i686-pc-windows-msvc` (linked into the 32-bit game DLL),
   so keep it portable and `unsafe`-free. CI has a dedicated job for it.

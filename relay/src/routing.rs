@@ -4192,15 +4192,24 @@ fn should_sample_active_conditions(received: &Received) -> bool {
 /// smoothed path estimate (via [`crate::mesh::rtt_us`], which owns the "0 means
 /// no measurement" convention); lost/sent are cumulative counters the
 /// decision-maker differences between consecutive samples to get a loss rate
-/// over the interval.
+/// over the interval. Multipath is disabled, so the default path owns this
+/// connection's measurements. An absent path reports zero (no measurement);
+/// the decision-maker ignores zero RTT and rejects regressing counters.
+///
+/// Sent UDP datagrams count individual GSO segments, not socket writes. Once
+/// the handshake establishes the counter baseline, each datagram carries one
+/// 1-RTT QUIC packet, matching the unit of the lost-packet counter.
 fn sample_slot_conditions(link: &Link, slot: SlotId, connection_epoch: u64) -> SampledLink {
-    let path = link.connection().stats().path;
+    let path = link
+        .connection()
+        .path_stats(rally_point_transport::quinn::PathId::ZERO)
+        .unwrap_or_default();
     SampledLink {
         conditions: SlotConditions {
             slot: u32::from(slot.0),
             rtt_us: crate::mesh::rtt_us(path.rtt),
             lost_packets: path.lost_packets,
-            sent_packets: path.sent_packets,
+            sent_packets: path.udp_tx.datagrams,
             connection_epoch: Some(connection_epoch),
         },
         upstream_lost_packets: link.upstream_lost_packets(),
@@ -4211,7 +4220,7 @@ fn sample_slot_conditions(link: &Link, slot: SlotId, connection_epoch: u64) -> S
 
 /// One sampling of a client link: the conditions that travel (to the mesh
 /// sidecar and the decision-maker) alongside the gauges that only ever land in
-/// the flight recording. They are read from one `stats()` snapshot so the two
+/// the flight recording. They are read from one `path_stats()` snapshot so the two
 /// always describe the same instant.
 struct SampledLink {
     conditions: SlotConditions,

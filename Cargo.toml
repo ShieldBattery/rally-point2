@@ -27,15 +27,13 @@ tokio = { version = "1.52", features = [
   "sync",
   "time",
 ] }
-# QUIC via quinn. Pinned to the rustls + ring backend rather than the default
-# aws-lc-rs to avoid the C/NASM toolchain requirement on Windows MSVC — the
-# `client` crate must also build for `i686-pc-windows-msvc` inside the game DLL.
-# Declared here as the frozen choice; wired into client/relay in Phase 1, at
-# which point these feature names must be confirmed against the resolved quinn.
-quinn = { version = "0.11", default-features = false, features = [
+# QUIC via maintained noq, kept under the quinn alias for transport consumers.
+# Pin the rustls + ring backend rather than aws-lc-rs to avoid the C/NASM toolchain
+# requirement on Windows MSVC; `client` also builds for `i686-pc-windows-msvc`.
+quinn = { package = "noq", version = "1.2.0", default-features = false, features = [
   "runtime-tokio",
   "rustls-ring",
-  "log",
+  "tracing-log",
 ] }
 bytes = "1.12"
 byteorder = "1.5"

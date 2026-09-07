@@ -152,6 +152,33 @@ pub enum ServerError {
     Bind(#[from] std::io::Error),
 }
 
+/// Binds the relay's QUIC endpoint to the requested address.
+///
+/// The IPv6 wildcard accepts both address families. Concrete IPv6 addresses stay
+/// IPv6-only because Windows rejects dual-stack binds to addresses such as `::1`.
+pub fn bind_endpoint(
+    server_config: quinn::ServerConfig,
+    listen: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(listen),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if listen.is_ipv6() {
+        socket.set_only_v6(!listen.ip().is_unspecified())?;
+    }
+    socket.bind(&listen.into())?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into(),
+        runtime,
+    )
+}
+
 /// Binds a QUIC server endpoint on `listen` and serves the client edge on it.
 ///
 /// Runs until the endpoint stops yielding connections. `registry` is the snapshot
@@ -167,7 +194,7 @@ pub async fn run(
     mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<quinn::Connection>>,
 ) -> Result<(), ServerError> {
-    let endpoint = quinn::Endpoint::server(server_config, listen)?;
+    let endpoint = bind_endpoint(server_config, listen)?;
     serve_reader(
         endpoint,
         registry,
@@ -311,7 +338,7 @@ async fn serve_reader(
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(connection)) => {
                             tracing::info!(
-                                remote = %connection.remote_address(),
+                                remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                                 "mesh accept queue full; refusing connection",
                             );
                             connection.close(

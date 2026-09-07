@@ -237,7 +237,7 @@ async fn connect_client(
     roots.add(ca.clone()).unwrap();
     let cfg = client_config(roots).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mut ep = quinn::Endpoint::client(bind).unwrap();
+    let ep = quinn::Endpoint::client(bind).unwrap();
     ep.set_default_client_config(cfg);
     let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
     handshake(&conn, &token, &client_key).await?;
@@ -1495,7 +1495,7 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     let cfg = rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)
         .map_err(|e| format!("building mesh client config: {e}"))?;
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mut ep = quinn::Endpoint::client(bind)?;
+    let ep = quinn::Endpoint::client(bind)?;
     ep.set_default_client_config(cfg);
     let connection = ep.connect(relay_b.addr, "localhost")?.await?;
 
@@ -1543,7 +1543,7 @@ async fn dial_and_send_hello(
     use rally_point_proto::version::ProtocolVersion;
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mut ep = quinn::Endpoint::client(bind)?;
+    let ep = quinn::Endpoint::client(bind)?;
     ep.set_default_client_config(cfg);
     let connection = ep.connect(addr, "localhost")?.await?;
     let mut hello_stream = connection.open_uni().await?;

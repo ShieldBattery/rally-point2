@@ -142,7 +142,7 @@ fn start_relay_with_mesh(
 fn client_endpoint(ca: &CertificateDer<'static>) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).unwrap();
-    let mut endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     endpoint.set_default_client_config(client_config(roots).unwrap());
     endpoint
 }

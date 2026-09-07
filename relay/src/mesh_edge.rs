@@ -419,7 +419,7 @@ pub async fn run_mesh_accept(
             {
                 tracing::warn!(
                     peer_id = peer_id.0,
-                    remote = %connection.remote_address(),
+                    remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                     reason = %refusal,
                     "refusing mesh peer: identity check failed",
                 );
@@ -432,7 +432,7 @@ pub async fn run_mesh_accept(
 
             tracing::info!(
                 peer_id = peer_id.0,
-                remote = %connection.remote_address(),
+                remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
                 "mesh link established (accept side)",
             );
 
@@ -618,7 +618,7 @@ pub async fn run_mesh_dial_with(
         }
     };
     let bind: SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, 0).into();
-    let mut endpoint = match quinn::Endpoint::client(bind) {
+    let endpoint = match quinn::Endpoint::client(bind) {
         Ok(ep) => ep,
         Err(error) => {
             tracing::error!(%error, "binding mesh dial endpoint; not dialing peer");
@@ -772,7 +772,7 @@ async fn dial_and_serve(
     tracing::info!(
         our_id = our_id.0,
         peer_id = peer_id.0,
-        remote = %connection.remote_address(),
+        remote = ?connection.path(quinn::PathId::ZERO).and_then(|path| path.remote_address().ok()),
         "mesh link established (dial side)",
     );
 
@@ -956,7 +956,7 @@ mod tests {
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {

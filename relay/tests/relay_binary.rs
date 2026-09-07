@@ -58,7 +58,7 @@ async fn a_client_connects_through_a_self_signed_relay_and_exchanges_a_turn() ->
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.ca.clone()).unwrap();
     let client_cfg = client_config(roots).unwrap();
-    let mut client_endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let client_endpoint = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     client_endpoint.set_default_client_config(client_cfg);
 
     let tenant_pair = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();

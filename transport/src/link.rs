@@ -1514,7 +1514,7 @@ mod tests {
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let accept = {
@@ -1916,7 +1916,7 @@ mod tests {
         let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client_ep = quinn::Endpoint::client(bind).unwrap();
+        let client_ep = quinn::Endpoint::client(bind).unwrap();
         client_ep.set_default_client_config(client_cfg);
 
         let accept = {

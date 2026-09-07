@@ -404,7 +404,7 @@ mod tests {
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let server_task = tokio::spawn(async move {
@@ -444,7 +444,7 @@ mod tests {
         let server = quinn::Endpoint::server(server_cfg, bind).unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(client_cfg);
 
         let server_task = tokio::spawn(async move {
@@ -510,7 +510,7 @@ mod tests {
         let mismatched_cfg =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;
@@ -562,7 +562,7 @@ mod tests {
         let mismatched_cfg =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
-        let mut client = quinn::Endpoint::client(bind).unwrap();
+        let client = quinn::Endpoint::client(bind).unwrap();
         client.set_default_client_config(mismatched_cfg);
 
         let client_result = client.connect(server_addr, "localhost").unwrap().await;

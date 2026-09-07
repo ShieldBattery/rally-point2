@@ -19,6 +19,7 @@ parking_lot = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 ring = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 # `signal` (on top of the workspace features) for the coordinated-drain shutdown
 # path: ctrl_c everywhere, plus SIGTERM on Linux/Fargate.
