@@ -53,7 +53,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
@@ -226,6 +226,39 @@ const RESUME_ANCHOR_INVALID_CLOSE: u32 = 0x09;
 /// a fresh dial re-admits with its own new provisional window, so this only
 /// ever delays a legitimate session, never bricks it.
 pub const PROVISIONAL_EXPIRED_CLOSE: u32 = 0x0A;
+
+/// QUIC application close code for a connection the relay closes because the
+/// client stopped producing turns while its session advanced past it — its game
+/// thread hung, or its process was suspended — and the lockstep simulation
+/// cannot proceed until the slot is out. Distinct from every other close so the
+/// cause is readable in a client's logs: nothing was wrong with the link.
+const SILENT_SLOT_CLOSE: u32 = 0x0D;
+
+/// Why a slot's shutdown signal was fired. The signaler stores it on the roster
+/// entry before waking the slot's link task, which reads it to pick the log line
+/// and QUIC close code that describe the cause. Anything unrecognized reads as
+/// [`Unspecified`](Self::Unspecified), so a torn or absent value degrades to the
+/// generic close rather than a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SlotCloseReason {
+    /// No more specific cause: the slot fell hopelessly behind and is being
+    /// isolated, or a terminal directive (a coordinator reap, a final mesh
+    /// leave) asked for its link to end.
+    Unspecified = 0,
+    /// The slot's client stopped producing turns while its session advanced past
+    /// it, stalling every other player behind it.
+    SilentSlot = 1,
+}
+
+impl SlotCloseReason {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            raw if raw == Self::SilentSlot as u8 => Self::SilentSlot,
+            _ => Self::Unspecified,
+        }
+    }
+}
 
 /// Whether a client's `GameResult` control frame should be forwarded to
 /// `consensus::record_result`, or dropped at ingress before it ever reaches the
@@ -448,6 +481,10 @@ pub struct SlotEntry {
     /// different connection may have taken over in the meantime.
     connection_epoch: u64,
     shutdown: Arc<Notify>,
+    /// The [`SlotCloseReason`] behind the pending `shutdown` signal, stored here
+    /// before the signal is fired. Shared with the link task, which reads it when
+    /// it wakes.
+    close_reason: Arc<AtomicU8>,
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
     /// arriving (see [`crate::provisional`]). Separate from `shutdown` so the
@@ -478,6 +515,8 @@ pub struct SlotInbox {
     /// [`SlotEntry::probe_push`]).
     probe_push_rx: mpsc::Receiver<u64>,
     shutdown: Arc<Notify>,
+    /// Why the `shutdown` signal was fired (see [`SlotEntry::close_reason`]).
+    close_reason: Arc<AtomicU8>,
     /// The provisional-reap signal (see [`SlotEntry::provisional_reap`]).
     provisional_reap: Arc<Notify>,
 }
@@ -657,6 +696,7 @@ pub fn register(
     // unfenced rather than blocking the relay's coordinator connection.
     let (probe_tx, probe_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
     let shutdown = Arc::new(Notify::new());
+    let close_reason = Arc::new(AtomicU8::new(SlotCloseReason::Unspecified as u8));
     let provisional_reap = Arc::new(Notify::new());
     {
         let mut roster = sessions.lock();
@@ -679,6 +719,7 @@ pub fn register(
                 probe_push: probe_tx,
                 connection_epoch,
                 shutdown: Arc::clone(&shutdown),
+                close_reason: Arc::clone(&close_reason),
                 provisional_reap: Arc::clone(&provisional_reap),
             },
         );
@@ -701,6 +742,7 @@ pub fn register(
         phase_push_rx: phase_rx,
         probe_push_rx: probe_rx,
         shutdown,
+        close_reason,
         provisional_reap,
     };
     Some((registration, inbox))
@@ -1240,6 +1282,41 @@ pub fn announce_slot_present(
 /// peer path: the slot stays occupied until its own task acts on the signal and
 /// deregisters itself, so no replacement can register a second sender in the interim.
 pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    signal_close(
+        sessions,
+        key,
+        slots,
+        SlotCloseReason::Unspecified,
+        "closing slot link after terminal directive",
+    );
+}
+
+/// Closes the links of `slots` in the `key` routing group because their clients
+/// stopped producing turns while the session advanced past them (see
+/// [`crate::consensus::run_silence_watch`]). Identical to [`close_slots`] but for
+/// the reason it stamps, which is what makes the closed connection carry
+/// [`SILENT_SLOT_CLOSE`] instead of the generic close: a client whose game thread
+/// hung has a perfectly healthy link, and its log should say so.
+pub fn close_slots_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    signal_close(
+        sessions,
+        key,
+        slots,
+        SlotCloseReason::SilentSlot,
+        "closing slot link after silent-slot eviction",
+    );
+}
+
+/// Stamps `reason` on each named slot's roster entry and fires its shutdown
+/// signal, logging `message`. The stamp lands before the signal, so the woken
+/// link task always reads the reason for the wake it is answering.
+fn signal_close(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slots: &[SlotId],
+    reason: SlotCloseReason,
+    message: &'static str,
+) {
     let roster = sessions.lock();
     let Some(group) = roster.get(key) else {
         return;
@@ -1250,8 +1327,9 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,
                 slot = slot.0,
-                "closing slot link after terminal directive",
+                "{message}",
             );
+            entry.close_reason.store(reason as u8, Ordering::Release);
             entry.shutdown.notify_one();
         }
     }
@@ -1387,6 +1465,7 @@ pub async fn run_slot_link(
         mut phase_push_rx,
         mut probe_push_rx,
         shutdown,
+        close_reason,
         provisional_reap,
     } = inbox;
     // Cloned (cheap — every field is an `Arc`) before the destructure below
@@ -2683,6 +2762,12 @@ pub async fn run_slot_link(
                                 },
                             );
                             consensus::record_slot_started(&decision_makers, &key, slot);
+                            // Only this relay hears the report, and every relay
+                            // serving the session needs it: its silent-slot
+                            // watch cannot weigh a slot it does not know has
+                            // left loading behind. Peers record it and stop
+                            // there -- reporting the load stays this home's job.
+                            crate::mesh::fan_out_slot_started(&mesh_links, &key, slot);
                         }
                     }
                     // The client's lobby command. Admit it against the relay's
@@ -2917,15 +3002,33 @@ pub async fn run_slot_link(
                 }
             }
             _ = shutdown.notified() => {
-                // The relay is isolating this slot: it fell hopelessly behind and was
-                // back-pressuring its peers. Close the link and leave; deregistration
-                // below then frees the slot, only now that this task is actually gone.
-                tracing::info!(
-                    tenant = key.tenant.as_ref(),
-                    session = key.session.0,
-                    slot = slot.0,
-                    "isolating lagging slot; closing connection",
-                );
+                // Something asked for this slot's link to end. Close it and leave;
+                // deregistration below then frees the slot, only now that this task is
+                // actually gone. The reason the signaler stamped picks the close code:
+                // a silenced slot's link was healthy, so saying "isolated" for it would
+                // send whoever reads the client's log after the wrong problem.
+                match SlotCloseReason::from_raw(close_reason.load(Ordering::Acquire)) {
+                    SlotCloseReason::SilentSlot => {
+                        tracing::info!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "slot stopped producing turns; closing connection",
+                        );
+                        link.connection().close(
+                            VarInt::from_u32(SILENT_SLOT_CLOSE),
+                            b"slot stopped producing turns",
+                        );
+                    }
+                    SlotCloseReason::Unspecified => {
+                        tracing::info!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            "isolating lagging slot; closing connection",
+                        );
+                    }
+                }
                 break 'serve;
             }
             _ = provisional_reap.notified() => {
@@ -2962,8 +3065,8 @@ pub async fn run_slot_link(
     // slot, an out-of-range resume anchor); a redundant close on one already
     // closing is a no-op. The paths that didn't — a plain client disconnect
     // (`link.recv()`'s own `Err` arm), a maintenance-flush send failure, and
-    // notably the lagging-slot isolation signal (whose own comment above
-    // says "close the link" but never actually did) — need this: the beacon
+    // and the shutdown signal's generic branch, which logs and breaks without
+    // a close of its own — need this: the beacon
     // and control-stream reader tasks spawned above each hold their own
     // `connection.clone()`, parked on `accept_uni`/`accept_bi`, so `link`'s
     // own handle going out of scope at the end of this function is never the
@@ -4765,7 +4868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_slots_signals_a_held_slot_and_is_a_no_op_for_an_absent_one() {
+    async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one() {
         let sessions: Sessions = Arc::default();
         let k = key();
         let (mut g0, inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
@@ -4790,6 +4893,22 @@ mod tests {
         assert!(
             sessions.lock().get(&k).unwrap().contains_key(&SlotId(0)),
             "close_slots signals, it does not yank the roster entry",
+        );
+        assert_eq!(
+            SlotCloseReason::from_raw(inbox0.close_reason.load(Ordering::Acquire)),
+            SlotCloseReason::Unspecified,
+            "a terminal directive names no more specific cause",
+        );
+
+        // A silence eviction stamps its own reason before signaling, so the woken
+        // link task can close with the code that names it.
+        close_slots_for_silence(&sessions, &k, &[SlotId(0)]);
+        tokio::time::timeout(Duration::from_millis(100), inbox0.shutdown.notified())
+            .await
+            .expect("the held slot is signaled to close");
+        assert_eq!(
+            SlotCloseReason::from_raw(inbox0.close_reason.load(Ordering::Acquire)),
+            SlotCloseReason::SilentSlot,
         );
     }
 

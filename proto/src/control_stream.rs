@@ -507,6 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_started_frame_round_trips_through_the_shared_framing() {
+        use crate::messages::SlotStarted;
+
+        // Mesh-only: a client's game-started report reaches its home relay on the
+        // client-edge stream carrying no slot at all, and the home shares it with
+        // its peers as this frame, stamped with the authenticated slot.
+        let frame = MeshControlFrame {
+            session: 12,
+            kind: Some(mesh_control_frame::Kind::SlotStarted(SlotStarted {
+                slot: 4,
+            })),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame);
+        match decoded.kind {
+            Some(mesh_control_frame::Kind::SlotStarted(ss)) => assert_eq!(ss.slot, 4),
+            other => panic!("expected SlotStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn slot_connectivity_frames_round_trip_through_the_shared_framing() {
         use crate::messages::SlotConnectivity;
 

@@ -1180,6 +1180,18 @@ message MeshControlFrame {
     // rejection leaves the drop undecided — never a frame-scheduled fallback,
     // which is exactly the unsoundness finalization exists to remove.
     FinalizeDropResult finalize_drop_result = 16;
+
+    // One of the sending relay's home clients reported that its game loop is
+    // running. The report itself rides that client's own reliable control
+    // stream, so it only ever reaches the slot's home relay; this shares it so
+    // every relay serving the session knows the slot has left loading behind.
+    // A receiving relay records it in its own session state ONLY -- the home
+    // alone reports the slot up its coordinator connection, so a shared report
+    // never double-counts a load. Not re-broadcast (the origin already sent a
+    // copy to every peer, the same no-echo rule the other kinds follow), and
+    // idempotent: the accumulated set is a set, so the join reconcile and a
+    // re-announce on a redialed link cost nothing. See `SlotStarted`.
+    SlotStarted slot_started = 17;
   }
 }
 
@@ -1409,6 +1421,27 @@ message SlotPresent {
   // The slot that registered, authoritative at its home relay (never a
   // client-asserted value — the home relay binds it to the authenticated
   // connection's token slot).
+  uint32 slot = 1;
+}
+
+// A relay's announcement to its mesh peers that one of its home clients
+// reported its game loop running. Carried in a `MeshControlFrame`.
+//
+// A client's game-started report reaches only the relay that homes it, but the
+// relay-side judgement that needs it -- the silent-slot watch, which must not
+// weigh the forwarded turns of a slot that may still be flushing lobby traffic
+// through its load -- runs on every relay serving the session. The home
+// therefore shares each report, at the moment it records one and again for
+// every started home slot whenever a mesh link (re)joins, so a peer that
+// arrives late or replaces another still converges on the full set.
+//
+// Additive: a peer that predates this frame ignores it, and its silent-slot
+// watch simply has no start report for another relay's slots, which stands that
+// watch down for the cross-relay session rather than misjudging it.
+message SlotStarted {
+  // The slot that reported, authoritative at its home relay. Never a
+  // client-asserted value: the client's report carries no slot at all, and the
+  // home binds it to the authenticated connection it arrived on.
   uint32 slot = 1;
 }
 

@@ -730,6 +730,113 @@ naming the slot, the reason, and the apply frame; it is broadcast to clients (id
 decision seq exactly like the buffer directive) and carried across the mesh in a **`SlotDeparted`** record
 so every relay, and any relay promoted to authority afterward, derives the identical leave.
 
+A drop needs a link death to start from, and a client can stop stepping without one: a hung game thread
+or a suspended process keeps answering keepalives, so its link stays up while lockstep holds every other
+player still behind it, and a drop request against a connected slot is ignored. The relay closes that gap
+with **silent-slot eviction**: a per-relay watch (every 2s) closes the link of the slot it homes that
+stopped feeding the session first.
+
+Naming *which* slot is the whole problem, because every per-slot quantity a client supplies — how many
+turns it sent, what frame they stamp, how far ahead their seqs run — is padding the hostile client
+chooses freely. A client that withholds one required turn while streaming higher ones would, by any of
+those measures, look like the busiest player in the game while its opponents starved on the missing turn,
+and blame would land on them. So the watch reads exactly one thing, and it is the relay's own: **the time
+each slot's gap-free forwarded prefix last advanced** — the forward-once gate's contiguous prefix of turns
+this relay actually delivered to local clients, which moves only when the turns below it genuinely
+arrived. Withholding a turn stops the withholder's own prefix dead at the gap; its opponents keep
+consuming what it already sent until their buffers empty, so their prefixes stop strictly *later*. A
+prefix the gate's sparse-set cap pushed forward over a gap does not count as an advance, and freezes that
+slot's clock from then on, so flooding far-ahead seqs to force one buys nothing.
+
+The verdict rests on **complete knowledge of the session**. Naming a culprit is a claim about every
+participant lockstep still waits on, so each of them must resolve to a stop time the relay can vouch for;
+one it cannot account for is a hole in the evidence, not a non-blocker, and a hole names nobody. Every rule
+below is that principle applied, and each of them fails *closed*.
+
+The participants compared are the **session descriptor's expected roster** — the slots the coordinator said
+this game is played by — not whichever slots the relay happens to hold state for. A roster slot with neither
+live state nor a departure record here has no stop time at all, so no verdict is available while one exists:
+two clients replaying into a resumed session whose third player has yet to connect are stalled by that third
+player, and letting an absent participant contribute nothing would blame whichever of the two stopped first.
+A descriptor that carried no roster (a standalone relay, a dev-injected descriptor) leaves the union of live
+and departed slots as the only participant set there is.
+
+**A participant that has not reported its game loop running is unknown too.** Lobby commands ride
+their own path and never reach the forward gate, but a client's pre-loop seed payloads — the
+initial-buffer turns it flushes right before its loop begins — do, so a slot can advance its forwarded
+prefix before it has simulated a single frame, while the players who finished loading sit waiting for
+its first simulated turn. Such advances measure traffic, not simulation, and from the relay the two are
+indistinguishable. Weighing them would
+make one of the *loaded* players the earliest stopper and close the link of the player who was ready
+first, so a slot with no start report resolves to no stop time at all and blocks, exactly like an
+unregistered roster slot. It is never nameable either: a loader is not a culprit.
+
+The report rides a client's own reliable control stream and so reaches only the relay that homes it,
+while the watch runs on every relay serving the session — so **the home shares that report over the
+mesh** (`SlotStarted`), at the moment it records one and again for every started home slot whenever a
+mesh link (re)joins, so a peer that arrives late or replaces another converges on the full set. A relay
+that receives one records it and stops: it does not re-broadcast (no echo) and it does not report the
+slot up its own coordinator connection, which stays the home's job, so one client's load is never
+attributed twice. The frame is additive, so a peer that predates it simply never learns another relay's
+slots started and stands its own watch down for that cross-relay session — the safe direction.
+
+A **resumed (re-homed) session stands the watch down entirely**. On a fresh relay the forward gate bases
+every slot's prefix at seq 0, while a returning client's retained history legitimately begins above it — its
+retention cap discarded the low seqs long ago. At the gate those two are indistinguishable: an honest client
+with incomplete coverage looks exactly like one withholding its first turns, its prefix never advances, and
+its clock sits at the session start forever. Forward-prefix clocks are simply not evidence after a re-home.
+The principled fix, not yet built (`TODO(rp2-silence-rehome)`), is to base each origin's gate prefix on a
+resumed session at the lowest seq any *other* local client's resume cursor still needs from that origin — a
+client-claimed value taken only in the direction that asks for *more* replay, never less — which would anchor
+the gate where the survivors actually resume and restore eviction there.
+
+A **decided leave stays in the comparison until the survivors have recovered from it**: a departed slot is
+retired only once every live participant's stop time is later than the instant the relay decided (or observed)
+that leave, and never merely because the decision exists. Deciding a leave is not the same as the survivors
+receiving and applying the directive, and until each of them has demonstrably stepped past it, their stalled
+clocks are still the departed slot's doing — retiring it at the decision would hand the blame straight to the
+players it stalled, who by then all sit past the window. Retirement is one-way. The degenerate case is
+accepted deliberately: a survivor that genuinely hangs at the very moment another slot leaves keeps that slot
+in the comparison indefinitely and so is never named, which is the safe direction. A slot held for an
+*undecided* drop was always in the comparison for the same reason — it froze at exactly the moment the
+survivors' stall began.
+
+Among the participants, the slot closed is the one that stopped at least a window ago
+(`--silent-slot-window-secs`, default 10s) and **strictly earlier than every other participant**. Ties name
+nobody: a session that stopped all at once has no victim, and a slot with no other participant left to be
+earlier than is holding nobody up. Being nameable at all additionally requires that this relay strictly homes
+the slot (only the home owns its link), that its connection is up with no departure or decided leave, that its
+link has been up at least a window, and that it has reported its game loop running.
+
+A slot that has forwarded nothing since the session started **stopped when the session started** — the
+earliest stop time there is, so it is the slot named as soon as it has reported its game loop running.
+That fallback is the relay's own start latch and never anything the slot says about itself: a client can
+withhold its seed payloads entirely and delay reporting its loop, and if its own report dated its silence it
+would carry a stop time *later* than the opponents who seeded and then stalled waiting for it — handing
+them the blame. The started report supplies no timestamp of its own, and an honest client seeds within
+milliseconds of reporting, which moves its clock the only way a clock moves here.
+
+A slot's stop time **never moves except by forwarding**. A reconnected link is owed a full window before
+it can be evicted — it has had no chance to forward anything yet — but its stop time stays where its
+prefix actually stopped. Resetting it on reconnect would be the same mistake as trusting a client-supplied
+count: a client that hangs and redials would look like the freshest slot in the session, and the players
+it stalled — who really did stop earlier — would become the earliest stoppers and be closed in its place.
+The redialing slot is exempt only for the window after its link came up, and is then closed anyway if its
+prefix still has not advanced. A genuinely healthy replacement needs nothing more: its first forwarded
+turn moves its clock on its own, and unblocks the survivors' turns behind it.
+
+A session where anyone is still loading therefore names nobody at all — not by a gate of its own, but
+because an unreported participant has no clock, and the app server's load timeout owns a session that
+never finishes loading.
+
+The close is manufactured link death and nothing more — the departure record, drop hold, survivors'
+countdown, and honored request are the ordinary path — but a slot evicted this way is refused readmission
+for the rest of the session, since reconnecting cannot restart a dead simulation and admitting it would
+clear the hold and restart the survivors' countdown on every redial. The close carries its own QUIC code
+(`SILENT_SLOT_CLOSE`) and a `slot_evicted_silent` flight event recording how long the slot had been
+stopped and by how much it led the next-earliest, so a client log and a recording both say the link was
+healthy and the game was not.
+
 The apply frame is the subtle part. A departing client's own `game_frame_count` cannot be trusted to set
 it — a malicious client could name an unreachable future frame and stall every honest survivor forever — so
 the leave's apply frame is **clamped to a survivor-reachable ceiling**: the highest frame the survivors have
@@ -1303,7 +1410,20 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   scrape targets (scale-to-zero makes them transient) — fleet health exports coordinator-side; no
   alerting until production baselines exist.
 - **No auto-drop of disconnected players.** Holds are decided only by a survivor's `RequestDrop`
-  (30s relay floor) or the 45s abandoned-session force-decide.
+  (30s relay floor) or the 45s abandoned-session force-decide. Silent-slot eviction does not change
+  this: it manufactures the *disconnect* for a connected slot that stopped producing turns, and the
+  hold it leaves behind is decided exactly as any other. The slot it names is chosen from
+  relay-authored evidence alone — the order in which slots' forwarded prefixes stopped advancing. No
+  client-supplied count, frame stamp, or seq may pick a victim: each is padding the hostile client
+  chooses (see "silent-slot eviction").
+- **The silence verdict requires complete knowledge, and every gap in it blocks.** The participants
+  compared are the descriptor's expected roster; a roster slot the relay holds no state for, a
+  participant with no game-started report (shared home-to-peer over the mesh so every relay has the
+  same set), a decided leave the survivors have not yet visibly resumed past, and every slot on a
+  re-homed session all block the verdict rather than counting for nothing. Each of the three false-eviction paths this
+  closed came from the opposite default — a state the relay could not see silently reading as "not a
+  blocker" — so a future "the watch is too quiet" fix belongs in *widening what the relay can vouch
+  for* (the re-home gate anchor of `TODO(rp2-silence-rehome)`), never in letting an unknown pass.
 - **Buffer-one micro-stalls are fixed by send-phase alignment, not buffer depth.** Holding depth
   two costs a full turn of latency to hide a few-millisecond phase artifact; the phase controller
   (see "Send-phase alignment") removes the artifact at depth one. Client stall telemetry stays

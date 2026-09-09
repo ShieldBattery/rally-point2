@@ -216,6 +216,17 @@ struct Cli {
     /// runs.
     #[arg(long, env = "RELAY_IDLE_UNENROLLED_EXIT_SECS", default_value_t = 900)]
     idle_unenrolled_exit_secs: u64,
+
+    /// How long a slot this relay homes may send this relay's local clients no
+    /// turns, having stopped before every other slot in its session did, before
+    /// the relay closes its link so the other players can drop it. Covers the
+    /// client whose game thread hung or whose process was suspended: its QUIC
+    /// link keeps answering keepalives, so nothing else ever sees it leave, and
+    /// lockstep holds every other player still behind it. `0` disables the watch
+    /// entirely — the session then stalls until everyone quits, which is what
+    /// this exists to prevent.
+    #[arg(long, env = "RELAY_SILENT_SLOT_WINDOW_SECS", default_value_t = 10)]
+    silent_slot_window_secs: u64,
 }
 
 /// How long the drain sequence waits for the coordinator's `DrainAck` before
@@ -387,6 +398,21 @@ async fn main() -> Result<()> {
         Arc::clone(&mesh_state.decision_makers),
         rally_point_relay::flight_recorder::SAMPLE_INTERVAL,
     ));
+
+    match cli.silent_slot_window_secs {
+        0 => tracing::info!(
+            "silent-slot eviction disabled; a client that stops producing turns will stall its session",
+        ),
+        secs => {
+            tracing::info!(window_secs = secs, "silent-slot eviction enabled");
+            tokio::spawn(rally_point_relay::consensus::run_silence_watch(
+                Arc::clone(&mesh_state.decision_makers),
+                Arc::clone(&sessions),
+                Duration::from_secs(secs),
+                rally_point_relay::consensus::SILENCE_CHECK_INTERVAL,
+            ));
+        }
+    }
 
     // A read handle onto the coordinator control-connection state, hoisted out of
     // the coordinator-config block so the idle self-exit can watch it. Populated

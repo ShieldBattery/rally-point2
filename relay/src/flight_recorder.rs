@@ -121,6 +121,22 @@ pub enum FlightEvent {
     SlotConnected { slot: u8, resumed: bool },
     /// A client's link ended (any exit: clean leave, drop, isolation).
     SlotDisconnected { slot: u8 },
+    /// The relay closed a slot's link because its turns stopped reaching the
+    /// session's other players while everyone else's kept arriving — a hung game
+    /// thread or a suspended process behind a link that kept answering
+    /// keepalives. Lockstep cannot advance past such a slot, and the survivors'
+    /// drop machinery only fires for a slot the relay saw disconnect, so the
+    /// relay manufactures the disconnect here; the
+    /// [`SlotDisconnected`](Self::SlotDisconnected) and
+    /// [`DropHeld`](Self::DropHeld) that follow are the ordinary link-death path
+    /// doing the rest. `silent_ms` is how long ago this slot's forwarded turns
+    /// stopped; `lead_ms` how much earlier that was than the next-earliest slot
+    /// the session still needed — the entire margin the eviction rested on.
+    SlotEvictedSilent {
+        slot: u8,
+        silent_ms: u64,
+        lead_ms: u64,
+    },
     /// This relay (as session authority) decided the synced leave for a slot.
     LeaveDecided {
         slot: u8,

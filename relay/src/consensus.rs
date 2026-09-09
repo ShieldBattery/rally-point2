@@ -838,6 +838,31 @@ struct SlotState {
     /// at, so a stamp that arrives out of order (a lower seq after a higher one)
     /// is told apart from a stamp that genuinely went backwards.
     newest_framed_seq: Option<u64>,
+    /// The silence watch's per-slot clock: when this slot's gap-free prefix of
+    /// forwarded turns last genuinely advanced (see
+    /// [`note_forward_advance`](DecisionMaker::note_forward_advance)), or when
+    /// the slot was last given a fresh link and so a fresh window to advance it
+    /// in. `None` until either happens;
+    /// [`silent_slot`](DecisionMaker::silent_slot) then measures from the
+    /// session's own start instead.
+    ///
+    /// Deliberately not stamped by anything a client asserts. A turn's arrival,
+    /// its frame stamp, and how far ahead its seq runs are all the client's
+    /// choice; the forwarded prefix moves only when the turns below it really
+    /// arrived, which is what makes this the one progress measure the watch can
+    /// assign blame from.
+    last_forward_advance_at: Option<Instant>,
+    /// When this slot's current connection generation was accepted here, or when
+    /// a reinstated departure restored the slot onto a fresh link. `None` for a
+    /// generation activated before this relay held any state for the slot, which
+    /// is the original connection: it has been up for as long as the relay has
+    /// known the slot at all.
+    ///
+    /// The silence watch owes a link this young a full window before it may
+    /// close it — a connection that just came up has had no chance to forward
+    /// anything yet. Deliberately separate from `last_forward_advance_at`: a new
+    /// link buys the slot *time*, never a newer stop time.
+    connection_up_at: Option<Instant>,
     /// Whether the backwards-stamp tripwire (see
     /// [`DecisionMaker::observe_turn_frame`]) has already fired for this slot.
     /// It reports once: a client whose counter restarted stamps below the
@@ -1638,10 +1663,47 @@ pub struct DecisionMaker {
     /// the whole set: the matching notice is dropped once its send succeeds, so
     /// the beat is what survives a coordinator losing or forgetting one.
     connected_slots: HashSet<SlotId>,
-    /// Every slot whose game-loop report this relay accepted. Grows
-    /// monotonically and is restated on every heartbeat, for the same reasons as
-    /// `connected_slots`.
+    /// Every slot whose game-loop report this relay accepted **from its own home
+    /// client**. Grows monotonically and is restated on every heartbeat, for the
+    /// same reasons as `connected_slots` — and stays home-only precisely so the
+    /// heartbeat keeps meaning "the slots I myself watched start", with no relay
+    /// restating another relay's slot to the coordinator. It is also the set the
+    /// home shares over the mesh when a link (re)joins.
     started_slots: HashSet<SlotId>,
+    /// Slots a peer relay reported started over the mesh (`SlotStarted`), which
+    /// only ever names slots that peer homes. Kept apart from `started_slots` so
+    /// nothing this relay reports upward is second-hand; the two are read as a
+    /// union wherever the question is simply whether a slot has left loading
+    /// behind (see [`has_started`](Self::has_started)).
+    peer_started_slots: HashSet<SlotId>,
+    /// Slots this relay closed for producing no turns while the session advanced
+    /// past them (see [`silent_slot`](Self::silent_slot)). Kept so a
+    /// re-dialing client whose simulation is dead is refused rather than
+    /// readmitted: readmission would clear the survivors' drop hold and restart
+    /// their countdown on every redial, which is the stall this eviction exists
+    /// to end. Only the slot's home ever marks one, since only the home closed
+    /// the link.
+    silence_evicted: HashSet<SlotId>,
+    /// When each decided leave was decided here, on this relay's monotonic
+    /// clock: the instant this relay authored the decision, or the instant a
+    /// peer authority's directive for the slot arrived. The silence watch keeps
+    /// a decided slot among the participants it compares until every live
+    /// participant has forwarded something after this instant — the survivors'
+    /// stalled clocks are explained by the slot that left until each of them
+    /// demonstrably resumed past the leave (see [`silent_slot`](Self::silent_slot)).
+    /// Bounded by the slot count (<=12).
+    decided_leave_at: HashMap<SlotId, Instant>,
+    /// Decided leaves every live participant has demonstrably resumed past, so
+    /// the silence watch no longer counts them among the session's participants.
+    /// One-way: a slot enters when that recovery test passes and never leaves,
+    /// so a stop time that later moves backwards (a reconnect seeding fresh
+    /// state) cannot put a long-gone slot back into the comparison.
+    recovered_leaves: HashSet<SlotId>,
+    /// Whether the silence watch has already recorded, for this session, that a
+    /// resumed descriptor stands it down. The watch re-examines every session
+    /// every couple of seconds and the reason it declines is a property of the
+    /// session, so it is worth saying once and never again.
+    resume_stand_down_logged: bool,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start,
     /// restated on every heartbeat: this relay's own coverage latch where the
     /// latch fires here, otherwise the moment it adopted the authority's
@@ -1742,13 +1804,49 @@ pub struct DecisionMaker {
     /// left to conceal, and a slot connecting afterwards must still be told.
     region_labels_released: bool,
     /// When this relay latched the session started, on its own monotonic clock.
-    /// The region-label release gate measures from here. Set exactly once, by
+    /// The region-label release gate measures from here, and so does
+    /// [`silent_slot`](Self::silent_slot): it is the stop time of every slot that
+    /// has forwarded nothing since the session began. Set exactly once, by
     /// [`latch_started`](Self::latch_started) — every path that starts a session
     /// funnels through it — so a re-delivered start directive (an authority
-    /// handoff re-firing, a late slot's re-push) cannot push the clock forward
-    /// and defer the release indefinitely. `None` until the session starts,
-    /// which holds the gate shut.
+    /// handoff re-firing, a late slot's re-push) cannot push the clock forward,
+    /// deferring the release indefinitely or making a slot that has forwarded
+    /// nothing look like it stopped later than it did. `None` until the session
+    /// starts, which holds both gates shut.
     started_at: Option<Instant>,
+}
+
+/// The slot the silence watch found holding up its session: the one whose turns
+/// stopped reaching this relay's local clients before anyone else's did.
+/// Produced by [`DecisionMaker::silent_slot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilentSlot {
+    pub slot: SlotId,
+    /// How long ago the slot stopped: since its gap-free forwarded prefix last
+    /// advanced, or — for a slot that has never advanced one — since the session
+    /// started.
+    pub silent_for: Duration,
+    /// How much earlier this slot stopped than the next-earliest slot the
+    /// session still requires — the whole margin the verdict rests on. In a real
+    /// stall it is about the survivors' buffer depth: the turns they could still
+    /// consume after the culprit's last one.
+    pub lead: Duration,
+}
+
+/// When a slot stopped: the last time its gap-free forwarded prefix genuinely
+/// advanced, or `session_started_at` for a slot that has never advanced one.
+///
+/// A slot that has forwarded nothing since the session began stopped at the
+/// beginning, by definition, and that is the earliest stop time there is. The
+/// fallback is deliberately the relay's own start latch rather than anything the
+/// slot reports: a client that forwards no turns at all and delays saying its
+/// game loop is running would otherwise carry a stop time later than the players
+/// who did seed and then stalled waiting for it, and the watch would close one of
+/// them instead.
+fn stopped_at(state: Option<&SlotState>, session_started_at: Instant) -> Instant {
+    state
+        .and_then(|state| state.last_forward_advance_at)
+        .unwrap_or(session_started_at)
 }
 
 /// One recorded departure as re-announced to a freshly (re)joined mesh link:
@@ -2907,6 +3005,11 @@ impl DecisionMaker {
             started: false,
             connected_slots: HashSet::new(),
             started_slots: HashSet::new(),
+            peer_started_slots: HashSet::new(),
+            silence_evicted: HashSet::new(),
+            decided_leave_at: HashMap::new(),
+            recovered_leaves: HashSet::new(),
+            resume_stand_down_logged: false,
             started_at_ms: None,
             resumed: false,
             finalized_drops_enabled: false,
@@ -3494,6 +3597,9 @@ impl DecisionMaker {
     /// home-client link. Unlike a mesh datagram, a local sample is an
     /// authoritative activation barrier for a replacement connection.
     fn activate_local_epochs(&mut self, conditions: &[SlotConditions]) {
+        // One instant for the batch, for the same reason `ingest_slots` takes
+        // one: these samples all arrived together.
+        let now = Instant::now();
         for condition in conditions {
             let (Ok(slot), Some(epoch)) = (
                 u8::try_from(condition.slot).map(SlotId),
@@ -3502,7 +3608,7 @@ impl DecisionMaker {
                 continue;
             };
             if !self.departures.contains_key(&slot) && !self.decided_leaves.contains_key(&slot) {
-                let _ = self.activate_connection_epoch(slot, epoch);
+                let _ = self.activate_connection_epoch(slot, epoch, now);
             }
         }
     }
@@ -3548,12 +3654,17 @@ impl DecisionMaker {
     /// Admits a reliable level=true frame after any departure/hold transition
     /// has completed. A down generation is terminal: only a distinct epoch can
     /// reopen it. Returns true when the requested generation is up afterward.
-    pub(crate) fn admit_connection_up(&mut self, slot: SlotId, observed: Option<u64>) -> bool {
+    pub(crate) fn admit_connection_up(
+        &mut self,
+        slot: SlotId,
+        observed: Option<u64>,
+        now: Instant,
+    ) -> bool {
         if self.departures.contains_key(&slot) || self.decided_leaves.contains_key(&slot) {
             return false;
         }
         match observed {
-            Some(epoch) => self.activate_connection_epoch(slot, epoch),
+            Some(epoch) => self.activate_connection_epoch(slot, epoch, now),
             None => !self.connection_states.contains_key(&slot),
         }
     }
@@ -3562,8 +3673,15 @@ impl DecisionMaker {
     /// A duplicate Up(E) is idempotent. Down(E) and every superseded epoch reject
     /// that epoch forever; a previously unseen distinct epoch may replace the
     /// current one once the departure record is gone.
+    ///
+    /// `now` records how long this slot's link has been up, which is what the
+    /// silence watch owes a freshly connected slot a window against (see
+    /// [`silent_slot`](Self::silent_slot)); it deliberately does not touch the
+    /// slot's stop time. The idempotent same-epoch return records nothing — a
+    /// client could otherwise renew that window forever by re-announcing the
+    /// generation it already holds.
     #[must_use]
-    pub fn activate_connection_epoch(&mut self, slot: SlotId, epoch: u64) -> bool {
+    pub fn activate_connection_epoch(&mut self, slot: SlotId, epoch: u64, now: Instant) -> bool {
         if self.departures.contains_key(&slot) || self.decided_leaves.contains_key(&slot) {
             return false;
         }
@@ -3589,6 +3707,7 @@ impl DecisionMaker {
             .insert(slot, ConnectionState::Up(epoch));
         if let Some(state) = self.slots.get_mut(&slot) {
             state.reset_link_conditions();
+            state.connection_up_at = Some(now);
         }
         true
     }
@@ -3618,6 +3737,18 @@ impl DecisionMaker {
             return ReconnectTransition {
                 admission: ReconnectAdmission::Rejected,
                 consume_hold: hold_pending,
+            };
+        }
+        // This slot's link was closed because its simulation stopped stepping
+        // while the session ran on past it, and reconnecting cannot restart a
+        // dead simulation. Admitting it would clear the survivors' drop hold and
+        // restart their countdown on every redial, leaving them stalled forever
+        // — so refuse, and deliberately do NOT consume the hold, which is what
+        // lets them decide the drop.
+        if self.silence_evicted.contains(&slot) {
+            return ReconnectTransition {
+                admission: ReconnectAdmission::Rejected,
+                consume_hold: false,
             };
         }
         // A drop mid-finalization is terminal-in-progress: the home has
@@ -3659,7 +3790,7 @@ impl DecisionMaker {
             after_reinstate();
         }
 
-        let admitted = self.admit_connection_up(slot, observed);
+        let admitted = self.admit_connection_up(slot, observed, Instant::now());
         debug_assert!(
             admitted,
             "a preclassified generation with no departure must be admissible"
@@ -4301,7 +4432,22 @@ impl DecisionMaker {
             },
         };
         self.decided_leaves.insert(slot, directive);
+        self.note_leave_decided(slot);
         Some(directive)
+    }
+
+    /// Stamps the instant `slot`'s leave became decided on this relay — its own
+    /// decision, or a peer authority's directive arriving. The silence watch
+    /// measures the survivors' recovery from the leave against this instant (see
+    /// [`silent_slot`](Self::silent_slot)), which is why every path that first
+    /// caches a decided leave stamps it: the watch cares that the leave is
+    /// decided, not who decided it. First stamp wins, so a re-announce cannot
+    /// push the recovery bar forward and re-protect a slot the survivors already
+    /// moved past.
+    fn note_leave_decided(&mut self, slot: SlotId) {
+        self.decided_leave_at
+            .entry(slot)
+            .or_insert_with(Instant::now);
     }
 
     /// The decision-and-cache step shared by [`decide_leave`] (behind the authority
@@ -4374,6 +4520,7 @@ impl DecisionMaker {
             final_turn_count,
         };
         self.decided_leaves.insert(slot, directive);
+        self.note_leave_decided(slot);
         Some(directive)
     }
 
@@ -4541,6 +4688,7 @@ impl DecisionMaker {
             final_turn_count,
         };
         self.decided_leaves.insert(slot, directive);
+        self.note_leave_decided(slot);
         Some(directive)
     }
 
@@ -4600,8 +4748,324 @@ impl DecisionMaker {
     /// Records that `slot` reported its game loop running, into the ever-started
     /// set the heartbeat restates. Idempotent for the same reason as
     /// [`note_slot_connected`](Self::note_slot_connected).
+    ///
+    /// Only a slot's own home receives this report, and the silence watch on
+    /// every relay needs it (see [`silent_slot`](Self::silent_slot)), so the home
+    /// also shares it across the mesh; the peer side lands in
+    /// [`note_peer_slot_started`](Self::note_peer_slot_started) instead, keeping
+    /// this set first-hand.
+    ///
+    /// The report deliberately supplies no timestamp to the watch: the moment a
+    /// client says it began is the client's to choose, and a slot that delays
+    /// saying so must not thereby look like it stopped later than the players
+    /// already waiting on it.
     pub fn note_slot_started(&mut self, slot: SlotId) {
         self.started_slots.insert(slot);
+    }
+
+    /// Records a peer relay's report that one of ITS home slots' game loops is
+    /// running (a mesh `SlotStarted`). Idempotent, and harmless for a slot this
+    /// relay homes: the two sets are only ever read as a union, so a crossed
+    /// report changes no answer. Deliberately does not touch `started_slots`,
+    /// which is what this relay restates to the coordinator — the home already
+    /// reported this slot, and a second relay reporting it would attribute the
+    /// same load twice.
+    pub fn note_peer_slot_started(&mut self, slot: SlotId) {
+        self.peer_started_slots.insert(slot);
+    }
+
+    /// Whether `slot`'s game loop is known to be running, from this relay's own
+    /// home client or a peer's shared report. The question every relay-side
+    /// judgement asks; which relay heard it first matters only to the coordinator
+    /// reporting, never here.
+    fn has_started(&self, slot: SlotId) -> bool {
+        self.started_slots.contains(&slot) || self.peer_started_slots.contains(&slot)
+    }
+
+    /// The slots this relay's own home clients have reported started, for the
+    /// home to (re)share with a mesh peer that just joined. First-hand only: a
+    /// relay never relays another relay's report, so a peer set converges from
+    /// each home directly and no report can loop the mesh.
+    pub fn started_home_slots(&self) -> Vec<SlotId> {
+        sorted_slots(&self.started_slots)
+    }
+
+    /// Records that `slot`'s gap-free prefix of forwarded turns advanced — that
+    /// turns this relay had never delivered before went out to its local clients
+    /// in order, closing no gap by fiat (see `mesh::Forwarded::prefix_advanced`,
+    /// which decides what counts). This is the silence watch's only progress
+    /// evidence, so `now` is the slot's stop clock being pushed forward.
+    ///
+    /// A slot with no live state here is not tracked: it left, or this relay has
+    /// no link measurements for it yet, and either way the watch does not judge
+    /// it.
+    pub fn note_forward_advance(&mut self, slot: SlotId, now: Instant) {
+        if let Some(state) = self.slots.get_mut(&slot) {
+            state.last_forward_advance_at = Some(now);
+        }
+    }
+
+    /// The slot whose turns stopped reaching this relay's local clients before
+    /// any other slot's did — the one holding lockstep up, and whose link this
+    /// relay should therefore close. A live QUIC link says nothing about whether
+    /// the game behind it is still stepping: keepalives keep flowing from a hung
+    /// game thread or a suspended process, and every other player is stalled
+    /// behind it with no way out. Reported so the caller can close the link,
+    /// after which the ordinary link-death path (departure record, drop hold,
+    /// survivors' countdown) resolves the slot like any other lost client.
+    ///
+    /// **The verdict rests on complete knowledge of the session.** Naming a
+    /// culprit is a claim about *every* participant lockstep still waits on, so
+    /// each of them must resolve to a stop time this relay can vouch for. A
+    /// participant it cannot account for is not a non-blocker — it is a hole in
+    /// the evidence, and a hole names nobody. Everything below is that principle
+    /// applied; none of it is an exception to it.
+    ///
+    /// Blame rests on one measurement and deliberately only one: the time each
+    /// slot's gap-free forwarded prefix last genuinely advanced (see
+    /// [`note_forward_advance`](Self::note_forward_advance)), falling back to the
+    /// session's own start instant for a slot that has never advanced one. Every
+    /// other per-slot quantity is the client's own choice — how many turns it
+    /// sent, what frame they stamp, how far ahead their seqs run — so any of them
+    /// can be padded by exactly the client this watch exists to catch. The
+    /// forwarded prefix cannot be: it moves only when the turns below it actually
+    /// arrived and went out, in order.
+    ///
+    /// That is what makes the *ordering* of stop times trustworthy. A client that
+    /// withholds one turn while streaming higher seqs stops its own prefix dead at
+    /// the gap however much it keeps sending, while its opponents go on consuming
+    /// the turns it already sent until their buffers starve — so the honest slots'
+    /// prefixes stop strictly later, and the earliest stopper is the slot the rest
+    /// are waiting on. Flooding far-ahead seqs to force the forward gate to jump
+    /// its prefix over a gap buys nothing either: a jumped prefix is excluded from
+    /// counting as progress at the source, and freezes that slot's clock from then
+    /// on.
+    ///
+    /// **The participants are the session descriptor's expected roster** — every
+    /// slot the coordinator said this game is played by — not whichever slots this
+    /// relay happens to hold state for. A roster slot with neither live state nor
+    /// a departure record here has no stop time at all, and no verdict is
+    /// available while one exists: two clients replaying into a session whose
+    /// third player has yet to connect are stalled by that third player, and
+    /// letting an absent participant contribute nothing would blame whichever of
+    /// them stopped first. A session whose descriptor carried no roster (a
+    /// standalone relay, a dev-injected descriptor) leaves the union of live and
+    /// departed slots as the only participant set there is.
+    ///
+    /// **A participant that has not reported its game loop running has no clock
+    /// either.** Lobby commands ride their own path and never reach the forward
+    /// gate, but a client's pre-loop seed payloads — the initial-buffer turns it
+    /// flushes right before its loop begins — do, so a slot can advance its
+    /// forwarded prefix before it has simulated a single frame, while the players
+    /// who finished loading sit waiting for its first simulated turn. Such
+    /// advances measure traffic, not simulation progress, and the two are
+    /// indistinguishable from here. So a
+    /// slot with no start report is unknown and blocks, exactly like an
+    /// unregistered roster slot; without that, the loaded players stalled behind a
+    /// loader would be the earliest stoppers and one of them would be named. Only
+    /// a slot's home receives that report, so the home shares it across the mesh
+    /// (`SlotStarted`) and every relay serving the session answers from the same
+    /// set.
+    ///
+    /// **A resumed session stands the watch down entirely.** On a fresh relay the
+    /// forward gate bases every slot's prefix at seq 0, while a re-homed client's
+    /// retained history legitimately begins above it — its retention cap discarded
+    /// the low seqs long ago. At the gate those two are indistinguishable: an
+    /// honest client whose coverage starts high looks exactly like one withholding
+    /// its first turns, and its prefix never advances at all, so its clock sits at
+    /// the session start forever. Forward-prefix clocks are therefore not evidence
+    /// on a resumed session, and evidence that is not evidence names nobody.
+    ///
+    /// TODO(rp2-silence-rehome): restore eviction on resumed sessions by basing
+    /// each origin's gate prefix, on a resumed session, at the lowest seq any
+    /// *other* local client's resume cursor still needs from that origin — a
+    /// client-claimed value taken only in the direction that asks for *more*
+    /// replay, never less, so no client can shrink what it owes. With the gate
+    /// anchored where the survivors actually resume, an honest re-homed client's
+    /// prefix advances again and its clock means what it means anywhere else.
+    ///
+    /// **A decided leave stays a participant until the survivors have recovered
+    /// from it.** A slot whose leave was decided is retired from the comparison
+    /// only once every live participant's stop time is later than the instant this
+    /// relay decided (or observed) that leave — never merely because the decision
+    /// exists. The survivors' stalled clocks are explained by the departed slot
+    /// right up until each of them demonstrably resumed after the directive was
+    /// delivered and applied, and deciding a leave is not the same as the
+    /// survivors recovering from one; retiring the slot at the decision would hand
+    /// the blame straight to the players it stalled, who by then are all sitting
+    /// past the window. The degenerate case is accepted deliberately: a survivor
+    /// that genuinely hangs at the very moment another slot leaves keeps the
+    /// departed slot in the comparison indefinitely and so is never named, which
+    /// is the safe direction — the ordinary drop machinery still owns it.
+    /// Retirement is one-way, so a clock that later moves backwards cannot put a
+    /// long-gone slot back into the comparison.
+    ///
+    /// A participant is a *candidate* — a slot that may be named — when, on top of
+    /// resolving to a stop time like everyone else:
+    ///
+    /// — this relay strictly homes it: only the home owns the slot's link and may
+    ///   close it, and a peer relay's view of another home's slot is second-hand;
+    /// — its connection is up, and it has neither a departure nor a decided leave —
+    ///   anything else is already on its way out;
+    /// — it has reported its game loop running. A loader can never be named. The
+    ///   general rule reaches this first — an unreported slot is unknown, so no
+    ///   verdict exists to name it in — and stating it here as well is what makes
+    ///   "a loader is not a culprit" true of the candidate rule on its own terms,
+    ///   rather than a coincidence of the order the checks run in;
+    /// — it has not already been evicted for silence
+    ///   ([`mark_silence_evicted`](Self::mark_silence_evicted)), so a slot whose
+    ///   link is already closing is not re-reported every tick;
+    /// — it stopped at least `window` ago, and its link has been up at least that
+    ///   long;
+    /// — and it stopped *strictly* before every other participant. Ties evict
+    ///   nobody: a session that stopped all at once has no victim to name, and a
+    ///   slot with no other participant left to be earlier than is holding nobody
+    ///   up.
+    ///
+    /// Only one slot can be strictly earliest, so only one is ever named.
+    pub fn silent_slot(&mut self, now: Instant, window: Duration) -> Option<SilentSlot> {
+        // The relay's own start latch, which is also the stop time of every slot
+        // that has forwarded nothing since. Absent means nothing has begun.
+        let session_started_at = self.started_at?;
+        if self.resumed {
+            if !self.resume_stand_down_logged {
+                self.resume_stand_down_logged = true;
+                tracing::debug!(
+                    tenant = self.key.tenant.as_ref(),
+                    session = self.key.session.0,
+                    "silence watch stands down: a re-homed client's retained history can start \
+                     above this relay's forward gate, so no slot's forwarded prefix is evidence",
+                );
+            }
+            return None;
+        }
+
+        // The roster the coordinator named, or — for a descriptor that carried
+        // none — everything this relay has ever held state for.
+        let mut participants: Vec<SlotId> = if self.expected_slots.is_empty() {
+            self.slots
+                .keys()
+                .chain(self.departures.keys())
+                .copied()
+                .collect::<HashSet<SlotId>>()
+                .into_iter()
+                .collect()
+        } else {
+            self.expected_slots.iter().copied().collect()
+        };
+        participants.retain(|slot| !self.recovered_leaves.contains(slot));
+        participants.sort_unstable_by_key(|slot| slot.0);
+
+        // Retire every decided leave the live participants have visibly moved
+        // past. Their own stop times are the proof: a survivor that forwarded
+        // something after the leave was decided has received and applied it.
+        let live_stops: Vec<Instant> = participants
+            .iter()
+            .filter_map(|slot| self.slots.get(slot))
+            .map(|state| stopped_at(Some(state), session_started_at))
+            .collect();
+        let recovered: Vec<SlotId> = participants
+            .iter()
+            .copied()
+            .filter(|slot| {
+                self.decided_leave_at
+                    .get(slot)
+                    .is_some_and(|decided| live_stops.iter().all(|stop| stop > decided))
+            })
+            .collect();
+        for slot in recovered {
+            self.recovered_leaves.insert(slot);
+        }
+        participants.retain(|slot| !self.recovered_leaves.contains(slot));
+
+        // Complete knowledge or no verdict.
+        let mut required: Vec<(SlotId, Instant)> = Vec::with_capacity(participants.len());
+        for slot in participants {
+            // A slot whose loop is not yet running can still advance its prefix
+            // — its pre-loop seed payloads pass the forward gate — for reasons
+            // that say nothing about its simulation. Its clock is not a stop
+            // time until its game loop is known to be running.
+            if !self.has_started(slot) {
+                return None;
+            }
+            let stopped = match (self.slots.get(&slot), self.departures.get(&slot)) {
+                (Some(state), _) => stopped_at(Some(state), session_started_at),
+                // A departed slot's own state went with its departure record.
+                (None, Some(departure)) => {
+                    stopped_at(departure.slot_state.as_ref(), session_started_at)
+                }
+                // A participant this relay has never held state for has no stop
+                // time to compare, and guessing one at either extreme would be
+                // inventing evidence.
+                (None, None) => return None,
+            };
+            required.push((slot, stopped));
+        }
+
+        for &(slot, stopped_at) in &required {
+            if !self.strictly_homes(slot)
+                || !self.connection_is_up(slot)
+                || !self.has_started(slot)
+                || self.departures.contains_key(&slot)
+                || self.decided_leaves.contains_key(&slot)
+                || self.silence_evicted.contains(&slot)
+            {
+                continue;
+            }
+            let silent_for = now.saturating_duration_since(stopped_at);
+            if silent_for < window {
+                continue;
+            }
+            // A link that just came up is owed the whole window before it may be
+            // closed: it has had no chance to forward anything yet. The grace is
+            // time and nothing else — the slot's stop time stays where its
+            // forwarding actually stopped — because a redial that moved the stop
+            // time forward would make the slot that hung the freshest in the
+            // session, and hand the blame to the players it stalled, who really
+            // did stop earlier and would then be the earliest stoppers left. A
+            // healthy replacement needs no more than the grace: its first
+            // forwarded turn moves its clock by itself.
+            let connection_up_at = self
+                .slots
+                .get(&slot)
+                .and_then(|state| state.connection_up_at);
+            if connection_up_at.is_some_and(|up| now.saturating_duration_since(up) < window) {
+                continue;
+            }
+            // The margin over the next-earliest stopper. It stays absent when
+            // any other participant stopped no later than this one — a tie, or
+            // an earlier stop, is no verdict — and when there is no other
+            // participant to be earlier than at all.
+            let mut lead: Option<Duration> = None;
+            for &(other, other_stopped_at) in &required {
+                if other == slot {
+                    continue;
+                }
+                let Some(gap) = other_stopped_at
+                    .checked_duration_since(stopped_at)
+                    .filter(|gap| !gap.is_zero())
+                else {
+                    lead = None;
+                    break;
+                };
+                lead = Some(lead.map_or(gap, |lead| lead.min(gap)));
+            }
+            if let Some(lead) = lead {
+                return Some(SilentSlot {
+                    slot,
+                    silent_for,
+                    lead,
+                });
+            }
+        }
+        None
+    }
+
+    /// Marks `slot` as evicted for silence, so it is neither re-reported by
+    /// [`silent_slot`](Self::silent_slot) nor readmitted if it re-dials (see
+    /// the `silence_evicted` field). Idempotent.
+    pub fn mark_silence_evicted(&mut self, slot: SlotId) {
+        self.silence_evicted.insert(slot);
     }
 
     /// Records the wall-clock instant this relay learned the session started, for
@@ -4710,6 +5174,7 @@ impl DecisionMaker {
             self.next_leave_seq = leave.leave_seq;
         }
         if inserted {
+            self.note_leave_decided(slot);
             // A final leave is terminal even when it outruns the corresponding
             // SlotDeparted on another peer link. Retire the live slot now and
             // leave a departure tombstone so frames/conditions cannot recreate
@@ -4766,8 +5231,9 @@ impl DecisionMaker {
     ///
     /// The departure's suspended slot state is restored, preserving game-frame
     /// and bounded seq/frame reachability history across the reconnect while
-    /// resetting RTT/loss/mesh measurements that belong to the old physical
-    /// link. Presence is re-asserted by the register's own `note_slot_present`.
+    /// resetting RTT/loss/mesh measurements — and the link's age — that belong to
+    /// the old physical link. Presence is re-asserted by the register's own
+    /// `note_slot_present`.
     ///
     /// A no-op — returns `false`, the departure record untouched — when the slot's
     /// leave is **already decided**. Ordinarily a re-register only reaches an
@@ -4797,6 +5263,11 @@ impl DecisionMaker {
             state.frame = Some(last_frame);
         }
         state.reset_link_conditions();
+        // The restored progress history belongs to the link that died. The
+        // resumed slot is owed the whole silence window on its new link before
+        // the watch may close it, which is what this records — the stop time the
+        // history carries stays exactly where its forwarding stopped.
+        state.connection_up_at = Some(Instant::now());
         self.slots.insert(slot, state);
         true
     }
@@ -6059,21 +6530,62 @@ pub fn record_slot_connected(
     registry.notify_slot_connected(slot_connected_notice(registry, key, slot, resumed));
 }
 
-/// Forwards a client's report that its game loop has started: retains the slot in
-/// the session's ever-started set and fires one slot-started notice up the
-/// coordinator connection. `slot` is the authenticated connection's slot the
-/// frame arrived on, never a value from the wire.
+/// Forwards a **home** client's report that its game loop has started: retains
+/// the slot in the session's first-hand ever-started set and fires one
+/// slot-started notice up the coordinator connection. `slot` is the
+/// authenticated connection's slot the frame arrived on, never a value from the
+/// wire.
 ///
 /// The one-report-per-slot rule lives at the relay's client edge (the link that
 /// received the frame), so a repeat never reaches here; the retained set is a
 /// union regardless, and — like [`record_slot_connected`] — a session with no
 /// decision-maker retains nothing, reports anyway, and stamps no frame
 /// coordinates.
+///
+/// The coordinator notice is the half that stays home-only: see
+/// [`record_peer_slot_started`], which folds a peer relay's shared report into
+/// the maker and stops there.
 pub fn record_slot_started(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) {
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.note_slot_started(slot);
     }
     registry.notify_slot_started(slot_started_notice(registry, key, slot));
+}
+
+/// Folds a peer relay's `SlotStarted` into the session's maker: the slot's home
+/// heard its client's report and shared it, so this relay knows the slot is past
+/// loading and its silent-slot watch can weigh it (see
+/// [`DecisionMaker::silent_slot`]). A session with no maker here has nothing to
+/// record, and the frame is simply dropped.
+///
+/// Fires **no** coordinator notice, which is the whole reason this is separate
+/// from [`record_slot_started`]: the home already reported the slot, and a
+/// second relay reporting it would attribute one client's load twice.
+pub fn record_peer_slot_started(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) {
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_peer_slot_started(slot);
+    }
+}
+
+/// Whether `slot`'s game loop is known to be running for `key` — this relay's own
+/// home client's report or a peer's shared one. `false` for a session with no
+/// maker here, which knows nothing about any slot.
+pub fn slot_has_started(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) -> bool {
+    registry
+        .lock()
+        .get(key)
+        .is_some_and(|maker| maker.has_started(slot))
+}
+
+/// The slots this relay's own home clients have reported started, for the mesh
+/// reconcile to (re)share with a freshly joined peer. Empty when the relay has no
+/// maker for the session (nothing to share).
+pub fn started_home_slots(registry: &DecisionMakers, key: &SessionKey) -> Vec<SlotId> {
+    registry
+        .lock()
+        .get(key)
+        .map(|maker| maker.started_home_slots())
+        .unwrap_or_default()
 }
 
 /// The current wall clock in unix epoch milliseconds — a result report's or a
@@ -6616,10 +7128,11 @@ pub fn activate_connection_epoch(
     slot: SlotId,
     epoch: u64,
 ) -> bool {
+    let now = Instant::now();
     registry
         .lock()
         .get_mut(key)
-        .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch))
+        .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch, now))
 }
 
 /// Atomically resolves a reliable connection-up event against both the drop
@@ -7118,6 +7631,97 @@ pub fn session_e2e(registry: &DecisionMakers, key: &SessionKey) -> (Option<u64>,
         .get(key)
         .map(|maker| maker.delivery_view())
         .unwrap_or((None, None))
+}
+
+/// Records that `slot`'s gap-free forwarded prefix advanced for `key`'s
+/// session, stamping the slot's stop clock (see
+/// [`DecisionMaker::note_forward_advance`]). Called from the forward gate's
+/// fan-out choke point, once per turn that genuinely extends the prefix.
+pub fn note_forward_advance(registry: &DecisionMakers, key: &SessionKey, slot: SlotId) {
+    let now = Instant::now();
+    if let Some(maker) = registry.lock().get_mut(key) {
+        maker.note_forward_advance(slot, now);
+    }
+}
+
+/// How often the silence watch re-examines every live session. Short relative to
+/// any sensible silence window, so a stalled session is released within a couple
+/// of seconds of the window closing, and cheap: one registry lock plus a walk of
+/// each session's slots, with no per-slot work between ticks.
+pub const SILENCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The relay-wide silent-slot watch: every `interval`, closes the link of the
+/// slot this relay homes whose turns stopped reaching local clients at least
+/// `window` ago and strictly before every other participant its session still
+/// requires (see [`DecisionMaker::silent_slot`]). One task per relay, spawned by
+/// the binary; never returns.
+///
+/// A lockstep session cannot outrun its slowest slot, so a client whose game
+/// thread hung — or whose process a player suspended — holds every other player
+/// still for as long as its QUIC link keeps answering keepalives. Nothing else
+/// resolves that: the survivors' drop machinery only ever fires for a slot the
+/// relay saw *disconnect*. Closing the link here manufactures exactly that
+/// disconnect, and the ordinary link-death path (departure record, drop hold,
+/// survivors' countdown, synced leave) takes it from there.
+///
+/// A verdict needs complete knowledge of the session, so most ticks produce
+/// none: the participants compared are the descriptor's expected roster, a
+/// roster slot this relay holds no state for blocks every verdict rather than
+/// counting for nothing, a decided leave stays in the comparison until every
+/// live participant has forwarded something after the decision, a resumed
+/// session stands the watch down outright, and a participant with no game-started
+/// report is unknown too — a client's pre-loop seed payloads advance its
+/// forwarded prefix before it has simulated anything, so that prefix is not
+/// simulation progress. Only a slot's home receives that
+/// report, so the home shares it across the mesh (`SlotStarted`) and every relay
+/// serving the session answers from the same set.
+pub async fn run_silence_watch(
+    makers: std::sync::Arc<DecisionMakers>,
+    sessions: crate::routing::Sessions,
+    window: Duration,
+    interval: Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    // The first tick fires immediately; skip it so no session is judged before
+    // it has had a chance to run.
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        // Marked under one registry lock, acted on outside it: closing a link and
+        // recording an event both take other locks, and the mark is what keeps a
+        // slot from being reported again on the next tick regardless.
+        let evicted: Vec<(SessionKey, SilentSlot)> = {
+            let now = Instant::now();
+            let mut evicted = Vec::new();
+            let mut registry = makers.lock();
+            for (key, maker) in registry.iter_mut() {
+                if let Some(found) = maker.silent_slot(now, window) {
+                    maker.mark_silence_evicted(found.slot);
+                    evicted.push((key.clone(), found));
+                }
+            }
+            evicted
+        };
+        for (key, found) in evicted {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = found.slot.0,
+                silent_ms = found.silent_for.as_millis() as u64,
+                lead_ms = found.lead.as_millis() as u64,
+                "slot's turns stopped reaching its peers before any other slot's did; closing its link so the survivors can drop it",
+            );
+            makers.flight_recorder().record(
+                &key,
+                crate::flight_recorder::FlightEvent::SlotEvictedSilent {
+                    slot: found.slot.0,
+                    silent_ms: found.silent_for.as_millis() as u64,
+                    lead_ms: found.lead.as_millis() as u64,
+                },
+            );
+            crate::routing::close_slots_for_silence(&sessions, &key, &[found.slot]);
+        }
+    }
 }
 
 /// Feeds one forwarded turn's commands into the session's desync comparator, if
@@ -9801,29 +10405,29 @@ mod tests {
             maker.connection_activation(SlotId(0), Some(11)),
             ConnectionActivation::Rejected,
         );
-        assert!(!maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(!maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
         maker.ingest_local(&epoch_conditions(0, 11, 900_000, 100, 1_000));
         assert!(!maker.slots.contains_key(&SlotId(0)));
         assert!(
-            !maker.activate_connection_epoch(SlotId(0), 22),
+            !maker.activate_connection_epoch(SlotId(0), 22, Instant::now()),
             "a new generation cannot bypass the pending departure",
         );
 
         assert!(maker.reinstate_slot(SlotId(0)));
-        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
         maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
         assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
 
         // Retention is a set for the whole maker lifetime, not just the one
         // immediately previous generation.
         assert!(maker.mark_connection_down(SlotId(0), Some(22)));
-        assert!(maker.activate_connection_epoch(SlotId(0), 33));
+        assert!(maker.activate_connection_epoch(SlotId(0), 33, Instant::now()));
         for retired in [11, 22] {
             assert_eq!(
                 maker.connection_activation(SlotId(0), Some(retired)),
                 ConnectionActivation::Rejected,
             );
-            assert!(!maker.activate_connection_epoch(SlotId(0), retired));
+            assert!(!maker.activate_connection_epoch(SlotId(0), retired, Instant::now()));
         }
         assert_eq!(
             maker.connection_states.get(&SlotId(0)),
@@ -9835,16 +10439,16 @@ mod tests {
     fn delayed_retired_true_cannot_replace_the_live_relay_epoch() {
         let mut maker =
             DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
         assert!(maker.mark_connection_down(SlotId(0), Some(11)));
-        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
 
         assert_eq!(
             maker.connection_activation(SlotId(0), Some(11)),
             ConnectionActivation::Rejected,
             "a delayed true(E1) is stale after E2 supersedes Down(E1)",
         );
-        assert!(!maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(!maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
         assert_eq!(
             maker.connection_states.get(&SlotId(0)),
             Some(&ConnectionState::Up(22)),
@@ -9855,7 +10459,7 @@ mod tests {
             maker.connection_activation(SlotId(0), Some(22)),
             ConnectionActivation::Current,
         );
-        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
         maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
         assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
     }
@@ -9874,7 +10478,7 @@ mod tests {
         assert!(maker.force_decide_leave(SlotId(0), DROPPED).is_some());
 
         assert!(!maker.reinstate_slot(SlotId(0)));
-        assert!(!maker.activate_connection_epoch(SlotId(0), 22));
+        assert!(!maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
     }
 
     #[test]
@@ -9888,9 +10492,9 @@ mod tests {
             maker.connection_activation(SlotId(0), None),
             ConnectionActivation::Replacement,
         );
-        assert!(!maker.admit_connection_up(SlotId(0), None));
+        assert!(!maker.admit_connection_up(SlotId(0), None, Instant::now()));
         assert!(maker.reinstate_slot(SlotId(0)));
-        assert!(maker.admit_connection_up(SlotId(0), None));
+        assert!(maker.admit_connection_up(SlotId(0), None, Instant::now()));
         maker.ingest_remote(&conditions(0, 30_000, 0, 1), 10_000);
         assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
     }
@@ -9902,7 +10506,7 @@ mod tests {
         maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
         assert!(!maker.slots.contains_key(&SlotId(0)));
 
-        assert!(maker.activate_connection_epoch(SlotId(0), 22));
+        assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
         maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
         assert!(maker.slots.contains_key(&SlotId(0)));
     }
@@ -9937,7 +10541,7 @@ mod tests {
             Authority::SelfRelay,
             HashSet::new(),
         );
-        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
         feed_turns(&mut maker, 0, 0..=15);
         maker.ingest_local(&epoch_conditions(0, 11, 150_000, 3, 20));
         let history = maker.slots[&SlotId(0)].frame_history.clone();
@@ -10062,7 +10666,7 @@ mod tests {
             Authority::Peer,
             HashSet::new(),
         );
-        assert!(maker.activate_connection_epoch(SlotId(0), 11));
+        assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
         assert!(maker.record_departure_for_epoch(
             SlotId(0),
             DepartureStamps::default(),
@@ -13807,7 +14411,7 @@ mod tests {
         for true_before_leave in [false, true] {
             let mut maker =
                 DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-            assert!(maker.activate_connection_epoch(SlotId(0), 11));
+            assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
             maker.observe_frame(SlotId(0), GameFrameCount(40));
             let _ = maker.note_slot_present(SlotId(0));
             let retained_result = ResultEcho {
@@ -13867,7 +14471,7 @@ mod tests {
             assert!(!maker.live_slots.contains(&SlotId(0)));
             assert!(!maker.note_slot_present(SlotId(0)));
             assert!(!maker.live_slots.contains(&SlotId(0)));
-            assert!(!maker.activate_connection_epoch(SlotId(0), 33));
+            assert!(!maker.activate_connection_epoch(SlotId(0), 33, Instant::now()));
             maker.ingest_local(&epoch_conditions(0, 33, 10_000, 0, 1));
             assert!(
                 !maker.slots.contains_key(&SlotId(0)),
@@ -15030,6 +15634,61 @@ mod tests {
         assert!(!reevaluate_session_start(&registry, &k));
     }
 
+    /// A peer relay's shared game-started report is folded into the maker so the
+    /// silence watch can weigh that slot, and goes no further: the slot's home
+    /// already told the coordinator, and a second relay telling it again would
+    /// attribute one client's load twice. The heartbeat's own set stays
+    /// first-hand for the same reason.
+    #[test]
+    fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
+        let registry = new_decision_makers();
+        let k = key();
+        let _ = sync_maker(
+            &registry,
+            &k,
+            bounds(1, 6),
+            Authority::Peer,
+            HashSet::new(),
+            [SlotId(0), SlotId(1)].into_iter().collect(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+            false,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.set_notice_notifier(tx);
+
+        record_peer_slot_started(&registry, &k, SlotId(1));
+        assert!(
+            rx.try_recv().is_err(),
+            "only the slot's home reports the load it watched",
+        );
+        assert!(
+            registry.lock().get(&k).unwrap().has_started(SlotId(1)),
+            "the maker knows the slot is simulating",
+        );
+        assert!(
+            load_state_of(&registry, &k).started.is_empty(),
+            "the heartbeat restates only this relay's own first-hand reports",
+        );
+        assert!(
+            started_home_slots(&registry, &k).is_empty(),
+            "and re-shares only its own, so a report never loops the mesh",
+        );
+
+        // This relay's own home client reporting does notify, and does join both
+        // the heartbeat's set and what the mesh reconcile re-shares.
+        record_slot_started(&registry, &k, SlotId(0));
+        assert!(matches!(rx.try_recv(), Ok(RelayNotice::SlotStarted(_))));
+        assert_eq!(load_state_of(&registry, &k).started, vec![SlotId(0)]);
+        assert_eq!(started_home_slots(&registry, &k), vec![SlotId(0)]);
+
+        // A crossed report for a slot this relay homes changes no answer.
+        record_peer_slot_started(&registry, &k, SlotId(0));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(started_home_slots(&registry, &k), vec![SlotId(0)]);
+    }
+
     /// One session's retained load state, picked out of the whole-registry
     /// snapshot every heartbeat is built from. Default for a session with no
     /// maker, which the snapshot never names.
@@ -16157,5 +16816,603 @@ mod tests {
             admitted += 1;
         }
         assert_eq!(admitted, burst as usize);
+    }
+
+    // -- Silent-slot eviction: a client whose simulation stopped stepping holds
+    //    every other player still behind a link that keeps answering, so the
+    //    relay closes it and lets the ordinary drop path finish the job. The
+    //    verdict rests on complete knowledge of the session: every participant
+    //    lockstep still requires must resolve to a relay-observed stop time, and
+    //    anything the relay cannot vouch for blocks rather than counting for
+    //    nothing. --
+
+    /// The silence window these tests measure against.
+    const SILENCE_WINDOW: Duration = Duration::from_secs(10);
+
+    /// Gives `slot` a live link, the way a registering client does: the
+    /// connection generation activates, and the first conditions sample creates
+    /// the slot's state. Activating before that sample leaves the slot's
+    /// link-age grace unset, which is what a slot present since the session
+    /// began actually looks like.
+    fn connect_slot(maker: &mut DecisionMaker, slot: u8, at: Instant) {
+        assert!(maker.activate_connection_epoch(SlotId(slot), 1, at));
+        maker.ingest_local(&epoch_conditions(slot, 1, 50_000, 0, 10));
+    }
+
+    /// A started session whose descriptor expects `expected` and homes `homed`
+    /// here, where every slot in `connected` has a live link and every slot in
+    /// `started` has reported its game loop running. Returned with the instant
+    /// the session latched its start, which is where every slot's clock begins
+    /// and what the tests measure from.
+    fn silence_maker_with(
+        expected: &[u8],
+        connected: &[u8],
+        homed: &[u8],
+        started: &[u8],
+    ) -> (DecisionMaker, Instant) {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        maker.mark_started();
+        let start = maker
+            .started_at
+            .expect("a started session latched its start instant");
+        maker.set_expected_slots(expected.iter().copied().map(SlotId).collect());
+        maker.set_homed_slots(homed.iter().copied().map(SlotId).collect());
+        for &slot in connected {
+            connect_slot(&mut maker, slot, start);
+        }
+        for &slot in started {
+            maker.note_slot_started(SlotId(slot));
+        }
+        (maker, start)
+    }
+
+    /// The two-slot session most of these tests run on: slots 0 and 1 expected
+    /// by the descriptor and both connected here.
+    fn silence_maker(homed: &[u8], started: &[u8]) -> (DecisionMaker, Instant) {
+        silence_maker_with(&[0, 1], &[0, 1], homed, started)
+    }
+
+    /// The stall this watch exists to end. Slot 1's turns stopped reaching the
+    /// session a second in; slot 0 kept forwarding for another 200ms — the turns
+    /// of slot 1's it had already buffered — and then starved behind the missing
+    /// ones. Slot 1 stopped first, so slot 1 is the slot everyone is waiting on.
+    fn stalled_session(homed: &[u8], started: &[u8]) -> (DecisionMaker, Instant) {
+        let (mut maker, start) = silence_maker(homed, started);
+        maker.note_forward_advance(SlotId(1), start + Duration::from_secs(1));
+        maker.note_forward_advance(SlotId(0), start + Duration::from_millis(1200));
+        (maker, start)
+    }
+
+    /// Records `slot`'s drop with a frame to schedule against — the departure a
+    /// leave can actually be decided from.
+    fn drop_slot(maker: &mut DecisionMaker, slot: u8) {
+        assert!(maker.record_departure_for_epoch(
+            SlotId(slot),
+            DepartureStamps {
+                last_frame: Some(GameFrameCount(112)),
+                ..Default::default()
+            },
+            DROPPED,
+            Some(1),
+        ));
+    }
+
+    #[test]
+    fn the_slot_whose_turns_stopped_first_is_the_one_named() {
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_secs(11),
+                lead: Duration::from_millis(200),
+            }),
+            "the survivor outlasted the slot it was waiting on, and by how much",
+        );
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(10), SILENCE_WINDOW)
+                .is_none(),
+            "nine seconds of quiet is still inside the window",
+        );
+    }
+
+    #[test]
+    fn a_slot_that_runs_ahead_of_the_turn_it_withheld_is_still_the_earliest_stopper() {
+        // The hostile client withholds one turn and keeps streaming higher seqs,
+        // so anything counted from what it *sent* makes it the busiest slot in
+        // the session while its opponent looks idle. The relay counts what it
+        // could forward in order instead: the withheld turn stopped this slot's
+        // prefix, and its opponent's ran on until the buffered turns ran out.
+        let (mut maker, start) = silence_maker(&[0, 1], &[0, 1]);
+        maker.note_forward_advance(SlotId(1), start + Duration::from_secs(1));
+        for seq in 20..40 {
+            maker.observe_turn_frame(SlotId(1), seq, GameFrameCount(200 + seq as u32));
+        }
+        maker.note_forward_advance(SlotId(0), start + Duration::from_millis(1300));
+
+        assert_eq!(
+            maker
+                .silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
+                .map(|found| found.slot),
+            Some(SlotId(1)),
+            "turns above the gap are not progress, however many of them arrive",
+        );
+    }
+
+    #[test]
+    fn a_slot_that_has_forwarded_nothing_stopped_when_the_session_started() {
+        // A client can withhold its seed payloads and delay saying its game loop
+        // is running, so that the moment it *claims* to have begun is later than the
+        // moment its opponent seeded and stalled waiting for it. The stop time it
+        // gets is the session's own start either way: it has been the slot
+        // everyone is waiting on since the beginning.
+        let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(5));
+        let now = start + Duration::from_secs(31);
+        assert!(
+            maker.silent_slot(now, SILENCE_WINDOW).is_none(),
+            "a slot that has not reported its game loop running is still loading",
+        );
+
+        maker.note_slot_started(SlotId(1));
+        assert_eq!(
+            maker.silent_slot(now, SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_secs(31),
+                lead: Duration::from_secs(5),
+            }),
+            "the late report names the slot, and never re-dates its silence",
+        );
+    }
+
+    #[test]
+    fn a_session_that_stopped_together_names_nobody() {
+        // Nothing distinguishes a victim when every slot stopped at once, and
+        // closing links would turn a shared stall into a shared drop.
+        let (mut maker, start) = silence_maker(&[0, 1], &[0, 1]);
+        let stop = start + Duration::from_secs(1);
+        maker.note_forward_advance(SlotId(0), stop);
+        maker.note_forward_advance(SlotId(1), stop);
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(600), SILENCE_WINDOW)
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn a_slot_that_forwarded_nothing_blocks_the_verdict_while_it_is_not_a_candidate() {
+        // Slot 1's link died before it ever reported its game loop running, so
+        // this relay never learned whether it was simulating at all. Its drop is
+        // the ordinary path's business, and slot 0 — which forwarded until it
+        // starved waiting for slot 1 — is not the one to close for it.
+        let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+        assert!(maker.mark_connection_down(SlotId(1), Some(1)));
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn an_expected_slot_this_relay_holds_no_state_for_blocks_every_verdict() {
+        // Two clients replay into a resumed game and stall waiting for a third
+        // that has not connected here yet. The participant holding lockstep up is
+        // exactly the one this relay can say nothing about, so counting it as a
+        // non-blocker would name whichever of the other two stopped first.
+        let (mut maker, start) = silence_maker_with(&[0, 1, 2], &[0, 1], &[0, 1, 2], &[0, 1]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+        maker.note_forward_advance(SlotId(1), start + Duration::from_millis(1200));
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+                .is_none(),
+            "a roster slot with no state here is a hole in the evidence, not a non-blocker",
+        );
+
+        // It arrives, catches up, and stops last of the three. Every participant
+        // now has a stop time, so the earliest of them can be named.
+        let arrival = start + Duration::from_secs(31);
+        connect_slot(&mut maker, 2, arrival);
+        maker.note_slot_started(SlotId(2));
+        maker.note_forward_advance(SlotId(2), arrival + Duration::from_secs(1));
+
+        assert_eq!(
+            maker.silent_slot(arrival + Duration::from_secs(20), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(0),
+                silent_for: Duration::from_secs(50),
+                lead: Duration::from_millis(200),
+            }),
+            "with the roster complete, the earliest stopper is the one holding it up",
+        );
+    }
+
+    #[test]
+    fn a_descriptor_with_no_roster_compares_the_slots_this_relay_holds() {
+        // A standalone relay or dev-injected descriptor names no roster, so there
+        // is no fuller participant set to be missing from: the slots this relay
+        // has state for are the session as far as it can ever know.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        maker.set_expected_slots(HashSet::new());
+
+        assert_eq!(
+            maker
+                .silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
+                .map(|found| found.slot),
+            Some(SlotId(1)),
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_stands_the_watch_down() {
+        // After a re-home this relay's forward gate bases every prefix at seq 0,
+        // while a returning client's retained history can legitimately begin
+        // above it — so an honest client with incomplete coverage looks exactly
+        // like one withholding its first turns, and its prefix never advances at
+        // all. No window turns that into evidence.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        maker.resumed = true;
+
+        for after in [12, 60, 600] {
+            assert!(
+                maker
+                    .silent_slot(start + Duration::from_secs(after), SILENCE_WINDOW)
+                    .is_none(),
+                "a re-homed session's forward-prefix clocks are not evidence at any age",
+            );
+        }
+    }
+
+    #[test]
+    fn a_slot_held_for_a_drop_counts_until_its_leave_is_decided_and_absorbed() {
+        // Slot 1 disconnected and its drop has not been decided, so the survivor
+        // is stalled behind an ordinary drop hold: slot 1 froze at the instant
+        // the stall began, and it is still what everyone is waiting on.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        drop_slot(&mut maker, 1);
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+                .is_none(),
+            "a survivor waiting out a drop hold is not the one holding the game up",
+        );
+
+        // Deciding the leave does not by itself clear the survivor: the directive
+        // still has to reach it and be applied, so the departed slot stays in the
+        // comparison and keeps explaining the stall.
+        assert!(maker.decide_leave(SlotId(1), DROPPED).is_some());
+        maker
+            .decided_leave_at
+            .insert(SlotId(1), start + Duration::from_secs(20));
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(60), SILENCE_WINDOW)
+                .is_none(),
+        );
+
+        // Once the survivor steps again after the decision, the departed slot is
+        // retired for good — leaving the survivor alone, with nobody left to be
+        // earlier than.
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(61));
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(90), SILENCE_WINDOW)
+                .is_none(),
+            "a lone slot cannot be holding anyone up",
+        );
+        assert!(maker.recovered_leaves.contains(&SlotId(1)));
+    }
+
+    #[test]
+    fn a_decided_leave_leaves_the_comparison_only_once_the_survivors_resume_past_it() {
+        // Three players: slot 0 stops first, slots 1 and 2 stop a fraction later
+        // waiting on it. Slot 0's undecided departure protects them; the moment
+        // its leave is decided must not stop protecting them, because delivery
+        // and application of the directive are still pending and both of them sit
+        // well past the window already.
+        let (mut maker, start) = silence_maker_with(&[0, 1, 2], &[0, 1, 2], &[0, 1, 2], &[0, 1, 2]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+        maker.note_forward_advance(SlotId(1), start + Duration::from_millis(1200));
+        maker.note_forward_advance(SlotId(2), start + Duration::from_millis(1300));
+
+        drop_slot(&mut maker, 0);
+        assert!(maker.decide_leave(SlotId(0), DROPPED).is_some());
+        let decided = start + Duration::from_secs(20);
+        maker.decided_leave_at.insert(SlotId(0), decided);
+
+        assert!(
+            maker
+                .silent_slot(decided + Duration::from_secs(1), SILENCE_WINDOW)
+                .is_none(),
+            "deciding a leave is not the survivors recovering from it",
+        );
+        assert!(!maker.recovered_leaves.contains(&SlotId(0)));
+
+        // Both survivors step again after the leave was delivered and applied.
+        maker.note_forward_advance(SlotId(1), decided + Duration::from_secs(2));
+        maker.note_forward_advance(SlotId(2), decided + Duration::from_secs(3));
+        assert!(
+            maker
+                .silent_slot(decided + Duration::from_secs(4), SILENCE_WINDOW)
+                .is_none(),
+            "both survivors are well inside the window; there is nothing to name",
+        );
+        assert!(
+            maker.recovered_leaves.contains(&SlotId(0)),
+            "a leave every live participant has stepped past is retired for good",
+        );
+
+        // Slot 1 now hangs while slot 2 runs on. It is named only once it has
+        // been quiet for a window and is the unique earliest of what remains.
+        assert!(
+            maker
+                .silent_slot(decided + Duration::from_secs(11), SILENCE_WINDOW)
+                .is_none(),
+            "slot 1 has not been quiet for a whole window yet",
+        );
+        maker.note_forward_advance(SlotId(2), decided + Duration::from_secs(30));
+        assert_eq!(
+            maker.silent_slot(decided + Duration::from_secs(40), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_secs(38),
+                lead: Duration::from_secs(28),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_peer_authored_leave_is_retained_until_the_survivor_resumes_past_it_too() {
+        // Who decided the leave changes nothing: a peer authority's directive
+        // arriving here decides the slot just as much, and starts the same
+        // recovery bar for the survivors it left behind.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        assert!(maker.observe_leave(&LeaveDirective {
+            finalized: false,
+            slot: 1,
+            reason: DROPPED,
+            apply_at_frame: 113,
+            leave_seq: 4,
+            final_turn_count: None,
+        }));
+        assert!(
+            maker.decided_leave_at.contains_key(&SlotId(1)),
+            "a peer-authored leave is stamped like this relay's own",
+        );
+        maker
+            .decided_leave_at
+            .insert(SlotId(1), start + Duration::from_secs(20));
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(21), SILENCE_WINDOW)
+                .is_none(),
+            "slot 0's stall is still slot 1's doing until slot 0 steps past the leave",
+        );
+
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(22));
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(40), SILENCE_WINDOW)
+                .is_none(),
+            "with slot 1 retired the survivor is alone, and holding nobody up",
+        );
+        assert!(maker.recovered_leaves.contains(&SlotId(1)));
+    }
+
+    #[test]
+    fn a_slot_still_loading_blocks_the_verdict_and_is_never_a_candidate() {
+        // A client that has not reported its game loop running is legitimately
+        // producing nothing, and whatever it does forward is pre-loop seed
+        // traffic — so
+        // it resolves to no stop time at all and blocks every verdict, and the
+        // same missing report keeps it from ever being named itself. The app
+        // server's load timeout owns a session that never finishes loading.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0]);
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+                .is_none(),
+        );
+
+        let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+        for after in [11, 60, 600] {
+            assert!(
+                maker
+                    .silent_slot(start + Duration::from_secs(after), SILENCE_WINDOW)
+                    .is_none(),
+                "the loading slot is the earliest stopper and cannot be named",
+            );
+        }
+    }
+
+    #[test]
+    fn a_loader_that_keeps_forwarding_blocks_instead_of_shifting_the_blame() {
+        // The regression a candidacy-only start rule would reintroduce: a client
+        // flushes its seed payloads before its loop runs, so slot 1's prefix can
+        // be fresher than that of slot 0 — which finished loading, seeded, and sits
+        // waiting for slot 1's first simulated turn, having stopped four seconds
+        // earlier. Slot 1's
+        // advances are traffic, not simulation, so they are no clock at all, and
+        // naming slot 0 off them would blame the player who was ready first.
+        let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+        maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+        maker.note_forward_advance(SlotId(1), start + Duration::from_secs(5));
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+                .is_none(),
+            "a participant with no game-started report has no stop time to compare",
+        );
+
+        // Once slot 1 is known to be simulating, both clocks mean the same thing
+        // and the earlier stopper is the one holding lockstep up.
+        maker.note_slot_started(SlotId(1));
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(0),
+                silent_for: Duration::from_secs(30),
+                lead: Duration::from_secs(4),
+            }),
+        );
+    }
+
+    /// A game-loop report reaches only the slot's own home, so a peer-homed slot
+    /// is unknown here until that home shares it across the mesh — and an unknown
+    /// participant blocks every verdict, including one against a slot this relay
+    /// homes.
+    #[test]
+    fn a_peer_homed_slot_blocks_the_watch_until_its_home_shares_the_start_report() {
+        let (mut maker, start) = stalled_session(&[1], &[1]);
+
+        assert!(
+            maker
+                .silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
+                .is_none(),
+            "this relay cannot weigh a peer's slot before its home says it is simulating",
+        );
+
+        maker.note_peer_slot_started(SlotId(0));
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_secs(11),
+                lead: Duration::from_millis(200),
+            }),
+            "the shared report completes the roster, and the earliest stopper is named",
+        );
+    }
+
+    #[test]
+    fn a_slot_not_ours_or_already_on_its_way_out_is_never_named() {
+        let (mut not_homed, start) = stalled_session(&[0], &[0, 1]);
+        let now = start + Duration::from_secs(12);
+        assert!(
+            not_homed.silent_slot(now, SILENCE_WINDOW).is_none(),
+            "only the slot's home owns its link and may close it",
+        );
+
+        let (mut down, start) = stalled_session(&[0, 1], &[0, 1]);
+        assert!(down.mark_connection_down(SlotId(1), Some(1)));
+        assert!(
+            down.silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
+                .is_none(),
+            "a slot whose link already died is the ordinary drop path's business",
+        );
+
+        let (mut evicted, start) = stalled_session(&[0, 1], &[0, 1]);
+        evicted.mark_silence_evicted(SlotId(1));
+        assert!(
+            evicted
+                .silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
+                .is_none(),
+            "a slot already closing must not be re-reported every tick",
+        );
+    }
+
+    #[test]
+    fn a_reconnected_slot_is_owed_a_window_but_never_a_newer_stop_time() {
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        let redial = start + Duration::from_secs(12);
+        assert_eq!(
+            maker
+                .silent_slot(redial, SILENCE_WINDOW)
+                .map(|found| found.slot),
+            Some(SlotId(1)),
+        );
+
+        // The client redialed, and the replacement connection registered before
+        // the dead one's departure was recorded. It has forwarded nothing on a
+        // link seconds old, so the watch leaves it alone for a window.
+        assert!(maker.activate_connection_epoch(SlotId(1), 2, redial));
+        assert!(
+            maker
+                .silent_slot(redial + Duration::from_secs(9), SILENCE_WINDOW)
+                .is_none(),
+            "the fresh link is owed a full window to forward its first turn",
+        );
+
+        // Its stop time never moved with the redial, so the survivor it stalled
+        // — which stopped later, after consuming what slot 1 had already sent -
+        // is still not the earliest stopper, and slot 1 is named again the moment
+        // the grace runs out with nothing forwarded.
+        let after_grace = redial + Duration::from_secs(11);
+        assert_eq!(
+            maker.silent_slot(after_grace, SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_secs(22),
+                lead: Duration::from_millis(200),
+            }),
+            "a redial buys time, never a fresher place in the stop order",
+        );
+
+        // Re-announcing the generation it already holds is not a fresh link, and
+        // grants no further grace.
+        assert!(maker.activate_connection_epoch(SlotId(1), 2, after_grace));
+        assert_eq!(
+            maker
+                .silent_slot(after_grace, SILENCE_WINDOW)
+                .map(|found| found.slot),
+            Some(SlotId(1)),
+        );
+    }
+
+    #[test]
+    fn a_healthy_replacement_link_refreshes_its_clock_by_forwarding() {
+        // The reconnect that is not an attack: turns start flowing inside the
+        // grace, which is the only thing that moves a slot's clock — and the
+        // survivor that was stalled behind it starts stepping again with it.
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        let redial = start + Duration::from_secs(12);
+        assert!(maker.activate_connection_epoch(SlotId(1), 2, redial));
+        let resumed = redial + Duration::from_secs(1);
+        maker.note_forward_advance(SlotId(1), resumed);
+        maker.note_forward_advance(SlotId(0), resumed + Duration::from_millis(100));
+
+        // Past the grace the resumed link stands on its forwarding alone, and
+        // that is enough.
+        assert!(
+            maker
+                .silent_slot(redial + Duration::from_millis(10_500), SILENCE_WINDOW)
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn a_silence_evicted_slot_is_refused_readmission_without_taking_the_hold() {
+        let (mut maker, _start) = stalled_session(&[0, 1], &[0, 1]);
+        maker.mark_silence_evicted(SlotId(1));
+        drop_slot(&mut maker, 1);
+
+        let transition = maker.resolve_reconnect(SlotId(1), Some(2), true);
+        assert_eq!(transition.admission, ReconnectAdmission::Rejected);
+        assert!(
+            !transition.consume_hold,
+            "the hold is what lets the survivors decide the drop; a redial must not clear it",
+        );
+        assert!(
+            maker.has_departure(SlotId(1)),
+            "the refused readmission leaves the departure standing",
+        );
     }
 }

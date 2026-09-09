@@ -33,7 +33,7 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
     FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LinkConditions, LobbyCommand,
     MeshControlFrame, Payload, PlayerSkin, RequestDrop, SessionStart, SlotConditions,
-    SlotConnectivity, SlotDeparted, SlotPresent, mesh_control_frame,
+    SlotConnectivity, SlotDeparted, SlotPresent, SlotStarted, mesh_control_frame,
 };
 use rally_point_transport::MeshSessionKey;
 use rally_point_transport::noq;
@@ -117,6 +117,37 @@ pub enum Seen {
     Duplicate,
 }
 
+/// What recording one turn at the forward gate did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Forwarded {
+    /// Whether the turn was new here, or a copy of one already delivered.
+    pub seen: Seen,
+    /// Whether this turn moved the slot's gap-free forwarded prefix forward over
+    /// turns that were genuinely forwarded: an in-order arrival, or one that
+    /// closed the gap the prefix had stalled behind. A prefix pushed over a gap
+    /// by [`SlotSeen::collapse_to_cap`] is not that, and neither is any later
+    /// advance of a slot whose prefix has ever been collapsed — past a collapse
+    /// the prefix no longer counts only turns that really arrived. Always false
+    /// for a duplicate.
+    ///
+    /// This is the relay's own evidence that a slot's turns are still reaching
+    /// local clients *in order*, and the only per-slot progress measure a client
+    /// cannot inflate: turns can be withheld, or sent far ahead of the prefix,
+    /// but nothing advances this except the missing turns themselves.
+    pub prefix_advanced: bool,
+}
+
+impl Forwarded {
+    /// A turn already delivered through an earlier ingress instance: no prefix
+    /// moved, because nothing was recorded.
+    fn duplicate() -> Self {
+        Self {
+            seen: Seen::Duplicate,
+            prefix_advanced: false,
+        }
+    }
+}
+
 impl MeshSeen {
     /// Creates an empty forward-once set for one session.
     pub fn new() -> Self {
@@ -124,9 +155,10 @@ impl MeshSeen {
     }
 
     /// Records `(slot, seq)` as forwarded and reports whether it's new or a
-    /// duplicate. A duplicate is dropped silently — the turn already reached
-    /// this relay's local clients through an earlier ingress instance.
-    pub fn mark_forwarded(&mut self, slot: SlotId, seq: u64) -> Seen {
+    /// duplicate, and whether it advanced the slot's gap-free prefix (see
+    /// [`Forwarded`]). A duplicate is dropped silently — the turn already
+    /// reached this relay's local clients through an earlier ingress instance.
+    pub fn mark_forwarded(&mut self, slot: SlotId, seq: u64) -> Forwarded {
         let state = self.slots.entry(slot).or_insert_with(|| SlotSeen {
             forwarded_through: None,
             ahead: BTreeSet::new(),
@@ -137,7 +169,7 @@ impl MeshSeen {
             .forwarded_through
             .is_some_and(|forwarded| seq <= forwarded)
         {
-            return Seen::Duplicate;
+            return Forwarded::duplicate();
         }
         let base = match state.forwarded_through {
             Some(through) => {
@@ -145,7 +177,7 @@ impl MeshSeen {
                     // Every u64 seq is at or below this prefix and the duplicate
                     // check above normally returns first. Keep the ceiling safe
                     // even if this code is rearranged later.
-                    return Seen::Duplicate;
+                    return Forwarded::duplicate();
                 };
                 next
             }
@@ -158,18 +190,32 @@ impl MeshSeen {
         if seq == base {
             state.forwarded_through = Some(seq);
             state.absorb_contiguous_run();
-            return Seen::New;
+            return Forwarded {
+                seen: Seen::New,
+                // A prefix that has ever been collapsed sits above a gap this
+                // relay never forwarded, so nothing stacked on top of it proves
+                // the slot's turns are still arriving in order.
+                prefix_advanced: !state.prefix_collapsed,
+            };
         }
         if !state.ahead.insert(seq) {
-            return Seen::Duplicate;
+            return Forwarded::duplicate();
         }
 
         // Absorb any now-contiguous run into the forwarded prefix, so old seqs
         // can be forgotten, then bound the sparse remainder so a stream of
         // permanent gaps can't grow it without limit.
+        let before = state.forwarded_through;
         state.absorb_contiguous_run();
+        let closed_a_gap = state.forwarded_through != before;
         state.collapse_to_cap();
-        Seen::New
+        Forwarded {
+            seen: Seen::New,
+            // Read after the collapse, so an arrival that absorbs a run and then
+            // pushes the sparse set over the cap reports no progress either: the
+            // prefix it leaves behind has jumped a gap.
+            prefix_advanced: closed_a_gap && !state.prefix_collapsed,
+        }
     }
 }
 
@@ -238,9 +284,15 @@ pub fn new_seen_registries() -> SeenRegistries {
 }
 
 /// Marks `(slot, seq)` as forwarded for `key`'s session, returning whether it's
-/// new or a duplicate. Used by both `run_slot_link` (local-client ingress) and
-/// `run_mesh_link` (mesh-peer ingress) before fanning out to local clients.
-pub fn mark_seen(registries: &SeenRegistries, key: &SessionKey, slot: SlotId, seq: u64) -> Seen {
+/// new or a duplicate and whether it advanced the slot's gap-free prefix. Used
+/// by both `run_slot_link` (local-client ingress) and `run_mesh_link` (mesh-peer
+/// ingress) before fanning out to local clients.
+pub fn mark_seen(
+    registries: &SeenRegistries,
+    key: &SessionKey,
+    slot: SlotId,
+    seq: u64,
+) -> Forwarded {
     let mut roster = registries.lock();
     if let Some(seen) = roster.get_mut(key) {
         return seen.mark_forwarded(slot, seq);
@@ -1465,6 +1517,17 @@ pub(crate) fn fan_out_slot_present(links: &MeshLinks, key: &SessionKey, slot: Sl
     fan_out_control(links, key, slot_present_frame(key.session, slot));
 }
 
+/// Shares one home client's game-started report with every peer relay serving
+/// `key`. The report reaches only the slot's home, but every relay's silent-slot
+/// watch has to know whether a slot is still loading, so the home tells them. A
+/// receiving relay records it and nothing else — it does not re-broadcast (no
+/// echo) and does not report the slot to its own coordinator connection, which
+/// stays the home's job. A duplicate is idempotent — the accumulated set is a
+/// set.
+pub(crate) fn fan_out_slot_started(links: &MeshLinks, key: &SessionKey, slot: SlotId) {
+    fan_out_control(links, key, slot_started_frame(key.session, slot));
+}
+
 /// Broadcasts the session-start directive the authority decided to every peer
 /// relay serving `key`, so each fans it down its own local slots — carrying the
 /// authority's computed initial buffer depth (`None` when it sized none) so each
@@ -1610,6 +1673,16 @@ fn slot_present_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
         kind: Some(mesh_control_frame::Kind::SlotPresent(SlotPresent {
+            slot: u32::from(slot.0),
+        })),
+    }
+}
+
+/// Builds a `SlotStarted` mesh control frame for `session`.
+fn slot_started_frame(session: SessionId, slot: SlotId) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SlotStarted(SlotStarted {
             slot: u32::from(slot.0),
         })),
     }
@@ -1939,11 +2012,20 @@ fn deliver_turn_to_locals(
     mut payload: Payload,
     home: crate::delivery::DeliveryHome,
 ) -> Option<Payload> {
-    if mark_seen(seen, key, slot, payload.seq) == Seen::Duplicate {
+    let forwarded = mark_seen(seen, key, slot, payload.seq);
+    if forwarded.seen == Seen::Duplicate {
         // Only the duplicate branch touches the recorder's maps —
         // the fresh-turn common path stays lock-free for the recorder.
         decision_makers.flight_recorder().note_dedup_drop(key, slot);
         return None;
+    }
+    if forwarded.prefix_advanced {
+        // The relay's own record that this slot's simulation is still feeding
+        // local lockstep, in order. Progress is taken here rather than from the
+        // turn itself because a client picks what it sends and when, so any
+        // count or stamp it supplies can be padded; only the turns it actually
+        // produced move this prefix.
+        crate::consensus::note_forward_advance(decision_makers, key, slot);
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just
@@ -2913,6 +2995,11 @@ pub async fn run_mesh_link(
                                     &control_forward_tx,
                                     &key,
                                 );
+                                reconcile_started_slots_on_join(
+                                    &decision_makers,
+                                    &control_forward_tx,
+                                    &key,
+                                );
                             }
                             if crate::presence::record_peer(
                                 &presence,
@@ -3062,6 +3149,13 @@ pub async fn run_mesh_link(
                         // The same snapshot carries active connection epochs.
                         reconcile_local_slots_on_join(
                             &conditions,
+                            &control_forward_tx,
+                            &key,
+                        );
+                        // And the game-started reports its own home clients made,
+                        // which reach no other relay on their own.
+                        reconcile_started_slots_on_join(
+                            &decision_makers,
                             &control_forward_tx,
                             &key,
                         );
@@ -3536,6 +3630,24 @@ fn dispatch_mesh_control_frame(
                 fan_out_session_start(&mesh.links, &key, initial_buffer_turns);
             }
         }
+        Some(mesh_control_frame::Kind::SlotStarted(started)) => {
+            let Ok(slot) = u8::try_from(started.slot).map(SlotId) else {
+                tracing::warn!(
+                    session = session_id.0,
+                    slot = started.slot,
+                    "mesh SlotStarted names a slot id out of range; dropping",
+                );
+                return;
+            };
+            // A peer relay's home client left loading behind. Record it so this
+            // relay's silent-slot watch can weigh that slot at all — a slot with
+            // no start report anywhere has no stop time this relay may trust,
+            // because a loading client still flushes lobby turns. Deliberately
+            // fires no coordinator notice: the home already reported the slot,
+            // and a second relay reporting it would attribute one load twice.
+            // Not re-broadcast either — the origin sent a copy to every peer.
+            crate::consensus::record_peer_slot_started(&mesh.decision_makers, &key, slot);
+        }
         Some(mesh_control_frame::Kind::SessionStart(start)) => {
             // The authority's session-start directive. Adopt the carried initial
             // buffer depth into this relay's maker — its buffer and its stored
@@ -3907,6 +4019,23 @@ fn reconcile_local_slots_on_join(
     }
 }
 
+/// Re-shares every game-started report this relay's own home clients made for
+/// `key` down a freshly registered link's control channel, so a peer that joined
+/// the mesh after those reports — or a relay that replaced one — converges on the
+/// full set instead of treating those slots as still loading forever. First-hand
+/// reports only: a relay never re-shares a peer's, so nothing loops the mesh.
+/// Idempotent on receipt (the accumulated set is a set) and cheap — a session has
+/// <=12 slots.
+fn reconcile_started_slots_on_join(
+    decision_makers: &crate::consensus::DecisionMakers,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    for slot in crate::consensus::started_home_slots(decision_makers, key) {
+        let _ = control_tx.send(slot_started_frame(key.session, slot));
+    }
+}
+
 /// Sends this relay's resume cursors for `key` down a freshly registered
 /// link's control channel — the mesh counterpart of
 /// [`reconcile_leaves_on_join`], closing the gap a redialed link's fresh
@@ -4272,10 +4401,10 @@ mod tests {
     #[test]
     fn marks_first_delivery_new_and_redelivery_duplicate() {
         let mut seen = MeshSeen::new();
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::Duplicate);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 1), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 1), Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::Duplicate);
     }
 
     #[test]
@@ -4292,21 +4421,24 @@ mod tests {
 
         // Filling the last gap absorbs the waiting ceiling value without
         // attempting to derive an unrepresentable successor.
-        assert_eq!(seen.mark_forwarded(SlotId(0), u64::MAX - 1), Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), u64::MAX - 1).seen, Seen::New);
         let state = &seen.slots[&SlotId(0)];
         assert_eq!(state.forwarded_through, Some(u64::MAX));
         assert!(state.ahead.is_empty());
-        assert_eq!(seen.mark_forwarded(SlotId(0), u64::MAX), Seen::Duplicate);
+        assert_eq!(
+            seen.mark_forwarded(SlotId(0), u64::MAX).seen,
+            Seen::Duplicate
+        );
     }
 
     #[test]
     fn keeps_slots_independent() {
         let mut seen = MeshSeen::new();
         // Two slots both have seq 0; both are new — identity is (slot, seq).
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(1), 0), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::Duplicate);
-        assert_eq!(seen.mark_forwarded(SlotId(1), 0), Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(1), 0).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(1), 0).seen, Seen::Duplicate);
     }
 
     #[test]
@@ -4315,11 +4447,11 @@ mod tests {
         // seq 0. Seq 3 is new; seq 0 is new (it fills the gap). A second copy of
         // seq 3 via path B is a duplicate.
         let mut seen = MeshSeen::new();
-        assert_eq!(seen.mark_forwarded(SlotId(0), 3), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 1), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 2), Seen::New);
-        assert_eq!(seen.mark_forwarded(SlotId(0), 3), Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 3).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 2).seen, Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 3).seen, Seen::Duplicate);
     }
 
     #[test]
@@ -4328,14 +4460,14 @@ mod tests {
         // second path is dropped as below the prefix.
         let mut seen = MeshSeen::new();
         for seq in 0..4 {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
         }
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::Duplicate);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
     }
 
     /// Reaches into one slot's private forward-gate state so the sparse-set tests
     /// can assert on the exact bound; the `mark_forwarded` API deliberately
-    /// exposes only the `New`/`Duplicate` verdict, not the representation.
+    /// exposes only its verdict, not the representation behind it.
     fn slot_ahead_len(seen: &MeshSeen, slot: SlotId) -> usize {
         seen.slots.get(&slot).map_or(0, |s| s.ahead.len())
     }
@@ -4348,7 +4480,7 @@ mod tests {
         // gap, collapsing to empty the moment the gap fills.
         let mut seen = MeshSeen::new();
         for seq in 0..1000 {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
             assert_eq!(
                 slot_ahead_len(&seen, SlotId(0)),
                 0,
@@ -4358,14 +4490,14 @@ mod tests {
 
         // Deliver a small window out of order: 1005..1010 arrive before 1000..1005.
         for seq in 1005..1010 {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
         }
         assert!(
             slot_ahead_len(&seen, SlotId(0)) <= SPARSE_SEEN_CAP,
             "a small reorder window stays far under the cap",
         );
         for seq in 1000..1005 {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
         }
         assert_eq!(
             slot_ahead_len(&seen, SlotId(0)),
@@ -4383,9 +4515,9 @@ mod tests {
         let mut seen = MeshSeen::new();
         // seq 0 forms the prefix; from there only even seqs arrive, leaving every
         // odd seq a permanent gap.
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
         for seq in (2..20_000).step_by(2) {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
             assert!(
                 slot_ahead_len(&seen, SlotId(0)) <= SPARSE_SEEN_CAP,
                 "sparse set stayed within the cap after seq {seq}",
@@ -4402,22 +4534,99 @@ mod tests {
         // duplicates: a re-forward of one of them arriving after the collapse is
         // dropped, exactly as it would have been before the prefix moved.
         let mut seen = MeshSeen::new();
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
         // Push enough even seqs to force at least one collapse.
         let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
         for seq in (2..=last).step_by(2) {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
         }
         // Every even seq that has ever been forwarded is still a duplicate,
         // whether the collapse swept it into the prefix or it remains in the
         // sparse set.
         for seq in (0..=last).step_by(2) {
             assert_eq!(
-                seen.mark_forwarded(SlotId(0), seq),
+                seen.mark_forwarded(SlotId(0), seq).seen,
                 Seen::Duplicate,
                 "an already-seen seq {seq} must not be delivered again",
             );
         }
+    }
+
+    #[test]
+    fn a_withheld_turn_stops_the_slots_reported_progress_at_the_gap() {
+        // A client that withholds one turn and keeps streaming higher seqs is
+        // the case the reported advance exists to catch: everything it sends
+        // after the gap forwards fine, and none of it moves the gap-free prefix
+        // its peers are actually stalled on.
+        let mut seen = MeshSeen::new();
+        for seq in 0..=5 {
+            assert!(
+                seen.mark_forwarded(SlotId(0), seq).prefix_advanced,
+                "an in-order turn extends the prefix",
+            );
+        }
+        for seq in 7..=9 {
+            let forwarded = seen.mark_forwarded(SlotId(0), seq);
+            assert_eq!(forwarded.seen, Seen::New);
+            assert!(
+                !forwarded.prefix_advanced,
+                "seq {seq} forwards, but the prefix is still stalled at the withheld 6",
+            );
+        }
+        assert_eq!(slot_forwarded_through(&seen, SlotId(0)), Some(5));
+
+        // Flooding far enough ahead makes the sparse-set cap collapse the prefix
+        // over the withheld turn. A prefix that jumped a gap is not evidence of
+        // forwarding, so neither that arrival nor any after it reports progress.
+        for seq in 10..=(SPARSE_SEEN_CAP as u64 + 12) {
+            assert!(!seen.mark_forwarded(SlotId(0), seq).prefix_advanced);
+        }
+        let state = seen.slots.get(&SlotId(0)).expect("slot 0 has gate state");
+        assert!(
+            state.prefix_collapsed,
+            "the flood pushed the sparse set past the cap",
+        );
+        let collapsed_through = state.forwarded_through;
+        assert!(collapsed_through > Some(5), "the collapse jumped the gap");
+
+        // In-order arrivals resume, and the slot's clock stays frozen: past a
+        // collapse the prefix no longer counts only turns that really arrived.
+        for seq in (SPARSE_SEEN_CAP as u64 + 13)..=(SPARSE_SEEN_CAP as u64 + 20) {
+            let forwarded = seen.mark_forwarded(SlotId(0), seq);
+            assert_eq!(forwarded.seen, Seen::New);
+            assert!(
+                !forwarded.prefix_advanced,
+                "a collapsed slot's prefix never reports progress again",
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_that_closes_a_gap_reports_the_progress_the_whole_run_makes() {
+        // The honest reordering case: the missing turn arrives and the run above
+        // it becomes contiguous, which is genuine progress for all of it.
+        let mut seen = MeshSeen::new();
+        assert!(seen.mark_forwarded(SlotId(0), 0).prefix_advanced);
+        for seq in 2..=4 {
+            assert!(!seen.mark_forwarded(SlotId(0), seq).prefix_advanced);
+        }
+        assert!(
+            seen.mark_forwarded(SlotId(0), 1).prefix_advanced,
+            "closing the gap absorbs the run above it",
+        );
+        assert_eq!(slot_forwarded_through(&seen, SlotId(0)), Some(4));
+        assert!(
+            !seen.mark_forwarded(SlotId(0), 1).prefix_advanced,
+            "a duplicate moves nothing",
+        );
+    }
+
+    /// The top of one slot's contiguous forwarded prefix, for the tests that
+    /// assert where a withheld turn left it.
+    fn slot_forwarded_through(seen: &MeshSeen, slot: SlotId) -> Option<u64> {
+        seen.slots
+            .get(&slot)
+            .and_then(|state| state.forwarded_through)
     }
 
     #[test]
@@ -4427,16 +4636,16 @@ mod tests {
         // forward gate would rather drop a lost/replayed gap turn than deliver
         // what it can no longer prove is new.
         let mut seen = MeshSeen::new();
-        assert_eq!(seen.mark_forwarded(SlotId(0), 0), Seen::New);
+        assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
         let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
         for seq in (2..=last).step_by(2) {
-            assert_eq!(seen.mark_forwarded(SlotId(0), seq), Seen::New);
+            assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
         }
         // The prefix has collapsed forward over the low odd gaps. A low odd seq —
         // one that was skipped and never forwarded — now arrives late and is
         // rejected as below the collapsed prefix.
         assert_eq!(
-            seen.mark_forwarded(SlotId(0), 1),
+            seen.mark_forwarded(SlotId(0), 1).seen,
             Seen::Duplicate,
             "a swallowed gap seq is seen, not fresh",
         );
@@ -4754,6 +4963,81 @@ mod tests {
         );
     }
 
+    /// A peer relay's `SlotStarted` lands in this relay's maker — the slot has
+    /// left loading behind, which is what the silent-slot watch needs before it
+    /// may weigh that slot at all — and goes nowhere else: no coordinator notice
+    /// (the home already reported the load) and no echo back across the mesh.
+    #[test]
+    fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
+        use rally_point_proto::control::BufferBounds;
+
+        let mesh_links = new_mesh_links();
+        let seen = new_seen_registries();
+        let sessions = routing::Sessions::default();
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::Peer,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            None,
+            false,
+        );
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        makers.set_notice_notifier(notice_tx);
+
+        // A peer mesh link that must not hear the frame come back.
+        let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
+
+        let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
+        joined.insert(
+            key.session,
+            SessionState {
+                key: key.clone(),
+                flush_deadline: tokio::time::Instant::now(),
+                _registration: MeshLinkRegistration {
+                    links: mesh_links.clone(),
+                    key: key.clone(),
+                    id: next_mesh_link_id(),
+                },
+            },
+        );
+
+        let frame = MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotStarted(SlotStarted {
+                slot: 3,
+            })),
+        };
+        let lobby = crate::lobby::new_lobby_registry();
+        let chat = crate::chat::new_chat_registry();
+        let skins = crate::skin::new_skin_registry();
+        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+
+        assert!(
+            crate::consensus::slot_has_started(&makers, &key, SlotId(3)),
+            "the peer's report is recorded here",
+        );
+        assert!(
+            crate::consensus::started_home_slots(&makers, &key).is_empty(),
+            "a peer's slot is never re-shared as one of this relay's own",
+        );
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "reporting the load stays the slot's home's job",
+        );
+        assert!(
+            echo_ctl_rx.try_recv().is_err(),
+            "and the frame is not re-broadcast across the mesh",
+        );
+    }
+
     /// Bundles the registries a `dispatch_mesh_control` test already built
     /// (so it can register members and observe echoes against them) into the
     /// `MeshState` its signature now takes. `conditions` and `presence` are not
@@ -4974,7 +5258,7 @@ mod tests {
             "mesh ingress still feeds consensus",
         );
         assert_eq!(
-            mark_seen(&seen, &key, SlotId(0), payload.seq),
+            mark_seen(&seen, &key, SlotId(0), payload.seq).seen,
             Seen::Duplicate,
             "mesh ingress still passes the session-level dedup gate",
         );
@@ -5187,6 +5471,53 @@ mod tests {
             directives,
             vec![leave],
             "the cached leave re-announced verbatim"
+        );
+    }
+
+    /// A `Join`-time reconcile re-shares every game-started report this relay's
+    /// own home clients made, so a peer that joined the mesh after those reports
+    /// — or a relay that replaced one — learns the set instead of treating those
+    /// slots as still loading. A peer's own shared report is never re-shared, so
+    /// nothing loops the mesh.
+    #[test]
+    fn join_reconcile_re_shares_this_relay_s_own_started_slots() {
+        use rally_point_proto::control::BufferBounds;
+
+        let makers = Arc::new(crate::consensus::new_decision_makers());
+        let key = control_key();
+        let _ = crate::consensus::sync_maker(
+            &makers,
+            &key,
+            BufferBounds::new(0, 20).unwrap(),
+            crate::consensus::Authority::SelfRelay,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            None,
+            false,
+        );
+        crate::consensus::record_slot_started(&makers, &key, SlotId(2));
+        crate::consensus::record_slot_started(&makers, &key, SlotId(0));
+        // A peer's slot, learned over the mesh: recorded here, never re-shared.
+        crate::consensus::record_peer_slot_started(&makers, &key, SlotId(1));
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        reconcile_started_slots_on_join(&makers, &control_tx, &key);
+        reconcile_started_slots_on_join(&makers, &control_tx, &key);
+
+        let mut started = Vec::new();
+        while let Ok(frame) = control_rx.try_recv() {
+            assert_eq!(frame.session, key.session.0);
+            match frame.kind {
+                Some(mesh_control_frame::Kind::SlotStarted(s)) => started.push(s.slot),
+                other => panic!("unexpected started reconcile frame {other:?}"),
+            }
+        }
+        assert_eq!(
+            started,
+            vec![0, 2, 0, 2],
+            "every own started slot, in slot order, on every join",
         );
     }
 
@@ -5735,7 +6066,7 @@ mod tests {
         // The turn was marked in the session-level gate: an overlapping copy is
         // a duplicate now.
         assert_eq!(
-            mark_seen(&seen, &key, SlotId(0), 0),
+            mark_seen(&seen, &key, SlotId(0), 0).seen,
             Seen::Duplicate,
             "the dispatch delivered (and marked) the turn",
         );
@@ -6573,7 +6904,7 @@ mod tests {
             "a retired session's mesh turn is dropped",
         );
         assert_eq!(
-            mark_seen(&mesh_state.seen, &key, SlotId(0), 3),
+            mark_seen(&mesh_state.seen, &key, SlotId(0), 3).seen,
             Seen::New,
             "the dropped turn never touched the session-level gate",
         );

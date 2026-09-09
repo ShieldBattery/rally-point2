@@ -73,7 +73,7 @@ fn mesh_dedup(c: &mut Criterion) {
             MeshSeen::new,
             |mut seen| {
                 for seq in 0..TURNS {
-                    assert_eq!(seen.mark_forwarded(SlotId(3), seq), Seen::New);
+                    assert_eq!(seen.mark_forwarded(SlotId(3), seq).seen, Seen::New);
                 }
                 black_box(seen)
             },
@@ -85,7 +85,7 @@ fn mesh_dedup(c: &mut Criterion) {
     group.bench_function("registry_warm_session", |b| {
         let registries = new_seen_registries();
         let key = session_key();
-        assert_eq!(mark_seen(&registries, &key, SlotId(3), 0), Seen::New);
+        assert_eq!(mark_seen(&registries, &key, SlotId(3), 0).seen, Seen::New);
         let mut next_seq = 1_u64;
         b.iter(|| {
             let result = mark_seen(&registries, &key, SlotId(3), next_seq);
