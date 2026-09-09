@@ -834,6 +834,15 @@ struct SlotState {
     /// (the seq-aware production path); the seq-less
     /// [`observe_frame`](DecisionMaker::observe_frame) leaves it empty (tests).
     frame_history: VecDeque<(u64, u32)>,
+    /// The highest transport seq a framed turn from this slot has been observed
+    /// at, so a stamp that arrives out of order (a lower seq after a higher one)
+    /// is told apart from a stamp that genuinely went backwards.
+    newest_framed_seq: Option<u64>,
+    /// Whether the backwards-stamp tripwire (see
+    /// [`DecisionMaker::observe_turn_frame`]) has already fired for this slot.
+    /// It reports once: a client whose counter restarted stamps below the
+    /// high-water mark on every turn until the counter catches up.
+    frame_regression_reported: bool,
     /// The current (latest) sample's cumulative `lost_packets`.
     curr_lost: u64,
     /// The current (latest) sample's cumulative `sent_packets`.
@@ -2990,15 +2999,48 @@ impl DecisionMaker {
     /// don't exercise the leave-frame clamp.
     ///
     /// A departed slot is ignored, exactly as in `observe_frame`.
-    pub fn observe_turn_frame(&mut self, slot: SlotId, seq: u64, frame: GameFrameCount) {
+    ///
+    /// Returns the slot's prior high-water mark when this stamp is **below** it
+    /// at a **higher** seq than any framed turn seen before — a tripwire, not a
+    /// correction. A client stamps its executable-turn index, which only
+    /// advances once its game loop is stepping, so an honest counter can never
+    /// produce that ordering: it means the counter restarted underneath the
+    /// stamps (a turn stamped before the loop began, when the index still held
+    /// its lobby-era value, or a hostile stamp). The observation is deliberately
+    /// left uncorrected — the slot's frame stays at the high-water mark and the
+    /// history keeps the earlier entries — because lowering a slot's frame on
+    /// its own say-so is the inflation lever in reverse; the point is to make
+    /// the condition visible, since a frame-scheduled leave derived from that
+    /// mark can land past the frame survivors stall at. Reported once per slot.
+    /// Out-of-order arrival (a lower seq after a higher one) never trips it.
+    pub fn observe_turn_frame(
+        &mut self,
+        slot: SlotId,
+        seq: u64,
+        frame: GameFrameCount,
+    ) -> Option<FrameRegression> {
         if self.departures.contains_key(&slot) {
-            return;
+            return None;
         }
         // Only the window back to `frontier − buffer_max` is ever consulted; keep
         // a little more than the buffer depth so the fastest survivor's history
         // still reaches the threshold turn even under a bit of reordering.
         let cap = (self.bounds.max as usize).saturating_add(4).max(8);
         let state = self.slots.entry(slot).or_default();
+        let regression = match (state.newest_framed_seq, state.frame) {
+            (Some(newest), Some(prior))
+                if seq > newest && frame < prior && !state.frame_regression_reported =>
+            {
+                state.frame_regression_reported = true;
+                Some(FrameRegression {
+                    prior_frame: prior.0,
+                })
+            }
+            _ => None,
+        };
+        if state.newest_framed_seq.is_none_or(|newest| seq > newest) {
+            state.newest_framed_seq = Some(seq);
+        }
         if state.frame.is_none_or(|current| frame > current) {
             state.frame = Some(frame);
         }
@@ -3006,6 +3048,7 @@ impl DecisionMaker {
         while state.frame_history.len() > cap {
             state.frame_history.pop_front();
         }
+        regression
     }
 
     /// The reachability ceiling for a leave's apply frame: the highest game frame
@@ -6996,15 +7039,53 @@ pub fn observe_turn_frame(
     frame: GameFrameCount,
     home: crate::delivery::DeliveryHome,
 ) {
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.observe_turn_frame(slot, seq, frame);
+    let regression = {
+        let mut makers = registry.lock();
+        let Some(maker) = makers.get_mut(key) else {
+            return;
+        };
+        let regression = maker.observe_turn_frame(slot, seq, frame);
         // The same validated turn is the origin-side half of end-to-end
         // delivery tracking: the newest seq this relay has seen from `slot`,
         // and — because turns are never re-forwarded relay-to-relay — the
         // source it arrived by is the slot's home relay, which is what hop
         // inference keys on.
         maker.delivery_mut().observe_origin(slot, seq, home);
+        regression
+    };
+    // Reported outside the maker lock: the recorder takes its own per-session
+    // lock, and this fires at most once per slot, never on the steady-state
+    // turn path.
+    if let Some(FrameRegression { prior_frame }) = regression {
+        tracing::warn!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = slot.0,
+            seq,
+            frame = frame.0,
+            prior_frame,
+            "framed turn stamped below the slot's newest frame at a higher seq: the client's \
+             executable-turn index restarted underneath its stamps (a turn stamped before its \
+             game loop began, or a hostile stamp); the slot's recorded frame stays at the \
+             high-water mark, so a frame-scheduled leave for it may be unreachable",
+        );
+        registry.flight_recorder().record(
+            key,
+            crate::flight_recorder::FlightEvent::FrameStampRegressed {
+                slot: slot.0,
+                seq,
+                frame: frame.0,
+                prior_frame,
+            },
+        );
     }
+}
+
+/// What [`DecisionMaker::observe_turn_frame`] reports when a slot's stamp went
+/// backwards at a higher seq: the high-water mark the stamp fell below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRegression {
+    pub prior_frame: u32,
 }
 
 /// Folds one destination delivered-through cursor into `key`'s end-to-end
@@ -12763,6 +12844,116 @@ mod tests {
         for seq in seqs {
             maker.observe_turn_frame(SlotId(slot), seq, GameFrameCount(100 + seq as u32));
         }
+    }
+
+    // -- Backwards-stamp tripwire: a client whose executable-turn index
+    //    restarted underneath its stamps (a turn stamped before its game loop
+    //    began) is reported once, never corrected, and out-of-order arrival
+    //    never trips it. --
+
+    /// The production shape of the stall this guards against: seed turns stamped
+    /// with a lobby-era index (215, 216), then in-loop turns from a restarted
+    /// counter (0, 1, ...). The first in-loop stamp trips the wire once; the
+    /// slot's frame stays at the high-water mark and later low stamps are quiet.
+    #[test]
+    fn a_stamp_below_the_high_water_mark_at_a_higher_seq_is_reported_once() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(2), 0, GameFrameCount(215)),
+            None
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(2), 1, GameFrameCount(216)),
+            None
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(2), 2, GameFrameCount(0)),
+            Some(FrameRegression { prior_frame: 216 }),
+            "the restarted counter's first stamp is the report",
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(2), 3, GameFrameCount(1)),
+            None,
+            "one report per slot",
+        );
+        assert_eq!(
+            maker.session_frame(),
+            Some(GameFrameCount(216)),
+            "the observation is not corrected: the high-water mark stands",
+        );
+    }
+
+    /// Reordering on the wire: a lower seq landing after a higher one, whatever
+    /// its stamp, is not a regression — the counter never went backwards, the
+    /// turn is just late.
+    #[test]
+    fn an_out_of_order_lower_seq_never_trips_the_tripwire() {
+        let mut maker = DecisionMaker::new(
+            key(),
+            bounds(0, 6),
+            law(),
+            Authority::SelfRelay,
+            HashSet::new(),
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(1), 5, GameFrameCount(105)),
+            None
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(1), 3, GameFrameCount(103)),
+            None,
+            "a late, lower-seq turn with a lower stamp is ordinary reordering",
+        );
+        assert_eq!(
+            maker.observe_turn_frame(SlotId(1), 6, GameFrameCount(106)),
+            None
+        );
+    }
+
+    /// The registry-level observer surfaces the report as a warning and a
+    /// flight event, so a recording shows the stamp restart directly instead of
+    /// leaving it to be inferred from directive arithmetic.
+    #[test]
+    fn a_frame_regression_is_recorded_as_a_flight_event() {
+        let makers = new_decision_makers();
+        let k = key();
+        makers.lock().insert(
+            k.clone(),
+            DecisionMaker::new(
+                k.clone(),
+                bounds(0, 6),
+                law(),
+                Authority::SelfRelay,
+                HashSet::new(),
+            ),
+        );
+        let home = crate::delivery::DeliveryHome::Local;
+        observe_turn_frame(&makers, &k, SlotId(2), 0, GameFrameCount(126), home);
+        observe_turn_frame(&makers, &k, SlotId(2), 1, GameFrameCount(0), home);
+        observe_turn_frame(&makers, &k, SlotId(2), 2, GameFrameCount(1), home);
+
+        let events: Vec<_> = makers
+            .flight_recorder()
+            .events(&k)
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![crate::flight_recorder::FlightEvent::FrameStampRegressed {
+                slot: 2,
+                seq: 1,
+                frame: 0,
+                prior_frame: 126,
+            }],
+            "exactly one event, for the first backwards stamp",
+        );
     }
 
     /// The exact production flow on the departing slot's home relay: read the

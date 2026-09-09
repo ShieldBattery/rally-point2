@@ -223,6 +223,23 @@ pub enum FlightEvent {
     /// a session stuck repeating this event is the signal for operator
     /// intervention (or the coordinated-abort follow-up).
     DropFinalizeRejected { slot: u8, no_cursor: bool },
+    /// A slot's validated turn carried a `game_frame_count` below the slot's
+    /// newest recorded frame at a *higher* transport seq than any framed turn
+    /// before it. A client stamps its executable-turn index, which only
+    /// advances once its game loop is stepping, so this ordering means the
+    /// index restarted underneath the stamps: a turn stamped before the loop
+    /// began, while the index still held its lobby-era value, or a hostile
+    /// stamp. The observation is not corrected — the slot's frame stays at the
+    /// high-water mark — so a frame-scheduled leave for this slot can land
+    /// past the frame the survivors stall at; a recording with this event
+    /// followed by a stall after the slot's leave is that failure. Reported
+    /// once per slot.
+    FrameStampRegressed {
+        slot: u8,
+        seq: u64,
+        frame: u32,
+        prior_frame: u32,
+    },
     /// The authority refused a home's FINALIZED answer because its own
     /// forwarded prefix for the slot already extends past the sealed count —
     /// local proof that turns beyond the count entered the mesh after the
