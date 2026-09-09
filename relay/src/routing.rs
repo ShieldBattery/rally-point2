@@ -1776,10 +1776,10 @@ pub async fn run_slot_link(
     // slot's window at 0 and, once the resumed high-seq stream passed the window,
     // reject it as out-of-window and drop the link — which, because every re-homed
     // slot crosses the window at the same absolute seq, tears down the whole group
-    // at once and leaves a later peer death unconfirmable to the survivor. Removing
-    // the own-slot entry here also keeps it out of the replay below (a slot is never
-    // replayed its own turns). Absent (a fresh dial or a peer-only reconnect), this
-    // is a no-op and the window bases at 0 as before.
+    // at once and leaves a later peer death unconfirmable to the survivor. The entry
+    // is consumed here because it is an anchor, not a delivery position: the replay
+    // below skips this slot by name regardless. Absent (a fresh dial or a peer-only
+    // reconnect), this is a no-op and the window bases at 0 as before.
     //
     // The anchor is transport state only: it bases this link's dedup window, and
     // nothing else. It never feeds the slot's final turn count — that comes from
@@ -1877,17 +1877,19 @@ pub async fn run_slot_link(
         }
     }
 
-    // Replay to a reconnecting client the turns it missed while it was gone. A fresh
-    // dial presents no resume cursors, so this replays nothing; a reconnect presents
-    // its per-peer-slot delivery position, and every recorded turn at or past a
-    // slot's cursor is written down the reliable control stream, oldest-first. They
-    // ride the stream as ordinary oversize-turn frames — the same path the client
-    // already folds back into its per-slot reorder buffer — so the replayed turns
-    // splice ahead of the live datagram turns that resume once this loop runs, and
-    // the client's per-slot seq ordering holds regardless of which path delivered
-    // each turn. Done before the serve loop so no live forward can outrun the
-    // replay on the control stream.
-    for payload in turn_ring.replay(&key, &resume_cursors) {
+    // Replay to this client the turns the session recorded that it has not already
+    // received. Its cursors name a delivery position per peer slot it has heard
+    // from; every recorded turn at or past one of those is written down the reliable
+    // control stream, oldest-first, and so is every turn from a peer the cursors do
+    // not name at all — a peer a client has never heard from is precisely the one
+    // whose turns went down the link that just died, and nothing else will carry
+    // them again. The client's own slot is never replayed to it. They ride the
+    // stream as ordinary oversize-turn frames — the path the client already folds
+    // into its per-slot reorder buffer — so the replayed turns splice ahead of the
+    // live datagram turns that resume once this loop runs, and the client's per-slot
+    // seq ordering holds regardless of which path delivered each turn. Done before
+    // the serve loop so no live forward can outrun the replay on the control stream.
+    for payload in turn_ring.replay(&key, &resume_cursors, slot) {
         if let Err(error) =
             rally_point_transport::control::send_control_turn(&mut control_send, payload).await
         {

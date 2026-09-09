@@ -2783,8 +2783,11 @@ struct ReconnectDriver {
 /// The per-slot resume cursors to present on a reconnect: for each peer slot the
 /// driver has received from, the seq it next needs (`next_seq`). The relay replays
 /// every recorded turn at or past the cursor and nothing below it, and the client's
-/// dedup absorbs any overlap. An empty map (no peer turns yet) asks for no replay,
-/// exactly like a fresh dial.
+/// dedup absorbs any overlap. A peer this driver has never received a turn from has
+/// no cursor to state, so it is simply absent — and the relay replays such a slot
+/// from the start of what it still holds, which is what un-wedges a client that
+/// dropped before a peer's first turn ever reached it. The dedup absorbs that
+/// overlap the same way, so an empty map is a valid ask, not a request for nothing.
 fn resume_cursors(next_seq: &HashMap<SlotId, u64>) -> Vec<(SlotId, u64)> {
     next_seq.iter().map(|(&slot, &next)| (slot, next)).collect()
 }

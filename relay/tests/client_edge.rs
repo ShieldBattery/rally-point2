@@ -2665,15 +2665,16 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
         game_frame_count: Some(frame),
         ..Default::default()
     };
-    /// The next region-label map on `reader`, skipping the session-start and
-    /// connectivity frames that legitimately precede it (a slot registering after
-    /// the session started is re-pushed both).
+    /// The next region-label map on `reader`, skipping every frame that
+    /// legitimately precedes it for a slot registering after the session started:
+    /// the re-pushed session-start and connectivity signals, and the replay of the
+    /// turns the session has already recorded.
     async fn next_labels(
         reader: &mut tokio::sync::mpsc::Receiver<ControlInbound>,
     ) -> Vec<(u64, String)> {
         loop {
             match recv_meaningful(reader).await {
-                ControlInbound::SessionStart(_) => continue,
+                ControlInbound::SessionStart(_) | ControlInbound::OversizeTurn(_) => continue,
                 ControlInbound::RegionLabels(map) => {
                     return map
                         .labels

@@ -257,25 +257,38 @@ impl TurnRing {
             .record(payload.clone(), origin, slots);
     }
 
-    /// The recorded turns a reconnecting client has not yet received, oldest-first.
+    /// The recorded turns a connecting client has not yet received, oldest-first,
+    /// from every slot but `own` — its own slot, which is never replayed to itself.
     ///
-    /// For each recorded turn, `cursors` names — per source slot — the next seq the
-    /// client still needs: a turn is replayed when its slot is present in `cursors`
-    /// and its seq is at or past that slot's cursor. A slot absent from `cursors` is
-    /// not replayed (the client did not ask to resume it), so an empty map — a fresh
-    /// dial — replays nothing. Oldest-first preserves each slot's seq order for the
-    /// client's per-slot reorder buffer. Every origin qualifies: a reconnecting
-    /// client wants everything it missed regardless of whether its home client
-    /// edge or a direct peer link first delivered it here.
+    /// `cursors` names, per source slot, the next seq the client still needs: a turn
+    /// from a slot present in `cursors` is replayed when its seq is at or past that
+    /// slot's cursor. A slot **absent** from `cursors` is replayed from the start of
+    /// whatever the ring still holds, because a client's cursor set covers only the
+    /// slots it has actually received a turn from. A peer whose first turns were
+    /// forwarded down the link that then died leaves no cursor behind at all, and
+    /// nothing else will ever carry those turns again — that link's redundancy
+    /// window died with it. Under-replaying there wedges the game permanently (the
+    /// client waits forever on a turn no path will send again); over-replaying costs
+    /// only bytes, since the client dedups by `(slot, seq)`.
     ///
-    /// A client's own inbound gaps have a second re-carrier besides this replay
-    /// — its own unacked-window redundancy, riding its live home-relay link — so
-    /// an absent slot here always safely means "nothing to replay", with no
-    /// resume-vs-fresh distinction to make. [`replay_local`](Self::replay_local)
-    /// (the mesh peer's reply) has no such second re-carrier and needs one; see
-    /// its own doc.
-    pub fn replay(&self, key: &SessionKey, cursors: &HashMap<SlotId, u64>) -> Vec<Payload> {
-        self.matching(key, cursors, None, false)
+    /// The rule holds for every dial, not just one that presents cursors, because an
+    /// empty cursor set does not mean a first arrival: a client that has neither sent
+    /// nor received a turn presents no cursors when it re-homes, and lands on a relay
+    /// whose ring can already hold the session's turns. It costs a genuine first
+    /// arrival nothing either — turns are recorded only after the session starts, and
+    /// a session starts only once every expected slot is present, so the ring a first
+    /// arrival reads is empty.
+    ///
+    /// Oldest-first preserves each slot's seq order for the client's per-slot reorder
+    /// buffer. Every origin qualifies: a client wants everything it missed regardless
+    /// of whether its home client edge or a direct peer link first delivered it here.
+    pub fn replay(
+        &self,
+        key: &SessionKey,
+        cursors: &HashMap<SlotId, u64>,
+        own: SlotId,
+    ) -> Vec<Payload> {
+        self.matching(key, cursors, None, true, Some(own))
     }
 
     /// Like [`replay`](Self::replay), but additionally restricted to turns this
@@ -285,38 +298,41 @@ impl TurnRing {
     /// mesh. That is what keeps a resume reply from becoming an echo: a mesh
     /// peer's cursors are answered only with what genuinely originated here.
     ///
-    /// `resuming` decides what a slot absent from `cursors` means, and it is
-    /// not the same "nothing to replay" [`replay`](Self::replay) can always
-    /// assume: a mesh peer's own inbound gaps have no second re-carrier once
-    /// the link that would have re-carried them has died (unlike a client's,
-    /// covered by its still-live home-relay link's own redundancy), so an
-    /// asker with genuine prior history for the session (`resuming` true)
-    /// needs an absent slot answered from the very start — its own dedup
-    /// absorbs whatever sparse overlap it already has — while an asker with
-    /// none at all (`resuming` false: a first Join, or one predating this
-    /// link) still gets nothing for an absent slot, exactly as `replay` would.
+    /// `resuming` decides what a slot absent from `cursors` means. An asker with
+    /// genuine prior history for the session (`resuming` true) needs an absent
+    /// slot answered from the very start — its own dedup absorbs whatever sparse
+    /// overlap it already has — exactly as [`replay`](Self::replay) answers one.
+    /// An asker with no history at all (`resuming` false: a relay holding no
+    /// forward-gate entry for the session, so it has never delivered one of its
+    /// turns and cannot have missed any) gets nothing for an absent slot, and
+    /// answering it would push the whole ring across the mesh on every first
+    /// Join. A client asker has no such distinction to make: it always has a
+    /// slot in the session it is dialing for.
     pub fn replay_local(
         &self,
         key: &SessionKey,
         cursors: &HashMap<SlotId, u64>,
         resuming: bool,
     ) -> Vec<Payload> {
-        self.matching(key, cursors, Some(TurnOrigin::Local), resuming)
+        self.matching(key, cursors, Some(TurnOrigin::Local), resuming, None)
     }
 
     /// Shared body for [`replay`](Self::replay) and
     /// [`replay_local`](Self::replay_local): every recorded turn at or past its
     /// slot's cursor, oldest-first, additionally restricted to `origin` when one
     /// is given. `replay_absent_from_zero` governs a slot absent from `cursors`:
-    /// excluded when `false` (the cursor asker never named it), included from
-    /// seq 0 when `true` (an asker with real history whose own gap-tracking
-    /// simply never covered this slot).
+    /// excluded when `false` (the asker has no history and so no gap to fill),
+    /// included from seq 0 when `true` (the asker's own delivery tracking simply
+    /// never covered this slot, which is not the same as having received it).
+    /// `skip` names a slot whose turns are never returned at all, whatever its
+    /// cursor says — the asking client's own slot, which is not replayed itself.
     fn matching(
         &self,
         key: &SessionKey,
         cursors: &HashMap<SlotId, u64>,
         origin: Option<TurnOrigin>,
         replay_absent_from_zero: bool,
+        skip: Option<SlotId>,
     ) -> Vec<Payload> {
         let state = self.state.lock();
         let Some(ring) = state.sessions.get(key) else {
@@ -329,7 +345,11 @@ impl TurnRing {
                 let Ok(slot) = u8::try_from(entry.payload.slot) else {
                     return false;
                 };
-                match cursors.get(&SlotId(slot)) {
+                let slot = SlotId(slot);
+                if skip == Some(slot) {
+                    return false;
+                }
+                match cursors.get(&slot) {
                     Some(&cursor) => entry.payload.seq >= cursor,
                     None => replay_absent_from_zero,
                 }
@@ -418,6 +438,11 @@ mod tests {
         ring.record(key, payload, TurnOrigin::Local, MAX_GAME_SLOTS);
     }
 
+    /// The slot doing the connecting in the tests that only care about cursor or
+    /// bound mechanics: one that never produces a turn of its own, so the
+    /// own-slot skip can never remove anything they assert on.
+    const RECONNECTING: SlotId = SlotId(9);
+
     #[test]
     fn the_count_bound_is_at_least_the_nominal_window_at_every_slot_count() {
         // The whole point of deriving the bound from the nominal window is that the
@@ -463,12 +488,44 @@ mod tests {
             record_local(&ring, &k, &turn(1, seq, 8));
         }
 
-        // A client that has slot 0 through seq 1 and slot 2 not at all: replay slot
-        // 0's seqs >= 2 only, and nothing for slot 1 (absent from the cursor map).
-        let cursors: HashMap<SlotId, u64> = [(SlotId(0), 2)].into();
-        let replayed = ring.replay(&k, &cursors);
+        // A client that holds slot 0 through seq 1 and slot 1 through seq 0: each
+        // named slot replays from its own cursor and nothing below it.
+        let cursors: HashMap<SlotId, u64> = [(SlotId(0), 2), (SlotId(1), 1)].into();
+        let replayed = ring.replay(&k, &cursors, RECONNECTING);
         let got: Vec<(u32, u64)> = replayed.iter().map(|p| (p.slot, p.seq)).collect();
-        assert_eq!(got, vec![(0, 2), (0, 3)]);
+        assert_eq!(got, vec![(0, 2), (0, 3), (1, 1)]);
+    }
+
+    #[test]
+    fn a_slot_the_cursors_never_name_replays_from_the_start() {
+        // The wedge this rule exists for: a client froze before a peer's first
+        // turn reached it, so its cursor map has no entry for that peer at all,
+        // while the relay had already forwarded those turns down the link that
+        // then died. Nothing else can carry them, so an unnamed slot replays
+        // whole. Its own slot is skipped even though it, too, goes unnamed.
+        let ring = TurnRing::new();
+        let k = key();
+        for seq in 0..3 {
+            record_local(&ring, &k, &turn(0, seq, 8));
+        }
+        for seq in 0..2 {
+            record_local(&ring, &k, &turn(1, seq, 8));
+        }
+        record_local(&ring, &k, &turn(2, 0, 8));
+
+        // Slot 2 is reconnecting and names only slot 1, from seq 1.
+        let cursors: HashMap<SlotId, u64> = [(SlotId(1), 1)].into();
+        let got: Vec<(u32, u64)> = ring
+            .replay(&k, &cursors, SlotId(2))
+            .iter()
+            .map(|p| (p.slot, p.seq))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, 0), (0, 1), (0, 2), (1, 1)],
+            "the unnamed peer replays whole, the named one from its cursor, and the \
+             reconnecting slot gets none of its own turns back",
+        );
     }
 
     #[test]
@@ -479,16 +536,42 @@ mod tests {
             record_local(&ring, &k, &turn(0, seq, 8));
         }
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
-        let seqs: Vec<u64> = ring.replay(&k, &cursors).iter().map(|p| p.seq).collect();
+        let seqs: Vec<u64> = ring
+            .replay(&k, &cursors, RECONNECTING)
+            .iter()
+            .map(|p| p.seq)
+            .collect();
         assert_eq!(seqs, vec![0, 1, 2, 3, 4], "oldest-first");
     }
 
     #[test]
-    fn an_empty_cursor_map_replays_nothing() {
+    fn an_empty_cursor_map_replays_every_other_slot_whole() {
+        // An empty map is not proof the client has nothing to catch up on — a
+        // re-homing client that has neither sent nor received a turn presents
+        // exactly this — so it asks for every peer's recorded turns, and only
+        // the asking slot's own are held back.
         let ring = TurnRing::new();
         let k = key();
         record_local(&ring, &k, &turn(0, 0, 8));
-        assert!(ring.replay(&k, &HashMap::new()).is_empty());
+        record_local(&ring, &k, &turn(1, 0, 8));
+
+        let got: Vec<(u32, u64)> = ring
+            .replay(&k, &HashMap::new(), SlotId(1))
+            .iter()
+            .map(|p| (p.slot, p.seq))
+            .collect();
+        assert_eq!(got, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn an_empty_ring_replays_nothing_to_a_first_arrival() {
+        // A slot's genuine first dial reads a ring that holds nothing: turns are
+        // recorded only once the session has started, and it starts only once
+        // every expected slot is present. Replaying an unnamed slot whole
+        // therefore costs a first arrival nothing.
+        let ring = TurnRing::new();
+        let k = key();
+        assert!(ring.replay(&k, &HashMap::new(), SlotId(0)).is_empty());
     }
 
     #[test]
@@ -512,7 +595,11 @@ mod tests {
 
         // The lowest `overflow` seqs were evicted; the newest cap-worth remain.
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
-        let seqs: Vec<u64> = ring.replay(&k, &cursors).iter().map(|p| p.seq).collect();
+        let seqs: Vec<u64> = ring
+            .replay(&k, &cursors, RECONNECTING)
+            .iter()
+            .map(|p| p.seq)
+            .collect();
         assert_eq!(seqs.first().copied(), Some(overflow as u64));
         assert_eq!(seqs.last().copied(), Some((cap + overflow - 1) as u64));
     }
@@ -637,7 +724,11 @@ mod tests {
         );
         // What remains is the newest run — the oldest seqs were evicted.
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
-        let seqs: Vec<u64> = ring.replay(&k, &cursors).iter().map(|p| p.seq).collect();
+        let seqs: Vec<u64> = ring
+            .replay(&k, &cursors, RECONNECTING)
+            .iter()
+            .map(|p| p.seq)
+            .collect();
         assert_eq!(
             seqs.last().copied(),
             Some((per + 2) as u64),
@@ -656,7 +747,10 @@ mod tests {
         record_local(&ring, &k, &turn(0, 0, 8));
         ring.end_session(&k);
         assert_eq!(ring.len(&k), 0);
-        assert!(ring.replay(&k, &[(SlotId(0), 0)].into()).is_empty());
+        assert!(
+            ring.replay(&k, &[(SlotId(0), 0)].into(), RECONNECTING)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -673,7 +767,7 @@ mod tests {
 
         let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
         assert_eq!(
-            ring.replay(&k, &cursors)
+            ring.replay(&k, &cursors, RECONNECTING)
                 .iter()
                 .map(|p| p.seq)
                 .collect::<Vec<_>>(),

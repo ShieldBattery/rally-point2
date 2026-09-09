@@ -353,7 +353,10 @@ turn it received (it executed them), so a replacement relay never needs a persis
 returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
 
 - **Resume cursors** (the same infrastructure a same-relay reconnect uses): on re-dial the client presents,
-  per peer slot, the seq it next needs, and the relay replays from its turn ring at or past it. A fresh
+  per peer slot, the seq it next needs, and the relay replays from its turn ring at or past it. A peer the
+  client has never received a turn from has no cursor to present, and the relay replays such a peer from
+  the start of what its ring holds: those are exactly the turns that went down the link that just died,
+  and no other path will carry them again (the client dedups the overlap). A fresh
   replacement relay's ring is empty, so this alone recovers nothing from it — which is what the retention
   ring below is for. Every re-dial also presents an **own-slot resume anchor** among the cursors. The relay
   builds a brand-new receive-side dedup on *every* connection (a same-relay resume or a re-home alike), which
