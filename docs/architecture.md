@@ -804,8 +804,13 @@ in the comparison indefinitely and so is never named, which is the safe directio
 *undecided* drop was always in the comparison for the same reason — it froze at exactly the moment the
 survivors' stall began.
 
-Among the participants, the slot closed is the one that stopped at least a window ago
-(`--silent-slot-window-secs`, default 10s) and **strictly earlier than every other participant**. Ties name
+A verdict is rendered only once the **whole session has sat still for the window**
+(`--silent-slot-window-secs`, default 10s): no participant's prefix has advanced within it. Any advance is an
+unblocking event the survivors may still be answering — a late turn from the slot everyone waited on reaches
+them, they step, and their own turns follow a round-trip later — and in that gap their clocks trail the slot
+that just moved through no fault of their own; judging then would name a survivor for the stall it is in the
+middle of leaving. Among the participants, the slot closed is then the one that stopped
+**strictly earlier than every other participant**. Ties name
 nobody: a session that stopped all at once has no victim, and a slot with no other participant left to be
 earlier than is holding nobody up. Being nameable at all additionally requires that this relay strictly homes
 the slot (only the home owns its link), that its connection is up with no departure or decided leave, that its

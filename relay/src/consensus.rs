@@ -4915,8 +4915,16 @@ impl DecisionMaker {
     /// — it has not already been evicted for silence
     ///   ([`mark_silence_evicted`](Self::mark_silence_evicted)), so a slot whose
     ///   link is already closing is not re-reported every tick;
-    /// — it stopped at least `window` ago, and its link has been up at least that
-    ///   long;
+    /// — the whole session has been quiet for at least `window`: no participant's
+    ///   prefix has advanced within it. Any advance is an unblocking event the
+    ///   survivors may still be answering — a late turn from the slot everyone
+    ///   waited on reaches them, they step, and their own turns follow a network
+    ///   round-trip later — and in that gap the survivors' clocks are older than
+    ///   the slot that just moved, so judging then would name a survivor for the
+    ///   stall it is in the middle of leaving. A slot that genuinely hung after
+    ///   an advance is named once the session has sat still for a window again.
+    ///   This also means the candidate itself stopped at least `window` ago;
+    /// — its link has been up at least `window`;
     /// — and it stopped *strictly* before every other participant. Ties evict
     ///   nobody: a session that stopped all at once has no victim to name, and a
     ///   slot with no other participant left to be earlier than is holding nobody
@@ -5002,6 +5010,16 @@ impl DecisionMaker {
             required.push((slot, stopped));
         }
 
+        // The session as a whole must have sat still for the window. A prefix
+        // that advanced more recently than that is an unblocking event the other
+        // participants may still be answering — the turn has to reach them and
+        // their next step has to make it back — and until it has, their clocks
+        // trail the slot that just moved through no fault of their own.
+        let latest_advance = required.iter().map(|&(_, stopped)| stopped).max()?;
+        if now.saturating_duration_since(latest_advance) < window {
+            return None;
+        }
+
         for &(slot, stopped_at) in &required {
             if !self.strictly_homes(slot)
                 || !self.connection_is_up(slot)
@@ -5012,10 +5030,9 @@ impl DecisionMaker {
             {
                 continue;
             }
+            // Implied by the session-wide quiet above (this slot stopped no later
+            // than the latest advance), kept as the reported measure.
             let silent_for = now.saturating_duration_since(stopped_at);
-            if silent_for < window {
-                continue;
-            }
             // A link that just came up is owed the whole window before it may be
             // closed: it has had no chance to forward anything yet. The grace is
             // time and nothing else — the slot's stop time stays where its
@@ -16901,6 +16918,54 @@ mod tests {
             DROPPED,
             Some(1),
         ));
+    }
+
+    /// The slot everyone waited on delivers a late turn just before the watch
+    /// ticks. The survivor has not had the round-trip it needs to consume that
+    /// turn and answer with its own, so its clock is momentarily the oldest —
+    /// naming it then would evict the one slot that did nothing wrong.
+    #[test]
+    fn a_survivor_is_not_named_while_it_is_still_answering_a_late_turn() {
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        maker.note_forward_advance(SlotId(1), start + Duration::from_millis(11_300));
+
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_millis(11_400), SILENCE_WINDOW),
+            None,
+            "the session moved 100ms ago; nobody is judged until it has sat still for a window",
+        );
+
+        // The survivor answers, and the session runs on: no verdict.
+        maker.note_forward_advance(SlotId(0), start + Duration::from_millis(11_500));
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_secs(20), SILENCE_WINDOW),
+            None,
+            "both moved within the window; the session is not stalled",
+        );
+    }
+
+    /// The other half of the late-turn case: the slot that delivered one turn
+    /// and went quiet again is named once the session has sat still for a full
+    /// window after that turn, and the survivor that answered it is not.
+    #[test]
+    fn a_slot_that_went_quiet_again_after_a_late_turn_is_named_after_a_full_window() {
+        let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
+        maker.note_forward_advance(SlotId(1), start + Duration::from_millis(11_300));
+        maker.note_forward_advance(SlotId(0), start + Duration::from_millis(11_500));
+
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_millis(21_400), SILENCE_WINDOW),
+            None,
+            "the survivor's answer is still inside the window",
+        );
+        assert_eq!(
+            maker.silent_slot(start + Duration::from_millis(21_600), SILENCE_WINDOW),
+            Some(SilentSlot {
+                slot: SlotId(1),
+                silent_for: Duration::from_millis(10_300),
+                lead: Duration::from_millis(200),
+            }),
+        );
     }
 
     #[test]
