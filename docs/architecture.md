@@ -1592,7 +1592,7 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
   both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench
-  for any retune is `transport/src/recarry_sim.rs`, which drives real `AckManager` pairs through
+  for any retune is `transport/src/recarry_sim/`, which drives real `AckManager` pairs through
   fade/burst/blackout scenarios and prints the comparison tables
   (`cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`).
 - **Relay regions reach clients, but only after real play has elapsed, and the gate is wall-clock.**

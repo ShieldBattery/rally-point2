@@ -137,8 +137,7 @@ async fn rejects_a_peer_with_a_mismatched_alpn() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"rp2/0".to_vec()];
-    let mismatched_cfg =
-        noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+    let mismatched_cfg = noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
     let client = noq::Endpoint::client(bind).unwrap();
     client.set_default_client_config(mismatched_cfg);
@@ -189,8 +188,7 @@ async fn rejects_a_mesh_peer_with_a_mismatched_alpn() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"rp2-mesh/0".to_vec()];
-    let mismatched_cfg =
-        noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
+    let mismatched_cfg = noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
 
     let client = noq::Endpoint::client(bind).unwrap();
     client.set_default_client_config(mismatched_cfg);
