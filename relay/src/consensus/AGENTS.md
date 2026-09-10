@@ -8,7 +8,7 @@
   glob block is what lets each child's `use super::*` keep resolving bare names.
 - `law.rs` tuning + `ControlLaw` + RTT/loss/outage windows; `slot.rs` per-slot state
   and connection-epoch types; `sync/` the desync comparator; `registry.rs` the locked
-  map, notices, `log_*`. `phase/`, `delivery.rs`, `buffer_law_sim.rs` are elsewhere.
+  map, notices, `log_*`. `phase/`, `delivery.rs`, and `buffer_law_sim/` also live here.
 - `maker/` is one `impl DecisionMaker` block per concern — `authority` frames +
   handoff, `connection` ingest + epochs, `buffer` the control law, `leave`,
   `departure`, `start` (roster/shape/region labels/phase), `silence`, `sync`. `ops/`
