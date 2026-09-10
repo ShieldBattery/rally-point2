@@ -57,6 +57,17 @@ Full rationale in `docs/architecture.md`. The ones easy to break by accident:
 
 ## Conventions
 
+- **Source layout.** Files aim for ~500 lines (800 is the ceiling). A module that
+  outgrows that becomes a directory (`foo/mod.rs` + siblings by concern) whose
+  `mod.rs` re-exports the public surface, so `crate::foo::X` paths never move;
+  submodules stay private. Unit tests live beside the code in `foo/tests.rs` or
+  `foo/tests/<topic>.rs` (child modules of `foo`, so private items stay
+  reachable), and big integration suites are `tests/<suite>/main.rs` with topic
+  files. Subject areas with non-obvious rules carry their own `AGENTS.md`
+  (`relay/src/{consensus,mesh,routing,coordinator,session,observability}`,
+  `coordinator/src/{api,session,lifecycle,provision}`, `client/src/driver`,
+  `transport/src`, `proto/src`, `relay/tests`, `coordinator/tests`) — read the
+  one for the area you are touching.
 - Declare dependencies once in `[workspace.dependencies]`, reference with
   `{ workspace = true }`.
 - `tracing` logs/metrics are correlated by `tenant / session / slot / turn`.
