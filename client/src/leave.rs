@@ -151,6 +151,34 @@ impl LeaveTracker {
         self.leaves.iter().any(|l| l.directive.slot == slot)
     }
 
+    /// Makes a tracked, not-yet-surfaced leave for `slot` due at the very next
+    /// [`take_due`](Self::take_due), whatever coordinate it was scheduled at, and
+    /// reports whether there was one. The directive's slot and reason are kept;
+    /// only its schedule is discarded.
+    ///
+    /// A leave's apply coordinate exists so that every client applies it at the
+    /// identical simulated step. A client that is leaving lockstep itself — its
+    /// game ending locally, or the player quitting — has no one left to stay
+    /// identical with, and a schedule it can no longer reach is a trap: a frame
+    /// past the one it is stalled at, or a turn count that needs turns the
+    /// departing peer will never send, would keep that peer required forever and
+    /// the stalled step from ever assembling. Expediting the leave lets the next
+    /// poll surface it with its real reason through the ordinary path.
+    pub fn expedite(&mut self, slot: u32) -> bool {
+        match self
+            .leaves
+            .iter_mut()
+            .find(|l| l.directive.slot == slot && !l.surfaced)
+        {
+            Some(leave) => {
+                leave.directive.apply_at_frame = 0;
+                leave.directive.final_turn_count = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Surfaces every not-yet-surfaced leave that has come due, as `(slot, reason)`
     /// pairs. Each slot's leave is returned at most once; the caller writes each
     /// slot's native `pending_leave_reason` and drops it from the readiness set,
@@ -513,5 +541,34 @@ mod tests {
             "the conflicting count must not drive surfacing"
         );
         assert_eq!(tracker.take_due(0, |_| 40), vec![(SlotId(2), LEFT)]);
+    }
+    /// A client leaving lockstep can make a scheduled leave due immediately — a
+    /// frame it is stalled short of, or a count needing turns that will never
+    /// come, no longer binds it — and the next poll surfaces the real reason.
+    #[test]
+    fn expedite_makes_a_scheduled_leave_due_at_the_next_poll() {
+        let mut tracker = LeaveTracker::new();
+        tracker.observe(&counted_leave(2, 0x3, 500, 1));
+        tracker.observe(&leave(3, 0x40000006, 10_000, 2));
+        assert!(
+            tracker.take_due(5, |_| 0).is_empty(),
+            "neither is due on its own terms"
+        );
+
+        assert!(tracker.expedite(2));
+        assert!(tracker.expedite(3));
+        assert!(!tracker.expedite(9), "nothing tracked for slot 9");
+
+        let mut due = tracker.take_due(5, |_| 0);
+        due.sort();
+        assert_eq!(due, vec![(SlotId(2), 0x3), (SlotId(3), 0x40000006)]);
+        assert!(
+            !tracker.expedite(2),
+            "an already-surfaced leave has nothing left to expedite"
+        );
+        assert!(
+            tracker.take_due(5, |_| 0).is_empty(),
+            "surfaced once, never again"
+        );
     }
 }
