@@ -1295,7 +1295,7 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
 /// stopped producing turns while the session advanced past them (see
 /// [`crate::consensus::run_silence_watch`]). Identical to [`close_slots`] but for
 /// the reason it stamps, which is what makes the closed connection carry
-/// [`SILENT_SLOT_CLOSE`] instead of the generic close: a client whose game thread
+/// `SILENT_SLOT_CLOSE` instead of the generic close: a client whose game thread
 /// hung has a perfectly healthy link, and its log should say so.
 pub fn close_slots_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
     signal_close(

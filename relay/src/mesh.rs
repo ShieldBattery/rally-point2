@@ -125,7 +125,7 @@ pub struct Forwarded {
     /// Whether this turn moved the slot's gap-free forwarded prefix forward over
     /// turns that were genuinely forwarded: an in-order arrival, or one that
     /// closed the gap the prefix had stalled behind. A prefix pushed over a gap
-    /// by [`SlotSeen::collapse_to_cap`] is not that, and neither is any later
+    /// by the sparse-set cap (`SlotSeen::collapse_to_cap`) is not that, and neither is any later
     /// advance of a slot whose prefix has ever been collapsed — past a collapse
     /// the prefix no longer counts only turns that really arrived. Always false
     /// for a duplicate.
