@@ -73,7 +73,7 @@ mod tests {
     }
 
     /// Signs `message` with an ECDSA P-256 PKCS#8 key — mirrors
-    /// `coordinator_client::sign_enroll_proof`'s ECDSA branch, kept
+    /// `rally_point_relay::coordinator::client::sign_enroll_proof`'s ECDSA branch, kept
     /// independent here so this module's tests don't depend on the relay
     /// crate.
     fn sign_ecdsa_p256(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {

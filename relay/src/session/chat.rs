@@ -8,7 +8,7 @@
 //! fan-out of those messages to a session's local members.
 //!
 //! **No replay log.** This is the one load-bearing difference from
-//! [`crate::lobby`]: a lobby command's ordered log exists because a missed setup
+//! [`crate::session::lobby`]: a lobby command's ordered log exists because a missed setup
 //! command leaves a member's pre-game state permanently incomplete, and the host
 //! can emit commands before every member has dialed in. Chat has neither
 //! property — there is no game state a missed chat line could corrupt, and a
@@ -106,7 +106,7 @@ pub struct ChatSession {
 }
 
 /// Registers a member for `key` and returns the receiver its slot-link task
-/// drains. Unlike [`crate::lobby::register_member`], there is no log to replay —
+/// drains. Unlike [`crate::session::lobby::register_member`], there is no log to replay —
 /// the newcomer simply starts tailing whatever is delivered from this point on.
 pub fn register_member(
     registry: &ChatRegistry,
@@ -133,7 +133,7 @@ pub fn deregister_member(registry: &ChatRegistry, key: &SessionKey, slot: SlotId
 }
 
 /// Drops all chat state for `key`, called when the relay's last local member for
-/// the session departs — mirroring [`crate::lobby::end_session`].
+/// the session departs — mirroring [`crate::session::lobby::end_session`].
 pub fn end_session(registry: &ChatRegistry, key: &SessionKey) {
     registry.lock().remove(key);
 }
@@ -190,7 +190,7 @@ pub fn admit(registry: &ChatRegistry, key: &SessionKey, slot: SlotId, text_len: 
 /// `chat.slot` is the authoritative author, already stamped — by the client
 /// edge to the authenticated slot for a client-authored message, or by the
 /// origin relay for a mesh-received one — so the author is excluded by matching
-/// it, exactly as [`crate::lobby::deliver`] does.
+/// it, exactly as [`crate::session::lobby::deliver`] does.
 pub fn deliver(registry: &ChatRegistry, key: &SessionKey, chat: GameChat) {
     let registry = registry.lock();
     let Some(session) = registry.get(key) else {

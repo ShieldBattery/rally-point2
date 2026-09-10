@@ -9,10 +9,10 @@
 //!
 //! **A latest-per-slot map, not a log and not a bare fan-out.** This is the load-bearing
 //! difference from both siblings. A skin is one-shot *state*, not a stream of
-//! events: unlike [`crate::chat`] (ephemeral — a member whose stream comes up
+//! events: unlike [`crate::session::chat`] (ephemeral — a member whose stream comes up
 //! after a message flowed simply missed it), a member that registers late or
 //! reconnects must still end up with every other member's *current* blob. And
-//! unlike [`crate::lobby`]'s append-only ordered log (where every command is
+//! unlike [`crate::session::lobby`]'s append-only ordered log (where every command is
 //! distinct and order matters), a slot's newer blob wholly supersedes its older
 //! one — only the latest matters. So this module keeps one blob per authoring
 //! slot and, when a member registers, replays every stored blob to it (before
@@ -23,7 +23,7 @@
 //! harmless.
 //!
 //! **Exactly-once across the replay/live boundary.** The map and the live
-//! per-member push channels live under one lock, mirroring [`crate::lobby`].
+//! per-member push channels live under one lock, mirroring [`crate::session::lobby`].
 //! [`register_member`] snapshots the map into the newcomer's channel and inserts
 //! that channel under the same lock that [`deliver`] inserts into the map and
 //! fans out under, so the two steps never interleave: a blob stored *before* a
@@ -123,7 +123,7 @@ pub struct SkinSession {
     /// Per-authoring-slot token buckets for the rate cap. Keyed separately from
     /// `members` (and outliving a member's own deregistration — see
     /// [`deregister_member`]) so a slot's budget is not reset by a reconnect,
-    /// mirroring [`crate::chat`].
+    /// mirroring [`crate::session::chat`].
     limiters: HashMap<SlotId, TokenBucket>,
     /// Per-slot rate-limited warn counter for the size-cap violation.
     size_warns: HashMap<SlotId, RateLimitedCounter>,
@@ -143,7 +143,7 @@ pub struct SkinSession {
 /// author is never echoed), and the sender is inserted into the session's member
 /// set. Doing all three under the one lock [`deliver`] also holds is what makes
 /// the replay/live handoff exactly-once — see the module docs. Unlike
-/// [`crate::lobby::register_member`] the replay is unordered (a map, not a log):
+/// [`crate::session::lobby::register_member`] the replay is unordered (a map, not a log):
 /// each slot's blob is independent state, so the order they arrive in carries no
 /// meaning.
 pub fn register_member(
@@ -193,8 +193,8 @@ pub fn deregister_member(registry: &SkinRegistry, key: &SessionKey, slot: SlotId
 }
 
 /// Drops all skin state for `key`, called when the relay's last local member for
-/// the session departs — mirroring [`crate::lobby::end_session`] and
-/// [`crate::chat::end_session`].
+/// the session departs — mirroring [`crate::session::lobby::end_session`] and
+/// [`crate::session::chat::end_session`].
 pub fn end_session(registry: &SkinRegistry, key: &SessionKey) {
     registry.lock().remove(key);
 }

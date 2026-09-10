@@ -27,7 +27,7 @@ use rally_point_proto::version::{
     CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_IDENTITY_UNPROVEN,
     CONTROL_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion,
 };
-use rally_point_relay::coordinator_client;
+use rally_point_relay::coordinator;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -319,14 +319,14 @@ async fn a_reconnect_under_the_same_certificate_replaces_the_entry() {
 #[tokio::test]
 async fn the_relay_signing_helper_produces_signatures_the_coordinator_verifier_accepts() {
     // Cross-crate round trip: the exact function a real relay calls
-    // (`coordinator_client::sign_enroll_proof`) against the exact function the
+    // (`rally_point_relay::coordinator::client::sign_enroll_proof`) against the exact function the
     // coordinator calls (`identity::verify_enroll_proof`) — proving the two
     // sides agree on the signed message and the supported algorithms, not just
     // that each one's own unit tests are internally consistent.
     let nonce = [0x42; 32];
 
     let (ecdsa_cert, ecdsa_key) = self_signed();
-    let ecdsa_signature = coordinator_client::sign_enroll_proof(&ecdsa_key, &nonce)
+    let ecdsa_signature = coordinator::client::sign_enroll_proof(&ecdsa_key, &nonce)
         .expect("an ECDSA P-256 key signs");
     assert!(identity::verify_enroll_proof(
         &ecdsa_cert,
@@ -349,7 +349,7 @@ async fn the_relay_signing_helper_produces_signatures_the_coordinator_verifier_a
         .unwrap();
     let ed_key = PrivateKeyDer::try_from(ed_cert_key.serialize_der()).unwrap();
     let ed_signature =
-        coordinator_client::sign_enroll_proof(&ed_key, &nonce).expect("an Ed25519 key signs");
+        coordinator::client::sign_enroll_proof(&ed_key, &nonce).expect("an Ed25519 key signs");
     assert!(identity::verify_enroll_proof(
         ed_cert.der(),
         &nonce,

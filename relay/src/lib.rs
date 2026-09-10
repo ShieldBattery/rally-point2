@@ -10,13 +10,13 @@
 //!   control commands.
 //! - **routing** ([`routing`]) — group authorized connections by session and fan
 //!   each validated turn out to that session's other slots.
-//! - **lobby** ([`lobby`]) — fan pre-game lobby commands out to a session's local
+//! - **lobby** ([`session::lobby`]) — fan pre-game lobby commands out to a session's local
 //!   members and keep the per-session ordered replay log a late-joining member
 //!   catches up from.
-//! - **chat** ([`chat`]) — fan in-game chat messages out to a session's local
+//! - **chat** ([`session::chat`]) — fan in-game chat messages out to a session's local
 //!   members. The mid-game counterpart to `lobby`: no replay log (chat is
 //!   ephemeral), plus a per-slot size and rate cap enforced at the relay.
-//! - **skin** ([`skin`]) — fan members' opaque cosmetic-skin blobs out to a
+//! - **skin** ([`session::skin`]) — fan members' opaque cosmetic-skin blobs out to a
 //!   session's local members and replay them on register. One-shot state, not
 //!   events: a latest-blob-per-slot map (a re-send replaces) replayed to late or
 //!   reconnecting members, with the same size and rate caps `chat` enforces.
@@ -24,23 +24,23 @@
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, direct origin-relay
 //!   fan-out, one-hop mesh delivery, and session-level duplicate gating.
-//! - **mesh_edge** ([`mesh_edge`]) — the mesh-edge connection half: establish
+//! - **mesh::edge** ([`mesh::edge`]) — the mesh-edge connection half: establish
 //!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise),
 //!   exchange a peer-identity hello so each link is labeled with its peer's id,
 //!   and spawn a `run_mesh_link` driver. The Join/Leave stream that drives
 //!   session membership is pluggable — the test sends it today, the
 //!   coordinator's session-descriptor push does in production (Phase 3).
-//! - **mesh_control** ([`mesh_control`]) — the Join source: holds the per-peer
+//! - **mesh::control** ([`mesh::control`]) — the Join source: holds the per-peer
 //!   `MeshCommand` senders the connection half surfaces and turns a coordinator
 //!   `SessionDescriptor` into targeted `Join`/`Leave` on the links serving that
 //!   session. Robust to whether a link or its descriptor arrives first.
-//! - **coordinator_client** ([`coordinator_client`]) — the relay side of the
+//! - **coordinator::client** ([`coordinator::client`]) — the relay side of the
 //!   coordinator→relay control transport: a held WebSocket connection the relay
 //!   dials out, over which the coordinator pushes this relay's current
 //!   session-descriptor set (on connect and again on every change, no polling).
-//!   Each set is fed to the `mesh_control` Join source, reconciling membership
+//!   Each set is fed to the `mesh::control` Join source, reconciling membership
 //!   as sessions come and go.
-//! - **region_ping** ([`region_ping`]) — relay-measured backbone round-trips:
+//! - **coordinator::region_ping** ([`coordinator::region_ping`]) — relay-measured backbone round-trips:
 //!   ping each region's always-up UDP echo beacon (the target set the coordinator
 //!   pushes down the control connection), keep the latest measured medians, and let
 //!   the heartbeat carry them back up so the coordinator can serve a measured
@@ -55,19 +55,19 @@
 //!   The same layer also carries desync detection (a comparator across relays'
 //!   independent views of the turn stream) and synced player-leaves (an agreed
 //!   apply frame every survivor's client applies identically).
-//! - **delivery** ([`delivery`]) — end-to-end turn-delivery tracking: the
+//! - **consensus::delivery** ([`consensus::delivery`]) — end-to-end turn-delivery tracking: the
 //!   per-pair fold of client-claimed beacon cursors (origin turns reaching each
 //!   destination client), hop inference, and the clamped cushion it feeds the
 //!   latency-buffer decision.
-//! - **turn_ring** ([`turn_ring`]) — a bounded, local, per-session record of
+//! - **session::turn_ring** ([`session::turn_ring`]) — a bounded, local, per-session record of
 //!   the turns a relay has forwarded, kept only long enough to replay a
 //!   reconnecting client's missed turns from its last-delivered cursor. Local
 //!   and ephemeral, not persisted or replicated across relays.
-//! - **flight recorder** ([`flight_recorder`]) — per-game observability:
+//! - **flight recorder** ([`observability::flight_recorder`]) — per-game observability:
 //!   bounded per-session events + link-health samples + turn-stream counters
 //!   (summaries only, never payload bytes), flushed as a self-describing JSON
 //!   blob on session close and wholesale before a drain exits.
-//! - **task_stats** ([`task_stats`]) — self-reported Fargate task resources:
+//! - **observability::task_stats** ([`observability::task_stats`]) — self-reported Fargate task resources:
 //!   polls this relay's own ECS Task Metadata `/stats` endpoint and logs
 //!   CPU/memory/network, independent of CloudWatch. A no-op outside Fargate.
 //!
@@ -81,37 +81,15 @@
 //! ([`main`](../main.rs)) wires up the process.
 
 pub mod auth;
-pub mod chat;
 pub mod config;
-pub mod coordinator_client;
-pub mod delivery;
-pub mod drop_hold;
-pub mod flight_recorder;
-pub mod flight_upload;
-pub mod idle_exit;
-pub mod load_fence;
-pub mod lobby;
+pub mod consensus;
+pub mod coordinator;
 pub mod mesh;
-pub mod mesh_control;
-pub mod mesh_dialer;
-pub mod mesh_edge;
-pub mod phase;
-pub mod presence;
-pub mod provisional;
-pub mod provisional_turns;
-pub mod region_ping;
+pub mod observability;
 pub mod routing;
 pub mod server;
-pub mod session_gate;
-pub mod skin;
-pub mod task_stats;
-pub mod turn_ring;
+pub mod session;
 pub mod validation;
-
-pub mod consensus;
-
-#[cfg(test)]
-mod buffer_law_sim;
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
 // TODO: reconcile with the Fargate task def + per-game IP rotation.

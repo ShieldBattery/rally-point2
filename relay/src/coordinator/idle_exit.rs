@@ -6,7 +6,7 @@
 //! exits the process cleanly so the task platform can reclaim it: when the relay
 //! holds **zero live sessions** ([`crate::routing::holds_any_slots`]) *and* has
 //! **no established control connection** (see
-//! [`crate::coordinator_client::run_descriptor_subscriber`]'s `control_connected`)
+//! [`crate::coordinator::client::run_descriptor_subscriber`]'s `control_connected`)
 //! continuously for a threshold, [`run`] resolves and the caller returns from
 //! `main` with a success exit code. On Fargate the platform then stops the task,
 //! the coordinator's vanished-task sweep tombstones it, and provisioning replaces

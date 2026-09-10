@@ -70,7 +70,7 @@ const LOBBY_LOG_MAX_COMMANDS: usize = 1024;
 /// the count cap, it is far above any real lobby.
 const LOBBY_LOG_MAX_BYTES: usize = 256 * 1024;
 
-/// The lobby rate cap's burst size, mirroring [`crate::chat`]'s
+/// The lobby rate cap's burst size, mirroring [`crate::session::chat`]'s
 /// [`TokenBucket`]-based admission but sized for lobby traffic rather than
 /// chat's human-typing cadence. Setup is a burst authored by one slot (almost
 /// always the host): a full 8-player lobby's slot, color, race, and team
@@ -126,7 +126,7 @@ pub struct LobbySession {
     members: HashMap<SlotId, mpsc::Sender<LobbyCommand>>,
     /// Per-authoring-slot token buckets for the rate cap. Keyed separately from
     /// `members` (and outliving a member's own deregistration) so a slot's
-    /// budget is not reset by a reconnect, mirroring [`crate::chat`].
+    /// budget is not reset by a reconnect, mirroring [`crate::session::chat`].
     limiters: HashMap<SlotId, TokenBucket>,
     /// Per-slot rate-limited warn counter for the rate-cap violation.
     rate_warns: HashMap<SlotId, RateLimitedCounter>,
@@ -195,7 +195,7 @@ pub fn end_session(registry: &LobbyRegistry, key: &SessionKey) {
 /// Checks whether one client-authored lobby command from `slot` in `key`'s
 /// session may proceed to [`deliver`]: `slot`'s token bucket has budget.
 /// Only ever called at the client edge, before `deliver` and the mesh
-/// fan-out — mirroring [`crate::chat::admit`], a mesh-received command has
+/// fan-out — mirroring [`crate::session::chat::admit`], a mesh-received command has
 /// already passed its origin relay's `admit` and goes straight to `deliver`
 /// (see `dispatch_mesh_control`'s `LobbyCommand` arm in the mesh module), so
 /// re-checking here would only re-penalize an already-admitted command

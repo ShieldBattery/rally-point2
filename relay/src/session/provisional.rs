@@ -17,7 +17,7 @@
 //! recorded, or a maker inserted -- before the other proceeds. A mark that
 //! momentarily wins the race against an in-flight descriptor is still
 //! guaranteed to be cleared: `sync_maker`'s caller
-//! ([`crate::mesh_control::MeshControl::apply_descriptor`]) clears the mark
+//! ([`crate::mesh::control::MeshControl::apply_descriptor`]) clears the mark
 //! right after creating the maker, and that call is strictly ordered after
 //! the insert its own lock scope already completed. A session created any
 //! other way -- a mesh Join, or a descriptor applied before any client ever
@@ -178,7 +178,7 @@ pub async fn run_sweep(
 ///
 /// A descriptor can name a session in the narrow window between the sweep
 /// pulling its mark (`take_expired`) and the reap firing --
-/// [`crate::mesh_control::MeshControl::apply_descriptor`] creates the session's
+/// [`crate::mesh::control::MeshControl::apply_descriptor`] creates the session's
 /// decision-maker and clears the mark concurrently. So each expired key is
 /// checked against `decision_makers` before it is reaped: a maker now present
 /// means a descriptor claimed the session, and the reap is skipped. The pulled
@@ -238,7 +238,7 @@ pub async fn run_sweep_with(
                 // delayed descriptor finally lands. The journal is retained
                 // until a descriptor drains it or retirement ends the
                 // session — no local heuristic can prove it dead sooner
-                // (see the retention rule in `crate::provisional_turns`).
+                // (see the retention rule in `crate::session::provisional_turns`).
                 routing::reap_provisional(&sessions, &key);
             }
         }

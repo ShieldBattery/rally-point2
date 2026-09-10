@@ -25,7 +25,7 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::ProtocolVersion;
-use rally_point_relay::coordinator_client;
+use rally_point_relay::coordinator;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -132,7 +132,7 @@ pub async fn answer_challenge(
     nonce: &[u8; 32],
 ) {
     let signature =
-        coordinator_client::sign_enroll_proof(key, nonce).expect("a supported key always signs");
+        coordinator::client::sign_enroll_proof(key, nonce).expect("a supported key always signs");
     let frame = serde_json::to_string(&RelayToCoordinator::IdentityProof { signature }).unwrap();
     socket.send(Message::Text(frame.into())).await.unwrap();
 }

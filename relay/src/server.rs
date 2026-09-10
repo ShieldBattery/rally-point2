@@ -610,7 +610,7 @@ async fn serve_connection(
         // provisional-admission sweep tears this session down rather than
         // trusting it indefinitely. A session already covered by a descriptor
         // — even one with an empty (unenforced) homed set — is left alone;
-        // see `crate::provisional::ProvisionalSessions::mark_if_undescribed`.
+        // see `crate::session::provisional::ProvisionalSessions::mark_if_undescribed`.
         // Inside the ingress section so the mark and the maker existence it
         // keys on are read atomically against a retirement sweep.
         if matches!(admission, consensus::ReconnectAdmission::Admitted { .. }) {

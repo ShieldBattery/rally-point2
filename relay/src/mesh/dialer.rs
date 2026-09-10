@@ -1,8 +1,8 @@
 //! On-demand mesh dialing: keep a dial supervisor alive per higher-id peer the
 //! coordinator's descriptors say this relay should currently mesh with.
 //!
-//! The connection half ([`mesh_edge`]) knows *how* to dial a
-//! peer and keep that one link healthy ([`run_mesh_dial`](crate::mesh_edge::run_mesh_dial)),
+//! The connection half ([`edge`]) knows *how* to dial a
+//! peer and keep that one link healthy ([`run_mesh_dial`](crate::mesh::edge::run_mesh_dial)),
 //! but it is told *which* peer to dial once, at startup. In production the peer set
 //! is not known at startup — relays churn under scale-to-zero and games pair
 //! regions dynamically — so *which* peers to dial is driven at runtime by the
@@ -10,7 +10,7 @@
 //! side.
 //!
 //! It subscribes to the Join source's declarative **desired-peer set**
-//! ([`MeshControl::desired_peers`](crate::mesh_control::MeshControl::desired_peers))
+//! ([`MeshControl::desired_peers`](crate::mesh::control::MeshControl::desired_peers))
 //! — the union of every current session's mesh peers, with addresses — and keeps
 //! exactly one dial supervisor alive per peer this relay should dial: the higher-id
 //! peers, since the lower id dials (lower-id peers dial *us* and arrive on the
@@ -68,8 +68,8 @@ use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
+use crate::mesh::edge::{self, MeshDial};
 use crate::mesh::{self, MeshState};
-use crate::mesh_edge::{self, MeshDial};
 use crate::routing::Sessions;
 
 /// The fixed ingredients every on-demand dial shares — everything a
@@ -145,7 +145,7 @@ struct ActiveDial {
 }
 
 /// Drives on-demand dialing from the Join source's desired-peer set: subscribes to
-/// `peers_rx` and keeps one [`run_mesh_dial`](mesh_edge::run_mesh_dial) supervisor
+/// `peers_rx` and keeps one [`run_mesh_dial`](edge::run_mesh_dial) supervisor
 /// alive per higher-id desired peer, at that peer's current address. Ends when the
 /// desired-peer channel closes (the Join source was dropped — the relay is shutting
 /// down).
@@ -269,7 +269,7 @@ fn spawn_dial(
     let redial_delay = config.redial_delay;
     let stopped_tx = stopped_tx.clone();
     tokio::spawn(async move {
-        mesh_edge::run_mesh_dial_with(dial, sessions, mesh, links, redial_delay).await;
+        edge::run_mesh_dial_with(dial, sessions, mesh, links, redial_delay).await;
         // The supervisor only returns on an intentional wind-down (a failed
         // connection is retried inside it), so this reports a real stop; a cancelled
         // supervisor is aborted before it reaches here.

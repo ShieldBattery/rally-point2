@@ -6,19 +6,18 @@
 //! every failure mode is in the library where it's testable.
 //!
 //! The mesh edge's connection half is wired here: peer-relay connections that
-//! arrive on the mesh ALPN are dispatched to [`mesh_edge::run_mesh_accept`], and
-//! each `--mesh-peer` dials via [`mesh_edge::run_mesh_dial`] when the
+//! arrive on the mesh ALPN are dispatched to [`mesh::edge::run_mesh_accept`], and
+//! each `--mesh-peer` dials via [`mesh::edge::run_mesh_dial`] when the
 //! [`should_dial_mesh`] tie-break says this relay is the lower id. Each
 //! established link surfaces `(peer id, MeshCommand sender)`, which the binary
-//! collects into a [`mesh_control::MeshControl`] — the Join source that turns a
+//! collects into a [`mesh::control::MeshControl`] — the Join source that turns a
 //! coordinator `SessionDescriptor` into targeted `Join`/`Leave` on the link to
 //! each session peer. The descriptor *source* is wired too: with `--coordinator-url`
-//! set, a [`coordinator_client`] task holds a control connection open to the
+//! set, a [`coordinator::client`] task holds a control connection open to the
 //! coordinator and drives the Join source from the descriptor sets it pushes.
 //! Without it (pure dev/loopback), the registry fills as links establish and tests
 //! drive `Join` directly.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,211 +31,22 @@ use rally_point_relay::auth::{Registry, RegistryReader, SharedRegistry};
 use rally_point_relay::config::{
     self, generate_dev_tenant_key, load_cert, self_signed_cert, tenant_key_from_pubkey,
 };
-use rally_point_relay::coordinator_client;
-use rally_point_relay::idle_exit;
+use rally_point_relay::coordinator;
+use rally_point_relay::coordinator::idle_exit;
+use rally_point_relay::coordinator::region_ping;
 use rally_point_relay::mesh;
-use rally_point_relay::mesh_control;
-use rally_point_relay::mesh_dialer;
-use rally_point_relay::mesh_edge;
-use rally_point_relay::provisional;
-use rally_point_relay::region_ping;
+use rally_point_relay::mesh::control;
+use rally_point_relay::mesh::dialer;
+use rally_point_relay::mesh::edge;
 use rally_point_relay::routing::Sessions;
-use rally_point_relay::{DEFAULT_PORT, server};
+use rally_point_relay::server;
+use rally_point_relay::session::provisional;
 use rally_point_transport::noq;
 
-/// Validating netcode v2 relay.
-#[derive(Debug, Parser)]
-#[command(name = "rally-point-relay", version, about)]
-struct Cli {
-    /// Address to listen on for client + mesh QUIC connections (dual-stack by
-    /// default — IPv6-primary ingress).
-    #[arg(long, env = "RELAY_LISTEN", default_value_t = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT))]
-    listen: SocketAddr,
+mod cli;
+mod shutdown;
 
-    /// TLS certificate chain for the relay's identity — either a PEM file path
-    /// (local dev, Docker volume mount) or inline PEM content (Fargate secret
-    /// injection). If absent, a self-signed cert is generated (dev/loopback
-    /// only — clients must trust it out-of-band).
-    #[arg(long, env = "RELAY_CERT")]
-    cert: Option<String>,
-
-    /// PEM private key matching `--cert` — either a file path or inline PEM
-    /// content, same as `--cert`. Required when `--cert` is set; ignored (a
-    /// fresh key is generated) when `--cert` is absent.
-    #[arg(long, env = "RELAY_KEY", requires = "cert")]
-    key: Option<String>,
-
-    /// Hex-encoded Ed25519 *public* (verifying) key for the tenant signing key.
-    /// The relay verifies client tokens against this; the matching private key
-    /// stays with the token issuer, never on the relay. If absent, a keypair is
-    /// generated and both halves are logged (the public is registered, the
-    /// private is printed so a client can mint matching tokens for loopback).
-    #[arg(long, env = "RELAY_TENANT_PUBKEY")]
-    tenant_pubkey: Option<String>,
-
-    /// Key id (`kid`) naming the tenant signing key in the registry.
-    #[arg(long, env = "RELAY_KID", default_value = "dev-key-1")]
-    kid: String,
-
-    /// Tenant id bound to the signing key.
-    #[arg(long, env = "RELAY_TENANT", default_value = "sb-dev")]
-    tenant: String,
-
-    /// This relay's id in the mesh (dev/loopback). The mesh link-establishment
-    /// tie-break is "lower id dials higher": when two relays could each dial
-    /// the other, exactly one must, so each compares its own id to a peer's
-    /// configured id and dials only when it is the lower. Leave absent to run
-    /// without a mesh edge (single-relay `C–S–C`). In production the
-    /// coordinator assigns the relay id (Phase 3).
-    #[arg(long, env = "RELAY_ID")]
-    relay_id: Option<u64>,
-
-    /// A peer relay to mesh with (dev/loopback): `ADDR#ID`, where ADDR is the
-    /// peer's listen endpoint and ID is its `--relay-id`. Repeatable. When this
-    /// relay's id is lower than a peer's, it dials that peer; when higher, it
-    /// waits for the peer to dial. Both sides of a relay-pair must list each
-    /// other. In production the coordinator pushes peer topology at runtime
-    /// (relays churn under scale-to-zero, so the peer set is unknowable at
-    /// startup), and the dial side needs the peer's id before connecting.
-    #[arg(long, env = "RELAY_MESH_PEER", value_name = "ADDR#ID")]
-    mesh_peers: Vec<String>,
-
-    /// PEM CA certificate(s) to trust when dialing mesh peers — either a file
-    /// path or inline PEM content, same form as `--cert`. For dev/loopback
-    /// with two relays sharing one self-signed cert, pass that same cert here;
-    /// if absent, the relay's own leaf cert is trusted (the shared-cert dev
-    /// case). In production, relay-to-relay trust comes from an internal CA
-    /// (both relays trust the same CA root) — Phase 3.
-    #[arg(long, env = "RELAY_MESH_ROOTS")]
-    mesh_roots: Option<String>,
-
-    /// TLS server name (SNI) to verify on mesh peer certificates. Defaults to
-    /// `localhost` for self-signed dev certs. Set to the hostname on the peer's
-    /// production cert otherwise.
-    #[arg(long, env = "RELAY_MESH_SERVER_NAME", default_value = "localhost")]
-    mesh_server_name: String,
-
-    /// Fail closed on the mesh accept path: refuse every dialing peer's
-    /// connection until the coordinator's fleet-peer set has arrived, rather
-    /// than treating an empty set as not-yet-enforced. This flag only matters
-    /// for the dev/static `--mesh-peer` path (no coordinator, so no fleet push
-    /// ever arrives): off by default there, that path keeps meshing with no
-    /// peer-identity checks at all; set it to fail closed instead. A
-    /// coordinator-driven relay (a relay id plus a coordinator URL) always fails
-    /// closed regardless of this flag — it will receive a fleet-peer push and
-    /// must never serve an unauthenticated mesh accept, not even during the
-    /// startup window before its first push lands (genuine peers' dial
-    /// supervisors redial through that brief window).
-    #[arg(long, env = "RELAY_REQUIRE_MESH_PEER_AUTH", default_value_t = false)]
-    require_mesh_peer_auth: bool,
-
-    /// Base URL of the coordinator's control-plane API (e.g.
-    /// `http://coordinator.internal:14910`). When set together with `--relay-id`,
-    /// the relay holds a control connection open to the coordinator and applies
-    /// the session descriptors it pushes — the production source of mesh
-    /// `Join`/`Leave`. Absent (pure dev/loopback), mesh membership is driven only
-    /// by tests or by links establishing; no coordinator is contacted.
-    #[arg(long, env = "RELAY_COORDINATOR_URL")]
-    coordinator_url: Option<String>,
-
-    /// Bootstrap secret presented to the coordinator (`Authorization: Bearer
-    /// <secret>`) when opening the control connection. Must match the
-    /// coordinator's `--bootstrap-secret`. Absent for dev/loopback against an
-    /// open coordinator.
-    #[arg(long, env = "RELAY_COORDINATOR_SECRET")]
-    coordinator_secret: Option<String>,
-
-    /// One-time enrollment token, presented in the enroll `Hello` so a
-    /// coordinator that runs a provisioned-relay ledger can bind this relay id to
-    /// its certificate at first enroll. The coordinator mints it when it launches
-    /// this relay's task and injects it here (its launch environment). Absent for
-    /// dev/loopback against a coordinator with no ledger. The token rides every
-    /// enroll this process sends — the environment does not change between
-    /// redials — and the coordinator ignores it once the certificate is bound:
-    /// the bound certificate, not the token, authorizes reconnects.
-    #[arg(long, env = "RELAY_ENROLL_TOKEN")]
-    enroll_token: Option<String>,
-
-    /// Public address(es) clients and peer relays reach this relay at — sent to
-    /// the coordinator in the enroll `Hello`. Repeatable (or comma-separated in
-    /// the env var) for a dual-stack relay: one flag per family, the first is the
-    /// primary and the order is the advertised preference. Defaults to `--listen`
-    /// when that is a concrete address, else loopback on the listen port
-    /// (dev/loopback) — a single-address advertise. Always explicit: the
-    /// coordinator never infers these from the control connection's source IP
-    /// (the relay reaches it over one family but must advertise both); deriving
-    /// them from the cloud substrate (ECS metadata) is a follow-up.
-    #[arg(long, env = "RELAY_ADVERTISE_ADDR", value_delimiter = ',')]
-    advertise_addr: Vec<SocketAddr>,
-
-    /// How long the coordinated-drain shutdown path waits for in-flight sessions to
-    /// finish before exiting and abandoning any that remain to coordinator-mediated
-    /// failover. Deliberately under Fargate's 120s `stopTimeout`, so the drain always
-    /// completes before the platform SIGKILLs the process.
-    #[arg(long, env = "RELAY_DRAIN_TIMEOUT_SECS", default_value_t = 90)]
-    drain_timeout_secs: u64,
-
-    /// Directory the flight recorder flushes per-session blobs into
-    /// (`<dir>/<tenant>/<session>/<relay_id>.json`) — the dev/loopback sink, and a
-    /// deliberate override: when set it wins even on a coordinator-connected relay,
-    /// which otherwise ships each flushed recording to the coordinator over its
-    /// control connection. Absent on a standalone relay (no coordinator), the
-    /// recorder still records — cheap and bounded — but a flush discards the
-    /// recording with a log line.
-    #[arg(long, env = "RELAY_FLIGHT_DIR")]
-    flight_dir: Option<std::path::PathBuf>,
-
-    /// The region this relay serves, sent to the coordinator in the enroll
-    /// `Hello`. Must be one of the coordinator's configured region ids, or the
-    /// coordinator refuses the control connection (close code 4002) — a typo'd tag
-    /// that silently serves nobody is worse than a failed enroll. Absent = an
-    /// untagged relay (dev/loopback, or a coordinator with no region config): it
-    /// enrolls unconditionally and is only ever the region-blind fallback pick.
-    #[arg(long, env = "RELAY_REGION")]
-    region: Option<String>,
-
-    /// How often the task-stats reporter reads this relay's own ECS Task
-    /// Metadata `/stats` endpoint and logs a CPU/memory/network line — a
-    /// load-test and production observability signal independent of
-    /// CloudWatch Container Insights, since it reads the task-local metadata
-    /// endpoint directly rather than any AWS-side aggregation. `0` disables
-    /// it. Fargate-only regardless of this value: the reporter is a no-op
-    /// unless `ECS_CONTAINER_METADATA_URI_V4` is set in the environment
-    /// (absent in dev/loopback and any non-Fargate run), so leaving this at
-    /// its default is harmless outside Fargate.
-    #[arg(long, env = "RELAY_TASK_STATS_INTERVAL_SECS", default_value_t = 10)]
-    task_stats_interval_secs: u64,
-
-    /// How long the relay must continuously hold zero sessions AND no coordinator
-    /// control connection before it exits on its own, so the task platform can
-    /// reclaim an idle task whose coordinator vanished (died, restarted with ledger
-    /// loss, or left this task orphaned). `0` disables the self-exit. A relay with
-    /// no coordinator configured never self-exits regardless of this value — a
-    /// standalone/dev relay has no enrollment to lose and serves for as long as it
-    /// runs.
-    #[arg(long, env = "RELAY_IDLE_UNENROLLED_EXIT_SECS", default_value_t = 900)]
-    idle_unenrolled_exit_secs: u64,
-
-    /// How long a slot this relay homes may send this relay's local clients no
-    /// turns, having stopped before every other slot in its session did, before
-    /// the relay closes its link so the other players can drop it. Covers the
-    /// client whose game thread hung or whose process was suspended: its QUIC
-    /// link keeps answering keepalives, so nothing else ever sees it leave, and
-    /// lockstep holds every other player still behind it. `0` disables the watch
-    /// entirely — the session then stalls until everyone quits, which is what
-    /// this exists to prevent.
-    #[arg(long, env = "RELAY_SILENT_SLOT_WINDOW_SECS", default_value_t = 10)]
-    silent_slot_window_secs: u64,
-}
-
-/// How long the drain sequence waits for the coordinator's `DrainAck` before
-/// proceeding regardless. A coordinator that is down, or one predating the drain
-/// frame, must never wedge shutdown — so this is short and the wait is best-effort.
-const DRAIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often the drain sequence re-checks whether the relay has gone idle. A
-/// shutdown path is not latency-critical, so a coarse poll keeps it simple.
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+use cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -327,7 +137,7 @@ async fn main() -> Result<()> {
     // descriptor apply lag; the task-stats reporter logs both. Created up front so all
     // share one handle; it stays all-zero without a coordinator connection (nothing
     // writes it).
-    let control_conn_stats = coordinator_client::ControlConnStats::new();
+    let control_conn_stats = coordinator::client::ControlConnStats::new();
     // Obtain the recorder handle before spawning task stats so its
     // relay-lifetime work totals can be sampled alongside Docker CPU. The
     // remaining recorder identity/sink/sampler wiring stays below.
@@ -335,7 +145,7 @@ async fn main() -> Result<()> {
 
     // Self-reported Fargate task resources: a no-op outside Fargate (see the
     // module doc), so this is safe to call unconditionally in dev/loopback too.
-    rally_point_relay::task_stats::spawn_if_enabled(
+    rally_point_relay::observability::task_stats::spawn_if_enabled(
         cli.task_stats_interval_secs,
         cli.relay_id,
         Arc::clone(&sessions),
@@ -358,7 +168,7 @@ async fn main() -> Result<()> {
     // it to tell an assigned-but-not-yet-dialed session from a provably unassigned
     // relay). Trivially empty without a coordinator, so the drain then keys on
     // local slot liveness alone.
-    let applied = coordinator_client::AppliedSessions::new();
+    let applied = coordinator::client::AppliedSessions::new();
 
     // The flight recorder: per-session observability, always recording (cheap,
     // bounded). The sink and identity are optional startup wiring; the sampling
@@ -370,34 +180,37 @@ async fn main() -> Result<()> {
     // the subscriber spawn — so the same channel spans them. Only wired at both
     // ends when a coordinator-connected relay installs the CoordinatorSink;
     // otherwise the receiver is dropped or idles unused.
-    let (flight_tx, flight_rx) =
-        tokio::sync::mpsc::channel(rally_point_relay::flight_recorder::FLIGHT_SHIP_QUEUE);
+    let (flight_tx, flight_rx) = tokio::sync::mpsc::channel(
+        rally_point_relay::observability::flight_recorder::FLIGHT_SHIP_QUEUE,
+    );
     if let Some(relay_id) = cli.relay_id {
         flight.set_identity(RelayId(relay_id));
     }
     match &cli.flight_dir {
         Some(dir) => {
             tracing::info!(dir = %dir.display(), "flight recordings flush to files");
-            flight.set_sink(Arc::new(rally_point_relay::flight_recorder::FileSink::new(
-                dir.clone(),
-            )));
+            flight.set_sink(Arc::new(
+                rally_point_relay::observability::flight_recorder::FileSink::new(dir.clone()),
+            ));
         }
         None if has_coordinator => {
             tracing::info!("flight recordings ship to the coordinator over the control connection");
             flight.set_sink(Arc::new(
-                rally_point_relay::flight_recorder::CoordinatorSink::new(flight_tx),
+                rally_point_relay::observability::flight_recorder::CoordinatorSink::new(flight_tx),
             ));
         }
         None => {
             tracing::info!("no --flight-dir configured; flight recordings are discarded at flush")
         }
     }
-    tokio::spawn(rally_point_relay::flight_recorder::run_sampler(
-        flight.clone(),
-        mesh_state.conditions.clone(),
-        Arc::clone(&mesh_state.decision_makers),
-        rally_point_relay::flight_recorder::SAMPLE_INTERVAL,
-    ));
+    tokio::spawn(
+        rally_point_relay::observability::flight_recorder::run_sampler(
+            flight.clone(),
+            mesh_state.conditions.clone(),
+            Arc::clone(&mesh_state.decision_makers),
+            rally_point_relay::observability::flight_recorder::SAMPLE_INTERVAL,
+        ),
+    );
 
     match cli.silent_slot_window_secs {
         0 => tracing::info!(
@@ -437,7 +250,7 @@ async fn main() -> Result<()> {
         // peer's certificate. Created here so both the accept task (a read handle)
         // and the coordinator subscriber (the writer) share one map; without a
         // coordinator URL it stays empty (dev/static `--mesh-peer`).
-        let fleet_peers = coordinator_client::FleetMeshPeers::new();
+        let fleet_peers = coordinator::client::FleetMeshPeers::new();
 
         // The region ping-beacon targets + measured-round-trip cache. The
         // coordinator pushes the region beacons down the control connection, the
@@ -451,7 +264,7 @@ async fn main() -> Result<()> {
 
         // Clone `links_tx` for the accept task; the original stays for the dial
         // tasks below (each clones again per peer).
-        tokio::spawn(mesh_edge::run_mesh_accept(
+        tokio::spawn(edge::run_mesh_accept(
             mesh_accept_rx,
             Arc::clone(&sessions),
             mesh_state.clone(),
@@ -490,7 +303,7 @@ async fn main() -> Result<()> {
                 let sessions = Arc::clone(&sessions);
                 let mesh = mesh_state.clone();
                 let links_tx = links_tx.clone();
-                let dial = mesh_edge::MeshDial {
+                let dial = edge::MeshDial {
                     our_id: RelayId(our_id),
                     peer_id: peer.id,
                     // The static dev/loopback path is single-address by nature.
@@ -500,7 +313,7 @@ async fn main() -> Result<()> {
                     cert_chain: mesh_cert_chain.clone(),
                     key: mesh_private_key.clone_key(),
                 };
-                tokio::spawn(mesh_edge::run_mesh_dial(dial, sessions, mesh, links_tx));
+                tokio::spawn(edge::run_mesh_dial(dial, sessions, mesh, links_tx));
             }
         }
 
@@ -513,7 +326,7 @@ async fn main() -> Result<()> {
         // Share the decision-maker registry the turn path holds (in `mesh_state`)
         // so a maker created here on a coordinator descriptor is the same one the
         // slot-link and mesh-link tasks feed conditions into and stamp decisions on.
-        let mesh_control = mesh_control::MeshControl::new(
+        let mesh_control = control::MeshControl::new(
             RelayId(our_id),
             mesh_state.decision_makers.clone(),
             mesh_state.presence.clone(),
@@ -568,7 +381,7 @@ async fn main() -> Result<()> {
             // desired-peer set. This is the production dial path — the static
             // `--mesh-peer` dials above are dev/loopback, where no coordinator
             // pushes topology.
-            let dialer_config = mesh_dialer::DialerConfig {
+            let dialer_config = dialer::DialerConfig {
                 our_id: RelayId(our_id),
                 server_name: cli.mesh_server_name.clone(),
                 roots: mesh_roots.clone(),
@@ -577,9 +390,9 @@ async fn main() -> Result<()> {
                 sessions: Arc::clone(&sessions),
                 mesh: mesh_state.clone(),
                 links: links_tx.clone(),
-                redial_delay: mesh_edge::MESH_REDIAL_DELAY,
+                redial_delay: edge::MESH_REDIAL_DELAY,
             };
-            tokio::spawn(mesh_dialer::run_mesh_dialer(
+            tokio::spawn(dialer::run_mesh_dialer(
                 dialer_config,
                 mesh_control.desired_peers(),
             ));
@@ -627,7 +440,7 @@ async fn main() -> Result<()> {
             // vouch. Left unstamped if the system RNG refuses, which the coordinator
             // reads as no continuity — conservative, and the load-state read is the
             // only thing affected.
-            if let Some(boot_id) = coordinator_client::new_boot_id() {
+            if let Some(boot_id) = coordinator::client::new_boot_id() {
                 relay_hello = relay_hello.with_boot_id(boot_id);
             }
             tracing::info!(
@@ -646,7 +459,7 @@ async fn main() -> Result<()> {
 
             // The provisional-admission sweep's arming signal: `true` only
             // while the control connection below is actually established (see
-            // `coordinator_client::run_descriptor_subscriber`'s doc on
+            // `coordinator::client::run_descriptor_subscriber`'s doc on
             // `control_connected`). Local to this block, so dev/static mode
             // (no coordinator URL) never constructs it and never spawns the
             // sweep task at all — the simplest possible "never arms".
@@ -656,14 +469,14 @@ async fn main() -> Result<()> {
             // once both have held for the exit threshold.
             idle_exit_connected_rx = Some(control_connected_rx.clone());
 
-            tokio::spawn(coordinator_client::run_descriptor_subscriber(
-                coordinator_client::EnrollConfig {
+            tokio::spawn(coordinator::client::run_descriptor_subscriber(
+                coordinator::client::EnrollConfig {
                     coordinator_url,
                     bootstrap_secret: cli.coordinator_secret.clone(),
                     relay_hello,
                     identity_key,
                 },
-                coordinator_client::ControlApplyTargets {
+                coordinator::client::ControlApplyTargets {
                     control: mesh_control.clone(),
                     applied: applied.clone(),
                     fleet: fleet_peers,
@@ -673,8 +486,8 @@ async fn main() -> Result<()> {
                     region_targets: region_targets.clone(),
                     drain_acked: drain_acked_tx.clone(),
                 },
-                coordinator_client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
-                coordinator_client::HeartbeatSources {
+                coordinator::client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
+                coordinator::client::HeartbeatSources {
                     sessions: Arc::clone(&sessions),
                     decision_makers: Arc::clone(&mesh_state.decision_makers),
                     region_rtt_cache: region_rtt_cache.clone(),
@@ -734,8 +547,8 @@ async fn main() -> Result<()> {
                 .context("relay server task panicked")?
                 .context("relay server ended with an error")?;
         }
-        _ = shutdown_signal() => {
-            drain_and_exit(
+        _ = shutdown::shutdown_signal() => {
+            shutdown::drain_and_exit(
                 has_coordinator,
                 &drain_tx,
                 &mut drain_acked_rx,
@@ -765,113 +578,10 @@ async fn main() -> Result<()> {
             // Zero sessions is the precondition, so there is nothing to drain and no
             // coordinator to exchange a drain with — just flush any pending flight
             // recordings before the process goes away.
-            flush_flight_recordings(&flight).await;
+            shutdown::flush_flight_recordings(&flight).await;
         }
     }
     Ok(())
-}
-
-/// Flushes whatever flight recordings remain to their sink, bounded by
-/// [`flight_recorder::DRAIN_FLUSH_TIMEOUT`](rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT).
-/// Both process-exit paths — the coordinated drain and the idle self-exit — end
-/// with this so a session's observability is not lost when the process goes away.
-/// Whatever the deadline cuts off is logged and abandoned: flight data is
-/// observability, never backpressure, and the rings are size-capped and live
-/// sessions bounded, so the volume always fits the timeout, which nests under
-/// Fargate's `stopTimeout`.
-async fn flush_flight_recordings(flight: &rally_point_relay::flight_recorder::FlightRecorder) {
-    flight
-        .flush_all(rally_point_relay::flight_recorder::DRAIN_FLUSH_TIMEOUT)
-        .await;
-}
-
-/// Resolves when the process receives a shutdown signal: `Ctrl-C` everywhere, plus
-/// `SIGTERM` on Unix — production runs on Linux/Fargate, which stops a task by
-/// sending `SIGTERM` (then `SIGKILL` after `stopTimeout`), so the drain must key on
-/// `SIGTERM`, not just an interactive interrupt.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing a SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-    }
-}
-
-/// The coordinated-drain sequence, run once a shutdown signal arrives while the
-/// server keeps serving: ask the coordinator to stop assigning us new sessions,
-/// wait (bounded) for its `DrainAck`, then wait for the relay to go idle before
-/// returning so the caller can exit.
-///
-/// **Idle predicate: no local slot held AND an empty applied descriptor set**
-/// ([`coordinator_client::drained_idle`]). The DrainAck contract makes the second
-/// half sound: the coordinator pushes our current descriptor set before the ack, so
-/// an empty applied set at ack time means we are *provably unassigned* — the
-/// truly-idle scale-in case exits immediately (well under a second). A non-empty
-/// set names sessions whose clients may not have dialed yet (a session committed
-/// just before our drain mark), so we wait: they dial, register slots, and the wait
-/// ends when they finish. Slot liveness alone would miss exactly that window and
-/// strand those clients dialing a dead relay pre-start, which the client driver
-/// cannot recover (it escalates to re-home only after `SessionStart`). The cost of
-/// the descriptor half is a *bounded* wait: a session whose clients never dial, or
-/// one a peer relay still serves after our players left, holds its descriptor here
-/// until the drain timeout — under Fargate's stopTimeout — and is then, like any
-/// session still running at the deadline, deliberately abandoned to the
-/// coordinator-mediated failover.
-async fn drain_and_exit(
-    has_coordinator: bool,
-    drain_tx: &tokio::sync::watch::Sender<bool>,
-    drain_acked_rx: &mut tokio::sync::watch::Receiver<bool>,
-    sessions: &Sessions,
-    applied: &coordinator_client::AppliedSessions,
-    flight: &rally_point_relay::flight_recorder::FlightRecorder,
-    drain_timeout: Duration,
-) {
-    tracing::info!("shutdown signal received; beginning coordinated drain");
-
-    if has_coordinator {
-        // Ask the coordinator to stop assigning us new sessions.
-        let _ = drain_tx.send(true);
-        // Wait for the DrainAck, but never let a down/older coordinator wedge us.
-        match tokio::time::timeout(DRAIN_ACK_TIMEOUT, drain_acked_rx.changed()).await {
-            Ok(Ok(())) => tracing::info!("coordinator acknowledged drain"),
-            Ok(Err(_)) => tracing::warn!("drain-ack channel closed before an ack; proceeding"),
-            Err(_) => tracing::warn!("timed out waiting for a drain ack; proceeding"),
-        }
-    } else {
-        tracing::info!("no coordinator configured; skipping the drain handshake");
-    }
-
-    // Wait until drained-idle, bounded by the drain timeout.
-    let deadline = tokio::time::Instant::now() + drain_timeout;
-    loop {
-        if coordinator_client::drained_idle(sessions, applied) {
-            tracing::info!("relay idle; no local slots held and no session assigned");
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "drain timeout reached with sessions still live or assigned; abandoning them to failover",
-            );
-            break;
-        }
-        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-    }
-
-    // Flush whatever flight recordings remain — sessions that never reached their
-    // ordinary close-time flush (still running at the deadline, or ended by a
-    // descriptor removal with no local slot to close).
-    flush_flight_recordings(flight).await;
 }
 
 fn init_tracing() {
