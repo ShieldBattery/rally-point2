@@ -281,7 +281,11 @@ impl DecisionMaker {
                     self.last_burn_frame = Some(frame.0);
                 }
                 Some(target)
-            } else if shrink_target < self.buffer.0 {
+            } else if shrink_target < self.buffer.0 && self.all_expected_slots_have_rtt() {
+                // A partial RTT sample can demonstrate a need for more cushion,
+                // but it cannot prove the configured buffer is oversized. Departed
+                // expected slots are exempt because they no longer contribute to
+                // the game's path.
                 // Lower slow: every buffer-size change alters the game feel,
                 // so a shrink must be both paced and earned -- and judged on
                 // `shrink_target`, whose margined path term refuses a shrink

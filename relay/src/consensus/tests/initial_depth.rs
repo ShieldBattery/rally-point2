@@ -198,3 +198,116 @@ fn emitted_depths_are_capped_at_the_game_sync_safe_ceiling_regardless_of_bounds(
     );
     assert_eq!(m.buffer(), BufferSize(GAME_SYNC_SAFE_BUFFER_MAX));
 }
+
+#[test]
+fn incomplete_rtt_coverage_reaffirms_the_initial_depth_without_lowering() {
+    // The first fast link is enough to compute a target, but slot 1 has not
+    // reported an RTT. Keep the configured initial depth until that missing
+    // link is represented in the control law.
+    let mut maker = DecisionMaker {
+        buffer: BufferSize(6),
+        ..initial_depth_maker(0, 20, &[0, 1], None, true)
+    };
+    maker.mark_started();
+
+    let fast = conditions(0, 32_000, 0, 100);
+    let initial = ingest_at(&mut maker, &fast, 1).expect("the initial re-affirm");
+    assert_eq!(initial.buffer, BufferSize(6));
+    assert_eq!(maker.buffer(), BufferSize(6));
+    assert!(
+        !maker.all_expected_slots_have_rtt(),
+        "slot 1 has not supplied an RTT"
+    );
+
+    for frame in 2..=500 {
+        assert_eq!(
+            ingest_at(&mut maker, &fast, frame),
+            None,
+            "incomplete RTT coverage holds the initial depth (frame {frame})"
+        );
+    }
+    assert_eq!(maker.buffer(), BufferSize(6));
+}
+
+#[test]
+fn complete_rtt_coverage_eventually_allows_a_lower() {
+    let mut maker = DecisionMaker {
+        buffer: BufferSize(6),
+        ..initial_depth_maker(0, 20, &[0, 1], None, true)
+    };
+    maker.mark_started();
+
+    let fast = conditions(0, 32_000, 0, 100);
+    assert_eq!(
+        ingest_at(&mut maker, &fast, 1).unwrap().buffer,
+        BufferSize(6),
+        "the incomplete first sample only re-affirms",
+    );
+
+    let fully_observed = multi_conditions(&[(0, 32_000, 0, 101), (1, 32_000, 0, 100)]);
+    assert!(
+        ingest_at(&mut maker, &fully_observed, 2).is_none(),
+        "the initial re-affirm's dwell still applies"
+    );
+    assert!(maker.all_expected_slots_have_rtt());
+
+    let lower_frame = 1 + maker.law.min_dwell_turns;
+    for frame in 3..lower_frame {
+        assert!(ingest_at(&mut maker, &fully_observed, frame).is_none());
+    }
+    assert_eq!(
+        ingest_at(&mut maker, &fully_observed, lower_frame)
+            .expect("complete coverage earns a paced lower")
+            .buffer,
+        BufferSize(4),
+    );
+}
+
+#[test]
+fn incomplete_rtt_coverage_still_raises_for_a_slow_observed_link() {
+    // Slot 2 remains unsampled, but the measured slow slot must still raise
+    // immediately; only speculative lowers wait for complete coverage.
+    let mut maker = DecisionMaker {
+        buffer: BufferSize(6),
+        ..initial_depth_maker(0, 20, &[0, 1, 2], None, true)
+    };
+    maker.mark_started();
+
+    assert_eq!(
+        ingest_at(&mut maker, &conditions(0, 32_000, 0, 100), 1)
+            .unwrap()
+            .buffer,
+        BufferSize(6),
+    );
+    let raised = ingest_at(
+        &mut maker,
+        &multi_conditions(&[(0, 32_000, 0, 101), (1, 469_000, 0, 100)]),
+        2,
+    )
+    .expect("a measured slow link raises immediately");
+    assert_eq!(raised.buffer, BufferSize(7));
+    assert!(
+        !maker.all_expected_slots_have_rtt(),
+        "slot 2 remains unsampled"
+    );
+}
+
+#[test]
+fn departed_expected_slot_does_not_block_a_lower() {
+    // A departed member no longer contributes to the game, so its missing
+    // RTT must not prevent the surviving slot's measured safe lower.
+    let mut maker = DecisionMaker {
+        buffer: BufferSize(6),
+        ..initial_depth_maker(0, 20, &[0, 1], None, true)
+    };
+    maker.record_departure(SlotId(1), DepartureStamps::default(), DROPPED);
+    maker.mark_started();
+
+    let lowered = ingest_at(&mut maker, &conditions(0, 32_000, 0, 100), 1)
+        .expect("the remaining measured slot can lower");
+    assert!(
+        maker.all_expected_slots_have_rtt(),
+        "the departed slot is exempt once the survivor is sampled"
+    );
+    assert_eq!(lowered.buffer, BufferSize(4),);
+}
