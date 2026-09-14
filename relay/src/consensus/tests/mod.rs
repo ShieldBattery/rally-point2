@@ -16,6 +16,7 @@ use rally_point_proto::messages::SlotConditions;
 mod authority;
 mod control_law;
 mod desync_majority;
+mod desync_ordering;
 mod desync_ordinals;
 mod directive;
 mod epochs;
@@ -389,7 +390,7 @@ fn feed_ring_kind(
     value: SyncValue,
     frame: u32,
 ) -> Option<SyncDivergence> {
-    maker.observe_sync(SlotId(slot), Some(frame), &sync_command(ring, kind, value))
+    maker.observe_ordered_sync(SlotId(slot), Some(frame), &sync_command(ring, kind, value))
 }
 
 /// [`feed_ring_kind`] with the kind SC:R's native check ties to `ring`'s
@@ -407,9 +408,9 @@ fn feed_ring(
 
 /// Feeds one slot's sync command with the ring nibble its true ordinal
 /// expects (`ordinal % 16`) and the kind that ordinal's parity implies.
-/// The frame is a distinct-per-ordinal marker. Feeding a slot's ordinals
-/// out of order (or interleaved with another slot's) exercises the same
-/// nibble-corrected placement a real reordered or racing-ahead slot would.
+/// The frame is a distinct-per-ordinal marker. Calls generate consecutive
+/// transport sequences; tests of network reordering must instead call
+/// `observe_sync` with explicit origin sequences.
 fn feed(
     maker: &mut DecisionMaker,
     slot: u8,

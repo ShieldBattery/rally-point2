@@ -288,10 +288,10 @@ fn consensus_sync(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(format!("P{players}"), label), |b| {
                 let mut maker = decision_maker(players, authority);
                 // Establish every comparator member before measuring the
-                // steady stream. On a peer this remains the intended no-op.
+                // steady stream. Peers retain ordering metadata without comparing it.
                 for slot in 0..players {
                     let result =
-                        maker.observe_sync(SlotId(slot), Some(30_000), black_box(&commands[0]));
+                        maker.observe_sync(SlotId(slot), 0, Some(30_000), black_box(&commands[0]));
                     debug_assert!(result.is_none());
                 }
 
@@ -300,8 +300,12 @@ fn consensus_sync(c: &mut Criterion) {
                     let stream = &commands[(ordinal % 16) as usize];
                     let frame = 30_000_u32.wrapping_add(ordinal as u32);
                     for slot in 0..players {
-                        let result =
-                            maker.observe_sync(SlotId(slot), Some(frame), black_box(stream));
+                        let result = maker.observe_sync(
+                            SlotId(slot),
+                            ordinal,
+                            Some(frame),
+                            black_box(stream),
+                        );
                         debug_assert!(result.is_none());
                         black_box(result);
                     }

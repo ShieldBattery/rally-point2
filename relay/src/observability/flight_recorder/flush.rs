@@ -46,7 +46,7 @@ impl FlightRecorder {
         // sampling tick still carries its turn-stream totals. Counters only —
         // the consensus state this flush races may already be gone, so the
         // e2e view is deliberately absent here (the periodic rows carry it).
-        let final_row = recording.sample_row(None, (None, None));
+        let final_row = recording.sample_row(None, (None, None), None);
         recording.push_sample(final_row);
         Some(FlightBlob {
             version: BLOB_VERSION,

@@ -13,6 +13,7 @@ mod departure;
 mod leave;
 mod silence;
 mod start;
+mod sync_coverage;
 
 pub use authority::{
     FrameRegression, is_authority, observe_delivery, observe_frame, observe_sync,
@@ -45,6 +46,7 @@ pub use start::{
     session_initial_buffer_turns, session_started, set_region_labels, set_session_shape,
     slot_has_started, started_home_slots, started_session_slot_count,
 };
+pub use sync_coverage::sync_coverage;
 
 #[cfg(test)]
 pub(in crate::consensus) use departure::admit_reconnect_with;

@@ -1,15 +1,17 @@
 //! Relay-side desync detection: the comparator across relays' independent
 //! views of the turn stream.
 //!
-//! This file holds the tuning constants and the value types -- the ordinal
-//! placement rules, the per-ordinal report set, and the tracker's own state.
-//! The folding logic lives in `tracker`, the log and notice throttles in
-//! `rate_limit`.
+//! This file holds the tuning constants, canonical-ordinal comparison state,
+//! and value types. `turns` establishes canonical ordinals, `tracker` folds
+//! reports, and `rate_limit` owns warning throttles.
 
 use super::*;
 
 mod rate_limit;
 mod tracker;
+mod turns;
+
+pub(in crate::consensus) use turns::{SyncCommand, SyncTurn, SyncTurns};
 
 pub(crate) use rate_limit::{RateLimitedCounter, TokenBucket};
 
@@ -42,17 +44,11 @@ pub(crate) use rate_limit::{RateLimitedCounter, TokenBucket};
 /// of the native `verify_peer_sync_slot`, not inferred from the wire.
 ///
 /// **Startup burst:** the enable path emits the first sync command at ring
-/// index 1 (`[1] = 0x12`), and the initial latency-depth flush emits several
-/// more `0x37`s stamped *identically* (same ring, same bytes) before the first
-/// per-turn record advances the ring — so a client's first few sync commands
-/// legitimately repeat ring 1 with identical content. [`SyncTracker::record`]'s
-/// same-ordinal duplicate-ignore absorbs this without any special-casing
-/// (live-relay confirmed): a repeat lands back at the same placed ordinal via
-/// ordinary nibble correction and is recognized as a duplicate. Ring index 0
-/// (and therefore our internal ordinal 0, which anchors to whatever ring value
-/// a tracker's very first observation happens to report — see
-/// [`SyncTracker::join_expected`]) first appears only once the ring wraps,
-/// around turn 15.
+/// index 1 (`[1] = 0x12`), and the initial latency-depth flush can repeat the
+/// same command before the per-turn record advances. `SyncTurns` maps those
+/// duplicates to one canonical ordinal, and `SyncTracker` keeps the first
+/// report for a slot at that ordinal. Ring index 0 first appears once the ring
+/// wraps, around turn 15.
 pub(in crate::consensus) const SYNC_COMMAND: u8 = 0x37;
 
 /// The total length of a `0x37` sync command, mirroring the command-length table.
@@ -72,23 +68,13 @@ pub(in crate::consensus) const SYNC_HASH16_LEN: usize = 2;
 pub(in crate::consensus) const SYNC_KIND_UNITS: u8 = 1;
 pub(in crate::consensus) const SYNC_KIND_HEADER: u8 = 2;
 
-/// The sync command's ring index is a 16-entry ring, so a slot's true ordinal
-/// is congruent to its ring nibble modulo this. The comparator uses it to
-/// *place* each report (the ordinal congruent to the ring nearest the slot's
-/// expected position), not merely to validate one — see the module docs.
+/// The sync command's ring index is a 16-entry ring. `SyncTurns` validates
+/// and unwraps it into the canonical ordinal before `SyncTracker` compares it.
 pub(in crate::consensus) const SYNC_RING_MODULUS: u64 = 16;
 
-/// The floor for [`sync_eval_margin`]'s per-session margin, and the value it
-/// returns for any buffer policy shallow enough not to need more: how far past
-/// an ordinal the frontier (the furthest any compared slot has reached) must
-/// move before that ordinal is evaluated. Replaces a same-instant "does
-/// everyone agree right now" check, which is unsound once slots can
-/// legitimately arrive out of order or lead each other by the latency
-/// buffer's depth (see the module docs): the margin instead waits long enough
-/// that every live slot's report for the ordinal has had time to show up,
-/// whatever order it arrived in. 8 is also where the ring nibble's own
-/// correction becomes ambiguous (see the module docs' bound note on steady-state
-/// placement), so there is no benefit to a smaller floor.
+/// The floor for [`sync_eval_margin`]'s per-session margin: how far past an
+/// ordinal the frontier must move before the comparator trusts its report set
+/// as complete. It covers transport reordering even for shallow buffers.
 pub(in crate::consensus) const SYNC_EVAL_MARGIN_MIN: u64 = 8;
 
 /// A defensive backstop, not a live constraint under normal policy: buffer
@@ -189,212 +175,56 @@ pub(in crate::consensus) struct SyncReport {
     pub(in crate::consensus) game_frame: Option<u32>,
 }
 
-/// One compared slot's bookkeeping: where it's expected to report next, and
-/// where it first joined the compare set.
+/// One compared slot's canonical ordinal progress. A slot joins the compare
+/// set on its first ordered sync report and is never required before `since`.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::consensus) struct Member {
-    /// This slot's next expected ordinal — the ordinal one past the last one
-    /// it placed a report at. Used both as the anchor a new report is
-    /// nibble-corrected against, and (via the max across all members) as the
-    /// tracker's *frontier*: the furthest any compared slot has reached.
+    /// One past the greatest canonical ordinal this slot has reported. It is
+    /// monotone even when a late older report is discarded.
     pub(in crate::consensus) next_expected: u64,
-    /// The ordinal this slot first joined the compare set at (its own true
-    /// ordinal at first observation, after nibble correction — never
-    /// retroactively 0). A member is only ever required to have reported an
-    /// ordinal at or after this, so a slot that joins mid-stream (a promotion,
-    /// or one whose sync simply started later) is never held responsible for
-    /// intervals before it existed.
+    /// The first canonical ordinal this slot reported to this comparator.
     pub(in crate::consensus) since: u64,
 }
 
-/// The per-session sync-checksum comparator. Lives on the authority relay's
-/// [`DecisionMaker`] and is fed one call per turn (via
-/// [`DecisionMaker::observe_sync`], called exactly once per distinct
-/// `(slot, seq)` turn — see that method's docs), which walks the turn's
-/// commands for `0x37`s and hands each here.
-///
-/// # How ordinals align
-///
-/// A slot's *sync ordinal* is the count of sync commands seen from it, and the
-/// wire only carries the low 4 bits of that count: `ring`, the `0x37`'s
-/// `[1] >> 4` (a 16-entry ring, `+1 mod 16` per turn). The low nibble (`[1] &
-/// 0xF`) is the hash *kind* (1 or 2 — see [`SYNC_COMMAND`]'s layout note), not
-/// a sender/slot id; there is no sender id anywhere in this payload at all.
-/// Two properties of the transport make naive "arrival order is the ordinal"
-/// counting wrong:
-///
-/// - **Reordering and lead.** QUIC datagrams are unordered at both the client
-///   edge and on each direct mesh link, and a client legitimately runs up to the
-///   latency buffer's depth *ahead* of its slowest peer's arrivals at the
-///   relay (producing turn `k+1` only requires having *executed* step
-///   `k+1 - depth`, not having every peer's turn `k` already in hand). So a
-///   slot's own turns can arrive at the relay out of order, and a slot's very
-///   first observed sync command can already be several ordinals into its
-///   stream.
-/// - **Duplication.** Link replacement, resume replay, and slot re-home overlap
-///   can present the same turn to the authority more than once. The comparator relies on its caller
-///   ([`DecisionMaker::observe_sync`]) handing it each distinct `(slot, seq)`
-///   turn exactly once; counting is not idempotent the way `observe_frame`'s
-///   monotone max is, so a duplicate that reached this far would silently
-///   drift a slot's ordinal.
-///
-/// The fix is **nibble-corrected placement**, in two flavors depending on
-/// whether the reporting slot is already known:
-///
-/// - **Steady state** (the slot has a [`Member`] entry already): placed at the
-///   ordinal congruent to `ring` (mod 16) *nearest the slot's own
-///   [`Member::next_expected`]*. This self-heals a reordered pair (a slot's
-///   own turns arriving out of sequence) — nearest-match resolves an offset
-///   of up to ±7 exactly. Critically, this bound is **transport-level
-///   reordering only** (how far out of order the mesh/QUIC can deliver two of
-///   *the same slot's* turns), which is far under ±7 regardless of the
-///   session's configured buffer depth — a slot's own emission order isn't
-///   affected by how much the buffer lets other slots lag behind it. See the
-///   bound note below.
-/// - **Join** (the slot's first-ever report): the transport-reordering
-///   argument above doesn't apply, because there's no prior report from this
-///   slot to be "out of order" relative to — its expected ordinal has to come
-///   from somewhere else, and that somewhere else (the current *frontier*,
-///   the furthest any member has reached) can be arbitrarily far from the
-///   join's true ordinal, growing with the session's buffer depth (a deeper
-///   buffer lets a fast slot's turns run further ahead of a slow slot's first
-///   arrival). Nibble-correcting around the frontier is therefore unsound at
-///   depth; instead the join anchors on the reporting turn's
-///   `game_frame_count` ([`SyncTracker::join_expected`]): lockstep keeps every
-///   client's frame for the same simulated interval within a couple of turns
-///   of each other *regardless of buffer depth* (the depth is a session-wide
-///   constant that cancels out across clients), so projecting from a recent
-///   (ordinal, frame) calibration point and nibble-correcting around *that*
-///   estimate lands on the true ordinal at any realistic depth. Falls back to
-///   frontier+nibble when no frame is available to anchor on (either the
-///   joining report carries none, or the tracker has no calibration yet), and
-///   further to the ring's own face value when there is no frontier either
-///   (the tracker's very first observation for the session at all — the
-///   promotion-mid-stream case, where there is no earlier context of any
-///   kind — see [`DecisionMaker::set_authority`]'s promotion reset).
-///
-/// Either way, a slot's join ordinal is tracked as [`Member::since`], so
-/// nothing is retroactively required of it for ordinals before that. A
-/// placement that lands below `base_ordinal` (already-retired territory —
-/// possible right after a correction, or after an eviction) is dropped
-/// silently; that one comparison is lost, which is acceptable.
-///
-/// **Bound note:** nibble correction is sound only while the gap between the
-/// value it corrects around and the report's true ordinal stays under 8 (half
-/// the 16-entry ring) — beyond that the nearest-match is ambiguous or wrong.
-/// For steady state that gap is transport reordering, bounded independent of
-/// buffer depth (see above). For a join, frame-anchoring keeps the gap to
-/// lockstep's cross-client frame skew (a couple of turns) rather than the
-/// buffer depth itself, so depth no longer threatens correctness either — see
-/// [`BufferBounds`] for this from the policy side. [`SYNC_ABSURD_BUFFER_MAX`]
-/// is the remaining backstop, for a policy so deep it stops being a
-/// buffer-tuning question at all.
-///
-/// # What retires an ordinal
-///
-/// An ordinal is evaluated once the frontier has moved at least
-/// [`sync_eval_margin`] past it (long enough that every live slot's report for
-/// it, however reordered or however deep the buffer let it lag, should have
-/// arrived) **and** every member whose `since` is at or before it has
-/// reported it. A member that hasn't reported yet despite the margin is rare
-/// but possible (a genuinely stalled link); [`SYNC_WINDOW`] eviction is the
-/// backstop that bounds the wait.
-///
-/// A retired ordinal whose reports all agree retires silently. One with a
-/// disagreement fires exactly one [`SyncDivergence`]: the strict-majority value
-/// is authoritative and every other slot is the diverged minority (dropped from
-/// the compare set, so the survivors keep being watched and a later second
-/// divergence fires again at its own ordinal); with no strict majority the
-/// comparator reports `no_majority` and goes dormant (the truth is unrecoverable
-/// for the session). A slot that departs or is dropped stops being required.
-///
-/// # Bounded state
-///
-/// In-flight ordinals are capped at [`SYNC_WINDOW`]; a slot that stalls leaves
-/// its ordinals forever-incomplete, so the oldest are evicted (with a
-/// rate-limited warn naming who failed to report) rather than growing without
-/// bound. Comparator state is reset wholesale on authority promotion — a real
-/// desync diverges every interval, so the next interval after promotion catches
-/// it, and transferring per-ordinal hash state across a handoff would be pure
-/// complexity for a one-interval blind spot.
+/// The authority's per-ordinal sync-checksum comparator. The ordered source
+/// assigns canonical ordinals before reports reach this type, so this state
+/// contains only comparison data and may reset independently on promotion.
 #[derive(Debug, Default)]
 pub(in crate::consensus) struct SyncTracker {
     /// Once set, the comparator has reached a verdict it cannot refine (a
     /// no-majority split, a majority event that left fewer than two comparable
     /// slots, or absurd buffer bounds) and no-ops for the rest of the session.
     pub(in crate::consensus) dormant: bool,
+    /// Whether this reset instance has accepted its first canonical ordinal.
+    /// This distinguishes a fresh promotion from a compare set that later became
+    /// empty after it had already advanced.
+    pub(in crate::consensus) initialized: bool,
     /// The lowest ordinal still awaiting evaluation; everything below has retired
     /// (agreed, fired, or been evicted).
     pub(in crate::consensus) base_ordinal: u64,
-    /// Each compared slot's bookkeeping. The key set *is* the compare set: a
-    /// slot enters on its first sync command and leaves on departure or as a
-    /// dropped minority.
+    /// Each compared slot's bookkeeping. The key set is the compare set: a slot
+    /// enters on its first sync command and leaves on departure or as a dropped
+    /// minority.
     pub(in crate::consensus) members: HashMap<SlotId, Member>,
     /// Reports awaiting a complete ordinal, keyed by ordinal then slot.
     pub(in crate::consensus) pending: BTreeMap<u64, HashMap<SlotId, SyncReport>>,
-    /// The lowest-ordinal **corroborated** `(ordinal, median_frame)` calibration
-    /// point, paired with `corroborated_latest` to derive the frames-per-ordinal
-    /// rate for frame-anchored join placement (see [`Self::join_expected`]). A
-    /// point is corroborated only once at least [`SYNC_CORROBORATION_MIN`]
-    /// **distinct** slots have reported the same ordinal with a frame — the
-    /// median of their frames, which a single attacker (controlling one slot)
-    /// cannot move. This replaces the earlier single-slot-sourced calibration a
-    /// lone slot could swing to shift an honest joiner a full ring cycle. Kept
-    /// independent of `pending`/`members` so it survives ordinal retirement.
-    pub(in crate::consensus) corroborated_first: Option<(u64, u32)>,
-    /// The highest-ordinal corroborated `(ordinal, median_frame)` point, paired
-    /// with `corroborated_first` for the rate and used as the projection anchor.
-    pub(in crate::consensus) corroborated_latest: Option<(u64, u32)>,
-    /// Rate-limit counter for the placement-correction debug log (a nonzero
-    /// nibble correction — a reorder, a lead, or a join). Routine (every game
-    /// start corrects the first ordinal after a join), so it logs at debug.
-    pub(in crate::consensus) corrections: RateLimitedCounter,
-    /// Rate-limit counter for the same-ordinal conflicting-value warn (a slot
-    /// reporting two different checksums for the same placed ordinal — an
-    /// honest client never does this).
+    /// Minorities confirmed divergent by this tracker instance. Their queued
+    /// reports cannot recreate them after the verdict.
+    pub(in crate::consensus) excluded: HashSet<SlotId>,
+    /// Rate-limit counter for conflicting values from one slot at one ordinal.
     pub(in crate::consensus) duplicate_warns: RateLimitedCounter,
-    /// Rate-limit counter for the malformed-hash-kind warn (the `0x37`'s low
-    /// nibble is neither 1 nor 2 — validated bytes shouldn't produce this;
-    /// see [`SyncTracker::record`]).
+    /// Rate-limit counter for malformed hash-kind nibbles.
     pub(in crate::consensus) malformed_kind_warns: RateLimitedCounter,
-    /// Rate-limit counter for the kind/parity-mismatch warn (a report's hash
-    /// kind disagrees with its placed ordinal's expected parity — an
-    /// alignment-drift indicator, not a desync; see [`SyncTracker::evaluate`]).
+    /// Rate-limit counter for reports whose kind disagrees with ordinal parity.
     pub(in crate::consensus) kind_parity_warns: RateLimitedCounter,
     /// Rate-limit counter for the window-eviction (stalled-slot) warn.
     pub(in crate::consensus) evict_warns: RateLimitedCounter,
-    /// Rate-limit counter for the multiple-sync-commands-in-one-turn warn (an
-    /// honest client emits exactly one `0x37` per outgoing turn; more than one
-    /// is the flooding lever a malicious client would use to inflate its own
-    /// frontier and seed join-placement calibration — see
-    /// [`DecisionMaker::observe_sync`]).
+    /// Rate-limit counter for extra sync commands packed into one turn.
     pub(in crate::consensus) multi_sync_warns: RateLimitedCounter,
-    /// Rate-limit counter for the deferred-join-placement warn (a joining slot
-    /// that can't be safely placed yet — no corroborated rate and the frontier is
-    /// more than a ring cycle ahead; its report is dropped and retried).
-    pub(in crate::consensus) defer_warns: RateLimitedCounter,
-    /// Scratch buffer for [`Self::update_corroboration`]'s per-ordinal median:
-    /// cleared and refilled on every call rather than reallocated, since it
-    /// runs on every accepted sync report (the per-turn path).
-    pub(in crate::consensus) frame_scratch: Vec<u32>,
 }
-
-/// The number of **distinct** slots that must report the same ordinal (each with
-/// a frame) before that ordinal's `(ordinal, median_frame)` becomes a
-/// corroborated calibration point for frame-anchored join placement. Three is the
-/// smallest count whose **median** a single attacker — who controls exactly one
-/// slot — provably cannot move: with ≤1 outlier among ≥3 values the median is
-/// still an honest slot's frame. This is what lets the join projection be
-/// tolerance-free (no "how close counts as agreeing?" parameter to tune).
-pub(in crate::consensus) const SYNC_CORROBORATION_MIN: usize = 3;
-
-/// The hash kind SC:R's native sync check ties to a ring index's parity: even
-/// → [`SYNC_KIND_UNITS`] (the per-unit hash), odd → [`SYNC_KIND_HEADER`] (the
-/// game-header/rng hash). A placed ordinal is always congruent to its true
-/// ring index modulo 16 ([`SYNC_RING_MODULUS`]), and mod-16 preserves parity
-/// (16 is even), so an honestly-placed report's ordinal parity exactly
-/// predicts its kind — this is what [`SyncTracker::evaluate`]'s kind/parity
-/// cross-check tests.
+/// The hash kind SC:R's native sync check ties to the canonical ordinal's
+/// parity: even → [`SYNC_KIND_UNITS`] and odd → [`SYNC_KIND_HEADER`]. A report
+/// with a mismatched kind is excluded from the comparison.
 pub(in crate::consensus) fn expected_kind_for_ordinal(ordinal: u64) -> u8 {
     if ordinal.is_multiple_of(2) {
         SYNC_KIND_UNITS

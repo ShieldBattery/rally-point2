@@ -336,7 +336,7 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
     // SlotDeparted is enqueued. A concurrently joining mesh
     // link snapshots this same registry, so it now observes
     // either true(E) before the departure or no active E at
-    // all â€” never departure followed by a stale replay-true.
+    // all — never departure followed by a stale replay-true.
     let _ = crate::mesh::unpublish_conditions(
         &ctx.conditions,
         &ctx.key,

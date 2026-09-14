@@ -291,7 +291,7 @@ pub use ops::{
     session_initial_buffer_turns, session_started, set_authority, set_own_relay_id,
     set_region_labels, set_session_shape, slot_departed, slot_frame, slot_has_started, slot_homed,
     slot_leave_decided, slot_strictly_homed, started_home_slots, started_session_slot_count,
-    sync_maker,
+    sync_coverage, sync_maker,
 };
 pub use registry::{
     DecisionMakers, RelayNotice, RetainedLoadState, new_decision_makers,

@@ -50,7 +50,7 @@ fn counter_bumps_fold_into_a_sample_on_the_tick() {
     // Drive the tick body directly with an empty conditions registry and no
     // e2e view.
     let conditions = crate::mesh::new_conditions_registry();
-    recorder.sample_now(&conditions, |_| (None, None));
+    recorder.sample_now(&conditions, |_| (None, None), |_| None);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     // One tick sample plus the final flush snapshot.
@@ -63,6 +63,45 @@ fn counter_bumps_fold_into_a_sample_on_the_tick() {
     assert_eq!(row.oversize_diverts, 1);
     assert_eq!(row.dedup_drops, 1);
     assert_eq!(row.rtt_us, None, "no published conditions for the slot");
+}
+
+#[test]
+fn checksum_coverage_rides_periodic_samples_and_defaults_when_omitted() {
+    let recorder = FlightRecorder::default();
+    let k = key(1);
+    recorder.slot_counters(&k, SlotId(0)).note_validated(12);
+    let conditions = crate::mesh::new_conditions_registry();
+    let coverage = SyncCoverage {
+        expected_players: 2,
+        ordered_slots: 1,
+        waiting_slots: 1,
+        unavailable_slots: 0,
+        comparable_slots: 1,
+        authority: true,
+        dormant: false,
+    };
+
+    recorder.sample_now(&conditions, |_| (None, None), |_| Some(coverage));
+
+    let blob = recorder.take_blob(&k, true).expect("a recording exists");
+    assert_eq!(blob.samples[0].sync_coverage, Some(coverage));
+    assert_eq!(
+        blob.samples[1].sync_coverage, None,
+        "the final flush cannot safely read retired consensus state",
+    );
+
+    let old: SampleRecord = serde_json::from_str(r#"{"at_ms": 1, "slots": []}"#)
+        .expect("pre-coverage samples remain readable");
+    assert_eq!(old.sync_coverage, None);
+    let partial: SyncCoverage = serde_json::from_str(r#"{"ordered_slots": 2}"#)
+        .expect("new coverage fields default when absent");
+    assert_eq!(
+        partial,
+        SyncCoverage {
+            ordered_slots: 2,
+            ..SyncCoverage::default()
+        }
+    );
 }
 
 #[test]
@@ -158,7 +197,7 @@ fn the_sampler_folds_published_link_conditions_into_the_row() {
             connection_epoch: None,
         },
     );
-    recorder.sample_now(&conditions, |_| (Some(17), Some(2)));
+    recorder.sample_now(&conditions, |_| (Some(17), Some(2)), |_| None);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     let sample = &blob.samples[0];

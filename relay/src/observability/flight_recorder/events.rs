@@ -91,6 +91,17 @@ pub enum FlightEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inputs: Option<BufferDecisionInputs>,
     },
+    /// This relay can no longer establish one origin's checksum ordinals.
+    /// Observation failure is distinct from a confirmed simulation divergence.
+    /// Recorded once per origin, retaining context before pending reports clear.
+    SyncOrderingUnavailable {
+        slot: u8,
+        reason: String,
+        seq: u64,
+        missing_next: u64,
+        previous_ordinal: Option<u64>,
+        ring: Option<u8>,
+    },
     /// The desync comparator confirmed a divergence.
     DesyncDetected {
         sync_ordinal: u64,
@@ -234,6 +245,35 @@ pub struct SlotEffRtt {
     pub eff_rtt_us: u32,
 }
 
+/// A relay's current ability to compare player sync checksums. The values are
+/// counts rather than slot identities so periodic samples remain compact and
+/// suitable for fleet-level aggregation.
+///
+/// A slot is `ordered` once this relay has a complete transport prefix and a
+/// native sync ordinal. `waiting` has a bounded gap, has not emitted a sync
+/// command yet, or has never been seen; each may still become ordered.
+/// `unavailable` lost the trustworthy prefix or native-ring epoch and is
+/// excluded from checksum comparison for the rest of this session on this
+/// relay. `expected_players` excludes observers and departed slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncCoverage {
+    pub expected_players: u32,
+    pub ordered_slots: u32,
+    pub waiting_slots: u32,
+    pub unavailable_slots: u32,
+    /// Players whose ordered checksum reports can currently participate in a
+    /// comparison. This can be smaller than `ordered_slots` after an authority
+    /// handoff resets comparator membership or while a minority is excluded.
+    pub comparable_slots: u32,
+    /// Whether this relay currently decides checksum divergences for the
+    /// session.
+    pub authority: bool,
+    /// Whether safety bounds or a disagreement without a majority suspended
+    /// the comparator.
+    pub dormant: bool,
+}
+
 /// One recorded event: what happened and when (unix epoch milliseconds).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRecord {
@@ -317,6 +357,11 @@ pub struct SampleRecord {
     /// Absent like [`worst_e2e_lag_turns`](Self::worst_e2e_lag_turns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_relay_hops: Option<u32>,
+    /// The checksum comparator's coverage at this sampling instant. Absent
+    /// from final-flush snapshots, because their consensus state may already
+    /// have been retired, and from sessions with no decision-maker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_coverage: Option<SyncCoverage>,
 }
 
 /// One session's flushed recording: the versioned, self-describing envelope a

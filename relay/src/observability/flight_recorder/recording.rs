@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 
-use super::events::{EventRecord, SampleRecord, SlotSample};
+use super::events::{EventRecord, SampleRecord, SlotSample, SyncCoverage};
 use super::{MAX_EVENTS_PER_SESSION, MAX_SAMPLES_PER_SESSION, now_ms};
 
 /// One slot's turn-stream counters: plain atomics the hot path bumps through a
@@ -180,6 +180,7 @@ impl SessionRecording {
         &self,
         conditions: Option<&HashMap<SlotId, SlotConditionsRow>>,
         e2e: (Option<u64>, Option<u32>),
+        sync_coverage: Option<SyncCoverage>,
     ) -> SampleRecord {
         let counters = self.counters.lock();
         let mut slots: Vec<SlotSample> = counters
@@ -209,6 +210,7 @@ impl SessionRecording {
             slots,
             worst_e2e_lag_turns: e2e.0,
             max_relay_hops: e2e.1,
+            sync_coverage,
         }
     }
 }

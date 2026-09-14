@@ -68,7 +68,7 @@ mod sinks;
 
 pub use events::{
     BufferDecisionInputs, EventRecord, FlightBlob, FlightEvent, SampleRecord, SlotEffRtt,
-    SlotSample,
+    SlotSample, SyncCoverage,
 };
 pub use recording::{FlushOutcome, RelayWorkSnapshot, SlotCounters};
 pub use sinks::{
@@ -434,6 +434,7 @@ impl FlightRecorder {
         &self,
         conditions: &ConditionsRegistry,
         e2e_for: impl Fn(&SessionKey) -> (Option<u64>, Option<u32>),
+        sync_coverage_for: impl Fn(&SessionKey) -> Option<SyncCoverage>,
     ) {
         let recordings: Vec<(SessionKey, Arc<SessionRecording>)> = {
             let state = self.inner.recordings.lock();
@@ -460,7 +461,22 @@ impl FlightRecorder {
                         })
                         .collect()
                 });
-            let row = recording.sample_row(rows.as_ref(), e2e_for(&key));
+            let coverage = sync_coverage_for(&key);
+            if let Some(coverage) = coverage {
+                tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    sync_expected_players = coverage.expected_players,
+                    sync_ordered_slots = coverage.ordered_slots,
+                    sync_waiting_slots = coverage.waiting_slots,
+                    sync_unavailable_slots = coverage.unavailable_slots,
+                    sync_comparable_slots = coverage.comparable_slots,
+                    sync_authority = coverage.authority,
+                    sync_dormant = coverage.dormant,
+                    "checksum comparator coverage",
+                );
+            }
+            let row = recording.sample_row(rows.as_ref(), e2e_for(&key), coverage);
             recording.push_sample(row);
         }
     }
@@ -512,9 +528,11 @@ pub async fn run_sampler(
     tick.tick().await;
     loop {
         tick.tick().await;
-        recorder.sample_now(&conditions, |key| {
-            crate::consensus::session_e2e(&makers, key)
-        });
+        recorder.sample_now(
+            &conditions,
+            |key| crate::consensus::session_e2e(&makers, key),
+            |key| crate::consensus::sync_coverage(&makers, key),
+        );
     }
 }
 

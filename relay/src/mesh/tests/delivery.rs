@@ -6,7 +6,8 @@ use super::*;
 /// Builds a single-command turn payload carrying one `0x37` sync command
 /// (`ring` = the ordinal mod 16), plus a made-up `game_frame_count`.
 fn sync_payload(seq: u64, slot: u8, ordinal: u8, value: [u8; 5]) -> Payload {
-    let mut commands = vec![0x37u8, (slot << 4) | (ordinal % 16)];
+    let kind = if ordinal.is_multiple_of(2) { 1 } else { 2 };
+    let mut commands = vec![0x37u8, ((ordinal % 16) << 4) | kind];
     commands.extend_from_slice(&value);
     Payload {
         seq,
@@ -430,4 +431,34 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
         Some(115),
         "the clamp ceiling reflects single-counted history",
     );
+}
+
+#[test]
+fn checksum_sequence_gaps_never_hold_gameplay_delivery() {
+    let (sessions, seen, decision_makers, turn_ring, key, _) =
+        region_label_relay(std::time::Duration::from_secs(60));
+    let (_registration, mut inbox) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
+
+    // Sequence 1 waits on 0 in the checksum observer. Sequence 4096 then
+    // exceeds its recoverable window. Both must reach the player immediately.
+    for seq in [1, 4096, 0] {
+        let payload = sync_payload(seq, 0, seq as u8, [1, 2, 3, 4, 5]);
+        let delivered = deliver_turn_to_locals(
+            &sessions,
+            &seen,
+            &decision_makers,
+            &turn_ring,
+            &key,
+            SlotId(0),
+            payload.clone(),
+            crate::consensus::delivery::DeliveryHome::Local,
+        )
+        .expect("checksum availability cannot suppress mesh delivery");
+        assert_eq!(delivered.seq, seq);
+        let forwarded = inbox
+            .try_recv_forward()
+            .expect("gameplay must not wait for the gap");
+        assert_eq!(forwarded.seq, seq);
+        assert_eq!(forwarded.commands, payload.commands);
+    }
 }

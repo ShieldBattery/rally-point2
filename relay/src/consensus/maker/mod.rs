@@ -216,8 +216,11 @@ pub struct DecisionMaker {
     pub(in crate::consensus) results: HashMap<SlotId, ResultEcho>,
     /// The per-session desync comparator. Only meaningful while this relay is the
     /// authority; reset wholesale on promotion (a real desync re-diverges every
-    /// interval, so no state need transfer across a handoff).
+    /// interval). Per-origin ordering and epochs live separately in `sync_turns`.
     pub(in crate::consensus) sync: SyncTracker,
+    /// Per-origin ordered checksum metadata. Retained across authority changes so
+    /// a promotion cannot reinterpret an outstanding transport gap as a ring wrap.
+    pub(in crate::consensus) sync_turns: SyncTurns,
     /// The slots the coordinator expects to connect before the session may start
     /// (every player and observer, from the session descriptor). Empty disables
     /// the session-start directive — a session whose descriptor carried no
@@ -451,6 +454,7 @@ impl DecisionMaker {
             observers,
             results: HashMap::new(),
             sync: SyncTracker::default(),
+            sync_turns: SyncTurns::default(),
             expected_slots: HashSet::new(),
             homed_slots: HashSet::new(),
             live_slots: HashSet::new(),

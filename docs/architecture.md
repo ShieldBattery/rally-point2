@@ -712,13 +712,38 @@ reported up the coordinator webhook leg, keyed on the sync ordinal so a re-detec
 handoff isn't counted twice. Observers are excluded — they don't reliably emit sync commands, so requiring
 their checksums would stall the cross-check.
 
-The comparator is **attacker-facing**, and hardened so a malicious client can only get its *own* game
-disputed, never frame an honest player. The frame-anchored placement that positions a joining slot is
-derived only from a corroborated median of **≥3 distinct slots'** `(ordinal, frame)` points — a lone
-attacker can neither reach the threshold nor move the median — and a join with no corroborated rate is
-placed only within one ring cycle of the frontier, else deferred rather than misplaced. Exactly one `0x37`
-per `(slot, turn)` is enforced, removing the flooding lever both the placement-poisoning and
-window-eviction attacks depended on.
+Checksum observation orders compact metadata by each origin's full transport sequence, independently
+of gameplay forwarding. Every turn occupies a position, including turns without a checksum. Starting
+at sequence zero, each relay unwraps the native four-bit sync ring into an absolute ordinal: repeated
+startup reports keep their ordinal, and an advance must be exactly one ring position. Peers retain
+these cursors and epochs across authority changes, so promotion cannot align different ring cycles.
+Game-frame claims never determine checksum alignment.
+
+Only the first `0x37` in a turn contributes metadata. Invalid hash kinds and kinds inconsistent with
+ordinal parity are excluded from voting. Pending metadata is bounded to the transport receive window
+(currently a sequence distance below 4096). Exceeding that window, an unexpected ring jump, or arithmetic
+overflow clears **only that origin's** pending metadata and removes its reports from comparison. Its
+failure latch survives promotion; every other origin retains its independent history and remains
+comparable. The warning retains the triggering sequence, missing next sequence, prior ordinal, ring,
+and reason. Each origin's first failure also records a `sync_ordering_unavailable` flight event with
+that context, on authority and peer relays, distinct from a desync verdict. A ring jump is not a
+simulation-divergence verdict: without a bound on how many native
+reports could have been omitted, even a small forward nibble difference can hide a whole ring cycle.
+
+The comparator is **attacker-facing**. A client controls its own report contents and can withhold or
+invalidate its own checksum coverage; it cannot shift another origin's ordinal, erase another origin's
+history, or disable comparisons among the remaining eligible players through an ordering failure.
+Reports with uncertain history are not votes and do not identify a diverged player. This is detection
+coverage, not proof of an honest simulation: with fewer than two eligible reports there is no cross-check,
+and a 1v1 loses cross-check coverage when either origin becomes unavailable. Surviving reports cannot
+establish that an excluded player's simulation agreed with them.
+
+A relay missing an origin's sequence-zero history has no trusted epoch anchor and cannot guess it from
+the first received ring index. This can occur during initial mesh attachment as well as rehoming; the
+mesh does not guarantee complete pre-history delivery. Periodic coverage samples distinguish waiting
+origins from unavailable origins, including before the ordering window is exhausted. Gameplay continues
+forwarding immediately regardless of checksum coverage. Existing peers with complete history retain
+comparison continuity when promoted.
 
 ### Synced player-leaves
 

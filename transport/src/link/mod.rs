@@ -48,7 +48,7 @@ pub(crate) use dedup::SlotDedup;
 /// advancing, so legitimately reaching this bound means the low seqs have been
 /// lost for a long run (minutes at the turn rate) — a dead link, not reorder. It
 /// also bounds the out-of-order set to at most this many entries per slot.
-const RECEIVE_WINDOW: u64 = 4096;
+pub const RECEIVE_WINDOW: u64 = 4096;
 
 /// A single transport link over one QUIC connection.
 pub struct Link {

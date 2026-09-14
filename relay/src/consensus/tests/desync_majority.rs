@@ -210,6 +210,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
         &registry,
         &k,
         SlotId(0),
+        0,
         Some(500),
         &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
     );
@@ -217,6 +218,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
         &registry,
         &k,
         SlotId(1),
+        0,
         Some(500),
         &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
     );
@@ -224,6 +226,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
         &registry,
         &k,
         SlotId(2),
+        0,
         Some(500),
         &sync_command(0, expected_kind_for_ordinal(0), SYNC_B),
     );
@@ -235,6 +238,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
             &registry,
             &k,
             SlotId(0),
+            u64::from(ordinal),
             Some(500 + u32::from(ordinal)),
             &sync_command(
                 ordinal,
@@ -265,9 +269,8 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
 /// SC:R's initial latency-depth flush burst emits several `0x37`s all
 /// stamped identically (same ring, same content) before the first
 /// per-turn record advances the ring — the same-ordinal duplicate-ignore
-/// already absorbs this without any special-casing (live-relay
-/// confirmed): each repeat lands back at the same placed ordinal via
-/// ordinary nibble correction.
+/// absorbs this: the ordered ring cursor leaves repeated reports at the
+/// same canonical ordinal, and the comparator keeps that slot's first vote.
 #[test]
 fn a_startup_burst_of_identical_ring_1_reports_causes_no_false_divergence() {
     let mut m = authority_maker();
@@ -322,8 +325,8 @@ fn fog_byte_divergence_with_matching_hash16_is_not_a_divergence() {
         let frame = 1000 + u32::from(ordinal);
         let a = sync_command_with_fog(ring, kind, SYNC_A, [1, 2, 3]);
         let b = sync_command_with_fog(ring, kind, SYNC_A, [9, 8, 7]);
-        assert_eq!(m.observe_sync(SlotId(0), Some(frame), &a), None);
-        assert_eq!(m.observe_sync(SlotId(1), Some(frame), &b), None);
+        assert_eq!(m.observe_ordered_sync(SlotId(0), Some(frame), &a), None);
+        assert_eq!(m.observe_ordered_sync(SlotId(1), Some(frame), &b), None);
     }
     assert_eq!(
         m.sync.base_ordinal, 1,
@@ -356,8 +359,8 @@ fn a_kind_parity_mismatch_is_an_anomaly_not_a_divergence() {
 
 /// A `0x37` whose low nibble is neither 1 nor 2 is a malformed sync
 /// command — defensive rejection, since validated bytes shouldn't produce
-/// this. The report is skipped entirely: no member bookkeeping, no
-/// calibration, nothing.
+/// this. Its ring still participates in ordering, but the report cannot
+/// create comparator membership or contribute a checksum vote.
 #[test]
 fn a_malformed_kind_is_skipped_not_recorded() {
     let mut m = authority_maker();

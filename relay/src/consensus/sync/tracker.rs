@@ -5,36 +5,22 @@
 use super::*;
 
 impl SyncTracker {
-    /// Records one slot's `0x37`, nibble-correcting its placement, and
-    /// evaluates any now-ready ordinals, returning a [`SyncDivergence`] if one
-    /// fired. `ring` is the command's ring nibble (the high nibble of `[1]`,
-    /// already shifted to 0..15); `kind` is the low nibble (the hash kind).
-    ///
-    /// `kind` must be [`SYNC_KIND_UNITS`] or [`SYNC_KIND_HEADER`] — anything
-    /// else is a malformed sync command (defensive; validated bytes shouldn't
-    /// produce this) and the report is skipped entirely: no member
-    /// bookkeeping, no calibration, nothing recorded, just a rate-limited warn.
-    ///
-    /// Placement: the ordinal congruent to `ring` (mod 16) nearest this slot's
-    /// expected ordinal — its own [`Member::next_expected`] if already a
-    /// member (steady state), else [`Self::join_expected`]'s frame-anchored
-    /// (or frontier, or ring-face-value) estimate for a first-ever report. See
-    /// the module docs for why the two cases differ and the bound on how far
-    /// each correction can reach. `margin` is this session's current
-    /// evaluation margin ([`sync_eval_margin`]) — threaded through to
-    /// [`Self::evaluate_ready`] rather than stored, so a mid-session bounds
-    /// change is picked up immediately without the tracker needing to be told.
-    #[allow(clippy::too_many_arguments)]
+    /// Records one sync report whose transport-ordered origin stream assigned
+    /// it `ordinal`. `kind` must be [`SYNC_KIND_UNITS`] or
+    /// [`SYNC_KIND_HEADER`]; anything else is malformed and skipped before it
+    /// can affect membership or pending comparisons.
     pub(in crate::consensus) fn record(
         &mut self,
         key: &SessionKey,
         slot: SlotId,
-        ring: u8,
-        kind: u8,
-        value: SyncValue,
-        game_frame: Option<u32>,
+        ordinal: u64,
+        report: SyncReport,
         margin: u64,
     ) -> Option<SyncDivergence> {
+        let SyncReport { kind, value, .. } = report;
+        if self.excluded.contains(&slot) {
+            return None;
+        }
         if kind != SYNC_KIND_UNITS && kind != SYNC_KIND_HEADER {
             if self.malformed_kind_warns.observe() {
                 tracing::warn!(
@@ -49,92 +35,29 @@ impl SyncTracker {
             }
             return None;
         }
-
-        let ring = u64::from(ring);
-        let existing_next_expected = self.members.get(&slot).map(|m| m.next_expected);
-        let is_new_member = existing_next_expected.is_none();
-        let expected = match existing_next_expected {
-            Some(expected) => expected,
-            None => match self.join_expected(ring, game_frame) {
-                Some(expected) => expected,
-                // Deep join with no corroborated rate and the frontier more than a
-                // ring cycle ahead: defer (see `defer_join`).
-                None => return self.defer_join(key, slot),
-            },
-        };
-
-        // Nearest ordinal ≡ ring (mod 16) to `expected`. `diff` lands in
-        // [-8, 8]; the ends (exactly ±8) are the ambiguous case the module
-        // docs' bound note calls out — deterministic here, but not
-        // necessarily correct, which is why each case's own bound (transport
-        // reordering for steady state, frame skew for a join) is what keeps
-        // real gaps well inside this range rather than at its edge.
-        let expected_mod = (expected % SYNC_RING_MODULUS) as i64;
-        let mut diff = ring as i64 - expected_mod;
-        if diff > 8 {
-            diff -= 16;
-        } else if diff < -8 {
-            diff += 16;
+        // A freshly reset comparator can begin after a long-running session.
+        // Anchor it at the first canonical ordinal rather than retiring every
+        // nonexistent ordinal from zero. `initialized` stays set after later
+        // departures, so an empty compare set never rewinds established progress.
+        if !self.initialized {
+            self.initialized = true;
+            self.base_ordinal = ordinal;
         }
-        let placed = i128::from(expected) + i128::from(diff);
-
-        // A *joining* slot placed above the frontier means the nibble jumped a
-        // ring cycle upward off the frontier anchor — the tell-tale of a deep
-        // join we can't resolve without a corroborated rate. Defer it (drop and
-        // retry) rather than misplace it a full cycle and risk framing an honest
-        // slot. Steady-state members are exempt: they legitimately *are* the
-        // frontier. (No frontier yet — the very first observation — is never
-        // above itself.)
-        if is_new_member
-            && let Some(frontier) = self.members.values().map(|m| m.next_expected).max()
-            && placed > i128::from(frontier)
-        {
-            return self.defer_join(key, slot);
-        }
-
-        if diff != 0 && self.corrections.observe() {
-            tracing::debug!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                expected,
-                ring,
-                placed,
-                count = self.corrections.count(),
-                "sync ordinal placement corrected from the ring nibble; \
-                 the turn arrived out of order, the slot is running ahead, \
-                 or it just joined the compare set",
-            );
-        }
-
-        // Advance this member's bookkeeping regardless of whether the
-        // placement itself lands in already-retired territory below — a
-        // dropped comparison must not also leave the member's own progress
-        // stale (it has still, after all, reported this many sync commands).
-        let next_expected_candidate = u64::try_from(placed + 1).unwrap_or(0);
-        let since_candidate = u64::try_from(placed).unwrap_or(0);
-        let member = self.members.entry(slot).or_insert_with(|| Member {
-            next_expected: 0,
-            since: since_candidate,
+        let next_expected = ordinal.saturating_add(1);
+        let member = self.members.entry(slot).or_insert(Member {
+            next_expected,
+            since: ordinal,
         });
-        member.next_expected = member.next_expected.max(next_expected_candidate);
-        if is_new_member {
-            member.since = since_candidate;
-        }
-
-        if placed < i128::from(self.base_ordinal) {
-            // Already-retired territory (possible right after a correction or
-            // an eviction): the comparison is lost, which is acceptable —
-            // don't let it perturb anything beyond the bookkeeping above.
+        member.next_expected = member.next_expected.max(next_expected);
+        if ordinal < self.base_ordinal {
+            // The ordered source can retain a report whose comparison interval
+            // already retired before this relay became authority. Keep the
+            // member's forward progress, but never resurrect that interval.
             return None;
         }
-        let ordinal = placed as u64; // non-negative: checked above
-
         match self.pending.entry(ordinal).or_default().entry(slot) {
             std::collections::hash_map::Entry::Occupied(existing) => {
                 if existing.get().value != value && self.duplicate_warns.observe() {
-                    // An honest client never emits two different checksums for
-                    // the same turn; keep the first and just flag it.
                     tracing::warn!(
                         tenant = key.tenant.as_ref(),
                         session = key.session.0,
@@ -145,151 +68,17 @@ impl SyncTracker {
                          at this ordinal; keeping the first",
                     );
                 }
-                // Same value: a harmless duplicate (the belt-and-suspenders
-                // case — the caller is expected to already dedup turns, but
-                // nibble correction can independently re-place a redundant
-                // report at an ordinal it already holds). Either way, nothing
-                // to insert.
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(SyncReport {
-                    value,
-                    kind,
-                    game_frame,
-                });
+                vacant.insert(report);
             }
         }
-
-        // Fold this ordinal into the corroborated calibration: once ≥3 distinct
-        // slots have reported it with frames, its median frame anchors the
-        // frame-rate estimate used to place late joins (see `join_expected`).
-        self.update_corroboration(ordinal);
-
         if let Some(divergence) = self.evaluate_ready(key, margin) {
             return Some(divergence);
         }
         self.evict_over_window(key);
         None
     }
-
-    /// The join-placement anchor for a slot's first-ever report: the ordinal
-    /// [`Self::record`]'s nibble correction will refine — or `None` to **defer**
-    /// the placement entirely when no anchor can be trusted.
-    ///
-    /// Three cases, in order:
-    /// - **No members yet** (the tracker's very first observation): the ring's
-    ///   own face value.
-    /// - **A corroborated rate is available**: project frame-anchored from the
-    ///   corroborated latest `(ordinal, frame)` point — a point ≥3 distinct slots
-    ///   agreed on (see [`Self::frame_rate`]), so a lone slot cannot swing it —
-    ///   clamped to `[0, frontier]`. This keeps deep honest joins (>7 ordinals
-    ///   from the frontier) landing on the true ordinal, exactly as before, but
-    ///   now from a reference an attacker can't poison.
-    /// - **No corroborated rate yet**: anchor on the frontier and let
-    ///   [`Self::record`]'s nibble correction resolve the placement — but only
-    ///   within a single ring cycle (`frontier < SYNC_RING_MODULUS`). Beyond one
-    ///   cycle the nibble could land a deep joiner a full cycle off a slot's true
-    ///   ordinal with no way to tell, so return `None` to **defer**. Within a
-    ///   cycle, `record` additionally defers any placement that lands *above* the
-    ///   frontier (the tell-tale of a deep joiner whose nibble jumped a cycle
-    ///   upward) — so a slot is only ever placed at or below the frontier, within
-    ///   the nibble's reliable ±7 range of its true ordinal.
-    ///
-    /// A joining slot's own single-slot frame is deliberately **never** trusted
-    /// as a rate/anchor source; that was the calibration-poisoning lever.
-    pub(in crate::consensus) fn join_expected(
-        &self,
-        ring: u64,
-        game_frame: Option<u32>,
-    ) -> Option<u64> {
-        let Some(frontier) = self.members.values().map(|m| m.next_expected).max() else {
-            return Some(ring); // no members at all: the very first observation
-        };
-        if let Some(frame) = game_frame
-            && let Some(rate) = self.frame_rate()
-            && let Some((ref_ordinal, ref_frame)) = self.corroborated_latest
-        {
-            let predicted = ref_ordinal as f64 + (f64::from(frame) - f64::from(ref_frame)) / rate;
-            return Some(predicted.clamp(0.0, frontier as f64).round() as u64);
-        }
-        // No trustworthy rate: safe to anchor on the frontier only within a
-        // single ring cycle; deeper than that, defer (the caller drops the report
-        // and retries on the slot's next one).
-        (frontier < SYNC_RING_MODULUS).then_some(frontier)
-    }
-
-    /// The frames-per-ordinal rate this session is advancing at, from the spread
-    /// between [`Self::corroborated_first`] and [`Self::corroborated_latest`] —
-    /// both **corroborated** points (≥3 distinct slots agreeing), so the slope an
-    /// attacker sees is one it cannot move with its single slot. `None` until two
-    /// distinct-ordinal corroborated points exist, or if the computed rate isn't a
-    /// sane forward rate (frames must advance, not stall or run backward, between
-    /// distinct ordinals).
-    pub(in crate::consensus) fn frame_rate(&self) -> Option<f64> {
-        let (o1, f1) = self.corroborated_first?;
-        let (o2, f2) = self.corroborated_latest?;
-        if o2 <= o1 {
-            return None;
-        }
-        let rate = (f64::from(f2) - f64::from(f1)) / (o2 - o1) as f64;
-        (rate.is_finite() && rate > 0.0).then_some(rate)
-    }
-
-    /// Drops a joining slot's report because it can't be safely placed yet (no
-    /// corroborated rate and the frontier is more than a ring cycle ahead, or the
-    /// placement would land above the frontier). No member is created and no
-    /// calibration is fed, so the slot stays in the join path and retries on its
-    /// next report — the natural re-placement, no separate comparison-lost flag.
-    /// Missing a possible desync for this slot is an acceptable false negative;
-    /// framing an honest slot by misplacing it a full ring cycle is not.
-    pub(in crate::consensus) fn defer_join(
-        &mut self,
-        key: &SessionKey,
-        slot: SlotId,
-    ) -> Option<SyncDivergence> {
-        if self.defer_warns.observe() {
-            tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                count = self.defer_warns.count(),
-                "deferring a joining slot's sync placement: no corroborated rate \
-                 yet and the join is more than a ring cycle from the frontier — \
-                 dropping this report, will retry on the slot's next one",
-            );
-        }
-        None
-    }
-
-    /// Folds the pending reports at `ordinal` into the corroborated calibration:
-    /// once at least [`SYNC_CORROBORATION_MIN`] **distinct** slots have reported
-    /// it with a frame, records `(ordinal, median_frame)` as a corroborated point
-    /// — extending the corroborated ordinal range at either end. The **median**
-    /// is what a single attacker cannot move (≤1 outlier among ≥3 values), so the
-    /// resulting rate/anchor is tolerance-free and poisoning-resistant.
-    pub(in crate::consensus) fn update_corroboration(&mut self, ordinal: u64) {
-        let Some(reports) = self.pending.get(&ordinal) else {
-            return;
-        };
-        // Reused across calls (cleared, not reallocated) since this runs on
-        // every accepted sync report and the common case never needs the sort
-        // below at all.
-        self.frame_scratch.clear();
-        self.frame_scratch
-            .extend(reports.values().filter_map(|r| r.game_frame));
-        if self.frame_scratch.len() < SYNC_CORROBORATION_MIN {
-            return;
-        }
-        self.frame_scratch.sort_unstable();
-        let median = self.frame_scratch[self.frame_scratch.len() / 2];
-        if self.corroborated_first.is_none_or(|(o, _)| ordinal < o) {
-            self.corroborated_first = Some((ordinal, median));
-        }
-        if self.corroborated_latest.is_none_or(|(o, _)| ordinal > o) {
-            self.corroborated_latest = Some((ordinal, median));
-        }
-    }
-
     /// Evaluates every ordinal now ready: the frontier (the furthest any
     /// member has reached) has moved at least `margin` past it (see
     /// [`sync_eval_margin`]), and every member required for it (its `since` at
@@ -306,7 +95,7 @@ impl SyncTracker {
                 return None; // no members yet
             };
             let base = self.base_ordinal;
-            if frontier < base + margin {
+            if frontier.saturating_sub(base) < margin {
                 return None; // not enough lead yet to trust completeness
             }
 
@@ -331,7 +120,7 @@ impl SyncTracker {
                 // frontier ahead of ordinal 0, or once every once-required
                 // member has since departed). Just retire and move on.
                 self.pending.remove(&base);
-                self.base_ordinal += 1;
+                self.base_ordinal = self.base_ordinal.saturating_add(1);
                 continue;
             }
             if !complete {
@@ -341,7 +130,7 @@ impl SyncTracker {
             }
 
             let reports = self.pending.remove(&base).expect("just matched complete");
-            self.base_ordinal += 1;
+            self.base_ordinal = self.base_ordinal.saturating_add(1);
             if let Some(divergence) = self.evaluate(base, &reports, key) {
                 return Some(divergence);
             }
@@ -470,7 +259,7 @@ impl SyncTracker {
                 // pending ordinal, so the survivors are compared only against each
                 // other from here on.
                 for slot in &diverged {
-                    self.remove_member(*slot);
+                    self.exclude_member(*slot);
                 }
                 // With fewer than two comparable slots left there is nothing to
                 // compare, so stop for the session.
@@ -529,13 +318,22 @@ impl SyncTracker {
                 );
             }
             if ordinal >= self.base_ordinal {
-                self.base_ordinal = ordinal + 1;
+                self.base_ordinal = ordinal.saturating_add(1);
             }
         }
     }
 
+    /// Excludes a confirmed divergent minority for this tracker instance. A
+    /// queued turn may still arrive after the verdict, but it must not recreate
+    /// the member and make survivors compare against a known-bad simulation.
+    pub(in crate::consensus) fn exclude_member(&mut self, slot: SlotId) {
+        self.excluded.insert(slot);
+        self.remove_member(slot);
+    }
+
     /// Removes `slot` from the compare set and drops its reports from every
-    /// pending ordinal, so it is neither required nor compared from here on.
+    /// pending ordinal. Departures and observer changes use this non-sticky
+    /// removal because a later descriptor can legitimately reinstate a slot.
     /// Idempotent — a slot not in the set is a no-op.
     pub(in crate::consensus) fn remove_member(&mut self, slot: SlotId) {
         self.members.remove(&slot);

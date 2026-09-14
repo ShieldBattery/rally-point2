@@ -249,15 +249,14 @@ pub(super) fn deliver_turn_to_locals(
     // The desync comparator's one and only feed point. Every turn-delivery
     // path — client edge (datagram and oversize-control), mesh datagram, and
     // mesh oversize-control — funnels through here, and this is placed right
-    // after the `mark_seen` dedup above. The comparator's per-slot ordinal
-    // count is not idempotent the way `observe_frame`'s monotone max is — a
-    // duplicate walked twice would silently drift the count and misalign
-    // every later comparison. A no-op unless this relay is the session
-    // authority.
+    // after the `mark_seen` dedup above. Every relay retains sequence-ordered
+    // checksum metadata from each distinct origin turn; only the authority
+    // compares. This observer never holds gameplay fan-out waiting for a gap.
     crate::consensus::observe_sync(
         decision_makers,
         key,
         slot,
+        payload.seq,
         payload.game_frame_count,
         &payload.commands,
     );

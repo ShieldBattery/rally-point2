@@ -361,24 +361,52 @@ pub fn session_e2e(registry: &DecisionMakers, key: &SessionKey) -> (Option<u64>,
 /// the relay has a maker, and fires a [`DesyncNotice`] up the coordinator
 /// connection when a divergence is confirmed. Called at the same turn choke
 /// points as [`observe_frame`], for every turn (client edge, mesh hop, oversize
-/// divert). A cheap no-op unless this relay is the session authority: the maker's
-/// [`observe_sync`](DecisionMaker::observe_sync) returns immediately for a
-/// non-authority relay before walking any bytes.
+/// divert). Every relay retains ordered checksum metadata so a promotion keeps
+/// its native ring epochs; only the authority compares or emits a notice.
 ///
-/// `game_frame` is the turn's `game_frame_count`; `commands` its raw command
+/// `seq` is the origin's full transport sequence. `game_frame` is the turn's
+/// `game_frame_count`; `commands` its raw command
 /// bytes (already validated at the ingress edge — this walk is the authority's
 /// own independent parse, not a trust in a peer's).
 pub fn observe_sync(
     registry: &DecisionMakers,
     key: &SessionKey,
     slot: SlotId,
+    seq: u64,
     game_frame: Option<u32>,
     commands: &[u8],
 ) {
-    let divergence = match registry.lock().get_mut(key) {
-        Some(maker) => maker.observe_sync(slot, game_frame, commands),
-        None => None,
+    let (divergence, ordering_failure) = {
+        let mut makers = registry.lock();
+        match makers.get_mut(key) {
+            Some(maker) => {
+                let was_unavailable = maker.sync_turns.unavailable(slot);
+                let divergence = maker.observe_sync(slot, seq, game_frame, commands);
+                let failure = if was_unavailable {
+                    None
+                } else {
+                    maker.sync_turns.failure(slot)
+                };
+                (divergence, failure)
+            }
+            None => (None, None),
+        }
     };
+    // The recorder has its own locks. Capture the transition under the maker
+    // lock, then publish outside it; a latched origin produces only one event.
+    if let Some(failure) = ordering_failure {
+        registry.flight.record(
+            key,
+            crate::observability::flight_recorder::FlightEvent::SyncOrderingUnavailable {
+                slot: slot.0,
+                reason: failure.reason.to_owned(),
+                seq: failure.seq,
+                missing_next: failure.next,
+                previous_ordinal: failure.previous_ordinal,
+                ring: failure.ring,
+            },
+        );
+    }
     if let Some(divergence) = divergence {
         log_desync(key, &divergence);
         registry.flight.record(
