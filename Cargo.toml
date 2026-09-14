@@ -82,7 +82,7 @@ time = { version = "0.3", features = ["parsing"] }
 # structured, repetitive JSON that compresses heavily even at the default, and the
 # flush path is rare (session close / drain), so trading a higher level's marginal
 # ratio for its CPU is not worth it.
-zstd = "0.13"
+zstd = "0.14"
 # Protobuf runtime for the generated wire messages (proto crate).
 prost = "0.14"
 
@@ -242,7 +242,7 @@ aws-sdk-ec2 = { version = "1.208", default-features = false, features = [
 # reuses the workspace's single crypto backend and the tree grows no aws-lc-rs path.
 # Pinned exactly so adding it leaves the shared `aws-smithy-*` versions the other SDK
 # clients resolved untouched. Coordinator-only.
-aws-sdk-s3 = { version = "=1.140.0", default-features = false, features = [
+aws-sdk-s3 = { version = "=1.146.1", default-features = false, features = [
   "rt-tokio",
   "behavior-version-latest",
 ] }
