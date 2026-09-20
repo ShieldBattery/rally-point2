@@ -37,8 +37,9 @@ tracing = { workspace = true }
 rcgen = { workspace = true, optional = true }
 
 [features]
-# Exposes `test_util` (self-signed certs + loopback QUIC pairs) to dependents'
-# tests. Never enabled by a production build.
+# Exposes `test_util` (self-signed certs + loopback QUIC pairs) and the
+# harness-only helpers scattered through the crate to dependents' tests. Never
+# enabled by a production build.
 test-util = ["dep:rcgen"]
 
 [dev-dependencies]

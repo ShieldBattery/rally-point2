@@ -71,6 +71,10 @@ pub fn spawn_mesh_control_reader(recv: noq::RecvStream) -> mpsc::Receiver<MeshCo
 /// inside the task means a peer that never opens its stream just parks the reader
 /// harmlessly. The accepted send half is unused (each side writes only on the
 /// stream it opened) and dropped.
+///
+/// Test-only: every production dialer and acceptor already has the recv half in
+/// hand, so nothing outside a harness needs the lazy accept.
+#[cfg(any(test, feature = "test-util"))]
 pub fn spawn_mesh_control_reader_accepting(
     connection: noq::Connection,
 ) -> mpsc::Receiver<MeshControlFrame> {
