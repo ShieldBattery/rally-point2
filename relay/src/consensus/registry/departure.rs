@@ -90,7 +90,7 @@ impl DecisionMakers {
     /// this call (and be claimed here) or wholly after the new epoch is active
     /// (and be rejected as stale). The caller's hold map must stay locked across
     /// this call for the pairing to be atomic — see
-    /// [`crate::session::state::SessionState::admit_reconnect`], which owns both
+    /// [`crate::session::SessionState::admit_reconnect`], which owns both
     /// registries and is the only production caller.
     ///
     /// A missing maker admits without reinstating: there is no local consensus
@@ -188,7 +188,7 @@ impl DecisionMakers {
             }
             echo
         };
-        self.emit_notice(RelayNotice::Result(result_notice(self, key, slot, echo)));
+        self.emit_notice(RelayNotice::Result(self.result_notice(key, slot, echo)));
     }
 
     /// The end-of-game result `slot` reported for `key`, if the relay has a maker
@@ -319,9 +319,9 @@ impl DecisionMakers {
         for directive in &decided {
             log_leave(key, directive);
             self.record_leave_event(key, directive);
-            self.emit_notice(RelayNotice::Departure(departure_notice(
-                self, key, directive,
-            )));
+            self.emit_notice(RelayNotice::Departure(
+                self.departure_notice(key, directive),
+            ));
         }
         decided
     }

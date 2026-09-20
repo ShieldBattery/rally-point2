@@ -21,9 +21,9 @@ impl DecisionMakers {
         if let Some(maker) = self.lock().get_mut(key) {
             maker.note_slot_connected(slot);
         }
-        self.emit_notice(RelayNotice::SlotConnected(slot_connected_notice(
-            self, key, slot, resumed,
-        )));
+        self.emit_notice(RelayNotice::SlotConnected(
+            self.slot_connected_notice(key, slot, resumed),
+        ));
     }
 
     /// Forwards a **home** client's report that its game loop has started: retains
@@ -45,9 +45,9 @@ impl DecisionMakers {
         if let Some(maker) = self.lock().get_mut(key) {
             maker.note_slot_started(slot);
         }
-        self.emit_notice(RelayNotice::SlotStarted(slot_started_notice(
-            self, key, slot,
-        )));
+        self.emit_notice(RelayNotice::SlotStarted(
+            self.slot_started_notice(key, slot),
+        ));
     }
 
     /// Folds a peer relay's `SlotStarted` into the session's maker: the slot's home
@@ -156,7 +156,7 @@ impl DecisionMakers {
                 initial_buffer_turns,
             },
         );
-        let notice = session_started_notice(self, key, initial_buffer_turns);
+        let notice = self.session_started_notice(key, initial_buffer_turns);
         // Retain the same instant the notice carries, so every heartbeat restates it
         // and a lost notice costs nothing. A peer adopting the directive off the mesh
         // retains its own, later, adoption instant; the coordinator keeps the first

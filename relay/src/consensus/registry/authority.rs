@@ -181,7 +181,7 @@ impl DecisionMakers {
         };
         for leave in &fresh {
             self.record_leave_event(key, leave);
-            self.emit_notice(RelayNotice::Departure(departure_notice(self, key, leave)));
+            self.emit_notice(RelayNotice::Departure(self.departure_notice(key, leave)));
         }
         // A seeded departure fires no departure notice (the coordinator that
         // seeded it already knows), but must still reach local survivors and mesh
@@ -240,7 +240,7 @@ impl DecisionMakers {
         );
         for leave in &fresh {
             self.record_leave_event(key, leave);
-            self.emit_notice(RelayNotice::Departure(departure_notice(self, key, leave)));
+            self.emit_notice(RelayNotice::Departure(self.departure_notice(key, leave)));
         }
         leaves
     }
@@ -445,7 +445,7 @@ impl DecisionMakers {
                     no_majority: divergence.no_majority,
                 },
             );
-            self.emit_notice(RelayNotice::Desync(desync_notice(self, key, &divergence)));
+            self.emit_notice(RelayNotice::Desync(self.desync_notice(key, &divergence)));
         }
     }
 }

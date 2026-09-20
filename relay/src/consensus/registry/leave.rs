@@ -109,7 +109,7 @@ impl DecisionMakers {
             }
             leave
         };
-        self.emit_notice(RelayNotice::Departure(departure_notice(self, key, &leave)));
+        self.emit_notice(RelayNotice::Departure(self.departure_notice(key, &leave)));
         true
     }
 
@@ -239,9 +239,9 @@ impl DecisionMakers {
         // `decide_leave` returns `Some` only on the authority's first decision for
         // the slot (it dedups internally), so this is the one departure notice the
         // authoring relay sends for it.
-        self.emit_notice(RelayNotice::Departure(departure_notice(
-            self, key, &directive,
-        )));
+        self.emit_notice(RelayNotice::Departure(
+            self.departure_notice(key, &directive),
+        ));
         Some(directive)
     }
 

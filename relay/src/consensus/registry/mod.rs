@@ -256,6 +256,191 @@ impl DecisionMakers {
         self.region_release_delay
     }
 
+    /// Builds the departure notice for a synced leave that just first entered this
+    /// relay's cache: classifies left-vs-dropped from the native `reason`, and
+    /// carries the raw reason and the deciding relay's `leave_seq` for the
+    /// coordinator's telemetry. The slot comes straight off the directive (the
+    /// relay-authoritative departing slot).
+    ///
+    /// Also stamps the session's correlation ids, if this relay's descriptor ever
+    /// carried them ([`set_session_refs`](Self::set_session_refs)) — `None` for a
+    /// standalone relay, a coordinator that predates the fields, or a session this
+    /// relay never received a descriptor for. Stamping them here (rather than
+    /// leaving the coordinator to look them up) is what makes the notice
+    /// self-describing: the descriptor a relay already applied survives a
+    /// coordinator restart even though the coordinator's own in-memory copy does
+    /// not.
+    pub(in crate::consensus) fn departure_notice(
+        &self,
+        key: &SessionKey,
+        leave: &LeaveDirective,
+    ) -> DepartureNotice {
+        let slot = SlotId(leave.slot as u8);
+        let (external_id, external_ref) = self.session_refs(key).stamps(slot);
+        DepartureNotice {
+            finalized: leave.finalized,
+            tenant: key.tenant.clone(),
+            session: key.session,
+            slot,
+            kind: if leave.reason == LEAVE_REASON_DROPPED {
+                DepartureKind::Dropped
+            } else {
+                DepartureKind::Left
+            },
+            reason: leave.reason,
+            leave_seq: leave.leave_seq,
+            external_id,
+            external_ref,
+            // The result this slot reported before departing, folded into its
+            // departure record (home-seeded, carried across the mesh). Embedding it
+            // makes the departure webhook atomic terminal truth; `None` proves the
+            // slot departed without ever reporting.
+            result: self.departure_result(key, slot),
+            // The count clients schedule the leave's application by — carried so
+            // the coordinator can seed it back through a rehome's `DepartedSlot`.
+            final_turn_count: leave.final_turn_count,
+        }
+    }
+
+    /// Builds the desync notice for a divergence the comparator just confirmed:
+    /// carries the sync ordinal + confirming frame, the majority/minority verdict,
+    /// and a wall-clock detection timestamp (unix epoch ms). Stamps the session's
+    /// `external_id` and each diverged slot's `external_ref` the same way (and from
+    /// the same store) as [`departure_notice`](Self::departure_notice), so the notice is self-describing
+    /// across a coordinator restart. The timestamp is read here rather than in the
+    /// pure comparator, which holds no clock.
+    pub(in crate::consensus) fn desync_notice(
+        &self,
+        key: &SessionKey,
+        divergence: &SyncDivergence,
+    ) -> DesyncNotice {
+        let refs = self.session_refs(key);
+        let detected_at_ms = unix_millis();
+        DesyncNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            sync_ordinal: divergence.sync_ordinal,
+            game_frame: divergence.game_frame,
+            detected_at_ms,
+            no_majority: divergence.no_majority,
+            diverged: divergence
+                .diverged
+                .iter()
+                .map(|slot| {
+                    let (_, external_ref) = refs.stamps(*slot);
+                    DivergedSlot {
+                        slot: *slot,
+                        external_ref,
+                    }
+                })
+                .collect(),
+            external_id: refs.external_id.clone(),
+        }
+    }
+
+    /// Builds the standalone result notice from the retained result `echo` a slot
+    /// reported: the opaque payload byte-for-byte, the wall-clock arrival stamp, and
+    /// the relay's view of where the report landed in the game timeline — all
+    /// captured into the echo by [`record_result`](Self::record_result) when the report arrived, and the
+    /// same echo that will later ride the slot's departure. Stamps the session's
+    /// `external_id` and the slot's `external_ref` the same way (and from the same
+    /// store) as [`departure_notice`](Self::departure_notice), so the notice is self-describing across a
+    /// coordinator restart.
+    pub(in crate::consensus) fn result_notice(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        echo: ResultEcho,
+    ) -> ResultNotice {
+        let (external_id, external_ref) = self.session_refs(key).stamps(slot);
+        ResultNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            slot,
+            external_id,
+            external_ref,
+            payload: echo.payload,
+            arrival_ms: echo.arrival_ms,
+            session_frame: echo.session_frame,
+            slot_frame: echo.slot_frame,
+        }
+    }
+
+    /// Builds the slot-connected notice for a slot link that just activated: the
+    /// slot, whether the dial presented resume cursors, and a wall-clock stamp read
+    /// here. Stamps the session's `external_id` and the slot's `external_ref` the
+    /// same way (and from the same store) as [`departure_notice`](Self::departure_notice), so the notice is
+    /// self-describing across a coordinator restart.
+    pub(in crate::consensus) fn slot_connected_notice(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        resumed: bool,
+    ) -> SlotConnectedNotice {
+        let (external_id, external_ref) = self.session_refs(key).stamps(slot);
+        SlotConnectedNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            slot,
+            external_id,
+            external_ref,
+            resumed,
+            connected_at_ms: unix_millis(),
+        }
+    }
+
+    /// Builds the session-started notice for the coverage latch that just fired,
+    /// carrying the depth the authority sized onto the directive and a wall-clock
+    /// stamp read here. Stamps the session's `external_id` the same way (and from the
+    /// same store) as [`departure_notice`](Self::departure_notice).
+    pub(in crate::consensus) fn session_started_notice(
+        &self,
+        key: &SessionKey,
+        initial_buffer_turns: Option<u32>,
+    ) -> SessionStartedNotice {
+        SessionStartedNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            external_id: self.session_refs(key).external_id,
+            started_at_ms: unix_millis(),
+            initial_buffer_turns,
+        }
+    }
+
+    /// Builds the slot-started notice for a client's game-loop report: the reporting
+    /// slot, a wall-clock arrival stamp, and the relay's view of where the report
+    /// landed in the game timeline (both frames normally absent — a game announcing
+    /// its loop has begun has usually not produced a framed turn). Stamps the
+    /// session's `external_id` and the slot's `external_ref` the same way (and from
+    /// the same store) as [`departure_notice`](Self::departure_notice).
+    pub(in crate::consensus) fn slot_started_notice(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+    ) -> SlotStartedNotice {
+        let (external_id, external_ref) = self.session_refs(key).stamps(slot);
+        let (session_frame, slot_frame) = {
+            let makers = self.lock();
+            match makers.get(key) {
+                Some(maker) => (
+                    maker.session_frame().map(|f| f.0),
+                    maker.slot_frame(slot).map(|f| f.0),
+                ),
+                None => (None, None),
+            }
+        };
+        SlotStartedNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            slot,
+            external_id,
+            external_ref,
+            arrival_ms: unix_millis(),
+            session_frame,
+            slot_frame,
+        }
+    }
+
     /// The end-of-game result embedded in `slot`'s departure record for `key`, if
     /// the relay has a maker holding a departure that carried one. Read while
     /// building a [`DepartureNotice`] so the notice embeds the same result every
@@ -290,191 +475,6 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
         refs: parking_lot::Mutex::new(HashMap::new()),
         flight: crate::observability::flight_recorder::FlightRecorder::default(),
         region_release_delay,
-    }
-}
-
-/// Builds the departure notice for a synced leave that just first entered this
-/// relay's cache: classifies left-vs-dropped from the native `reason`, and
-/// carries the raw reason and the deciding relay's `leave_seq` for the
-/// coordinator's telemetry. The slot comes straight off the directive (the
-/// relay-authoritative departing slot).
-///
-/// Also stamps the session's correlation ids, if this relay's descriptor ever
-/// carried them ([`DecisionMakers::set_session_refs`]) — `None` for a
-/// standalone relay, a coordinator that predates the fields, or a session this
-/// relay never received a descriptor for. Stamping them here (rather than
-/// leaving the coordinator to look them up) is what makes the notice
-/// self-describing: the descriptor a relay already applied survives a
-/// coordinator restart even though the coordinator's own in-memory copy does
-/// not.
-pub(in crate::consensus) fn departure_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    leave: &LeaveDirective,
-) -> DepartureNotice {
-    let slot = SlotId(leave.slot as u8);
-    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
-    DepartureNotice {
-        finalized: leave.finalized,
-        tenant: key.tenant.clone(),
-        session: key.session,
-        slot,
-        kind: if leave.reason == LEAVE_REASON_DROPPED {
-            DepartureKind::Dropped
-        } else {
-            DepartureKind::Left
-        },
-        reason: leave.reason,
-        leave_seq: leave.leave_seq,
-        external_id,
-        external_ref,
-        // The result this slot reported before departing, folded into its
-        // departure record (home-seeded, carried across the mesh). Embedding it
-        // makes the departure webhook atomic terminal truth; `None` proves the
-        // slot departed without ever reporting.
-        result: registry.departure_result(key, slot),
-        // The count clients schedule the leave's application by — carried so
-        // the coordinator can seed it back through a rehome's `DepartedSlot`.
-        final_turn_count: leave.final_turn_count,
-    }
-}
-
-/// Builds the desync notice for a divergence the comparator just confirmed:
-/// carries the sync ordinal + confirming frame, the majority/minority verdict,
-/// and a wall-clock detection timestamp (unix epoch ms). Stamps the session's
-/// `external_id` and each diverged slot's `external_ref` the same way (and from
-/// the same store) as [`departure_notice`], so the notice is self-describing
-/// across a coordinator restart. The timestamp is read here rather than in the
-/// pure comparator, which holds no clock.
-pub(in crate::consensus) fn desync_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    divergence: &SyncDivergence,
-) -> DesyncNotice {
-    let refs = registry.session_refs(key);
-    let detected_at_ms = unix_millis();
-    DesyncNotice {
-        tenant: key.tenant.clone(),
-        session: key.session,
-        sync_ordinal: divergence.sync_ordinal,
-        game_frame: divergence.game_frame,
-        detected_at_ms,
-        no_majority: divergence.no_majority,
-        diverged: divergence
-            .diverged
-            .iter()
-            .map(|slot| {
-                let (_, external_ref) = refs.stamps(*slot);
-                DivergedSlot {
-                    slot: *slot,
-                    external_ref,
-                }
-            })
-            .collect(),
-        external_id: refs.external_id.clone(),
-    }
-}
-
-/// Builds the standalone result notice from the retained result `echo` a slot
-/// reported: the opaque payload byte-for-byte, the wall-clock arrival stamp, and
-/// the relay's view of where the report landed in the game timeline — all
-/// captured into the echo by [`record_result`] when the report arrived, and the
-/// same echo that will later ride the slot's departure. Stamps the session's
-/// `external_id` and the slot's `external_ref` the same way (and from the same
-/// store) as [`departure_notice`], so the notice is self-describing across a
-/// coordinator restart.
-pub(in crate::consensus) fn result_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-    echo: ResultEcho,
-) -> ResultNotice {
-    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
-    ResultNotice {
-        tenant: key.tenant.clone(),
-        session: key.session,
-        slot,
-        external_id,
-        external_ref,
-        payload: echo.payload,
-        arrival_ms: echo.arrival_ms,
-        session_frame: echo.session_frame,
-        slot_frame: echo.slot_frame,
-    }
-}
-
-/// Builds the slot-connected notice for a slot link that just activated: the
-/// slot, whether the dial presented resume cursors, and a wall-clock stamp read
-/// here. Stamps the session's `external_id` and the slot's `external_ref` the
-/// same way (and from the same store) as [`departure_notice`], so the notice is
-/// self-describing across a coordinator restart.
-pub(in crate::consensus) fn slot_connected_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-    resumed: bool,
-) -> SlotConnectedNotice {
-    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
-    SlotConnectedNotice {
-        tenant: key.tenant.clone(),
-        session: key.session,
-        slot,
-        external_id,
-        external_ref,
-        resumed,
-        connected_at_ms: unix_millis(),
-    }
-}
-
-/// Builds the session-started notice for the coverage latch that just fired,
-/// carrying the depth the authority sized onto the directive and a wall-clock
-/// stamp read here. Stamps the session's `external_id` the same way (and from the
-/// same store) as [`departure_notice`].
-pub(in crate::consensus) fn session_started_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    initial_buffer_turns: Option<u32>,
-) -> SessionStartedNotice {
-    SessionStartedNotice {
-        tenant: key.tenant.clone(),
-        session: key.session,
-        external_id: registry.session_refs(key).external_id,
-        started_at_ms: unix_millis(),
-        initial_buffer_turns,
-    }
-}
-
-/// Builds the slot-started notice for a client's game-loop report: the reporting
-/// slot, a wall-clock arrival stamp, and the relay's view of where the report
-/// landed in the game timeline (both frames normally absent — a game announcing
-/// its loop has begun has usually not produced a framed turn). Stamps the
-/// session's `external_id` and the slot's `external_ref` the same way (and from
-/// the same store) as [`departure_notice`].
-pub(in crate::consensus) fn slot_started_notice(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-) -> SlotStartedNotice {
-    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
-    let (session_frame, slot_frame) = {
-        let makers = registry.lock();
-        match makers.get(key) {
-            Some(maker) => (
-                maker.session_frame().map(|f| f.0),
-                maker.slot_frame(slot).map(|f| f.0),
-            ),
-            None => (None, None),
-        }
-    };
-    SlotStartedNotice {
-        tenant: key.tenant.clone(),
-        session: key.session,
-        slot,
-        external_id,
-        external_ref,
-        arrival_ms: unix_millis(),
-        session_frame,
-        slot_frame,
     }
 }
 
