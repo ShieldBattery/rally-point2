@@ -6,19 +6,19 @@ use super::*;
 /// A dropped departure is never decided on its own: it marks an undecided hold
 /// and no leave ever reaches survivors without an explicit request, no matter
 /// how long passes. This is the no-auto-drop policy at the routing level.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dropped_departure_is_never_decided_on_its_own() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     // Even a zero unlock floor — "past the floor from the first instant" —
     // decides nothing without a request; only an honored `RequestDrop` does.
     let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
 
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,
@@ -27,15 +27,17 @@ async fn a_dropped_departure_is_never_decided_on_its_own() {
     // The drop is held, and nothing has reached the survivor.
     assert!(holds.is_pending(&k, SlotId(1)), "the drop marked a hold");
     assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
+        h.inbox.try_recv_leave().is_none(),
         "a drop is never decided on its own",
     );
 
-    // Well past any window a timer could ever have used, still no leave — the
-    // survivor stays stalled but alive, waiting on a human's decision.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // An hour on — past every window a timer could conceivably have used —
+    // still no leave: the survivor stays stalled but alive, waiting on a
+    // human's decision. Paused time makes the wait free, so the claim is made
+    // at a scale no real-clock sleep could reach.
+    tokio::time::advance(Duration::from_secs(3600)).await;
     assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
+        h.inbox.try_recv_leave().is_none(),
         "no auto-drop ever fires",
     );
     assert!(
@@ -49,22 +51,22 @@ async fn a_dropped_departure_is_never_decided_on_its_own() {
 #[tokio::test]
 async fn a_clean_departure_decides_immediately() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_LEFT,
     );
 
-    let leave = inbox
-        .leave_push_rx
-        .try_recv()
+    let leave = h
+        .inbox
+        .try_recv_leave()
         .expect("a clean leave fires without any hold");
     assert_eq!(leave.slot, 1);
     assert_eq!(leave.reason, LEAVE_REASON_LEFT);
@@ -77,29 +79,29 @@ async fn a_clean_departure_decides_immediately() {
 #[tokio::test]
 async fn a_clean_intent_during_a_drop_hold_releases_it_and_proceeds() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
     // A drop marks the hold.
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,
     );
     assert!(holds.is_pending(&k, SlotId(1)));
-    assert!(inbox.leave_push_rx.try_recv().is_err(), "still held");
+    assert!(h.inbox.try_recv_leave().is_none(), "still held");
 
     // The clean intent arrives: it releases the hold and decides at once with
     // the "left" reason.
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_LEFT,
@@ -108,9 +110,9 @@ async fn a_clean_intent_during_a_drop_hold_releases_it_and_proceeds() {
         !holds.is_pending(&k, SlotId(1)),
         "the clean intent released the hold"
     );
-    let leave = inbox
-        .leave_push_rx
-        .try_recv()
+    let leave = h
+        .inbox
+        .try_recv_leave()
         .expect("the clean leave decided immediately");
     assert_eq!(leave.reason, LEAVE_REASON_LEFT, "the left outcome wins");
 }
@@ -120,13 +122,13 @@ async fn a_clean_intent_during_a_drop_hold_releases_it_and_proceeds() {
 #[tokio::test]
 async fn a_request_before_the_unlock_is_refused() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,
@@ -134,15 +136,9 @@ async fn a_request_before_the_unlock_is_refused() {
 
     // A request while the hold is fresh (well before the unreachable floor) is
     // refused: no leave, and the hold is untouched.
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        honor_drop_request(&sessions, &test_state, &k, SlotId(1), 0);
-    };
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 0);
     assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
+        h.inbox.try_recv_leave().is_none(),
         "a pre-unlock request decides no leave",
     );
     assert!(
@@ -152,32 +148,27 @@ async fn a_request_before_the_unlock_is_refused() {
 }
 
 /// A `RequestDrop` past the unlock floor decides the leave exactly once with the
-/// DROPPED reason, and a duplicate request after the decide is a harmless no-op.
+/// DROPPED reason, and further requests — however many, through whichever
+/// entry point — find the hold already gone.
 #[tokio::test]
 async fn a_request_past_the_unlock_decides_once_then_dedups() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,
     );
 
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        honor_drop_request(&sessions, &test_state, &k, SlotId(1), 0);
-    };
-    let leave = inbox
-        .leave_push_rx
-        .try_recv()
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 0);
+    let leave = h
+        .inbox
+        .try_recv_leave()
         .expect("the request past the unlock decides the leave");
     assert_eq!(leave.slot, 1);
     assert_eq!(
@@ -189,133 +180,68 @@ async fn a_request_past_the_unlock_decides_once_then_dedups() {
         "honoring the request released the hold",
     );
 
-    // A duplicate request after the decide does nothing — the hold is gone and
+    // A duplicate honor after the decide does nothing — the hold is gone and
     // the decision dedups.
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        honor_drop_request(&sessions, &test_state, &k, SlotId(1), 0);
-    };
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 0);
     assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
+        h.inbox.try_recv_leave().is_none(),
         "a duplicate request after the decide is a no-op",
+    );
+
+    // And so does a whole double-click storm arriving the way a client's
+    // really does, through the edge-validating entry point: whether each one
+    // is rate-admitted or not, every one of them finds the hold already
+    // claimed, so the slot is removed at most once.
+    for _ in 0..8 {
+        handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 1);
+    }
+    assert!(
+        h.inbox.try_recv_leave().is_none(),
+        "a burst decides the leave at most once",
     );
 }
 
-/// A `RequestDrop` targeting a slot that already left cleanly (decided, no hold)
-/// is a no-op, and one targeting the requester itself is rejected at the edge.
+/// The client-edge validation refuses a `RequestDrop` this relay has no reason
+/// to honor, without a decide — the cheap sanity check before spending a mesh
+/// broadcast. Three ways a request can be nonsense, all of them a no-op.
 #[tokio::test]
-async fn a_request_for_a_decided_or_self_slot_is_a_no_op() {
+async fn a_request_for_a_decided_self_or_connected_slot_is_a_no_op() {
     let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
+
+    // A request naming a slot that is fully connected — no departure, no hold
+    // — is nonsense and is dropped at the edge.
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 1);
+    assert!(
+        h.inbox.try_recv_leave().is_none(),
+        "a request for a connected slot decides nothing",
+    );
+
+    // A request naming the requester itself is rejected before any hold check
+    // or fan-out — the survivor (slot 0) here is not disconnected.
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 0);
+    assert!(
+        h.inbox.try_recv_leave().is_none(),
+        "a self-targeting request is rejected, deciding nothing",
+    );
 
     // Slot 1 leaves cleanly: decided immediately, no hold left behind.
     hold_or_decide_leave(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &k,
         SlotId(1),
         LEAVE_REASON_LEFT,
     );
-    let _ = inbox
-        .leave_push_rx
-        .try_recv()
-        .expect("the clean leave decided");
+    let _ = h.inbox.try_recv_leave().expect("the clean leave decided");
 
     // A drop request for that already-decided slot finds no hold: no-op.
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        honor_drop_request(&sessions, &test_state, &k, SlotId(1), 0);
-    };
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 0);
     assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
+        h.inbox.try_recv_leave().is_none(),
         "a request for an already-decided slot decides nothing further",
-    );
-
-    // A request naming the requester itself is rejected at the edge before any
-    // hold check or fan-out — the survivor (slot 0) here is not disconnected.
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        handle_drop_request(&sessions, &test_state, &k, SlotId(0), 0);
-    };
-    assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
-        "a self-targeting request is rejected, deciding nothing",
-    );
-}
-
-/// The client-edge validation rejects a request for a slot this relay has no
-/// reason to believe is disconnected (neither held nor departed), without a
-/// decide — the cheap sanity check before spending a mesh broadcast.
-#[tokio::test]
-async fn a_request_for_a_connected_slot_is_rejected_at_the_edge() {
-    let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
-    let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
-
-    // Slot 1 is fully connected (no departure, no hold). A request to drop it is
-    // nonsense and is dropped at the edge.
-    {
-        let mut test_state = crate::mesh::new_mesh_state();
-        test_state.drop_holds = holds.clone();
-        test_state.decision_makers = makers.clone();
-        test_state.links = mesh_links.clone();
-        handle_drop_request(&sessions, &test_state, &k, SlotId(0), 1);
-    };
-    assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
-        "a request for a connected slot decides nothing",
-    );
-}
-
-/// The per-requester rate cap bounds how many requests one requester can spend a
-/// mesh broadcast on, and — crucially — an over-limit burst never multi-decides:
-/// the decision dedups regardless, so a double-click storm removes the slot at
-/// most once.
-#[tokio::test]
-async fn a_burst_of_requests_decides_at_most_once() {
-    let k = key();
-    let (sessions, mesh_links, makers, mut inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
-    let holds = DropHolds::new(IMMEDIATE_UNLOCK, UNREACHABLE_UNLOCK);
-    hold_or_decide_leave(
-        &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
-        &k,
-        SlotId(1),
-        LEAVE_REASON_DROPPED,
-    );
-
-    // A burst of requests from the same survivor: the first decides, and every
-    // later one — whether rate-admitted or not — finds the hold already gone.
-    for _ in 0..8 {
-        {
-            let mut test_state = crate::mesh::new_mesh_state();
-            test_state.drop_holds = holds.clone();
-            test_state.decision_makers = makers.clone();
-            test_state.links = mesh_links.clone();
-            handle_drop_request(&sessions, &test_state, &k, SlotId(0), 1);
-        };
-    }
-    let leave = inbox
-        .leave_push_rx
-        .try_recv()
-        .expect("the burst decided the leave once");
-    assert_eq!(leave.slot, 1);
-    assert!(
-        inbox.leave_push_rx.try_recv().is_err(),
-        "the burst decided the leave at most once",
     );
 }

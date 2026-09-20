@@ -200,6 +200,69 @@ pub fn validate_turn(slot: SlotId, mut payload: Payload) -> Result<ValidatedTurn
     })
 }
 
+/// Asserts the four invariants [`validate_turn`] owes the rest of the relay
+/// for one input, whatever those bytes are: the validated payload is bound to
+/// `slot` and carries `seq`/`game_frame_count` verbatim with no
+/// client-supplied envelope directive (**binding**); the sanitized command
+/// stream never grows, and stripping is the only rewrite (**no
+/// amplification**); that stream itself re-validates with nothing further
+/// stripped, byte for byte, so a peer re-parsing forwarded bytes can never
+/// disagree with the ingress validator (**fixpoint**); and a rejection names
+/// a byte offset inside the input, so abuse diagnostics always point at real
+/// bytes (**attribution**).
+///
+/// Always compiled and public because two harnesses assert this set: the
+/// randomized property tests that run on stable in every CI `cargo test`, and
+/// the coverage-guided fuzz target in `relay/fuzz/` — a separate, nightly-only
+/// workspace that can only reach this crate's public API. One shared copy,
+/// rather than two that can silently drift apart.
+pub fn assert_validate_turn_invariants(
+    slot: SlotId,
+    seq: u64,
+    game_frame_count: Option<u32>,
+    commands: &[u8],
+) {
+    let submitted = Payload {
+        seq,
+        // Deliberately untrusted: a successful validation must replace it
+        // with the authorized slot.
+        slot: u32::MAX,
+        commands: commands.to_vec().into(),
+        game_frame_count,
+        sync_generation: None,
+        buffer_directive: None,
+    };
+    match validate_turn(slot, submitted) {
+        Ok(validated) => {
+            assert_eq!(validated.payload.slot, u32::from(slot.0));
+            assert_eq!(validated.payload.seq, seq);
+            assert_eq!(validated.payload.game_frame_count, game_frame_count);
+            assert_eq!(validated.payload.buffer_directive, None);
+            assert!(validated.payload.commands.len() <= commands.len());
+            if validated.stripped_control == 0 {
+                assert_eq!(&validated.payload.commands[..], commands);
+            }
+
+            let again = validate_turn(slot, validated.payload.clone())
+                .expect("sanitized output must re-validate");
+            assert_eq!(again.stripped_control, 0, "sanitizing must be complete");
+            assert_eq!(
+                again.payload.commands, validated.payload.commands,
+                "sanitized output must be a fixpoint",
+            );
+        }
+        Err(
+            ValidationError::UnknownOpcode { offset, .. }
+            | ValidationError::Truncated { offset, .. },
+        ) => {
+            assert!(
+                offset < commands.len(),
+                "a rejection must point inside the turn",
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,15 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn forwards_a_fixed_length_command_verbatim() {
-        // Build (0x0C) is 8 bytes including the opcode.
-        let build = [0x0C, 1, 2, 3, 4, 5, 6, 7];
-        let turn = validated(&build);
-        assert_eq!(&turn.payload.commands[..], &build);
-        assert_eq!(turn.stripped_control, 0);
-    }
-
-    #[test]
     fn reuses_the_command_buffer_when_nothing_is_stripped() {
         let build = [0x0C, 1, 2, 3, 4, 5, 6, 7];
         let mut input = payload(9, Some(41), &build);
@@ -331,8 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn forwards_a_run_of_commands_in_order() {
-        // KeepAlive (1) + Vision (3) + Build (8) back to back.
+    fn forwards_a_run_of_fixed_length_commands_in_order() {
+        // KeepAlive (1) + Vision (3) + Build (8) back to back: the offset
+        // advances by each command's table length, and every one of them —
+        // including the 8-byte Build on its own — comes out byte for byte.
         let mut stream = Vec::new();
         stream.extend_from_slice(&[0x05]);
         stream.extend_from_slice(&[0x0D, 0, 1]);
@@ -372,12 +428,17 @@ mod tests {
 
     #[test]
     fn strips_control_but_keeps_surrounding_gameplay() {
-        // KeepAlive, then a client-injected latency change, then a Build. Only the
-        // latency command is removed; the rest forwards untouched.
+        // KeepAlive, a client-injected latency change, a Build, a turn-rate
+        // change, and the replay leave marker. Only the three control commands
+        // are removed — the lazy rebuild copies the already-validated prefix
+        // and appends every later allowed command — and the stripped count
+        // accumulates across all of them.
         let mut stream = Vec::new();
         stream.extend_from_slice(&[0x05]);
         stream.extend_from_slice(&[0x55, 0x02]);
         stream.extend_from_slice(&[0x0C, 1, 2, 3, 4, 5, 6, 7]);
+        stream.extend_from_slice(&[0x5f, 0x00]);
+        stream.extend_from_slice(&[0x57, 0x00]);
 
         let turn = validated(&stream);
 
@@ -385,14 +446,6 @@ mod tests {
         expected.extend_from_slice(&[0x05]);
         expected.extend_from_slice(&[0x0C, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(&turn.payload.commands[..], &expected[..]);
-        assert_eq!(turn.stripped_control, 1);
-    }
-
-    #[test]
-    fn a_turn_that_is_all_control_strips_to_empty() {
-        let stream = [0x55, 0x02, 0x66, 0, 0, 0, 0x57, 0x00];
-        let turn = validated(&stream);
-        assert!(turn.payload.commands.is_empty());
         assert_eq!(turn.stripped_control, 3);
     }
 
@@ -482,40 +535,12 @@ mod tests {
         assert_eq!(&turn.payload.commands[..], &[0x09, 0]);
     }
 
-    /// The invariants the validator owes the rest of the relay on *any* input,
-    /// asserted for one turn. Shared by the randomized tests below; the
-    /// coverage-guided fuzz target (`relay/fuzz/fuzz_targets/validate_turn.rs`)
-    /// asserts the same set.
+    /// The validator's cross-cutting invariants for one turn, at the fixed
+    /// binding coordinates the randomized tests below drive: the assertions
+    /// themselves live in `super::assert_validate_turn_invariants`, which the
+    /// fuzz harness in `relay/fuzz/` calls too.
     fn assert_validator_invariants(commands: &[u8]) {
-        match validate_bytes(SLOT, 7, Some(41), commands) {
-            Ok(validated) => {
-                // Binding: everything but the command bytes comes from the
-                // caller, never from the attacker-controlled input.
-                assert_eq!(validated.payload.slot, u32::from(SLOT.0));
-                assert_eq!(validated.payload.seq, 7);
-                assert_eq!(validated.payload.game_frame_count, Some(41));
-                assert_eq!(validated.payload.buffer_directive, None);
-                // No amplification, and stripping is the only rewrite.
-                assert!(validated.payload.commands.len() <= commands.len());
-                if validated.stripped_control == 0 {
-                    assert_eq!(&validated.payload.commands[..], commands);
-                }
-                // Fixpoint: what the relay forwards must itself validate
-                // clean, byte-for-byte — a peer re-parsing forwarded bytes
-                // must never disagree with the ingress validator.
-                let again = validate_bytes(SLOT, 7, Some(41), &validated.payload.commands)
-                    .expect("sanitized output must re-validate");
-                assert_eq!(again.stripped_control, 0, "sanitizing must be complete");
-                assert_eq!(again.payload.commands, validated.payload.commands);
-            }
-            Err(
-                ValidationError::UnknownOpcode { offset, .. }
-                | ValidationError::Truncated { offset, .. },
-            ) => {
-                // Attribution: a rejection names real bytes of the turn.
-                assert!(offset < commands.len());
-            }
-        }
+        assert_validate_turn_invariants(SLOT, 7, Some(41), commands);
     }
 
     /// A tiny deterministic xorshift so the randomized tests need no dev

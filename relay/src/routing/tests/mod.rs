@@ -5,8 +5,6 @@
 
 use super::*;
 
-use std::sync::atomic::Ordering;
-
 use rally_point_transport::Received;
 
 use crate::consensus;
@@ -27,11 +25,20 @@ mod reconnect_races;
 mod roster;
 mod session_close;
 
+pub(super) use crate::test_support::{seed_maker, session_key};
+
 pub(super) fn key() -> SessionKey {
-    SessionKey {
-        tenant: TenantId("sb-staging".to_owned()),
-        session: SessionId(1),
-    }
+    session_key(1)
+}
+
+/// Registers `slot` for `key` and hands back its inbox with the registration
+/// guard disarmed — the shape of every test that just wants a slot on the
+/// roster, the guard's own free-on-drop behavior having its own tests in
+/// `roster.rs`.
+pub(super) fn registered(sessions: &Sessions, key: &SessionKey, slot: SlotId) -> SlotInbox {
+    let (mut guard, inbox) = register(sessions, key, slot, 1).expect("the slot registers");
+    guard.disarm();
+    inbox
 }
 
 pub(super) fn payload() -> Payload {
@@ -65,24 +72,47 @@ pub(super) const UNREACHABLE_UNLOCK: Duration = Duration::from_secs(3600);
 /// A zero unlock floor, so a held drop is "past the floor" from the first
 /// instant and a `RequestDrop` is honored without any wait.
 pub(super) const IMMEDIATE_UNLOCK: Duration = Duration::ZERO;
+/// A stood-up single-relay session for the departure and drop-request tests:
+/// the shared registries the drop paths read, plus the survivor slot's inbox,
+/// where a decided leave lands.
+pub(super) struct DropHarness {
+    pub(super) sessions: Sessions,
+    pub(super) mesh_links: crate::mesh::MeshLinks,
+    pub(super) makers: Arc<crate::consensus::DecisionMakers>,
+    pub(super) seen: crate::mesh::SeenRegistries,
+    pub(super) inbox: SlotInbox,
+}
+
+impl DropHarness {
+    /// The `MeshState` the drop paths take, carrying this harness's registries
+    /// plus the caller's holds and leaving every registry the test doesn't
+    /// drive at its empty default. Every field is a shared handle, so the
+    /// test's own bindings and the bundle observe the same state.
+    pub(super) fn mesh(&self, holds: &DropHolds) -> crate::mesh::MeshState {
+        crate::mesh::MeshState {
+            drop_holds: holds.clone(),
+            decision_makers: Arc::clone(&self.makers),
+            links: self.mesh_links.clone(),
+            seen: self.seen.clone(),
+            ..crate::mesh::new_mesh_state()
+        }
+    }
+}
+
 /// Stands up a single-relay authority maker for `key` with a frame basis, plus
 /// a survivor slot registered so a decided leave has somewhere to fan out. The
 /// departing slot is given an observed frame too, so `decide_leave` schedules
-/// against it. Returns the shared registries and the survivor's inbox.
-/// Like [`drop_hold_harness`], but the session runs the finalized-drop
-/// handshake and this relay strictly homes `homed`.
-pub(super) fn finalized_drop_harness(
+/// against it.
+///
+/// `finalized_homes` is `None` for an ordinary session and `Some(slots)` for
+/// one running the home-side finalization handshake, where this relay strictly
+/// homes exactly `slots` — the only axis the two shapes differ on.
+pub(super) fn drop_hold_harness(
     key: &SessionKey,
     survivor: SlotId,
     departing: SlotId,
-    homed: &[u8],
-) -> (
-    Sessions,
-    crate::mesh::MeshLinks,
-    Arc<crate::consensus::DecisionMakers>,
-    crate::mesh::SeenRegistries,
-    SlotInbox,
-) {
+    finalized_homes: Option<&[u8]>,
+) -> DropHarness {
     use crate::consensus::{self, Authority};
     use rally_point_proto::control::BufferBounds;
 
@@ -94,47 +124,14 @@ pub(super) fn finalized_drop_harness(
         &makers,
         key,
         consensus::MakerSync {
-            homed_slots: homed.iter().map(|&s| SlotId(s)).collect(),
-            finalized_drops: true,
+            homed_slots: finalized_homes
+                .unwrap_or(&[])
+                .iter()
+                .map(|&s| SlotId(s))
+                .collect(),
+            finalized_drops: finalized_homes.is_some(),
             ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
         },
-    );
-    consensus::observe_frame(
-        &makers,
-        key,
-        survivor,
-        rally_point_proto::ids::GameFrameCount(40),
-    );
-    consensus::observe_frame(
-        &makers,
-        key,
-        departing,
-        rally_point_proto::ids::GameFrameCount(50),
-    );
-    let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
-    guard.disarm();
-    (sessions, mesh_links, makers, seen, inbox)
-}
-pub(super) fn drop_hold_harness(
-    key: &SessionKey,
-    survivor: SlotId,
-    departing: SlotId,
-) -> (
-    Sessions,
-    crate::mesh::MeshLinks,
-    Arc<crate::consensus::DecisionMakers>,
-    SlotInbox,
-) {
-    use crate::consensus::{self, Authority};
-    use rally_point_proto::control::BufferBounds;
-
-    let sessions: Sessions = Arc::default();
-    let mesh_links = crate::mesh::new_mesh_links();
-    let makers = Arc::new(consensus::new_decision_makers());
-    let _ = consensus::sync_maker(
-        &makers,
-        key,
-        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay),
     );
     // Both slots have framed history: the survivor pins a session frame and the
     // departing slot gives the leave its apply-frame basis.
@@ -153,12 +150,20 @@ pub(super) fn drop_hold_harness(
 
     let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
     guard.disarm();
-    (sessions, mesh_links, makers, inbox)
+    DropHarness {
+        sessions,
+        mesh_links,
+        makers,
+        seen,
+        inbox,
+    }
 }
+
 // -- fully-abandoned session teardown --
 
-/// A short abandoned-session window for tests, so the timer path can be driven
-/// with a real (tiny) sleep rather than the production 45 seconds.
+/// A short abandoned-session window for tests, so a timer's own sleep is the
+/// first deadline a paused clock advances to rather than the production 45
+/// seconds' worth of virtual time.
 pub(super) const TINY_ABANDON: Duration = Duration::from_millis(80);
 
 /// Bundles individually-constructed registries into the `MeshState` that
@@ -194,7 +199,6 @@ pub(super) fn abandoned_harness() -> (
 ) {
     use crate::consensus::{self, Authority};
     use crate::session::presence::Candidate;
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let k = key();
@@ -202,14 +206,7 @@ pub(super) fn abandoned_harness() -> (
     let mesh_links = crate::mesh::new_mesh_links();
     let makers = Arc::new(consensus::new_decision_makers());
     let presence = Arc::new(crate::session::presence::new_presence_registry());
-    let _ = consensus::sync_maker(
-        &makers,
-        &k,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_maker(&makers, &k, Authority::SelfRelay, &[0, 1], &[]);
     consensus::mark_session_started(&makers, &k);
     consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
     consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));

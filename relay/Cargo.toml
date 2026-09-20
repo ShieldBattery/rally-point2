@@ -73,6 +73,12 @@ axum = { workspace = true }
 # math, so advancing the clock is the whole point rather than sleeping it out.
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
+# `test-util` is the paused-clock harness (`#[tokio::test(start_paused = true)]`
+# plus `tokio::time::advance`), so a window measured in seconds or minutes is
+# driven by advancing a virtual clock instead of slept through. A dev-dependency
+# only: nothing the relay binary links carries it, and the clock still runs in
+# real time until a test explicitly pauses it.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "hot_paths"

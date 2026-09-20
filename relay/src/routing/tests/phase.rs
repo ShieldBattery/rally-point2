@@ -27,8 +27,8 @@ fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
             )
         },
     );
-    let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0), 1).unwrap();
-    let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).unwrap();
+    let mut inbox0 = registered(&sessions, &k, SlotId(0));
+    let mut inbox1 = registered(&sessions, &k, SlotId(1));
 
     let turn_us: u64 = 41_667;
     let base = Instant::now();

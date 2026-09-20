@@ -66,6 +66,40 @@ fn registry_with(kid: &str, tenant: &str, key: &TestKey) -> Registry {
     registry
 }
 
+/// The preamble every token test shares: the tenant's signing key, the
+/// client's connection-binding key, and a registry binding `KID` to `TENANT`.
+struct Fixture {
+    tenant_key: TestKey,
+    client: TestKey,
+    registry: Registry,
+}
+
+fn fixture() -> Fixture {
+    let tenant_key = test_key();
+    let registry = registry_with(KID, TENANT, &tenant_key);
+    Fixture {
+        tenant_key,
+        client: test_key(),
+        registry,
+    }
+}
+
+impl Fixture {
+    /// A token for `slot`, signed by the fixture's tenant key under `KID`,
+    /// claiming `TENANT` and valid for another minute — the well-formed shape
+    /// each rejection test perturbs exactly one part of.
+    fn mint(&self, slot: SlotId) -> SignedToken {
+        mint(
+            &self.tenant_key,
+            KID,
+            TENANT,
+            slot,
+            NOW + 60,
+            self.client.public,
+        )
+    }
+}
+
 /// One `TenantVerifyingKey` entry, as a coordinator `TenantKeys` push carries it.
 fn pushed(kid: &str, tenant: &str, verifying_key: Vec<u8>) -> TenantVerifyingKey {
     TenantVerifyingKey {
@@ -109,6 +143,12 @@ fn a_pushed_set_skips_invalid_entries_and_applies_the_rest() {
         pushed(
             &"k".repeat(MAX_STRING_LEN + 1),
             TENANT,
+            good.public.to_vec(),
+        ),
+        // Over-long tenant: skipped.
+        pushed(
+            "long-tenant-key",
+            &"t".repeat(MAX_STRING_LEN + 1),
             good.public.to_vec(),
         ),
         // Well-formed: applied.
@@ -166,110 +206,97 @@ fn a_later_push_replaces_the_set_wholesale() {
 
 #[test]
 fn a_fixed_reader_serves_its_seeded_set() {
-    let tenant_key = test_key();
-    let client = test_key();
-    let reader = RegistryReader::fixed(Arc::new(registry_with(KID, TENANT, &tenant_key)));
+    let f = fixture();
+    let reader = RegistryReader::fixed(Arc::new(registry_with(KID, TENANT, &f.tenant_key)));
     assert!(!reader.is_empty());
-    let token = mint(&tenant_key, KID, TENANT, SlotId(1), NOW + 60, client.public);
+    let token = f.mint(SlotId(1));
     assert!(verify_token(&reader.current(), &token, NOW).is_ok());
 }
 
 #[test]
 fn accepts_a_well_formed_token() {
-    let tenant_key = test_key();
-    let client = test_key();
-    let registry = registry_with(KID, TENANT, &tenant_key);
-    let token = mint(&tenant_key, KID, TENANT, SlotId(3), NOW + 60, client.public);
+    let f = fixture();
+    let token = f.mint(SlotId(3));
 
-    let authorized = verify_token(&registry, &token, NOW).unwrap();
+    let authorized = verify_token(&f.registry, &token, NOW).unwrap();
     assert_eq!(authorized.tenant.as_ref(), TENANT);
     assert_eq!(authorized.session, SessionId(7));
     assert_eq!(authorized.slot, SlotId(3));
-    assert_eq!(authorized.client_pubkey.0, client.public);
+    assert_eq!(authorized.client_pubkey.0, f.client.public);
 }
 
 #[test]
 fn rejects_an_unregistered_kid() {
-    let tenant_key = test_key();
-    let client = test_key();
-    let registry = registry_with(KID, TENANT, &tenant_key);
+    let f = fixture();
     let token = mint(
-        &tenant_key,
+        &f.tenant_key,
         "other-key",
         TENANT,
         SlotId(0),
         NOW + 60,
-        client.public,
+        f.client.public,
     );
 
     assert!(matches!(
-        verify_token(&registry, &token, NOW),
+        verify_token(&f.registry, &token, NOW),
         Err(AuthError::UnknownKey)
     ));
 }
 
 #[test]
 fn rejects_a_signature_from_the_wrong_key() {
-    let registered = test_key();
+    let f = fixture();
     let impostor = test_key();
-    let client = test_key();
-    let registry = registry_with(KID, TENANT, &registered);
     // Same kid the registry knows, but signed by a different key.
-    let token = mint(&impostor, KID, TENANT, SlotId(0), NOW + 60, client.public);
+    let token = mint(&impostor, KID, TENANT, SlotId(0), NOW + 60, f.client.public);
 
     assert!(matches!(
-        verify_token(&registry, &token, NOW),
+        verify_token(&f.registry, &token, NOW),
         Err(AuthError::BadSignature)
     ));
 }
 
 #[test]
 fn rejects_a_tampered_claim() {
-    let tenant_key = test_key();
-    let client = test_key();
-    let registry = registry_with(KID, TENANT, &tenant_key);
-    let mut token = mint(&tenant_key, KID, TENANT, SlotId(0), NOW + 60, client.public);
+    let f = fixture();
+    let mut token = f.mint(SlotId(0));
     // Flip the slot after signing; the signature no longer covers it.
     token.claims.slot = SlotId(1);
 
     assert!(matches!(
-        verify_token(&registry, &token, NOW),
+        verify_token(&f.registry, &token, NOW),
         Err(AuthError::BadSignature)
     ));
 }
 
 #[test]
 fn rejects_a_tenant_claim_that_does_not_match_the_key() {
-    let tenant_key = test_key();
-    let client = test_key();
     // The registry binds this key to TENANT; the token, validly signed by the
     // same key, claims to be a different tenant.
-    let registry = registry_with(KID, TENANT, &tenant_key);
+    let f = fixture();
     let token = mint(
-        &tenant_key,
+        &f.tenant_key,
         KID,
         "some-other-tenant",
         SlotId(0),
         NOW + 60,
-        client.public,
+        f.client.public,
     );
 
     assert!(matches!(
-        verify_token(&registry, &token, NOW),
+        verify_token(&f.registry, &token, NOW),
         Err(AuthError::TenantMismatch)
     ));
 }
 
 #[test]
 fn rejects_an_expired_token() {
-    let tenant_key = test_key();
-    let client = test_key();
-    let registry = registry_with(KID, TENANT, &tenant_key);
+    let f = fixture();
     // Expires exactly at NOW — the boundary is treated as expired.
-    let token = mint(&tenant_key, KID, TENANT, SlotId(0), NOW, client.public);
+    let token = mint(&f.tenant_key, KID, TENANT, SlotId(0), NOW, f.client.public);
 
     assert!(matches!(
-        verify_token(&registry, &token, NOW),
+        verify_token(&f.registry, &token, NOW),
         Err(AuthError::Expired)
     ));
 }
@@ -292,59 +319,45 @@ fn verifies_a_genuine_challenge_response() {
 }
 
 #[test]
-fn rejects_a_challenge_signed_by_the_wrong_key() {
+fn rejects_a_challenge_response_perturbed_in_any_of_its_three_parts() {
+    // A proof of possession covers exactly three things, and each one dropped
+    // from the canonical bytes is a different, real fail-open — so each is
+    // perturbed on its own here, against an otherwise genuine response.
     let client = test_key();
     let impostor = test_key();
-    let challenge = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
-    let signature = impostor.sign(&challenge.signed_message(&CHANNEL_BINDING));
-
-    assert!(matches!(
-        verify_challenge(
-            &ClientPublicKey(client.public),
-            &challenge,
-            &CHANNEL_BINDING,
-            &ChallengeResponse(signature),
-        ),
-        Err(AuthError::ChallengeFailed)
-    ));
-}
-
-#[test]
-fn rejects_a_response_to_a_different_challenge() {
-    let client = test_key();
-    let issued = ConnectionChallenge([0x11; CHALLENGE_LEN]);
-    let other = ConnectionChallenge([0x22; CHALLENGE_LEN]);
-    // The client signs a challenge the relay never issued.
-    let signature = client.sign(&other.signed_message(&CHANNEL_BINDING));
-
-    assert!(matches!(
-        verify_challenge(
-            &ClientPublicKey(client.public),
-            &issued,
-            &CHANNEL_BINDING,
-            &ChallengeResponse(signature),
-        ),
-        Err(AuthError::ChallengeFailed)
-    ));
-}
-
-#[test]
-fn rejects_a_response_bound_to_a_different_channel() {
-    // The client signs the right challenge with the right key, but bound to a
-    // different connection's channel — the relay-in-the-middle replay. Verified
-    // against this connection's binding, it must fail.
-    let client = test_key();
-    let challenge = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
+    let issued = ConnectionChallenge([0x5A; CHALLENGE_LEN]);
+    let other_challenge = ConnectionChallenge([0x22; CHALLENGE_LEN]);
     let other_channel = [0xC4; CHANNEL_BINDING_LEN];
-    let signature = client.sign(&challenge.signed_message(&other_channel));
 
-    assert!(matches!(
-        verify_challenge(
-            &ClientPublicKey(client.public),
-            &challenge,
-            &CHANNEL_BINDING,
-            &ChallengeResponse(signature),
+    let cases = [
+        (
+            "signed by a key that is not the token's client key",
+            impostor.sign(&issued.signed_message(&CHANNEL_BINDING)),
         ),
-        Err(AuthError::ChallengeFailed)
-    ));
+        (
+            "a response to a challenge this relay never issued -- the nonce \
+             must be covered, or a captured response replays",
+            client.sign(&other_challenge.signed_message(&CHANNEL_BINDING)),
+        ),
+        (
+            "bound to another connection's channel -- the relay-in-the-middle \
+             replay, which only the binding being covered refuses",
+            client.sign(&issued.signed_message(&other_channel)),
+        ),
+    ];
+
+    for (perturbation, signature) in cases {
+        assert!(
+            matches!(
+                verify_challenge(
+                    &ClientPublicKey(client.public),
+                    &issued,
+                    &CHANNEL_BINDING,
+                    &ChallengeResponse(signature),
+                ),
+                Err(AuthError::ChallengeFailed)
+            ),
+            "accepted a response {perturbation}",
+        );
+    }
 }

@@ -88,6 +88,20 @@ pub(crate) const fn max_turns(slots: usize) -> usize {
     RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * effective_slots(slots) * 3 / 2
 }
 
+// The whole point of deriving the bound from the nominal window: at every
+// session shape the ring can hold that window's worth of turns for every slot,
+// and an unknown shape is sized for the largest game rather than a smaller
+// one. Every input is a compile-time constant, so an edit to the derivation
+// that breaks the invariant fails the build rather than a test.
+const _: () = {
+    let mut slots = 1;
+    while slots <= MAX_GAME_SLOTS {
+        assert!(max_turns(slots) >= RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * slots);
+        slots += 1;
+    }
+    assert!(max_turns(0) == max_turns(MAX_GAME_SLOTS));
+};
+
 /// The byte ceiling on a full 12-slot session's recorded turns, counting each
 /// turn's command bytes (the variable, dominant cost; the fixed envelope fields
 /// are negligible). [`max_bytes`] scales it by the session's slot count exactly
@@ -120,6 +134,16 @@ const fn max_bytes(slots: usize) -> usize {
         scaled
     }
 }
+
+// The byte bound exists for oversize spray, so even at the smallest session
+// shape it must clear a count bound's worth of ordinary few-hundred-byte
+// turns; and, like the count bound, an unknown shape is sized for the largest
+// game.
+const _: () = {
+    const ORDINARY_TURN_BYTES: usize = 300;
+    assert!(max_bytes(1) >= max_turns(1) * ORDINARY_TURN_BYTES);
+    assert!(max_bytes(0) == max_bytes(MAX_GAME_SLOTS));
+};
 
 /// Where a recorded turn reached this relay from — stamped once, at the
 /// moment it wins the session-level dedup and is recorded here, rather than

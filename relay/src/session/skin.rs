@@ -322,16 +322,58 @@ pub fn deliver(registry: &SkinRegistry, key: &SessionKey, skin: PlayerSkin) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
+    use crate::session::fanout_tests::{self as shared, FanOutChannel};
+    use crate::test_support::session_key;
 
-    fn key() -> SessionKey {
-        SessionKey {
-            tenant: TenantId("sb-staging".to_owned()),
-            session: SessionId(1),
+    /// Skins as one of the three fan-out registries, so the guarantees this
+    /// module shares with the chat and lobby channels come from the one shared
+    /// set of test bodies rather than a third copy of them.
+    struct Skin;
+
+    impl FanOutChannel for Skin {
+        type Registry = SkinRegistry;
+        type Message = PlayerSkin;
+
+        const RATE_BURST: u32 = SKIN_RATE_BURST;
+
+        fn new_registry() -> SkinRegistry {
+            new_skin_registry()
+        }
+        fn register_member(
+            registry: &SkinRegistry,
+            key: &SessionKey,
+            slot: SlotId,
+        ) -> mpsc::Receiver<PlayerSkin> {
+            register_member(registry, key, slot)
+        }
+        fn deregister_member(registry: &SkinRegistry, key: &SessionKey, slot: SlotId) {
+            deregister_member(registry, key, slot);
+        }
+        fn end_session(registry: &SkinRegistry, key: &SessionKey) {
+            end_session(registry, key);
+        }
+        fn admit(registry: &SkinRegistry, key: &SessionKey, slot: SlotId, len: usize) -> bool {
+            admit(registry, key, slot, len)
+        }
+        fn deliver(registry: &SkinRegistry, key: &SessionKey, message: PlayerSkin) -> bool {
+            deliver(registry, key, message)
+        }
+        fn message(slot: u32, body: &str) -> PlayerSkin {
+            PlayerSkin {
+                slot,
+                payload: body.as_bytes().to_vec().into(),
+            }
+        }
+        fn parts(message: &PlayerSkin) -> (u32, String) {
+            (
+                message.slot,
+                String::from_utf8(message.payload.to_vec()).expect("test payloads are text"),
+            )
         }
     }
 
+    /// A blob carrying one opaque byte — what the map-shape tests below fill
+    /// the latest-per-slot map with.
     fn skin(slot: u32, byte: u8) -> PlayerSkin {
         PlayerSkin {
             slot,
@@ -352,20 +394,38 @@ mod tests {
 
     #[test]
     fn a_blob_fans_out_to_every_member_but_its_author() {
-        let registry = new_skin_registry();
-        let k = key();
-        let mut host = register_member(&registry, &k, SlotId(0));
-        let mut peer = register_member(&registry, &k, SlotId(1));
+        shared::the_author_is_skipped_and_every_other_member_is_reached::<Skin>();
+    }
 
-        assert!(deliver(&registry, &k, skin(0, 0xA1)));
-        assert_eq!(drain(&mut host), vec![], "the author is not echoed its own");
-        assert_eq!(drain(&mut peer), vec![(0, 0xA1)]);
+    #[test]
+    fn deregister_removes_a_member_and_end_session_drops_the_map() {
+        shared::a_deregistered_member_stops_receiving_and_end_session_clears_the_state::<Skin>();
+    }
+
+    #[test]
+    fn a_blob_stored_before_a_join_is_not_also_delivered_live() {
+        shared::a_retained_message_is_replayed_to_a_joiner_and_not_also_fanned_live::<Skin>();
+    }
+
+    #[test]
+    fn oversize_payload_is_rejected_by_admit() {
+        shared::the_size_cap_admits_exactly_its_boundary::<Skin>(SKIN_BLOB_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_burst_past_the_rate_cap_is_rejected() {
+        shared::a_burst_past_the_rate_cap_is_rejected::<Skin>();
+    }
+
+    #[test]
+    fn the_rate_cap_is_independent_per_slot() {
+        shared::the_rate_cap_is_independent_per_slot::<Skin>();
     }
 
     #[test]
     fn a_late_member_replays_stored_blobs_but_not_its_own() {
         let registry = new_skin_registry();
-        let k = key();
+        let k = session_key(1);
         // Two members are up and each broadcasts a blob before the third joins.
         let _host = register_member(&registry, &k, SlotId(0));
         let _peer = register_member(&registry, &k, SlotId(1));
@@ -390,7 +450,7 @@ mod tests {
     #[test]
     fn a_re_sent_blob_replaces_so_a_late_joiner_gets_only_the_latest() {
         let registry = new_skin_registry();
-        let k = key();
+        let k = session_key(1);
         let _host = register_member(&registry, &k, SlotId(0));
         // Slot 0 broadcasts twice — the second supersedes the first.
         deliver(&registry, &k, skin(0, 0x10));
@@ -402,82 +462,9 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_stored_before_a_join_is_not_also_delivered_live() {
-        // The exactly-once boundary: a blob already in the map when a member
-        // joins is delivered by the replay, and is not re-fanned live (the member
-        // was not yet in the set when it was stored).
-        let registry = new_skin_registry();
-        let k = key();
-        let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, skin(0, 0x55));
-
-        let mut peer = register_member(&registry, &k, SlotId(1));
-        // Exactly one copy — from the replay, not a second live delivery.
-        assert_eq!(drain(&mut peer), vec![(0, 0x55)]);
-    }
-
-    #[test]
-    fn a_mesh_authored_blob_reaches_every_local_member_and_is_stored() {
-        let registry = new_skin_registry();
-        let k = key();
-        let mut a = register_member(&registry, &k, SlotId(0));
-        let mut b = register_member(&registry, &k, SlotId(1));
-
-        // A blob authored by a remote slot (7) arriving off the mesh: no local
-        // member is its author, so both locals receive it.
-        assert!(deliver(&registry, &k, skin(7, 0xEE)));
-        assert_eq!(drain(&mut a), vec![(7, 0xEE)]);
-        assert_eq!(drain(&mut b), vec![(7, 0xEE)]);
-
-        // And it was stored, so a local member joining afterwards replays it.
-        let mut late = register_member(&registry, &k, SlotId(2));
-        assert_eq!(drain(&mut late), vec![(7, 0xEE)]);
-    }
-
-    #[test]
-    fn oversize_payload_is_rejected_by_admit() {
-        let registry = new_skin_registry();
-        let k = key();
-        assert!(admit(&registry, &k, SlotId(0), SKIN_BLOB_MAX_BYTES));
-        assert!(!admit(&registry, &k, SlotId(0), SKIN_BLOB_MAX_BYTES + 1));
-    }
-
-    /// The burst-then-reject half of the cap. Recovery after a refill is the
-    /// token bucket's own test (`crate::rate_limit`), driven off synthetic
-    /// instants rather than a real wait on the production interval.
-    #[test]
-    fn a_burst_past_the_rate_cap_is_rejected() {
-        let registry = new_skin_registry();
-        let k = key();
-        let slot = SlotId(0);
-
-        // The first SKIN_RATE_BURST blobs in a burst are all admitted.
-        for _ in 0..SKIN_RATE_BURST {
-            assert!(admit(&registry, &k, slot, 4));
-        }
-        // The next one, still within the burst window, is rejected.
-        assert!(!admit(&registry, &k, slot, 4));
-    }
-
-    #[test]
-    fn the_rate_cap_is_independent_per_slot() {
-        let registry = new_skin_registry();
-        let k = key();
-        for _ in 0..SKIN_RATE_BURST {
-            assert!(admit(&registry, &k, SlotId(0), 4));
-        }
-        assert!(
-            !admit(&registry, &k, SlotId(0), 4),
-            "slot 0 exhausted its burst"
-        );
-        // A different slot has its own, untouched budget.
-        assert!(admit(&registry, &k, SlotId(1), 4));
-    }
-
-    #[test]
     fn a_new_slot_past_the_map_cap_is_refused_but_a_re_send_still_admits() {
         let registry = new_skin_registry();
-        let k = key();
+        let k = session_key(1);
         // Fill the map to its cap with distinct authoring slots. (A distinct slot
         // per blob so no one slot's rate cap interferes; deliver does not consult
         // the rate limiter, so this only exercises the map's slot cap.)
@@ -500,20 +487,22 @@ mod tests {
     }
 
     #[test]
-    fn deregister_keeps_the_map_but_end_session_drops_it() {
+    fn a_slot_id_out_of_range_is_refused_rather_than_aliased() {
+        // The author is relay-stamped upstream, so this is unreachable in
+        // practice — but it is the one place a slot id wider than a real slot
+        // could silently truncate onto a valid slot's entry, so the refusal is
+        // asserted rather than assumed.
         let registry = new_skin_registry();
-        let k = key();
-        let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, skin(0, 0x01));
-        deregister_member(&registry, &k, SlotId(0));
-
-        // The map survives the member leaving, so a late joiner still catches up.
+        let k = session_key(1);
+        let mut member = register_member(&registry, &k, SlotId(0));
+        assert!(!deliver(&registry, &k, skin(300, 0x01)));
+        assert_eq!(
+            drain(&mut member),
+            vec![],
+            "nothing out of range is ever fanned out",
+        );
+        // And it left no entry behind for a late joiner to replay.
         let mut late = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut late), vec![(0, 0x01)]);
-
-        // end_session drops everything; a fresh join then starts from empty.
-        end_session(&registry, &k);
-        let mut after = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut after), vec![]);
+        assert_eq!(drain(&mut late), vec![]);
     }
 }

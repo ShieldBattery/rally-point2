@@ -319,16 +319,12 @@ async fn read_presence_frames(mut stream: noq::RecvStream, tx: mpsc::Sender<Mesh
 
 #[cfg(test)]
 mod tests {
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
-
     use super::*;
 
+    use crate::test_support::session_key as key_of;
+
     fn key() -> SessionKey {
-        SessionKey {
-            tenant: TenantId("t".to_owned()),
-            session: SessionId(1),
-        }
+        key_of(1)
     }
 
     fn order_self_then_peer(peer: u64) -> Vec<Candidate> {
@@ -506,16 +502,14 @@ mod tests {
         // The peer's players return: no longer abandoned.
         record_peer(&registry, &key(), RelayId(2), 1);
         assert!(!all_empty(&registry, &key(), 0));
-    }
 
-    #[test]
-    fn all_empty_ignores_a_peer_not_in_the_current_order() {
-        let registry = new_presence_registry();
-        // A single-relay session: the order names only this relay.
-        set_order(&registry, &key(), vec![Candidate::SelfRelay]);
-        record_own(&registry, &key(), 1);
-        record_own(&registry, &key(), 0);
-        // The authoritative local roster is empty and there are no peers.
-        assert!(all_empty(&registry, &key(), 0));
+        // A single-relay session has only this relay's own candidate to
+        // satisfy, so an observed live-then-empty local roster is abandonment
+        // on its own -- no peer report is waited on that will never come.
+        let solo = key_of(2);
+        set_order(&registry, &solo, vec![Candidate::SelfRelay]);
+        record_own(&registry, &solo, 1);
+        record_own(&registry, &solo, 0);
+        assert!(all_empty(&registry, &solo, 0));
     }
 }

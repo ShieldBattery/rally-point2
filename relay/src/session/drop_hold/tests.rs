@@ -4,8 +4,11 @@
 //! drop-request rate cap.
 
 use super::*;
-use rally_point_proto::control::TenantId;
-use rally_point_proto::ids::SessionId;
+use crate::test_support::session_key as key_of;
+
+fn key() -> SessionKey {
+    key_of(1)
+}
 
 /// The expired-timer identity check: an old timer whose cancellation landed
 /// after its sleep elapsed must not consume the entry of a fresh timer a
@@ -46,13 +49,6 @@ async fn an_expired_timer_cannot_claim_a_fresh_timers_entry() {
     assert_eq!(holds.claim_expiry(&k, gen_b), None, "a claim is one-shot");
 }
 
-fn key() -> SessionKey {
-    SessionKey {
-        tenant: TenantId("t".to_owned()),
-        session: SessionId(1),
-    }
-}
-
 #[test]
 fn a_hold_is_pending_and_records_its_elapsed() {
     let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
@@ -72,7 +68,7 @@ fn a_hold_is_pending_and_records_its_elapsed() {
 }
 
 #[test]
-fn releasing_a_hold_clears_it() {
+fn releasing_a_hold_clears_it_and_a_second_release_finds_nothing_to_claim() {
     let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
     holds.hold(key(), SlotId(3));
     assert!(
@@ -81,26 +77,16 @@ fn releasing_a_hold_clears_it() {
     );
     assert!(!holds.is_pending(&key(), SlotId(3)));
     assert!(holds.held_for(&key(), SlotId(3)).is_none());
-    // Releasing an absent hold is a no-op, never a panic.
-    assert!(!holds.release(&key(), SlotId(9)));
-}
-
-#[test]
-fn a_second_release_finds_nothing_to_claim() {
-    // The claim semantics that close the split-brain race: once a hold is
-    // released, a second release for the same slot -- a concurrent decide
-    // path that lost the race -- must see `false`, not silently "succeed"
-    // again, so it knows to stand down rather than act a second time.
-    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
-    holds.hold(key(), SlotId(3));
-    assert!(
-        holds.release(&key(), SlotId(3)),
-        "the first release claims it"
-    );
+    // The claim semantics that close the split-brain race: a second release
+    // for the same slot -- a concurrent decide path that lost the race --
+    // must see `false`, not silently "succeed" again, so it knows to stand
+    // down rather than act a second time.
     assert!(
         !holds.release(&key(), SlotId(3)),
         "a second release for the same slot finds nothing left to claim",
     );
+    // Releasing an absent hold is likewise a no-op, never a panic.
+    assert!(!holds.release(&key(), SlotId(9)));
 }
 
 #[test]
@@ -197,14 +183,14 @@ fn concurrent_claims_on_the_same_hold_have_exactly_one_winner() {
 #[test]
 fn a_duplicate_hold_keeps_the_original_instant() {
     let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
-    holds.hold(key(), SlotId(3));
-    std::thread::sleep(Duration::from_millis(30));
-    let after_first = holds.held_for(&key(), SlotId(3)).unwrap();
-    // A second hold for the same slot must not restart the window.
-    holds.hold(key(), SlotId(3));
-    let after_second = holds.held_for(&key(), SlotId(3)).unwrap();
-    assert!(
-        after_second >= after_first,
+    let first_seen = Instant::now();
+    assert_eq!(holds.hold_at(key(), SlotId(3), first_seen), first_seen);
+    // A second drop signal for the same slot, an hour later, must not restart
+    // the window: the unlock floor is measured from when the slot was *first*
+    // observed gone, so a repeating signal could otherwise hold it off forever.
+    assert_eq!(
+        holds.hold_at(key(), SlotId(3), first_seen + Duration::from_secs(3600)),
+        first_seen,
         "a duplicate hold kept the original, older instant rather than resetting it",
     );
 }
@@ -213,11 +199,15 @@ fn a_duplicate_hold_keeps_the_original_instant() {
 fn a_never_requested_hold_never_decides_on_its_own() {
     // The core policy: a hold is a marker, not a timer. Even an unlock of zero —
     // "past the floor from the first instant" — decides nothing by itself; a
-    // hold only clears when something explicitly releases it. There is no task
-    // to observe, so the invariant is simply that the hold stays pending.
+    // hold only clears when something explicitly releases it. Nothing is ever
+    // spawned against a hold, so there is no task whose firing a wait could
+    // catch: re-reading the registry is the whole observation.
     let holds = DropHolds::new(Duration::ZERO, ABANDONED_SESSION_TIMEOUT);
     holds.hold(key(), SlotId(3));
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        holds.held_for(&key(), SlotId(3)).unwrap() >= holds.unlock(),
+        "the hold is past its unlock floor from the very first instant",
+    );
     assert!(
         holds.is_pending(&key(), SlotId(3)),
         "nothing removes a hold without an explicit release — no auto-drop",
@@ -226,52 +216,38 @@ fn a_never_requested_hold_never_decides_on_its_own() {
 
 #[test]
 fn end_session_sweeps_only_decided_holds_keeping_undecided_ones_and_other_sessions() {
-    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
     // Slot 0's drop is undecided (the common case: the last local slot's own
     // hold, freshly marked in the very teardown that empties the roster and
     // triggers this sweep). Slot 1's was already decided elsewhere (an earlier
     // honored request or force-decide) and its hold should have been released
     // then, but this proves the sweep is still correct as a defensive backstop
     // if it somehow wasn't.
-    holds.hold(key(), SlotId(0));
-    holds.hold(key(), SlotId(1));
-    let other = SessionKey {
-        tenant: TenantId("t".to_owned()),
-        session: SessionId(2),
-    };
-    holds.hold(other.clone(), SlotId(0));
+    //
+    // Run over both shapes of `decided`: nothing decided yet (the common
+    // case, where every hold is still the sole path back to that drop being
+    // resolved) and slot 1 decided.
+    let other = key_of(2);
+    for decided in [HashSet::new(), [SlotId(1)].into_iter().collect()] {
+        let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
+        holds.hold(key(), SlotId(0));
+        holds.hold(key(), SlotId(1));
+        holds.hold(other.clone(), SlotId(0));
 
-    let decided = [SlotId(1)].into_iter().collect();
-    holds.end_session(&key(), &decided);
-    assert!(
-        holds.is_pending(&key(), SlotId(0)),
-        "the undecided hold survives the sweep -- it's still the reconnect token",
-    );
-    assert!(
-        !holds.is_pending(&key(), SlotId(1)),
-        "the already-decided hold is swept",
-    );
-    assert!(
-        holds.is_pending(&other, SlotId(0)),
-        "another session's holds are untouched",
-    );
-}
-
-#[test]
-fn end_session_with_no_decided_slots_keeps_every_hold_for_the_session() {
-    // The common case: nothing decided yet, so a session-emptied teardown must
-    // not erase any hold -- every one of them is still the sole path back to
-    // this drop being resolved.
-    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
-    holds.hold(key(), SlotId(0));
-    holds.hold(key(), SlotId(1));
-
-    holds.end_session(&key(), &HashSet::new());
-    assert_eq!(
-        holds.pending_slots(&key()),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        "no undecided hold is swept when nothing is decided",
-    );
+        holds.end_session(&key(), &decided);
+        assert!(
+            holds.is_pending(&key(), SlotId(0)),
+            "the undecided hold survives the sweep -- it's still the reconnect token",
+        );
+        assert_eq!(
+            holds.is_pending(&key(), SlotId(1)),
+            !decided.contains(&SlotId(1)),
+            "a hold is swept exactly when its slot was already decided",
+        );
+        assert!(
+            holds.is_pending(&other, SlotId(0)),
+            "another session's holds are untouched",
+        );
+    }
 }
 
 /// The production burst-then-reject half of the cap. Recovery after a refill

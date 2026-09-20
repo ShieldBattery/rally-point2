@@ -4,14 +4,10 @@
 //! `replay_local` origin filter mesh resume replies rely on.
 
 use super::*;
-use rally_point_proto::control::TenantId;
-use rally_point_proto::ids::SessionId;
+use crate::test_support::session_key as key_of;
 
 fn key() -> SessionKey {
-    SessionKey {
-        tenant: TenantId("t".to_owned()),
-        session: SessionId(1),
-    }
+    key_of(1)
 }
 
 fn turn(slot: u8, seq: u64, len: usize) -> Payload {
@@ -34,37 +30,6 @@ fn record_local(ring: &TurnRing, key: &SessionKey, payload: &Payload) {
 /// bound mechanics: one that never produces a turn of its own, so the
 /// own-slot skip can never remove anything they assert on.
 const RECONNECTING: SlotId = SlotId(9);
-
-#[test]
-fn the_count_bound_is_at_least_the_nominal_window_at_every_slot_count() {
-    // The whole point of deriving the bound from the nominal window is that the
-    // ring can always hold that window's worth of turns for every slot. All
-    // inputs are compile-time constants, so this is checked in a `const` block (a
-    // plain runtime `assert!` on two constants is itself a clippy lint) — it
-    // still catches a future edit to the derivation that breaks the invariant,
-    // just at compile time instead of test time.
-    const {
-        let mut slots = 1;
-        while slots <= MAX_GAME_SLOTS {
-            assert!(max_turns(slots) >= RING_WINDOW_SECS * NOMINAL_TURNS_PER_SEC_PER_SLOT * slots);
-            slots += 1;
-        }
-        // Unknown shape sizes for the largest game, never a smaller one.
-        assert!(max_turns(0) == max_turns(MAX_GAME_SLOTS));
-        assert!(max_bytes(0) == max_bytes(MAX_GAME_SLOTS));
-    }
-}
-
-#[test]
-fn the_byte_floor_clears_a_count_bound_of_ordinary_turns() {
-    // The byte bound exists for oversize spray, so even at the smallest
-    // session shape it must not bite a count bound's worth of ordinary
-    // few-hundred-byte turns.
-    const ORDINARY_TURN_BYTES: usize = 300;
-    const {
-        assert!(max_bytes(1) >= max_turns(1) * ORDINARY_TURN_BYTES);
-    }
-}
 
 #[test]
 fn records_and_replays_turns_past_a_cursor() {
@@ -93,6 +58,11 @@ fn a_slot_the_cursors_never_name_replays_from_the_start() {
     // while the relay had already forwarded those turns down the link that
     // then died. Nothing else can carry them, so an unnamed slot replays
     // whole. Its own slot is skipped even though it, too, goes unnamed.
+    //
+    // A partial map and an empty one are the same rule: an empty map is not
+    // proof the client has nothing to catch up on -- a re-homing client that
+    // has neither sent nor received a turn presents exactly that -- so each
+    // unnamed peer replays whole either way.
     let ring = TurnRing::new();
     let k = key();
     for seq in 0..3 {
@@ -103,65 +73,25 @@ fn a_slot_the_cursors_never_name_replays_from_the_start() {
     }
     record_local(&ring, &k, &turn(2, 0, 8));
 
-    // Slot 2 is reconnecting and names only slot 1, from seq 1.
-    let cursors: HashMap<SlotId, u64> = [(SlotId(1), 1)].into();
-    let got: Vec<(u32, u64)> = ring
-        .replay(&k, &cursors, SlotId(2))
-        .iter()
-        .map(|p| (p.slot, p.seq))
-        .collect();
-    assert_eq!(
-        got,
-        vec![(0, 0), (0, 1), (0, 2), (1, 1)],
-        "the unnamed peer replays whole, the named one from its cursor, and the \
-         reconnecting slot gets none of its own turns back",
-    );
-}
-
-#[test]
-fn replay_preserves_oldest_first_order() {
-    let ring = TurnRing::new();
-    let k = key();
-    for seq in 0..5 {
-        record_local(&ring, &k, &turn(0, seq, 8));
+    // Slot 2 is reconnecting; with slot 1 named from seq 1, and with nothing
+    // named at all. Each expectation is an exact ordered comparison, so it
+    // pins the oldest-first replay order too.
+    let partial: HashMap<SlotId, u64> = [(SlotId(1), 1)].into();
+    for (cursors, expected) in [
+        (partial, vec![(0, 0), (0, 1), (0, 2), (1, 1)]),
+        (HashMap::new(), vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]),
+    ] {
+        let got: Vec<(u32, u64)> = ring
+            .replay(&k, &cursors, SlotId(2))
+            .iter()
+            .map(|p| (p.slot, p.seq))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "each unnamed peer replays whole, a named one from its cursor, and the \
+             reconnecting slot gets none of its own turns back",
+        );
     }
-    let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
-    let seqs: Vec<u64> = ring
-        .replay(&k, &cursors, RECONNECTING)
-        .iter()
-        .map(|p| p.seq)
-        .collect();
-    assert_eq!(seqs, vec![0, 1, 2, 3, 4], "oldest-first");
-}
-
-#[test]
-fn an_empty_cursor_map_replays_every_other_slot_whole() {
-    // An empty map is not proof the client has nothing to catch up on — a
-    // re-homing client that has neither sent nor received a turn presents
-    // exactly this — so it asks for every peer's recorded turns, and only
-    // the asking slot's own are held back.
-    let ring = TurnRing::new();
-    let k = key();
-    record_local(&ring, &k, &turn(0, 0, 8));
-    record_local(&ring, &k, &turn(1, 0, 8));
-
-    let got: Vec<(u32, u64)> = ring
-        .replay(&k, &HashMap::new(), SlotId(1))
-        .iter()
-        .map(|p| (p.slot, p.seq))
-        .collect();
-    assert_eq!(got, vec![(0, 0)]);
-}
-
-#[test]
-fn an_empty_ring_replays_nothing_to_a_first_arrival() {
-    // A slot's genuine first dial reads a ring that holds nothing: turns are
-    // recorded only once the session has started, and it starts only once
-    // every expected slot is present. Replaying an unnamed slot whole
-    // therefore costs a first arrival nothing.
-    let ring = TurnRing::new();
-    let k = key();
-    assert!(ring.replay(&k, &HashMap::new(), SlotId(0)).is_empty());
 }
 
 #[test]
@@ -233,29 +163,10 @@ fn a_shrinking_slot_count_tightens_the_bounds_on_the_next_record() {
 }
 
 #[test]
-fn an_unknown_slot_count_sizes_for_a_full_game() {
-    // `0` means the caller genuinely doesn't know the session's shape;
-    // under-retaining on unknown would break the reconnect the ring exists
-    // for, so it gets the full-game bound.
-    let ring = TurnRing::new();
-    let k = key();
-    let cap = max_turns(MAX_GAME_SLOTS);
-    let small_cap = max_turns(2);
-    for seq in 0..(small_cap + 5) as u64 {
-        ring.record(&k, &turn(0, seq, 1), TurnOrigin::Local, 0);
-    }
-    assert!(ring.len(&k) > small_cap, "not bounded like a small session");
-    assert!(ring.len(&k) <= cap);
-}
-
-#[test]
 fn totals_sum_turns_and_command_bytes_across_sessions() {
     let ring = TurnRing::new();
     let k = key();
-    let other = SessionKey {
-        tenant: TenantId("t".to_owned()),
-        session: SessionId(2),
-    };
+    let other = key_of(2);
     record_local(&ring, &k, &turn(0, 0, 10));
     record_local(&ring, &k, &turn(0, 1, 10));
     record_local(&ring, &other, &turn(0, 0, 7));
@@ -275,10 +186,7 @@ fn totals_sum_turns_and_command_bytes_across_sessions() {
 fn origin_totals_are_distinct_record_counts_and_survive_session_teardown() {
     let ring = TurnRing::new();
     let first = key();
-    let second = SessionKey {
-        tenant: TenantId("t".to_owned()),
-        session: SessionId(2),
-    };
+    let second = key_of(2);
 
     ring.record(&first, &turn(0, 0, 8), TurnOrigin::Local, 2);
     ring.record(&first, &turn(1, 0, 8), TurnOrigin::Mesh, 2);
@@ -341,6 +249,10 @@ fn ending_a_session_drops_its_ring() {
         ring.replay(&k, &[(SlotId(0), 0)].into(), RECONNECTING)
             .is_empty()
     );
+    // The same read a slot's genuine first dial makes — no ring for the
+    // session, no cursors of its own — so replaying unnamed slots whole costs
+    // a first arrival nothing.
+    assert!(ring.replay(&k, &HashMap::new(), SlotId(0)).is_empty());
 }
 
 #[test]
@@ -372,28 +284,20 @@ fn replay_local_excludes_mesh_delivered_entries() {
         vec![0, 2],
         "the mesh resume reply skips the mesh-delivered entry",
     );
-}
 
-#[test]
-fn replay_local_of_an_all_mesh_slot_is_empty() {
-    // A slot every recorded entry arrived by mesh (this relay never hosts
-    // that slot's client) has nothing this relay may reply with — a mesh
-    // peer's ask for it is answered by whichever relay actually homes it.
-    // True regardless of `resuming`: a listed cursor is honored by seq, an
-    // absent one by `resuming`, but the origin filter excludes every entry
-    // here either way.
-    let ring = TurnRing::new();
-    let k = key();
-    ring.record(&k, &turn(0, 0, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
-    ring.record(&k, &turn(0, 1, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
-
-    let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
-    assert!(ring.replay_local(&k, &cursors, false).is_empty());
-    assert!(ring.replay_local(&k, &cursors, true).is_empty());
-
-    let no_cursor: HashMap<SlotId, u64> = HashMap::new();
+    // A slot whose every recorded entry arrived by mesh (this relay never
+    // hosts that slot's client) has nothing this relay may reply with at all
+    // — a mesh peer's ask for it is answered by whichever relay homes it. The
+    // origin filter applies before the `resuming` rule, so that holds for a
+    // listed cursor and for an absent one asked from zero alike.
+    let all_mesh = key_of(2);
+    ring.record(&all_mesh, &turn(0, 0, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+    ring.record(&all_mesh, &turn(0, 1, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+    assert!(ring.replay_local(&all_mesh, &cursors, false).is_empty());
+    assert!(ring.replay_local(&all_mesh, &cursors, true).is_empty());
     assert!(
-        ring.replay_local(&k, &no_cursor, true).is_empty(),
+        ring.replay_local(&all_mesh, &HashMap::new(), true)
+            .is_empty(),
         "an all-mesh slot has nothing Local to replay even unlisted-from-0",
     );
 }

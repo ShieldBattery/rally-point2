@@ -434,6 +434,14 @@ impl SlotInbox {
         Arc::clone(&self.shutdown)
     }
 
+    /// The cause stamped behind the pending shutdown signal, read back the way
+    /// the woken link task reads it, for a test asserting which close code the
+    /// signaler asked for.
+    #[cfg(test)]
+    fn close_reason(&self) -> SlotCloseReason {
+        SlotCloseReason::from_raw(self.close_reason.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// The slot's provisional-reap signal, for a test that drives the
     /// bounded-admission sweep's close path directly without waiting out a
     /// real deadline.
@@ -442,14 +450,20 @@ impl SlotInbox {
         Arc::clone(&self.provisional_reap)
     }
 
-    /// Non-blockingly pulls the next slot-connectivity change pushed to this slot,
-    /// for a cross-module test asserting a connectivity frame fanned to a local
-    /// slot. `None` when nothing is queued.
+    /// Non-blockingly pulls the next slot-connectivity change pushed to this
+    /// slot, whole, for a test asserting which connection generation the level
+    /// describes as well as the level itself. `None` when nothing is queued.
+    #[cfg(test)]
+    fn try_recv_connectivity_change(&mut self) -> Option<ConnectivityChange> {
+        self.conn_push_rx.try_recv().ok()
+    }
+
+    /// [`try_recv_connectivity_change`](Self::try_recv_connectivity_change)
+    /// without the generation, for the cross-module tests that only assert
+    /// which slot was reported at which level.
     #[cfg(test)]
     pub(crate) fn try_recv_connectivity(&mut self) -> Option<(SlotId, bool)> {
-        self.conn_push_rx
-            .try_recv()
-            .ok()
+        self.try_recv_connectivity_change()
             .map(|(slot, connected, _)| (slot, connected))
     }
 

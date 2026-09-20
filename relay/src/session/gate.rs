@@ -343,15 +343,7 @@ impl SessionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
-
-    fn key(session: u64) -> SessionKey {
-        SessionKey {
-            tenant: TenantId("sb-test".to_owned()),
-            session: SessionId(session),
-        }
-    }
+    use crate::test_support::session_key as key;
 
     #[test]
     fn ingress_runs_while_served_and_refuses_after_retirement() {
@@ -510,23 +502,43 @@ mod tests {
         // probes every gate. If the probe BLOCKED on a contended gate, these
         // two would deadlock across unrelated sessions with the registry
         // held. The prune's non-blocking probe (skip and keep) is what this
-        // pins — under the blocking shape this test hangs.
-        for _ in 0..100 {
-            let gates = SessionGates::default();
-            let a = key(1);
-            let b = key(2);
-            assert_eq!(gates.with_ingress(&a, || ()), Some(()));
-            assert_eq!(gates.with_ingress(&b, || ()), Some(()));
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    let _ = gates.discard_if(&a, || {
-                        std::thread::yield_now();
-                        true
+        // pins.
+        //
+        // A regression here wedges rather than failing an assertion, so the
+        // rounds run on their own thread behind a watchdog: a stuck run then
+        // fails this test with a diagnosis instead of hanging the whole run
+        // until CI's job timeout kills it. The rounds take single-digit
+        // milliseconds, so the deadline is pure headroom.
+        const DEADLOCK_WATCHDOG: Duration = Duration::from_secs(30);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                let gates = SessionGates::default();
+                let a = key(1);
+                let b = key(2);
+                assert_eq!(gates.with_ingress(&a, || ()), Some(()));
+                assert_eq!(gates.with_ingress(&b, || ()), Some(()));
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let _ = gates.discard_if(&a, || {
+                            std::thread::yield_now();
+                            true
+                        });
                     });
+                    s.spawn(|| gates.retire(&b));
                 });
-                s.spawn(|| gates.retire(&b));
-            });
-            assert!(gates.is_retired(&b));
+                assert!(gates.is_retired(&b));
+            }
+            let _ = finished_tx.send(());
+        });
+        match finished_rx.recv_timeout(DEADLOCK_WATCHDOG) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("a cleanup racing a cross-session retirement deadlocked")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the race rounds failed; their own panic names the round")
+            }
         }
     }
 

@@ -99,11 +99,24 @@ impl ProvisionalSessions {
     /// earlier deadline, so a steady trickle of dials can't hold a
     /// descriptor-less session open indefinitely.
     pub fn mark_if_undescribed(&self, decision_makers: &DecisionMakers, key: &SessionKey) -> bool {
+        self.mark_if_undescribed_at(decision_makers, key, Instant::now())
+    }
+
+    /// [`mark_if_undescribed`](Self::mark_if_undescribed) with the instant the
+    /// window runs from supplied rather than read off the clock, so a mark, a
+    /// duplicate of it, and the sweep that reaps them can all be placed on one
+    /// synthetic timeline instead of the window being slept out.
+    fn mark_if_undescribed_at(
+        &self,
+        decision_makers: &DecisionMakers,
+        key: &SessionKey,
+        now: Instant,
+    ) -> bool {
         let makers = decision_makers.lock();
         if makers.contains_key(key) {
             return false;
         }
-        let deadline = Instant::now() + self.window;
+        let deadline = now + self.window;
         self.marks.lock().entry(key.clone()).or_insert(deadline);
         true
     }
@@ -128,7 +141,15 @@ impl ProvisionalSessions {
     /// give that resync room to land -- never reaping on time debt
     /// accumulated while the connection was down.
     fn restart_all(&self) {
-        let deadline = Instant::now() + self.window;
+        self.restart_all_at(Instant::now());
+    }
+
+    /// [`restart_all`](Self::restart_all) with the instant the fresh window
+    /// runs from supplied rather than read off the clock — the same synthetic
+    /// timeline [`mark_if_undescribed_at`](Self::mark_if_undescribed_at) and
+    /// [`take_expired`](Self::take_expired) take.
+    fn restart_all_at(&self, now: Instant) {
+        let deadline = now + self.window;
         for value in self.marks.lock().values_mut() {
             *value = deadline;
         }
@@ -248,15 +269,7 @@ pub async fn run_sweep_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
-
-    fn key(session: u64) -> SessionKey {
-        SessionKey {
-            tenant: TenantId("t".to_owned()),
-            session: SessionId(session),
-        }
-    }
+    use crate::test_support::{seed_local_maker, session_key as key};
 
     #[test]
     fn marks_and_clears() {
@@ -273,19 +286,23 @@ mod tests {
         provisional.clear(&key(1));
     }
 
+    /// The window the synthetic-timeline tests below mark with, so their
+    /// `now`s read as multiples of the deadline they are testing against.
+    const WINDOW: Duration = Duration::from_millis(10);
+
     #[test]
     fn a_duplicate_mark_keeps_the_earlier_deadline() {
-        let provisional = ProvisionalSessions::new(Duration::from_millis(10));
+        let provisional = ProvisionalSessions::new(WINDOW);
         let makers = crate::consensus::new_decision_makers();
+        let start = Instant::now();
 
-        assert!(provisional.mark_if_undescribed(&makers, &key(1)));
-        std::thread::sleep(Duration::from_millis(30));
-        // A second admission for the same still-undescribed session must not
-        // push the deadline out -- if it did, a fresh 10ms window from *this*
-        // call would still be unexpired below.
-        assert!(provisional.mark_if_undescribed(&makers, &key(1)));
+        assert!(provisional.mark_if_undescribed_at(&makers, &key(1), start));
+        // A second admission for the same still-undescribed session, a long
+        // way into the window, must not push the deadline out -- if it did,
+        // a fresh window from *this* call would still be unexpired below.
+        assert!(provisional.mark_if_undescribed_at(&makers, &key(1), start + WINDOW * 30));
 
-        let expired = provisional.take_expired(Instant::now());
+        let expired = provisional.take_expired(start + WINDOW * 2);
         assert_eq!(
             expired,
             vec![key(1)],
@@ -295,19 +312,9 @@ mod tests {
 
     #[test]
     fn mark_if_undescribed_refuses_once_a_maker_exists() {
-        use crate::consensus::{MakerSync, sync_maker};
-        use rally_point_proto::control::BufferBounds;
-
         let provisional = ProvisionalSessions::new(Duration::from_secs(10));
         let makers = crate::consensus::new_decision_makers();
-        let _ = sync_maker(
-            &makers,
-            &key(1),
-            MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::SelfRelay,
-            ),
-        );
+        seed_local_maker(&makers, &key(1), &[0]);
 
         assert!(
             !provisional.mark_if_undescribed(&makers, &key(1)),
@@ -318,15 +325,15 @@ mod tests {
 
     #[test]
     fn take_expired_only_removes_past_deadlines() {
-        let provisional = ProvisionalSessions::new(Duration::from_millis(10));
+        let provisional = ProvisionalSessions::new(WINDOW);
         let makers = crate::consensus::new_decision_makers();
-        provisional.mark_if_undescribed(&makers, &key(1));
+        let start = Instant::now();
+        provisional.mark_if_undescribed_at(&makers, &key(1), start);
 
         let long_lived = ProvisionalSessions::new(Duration::from_secs(60));
-        long_lived.mark_if_undescribed(&makers, &key(2));
+        long_lived.mark_if_undescribed_at(&makers, &key(2), start);
 
-        std::thread::sleep(Duration::from_millis(30));
-        let expired = provisional.take_expired(Instant::now());
+        let expired = provisional.take_expired(start + WINDOW * 3);
         assert_eq!(expired, vec![key(1)], "only the passed deadline is reaped");
         assert!(
             long_lived.is_marked(&key(2)),
@@ -336,16 +343,19 @@ mod tests {
 
     #[test]
     fn restart_all_pushes_every_mark_out() {
-        let provisional = ProvisionalSessions::new(Duration::from_millis(10));
+        let provisional = ProvisionalSessions::new(WINDOW);
         let makers = crate::consensus::new_decision_makers();
-        provisional.mark_if_undescribed(&makers, &key(1));
-        provisional.mark_if_undescribed(&makers, &key(2));
+        let start = Instant::now();
+        provisional.mark_if_undescribed_at(&makers, &key(1), start);
+        provisional.mark_if_undescribed_at(&makers, &key(2), start);
 
-        std::thread::sleep(Duration::from_millis(30));
-        provisional.restart_all();
+        // The reconnect lands long past both original deadlines: every mark
+        // gets a clean window rather than being reaped on the outage's debt.
+        let reconnect = start + WINDOW * 3;
+        provisional.restart_all_at(reconnect);
 
         assert!(
-            provisional.take_expired(Instant::now()).is_empty(),
+            provisional.take_expired(reconnect).is_empty(),
             "both marks were pushed out to a fresh, un-expired deadline",
         );
         assert!(provisional.is_marked(&key(1)));
@@ -360,7 +370,7 @@ mod tests {
         // window, and the sweep ticks at a tenth of it, so a slow/loaded CI
         // runner's scheduling jitter has slack in every direction rather than
         // riding the edge of an assertion.
-        let window = Duration::from_millis(100);
+        let window = Duration::from_millis(50);
         let tick = window / 10;
         let provisional = ProvisionalSessions::new(window);
         let makers = Arc::new(crate::consensus::new_decision_makers());
@@ -442,14 +452,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_described_session_is_spared_when_its_maker_appears_before_the_reap() {
-        use crate::consensus::{MakerSync, sync_maker};
-        use rally_point_proto::control::BufferBounds;
-
         // The race the maker-check closes: a session marked provisional, then named
         // by a descriptor (its decision-maker created) with the mark not yet
         // cleared. The sweep's take_expired pulls the still-present mark, but the
         // maker now exists, so the session must be spared rather than reaped.
-        let window = Duration::from_millis(20);
+        //
+        // The assertion is a negative, so it costs its full window by
+        // construction; the window is therefore the smallest one the sweep's
+        // tick can still resolve inside.
+        let window = Duration::from_millis(10);
         let provisional = ProvisionalSessions::new(window);
         let makers = Arc::new(crate::consensus::new_decision_makers());
         let sessions: Sessions = Arc::default();
@@ -463,14 +474,7 @@ mod tests {
         // Mark first (no maker yet), then create the maker as apply_descriptor's
         // sync_maker would -- leaving the mark in place to model the race window.
         assert!(provisional.mark_if_undescribed(&makers, &key(1)));
-        let _ = sync_maker(
-            &makers,
-            &key(1),
-            MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::SelfRelay,
-            ),
-        );
+        seed_local_maker(&makers, &key(1), &[0]);
         assert!(
             provisional.is_marked(&key(1)),
             "the mark is still present when the sweep runs",

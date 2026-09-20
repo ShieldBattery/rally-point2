@@ -1,20 +1,72 @@
 //! The per-slot forward queue's two bounds and the lagging-peer signal they
-//! raise, the close-signal path, and the game-result ingress rule.
+//! raise, the close signals and the codes that name their cause, and the
+//! game-result ingress rule.
 
 use super::*;
 
-#[tokio::test]
+/// The seven close codes a routing path can end a slot's connection with stay
+/// distinct, because each is a diagnostic a client's own logs are read for:
+/// collapsing any two would make "the descriptor was merely slow" and "your
+/// turn was rejected" indistinguishable after the fact.
+#[test]
+fn every_routing_close_code_names_its_own_cause() {
+    let routing_codes = [
+        ("a turn that failed validation", INVALID_TURN_CLOSE),
+        ("a link isolated behind its bounds", ISOLATED_CLOSE),
+        ("a leave-intent the relay processed", LEAVE_PROCESSED_CLOSE),
+        ("a lost control stream", CONTROL_STREAM_LOST_CLOSE),
+        ("an insane resume anchor", RESUME_ANCHOR_INVALID_CLOSE),
+        ("an expired provisional window", PROVISIONAL_EXPIRED_CLOSE),
+        ("a slot that went silent", SILENT_SLOT_CLOSE),
+    ];
+    let mut by_code = std::collections::HashMap::new();
+    for (cause, code) in routing_codes {
+        assert!(
+            by_code.insert(code, cause).is_none(),
+            "{cause} shares close code {code:#04x} with {}",
+            by_code[&code],
+        );
+    }
+    // And with the server-owned codes a routing path can also surface, which a
+    // client's driver treats differently again.
+    for code in [
+        crate::server::SLOT_DEPARTED_CLOSE,
+        crate::server::SESSION_RETIRED_CLOSE,
+    ] {
+        assert!(
+            !by_code.contains_key(&code),
+            "a routing close code collides with a server-owned one ({code:#04x})",
+        );
+    }
+}
+
+/// The cause a signaler stamps survives the round trip through the shared
+/// byte the woken link task reads it back from, and an unrecognized byte
+/// degrades to the generic close rather than to some other specific cause.
+#[test]
+fn a_stamped_close_reason_round_trips_and_an_unknown_byte_degrades() {
+    for reason in [SlotCloseReason::Unspecified, SlotCloseReason::SilentSlot] {
+        assert_eq!(SlotCloseReason::from_raw(reason as u8), reason);
+    }
+    assert_eq!(
+        SlotCloseReason::from_raw(0xFF),
+        SlotCloseReason::Unspecified
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one() {
     let sessions: Sessions = Arc::default();
     let k = key();
-    let (mut g0, inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
+    let inbox0 = registered(&sessions, &k, SlotId(0));
+    let shutdown = inbox0.shutdown_handle();
 
     // Closing a slot this relay does not hold (slot 5) is a no-op — no panic,
-    // and the held slot is untouched.
+    // and the held slot is untouched. With the clock paused there is nothing
+    // else to wait on, so the timeout resolves without real time passing.
     close_slots(&sessions, &k, &[SlotId(5)]);
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox0.shutdown.notified())
+        tokio::time::timeout(Duration::from_secs(60), shutdown.notified())
             .await
             .is_err(),
         "an absent slot's close must not signal a held one",
@@ -23,15 +75,13 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     // Closing the held slot fires its shutdown signal (its task would then
     // close the link and deregister), but leaves it in the roster meanwhile.
     close_slots(&sessions, &k, &[SlotId(0), SlotId(9)]);
-    tokio::time::timeout(Duration::from_millis(100), inbox0.shutdown.notified())
-        .await
-        .expect("the held slot is signaled to close");
+    shutdown.notified().await;
     assert!(
         sessions.lock().get(&k).unwrap().contains_key(&SlotId(0)),
         "close_slots signals, it does not yank the roster entry",
     );
     assert_eq!(
-        SlotCloseReason::from_raw(inbox0.close_reason.load(Ordering::Acquire)),
+        inbox0.close_reason(),
         SlotCloseReason::Unspecified,
         "a terminal directive names no more specific cause",
     );
@@ -39,34 +89,26 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     // A silence eviction stamps its own reason before signaling, so the woken
     // link task can close with the code that names it.
     close_slots_for_silence(&sessions, &k, &[SlotId(0)]);
-    tokio::time::timeout(Duration::from_millis(100), inbox0.shutdown.notified())
-        .await
-        .expect("the held slot is signaled to close");
-    assert_eq!(
-        SlotCloseReason::from_raw(inbox0.close_reason.load(Ordering::Acquire)),
-        SlotCloseReason::SilentSlot,
-    );
+    shutdown.notified().await;
+    assert_eq!(inbox0.close_reason(), SlotCloseReason::SilentSlot);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fan_out_signals_a_full_peer_and_keeps_delivering_to_healthy_ones() {
     let sessions: Sessions = Arc::default();
     let k = key();
     // Source (0), a healthy peer (1) we keep drained, and a peer (2) we never
-    // drain so its queue fills. Disarm the guards — the test owns the roster.
-    let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    let (mut g2, inbox2) = register(&sessions, &k, SlotId(2), 1).expect("slot 2 registers");
-    g0.disarm();
-    g1.disarm();
-    g2.disarm();
+    // drain so its queue fills.
+    let _inbox0 = registered(&sessions, &k, SlotId(0));
+    let mut inbox1 = registered(&sessions, &k, SlotId(1));
+    let inbox2 = registered(&sessions, &k, SlotId(2));
 
     // Fan out past slot 2's capacity. Slot 1 is drained every turn and so never
     // fills; slot 2 is never drained and fills, getting signaled to disconnect.
     let mut delivered_to_1 = 0;
     for _ in 0..(FORWARD_CAPACITY + 8) {
         fan_out(&sessions, &k, SlotId(0), payload());
-        if inbox1.forward_rx.try_recv().is_some() {
+        if inbox1.try_recv_forward().is_some() {
             delivered_to_1 += 1;
         }
     }
@@ -76,9 +118,7 @@ async fn fan_out_signals_a_full_peer_and_keeps_delivering_to_healthy_ones() {
 
     // The stuck peer was signaled to shut down (its task would then close its
     // link and deregister)...
-    tokio::time::timeout(Duration::from_millis(100), inbox2.shutdown.notified())
-        .await
-        .expect("slot 2 was signaled to disconnect");
+    inbox2.shutdown_handle().notified().await;
 
     // ...but fan_out left it in the roster: the slot stays occupied until its own
     // task exits, so no replacement can register a second sender for it.
@@ -88,16 +128,14 @@ async fn fan_out_signals_a_full_peer_and_keeps_delivering_to_healthy_ones() {
     assert!(slots.contains_key(&SlotId(2)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn normal_payloads_fill_the_count_bound_without_tripping_the_byte_budget() {
     // A queue filled to the payload-count bound with normal-size turns must not
     // be byte-isolated: the count bound is what governs honest lagging traffic.
     let sessions: Sessions = Arc::default();
     let k = key();
-    let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    g0.disarm();
-    g1.disarm();
+    let _inbox0 = registered(&sessions, &k, SlotId(0));
+    let inbox1 = registered(&sessions, &k, SlotId(1));
 
     // A few hundred command bytes is a generous normal turn; a full
     // count-bounded queue of them is only ~FORWARD_CAPACITY * 512 bytes, far
@@ -110,23 +148,19 @@ async fn normal_payloads_fill_the_count_bound_without_tripping_the_byte_budget()
     // The queue holds exactly the count bound and never crossed the byte
     // budget, so the slot was not signaled to disconnect.
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
-            .await
-            .is_err(),
+        never_signaled(&inbox1).await,
         "a count-full queue of normal turns must not trip the byte budget",
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn oversize_payloads_trip_the_byte_budget_before_the_count_bound() {
     // Max-oversize turns pin far more per payload, so a queue of them must be
     // byte-isolated well before it reaches the payload-count bound.
     let sessions: Sessions = Arc::default();
     let k = key();
-    let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    g0.disarm();
-    g1.disarm();
+    let _inbox0 = registered(&sessions, &k, SlotId(0));
+    let mut inbox1 = registered(&sessions, &k, SlotId(1));
 
     // Never drain slot 1: fan out max-oversize turns until the budget trips.
     // The byte budget admits exactly FORWARD_BYTE_BUDGET / oversize-len turns,
@@ -147,29 +181,25 @@ async fn oversize_payloads_trip_the_byte_budget_before_the_count_bound() {
 
     // The slot was signaled to disconnect (the byte budget, not the count
     // bound)...
-    tokio::time::timeout(Duration::from_millis(100), inbox1.shutdown.notified())
-        .await
-        .expect("the oversize spray trips the byte budget");
+    inbox1.shutdown_handle().notified().await;
 
     // ...and only the under-budget turns were ever enqueued — far fewer than
     // the count bound would have allowed.
     let mut resident = 0;
-    while inbox1.forward_rx.try_recv().is_some() {
+    while inbox1.try_recv_forward().is_some() {
         resident += 1;
     }
     assert_eq!(resident, admitted);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn draining_the_forward_queue_frees_the_byte_budget() {
     // The budget is resident bytes, not a cumulative total: a queue filled to
     // the budget accepts again once its turns are drained.
     let sessions: Sessions = Arc::default();
     let k = key();
-    let (mut g0, _inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    g0.disarm();
-    g1.disarm();
+    let _inbox0 = registered(&sessions, &k, SlotId(0));
+    let mut inbox1 = registered(&sessions, &k, SlotId(1));
 
     let admitted = FORWARD_BYTE_BUDGET / MAX_OVERSIZE_TURN_COMMANDS_LEN;
     // Fill the queue right up to the budget — every turn lands, none isolates.
@@ -182,15 +212,13 @@ async fn draining_the_forward_queue_frees_the_byte_budget() {
         );
     }
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
-            .await
-            .is_err(),
+        never_signaled(&inbox1).await,
         "a queue filled exactly to the budget must not isolate",
     );
 
     // Drain every turn; each drain releases its bytes from the resident count.
     for _ in 0..admitted {
-        assert!(inbox1.forward_rx.recv().await.is_some());
+        assert!(inbox1.try_recv_forward().is_some());
     }
 
     // The freed budget accepts a fresh full batch, again without isolating —
@@ -204,16 +232,24 @@ async fn draining_the_forward_queue_frees_the_byte_budget() {
         );
     }
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox1.shutdown.notified())
-            .await
-            .is_err(),
+        never_signaled(&inbox1).await,
         "a drained queue must accept a fresh batch up to the budget",
     );
     let mut resident = 0;
-    while inbox1.forward_rx.try_recv().is_some() {
+    while inbox1.try_recv_forward().is_some() {
         resident += 1;
     }
     assert_eq!(resident, admitted);
+}
+
+/// Whether `inbox`'s slot went unsignaled. Only sound under a paused clock,
+/// where the shutdown notification is the one thing that could ever resolve:
+/// the timeout then fires the instant the runtime runs out of other work, so
+/// the negative costs no real time despite naming a generous window.
+async fn never_signaled(inbox: &SlotInbox) -> bool {
+    tokio::time::timeout(Duration::from_secs(60), inbox.shutdown_handle().notified())
+        .await
+        .is_err()
 }
 
 #[tokio::test]
@@ -230,15 +266,10 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
 
     // This relay is not the session's authority: its own maker never has a
     // directive, so the forward step must leave an incoming stamp alone.
-    let _ = consensus::sync_maker(
-        &makers,
-        &k,
-        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
-    );
+    seed_maker(&makers, &k, Authority::Peer, &[], &[]);
 
     // A local client to fan out to.
-    let (mut guard, mut inbox) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    guard.disarm();
+    let mut inbox = registered(&sessions, &k, SlotId(1));
 
     // A turn stamped by the authority arrives over the mesh.
     let stamp = BufferDirective {
@@ -266,8 +297,7 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
     );
 
     let delivered = inbox
-        .forward_rx
-        .try_recv()
+        .try_recv_forward()
         .expect("the turn fans out to the local slot");
     assert_eq!(
         delivered.buffer_directive,
@@ -322,32 +352,26 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
         rally_point_proto::ids::RelayId(2),
     );
     assert!(
-        inbox.forward_rx.try_recv().is_none(),
+        inbox.try_recv_forward().is_none(),
         "the session-level duplicate is dropped",
     );
 }
 
-// -- GameResult ingress --
-
-/// An empty payload is the wire sentinel for "no result reported", never a
-/// real report, so it is inadmissible regardless of the size cap.
+/// The `GameResult` ingress predicate, over every branch it has. An empty
+/// payload is the wire sentinel for "no result reported", never a real one,
+/// so it is inadmissible regardless of the size cap; a payload over the cap is
+/// an ill-formed report; anything in between — including one sized exactly at
+/// the cap — is admissible.
 #[test]
-fn empty_game_result_is_inadmissible() {
+fn a_game_result_is_admissible_only_when_non_empty_and_within_the_cap() {
     assert_eq!(game_result_admissible(&[]), Err("empty"));
-}
-
-/// A payload over the cap is an ill-formed report.
-#[test]
-fn oversize_game_result_is_inadmissible() {
-    let payload = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1];
-    assert_eq!(game_result_admissible(&payload), Err("oversize"));
-}
-
-/// A non-empty, within-cap payload -- including one sized exactly at the
-/// cap -- is admissible.
-#[test]
-fn well_formed_game_result_is_admissible() {
     assert_eq!(game_result_admissible(&[0xDE, 0xAD]), Ok(()));
-    let at_cap = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN];
-    assert_eq!(game_result_admissible(&at_cap), Ok(()));
+    assert_eq!(
+        game_result_admissible(&vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN]),
+        Ok(()),
+    );
+    assert_eq!(
+        game_result_admissible(&vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1]),
+        Err("oversize"),
+    );
 }

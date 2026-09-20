@@ -60,8 +60,7 @@ async fn an_emptied_close_keeps_an_undrained_journal() {
     let mesh = crate::mesh::new_mesh_state();
     mesh.provisional_turns.arm();
     let k = key();
-    let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("the leaver registers");
-    g1.disarm();
+    let _i1 = registered(&sessions, &k, SlotId(1));
     // Admission marks the undescribed session for the provisional sweep.
     assert!(
         mesh.provisional
@@ -111,10 +110,8 @@ async fn slot_teardown_records_flight_events_and_the_close_flushes() {
     let sessions: Sessions = Arc::default();
     let mesh = crate::mesh::new_mesh_state();
     let k = key();
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
-    let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    g1.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
+    let _i1 = registered(&sessions, &k, SlotId(1));
     let flight = mesh.decision_makers.flight_recorder().clone();
 
     // Slot 1's link dies without a clean leave; slot 0 remains, so the
@@ -133,13 +130,17 @@ async fn slot_teardown_records_flight_events_and_the_close_flushes() {
     );
 
     // The last slot leaves: the close event seals the recording and the
-    // detached flush retires it (discarded — no sink configured).
+    // detached flush retires it (discarded — no sink configured). The flush
+    // runs on a spawned task, so yield until the scheduler has run it rather
+    // than polling a clock — with no sink it removes the recording without
+    // awaiting anything, so a couple of yields always suffice and the bound
+    // only keeps a regression a failure instead of a hang.
     end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
-    for _ in 0..100 {
+    for _ in 0..64 {
         if flight.recorded_sessions().is_empty() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
     }
     assert!(
         flight.recorded_sessions().is_empty(),
@@ -158,8 +159,7 @@ fn session_emptying_teardown_drops_the_seen_registry_entry() {
     let sessions: Sessions = Arc::default();
     let mesh = crate::mesh::new_mesh_state();
     let k = key();
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
 
     crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
     assert!(
@@ -184,7 +184,6 @@ fn session_emptying_teardown_drops_the_seen_registry_entry() {
 async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
     use crate::consensus::{self, Authority, RelayNotice};
     use crate::session::presence::Candidate;
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let k = key();
@@ -192,20 +191,12 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
     let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     mesh.decision_makers.set_notice_notifier(tx);
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &k,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
     consensus::mark_session_started(&mesh.decision_makers, &k);
     consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(50));
     crate::session::presence::set_order(&mesh.presence, &k, vec![Candidate::SelfRelay]);
 
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
     // The serve path reports own presence right after registering; without a
     // live report the session is never `ever_live` and the abandoned-expiry
     // recheck below would (correctly) refuse to treat it as abandoned.
@@ -258,25 +249,16 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
 #[tokio::test]
 async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
     use crate::consensus::{self, Authority, RelayNotice};
-    use rally_point_proto::control::BufferBounds;
 
     let k = key();
     let sessions: Sessions = Arc::default();
     let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     mesh.decision_makers.set_notice_notifier(tx);
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &k,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
     consensus::mark_session_started(&mesh.decision_makers, &k);
 
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
     crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
 
     // A clean leave, announced by the control-stream handler before the
@@ -315,8 +297,7 @@ async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
 /// nothing could ever seed: the fresh window's prefix wedges permanently.
 #[tokio::test]
 async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
-    use crate::consensus::{self, Authority, RelayNotice};
-    use rally_point_proto::control::BufferBounds;
+    use crate::consensus::{Authority, RelayNotice};
 
     let k = key();
     let sessions: Sessions = Arc::default();
@@ -324,17 +305,9 @@ async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     mesh.decision_makers.set_notice_notifier(tx);
     // Descriptor-backed (a maker exists, homing slot 0) but never started.
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &k,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
 
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    g0.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
     // A pre-start turn passed the forward gate: seq 1 was received and
     // transport-acked while seq 0 never arrived — the acked hole the
     // resume's anchor-0 seeding must close from these receipts.

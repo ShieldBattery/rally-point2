@@ -294,16 +294,59 @@ pub fn deliver(registry: &LobbyRegistry, key: &SessionKey, command: LobbyCommand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
+    use crate::session::fanout_tests::{self as shared, FanOutChannel};
+    use crate::test_support::session_key;
 
-    fn key() -> SessionKey {
-        SessionKey {
-            tenant: TenantId("sb-staging".to_owned()),
-            session: SessionId(1),
+    /// The lobby as one of the three fan-out registries, so the guarantees it
+    /// shares with the chat and skin channels come from the one shared set of
+    /// test bodies rather than a third copy of them.
+    struct Lobby;
+
+    impl FanOutChannel for Lobby {
+        type Registry = LobbyRegistry;
+        type Message = LobbyCommand;
+
+        const RATE_BURST: u32 = LOBBY_RATE_BURST;
+
+        fn new_registry() -> LobbyRegistry {
+            new_lobby_registry()
+        }
+        fn register_member(
+            registry: &LobbyRegistry,
+            key: &SessionKey,
+            slot: SlotId,
+        ) -> mpsc::Receiver<LobbyCommand> {
+            register_member(registry, key, slot)
+        }
+        fn deregister_member(registry: &LobbyRegistry, key: &SessionKey, slot: SlotId) {
+            deregister_member(registry, key, slot);
+        }
+        fn end_session(registry: &LobbyRegistry, key: &SessionKey) {
+            end_session(registry, key);
+        }
+        fn admit(registry: &LobbyRegistry, key: &SessionKey, slot: SlotId, _len: usize) -> bool {
+            // The lobby caps a session's whole log, not one command's size.
+            admit(registry, key, slot)
+        }
+        fn deliver(registry: &LobbyRegistry, key: &SessionKey, message: LobbyCommand) -> bool {
+            deliver(registry, key, message)
+        }
+        fn message(slot: u32, body: &str) -> LobbyCommand {
+            LobbyCommand {
+                slot,
+                payload: body.as_bytes().to_vec().into(),
+            }
+        }
+        fn parts(message: &LobbyCommand) -> (u32, String) {
+            (
+                message.slot,
+                String::from_utf8(message.payload.to_vec()).expect("test payloads are text"),
+            )
         }
     }
 
+    /// A command carrying one opaque byte — what the replay-order and log-cap
+    /// tests below fill the log with.
     fn command(slot: u32, byte: u8) -> LobbyCommand {
         LobbyCommand {
             slot,
@@ -324,21 +367,33 @@ mod tests {
 
     #[test]
     fn a_command_fans_out_to_every_member_but_its_author() {
-        let registry = new_lobby_registry();
-        let k = key();
-        let mut host = register_member(&registry, &k, SlotId(0));
-        let mut peer = register_member(&registry, &k, SlotId(1));
+        shared::the_author_is_skipped_and_every_other_member_is_reached::<Lobby>();
+    }
 
-        // Slot 0 (host) authors a command: it reaches slot 1, never slot 0.
-        deliver(&registry, &k, command(0, 0xA1));
-        assert_eq!(drain(&mut host), vec![], "the author is not echoed its own");
-        assert_eq!(drain(&mut peer), vec![(0, 0xA1)]);
+    #[test]
+    fn deregister_removes_a_member_and_end_session_drops_the_log() {
+        shared::a_deregistered_member_stops_receiving_and_end_session_clears_the_state::<Lobby>();
+    }
+
+    #[test]
+    fn a_command_appended_before_a_join_is_not_also_delivered_live() {
+        shared::a_retained_message_is_replayed_to_a_joiner_and_not_also_fanned_live::<Lobby>();
+    }
+
+    #[test]
+    fn a_burst_past_the_rate_cap_is_rejected() {
+        shared::a_burst_past_the_rate_cap_is_rejected::<Lobby>();
+    }
+
+    #[test]
+    fn the_rate_cap_is_independent_per_slot() {
+        shared::the_rate_cap_is_independent_per_slot::<Lobby>();
     }
 
     #[test]
     fn a_late_member_replays_the_whole_log_in_order_then_tails_live() {
         let registry = new_lobby_registry();
-        let k = key();
+        let k = session_key(1);
         // The host is up and authors setup commands before the peer's link exists.
         let _host = register_member(&registry, &k, SlotId(0));
         deliver(&registry, &k, command(0, 0x01));
@@ -357,7 +412,7 @@ mod tests {
     #[test]
     fn replay_skips_a_reconnecting_members_own_authored_commands() {
         let registry = new_lobby_registry();
-        let k = key();
+        let k = session_key(1);
         let _host = register_member(&registry, &k, SlotId(0));
         let _peer = register_member(&registry, &k, SlotId(1));
         deliver(&registry, &k, command(0, 0x10)); // host authored
@@ -370,124 +425,74 @@ mod tests {
     }
 
     #[test]
-    fn a_mesh_authored_command_reaches_every_local_member() {
+    fn the_log_survives_a_members_deregistration() {
+        // Unlike the chat channel's, a member leaving must not take the setup
+        // stream with it -- whoever joins next still has to catch up on it.
         let registry = new_lobby_registry();
-        let k = key();
-        let mut a = register_member(&registry, &k, SlotId(0));
-        let mut b = register_member(&registry, &k, SlotId(1));
-
-        // A command authored by a remote slot (7) arriving off the mesh: no local
-        // member is its author, so both locals receive it.
-        deliver(&registry, &k, command(7, 0xEE));
-        assert_eq!(drain(&mut a), vec![(7, 0xEE)]);
-        assert_eq!(drain(&mut b), vec![(7, 0xEE)]);
-    }
-
-    #[test]
-    fn a_command_appended_before_a_join_is_not_also_delivered_live() {
-        // The exactly-once boundary: a command already in the log when a member
-        // joins is delivered by the replay, and is not re-fanned live (the member
-        // was not yet in the set when it was delivered).
-        let registry = new_lobby_registry();
-        let k = key();
+        let k = session_key(1);
         let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, command(0, 0x55));
+        deliver(&registry, &k, command(0, 0x01));
+        deregister_member(&registry, &k, SlotId(0));
 
-        let mut peer = register_member(&registry, &k, SlotId(1));
-        // Exactly one copy — from the replay, not a second live delivery.
-        assert_eq!(drain(&mut peer), vec![(0, 0x55)]);
+        let mut late = register_member(&registry, &k, SlotId(1));
+        assert_eq!(drain(&mut late), vec![(0, 0x01)]);
     }
 
     #[test]
-    fn the_log_stops_growing_past_the_command_cap() {
+    fn the_log_stops_growing_past_the_command_cap_and_deliver_reports_it() {
+        // `deliver`'s own admission concern is the session-wide log cap, not
+        // the rate cap (that is `admit`, checked separately by the caller
+        // before `deliver` is ever reached). Its bool is the caller's cue for
+        // whether to also forward the command across the mesh: a command this
+        // relay refused was never logged or fanned to its own locals, so a
+        // peer that received it anyway would be out of sync with it.
         let registry = new_lobby_registry();
-        let k = key();
+        let k = session_key(1);
         let mut peer = register_member(&registry, &k, SlotId(1));
-        // Author one past the cap from slot 0 (so the peer receives them all).
-        for i in 0..(LOBBY_LOG_MAX_COMMANDS + 1) {
-            deliver(&registry, &k, command(0, i as u8));
+        // Author the whole cap from slot 0, so the peer receives them all.
+        for i in 0..LOBBY_LOG_MAX_COMMANDS {
+            assert!(
+                deliver(&registry, &k, command(0, i as u8)),
+                "command {i} is still under the log cap",
+            );
         }
-        // The peer received exactly the cap's worth — the overflow command was
+        assert!(
+            !deliver(&registry, &k, command(0, 0)),
+            "the cap is exhausted; deliver refuses",
+        );
+        assert!(
+            !deliver(&registry, &k, command(0, 0)),
+            "and the overflow latch keeps refusing",
+        );
+
+        // The peer received exactly the cap's worth — the refused commands were
         // dropped, not fanned out.
         assert_eq!(drain(&mut peer).len(), LOBBY_LOG_MAX_COMMANDS);
 
         // And a member joining afterwards replays exactly the cap's worth, the
-        // consistent prefix.
+        // truncated but consistent prefix.
         let mut late = register_member(&registry, &k, SlotId(2));
         assert_eq!(drain(&mut late).len(), LOBBY_LOG_MAX_COMMANDS);
     }
 
     #[test]
-    fn deregister_removes_a_member_but_keeps_the_log() {
+    fn the_log_stops_growing_past_the_byte_cap() {
+        // The bound's other half: a session far under the command count can
+        // still pin memory with a few large payloads, so the running byte
+        // total is what has to refuse here.
         let registry = new_lobby_registry();
-        let k = key();
-        let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, command(0, 0x01));
-        deregister_member(&registry, &k, SlotId(0));
-
-        // The log survives the member leaving, so a late joiner still catches up.
-        let mut late = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut late), vec![(0, 0x01)]);
-
-        // end_session drops everything; a fresh join then starts from empty.
-        end_session(&registry, &k);
-        let mut after = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut after), vec![]);
-    }
-
-    /// The burst-then-reject half of the cap. Recovery after a refill is the
-    /// token bucket's own test (`crate::rate_limit`), driven off synthetic
-    /// instants rather than a real wait on the production interval.
-    #[test]
-    fn a_burst_past_the_rate_cap_is_rejected() {
-        let registry = new_lobby_registry();
-        let k = key();
-        let slot = SlotId(0);
-
-        // The first LOBBY_RATE_BURST commands in a burst are all admitted --
-        // covering a full lobby's worth of setup commands from one slot.
-        for _ in 0..LOBBY_RATE_BURST {
-            assert!(admit(&registry, &k, slot));
-        }
-        // The next one, still within the burst window, is rejected.
-        assert!(!admit(&registry, &k, slot));
-    }
-
-    #[test]
-    fn the_rate_cap_is_independent_per_slot() {
-        let registry = new_lobby_registry();
-        let k = key();
-        for _ in 0..LOBBY_RATE_BURST {
-            assert!(admit(&registry, &k, SlotId(0)));
-        }
+        let k = session_key(1);
+        let big = LobbyCommand {
+            slot: 0,
+            payload: vec![0u8; LOBBY_LOG_MAX_BYTES * 2 / 3].into(),
+        };
         assert!(
-            !admit(&registry, &k, SlotId(0)),
-            "slot 0 exhausted its burst"
+            deliver(&registry, &k, big.clone()),
+            "the first payload fits under the byte cap",
         );
-        // A different slot has its own, untouched budget.
-        assert!(admit(&registry, &k, SlotId(1)));
-    }
-
-    #[test]
-    fn deliver_reports_admit_or_refuse_and_the_caller_gates_mesh_fan_out_on_it() {
-        // `deliver`'s own admission concern is the session-wide log cap, not
-        // the rate cap (that's `admit`, checked separately by the caller
-        // before `deliver` is ever reached). Exhaust the log cap directly, so
-        // `deliver` itself is what refuses, without touching the rate cap.
-        let registry = new_lobby_registry();
-        let k = key();
-        // A distinct authoring slot per command so no one slot's rate cap
-        // interferes with filling the session-wide log cap.
-        for i in 0..LOBBY_LOG_MAX_COMMANDS {
-            let slot = (i % 200) as u32; // cycle slots well past any u8 rate cap window
-            assert!(
-                deliver(&registry, &k, command(slot, 0)),
-                "command {i} should still be under the log cap",
-            );
-        }
         assert!(
-            !deliver(&registry, &k, command(250, 0)),
-            "the log cap is now exhausted; deliver refuses",
+            !deliver(&registry, &k, big),
+            "the second would cross it, and is refused far under the command cap",
         );
     }
 }

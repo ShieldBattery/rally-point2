@@ -14,24 +14,22 @@ use super::*;
 #[tokio::test]
 async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconnected() {
     let k = key();
-    let (sessions, mesh_links, makers, _inbox) = drop_hold_harness(&k, SlotId(0), SlotId(1));
+    let h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
     let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
     // Simulate a reconnect for slot 1 winning the roster race: it registers
     // before this (stale, racing) disconnect teardown reaches the
     // announcement below -- mirroring a concurrent `serve_connection`
     // acquiring the roster lock first.
-    let (mut reconnect_guard, _reconnect_inbox) =
-        register(&sessions, &k, SlotId(1), 1).expect("the reconnect claims the roster seat");
-    reconnect_guard.disarm();
+    let _reconnect_inbox = registered(&h.sessions, &k, SlotId(1));
 
     // The disconnect's teardown -- unaware the seat was already reclaimed --
     // reaches its announcement.
     announce_departure(
         &holds,
-        &makers,
-        &sessions,
-        &mesh_links,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
         &crate::session::provisional_turns::ProvisionalTurnPen::default(),
         &k,
         SlotId(1),
@@ -45,7 +43,7 @@ async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconne
         "no hold was marked against the already-reconnected slot",
     );
     assert!(
-        !consensus::slot_departed(&makers, &k, SlotId(1)),
+        !consensus::slot_departed(&h.makers, &k, SlotId(1)),
         "no departure record was written against the already-reconnected slot -- \
          an orphaned record would wrongly refuse every later reconnect for the slot",
     );
@@ -54,18 +52,13 @@ async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconne
 #[test]
 fn old_link_teardown_cannot_erase_a_replacement_epoch() {
     use crate::consensus::Authority;
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
     use rally_point_proto::messages::SlotConditions;
 
     let sessions: Sessions = Arc::default();
     let mesh = crate::mesh::new_mesh_state();
     let k = key();
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &k,
-        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
-    );
+    seed_maker(&mesh.decision_makers, &k, Authority::Peer, &[], &[]);
     let replacement = SlotConditions {
         slot: 0,
         rtt_us: 30_000,
@@ -110,7 +103,6 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
 async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     use crate::consensus::{self, Authority};
     use crate::session::presence::{self, Candidate};
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let k = key();
@@ -123,22 +115,13 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
 
     // A started single-relay session of two framed slots, this relay authority.
-    let _ = consensus::sync_maker(
-        &makers,
-        &k,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_maker(&makers, &k, Authority::SelfRelay, &[0, 1], &[]);
     consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
     consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
     presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
 
-    let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, _i1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 registers");
-    g0.disarm();
-    g1.disarm();
+    let _i0 = registered(&sessions, &k, SlotId(0));
+    let _i1 = registered(&sessions, &k, SlotId(1));
     let _ = consensus::note_slot_present(&makers, &k, SlotId(0));
     let _ = consensus::note_slot_present(&makers, &k, SlotId(1));
     report_own_presence(
@@ -202,8 +185,7 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     // Slot 0 re-registers while its drop is still held: register, then claim +
     // reinstate atomically as the server does, then report presence — which
     // re-promotes.
-    let (mut r0, _ri0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 re-registers");
-    r0.disarm();
+    let _ri0 = registered(&sessions, &k, SlotId(0));
     assert!(
         holds.take_if_pending(&k, SlotId(0), || consensus::reinstate_slot(
             &makers,
@@ -223,8 +205,7 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     );
 
     // Slot 1 re-registers too.
-    let (mut r1, _ri1) = register(&sessions, &k, SlotId(1), 1).expect("slot 1 re-registers");
-    r1.disarm();
+    let _ri1 = registered(&sessions, &k, SlotId(1));
     assert!(
         holds.take_if_pending(&k, SlotId(1), || consensus::reinstate_slot(
             &makers,
@@ -263,15 +244,19 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
 async fn connectivity_fans_to_every_local_slot() {
     let k = key();
     let sessions: Sessions = Arc::default();
-    let (mut g0, mut inbox0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");
-    let (mut g1, mut inbox1) = register(&sessions, &k, SlotId(3), 1).expect("slot 3 registers");
-    g0.disarm();
-    g1.disarm();
+    let mut inbox0 = registered(&sessions, &k, SlotId(0));
+    let mut inbox1 = registered(&sessions, &k, SlotId(3));
 
     fan_out_connectivity(&sessions, &k, SlotId(3), false, None);
 
-    let a = inbox0.conn_push_rx.try_recv().expect("slot 0 hears it");
-    assert_eq!(a, (SlotId(3), false, None));
-    let b = inbox1.conn_push_rx.try_recv().expect("slot 3 hears it too");
-    assert_eq!(b, (SlotId(3), false, None));
+    assert_eq!(
+        inbox0.try_recv_connectivity_change(),
+        Some((SlotId(3), false, None)),
+        "slot 0 hears it",
+    );
+    assert_eq!(
+        inbox1.try_recv_connectivity_change(),
+        Some((SlotId(3), false, None)),
+        "and so does the subject slot itself",
+    );
 }

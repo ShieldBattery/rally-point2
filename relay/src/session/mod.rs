@@ -10,6 +10,11 @@
 
 pub mod chat;
 pub mod drop_hold;
+/// The test bodies `chat`, `lobby` and `skin` share — they are one registry
+/// with three replay policies, so everything that is not the replay policy is
+/// asserted once, generically, rather than three times.
+#[cfg(test)]
+pub(crate) mod fanout_tests;
 pub mod gate;
 pub mod lobby;
 pub mod presence;

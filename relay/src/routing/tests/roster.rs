@@ -32,15 +32,6 @@ fn an_occupied_slot_is_refused() {
 }
 
 #[test]
-fn dropping_an_armed_registration_frees_the_slot() {
-    let sessions: Sessions = Arc::default();
-    let (guard, _inbox) = register(&sessions, &key(), SlotId(0), 1).expect("first registers");
-    drop(guard);
-    // The slot — and the now-empty group — are gone, so it registers anew.
-    assert!(register(&sessions, &key(), SlotId(0), 1).is_some());
-}
-
-#[test]
 fn live_slots_snapshots_registered_slots_per_group() {
     let sessions: Sessions = Arc::default();
     assert!(live_slots(&sessions).is_empty(), "a fresh roster is empty");
@@ -101,9 +92,11 @@ fn a_fence_probe_reaches_only_the_link_generation_it_names() {
 }
 
 #[test]
-fn holds_any_slots_tracks_registration_and_release() {
-    // The drain-idle predicate: empty until a slot registers, empty again once it
-    // is freed — so the coordinated-drain wait converges when the last slot leaves.
+fn dropping_an_armed_registration_frees_the_slot_and_its_emptied_group() {
+    // The drain-idle predicate: empty until a slot registers, empty again once
+    // it is freed — so the coordinated-drain wait converges when the last slot
+    // leaves — and the freed slot is genuinely reclaimable, not merely absent
+    // from the snapshot.
     let sessions: Sessions = Arc::default();
     assert!(!holds_any_slots(&sessions), "a fresh roster holds no slots");
     let (guard, _inbox) = register(&sessions, &key(), SlotId(0), 1).expect("slot 0 registers");
@@ -112,6 +105,39 @@ fn holds_any_slots_tracks_registration_and_release() {
     assert!(
         !holds_any_slots(&sessions),
         "freeing the last slot drops the group, so nothing is held",
+    );
+    assert!(
+        register(&sessions, &key(), SlotId(0), 1).is_some(),
+        "the slot -- and its now-empty group -- register anew",
+    );
+}
+
+/// Slot occupancy and fan-out are scoped by the whole `(tenant, session)` key,
+/// never by the session number alone: two tenants assigned the same session id
+/// must neither block nor receive each other's traffic.
+#[tokio::test]
+async fn two_tenants_sharing_a_session_id_register_and_fan_out_independently() {
+    let sessions: Sessions = Arc::default();
+    let first = key();
+    let second = SessionKey {
+        tenant: TenantId::new("other-tenant").unwrap(),
+        session: first.session,
+    };
+
+    let _sender = registered(&sessions, &first, SlotId(0));
+    let mut peer = registered(&sessions, &first, SlotId(1));
+    // The same slot id under the other tenant is free, not occupied.
+    let mut stranger = registered(&sessions, &second, SlotId(1));
+
+    fan_out(&sessions, &first, SlotId(0), payload());
+
+    assert!(
+        peer.try_recv_forward().is_some(),
+        "the turn reaches its own tenant's peer",
+    );
+    assert!(
+        stranger.try_recv_forward().is_none(),
+        "and never crosses into the other tenant's identically-numbered session",
     );
 }
 

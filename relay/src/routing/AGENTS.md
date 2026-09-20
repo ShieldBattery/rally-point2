@@ -49,4 +49,8 @@ holds `&mut` on the context. Arms return `ControlFlow`; `Break` means
 `cargo test -p rally-point-relay --lib routing::`. Fixtures and the drop-hold /
 abandoned-session harnesses live in `tests/mod.rs`; `TINY_ABANDON`,
 `IMMEDIATE_UNLOCK` and `UNREACHABLE_UNLOCK` make those windows drivable without
-real waits. `relay/tests/client_edge/` drives `run_slot_link` end to end.
+real waits, and a test that still has to outlast one runs under
+`#[tokio::test(start_paused = true)]`, where a sleep past the deadline costs
+no real time. Read a registered slot through `SlotInbox`'s accessors rather
+than its private fields, so the in-module tests and the cross-module ones
+share one path. `relay/tests/client_edge/` drives `run_slot_link` end to end.

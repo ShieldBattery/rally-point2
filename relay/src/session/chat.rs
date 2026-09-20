@@ -220,43 +220,80 @@ pub fn deliver(registry: &ChatRegistry, key: &SessionKey, chat: GameChat) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rally_point_proto::control::TenantId;
-    use rally_point_proto::ids::SessionId;
+    use crate::session::fanout_tests::{self as shared, FanOutChannel};
+    use crate::test_support::session_key;
 
-    fn key() -> SessionKey {
-        SessionKey {
-            tenant: TenantId("sb-staging".to_owned()),
-            session: SessionId(1),
-        }
-    }
+    /// Chat as one of the three fan-out registries, so the guarantees it
+    /// shares with the lobby and skin channels are asserted from the one
+    /// shared set of bodies.
+    struct Chat;
 
-    fn chat(slot: u32, text: &str) -> GameChat {
-        GameChat {
-            slot,
-            target_kind: 0,
-            target_slot: 0,
-            text: text.to_owned(),
-        }
-    }
+    impl FanOutChannel for Chat {
+        type Registry = ChatRegistry;
+        type Message = GameChat;
 
-    fn drain(rx: &mut mpsc::Receiver<GameChat>) -> Vec<(u32, String)> {
-        let mut got = Vec::new();
-        while let Ok(chat) = rx.try_recv() {
-            got.push((chat.slot, chat.text));
+        const RATE_BURST: u32 = CHAT_RATE_BURST;
+
+        fn new_registry() -> ChatRegistry {
+            new_chat_registry()
         }
-        got
+        fn register_member(
+            registry: &ChatRegistry,
+            key: &SessionKey,
+            slot: SlotId,
+        ) -> mpsc::Receiver<GameChat> {
+            register_member(registry, key, slot)
+        }
+        fn deregister_member(registry: &ChatRegistry, key: &SessionKey, slot: SlotId) {
+            deregister_member(registry, key, slot);
+        }
+        fn end_session(registry: &ChatRegistry, key: &SessionKey) {
+            end_session(registry, key);
+        }
+        fn admit(registry: &ChatRegistry, key: &SessionKey, slot: SlotId, len: usize) -> bool {
+            admit(registry, key, slot, len)
+        }
+        fn deliver(registry: &ChatRegistry, key: &SessionKey, message: GameChat) -> bool {
+            deliver(registry, key, message);
+            // Chat refuses nothing at fan-out: there is no log to overflow.
+            true
+        }
+        fn message(slot: u32, body: &str) -> GameChat {
+            GameChat {
+                slot,
+                target_kind: 0,
+                target_slot: 0,
+                text: body.to_owned(),
+            }
+        }
+        fn parts(message: &GameChat) -> (u32, String) {
+            (message.slot, message.text.clone())
+        }
     }
 
     #[test]
     fn a_message_fans_out_to_every_member_but_its_author() {
-        let registry = new_chat_registry();
-        let k = key();
-        let mut host = register_member(&registry, &k, SlotId(0));
-        let mut peer = register_member(&registry, &k, SlotId(1));
+        shared::the_author_is_skipped_and_every_other_member_is_reached::<Chat>();
+    }
 
-        deliver(&registry, &k, chat(0, "gl hf"));
-        assert_eq!(drain(&mut host), vec![], "the author is not echoed its own");
-        assert_eq!(drain(&mut peer), vec![(0, "gl hf".to_owned())]);
+    #[test]
+    fn deregister_removes_a_member_and_end_session_drops_the_channel() {
+        shared::a_deregistered_member_stops_receiving_and_end_session_clears_the_state::<Chat>();
+    }
+
+    #[test]
+    fn oversize_text_is_rejected_by_admit() {
+        shared::the_size_cap_admits_exactly_its_boundary::<Chat>(CHAT_TEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_burst_past_the_rate_cap_is_rejected() {
+        shared::a_burst_past_the_rate_cap_is_rejected::<Chat>();
+    }
+
+    #[test]
+    fn the_rate_cap_is_independent_per_slot() {
+        shared::the_rate_cap_is_independent_per_slot::<Chat>();
     }
 
     #[test]
@@ -265,74 +302,19 @@ mod tests {
         // a message delivered before a member joins is simply missed, not
         // replayed to it later.
         let registry = new_chat_registry();
-        let k = key();
+        let k = session_key(1);
         let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, chat(0, "before you joined"));
+        deliver(&registry, &k, Chat::message(0, "before you joined"));
 
         let mut late = register_member(&registry, &k, SlotId(1));
         assert_eq!(
-            drain(&mut late),
+            shared::drain::<Chat>(&mut late),
             vec![],
             "chat is ephemeral -- a late joiner gets no replay"
         );
 
         // But it does tail live messages from that point on.
-        deliver(&registry, &k, chat(0, "hi"));
-        assert_eq!(drain(&mut late), vec![(0, "hi".to_owned())]);
-    }
-
-    #[test]
-    fn a_mesh_authored_message_reaches_every_local_member() {
-        let registry = new_chat_registry();
-        let k = key();
-        let mut a = register_member(&registry, &k, SlotId(0));
-        let mut b = register_member(&registry, &k, SlotId(1));
-
-        // A remote slot (7) authored this, arriving off the mesh: neither local
-        // member is its author, so both receive it.
-        deliver(&registry, &k, chat(7, "hey from relay B"));
-        assert_eq!(drain(&mut a), vec![(7, "hey from relay B".to_owned())]);
-        assert_eq!(drain(&mut b), vec![(7, "hey from relay B".to_owned())]);
-    }
-
-    #[test]
-    fn oversize_text_is_rejected_by_admit() {
-        let registry = new_chat_registry();
-        let k = key();
-        assert!(admit(&registry, &k, SlotId(0), CHAT_TEXT_MAX_BYTES));
-        assert!(!admit(&registry, &k, SlotId(0), CHAT_TEXT_MAX_BYTES + 1));
-    }
-
-    /// The burst-then-reject half of the cap. Recovery after a refill is the
-    /// token bucket's own test (`crate::rate_limit`), driven off synthetic
-    /// instants rather than a real wait on the production interval.
-    #[test]
-    fn a_burst_past_the_rate_cap_is_rejected() {
-        let registry = new_chat_registry();
-        let k = key();
-        let slot = SlotId(0);
-
-        // The first CHAT_RATE_BURST messages in a burst are all admitted.
-        for _ in 0..CHAT_RATE_BURST {
-            assert!(admit(&registry, &k, slot, 4));
-        }
-        // The next one, still within the burst window, is rejected.
-        assert!(!admit(&registry, &k, slot, 4));
-    }
-
-    #[test]
-    fn deregister_removes_a_member_but_a_late_joiner_still_gets_no_replay() {
-        let registry = new_chat_registry();
-        let k = key();
-        let _host = register_member(&registry, &k, SlotId(0));
-        deliver(&registry, &k, chat(0, "before"));
-        deregister_member(&registry, &k, SlotId(0));
-
-        let mut late = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut late), vec![]);
-
-        end_session(&registry, &k);
-        let mut after = register_member(&registry, &k, SlotId(1));
-        assert_eq!(drain(&mut after), vec![]);
+        deliver(&registry, &k, Chat::message(0, "hi"));
+        assert_eq!(shared::drain::<Chat>(&mut late), vec![(0, "hi".to_owned())]);
     }
 }

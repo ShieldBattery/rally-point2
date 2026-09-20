@@ -42,3 +42,11 @@ teardown).
 
 `cargo test -p rally-point-relay --lib session::` — each split module's tests
 live in a sibling `tests.rs` or `tests/`.
+
+`fanout_tests.rs` holds the test bodies `chat`, `lobby` and `skin` share.
+They are one registry with three replay policies, so everything that is not
+the replay policy — author exclusion, the caps, teardown — is asserted once,
+generic over a `FanOutChannel` impl each module declares in its own test
+module. A guarantee that belongs to exactly one of the three goes in that
+module; a guarantee all three owe goes in `fanout_tests.rs`, never three
+times.

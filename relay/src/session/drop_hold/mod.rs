@@ -251,10 +251,15 @@ impl DropHolds {
     /// window). Records nothing to decide: a dropped slot is removed only by an
     /// honored `RequestDrop`, or never.
     pub fn hold(&self, key: SessionKey, slot: SlotId) {
-        self.holds
-            .lock()
-            .entry((key, slot))
-            .or_insert_with(Instant::now);
+        self.hold_at(key, slot, Instant::now());
+    }
+
+    /// [`hold`](Self::hold) with the observation instant supplied rather than
+    /// read off the clock, and the instant the hold ended up stamped with
+    /// returned — so the duplicate-hold rule can be asserted exactly, on one
+    /// synthetic timeline, instead of through elapsed wall-clock time.
+    fn hold_at(&self, key: SessionKey, slot: SlotId, at: Instant) -> Instant {
+        *self.holds.lock().entry((key, slot)).or_insert(at)
     }
 
     /// Runs `record` and installs the corresponding drop hold only when the
