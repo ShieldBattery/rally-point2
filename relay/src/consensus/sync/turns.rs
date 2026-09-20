@@ -19,6 +19,21 @@ pub(in crate::consensus) struct SyncTurn {
     pub frame: Option<u32>,
     pub ordinal: Option<u64>,
     pub command: Option<SyncCommand>,
+    /// The origin's absolute native generation for `command`, when this origin
+    /// uses the enhanced checksum-coverage contract.
+    pub generation: Option<u64>,
+    /// Native generations this origin asserts were not emitted between its last
+    /// checksum and this one.
+    pub skipped: Option<SyncGap>,
+}
+
+/// A non-empty, half-open interval of checksum generations the originating
+/// client asserts it did not emit. It is derived only after the transport prefix is
+/// complete, so a delayed turn cannot manufacture an omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::consensus) struct SyncGap {
+    pub first: u64,
+    pub end: u64,
 }
 
 /// Captured before discarding a slot's pending metadata. Sequence gaps describe
@@ -43,7 +58,14 @@ struct SlotTurns {
     next: u64,
     pending: BTreeMap<u64, SyncTurn>,
     ordinal: Option<u64>,
+    mode: Option<SyncMode>,
     failure: Option<SyncOrderingFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncMode {
+    Legacy,
+    Enhanced,
 }
 
 impl SyncTurns {
@@ -142,25 +164,73 @@ impl SlotTurns {
         };
         if let Some(command) = turn.command {
             let ring = u64::from(command.ring);
-            // Repeated startup checksums retain their ordinal. A jump cannot
-            // establish how many whole ring cycles were omitted, even when the
-            // transport prefix is complete. Never guess an epoch from proximity.
-            let ordinal = match self.ordinal {
-                None => ring,
-                Some(last) if last % SYNC_RING_MODULUS == ring => last,
-                Some(last) if (last % SYNC_RING_MODULUS + 1) % SYNC_RING_MODULUS == ring => {
-                    let Some(ordinal) = last.checked_add(1) else {
-                        return Err(self.fail("ordinal_overflow", seq, turn));
-                    };
-                    ordinal
+            let ordinal = match (self.mode, turn.generation) {
+                (None, None) => {
+                    self.mode = Some(SyncMode::Legacy);
+                    unwrap_legacy_ordinal(self.ordinal, ring)
+                        .map_err(|reason| self.fail(reason, seq, turn))?
                 }
-                Some(_) => return Err(self.fail("ring_discontinuity", seq, turn)),
+                (None, Some(u64::MAX)) => {
+                    return Err(self.fail("generation_overflow", seq, turn));
+                }
+                (None, Some(generation)) => {
+                    if generation != ring {
+                        return Err(self.fail("generation_initial_anchor", seq, turn));
+                    }
+                    self.mode = Some(SyncMode::Enhanced);
+                    generation
+                }
+                (Some(SyncMode::Legacy), None) => unwrap_legacy_ordinal(self.ordinal, ring)
+                    .map_err(|reason| self.fail(reason, seq, turn))?,
+                (Some(SyncMode::Legacy), Some(_)) | (Some(SyncMode::Enhanced), None) => {
+                    return Err(self.fail("generation_mode_mismatch", seq, turn));
+                }
+                (Some(SyncMode::Enhanced), Some(generation)) => {
+                    if generation == u64::MAX {
+                        return Err(self.fail("generation_overflow", seq, turn));
+                    }
+                    if generation % SYNC_RING_MODULUS != ring {
+                        return Err(self.fail("generation_ring_mismatch", seq, turn));
+                    }
+                    let Some(last) = self.ordinal else {
+                        return Err(self.fail("generation_missing_anchor", seq, turn));
+                    };
+                    let Some(delta) = generation.checked_sub(last) else {
+                        return Err(self.fail("generation_regression", seq, turn));
+                    };
+                    if delta > u64::from(GAME_SYNC_SAFE_BUFFER_MAX) {
+                        return Err(self.fail("generation_jump", seq, turn));
+                    }
+                    if delta > 1 {
+                        let Some(first) = last.checked_add(1) else {
+                            return Err(self.fail("ordinal_overflow", seq, turn));
+                        };
+                        turn.skipped = Some(SyncGap {
+                            first,
+                            end: generation,
+                        });
+                    }
+                    generation
+                }
             };
             self.ordinal = Some(ordinal);
             turn.ordinal = Some(ordinal);
+        } else if turn.generation.is_some() {
+            return Err(self.fail("generation_without_sync", seq, turn));
         }
         self.next = next;
         Ok(turn)
+    }
+}
+
+fn unwrap_legacy_ordinal(last: Option<u64>, ring: u64) -> Result<u64, &'static str> {
+    match last {
+        None => Ok(ring),
+        Some(last) if last % SYNC_RING_MODULUS == ring => Ok(last),
+        Some(last) if (last % SYNC_RING_MODULUS + 1) % SYNC_RING_MODULUS == ring => {
+            last.checked_add(1).ok_or("ordinal_overflow")
+        }
+        Some(_) => Err("ring_discontinuity"),
     }
 }
 
@@ -177,7 +247,103 @@ mod tests {
                 kind: 1,
                 value: [0, 0],
             }),
+            generation: None,
+            skipped: None,
         }
+    }
+
+    fn enhanced_turn(ring: u8, generation: u64) -> SyncTurn {
+        SyncTurn {
+            frame: None,
+            ordinal: None,
+            command: Some(SyncCommand {
+                ring,
+                kind: 1,
+                value: [0, 0],
+            }),
+            generation: Some(generation),
+            skipped: None,
+        }
+    }
+
+    #[test]
+    fn enhanced_generation_unwraps_the_incident_jump_and_marks_its_omission() {
+        let mut turns = SyncTurns::default();
+        turns.slots.insert(
+            SlotId(0),
+            SlotTurns {
+                next: 2041,
+                ordinal: Some(2034),
+                mode: Some(SyncMode::Enhanced),
+                ..Default::default()
+            },
+        );
+        let turn = turns
+            .push(SlotId(0), 2041, enhanced_turn(4, 2036))
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.ordinal, Some(2036));
+        assert_eq!(
+            turn.skipped,
+            Some(SyncGap {
+                first: 2035,
+                end: 2036,
+            })
+        );
+        assert!(!turns.unavailable(SlotId(0)));
+    }
+
+    #[test]
+    fn enhanced_generation_failures_stay_with_their_origin() {
+        for (generation, ring, reason) in [
+            (2, 1, "generation_initial_anchor"),
+            (u64::MAX, 15, "generation_overflow"),
+        ] {
+            let mut turns = SyncTurns::default();
+            assert_eq!(
+                turns
+                    .push(SlotId(0), 0, enhanced_turn(ring, generation))
+                    .unwrap_err()
+                    .reason,
+                reason
+            );
+            assert!(
+                turns
+                    .push(SlotId(1), 0, enhanced_turn(0, 0))
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(turns.unavailable(SlotId(0)));
+            assert!(!turns.unavailable(SlotId(1)));
+        }
+
+        let mut turns = SyncTurns::default();
+        turns.push(SlotId(0), 0, enhanced_turn(0, 0)).unwrap();
+        assert_eq!(
+            turns
+                .push(SlotId(0), 1, enhanced_turn(15, u64::MAX))
+                .unwrap_err()
+                .reason,
+            "generation_overflow"
+        );
+    }
+
+    #[test]
+    fn enhanced_mode_never_downgrades_or_accepts_unbound_metadata() {
+        let mut turns = SyncTurns::default();
+        turns.push(SlotId(0), 0, enhanced_turn(0, 0)).unwrap();
+        assert_eq!(
+            turns.push(SlotId(0), 1, turn(Some(1))).unwrap_err().reason,
+            "generation_mode_mismatch"
+        );
+
+        let mut turns = SyncTurns::default();
+        let mut unbound = turn(None);
+        unbound.generation = Some(0);
+        assert_eq!(
+            turns.push(SlotId(0), 0, unbound).unwrap_err().reason,
+            "generation_without_sync"
+        );
     }
 
     #[test]

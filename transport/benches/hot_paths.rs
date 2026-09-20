@@ -11,6 +11,7 @@ fn payload(slot: u8, seq: u64, command_bytes: usize) -> Payload {
         slot: u32::from(slot),
         commands: vec![0x05; command_bytes].into(),
         game_frame_count: Some(seq as u32),
+        sync_generation: None,
         buffer_directive: None,
     }
 }

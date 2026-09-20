@@ -36,6 +36,7 @@ fuzz_target!(|commands: &[u8]| {
         slot: u32::MAX,
         commands: commands.to_vec().into(),
         game_frame_count: Some(41),
+        sync_generation: None,
         buffer_directive: None,
     };
     match validate_turn(slot, payload) {

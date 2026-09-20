@@ -40,6 +40,159 @@ fn ordered_feed(maker: &mut DecisionMaker, slot: u8, ordinal: u16) -> Option<Syn
 }
 
 #[test]
+fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checksum() {
+    let mut maker = authority_maker();
+    for generation in 0..=2034u64 {
+        for slot in 0..3 {
+            assert!(
+                maker
+                    .observe_sync_with_generation(
+                        SlotId(slot),
+                        generation,
+                        Some(generation as u32),
+                        &sync_command(
+                            (generation % 16) as u8,
+                            expected_kind_for_ordinal(generation),
+                            SYNC_A,
+                        ),
+                        Some(generation),
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    for slot in [0, 1] {
+        assert!(
+            maker
+                .observe_sync_with_generation(
+                    SlotId(slot),
+                    2035,
+                    Some(2035),
+                    &sync_command(3, SYNC_KIND_HEADER, SYNC_A),
+                    Some(2035),
+                )
+                .is_none()
+        );
+    }
+    // The origin's transport sequence stays contiguous while native generation 2035 is omitted.
+    assert!(
+        maker
+            .observe_sync_with_generation(
+                SlotId(2),
+                2035,
+                Some(2036),
+                &sync_command(4, SYNC_KIND_UNITS, SYNC_A),
+                Some(2036),
+            )
+            .is_none()
+    );
+    for slot in [0, 1] {
+        assert!(
+            maker
+                .observe_sync_with_generation(
+                    SlotId(slot),
+                    2036,
+                    Some(2036),
+                    &sync_command(4, SYNC_KIND_UNITS, SYNC_A),
+                    Some(2036),
+                )
+                .is_none()
+        );
+    }
+
+    for slot in [0, 1] {
+        assert!(
+            maker
+                .observe_sync_with_generation(
+                    SlotId(slot),
+                    2037,
+                    Some(2037),
+                    &sync_command(5, SYNC_KIND_HEADER, SYNC_A),
+                    Some(2037),
+                )
+                .is_none()
+        );
+    }
+    assert!(
+        maker
+            .observe_sync_with_generation(
+                SlotId(2),
+                2036,
+                Some(2037),
+                &sync_command(5, SYNC_KIND_HEADER, SYNC_B),
+                Some(2037),
+            )
+            .is_none()
+    );
+
+    let mut divergence = None;
+    for generation in 2038..=2044u64 {
+        divergence = maker.observe_sync_with_generation(
+            SlotId(0),
+            generation,
+            Some(generation as u32),
+            &sync_command(
+                (generation % 16) as u8,
+                expected_kind_for_ordinal(generation),
+                SYNC_A,
+            ),
+            Some(generation),
+        );
+    }
+    assert_eq!(
+        divergence,
+        Some(SyncDivergence {
+            sync_ordinal: 2037,
+            game_frame: Some(2037),
+            no_majority: false,
+            diverged: vec![SlotId(2)],
+        })
+    );
+    assert!(maker.sync.base_ordinal >= 2038);
+    assert_eq!(maker.sync.evict_warns, 0);
+    assert!(!maker.sync_turns.unavailable(SlotId(0)));
+    assert!(!maker.sync_turns.unavailable(SlotId(1)));
+    assert!(!maker.sync_turns.unavailable(SlotId(2)));
+}
+
+#[test]
+fn enhanced_metadata_survives_reordering_across_promotion() {
+    let mut maker = authority_maker();
+    let _ = maker.set_authority(Authority::Peer, &HashSet::new());
+    assert!(
+        maker
+            .observe_sync_with_generation(
+                SlotId(0),
+                0,
+                Some(0),
+                &sync_command(0, SYNC_KIND_UNITS, SYNC_A),
+                Some(0),
+            )
+            .is_none()
+    );
+    assert!(
+        maker
+            .observe_sync_with_generation(
+                SlotId(0),
+                2,
+                Some(3),
+                &sync_command(3, SYNC_KIND_HEADER, SYNC_A),
+                Some(3),
+            )
+            .is_none()
+    );
+
+    let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
+    assert!(
+        maker
+            .observe_sync_with_generation(SlotId(0), 1, Some(1), &[0x05], None)
+            .is_none()
+    );
+    assert!(maker.sync_turns.ordered(SlotId(0)));
+    assert!(!maker.sync_turns.unavailable(SlotId(0)));
+}
+#[test]
 fn a_real_disagreement_is_detected_after_reordered_turns_recover() {
     let mut maker = authority_maker();
     for ordinal in 0..40 {

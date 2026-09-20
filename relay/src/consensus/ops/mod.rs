@@ -17,7 +17,8 @@ mod sync_coverage;
 
 pub use authority::{
     FrameRegression, is_authority, observe_delivery, observe_frame, observe_sync,
-    observe_turn_frame, session_e2e, set_authority, slot_frame, sync_maker,
+    observe_sync_with_generation, observe_turn_frame, session_e2e, set_authority, slot_frame,
+    sync_maker,
 };
 pub use buffer::{
     active_directive, ingest_local_condition, ingest_local_conditions, ingest_remote_conditions,

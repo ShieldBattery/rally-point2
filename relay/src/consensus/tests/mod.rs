@@ -15,6 +15,7 @@ use rally_point_proto::messages::SlotConditions;
 
 mod authority;
 mod control_law;
+mod desync_generations;
 mod desync_majority;
 mod desync_ordering;
 mod desync_ordinals;

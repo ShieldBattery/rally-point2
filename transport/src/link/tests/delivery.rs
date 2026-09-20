@@ -32,7 +32,7 @@ async fn delivers_each_payload_once_and_retires_on_ack() {
 }
 
 #[tokio::test]
-async fn preserves_game_frame_count_across_send_and_recv() {
+async fn preserves_payload_annotations_across_send_and_recv() {
     // The frame is a consensus annotation, not a transport key: the link
     // dedups and retires by (slot, seq) and must carry the frame through
     // verbatim so the relay and decision-maker can key on it. A None (lobby
@@ -44,6 +44,7 @@ async fn preserves_game_frame_count_across_send_and_recv() {
             seq: 0,
             slot: 0,
             game_frame_count: Some(1337),
+            sync_generation: Some(73),
             commands: vec![0x05].into(),
             ..Default::default()
         }))
@@ -63,6 +64,7 @@ async fn preserves_game_frame_count_across_send_and_recv() {
     }
     delivered.sort_by_key(|p| p.seq);
     assert_eq!(delivered[0].game_frame_count, Some(1337));
+    assert_eq!(delivered[0].sync_generation, Some(73));
     assert_eq!(delivered[1].game_frame_count, None);
 }
 
@@ -80,6 +82,7 @@ async fn preserves_buffer_directive_across_send_and_recv() {
             seq: 0,
             slot: 0,
             game_frame_count: Some(500),
+            sync_generation: None,
             buffer_directive: Some(BufferDirective {
                 buffer_turns: 6,
                 apply_at_frame: 512,

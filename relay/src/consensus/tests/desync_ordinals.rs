@@ -18,6 +18,7 @@ fn tracker_record(
             value,
             game_frame: u32::try_from(ordinal).ok(),
         },
+        None,
         authority_margin(),
     )
 }
@@ -134,7 +135,10 @@ fn same_ordinal_duplicate_keeps_the_first_value_and_progress() {
     tracker_feed(&mut tracker, 0, 7, SYNC_B);
 
     assert_eq!(tracker.members[&SlotId(0)].next_expected, 8);
-    assert_eq!(tracker.pending[&7][&SlotId(0)].value, SYNC_A);
+    assert!(matches!(
+        tracker.pending[&7][&SlotId(0)],
+        SyncObservation::Report(SyncReport { value: SYNC_A, .. })
+    ));
     assert!(tracker.duplicate_warns > 0);
 }
 

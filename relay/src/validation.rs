@@ -214,6 +214,7 @@ mod tests {
             slot: u32::MAX,
             commands: commands.to_vec().into(),
             game_frame_count,
+            sync_generation: None,
             buffer_directive: None,
         }
     }
@@ -266,6 +267,18 @@ mod tests {
         for frame in [None, Some(0u32), Some(1), Some(42), Some(u32::MAX)] {
             let turn = validate_bytes(SLOT, 0, frame, &[0x05]).unwrap();
             assert_eq!(turn.payload.game_frame_count, frame);
+        }
+    }
+
+    #[test]
+    fn preserves_sync_generation_when_stripping_relay_owned_commands() {
+        for generation in [None, Some(0), Some(2036), Some(u64::MAX)] {
+            let mut input = payload(2041, Some(2035), &[0x55, 0, 0x37, 4, 1, 2, 3, 4, 5]);
+            input.sync_generation = generation;
+            let turn = validate_turn(SLOT, input).unwrap();
+            assert_eq!(turn.payload.sync_generation, generation);
+            assert_eq!(&turn.payload.commands[..], &[0x37, 4, 1, 2, 3, 4, 5]);
+            assert_eq!(turn.stripped_control, 1);
         }
     }
 

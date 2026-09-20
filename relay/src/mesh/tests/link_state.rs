@@ -347,6 +347,7 @@ async fn fold_oversize_into_link_advances_the_dedup_and_gates_dispatch() {
             seq: 0,
             slot: 0,
             commands: vec![0xAB; 2000].into(),
+            sync_generation: Some(73),
             ..Default::default()
         })),
     };

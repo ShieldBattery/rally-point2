@@ -194,6 +194,16 @@ message Payload {
   // don't participate in apply-at-turn-N decisions).
   optional uint32 game_frame_count = 4;
 
+  // Absolute native checksum-generation ordinal for the first 0x37 checksum
+  // command in this payload. This is origin-claimed observation metadata,
+  // independent of transport seq and send-time game_frame_count. It may repeat
+  // on extra flushes or skip when the game shrinks its buffer. Relays preserve
+  // it verbatim across forwarding, retransmission, oversize delivery, and
+  // resume; it is not forwarding or deduplication control. Absent for legacy
+  // senders and payloads without a sync command. The all-ones value is reserved
+  // as invalid/unknown; clients use it to fail closed when coverage is unavailable.
+  optional uint64 sync_generation = 6;
+
   // A latency-buffer change the decision-making relay is broadcasting, if this
   // forwarded turn carries one. The relay that holds buffer authority stamps
   // this onto every turn it forwards until the whole session has passed the

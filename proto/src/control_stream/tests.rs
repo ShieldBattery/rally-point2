@@ -12,9 +12,53 @@ fn oversize_turn(bytes: usize) -> ControlFrame {
             slot: 2,
             commands: vec![0x0C; bytes].into(),
             game_frame_count: Some(41),
+            sync_generation: Some(73),
             buffer_directive: None,
         })),
     }
+}
+
+#[test]
+fn payload_sync_generation_presence_and_round_trip_are_backward_compatible() {
+    let legacy = Payload {
+        seq: 9,
+        slot: 2,
+        commands: vec![0x0C].into(),
+        game_frame_count: Some(41),
+        sync_generation: None,
+        buffer_directive: None,
+    };
+    let legacy_bytes = legacy.encode_to_vec();
+    assert_eq!(
+        Payload::decode(legacy_bytes.as_slice())
+            .unwrap()
+            .sync_generation,
+        None
+    );
+
+    let explicit_zero = Payload {
+        sync_generation: Some(0),
+        ..legacy.clone()
+    };
+    let explicit_zero_bytes = explicit_zero.encode_to_vec();
+    assert_ne!(explicit_zero_bytes, legacy_bytes);
+    assert_eq!(
+        Payload::decode(explicit_zero_bytes.as_slice())
+            .unwrap()
+            .sync_generation,
+        Some(0)
+    );
+
+    let nonzero = Payload {
+        sync_generation: Some(987_654_321),
+        ..legacy
+    };
+    assert_eq!(
+        Payload::decode(nonzero.encode_to_vec().as_slice())
+            .unwrap()
+            .sync_generation,
+        Some(987_654_321)
+    );
 }
 
 #[test]
@@ -255,6 +299,7 @@ fn mesh_control_frames_round_trip_through_the_shared_framing() {
             slot: 2,
             commands: vec![0x0C; 2000].into(),
             game_frame_count: Some(41),
+            sync_generation: Some(73),
             buffer_directive: None,
         })),
     };

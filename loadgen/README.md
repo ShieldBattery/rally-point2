@@ -23,7 +23,10 @@ game simulation is the real production path, not a mock:
 - **Sync comparator** — every turn carries a well-formed `0x37` sync command (ring nibble, hash
   kind, `hash16`), derived from a per-session seed so all players agree — the comparator runs hot
   but observes no divergence. A `--desync-fraction` knob perturbs one player's hashes to exercise
-  the desync verdict + webhook path deliberately.
+  the desync verdict + webhook path deliberately. Even-numbered slots attach the checksum's
+  absolute generation; odd-numbered slots remain untagged, exercising enhanced and legacy origins
+  together. This synthetic stream emits every generation and does not model native buffer staging
+  or checksum omissions during a resize.
 - **Session end** — leave intents drain through the relay's coordinated-leave machinery and close
   sessions cleanly, so lifecycle accounting, reaping, and (on a provisioning coordinator)
   idle-relay scale-down run for real.

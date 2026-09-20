@@ -28,7 +28,7 @@ use tokio::time::{
 
 use crate::lifecycle::{DrainResolution, SessionLifecycle};
 use crate::metrics::{Ending, PlayerReport};
-use crate::turn::TurnBuilder;
+use crate::turn::{TurnBuilder, sync_generation};
 
 /// Per-session shared map from a turn's `(origin slot, frame)` to the process
 /// instant the origin player sent it. A sender writes its own entry right before
@@ -400,6 +400,9 @@ async fn pump_turns(
                     slot: 0,
                     commands: commands.into(),
                     game_frame_count: Some(frame),
+                    // Exercise both modes in each multi-player session. Keep the
+                    // choice stable for this origin throughout its connection.
+                    sync_generation: own_slot.is_multiple_of(2).then_some(sync_generation(ordinal)),
                     buffer_directive: None,
                 };
                 let send_result = tokio::select! {
@@ -651,6 +654,7 @@ mod tests {
             slot: origin,
             commands: Default::default(),
             game_frame_count: Some(frame),
+            sync_generation: None,
             buffer_directive: None,
         }
     }

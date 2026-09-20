@@ -14,6 +14,20 @@ impl DecisionMaker {
         game_frame: Option<u32>,
         commands: &[u8],
     ) -> Option<SyncDivergence> {
+        self.observe_sync_with_generation(slot, seq, game_frame, commands, None)
+    }
+
+    /// `sync_generation` is client-authored metadata bound to the first parsed
+    /// native sync command in this turn; it never supplies another slot's
+    /// history or a checksum value.
+    pub fn observe_sync_with_generation(
+        &mut self,
+        slot: SlotId,
+        seq: u64,
+        game_frame: Option<u32>,
+        commands: &[u8],
+        sync_generation: Option<u64>,
+    ) -> Option<SyncDivergence> {
         if self.observers.contains(&slot) {
             return None;
         }
@@ -24,6 +38,8 @@ impl DecisionMaker {
             frame: game_frame,
             ordinal: None,
             command: self.parse_sync(slot, commands),
+            generation: sync_generation,
+            skipped: None,
         };
         let mut ready = match self.sync_turns.push(slot, seq, turn) {
             Ok(None) => self.sync_turns.pop_ready(slot),
@@ -113,6 +129,7 @@ impl DecisionMaker {
                 value: command.value,
                 game_frame: turn.frame,
             },
+            turn.skipped,
             sync_eval_margin(self.bounds.max),
         )
     }

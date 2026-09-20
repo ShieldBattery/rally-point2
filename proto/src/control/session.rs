@@ -55,26 +55,17 @@ pub const GAME_SYNC_SAFE_BUFFER_MAX: u32 = 14;
 /// reach it through that module.
 ///
 /// **Depth and the relay's desync comparator.** The relay's
-/// `consensus::SyncTracker` reconstructs a slot's absolute sync ordinal from a
-/// 4-bit ring nibble. Its steady-state placement corrects each report
-/// relative to that same slot's own last-known ordinal, so its accuracy
-/// depends only on transport-level reordering (comfortably under the ±7 the
-/// nibble math tolerates) — never on `max`. A slot's first-ever report (a
-/// join, or an authority promotion mid-stream) instead anchors on the
-/// reporting turn's `game_frame_count`: lockstep keeps every client's frame
-/// for the same simulated interval within a couple of turns of each other
-/// regardless of buffer depth (the depth is a session-wide constant that
-/// cancels out across clients), so the frame estimate — refined by the same
-/// nibble correction — stays accurate at any realistic `max`. The
-/// comparator's evaluation margin scales with `max` instead (see
-/// `consensus::sync_eval_margin`), so a deeper buffer costs only a longer wait
-/// before an ordinal retires, not a correctness risk. Only a `max` at or
-/// above `consensus::SYNC_ABSURD_BUFFER_MAX` — a defensive backstop far above
-/// any real policy, not a live constraint — disables desync detection
-/// outright.
+/// `consensus::SyncTurns` orders each origin's complete transport sequence
+/// prefix before assigning its absolute native sync generation. The comparator
+/// then compares the reports by that per-origin ordering; it does not anchor
+/// history to `game_frame_count` or any other frame coordinate. Its evaluation
+/// margin scales with `max` (see `consensus::sync_eval_margin`), so a deeper
+/// buffer costs only a longer wait before an ordinal retires. That evaluation
+/// margin and its `SYNC_ABSURD_BUFFER_MAX` backstop are relay-side comparison
+/// limits, distinct from the game's native `GAME_SYNC_SAFE_BUFFER_MAX` ceiling.
 ///
-/// **Depth and the game's own sync validation.** The relay tolerates any
-/// depth; the *game* does not. `max` must never exceed
+/// **Depth and the game's own sync validation.** The relay's comparison margin
+/// is not the game's native buffer limit. `max` must never exceed
 /// [`GAME_SYNC_SAFE_BUFFER_MAX`] — past that ceiling the game's native sync
 /// validation mass-drops players deterministically (see the constant's docs).
 /// The coordinator enforces this when it loads its tenant registry, so an

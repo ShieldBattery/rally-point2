@@ -11,7 +11,7 @@ mod rate_limit;
 mod tracker;
 mod turns;
 
-pub(in crate::consensus) use turns::{SyncCommand, SyncTurn, SyncTurns};
+pub(in crate::consensus) use turns::{SyncCommand, SyncGap, SyncTurn, SyncTurns};
 
 pub(crate) use rate_limit::{RateLimitedCounter, TokenBucket};
 
@@ -19,36 +19,35 @@ pub(crate) use rate_limit::{RateLimitedCounter, TokenBucket};
 // Relay-side desync detection
 // ---------------------------------------------------------------------------
 //
-// SC:R's lockstep sim exchanges a per-turn checksum through the command stream:
-// each client emits exactly one `0x37` sync command per outgoing turn once its
-// sync check is active. Because every client's Nth sync command covers the same
-// simulated interval, two clients whose sims have diverged produce a *different*
-// checksum at the same ordinal. Only the client's own sim reacts to a mismatch
-// (by dropping the peer over a transport that is inert under this seam), so under
-// netcode v2 a desync is invisible to everyone unless something that sees every
-// slot's turns compares the checksums itself. That is what [`SyncTracker`] does,
-// on the session's authority relay, off the same turn stream the buffer/leave
-// consensus already reads.
+// SC:R's lockstep simulation produces checksum commands in native sync
+// generations. A command is staged in an outgoing buffer, while the native
+// recorder advances after that buffer is flushed. A flush can therefore repeat
+// a staged generation, and a buffer shrink can omit one from later emission.
+// The legacy four-bit ring identifies the native generation modulo 16 but
+// cannot describe omitted generations. With `Payload::sync_generation`, the
+// origin supplies the absolute native generation that produced the staged
+// checksum; `turns` validates that bounded, per-origin claim before `tracker`
+// compares reports. That lets the authority relay compare every slot's
+// independent view without assigning a shared emission ordinal.
 
-/// The SC:R sync-command opcode. A 7-byte command emitted once per network
-/// turn while the game's sync check is active: `[0]` = this opcode; `[1]` =
-/// `(ring_index << 4) | hash_kind` — the high nibble is a 16-entry ring index
-/// (advancing `+1 mod 16` per turn) the comparator uses to place each report,
-/// the low nibble is the *hash kind* (1 or 2, never a sender/slot id — there
-/// is no sender id anywhere in this payload; identity comes from framing),
-/// locked to the ring index's parity (even → 1, odd → 2). So `[1]` cycles a
-/// fixed 16-value sequence: `0x01, 0x12, 0x21, 0x32, …, 0xF2`. `[2:3]` is
-/// `hash16` (the only byte range the comparator compares — see [`SyncValue`]);
-/// `[4..7]` is per-sender, vision-masked fog/vision data the comparator never
-/// reads (see [`SyncValue`] for why). This is definitive from a BinaryNinja RE
-/// of the native `verify_peer_sync_slot`, not inferred from the wire.
+/// The SC:R sync-command opcode. A 7-byte command staged in the outgoing
+/// buffer while the game's sync check is active: `[0]` = this opcode; `[1]` =
+/// `(ring_index << 4) | hash_kind`. The high nibble is the native generation
+/// modulo the 16-entry ring; it is not an emitted-turn counter. The low nibble
+/// is the *hash kind* (1 or 2, never a sender/slot id — there is no sender id
+/// anywhere in this payload; identity comes from framing), locked to the ring
+/// index's parity (even → 1, odd → 2). So `[1]` cycles a fixed 16-value
+/// sequence: `0x01, 0x12, 0x21, 0x32, …, 0xF2`. `[2:3]` is `hash16` (the
+/// only byte range the comparator compares — see [`SyncValue`]); `[4..7]` is
+/// per-sender, vision-masked fog/vision data the comparator never reads (see
+/// [`SyncValue`] for why). This is definitive from a BinaryNinja RE of the
+/// native `verify_peer_sync_slot`, not inferred from the wire.
 ///
-/// **Startup burst:** the enable path emits the first sync command at ring
-/// index 1 (`[1] = 0x12`), and the initial latency-depth flush can repeat the
-/// same command before the per-turn record advances. `SyncTurns` maps those
-/// duplicates to one canonical ordinal, and `SyncTracker` keeps the first
-/// report for a slot at that ordinal. Ring index 0 first appears once the ring
-/// wraps, around turn 15.
+/// **Startup burst:** the enable path's first active command uses ring index 1
+/// (`[1] = 0x12`), and the initial latency-depth flush can repeat that staged
+/// generation before a later native record advances. `SyncTurns` maps repeated
+/// generations to one canonical ordinal, and `SyncTracker` keeps the first
+/// report for a slot at that ordinal.
 pub(in crate::consensus) const SYNC_COMMAND: u8 = 0x37;
 
 /// The total length of a `0x37` sync command, mirroring the command-length table.
@@ -68,8 +67,9 @@ pub(in crate::consensus) const SYNC_HASH16_LEN: usize = 2;
 pub(in crate::consensus) const SYNC_KIND_UNITS: u8 = 1;
 pub(in crate::consensus) const SYNC_KIND_HEADER: u8 = 2;
 
-/// The sync command's ring index is a 16-entry ring. `SyncTurns` validates
-/// and unwraps it into the canonical ordinal before `SyncTracker` compares it.
+/// The sync command's native generation ring has 16 positions. Legacy turns
+/// unwrap only a repeat or one-step advance; enhanced turns verify the absolute
+/// generation against this modulus before `SyncTracker` compares them.
 pub(in crate::consensus) const SYNC_RING_MODULUS: u64 = 16;
 
 /// The floor for [`sync_eval_margin`]'s per-session margin: how far past an
@@ -175,6 +175,14 @@ pub(in crate::consensus) struct SyncReport {
     pub(in crate::consensus) game_frame: Option<u32>,
 }
 
+/// One origin's coverage at a checksum ordinal. A skipped generation advances
+/// only that origin's coverage; it never invents a checksum value.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::consensus) enum SyncObservation {
+    Report(SyncReport),
+    Skipped,
+}
+
 /// One compared slot's canonical ordinal progress. A slot joins the compare
 /// set on its first ordered sync report and is never required before `since`.
 #[derive(Debug, Clone, Copy)]
@@ -206,8 +214,8 @@ pub(in crate::consensus) struct SyncTracker {
     /// enters on its first sync command and leaves on departure or as a dropped
     /// minority.
     pub(in crate::consensus) members: HashMap<SlotId, Member>,
-    /// Reports awaiting a complete ordinal, keyed by ordinal then slot.
-    pub(in crate::consensus) pending: BTreeMap<u64, HashMap<SlotId, SyncReport>>,
+    /// Origin coverage awaiting a complete ordinal, keyed by ordinal then slot.
+    pub(in crate::consensus) pending: BTreeMap<u64, HashMap<SlotId, SyncObservation>>,
     /// Minorities confirmed divergent by this tracker instance. Their queued
     /// reports cannot recreate them after the verdict.
     pub(in crate::consensus) excluded: HashSet<SlotId>,

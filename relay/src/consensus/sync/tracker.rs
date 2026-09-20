@@ -15,6 +15,7 @@ impl SyncTracker {
         slot: SlotId,
         ordinal: u64,
         report: SyncReport,
+        skipped: Option<SyncGap>,
         margin: u64,
     ) -> Option<SyncDivergence> {
         let SyncReport { kind, value, .. } = report;
@@ -49,28 +50,50 @@ impl SyncTracker {
             since: ordinal,
         });
         member.next_expected = member.next_expected.max(next_expected);
+        let since = member.since;
         if ordinal < self.base_ordinal {
             // The ordered source can retain a report whose comparison interval
             // already retired before this relay became authority. Keep the
             // member's forward progress, but never resurrect that interval.
             return None;
         }
+        if let Some(skipped) = skipped {
+            self.record_skipped(slot, since, skipped);
+        }
         match self.pending.entry(ordinal).or_default().entry(slot) {
-            std::collections::hash_map::Entry::Occupied(existing) => {
-                if existing.get().value != value && self.duplicate_warns.observe() {
-                    tracing::warn!(
-                        tenant = key.tenant.as_ref(),
-                        session = key.session.0,
-                        slot = slot.0,
-                        ordinal,
-                        count = self.duplicate_warns.count(),
-                        "conflicting sync value for a slot already reported \
-                         at this ordinal; keeping the first",
-                    );
+            std::collections::hash_map::Entry::Occupied(existing) => match existing.get() {
+                SyncObservation::Report(existing) if existing.value != value => {
+                    if self.duplicate_warns.observe() {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            ordinal,
+                            count = self.duplicate_warns.count(),
+                            "conflicting sync value for a slot already reported \
+                             at this ordinal; keeping the first",
+                        );
+                    }
                 }
-            }
+                SyncObservation::Skipped => {
+                    // Validated per-origin monotone ordering makes a report after
+                    // a recorded omission unreachable; retain this guard defensively.
+                    if self.duplicate_warns.observe() {
+                        tracing::warn!(
+                            tenant = key.tenant.as_ref(),
+                            session = key.session.0,
+                            slot = slot.0,
+                            ordinal,
+                            count = self.duplicate_warns.count(),
+                            "checksum report arrived after this origin asserted the generation was omitted; \
+                             keeping the omission",
+                        );
+                    }
+                }
+                SyncObservation::Report(_) => {}
+            },
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(report);
+                vacant.insert(SyncObservation::Report(report));
             }
         }
         if let Some(divergence) = self.evaluate_ready(key, margin) {
@@ -78,6 +101,19 @@ impl SyncTracker {
         }
         self.evict_over_window(key);
         None
+    }
+
+    fn record_skipped(&mut self, slot: SlotId, since: u64, skipped: SyncGap) {
+        for ordinal in skipped.first.max(self.base_ordinal)..skipped.end {
+            if ordinal < since {
+                continue;
+            }
+            self.pending
+                .entry(ordinal)
+                .or_default()
+                .entry(slot)
+                .or_insert(SyncObservation::Skipped);
+        }
     }
     /// Evaluates every ordinal now ready: the frontier (the furthest any
     /// member has reached) has moved at least `margin` past it (see
@@ -129,9 +165,9 @@ impl SyncTracker {
                 return None;
             }
 
-            let reports = self.pending.remove(&base).expect("just matched complete");
+            let observations = self.pending.remove(&base).expect("just matched complete");
             self.base_ordinal = self.base_ordinal.saturating_add(1);
-            if let Some(divergence) = self.evaluate(base, &reports, key) {
+            if let Some(divergence) = self.evaluate(base, &observations, key) {
                 return Some(divergence);
             }
         }
@@ -178,7 +214,7 @@ impl SyncTracker {
     pub(in crate::consensus) fn evaluate(
         &mut self,
         ordinal: u64,
-        reports: &HashMap<SlotId, SyncReport>,
+        observations: &HashMap<SlotId, SyncObservation>,
         key: &SessionKey,
     ) -> Option<SyncDivergence> {
         let expected_kind = expected_kind_for_ordinal(ordinal);
@@ -192,7 +228,10 @@ impl SyncTracker {
         let mut comparable = 0usize;
         let mut agreed_value: Option<SyncValue> = None;
         let mut diverges = false;
-        for (slot, report) in reports {
+        for (slot, observation) in observations {
+            let SyncObservation::Report(report) = observation else {
+                continue;
+            };
             if report.kind != expected_kind {
                 if self.kind_parity_warns.observe() {
                     tracing::warn!(
@@ -226,8 +265,10 @@ impl SyncTracker {
         // allocation here doesn't matter. `comparable` and the kind/parity
         // warn were already handled in the pass above, so this only groups.
         let mut groups: HashMap<SyncValue, Vec<SlotId>> = HashMap::new();
-        for (slot, report) in reports {
-            if report.kind == expected_kind {
+        for (slot, observation) in observations {
+            if let SyncObservation::Report(report) = observation
+                && report.kind == expected_kind
+            {
                 groups.entry(report.value).or_default().push(*slot);
             }
         }
@@ -235,7 +276,13 @@ impl SyncTracker {
         // The frame the mismatch was confirmed at. In lockstep every report at
         // one ordinal shares a frame, so picking the newest present is only a
         // defensive tie-break, not a meaningful choice among disagreeing values.
-        let game_frame = reports.values().filter_map(|r| r.game_frame).max();
+        let game_frame = observations
+            .values()
+            .filter_map(|observation| match observation {
+                SyncObservation::Report(report) => report.game_frame,
+                SyncObservation::Skipped => None,
+            })
+            .max();
 
         let majority = groups
             .iter()

@@ -376,12 +376,31 @@ pub fn observe_sync(
     game_frame: Option<u32>,
     commands: &[u8],
 ) {
+    observe_sync_with_generation(registry, key, slot, seq, game_frame, commands, None);
+}
+
+/// The enhanced checksum-coverage variant of [`observe_sync`].
+pub fn observe_sync_with_generation(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    slot: SlotId,
+    seq: u64,
+    game_frame: Option<u32>,
+    commands: &[u8],
+    sync_generation: Option<u64>,
+) {
     let (divergence, ordering_failure) = {
         let mut makers = registry.lock();
         match makers.get_mut(key) {
             Some(maker) => {
                 let was_unavailable = maker.sync_turns.unavailable(slot);
-                let divergence = maker.observe_sync(slot, seq, game_frame, commands);
+                let divergence = maker.observe_sync_with_generation(
+                    slot,
+                    seq,
+                    game_frame,
+                    commands,
+                    sync_generation,
+                );
                 let failure = if was_unavailable {
                     None
                 } else {

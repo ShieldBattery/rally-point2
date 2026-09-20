@@ -697,38 +697,51 @@ anyway.
 
 ### Relay-side desync detection
 
-SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the command
-stream: each client emits one `0x37` sync command per network turn once its sync check is active, and
-because every client's Nth sync command covers the same simulated interval, two clients whose sims have
-diverged produce a *different* checksum at the same ordinal. Natively each client compares its peers'
-checksums and drops a mismatching peer itself — but netcode v2's transport is inert under that seam (the
-relay owns the wire, and the game's own peer-drop path never fires), so a desync would be **invisible to
-everyone** unless something that sees every slot's turns compares the checksums. The **authority relay
-does**, off the same validated turn stream the buffer and leave consensus already read: it extracts each
-slot's `hash16` (the sim-state bytes of the `0x37`, not the per-sender fog/vision bytes that legitimately
-differ), places it at the right ordinal using the command's 16-entry ring index, and once every compared
-slot has reported that ordinal and the frontier has advanced past it, compares them. A divergence is
-reported up the coordinator webhook leg, keyed on the sync ordinal so a re-detection after an authority
-handoff isn't counted twice. Observers are excluded — they don't reliably emit sync commands, so requiring
-their checksums would stall the cross-check.
+SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the
+command stream. A native sync generation is recorded after the game flushes an outgoing buffer, so
+an emitted `0x37` is a staged checksum rather than a counter of outgoing turns: a flush can repeat a
+staged generation, while a buffer shrink can omit a generated checksum from later emission. Natively
+each client compares its peers' checksums and drops a mismatching peer itself - but netcode v2's
+transport is inert under that seam (the relay owns the wire, and the game's own peer-drop path never
+fires), so a desync would be **invisible to everyone** unless something that sees every slot's turns
+compares the checksums. The **authority relay does**, off the same validated turn stream the buffer
+and leave consensus already read: it extracts each slot's `hash16` (the sim-state bytes of the
+`0x37`, not the per-sender fog/vision bytes that legitimately differ), assigns its native-generation
+ordinal, and once every required origin has coverage for that ordinal and the frontier has advanced
+past it, compares the actual checksum reports. A divergence is reported up the coordinator webhook
+leg, keyed on the sync ordinal so a re-detection after an authority handoff isn't counted twice.
+Observers are excluded - they don't reliably emit sync commands, so requiring their checksums would
+stall the cross-check.
 
 Checksum observation orders compact metadata by each origin's full transport sequence, independently
-of gameplay forwarding. Every turn occupies a position, including turns without a checksum. Starting
-at sequence zero, each relay unwraps the native four-bit sync ring into an absolute ordinal: repeated
-startup reports keep their ordinal, and an advance must be exactly one ring position. Peers retain
-these cursors and epochs across authority changes, so promotion cannot align different ring cycles.
-Game-frame claims never determine checksum alignment.
+of gameplay forwarding. Every turn occupies a position, including turns without a checksum. For
+legacy clients, the relay can unwrap the native four-bit ring only when it repeats or advances by one;
+it never guesses a missing wrap or a whole ring cycle. Enhanced clients attach optional
+`sync_generation`: the absolute native generation that created their staged checksum. Their first
+tag must equal the ring (so it anchors within the first 16 generations); every later tag must be
+monotonic, match the ring modulo 16, and advance by at most `GAME_SYNC_SAFE_BUFFER_MAX` (14). A
+bounded advance records the omitted interval as coverage for that **origin only**, with no invented
+checksum vote. The first parsed checksum locks an origin to legacy or enhanced mode; a later mode
+change, unbound tag, malformed tag, or reserved `u64::MAX` tag clears only that origin's ordering
+state. Game-frame claims never determine checksum alignment.
+
+Within the accepted advance range, the ring and previous ordinal determine a unique next ordinal:
+`sync_generation` is an independent client-side cross-check of that inference, not extra resolution
+inside the range. Its purpose is to reject an actual advance outside the range instead of silently
+aliasing it onto a shorter one. For example, advancing 18 generations has the same nibble as advancing
+two. Turns without a checksum can complete the transport prefix without reporting those generations;
+the native depth ceiling bounds snapshot age at execution, not the number of unreported snapshots.
+The tag is still a client claim, not authenticated evidence of its simulation or of an applied shrink.
 
 Only the first `0x37` in a turn contributes metadata. Invalid hash kinds and kinds inconsistent with
 ordinal parity are excluded from voting. Pending metadata is bounded to the transport receive window
-(currently a sequence distance below 4096). Exceeding that window, an unexpected ring jump, or arithmetic
-overflow clears **only that origin's** pending metadata and removes its reports from comparison. Its
-failure latch survives promotion; every other origin retains its independent history and remains
-comparable. The warning retains the triggering sequence, missing next sequence, prior ordinal, ring,
-and reason. Each origin's first failure also records a `sync_ordering_unavailable` flight event with
-that context, on authority and peer relays, distinct from a desync verdict. A ring jump is not a
-simulation-divergence verdict: without a bound on how many native
-reports could have been omitted, even a small forward nibble difference can hide a whole ring cycle.
+(currently a sequence distance below 4096). Exceeding that window, a legacy ring discontinuity, an
+enhanced-generation violation, or arithmetic overflow clears **only that origin's** pending metadata
+and removes its reports from comparison. Its failure latch survives promotion; every other origin
+retains its independent history and remains comparable. The warning retains the triggering sequence,
+missing next sequence, prior ordinal, ring, and reason. Each origin's first failure also records a
+`sync_ordering_unavailable` flight event with that context, on authority and peer relays, distinct
+from a desync verdict.
 
 The comparator is **attacker-facing**. A client controls its own report contents and can withhold or
 invalidate its own checksum coverage; it cannot shift another origin's ordinal, erase another origin's
@@ -736,14 +749,25 @@ history, or disable comparisons among the remaining eligible players through an 
 Reports with uncertain history are not votes and do not identify a diverged player. This is detection
 coverage, not proof of an honest simulation: with fewer than two eligible reports there is no cross-check,
 and a 1v1 loses cross-check coverage when either origin becomes unavailable. Surviving reports cannot
-establish that an excluded player's simulation agreed with them.
+establish that an excluded player's simulation agreed with them. A skipped entry means only that
+this origin supplies no vote for the interval. It satisfies retirement bookkeeping, not a successful
+checksum comparison, and does not trigger a missing-report eviction warning. Ordered/comparable slot
+counts do not measure the number of intervals actually compared. Repeated claimed omissions can
+therefore reduce detection coverage without producing an ordering failure.
 
-A relay missing an origin's sequence-zero history has no trusted epoch anchor and cannot guess it from
-the first received ring index. This can occur during initial mesh attachment as well as rehoming; the
-mesh does not guarantee complete pre-history delivery. Periodic coverage samples distinguish waiting
-origins from unavailable origins, including before the ordering window is exhausted. Gameplay continues
-forwarding immediately regardless of checksum coverage. Existing peers with complete history retain
-comparison continuity when promoted.
+A relay missing an origin's sequence-zero history cannot establish checksum ordering in either mode.
+A later ring index or generation tag cannot replace that missing prefix. This can occur during initial
+mesh attachment as well as rehoming; the mesh does not guarantee complete pre-history delivery. Late
+admission and relay restart have the same limit.
+Periodic coverage samples distinguish waiting origins from unavailable origins, including before the
+ordering window is exhausted. Gameplay continues forwarding immediately regardless of checksum
+coverage. Existing peers with complete history retain comparison continuity when promoted.
+
+`sync_generation` is an additive observation field. Deploy the update to every relay before releasing
+clients that emit it: older home or mesh relays can erase the field when reserializing payloads. Loss
+of the field after enhanced mode begins is an ordering failure; stripping it from the beginning leaves
+the observer in legacy mode with its existing shrink limitation. Upgraded relays continue to accept
+untagged legacy clients.
 
 ### Synced player-leaves
 

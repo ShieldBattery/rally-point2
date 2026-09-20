@@ -252,13 +252,14 @@ pub(super) fn deliver_turn_to_locals(
     // after the `mark_seen` dedup above. Every relay retains sequence-ordered
     // checksum metadata from each distinct origin turn; only the authority
     // compares. This observer never holds gameplay fan-out waiting for a gap.
-    crate::consensus::observe_sync(
+    crate::consensus::observe_sync_with_generation(
         decision_makers,
         key,
         slot,
         payload.seq,
         payload.game_frame_count,
         &payload.commands,
+        payload.sync_generation,
     );
     match crate::consensus::active_directive(decision_makers, key) {
         Some(directive) => payload.buffer_directive = Some(directive),

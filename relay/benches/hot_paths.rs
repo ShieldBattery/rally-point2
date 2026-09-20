@@ -20,6 +20,7 @@ fn payload(seq: u64, commands: Vec<u8>) -> Payload {
         slot: u32::MAX,
         commands: commands.into(),
         game_frame_count: Some(seq as u32),
+        sync_generation: None,
         buffer_directive: None,
     }
 }

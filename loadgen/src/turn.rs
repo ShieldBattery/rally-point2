@@ -55,7 +55,13 @@ fn ring_kind_byte(ring: u8) -> u8 {
 /// The ring index a turn ordinal uses: the ring starts at 1 for the first turn
 /// (matching the game's sync-enable burst) and advances `+1 mod 16` per turn.
 fn ring_for_ordinal(ordinal: u64) -> u8 {
-    ((ordinal + 1) % u64::from(RING_MODULUS)) as u8
+    (sync_generation(ordinal) % u64::from(RING_MODULUS)) as u8
+}
+
+/// The synthetic checksum generation: one snapshot per emitted turn, starting
+/// at native ring 1. This stream does not simulate native pipe resizes.
+pub fn sync_generation(ordinal: u64) -> u64 {
+    ordinal + 1
 }
 
 /// A deterministic 16-bit hash for `(session_seed, ordinal)`, so every player in
@@ -245,6 +251,7 @@ mod tests {
                     slot: u32::MAX,
                     commands: commands.clone().into(),
                     game_frame_count: Some(ordinal as u32),
+                    sync_generation: None,
                     buffer_directive: None,
                 };
                 let validated = validate_turn(SlotId(0), payload)

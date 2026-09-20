@@ -280,6 +280,7 @@ async fn envelope_metadata_survives_delivery_to_the_game() {
         slot: 0,
         commands: vec![0x0C].into(),
         game_frame_count: Some(41),
+        sync_generation: Some(73),
         buffer_directive: Some(BufferDirective {
             buffer_turns: 4,
             apply_at_frame: 64,
