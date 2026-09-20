@@ -53,14 +53,12 @@ use rally_point_proto::time::unix_secs_fail_closed;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::digest::{constant_time_eq, sha256};
 use crate::pair_rtts::DirectionRttRow;
 
 mod schema;
 
-use schema::{
-    LedgerRow, TOKEN_BYTES, as_i64, as_u64, constant_time_eq, parse_expected_ips,
-    row_to_provisioned_task, sha256,
-};
+use schema::{LedgerRow, TOKEN_BYTES, as_i64, as_u64, parse_expected_ips, row_to_provisioned_task};
 // Test-only: not needed by this file's own code, only by `tests`' `use
 // super::*;` picking them up the same way it would if this were still one
 // file.

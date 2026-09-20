@@ -11,6 +11,7 @@ use rally_point_proto::request_auth;
 use rally_point_proto::time::unix_secs_fail_closed;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
+use crate::digest::constant_time_eq;
 use crate::session::SessionSetup;
 use crate::tenant;
 
@@ -37,21 +38,6 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         return false;
     };
     constant_time_eq(presented.as_bytes(), expected.as_bytes())
-}
-
-/// Constant-time byte-slice equality, so a secret comparison leaks no timing
-/// signal that would let it be brute-forced a byte at a time. Differing lengths
-/// short-circuit (a length mismatch is already a non-match), then equal-length
-/// inputs are compared with no data-dependent branch.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Header carrying the request signing timestamp: unix epoch *seconds*, decimal

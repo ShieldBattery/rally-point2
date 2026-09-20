@@ -1,6 +1,6 @@
 //! Schema versioning and migration, plus the small storage-adjacent helpers
-//! every ledger method leans on: row parsing, the token digest/compare, and the
-//! SQLite `INTEGER` <-> `u64` reinterpretation.
+//! every ledger method leans on: row parsing and the SQLite `INTEGER` <-> `u64`
+//! reinterpretation.
 //! Grouped here because none of it is enrollment *policy* — `mod.rs` decides
 //! what an enroll means; this file is just how a row gets in and out of SQLite.
 
@@ -165,30 +165,6 @@ pub(super) fn parse_expected_ips(stored: Option<&str>) -> Result<Vec<IpAddr>, Le
         .map(|s| s.parse::<IpAddr>())
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ips)
-}
-
-/// The SHA-256 digest of `bytes` — the form the ledger stores a token in and
-/// compares a presented token against, so the token plaintext never lands on
-/// disk.
-pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
-    out
-}
-
-/// Constant-time equality over two byte slices, so a token or fingerprint
-/// comparison leaks no timing signal that would let it be probed a byte at a
-/// time. A length mismatch short-circuits (already a non-match); equal-length
-/// inputs are compared with no data-dependent branch.
-pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Reinterprets a `u64` as SQLite's signed `INTEGER`. Relay ids and Unix-second

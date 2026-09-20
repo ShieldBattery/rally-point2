@@ -132,9 +132,7 @@ pub enum BootLineage {
 /// Public so the integration suites compare against this digest rather than
 /// re-implementing it and testing their own copy.
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
-    out
+    crate::digest::sha256(cert_der)
 }
 
 /// Rebuilds the fleet mesh-peer set from the current relay map and publishes it
