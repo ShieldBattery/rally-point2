@@ -71,12 +71,13 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     );
 }
 
-/// A relay whose region-label gate is driven by the production turn path, on
-/// a shortened release delay so the wait is milliseconds rather than the
-/// production ten seconds. Returns the registries plus the label map the
-/// descriptor recorded.
-fn region_label_relay(
-    delay: std::time::Duration,
+/// The registries the production turn path runs against, wired to a maker
+/// whose region-label release delay is `region_delay` — `Duration::ZERO` for a
+/// gate that is open the instant the session starts, a long delay for one that
+/// never opens during the test. Returns them plus the label map the descriptor
+/// recorded.
+fn delivery_relay(
+    region_delay: std::time::Duration,
 ) -> (
     routing::Sessions,
     SeenRegistries,
@@ -91,7 +92,9 @@ fn region_label_relay(
 
     let sessions = routing::Sessions::default();
     let seen = new_seen_registries();
-    let decision_makers = Arc::new(consensus::new_decision_makers_with_region_delay(delay));
+    let decision_makers = Arc::new(consensus::new_decision_makers_with_region_delay(
+        region_delay,
+    ));
     let turn_ring = crate::session::turn_ring::TurnRing::new();
     let key = control_key();
     let _ = consensus::sync_maker(
@@ -122,15 +125,13 @@ fn region_label_relay(
 /// starts, nothing reaches one before the release delay elapses (including
 /// when a turn forges an enormous frame), the map that does reach them is the
 /// descriptor's, and it is fanned out exactly once.
+///
+/// Two relays rather than a wait: the delay is injected, so a gate that is
+/// meant to stay shut gets one long enough never to open, and a gate that is
+/// meant to be open gets none at all.
 #[test]
 fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
     use crate::consensus;
-
-    let delay = std::time::Duration::from_millis(120);
-    let (sessions, seen, decision_makers, turn_ring, key, labels) = region_label_relay(delay);
-
-    let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
-    let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
 
     let turn = |seq: u64, frame: u32| Payload {
         seq,
@@ -138,6 +139,51 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
         game_frame_count: Some(frame),
         ..Default::default()
     };
+
+    // A relay whose release delay outlasts the test: the gate never opens.
+    {
+        let (sessions, seen, decision_makers, turn_ring, key, _labels) =
+            delivery_relay(std::time::Duration::from_secs(3600));
+        let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
+        let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
+        let deliver = |payload: Payload| {
+            deliver_turn_to_locals(
+                &sessions,
+                &seen,
+                &decision_makers,
+                &turn_ring,
+                &key,
+                SlotId(0),
+                payload,
+                crate::consensus::delivery::DeliveryHome::Local,
+            );
+        };
+
+        // Turns flowing before the session has started: no clock to measure
+        // from, so nothing is released.
+        deliver(turn(0, 1));
+        assert_eq!(inbox0.try_recv_region_labels(), None);
+        assert_eq!(inbox1.try_recv_region_labels(), None);
+
+        // The session starts, but the delay has not elapsed — and a turn
+        // forging an enormous frame does not change that. The gate reads no
+        // part of a payload, so a claim a client controls cannot advance it.
+        consensus::mark_session_started(&decision_makers, &key);
+        deliver(turn(1, u32::MAX));
+        assert_eq!(
+            inbox0.try_recv_region_labels(),
+            None,
+            "a forged game frame does not open the gate",
+        );
+        assert_eq!(inbox1.try_recv_region_labels(), None);
+    }
+
+    // A relay whose delay has elapsed by construction: the next delivered turn
+    // opens the gate and every local slot gets the descriptor's map, verbatim.
+    let (sessions, seen, decision_makers, turn_ring, key, labels) =
+        delivery_relay(std::time::Duration::ZERO);
+    let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
+    let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
     let deliver = |payload: Payload| {
         deliver_turn_to_locals(
             &sessions,
@@ -151,27 +197,7 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
         );
     };
 
-    // Turns flowing before the session has started: no clock to measure from,
-    // so nothing is released.
-    deliver(turn(0, 1));
-    assert_eq!(inbox0.try_recv_region_labels(), None);
-    assert_eq!(inbox1.try_recv_region_labels(), None);
-
-    // The session starts, but the delay has not elapsed — and a turn forging an
-    // enormous frame does not change that. The gate reads no part of a payload,
-    // so a claim a client controls cannot advance it.
     consensus::mark_session_started(&decision_makers, &key);
-    deliver(turn(1, u32::MAX));
-    assert_eq!(
-        inbox0.try_recv_region_labels(),
-        None,
-        "a forged game frame does not open the gate",
-    );
-    assert_eq!(inbox1.try_recv_region_labels(), None);
-
-    // Once the delay has genuinely elapsed, the next delivered turn opens the
-    // gate and every local slot gets the descriptor's map, verbatim.
-    std::thread::sleep(delay + std::time::Duration::from_millis(30));
     deliver(turn(2, 5));
     assert_eq!(inbox0.try_recv_region_labels().as_ref(), Some(&labels));
     assert_eq!(inbox1.try_recv_region_labels().as_ref(), Some(&labels));
@@ -199,12 +225,11 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
 fn a_frameless_turn_drives_the_region_label_gate_like_any_other() {
     use crate::consensus;
 
-    let delay = std::time::Duration::from_millis(80);
-    let (sessions, seen, decision_makers, turn_ring, key, labels) = region_label_relay(delay);
+    let (sessions, seen, decision_makers, turn_ring, key, labels) =
+        delivery_relay(std::time::Duration::ZERO);
     let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
 
     consensus::mark_session_started(&decision_makers, &key);
-    std::thread::sleep(delay + std::time::Duration::from_millis(30));
 
     deliver_turn_to_locals(
         &sessions,
@@ -411,7 +436,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
 #[test]
 fn checksum_sequence_gaps_never_hold_gameplay_delivery() {
     let (sessions, seen, decision_makers, turn_ring, key, _) =
-        region_label_relay(std::time::Duration::from_secs(60));
+        delivery_relay(std::time::Duration::from_secs(60));
     let (_registration, mut inbox) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
 
     // Sequence 1 waits on 0 in the checksum observer. Sequence 4096 then

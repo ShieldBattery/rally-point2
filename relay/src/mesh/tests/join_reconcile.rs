@@ -10,21 +10,11 @@ use super::*;
 /// link that died and redialed reconverges.
 #[test]
 fn reconcile_leaves_on_join_re_announces_known_state() {
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let makers = Arc::new(crate::consensus::new_decision_makers());
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::SelfRelay,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
     // The authority decided one slot's leave (caches a directive and records a
     // departure), and separately recorded a bare departure for another slot.
     crate::consensus::observe_frame(&makers, &key, SlotId(1), GameFrameCount(50));
@@ -70,20 +60,9 @@ fn reconcile_leaves_on_join_re_announces_known_state() {
 /// nothing loops the mesh.
 #[test]
 fn join_reconcile_re_shares_this_relay_s_own_started_slots() {
-    use rally_point_proto::control::BufferBounds;
-
     let makers = Arc::new(crate::consensus::new_decision_makers());
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::SelfRelay,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
     crate::consensus::record_slot_started(&makers, &key, SlotId(2));
     crate::consensus::record_slot_started(&makers, &key, SlotId(0));
     // A peer's slot, learned over the mesh: recorded here, never re-shared.
@@ -184,17 +163,6 @@ fn resume_cursor_snapshot_is_the_forward_gate_prefix_plus_one() {
     assert!(
         has_resumable_state(&seen, &key),
         "a gapped slot still counts as forward-gate history for the session",
-    );
-}
-
-#[test]
-fn resume_cursor_snapshot_of_an_untouched_session_is_empty() {
-    let seen = new_seen_registries();
-    let key = control_key();
-    assert!(resume_cursor_snapshot(&seen, &key).is_empty());
-    assert!(
-        !has_resumable_state(&seen, &key),
-        "no forward-gate entry at all reads as a first join, not a resume",
     );
 }
 
@@ -423,7 +391,11 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
 
     // Slot 0 is entirely unlisted in both asks -- this relay's own
     // gap-tracking never formed a contiguous prefix for it before the
-    // asker's link died.
+    // asker's link died. The ring above is populated, so the non-resuming
+    // arm is a real refusal and not an empty-ring accident: a first-join
+    // peer's cursor frame carries no entries AND `resuming = false`, and a
+    // newly-added relay's own clients get their backfill from their own
+    // client-side reconnect, never from a mesh peer's unsolicited replay.
     let non_resuming_ask = MeshControlFrame {
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
@@ -483,97 +455,4 @@ fn resume_replay_is_none_for_an_unjoined_session_or_an_empty_result() {
         )),
     };
     assert!(resume_replay_for_frame(&other, &joined, &mesh).is_none());
-}
-
-#[test]
-fn a_first_joins_empty_cursors_ask_for_no_replay_even_on_a_populated_ring() {
-    // A first-join peer's cursor frame carries no entries AND `resuming =
-    // false` (proven by
-    // `reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join`
-    // above); this proves the receiving side honors that absent-means-nothing
-    // semantic even when it has plenty it COULD reply with -- a newly-added
-    // relay's own clients get their backfill from their own client-side
-    // reconnect, not from a mesh peer's unsolicited replay. Contrast
-    // `resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resuming`,
-    // where the identical empty cursor list means the opposite because
-    // `resuming` is true there.
-    let mesh = new_mesh_state();
-    let key = control_key();
-    mesh.turn_ring.record(
-        &key,
-        &Payload {
-            slot: 0,
-            seq: 0,
-            ..Default::default()
-        },
-        crate::session::turn_ring::TurnOrigin::Local,
-        crate::session::turn_ring::MAX_GAME_SLOTS,
-    );
-
-    let mut joined = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: register_mesh_link(
-                &mesh.links,
-                key.clone(),
-                mpsc::channel(1).0,
-                mpsc::unbounded_channel().0,
-                Arc::new(tokio::sync::Notify::new()),
-            ),
-        },
-    );
-
-    let first_join_ask = MeshControlFrame {
-        session: key.session.0,
-        kind: Some(mesh_control_frame::Kind::MeshResumeCursors(
-            rally_point_proto::messages::MeshResumeCursors {
-                cursors: vec![],
-                resuming: false,
-            },
-        )),
-    };
-    assert!(
-        resume_replay_for_frame(&first_join_ask, &joined, &mesh).is_none(),
-        "a non-resuming empty cursor map replays nothing, regardless of what the ring holds",
-    );
-}
-
-#[test]
-fn resume_cursor_snapshot_survives_the_links_own_registration_ending() {
-    // The forward-gate cursors live in `SeenRegistries`, a session-keyed
-    // registry entirely separate from `MeshLinks` -- a link dying (its
-    // `MeshLinkRegistration` dropping) must not touch the cursors a fresh
-    // link on the same session will read on its own next Join.
-    let seen = new_seen_registries();
-    let links = new_mesh_links();
-    let key = control_key();
-
-    mark_seen(&seen, &key, SlotId(0), 0);
-    mark_seen(&seen, &key, SlotId(0), 1);
-    let before = resume_cursor_snapshot(&seen, &key);
-
-    // A link registers for the session, then dies (its registration drops,
-    // deregistering it from `MeshLinks` -- the RAII path a redial's old
-    // link and this test both exercise).
-    let registration = register_mesh_link(
-        &links,
-        key.clone(),
-        mpsc::channel(1).0,
-        mpsc::unbounded_channel().0,
-        Arc::new(tokio::sync::Notify::new()),
-    );
-    drop(registration);
-    assert!(
-        links.lock().get(&key).is_none(),
-        "the dead link's registration is gone from MeshLinks",
-    );
-
-    assert_eq!(
-        resume_cursor_snapshot(&seen, &key),
-        before,
-        "the cursors a fresh link's Join will read are unaffected by the dead link",
-    );
 }

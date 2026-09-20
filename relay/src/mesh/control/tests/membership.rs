@@ -1,22 +1,9 @@
 //! Link registration and peer membership: joins reach only named peers,
 //! dropped peers leave, reconnects re-sync, and the published desired-peer
-//! set tracks descriptor/session changes without redundant republishes.
+//! set tracks descriptor/session changes without redundant republishes — plus
+//! the authority verdict each descriptor's relay set implies.
 
 use super::*;
-
-#[test]
-fn applies_join_to_each_registered_peer() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
-    let (tx2, mut rx2) = link();
-    let (tx3, mut rx3) = link();
-    let _ = control.register_link(RelayId(2), 1, tx2);
-    let _ = control.register_link(RelayId(3), 1, tx3);
-
-    control.apply_descriptor(&descriptor(1, &[2, 3]));
-
-    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
-    assert_eq!(rx3.try_recv().unwrap(), MeshCommand::Join(key(1)));
-}
 
 #[test]
 fn joins_only_named_peers_never_broadcasts() {
@@ -104,21 +91,6 @@ fn end_session_on_an_unknown_session_is_a_no_op() {
 }
 
 #[test]
-fn reconnect_replaces_sender_and_rejoins_desired_sessions() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
-    let (tx2_old, mut rx2_old) = link();
-    let _ = control.register_link(RelayId(2), 1, tx2_old);
-    control.apply_descriptor(&descriptor(1, &[2]));
-    assert_eq!(rx2_old.try_recv().unwrap(), MeshCommand::Join(key(1)));
-
-    // The link to peer 2 drops and reconnects: a new sender registers under
-    // the same id, and the desired session re-joins on it.
-    let (tx2_new, mut rx2_new) = link();
-    let _ = control.register_link(RelayId(2), 2, tx2_new);
-    assert_eq!(rx2_new.try_recv().unwrap(), MeshCommand::Join(key(1)));
-}
-
-#[test]
 fn late_older_registration_cannot_replace_or_resurrect_after_the_new_link_dies() {
     let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
     control.apply_descriptor(&descriptor(1, &[2]));
@@ -127,6 +99,8 @@ fn late_older_registration_cannot_replace_or_resurrect_after_the_new_link_dies()
     assert!(control.register_link(RelayId(2), 10, old_tx));
     assert_eq!(old_rx.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
+    // The link to peer 2 drops and reconnects: a newer generation registers
+    // under the same id, and the desired session re-joins on that sender.
     let (new_tx, mut new_rx) = link();
     assert!(control.register_link(RelayId(2), 20, new_tx));
     assert_eq!(new_rx.try_recv().unwrap(), MeshCommand::Join(key(1)));
@@ -149,8 +123,10 @@ fn late_older_registration_cannot_replace_or_resurrect_after_the_new_link_dies()
 #[test]
 fn drops_a_descriptor_self_reference() {
     // A descriptor that erroneously lists this relay among its own peers
-    // must not produce a self-join — a relay never meshes with itself.
+    // must not produce a self-join — a relay never meshes with itself — and
+    // must not publish it as a peer to dial either.
     let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let mut peers_rx = control.desired_peers();
     let (tx1, mut rx1) = link();
     // Even if a link were somehow registered under our own id, we don't join.
     let _ = control.register_link(RelayId(1), 1, tx1);
@@ -159,39 +135,24 @@ fn drops_a_descriptor_self_reference() {
         rx1.try_recv().is_err(),
         "a relay must not join a link to itself",
     );
-}
-
-#[test]
-fn a_join_burst_beyond_the_old_capacity_is_never_dropped() {
-    // A burst of session starts on one relay-pair — more than the previous
-    // bounded command-channel capacity — must not drop any join. The
-    // unbounded channel absorbs the burst; the driver drains it in order.
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
-    let (tx2, mut rx2) = link();
-    let _ = control.register_link(RelayId(2), 1, tx2);
-
-    const BURST: u64 = 64; // well beyond the previous 32-deep bound
-    for s in 1..=BURST {
-        control.apply_descriptor(&descriptor(s, &[2]));
-    }
-
-    for s in 1..=BURST {
-        assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(s)));
-    }
-    assert!(rx2.try_recv().is_err(), "no extra commands");
+    let published = peers_rx.borrow_and_update().clone();
+    assert_eq!(published.len(), 1, "a relay never dials itself");
+    assert_eq!(published[0].relay_id, RelayId(2));
 }
 
 #[test]
 fn a_terminal_leave_is_delivered_under_backlog() {
-    // The exact gap finding #2 flagged: a session's final `Leave` — with no
-    // later descriptor to re-push it — must not be lost behind a backlog of
-    // undrained commands. With an unbounded channel it is durably queued.
+    // A session's final `Leave` — with no later descriptor to re-push it —
+    // must not be lost behind a backlog of undrained commands, and neither
+    // may any of the backlogged joins: the command channel is unbounded
+    // precisely because a dropped terminal `Leave` has no later event to
+    // correct it. The backlog here is deeper than the bounded channel this
+    // replaced, and every command must come out in order.
     let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
     let (tx2, mut rx2) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
 
-    // Build a backlog of joins (beyond the old bound), none drained yet.
-    const BACKLOG: u64 = 40;
+    const BACKLOG: u64 = 64; // well beyond the previous 32-deep bound
     for s in 1..=BACKLOG {
         control.apply_descriptor(&descriptor(s, &[2]));
     }
@@ -265,17 +226,6 @@ fn ending_a_session_republishes_the_shrunk_peer_set() {
 }
 
 #[test]
-fn a_self_reference_is_not_published_as_a_desired_peer() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
-    let mut peers_rx = control.desired_peers();
-    // The descriptor erroneously lists this relay (1) among its own peers.
-    control.apply_descriptor(&descriptor(1, &[1, 2]));
-    let published = peers_rx.borrow_and_update().clone();
-    assert_eq!(published.len(), 1, "a relay never dials itself");
-    assert_eq!(published[0].relay_id, RelayId(2));
-}
-
-#[test]
 fn an_unchanged_peer_set_does_not_republish() {
     let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
     let mut peers_rx = control.desired_peers();
@@ -292,23 +242,6 @@ fn an_unchanged_peer_set_does_not_republish() {
 }
 
 #[test]
-fn apply_descriptor_creates_a_self_authority_maker_for_a_single_relay_session() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
-
-    // A descriptor with no peers is a single-relay session: the relay is its
-    // own buffer authority.
-    control.apply_descriptor(&descriptor(1, &[]));
-
-    let registry = makers.lock();
-    let maker = registry.get(&key(1)).expect("a maker was created");
-    assert!(
-        maker.is_authority(),
-        "a single-relay session is its own authority",
-    );
-}
-
-#[test]
 fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
     // End to end through the production apply path: a descriptor carrying
     // the tenant's correlation ids, applied, must leave the registry able
@@ -319,13 +252,21 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
     makers.set_notice_notifier(tx);
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
 
-    let mut descriptor = descriptor(1, &[]);
-    descriptor.external_id = Some("game-42".to_owned());
-    descriptor.slot_refs = vec![SlotExternalRef {
+    let mut first = descriptor(1, &[]);
+    first.external_id = Some("game-old".to_owned());
+    first.slot_refs = vec![SlotExternalRef {
         slot: SlotId(0),
         external_ref: "sb-user-3".to_owned(),
     }];
-    control.apply_descriptor(&descriptor);
+    control.apply_descriptor(&first);
+
+    // A changed re-apply must replace the stale correlation ids rather than
+    // keep the ones the first push stamped.
+    let second = SessionDescriptor {
+        external_id: Some("game-new".to_owned()),
+        ..first
+    };
+    control.apply_descriptor(&second);
 
     consensus::observe_frame(
         &makers,
@@ -342,71 +283,35 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
     else {
         panic!("a departure notice");
     };
-    assert_eq!(notice.external_id, Some("game-42".to_owned()));
-    assert_eq!(notice.external_ref, Some("sb-user-3".to_owned()));
-}
-
-#[test]
-fn apply_descriptor_replaces_correlation_ids_on_a_changed_reapply() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    makers.set_notice_notifier(tx);
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
-
-    let mut first = descriptor(1, &[]);
-    first.external_id = Some("game-old".to_owned());
-    control.apply_descriptor(&first);
-
-    let mut second = descriptor(1, &[]);
-    second.external_id = Some("game-new".to_owned());
-    control.apply_descriptor(&second);
-
-    consensus::observe_frame(
-        &makers,
-        &key(1),
-        SlotId(1),
-        rally_point_proto::ids::GameFrameCount(10),
-    );
-    assert!(consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some());
-    let consensus::RelayNotice::Departure(notice) = rx.try_recv().expect("one departure notice")
-    else {
-        panic!("a departure notice");
-    };
     assert_eq!(
         notice.external_id,
         Some("game-new".to_owned()),
         "the re-applied descriptor's refs replace the stale ones",
     );
-}
-
-#[test]
-fn authority_is_the_lowest_relay_id_serving_the_session() {
-    // our_id 1, peer 2: we're the lowest, so we decide.
-    let low = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), low.clone(), Arc::default());
-    control.apply_descriptor(&descriptor(1, &[2]));
-    assert!(
-        low.lock().get(&key(1)).unwrap().is_authority(),
-        "the lowest relay id is the authority",
-    );
-
-    // our_id 3, peer 2: the peer is lower, so it decides, not us.
-    let high = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(3), high.clone(), Arc::default());
-    control.apply_descriptor(&descriptor(1, &[2]));
-    assert!(
-        !high.lock().get(&key(1)).unwrap().is_authority(),
-        "a relay that isn't the lowest id defers to the peer that is",
-    );
+    assert_eq!(notice.external_ref, Some("sb-user-3".to_owned()));
 }
 
 #[test]
 fn a_repushed_descriptor_moves_authority_with_the_relay_set() {
-    // Relay 2 starts as the session's only relay: it is the authority.
+    // The id-order fallback, stated directly: our_id 3 with peer 2 present
+    // means the peer is lower, so it decides, not us.
+    let deferring = Arc::new(consensus::new_decision_makers());
+    let control = MeshControl::new(RelayId(3), deferring.clone(), Arc::default());
+    control.apply_descriptor(&descriptor(1, &[2]));
+    assert!(
+        !deferring.lock().get(&key(1)).unwrap().is_authority(),
+        "a relay that isn't the lowest id defers to the peer that is",
+    );
+
+    // Relay 2 starts as the session's only relay: it is the authority, which
+    // is also what a single-relay (no-peer) descriptor must produce.
     let makers = Arc::new(consensus::new_decision_makers());
     let control = MeshControl::new(RelayId(2), makers.clone(), Arc::default());
     control.apply_descriptor(&descriptor(1, &[]));
-    assert!(makers.lock().get(&key(1)).unwrap().is_authority());
+    assert!(
+        makers.lock().get(&key(1)).unwrap().is_authority(),
+        "a single-relay session is its own authority",
+    );
 
     // A player homed on relay 1 joins: the re-pushed descriptor names a
     // lower id, so relay 2 is demoted — a frozen verdict here would leave

@@ -2,7 +2,7 @@
 //! the relay-pair RTT cache, the maintenance schedule, redundancy-aware flush
 //! deferral, and the ack-cursor and oversize-turn folds.
 
-use rally_point_transport::test_util::self_signed;
+use rally_point_transport::test_util::{Edge, loopback};
 
 use super::*;
 
@@ -13,23 +13,12 @@ fn mesh_window_exhausted_trips_only_strictly_past_the_cap() {
     assert!(mesh_window_exhausted(MESH_UNACKED_WINDOW_CAP + 1));
 }
 
+/// The relay-pair RTT cache samples once on first use and answers from that
+/// sample for the whole TTL, refreshing only when the window has fully
+/// elapsed: the boundary is inclusive, so everything strictly below the TTL
+/// reuses and a read exactly at it re-samples.
 #[test]
-fn mesh_rtt_cache_samples_on_first_use() {
-    let now = tokio::time::Instant::now();
-    let samples = std::cell::Cell::new(0);
-    let mut cache = MeshRttCache::default();
-
-    let rtt = cache.get_or_refresh_with(now, || {
-        samples.set(samples.get() + 1);
-        12_000
-    });
-
-    assert_eq!(rtt, 12_000);
-    assert_eq!(samples.get(), 1);
-}
-
-#[test]
-fn mesh_rtt_cache_reuses_a_sample_within_the_window() {
+fn mesh_rtt_cache_samples_once_and_refreshes_at_the_window_boundary() {
     let start = tokio::time::Instant::now();
     let samples = std::cell::Cell::new(0);
     let mut cache = MeshRttCache::default();
@@ -38,7 +27,10 @@ fn mesh_rtt_cache_reuses_a_sample_within_the_window() {
         samples.get() * 10_000
     };
 
+    // An empty cache samples, and answers with what it sampled.
     assert_eq!(cache.get_or_refresh_with(start, sample), 10_000);
+    assert_eq!(samples.get(), 1);
+
     assert_eq!(
         cache.get_or_refresh_with(
             start + MESH_RTT_CACHE_TTL - std::time::Duration::from_nanos(1),
@@ -47,24 +39,12 @@ fn mesh_rtt_cache_reuses_a_sample_within_the_window() {
         10_000,
     );
     assert_eq!(samples.get(), 1, "the within-window closure is not run");
-}
 
-#[test]
-fn mesh_rtt_cache_refreshes_at_the_window_boundary() {
-    let start = tokio::time::Instant::now();
-    let samples = std::cell::Cell::new(0);
-    let mut cache = MeshRttCache::default();
-    let sample = || {
-        samples.set(samples.get() + 1);
-        samples.get() * 10_000
-    };
-
-    assert_eq!(cache.get_or_refresh_with(start, sample), 10_000);
     assert_eq!(
         cache.get_or_refresh_with(start + MESH_RTT_CACHE_TTL, sample),
         20_000,
     );
-    assert_eq!(samples.get(), 2);
+    assert_eq!(samples.get(), 2, "the TTL boundary itself refreshes");
 }
 
 #[test]
@@ -181,53 +161,6 @@ async fn live_and_replay_sends_report_when_they_carry_redundancy() {
     );
 }
 
-/// A loopback mesh-link QUIC connection, wrapped as a [`MeshLink`]. Only one
-/// side is needed for the ack-cursor tests below: `apply_ack_cursors` and
-/// `reconcile_ack_cursors` operate purely on in-memory transport state
-/// (`payloads_in_flight`, `delivered_through_all`, `retire_through`), so
-/// what matters is a genuinely established connection to build a
-/// `MeshLink` from, not a live peer on the other end.
-async fn connected_mesh_link() -> (
-    rally_point_transport::MeshLink,
-    rally_point_transport::noq::Endpoint,
-    rally_point_transport::noq::Endpoint,
-) {
-    use std::net::{Ipv4Addr, SocketAddr};
-
-    use rally_point_transport::noq;
-    use rally_point_transport::quic::{mesh_client_config, server_config};
-
-    let (chain, key, ca) = self_signed();
-    let server_cfg = server_config(chain, key).unwrap();
-    let mut roots = rally_point_transport::rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let _server_conn = accept.await.unwrap();
-
-    (
-        rally_point_transport::MeshLink::new(client_conn),
-        client,
-        server,
-    )
-}
-
 /// A minimal `SessionState` for `reconcile_ack_cursors`'s `joined` map --
 /// a real `MeshLinkRegistration` (needed so its `Drop` doesn't panic) but
 /// otherwise inert: nothing in this test drains the registry it points at.
@@ -250,7 +183,7 @@ fn bare_session_state(key: SessionKey) -> SessionState {
 /// driver's beacon-reader-fed `retire_through` call.
 #[tokio::test]
 async fn apply_ack_cursors_retires_the_named_slots_unacked_window() {
-    let (mut link, _client_ep, _server_ep) = connected_mesh_link().await;
+    let (mut link, _peer, _client_ep, _server_ep) = connected_mesh_link_pair().await;
     let key = control_key();
     let session = key.session;
     link.open_session(mesh_session_key(&key));
@@ -322,7 +255,7 @@ async fn apply_ack_cursors_retires_the_named_slots_unacked_window() {
 /// unjoined session passes through for the dispatch's own defensive drop.
 #[tokio::test]
 async fn fold_oversize_into_link_advances_the_dedup_and_gates_dispatch() {
-    let (mut link, _client_ep, _server_ep) = connected_mesh_link().await;
+    let (mut link, _peer, _client_ep, _server_ep) = connected_mesh_link_pair().await;
     let key = control_key();
     let session = key.session;
     link.open_session(mesh_session_key(&key));
@@ -428,49 +361,25 @@ async fn reconcile_ack_cursors_pushes_only_on_advance() {
     }
 }
 
-/// A second loopback mesh-link pair (both sides), for the one test above
-/// that needs a real receive to observe `delivered_through_all` advance —
-/// distinct from `connected_mesh_link`, which only needs one live side.
-pub(crate) async fn connected_mesh_link_pair() -> (
+/// A loopback mesh-link QUIC connection with both sides wrapped as a
+/// `MeshLink`. Tests that need only one live side ignore the peer half:
+/// `apply_ack_cursors` and `fold_oversize_into_link` operate purely on
+/// in-memory transport state (`payloads_in_flight`, `delivered_through`,
+/// `retire_through`), so what matters there is a genuinely established
+/// connection to build a `MeshLink` from, not a peer answering on the
+/// other end.
+async fn connected_mesh_link_pair() -> (
     rally_point_transport::MeshLink,
     rally_point_transport::MeshLink,
     rally_point_transport::noq::Endpoint,
     rally_point_transport::noq::Endpoint,
 ) {
-    use std::net::{Ipv4Addr, SocketAddr};
-
-    use rally_point_transport::noq;
-    use rally_point_transport::quic::{mesh_client_config, server_config};
-
-    let (chain, key, ca) = self_signed();
-    let server_cfg = server_config(chain, key).unwrap();
-    let mut roots = rally_point_transport::rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let server_conn = accept.await.unwrap();
-
+    let (dialer, acceptor, dial_endpoint, accept_endpoint) = loopback(Edge::Mesh).await;
     (
-        rally_point_transport::MeshLink::new(client_conn),
-        rally_point_transport::MeshLink::new(server_conn),
-        client,
-        server,
+        rally_point_transport::MeshLink::new(dialer),
+        rally_point_transport::MeshLink::new(acceptor),
+        dial_endpoint,
+        accept_endpoint,
     )
 }
 

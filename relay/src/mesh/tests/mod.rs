@@ -83,44 +83,147 @@ pub(super) fn register_link_channels(
     (forward_rx, control_rx)
 }
 
-/// Bundles the registries a `dispatch_mesh_control` test already built
-/// (so it can register members and observe echoes against them) into the
-/// `MeshState` its signature now takes. `conditions` and `presence` are not
-/// under test here, so fresh empty ones are enough.
-pub(super) fn test_mesh_state(
-    mesh_links: &MeshLinks,
-    seen: &SeenRegistries,
-    makers: &Arc<crate::consensus::DecisionMakers>,
-    lobby: &crate::session::lobby::LobbyRegistry,
-    chat: &crate::session::chat::ChatRegistry,
-    skins: &crate::session::skin::SkinRegistry,
-) -> MeshState {
+/// The `MeshState` a `dispatch_mesh_control` test runs against: production
+/// wiring throughout, so a test registers its members and observes echoes
+/// through the state's own registries (`mesh.links`, `mesh.chat`, …) rather
+/// than building six of them up front. A test that needs to shape a field
+/// itself overrides it: `MeshState { links, ..test_mesh_state() }`.
+///
+/// The one deviation from production is a zero drop-unlock floor, so a held
+/// drop is "past the floor" from the first instant and a `RequestDrop`
+/// dispatch can drive the honor path without a real wait. Tests that only hold
+/// and release a drop are unaffected by the floor, and the abandoned-session
+/// window keeps its production value — no dispatch test drives that path.
+pub(super) fn test_mesh_state() -> MeshState {
     MeshState {
-        links: mesh_links.clone(),
-        current_links: Arc::new(Mutex::new(HashMap::new())),
-        seen: seen.clone(),
-        conditions: new_conditions_registry(),
-        decision_makers: makers.clone(),
-        presence: Arc::new(crate::session::presence::new_presence_registry()),
-        lobby: lobby.clone(),
-        chat: chat.clone(),
-        skins: skins.clone(),
-        load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
-        // A zero unlock floor so a held drop is "past the floor" from the first
-        // instant, letting a `RequestDrop` dispatch test drive the honor path
-        // without a real wait. Tests that only hold and release a drop are
-        // unaffected by the floor. The abandoned-session window keeps its
-        // production value — no dispatch test drives that path.
         drop_holds: crate::session::drop_hold::DropHolds::new(
             std::time::Duration::ZERO,
             crate::session::drop_hold::ABANDONED_SESSION_TIMEOUT,
         ),
-        turn_ring: crate::session::turn_ring::TurnRing::new(),
-        provisional: crate::session::provisional::ProvisionalSessions::new(
-            crate::session::provisional::PROVISIONAL_WINDOW,
+        ..new_mesh_state()
+    }
+}
+
+/// Makes a decision-maker exist for `key` under `authority`, with the wide
+/// buffer bounds this area runs under — the one-line stand-in for the
+/// `MakerSync` literal a dispatch test needs only so the session has a maker
+/// at all.
+pub(super) fn test_maker(
+    makers: &crate::consensus::DecisionMakers,
+    key: &SessionKey,
+    authority: crate::consensus::Authority,
+) {
+    let _ = crate::test_support::seed_maker(makers, key, authority, &[], &[]);
+}
+
+/// The slot every drop-finalization test drops. It is homed on a peer relay,
+/// so the relay under test learns its sealed count only from that home's
+/// `FinalizeDropResult`.
+pub(super) const FINALIZE_SUBJECT_SLOT: u8 = 1;
+
+/// What [`finalize_fixture`] does about the subject slot before the test's own
+/// frame arrives.
+#[derive(Clone, Copy)]
+pub(super) enum PeerDrop {
+    /// Nothing — the test records the departure it needs itself.
+    Untouched,
+    /// Held undecided, the state a dropped peer-homed slot leaves behind.
+    Held,
+    /// Recorded first (optionally fenced to a connection generation), then
+    /// held.
+    Recorded(Option<u64>),
+}
+
+/// The state every drop-finalization test starts from: a maker with finalized
+/// drops enabled, homing `homed` and deciding under `authority`; the mesh
+/// state the dispatch runs against; and the per-link joined map the frame's
+/// bare session id resolves through.
+pub(super) struct FinalizeFixture {
+    pub(super) sessions: routing::Sessions,
+    pub(super) mesh: MeshState,
+    pub(super) key: SessionKey,
+    joined: HashMap<SessionId, SessionState>,
+}
+
+impl FinalizeFixture {
+    /// Runs one mesh control frame through the dispatch, as a peer relay's
+    /// link driver would.
+    pub(super) fn dispatch(&self, frame: MeshControlFrame) {
+        dispatch_mesh_control(frame, RelayId(9), &self.joined, &self.sessions, &self.mesh);
+    }
+
+    /// A local survivor (slot 0) whose inbox receives whatever leave the
+    /// relay decides for the subject slot.
+    pub(super) fn survivor(&self) -> (routing::SlotRegistration, routing::SlotInbox) {
+        routing::register(&self.sessions, &self.key, SlotId(0), 1).expect("survivor registers")
+    }
+}
+
+pub(super) fn finalize_fixture(
+    authority: crate::consensus::Authority,
+    homed: &[u8],
+    departure: PeerDrop,
+) -> FinalizeFixture {
+    let key = control_key();
+    let mesh = test_mesh_state();
+    let sessions: routing::Sessions = Arc::default();
+    let _ = crate::consensus::sync_maker(
+        &mesh.decision_makers,
+        &key,
+        crate::consensus::MakerSync {
+            homed_slots: homed.iter().map(|&slot| SlotId(slot)).collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                authority,
+            )
+        },
+    );
+
+    let subject = SlotId(FINALIZE_SUBJECT_SLOT);
+    match departure {
+        PeerDrop::Recorded(None) => crate::consensus::record_departure(
+            &mesh.decision_makers,
+            &key,
+            subject,
+            crate::consensus::DepartureStamps::default(),
+            crate::consensus::LEAVE_REASON_DROPPED,
         ),
-        gates: crate::session::gate::SessionGates::default(),
-        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
+        PeerDrop::Recorded(epoch) => assert!(
+            crate::consensus::record_departure_for_epoch(
+                &mesh.decision_makers,
+                &key,
+                subject,
+                crate::consensus::DepartureStamps::default(),
+                crate::consensus::LEAVE_REASON_DROPPED,
+                epoch,
+            ),
+            "the subject's drop is recorded for its connection generation",
+        ),
+        PeerDrop::Untouched | PeerDrop::Held => {}
+    }
+    if !matches!(departure, PeerDrop::Untouched) {
+        routing::hold_or_decide_leave(
+            &mesh.drop_holds,
+            &mesh.decision_makers,
+            &sessions,
+            &mesh.links,
+            &key,
+            subject,
+            crate::consensus::LEAVE_REASON_DROPPED,
+        );
+        assert!(
+            mesh.drop_holds.is_pending(&key, subject),
+            "the peer-homed drop is held undecided until a finalize result lands",
+        );
+    }
+
+    let joined = joined_state(&mesh.links, &key);
+    FinalizeFixture {
+        sessions,
+        mesh,
+        key,
+        joined,
     }
 }
 

@@ -135,6 +135,23 @@ fn a_resumed_descriptor_latches_started_and_seeds_departures() {
         !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
         "an already-started session fires no fresh session-wide start directive",
     );
+
+    // The re-home landing is recorded, so a flight recording shows how many
+    // departures the resumed descriptor arrived carrying.
+    let events: Vec<_> = makers
+        .flight_recorder()
+        .events(&key(1))
+        .into_iter()
+        .map(|record| record.event)
+        .collect();
+    assert!(
+        events.contains(
+            &crate::observability::flight_recorder::FlightEvent::ResumedDescriptorApplied {
+                departed_slots: 2
+            }
+        ),
+        "the re-home landing is recorded: {events:?}",
+    );
 }
 
 /// A client admitted before its session's descriptor (provisional

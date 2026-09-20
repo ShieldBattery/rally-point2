@@ -15,27 +15,13 @@ use super::*;
 #[tokio::test]
 async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepted_copy() {
     let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
     // A maker for the session -- `observe_leave` (a Peer-relay concern:
     // only a non-authority relay observes a leave off the mesh) is a
     // no-op with no maker to cache into, so one must exist first.
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
 
     // A local survivor (slot 5) that must hear an accepted leave and must
     // NOT hear a rejected, conflicting one.
@@ -47,19 +33,7 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
     subject_guard.disarm();
     let subject_shutdown = subject_inbox.shutdown_handle();
 
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
+    let joined = joined_state(&mesh_state.links, &key);
 
     let first = LeaveDirective {
         finalized: false,
@@ -165,23 +139,10 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
 #[tokio::test]
 async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
     let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
     crate::consensus::record_departure(
         &makers,
         &key,
@@ -189,8 +150,6 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
         crate::consensus::DepartureStamps::default(),
         0x4000_0006,
     );
-
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
 
     // This relay observed slot 0 drop and marked a hold on its leave. A hold
     // never fires on its own — the release is what clears it.
@@ -200,19 +159,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
         "the drop marked a hold",
     );
 
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
+    let joined = joined_state(&mesh_state.links, &key);
 
     // The peer relay reports slot 0 back — it re-registered there while its drop
     // was still undecided.
@@ -237,23 +184,10 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
 #[tokio::test]
 async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
     assert!(crate::consensus::activate_connection_epoch(
         &makers,
         &key,
@@ -272,8 +206,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     let (mut guard, mut inbox) =
         routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
     guard.disarm();
-    let joined = joined_state(&mesh_links, &key);
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+    let joined = joined_state(&mesh_state.links, &key);
     mesh_state.drop_holds.hold(key.clone(), SlotId(0));
 
     let connected = |epoch| MeshControlFrame {
@@ -313,23 +246,10 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
 fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
     for true_before_leave in [false, true] {
         let sessions: routing::Sessions = Arc::default();
-        let mesh_links = new_mesh_links();
-        let seen = new_seen_registries();
-        let makers = Arc::new(crate::consensus::new_decision_makers());
-        let lobby = crate::session::lobby::new_lobby_registry();
-        let chat = crate::session::chat::new_chat_registry();
-        let skins = crate::session::skin::new_skin_registry();
+        let mesh_state = test_mesh_state();
+        let makers = Arc::clone(&mesh_state.decision_makers);
         let key = control_key();
-        let _ = crate::consensus::sync_maker(
-            &makers,
-            &key,
-            crate::consensus::MakerSync {
-                ..crate::consensus::MakerSync::new(
-                    rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                    crate::consensus::Authority::Peer,
-                )
-            },
-        );
+        test_maker(&makers, &key, crate::consensus::Authority::Peer);
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
             &key,
@@ -339,8 +259,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         let (mut guard, mut inbox) =
             routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
         guard.disarm();
-        let joined = joined_state(&mesh_links, &key);
-        let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+        let joined = joined_state(&mesh_state.links, &key);
 
         let connected = |epoch| MeshControlFrame {
             session: key.session.0,

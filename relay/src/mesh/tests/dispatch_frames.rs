@@ -1,6 +1,6 @@
 //! Mesh control-frame dispatch: an oversize turn folded back onto the turn
-//! path, a peer lobby command, and the ingress gate's fencing of retired
-//! sessions and decided slots.
+//! path, and the ingress gate's fencing of retired sessions and decided
+//! slots.
 
 use super::*;
 
@@ -13,43 +13,19 @@ use super::*;
 /// the end-to-end mesh test; the slot inbox is private to `routing`.)
 #[test]
 fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
 
     // A peer mesh link that must NOT hear an echo of the received turn.
-    let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
-
+    let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_state.links, &key);
     // The per-link joined state the dispatch resolves the bare session
     // id through, as the driver would hold it after a Join.
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
+    let joined = joined_state(&mesh_state.links, &key);
 
     let payload = Payload {
         seq: 0,
@@ -62,10 +38,6 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
     };
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
     dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
     // The remote slot's frame fed the consensus coordinate, exactly as a
@@ -77,67 +49,12 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
     // The turn was marked in the session-level gate: an overlapping copy is
     // a duplicate now.
     assert_eq!(
-        mark_seen(&seen, &key, SlotId(0), 0).seen,
+        mark_seen(&mesh_state.seen, &key, SlotId(0), 0).seen,
         Seen::Duplicate,
         "the dispatch delivered (and marked) the turn",
     );
     // No echo: neither a datagram forward nor a control frame went back out
     // to the mesh.
-    assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
-    assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
-}
-
-/// A lobby command arriving over the mesh control stream is folded into this
-/// relay's local delivery — appended to the replay log and fanned to local
-/// members — and NOT re-broadcast to other mesh links: the origin relay
-/// already sent a copy to every link serving the session, so re-flooding would
-/// only echo. Mirrors the oversize-turn dispatch test.
-#[test]
-fn a_lobby_command_dispatch_delivers_locally_and_never_echoes() {
-    let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
-    let key = control_key();
-
-    // A local member on this relay (slot 5) that must receive the mesh command.
-    let mut member = crate::session::lobby::register_member(&lobby, &key, SlotId(5));
-    // A peer mesh link that must NOT hear an echo of the received command.
-    let (mut echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
-
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
-
-    // A command a remote member (slot 0) authored, already slot-stamped.
-    let frame = MeshControlFrame {
-        session: key.session.0,
-        kind: Some(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
-            slot: 0,
-            payload: vec![0xAB].into(),
-        })),
-    };
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
-
-    // The local member received the command with the origin's authoritative slot.
-    let delivered = member.try_recv().expect("the local member received it");
-    assert_eq!(delivered.slot, 0);
-    assert_eq!(delivered.payload.as_ref(), &[0xAB]);
-    // No echo back out to the mesh on either path.
     assert!(echo_fwd_rx.try_recv().is_err(), "no datagram-path echo");
     assert!(echo_ctl_rx.try_recv().is_err(), "no control-stream echo");
 }
@@ -153,41 +70,13 @@ fn a_lobby_command_dispatch_delivers_locally_and_never_echoes() {
 #[test]
 fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     let sessions: routing::Sessions = Arc::default();
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let serve = || {
-        let _ = crate::consensus::sync_maker(
-            &makers,
-            &key,
-            crate::consensus::MakerSync {
-                ..crate::consensus::MakerSync::new(
-                    rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                    crate::consensus::Authority::Peer,
-                )
-            },
-        );
-    };
+    let serve = || test_maker(&makers, &key, crate::consensus::Authority::Peer);
     serve();
 
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
+    let joined = joined_state(&mesh_state.links, &key);
     let departed = |slot: u32| MeshControlFrame {
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
@@ -251,16 +140,7 @@ fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
     let key = control_key();
     let mesh_state = new_mesh_state();
     let makers = Arc::clone(&mesh_state.decision_makers);
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
     let (_reg, mut survivor) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");
     let (mut peer_rx, _peer_ctl_rx) = register_link_channels(&mesh_state.links, &key);

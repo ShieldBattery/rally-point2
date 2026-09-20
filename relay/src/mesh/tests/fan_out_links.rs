@@ -77,42 +77,17 @@ fn broadcast_leaves_drops_an_out_of_range_slot_and_still_delivers_the_rest() {
 /// (the home already reported the load) and no echo back across the mesh.
 #[test]
 fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
-    use rally_point_proto::control::BufferBounds;
-
-    let mesh_links = new_mesh_links();
-    let seen = new_seen_registries();
     let sessions = routing::Sessions::default();
-    let makers = Arc::new(crate::consensus::new_decision_makers());
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.decision_makers);
     let key = control_key();
-    let _ = crate::consensus::sync_maker(
-        &makers,
-        &key,
-        crate::consensus::MakerSync {
-            ..crate::consensus::MakerSync::new(
-                BufferBounds::new(0, 20).unwrap(),
-                crate::consensus::Authority::Peer,
-            )
-        },
-    );
+    test_maker(&makers, &key, crate::consensus::Authority::Peer);
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
 
     // A peer mesh link that must not hear the frame come back.
-    let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_links, &key);
-
-    let mut joined: HashMap<SessionId, SessionState> = HashMap::new();
-    joined.insert(
-        key.session,
-        SessionState {
-            key: key.clone(),
-            flush_deadline: tokio::time::Instant::now(),
-            _registration: MeshLinkRegistration {
-                links: mesh_links.clone(),
-                key: key.clone(),
-                id: next_mesh_link_id(),
-            },
-        },
-    );
+    let (_echo_fwd_rx, mut echo_ctl_rx) = register_link_channels(&mesh_state.links, &key);
+    let joined = joined_state(&mesh_state.links, &key);
 
     let frame = MeshControlFrame {
         session: key.session.0,
@@ -120,10 +95,6 @@ fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
             slot: 3,
         })),
     };
-    let lobby = crate::session::lobby::new_lobby_registry();
-    let chat = crate::session::chat::new_chat_registry();
-    let skins = crate::session::skin::new_skin_registry();
-    let mesh_state = test_mesh_state(&mesh_links, &seen, &makers, &lobby, &chat, &skins);
     dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
     assert!(
@@ -266,7 +237,6 @@ fn client_turn_enters_each_mesh_link_once() {
 #[test]
 fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
     use crate::consensus::{self, Authority};
-    use rally_point_proto::control::BufferBounds;
     use rally_point_proto::ids::GameFrameCount;
 
     let sessions = routing::Sessions::default();
@@ -275,11 +245,7 @@ fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
     let makers = Arc::new(consensus::new_decision_makers());
     let turn_ring = crate::session::turn_ring::TurnRing::new();
     let key = control_key();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
-    );
+    test_maker(&makers, &key, Authority::Peer);
     let (_registration, mut local) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");
     let (mut peer_b_rx, mut peer_b_control_rx) = register_link_channels(&links, &key);
@@ -417,7 +383,10 @@ async fn fan_out_to_mesh_resets_a_full_link_and_keeps_delivering_to_a_healthy_on
 
 /// `fan_out_control` reaches every link serving the session (with the frame's
 /// session stamped), and a link whose driver has exited (closed channel) is
-/// tolerated without disturbing the healthy ones.
+/// tolerated without disturbing the healthy ones. The departure it fans also
+/// carries the record's finalization proof, so a reconcile re-send of a
+/// home-finalized drop is not stripped back to a frame fallback by the
+/// receiving sanitizer.
 #[test]
 fn fan_out_control_reaches_every_link_and_tolerates_a_closed_channel() {
     let links = new_mesh_links();
@@ -432,6 +401,8 @@ fn fan_out_control_reaches_every_link_and_tolerates_a_closed_channel() {
         &crate::consensus::DepartureStamps {
             last_frame: Some(rally_point_proto::ids::GameFrameCount(41)),
             reachable_frame: Some(38),
+            final_turn_count: Some(9),
+            finalized: true,
             ..Default::default()
         },
         3,
@@ -448,6 +419,8 @@ fn fan_out_control_reaches_every_link_and_tolerates_a_closed_channel() {
                 assert_eq!(sd.slot, 2);
                 assert_eq!(sd.last_frame, Some(41));
                 assert_eq!(sd.reason, 3);
+                assert!(sd.finalized, "the home's seal survives the fan-out");
+                assert_eq!(sd.final_turn_count, Some(9));
             }
             other => panic!("expected SlotDeparted, got {other:?}"),
         }

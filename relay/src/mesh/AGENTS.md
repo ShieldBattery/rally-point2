@@ -56,6 +56,11 @@
 ## Tests
 
 `cargo test -p rally-point-relay --lib mesh::tests::`. Fixtures in `tests/mod.rs`
-(`control_key`, `register_link_channels`, `test_mesh_state`, `joined_state`); real
-connections come from `connected_mesh_link[_pair]` in `tests/link_state.rs`. Shrink
-a production timing window with a `new_mesh_state_with_*` constructor, don't sleep.
+(`control_key`, `register_link_channels`, `test_mesh_state`, `test_maker`,
+`joined_state`, `finalize_fixture`); `test_mesh_state()` is production wiring with
+a zero drop-unlock floor, so reach registries through it (`mesh.links`, `mesh.chat`)
+and override a field with `MeshState { links, ..test_mesh_state() }` rather than
+building registries up front. Real connections come from
+`rally_point_transport::test_util::loopback(Edge::Mesh)`. Shrink a production timing
+window with a `new_mesh_state_with_*` / `new_decision_makers_with_*` constructor,
+don't sleep; wait on a real observable (a `Notify`, a permit count) when you must.

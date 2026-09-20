@@ -78,22 +78,6 @@ async fn end_session_sweeps_retained_receipts_and_replay_state() {
 }
 
 #[test]
-fn a_non_resumed_descriptor_leaves_the_session_not_started() {
-    // The ordinary (non-rehome) path: without `resumed`, the session is not
-    // latched started, so the normal start-on-coverage flow still governs it.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
-    let mut desc = descriptor(1, &[]);
-    desc.expected_slots = vec![SlotId(0), SlotId(1)];
-    control.apply_descriptor(&desc);
-    let registry = makers.lock();
-    assert!(
-        !registry.get(&key(1)).unwrap().is_started(),
-        "a fresh descriptor does not latch the session started",
-    );
-}
-
-#[test]
 fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
     // Both of a two-player single-relay session's clients dial and register
     // before the coordinator's descriptor applies. Each slot's link task
@@ -152,7 +136,9 @@ fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
 fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
     // Only slot 0 raced the descriptor; slot 1 has not dialed yet. The
     // reconcile must not start the session on the partial roster — the
-    // session starts only once slot 1 later announces.
+    // session starts only once slot 1 later announces. This is also the
+    // ordinary (non-rehome) descriptor's own guarantee: without `resumed`,
+    // nothing latches the session started ahead of coverage.
     let makers = Arc::new(consensus::new_decision_makers());
     let sessions = Sessions::default();
     let mesh_links = crate::mesh::new_mesh_links();
@@ -231,38 +217,6 @@ fn a_leave_decision_lands_in_the_flight_recorder() {
 }
 
 #[test]
-fn a_resumed_descriptor_apply_lands_in_the_flight_recorder() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
-
-    let mut desc = descriptor(1, &[]);
-    desc.expected_slots = vec![SlotId(0), SlotId(1)];
-    desc.resumed = true;
-    desc.departed_slots = vec![DepartedSlot {
-        finalized: false,
-        slot: SlotId(1),
-        kind: DepartureKind::Dropped,
-        final_turn_count: None,
-    }];
-    control.apply_descriptor(&desc);
-
-    let events: Vec<_> = makers
-        .flight_recorder()
-        .events(&key(1))
-        .into_iter()
-        .map(|r| r.event)
-        .collect();
-    assert!(
-        events.contains(
-            &crate::observability::flight_recorder::FlightEvent::ResumedDescriptorApplied {
-                departed_slots: 1
-            }
-        ),
-        "the re-home landing is recorded: {events:?}",
-    );
-}
-
-#[test]
 fn end_session_destroys_the_maker() {
     let makers = Arc::new(consensus::new_decision_makers());
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
@@ -277,6 +231,12 @@ fn end_session_destroys_the_maker() {
     );
 }
 
+/// The whole relay-side buffer path at the registry level, from a descriptor
+/// creating the maker to a directive queued off it: the 150ms baseline a
+/// high-RTT sample alone produces, and what the cross-relay delivery inputs
+/// may add on top of it — at most one extra-hop turn plus the capped lag term,
+/// however absurd a destination's claimed lag, and never past the session's
+/// own `BufferBounds`.
 #[test]
 fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
     use crate::consensus::delivery::{
@@ -295,11 +255,33 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         }],
     };
 
+    // The baseline, with no delivery inputs at all: a descriptor creates the
+    // maker, a validated turn's frame and a high-RTT sample fed through the
+    // same helpers the turn path uses make it decide, and the decision is
+    // available to stamp onto the turns this relay forwards.
+    {
+        let makers = Arc::new(consensus::new_decision_makers());
+        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
+
+        consensus::observe_frame(&makers, &key(1), SlotId(0), GameFrameCount(1));
+        let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+            .expect("a raise fires on the first high-RTT sample");
+        assert_eq!(
+            decision.buffer.0, 4,
+            "150ms -> 4 turns, within bounds (1, 6)"
+        );
+
+        let directive =
+            consensus::active_directive(&makers, &key(1)).expect("a directive is queued");
+        assert_eq!(directive.buffer_turns, 4);
+        assert_eq!(directive.apply_at_frame, decision.applied_frame.0);
+    }
+
     // Wide bounds so the cushion's own caps are what bounds the outcome.
     // The malicious case: a cross-relay destination understating its cursor
-    // by miles. The law's 150ms baseline is 4 turns (see the sibling test);
-    // the delivery inputs may add AT MOST one hop turn plus the capped lag
-    // term — never more, however absurd the claimed lag.
+    // by miles. The delivery inputs may add AT MOST one hop turn plus the
+    // capped lag term on top of that 4-turn baseline.
     let makers = Arc::new(consensus::new_decision_makers());
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
     let mut desc = descriptor(1, &[]);
@@ -358,39 +340,4 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         decision.buffer.0, 6,
         "the cushion never escapes the session's BufferBounds",
     );
-}
-
-#[test]
-fn a_created_maker_ingests_conditions_and_queues_a_directive() {
-    use rally_point_proto::ids::{GameFrameCount, SlotId};
-    use rally_point_proto::messages::{LinkConditions, SlotConditions};
-
-    // The whole relay-side path, end to end at the registry level: a descriptor
-    // creates the maker, a validated turn's frame and a high-RTT sample fed
-    // through the same helpers the turn path uses make it decide, and the
-    // decision is available to stamp.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
-    control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
-
-    consensus::observe_frame(&makers, &key(1), SlotId(0), GameFrameCount(1));
-    let conditions = LinkConditions {
-        slots: vec![SlotConditions {
-            slot: 0,
-            rtt_us: 150_000,
-            lost_packets: 0,
-            sent_packets: 100,
-            connection_epoch: None,
-        }],
-    };
-    let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
-        .expect("a raise fires on the first high-RTT sample");
-    assert_eq!(
-        decision.buffer.0, 4,
-        "150ms -> 4 turns, within bounds (1, 6)"
-    );
-
-    let directive = consensus::active_directive(&makers, &key(1)).expect("a directive is queued");
-    assert_eq!(directive.buffer_turns, 4);
-    assert_eq!(directive.apply_at_frame, decision.applied_frame.0);
 }

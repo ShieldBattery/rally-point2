@@ -2,10 +2,7 @@
 //! mechanism and its wiring through `run_mesh_accept`, plus fleet-peer
 //! identity verification against an empty (not-yet-pushed) fleet map.
 
-use std::net::Ipv4Addr;
-
-use rally_point_transport::quic::server_config;
-use rally_point_transport::test_util::self_signed;
+use rally_point_transport::test_util::{Edge, loopback};
 use tokio::sync::mpsc;
 
 use crate::mesh;
@@ -14,49 +11,40 @@ use crate::routing::Sessions;
 use super::accept::{MESH_ACCEPT_CONCURRENCY, MESH_ACCEPT_PERMITS};
 use super::*;
 
-/// A loopback QUIC connection negotiated on `MESH_ALPN`, mirroring the
-/// integration tests' own helper -- only the accept side is returned
-/// (what `run_mesh_accept` would receive off the client edge's ALPN
-/// dispatch in production); the dial side is kept alive by the caller via
-/// the returned endpoints but is never made to speak, so the accepted
-/// connection just sits there as a stalled, unauthenticated mesh peer.
+/// A loopback QUIC connection negotiated on `MESH_ALPN`: the accept side --
+/// what `run_mesh_accept` receives off the client edge's ALPN dispatch in
+/// production -- plus the dial side and both endpoints. The dialer is never
+/// made to speak, so the accepted connection just sits there as a stalled,
+/// unauthenticated mesh peer; every handle is returned rather than dropped
+/// here because noq closes a connection once its last handle goes away, which
+/// would end the "silent" connection immediately.
 async fn silent_mesh_connection() -> (
     noq::Connection,
     noq::Connection,
     noq::Endpoint,
     noq::Endpoint,
 ) {
-    use rally_point_transport::quic::mesh_client_config;
+    let (dialer, acceptor, dial_endpoint, accept_endpoint) = loopback(Edge::Mesh).await;
+    (acceptor, dialer, dial_endpoint, accept_endpoint)
+}
 
-    let (chain, key, ca) = self_signed();
-    let server_cfg = server_config(chain, key).unwrap();
-    let mut roots = rally_point_transport::rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    // Returned, not just dropped here: noq's `Connection` triggers an
-    // implicit close of that side when its last handle drops, which
-    // would immediately end the "silent" connection this helper exists
-    // to hold open.
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let server_conn = accept.await.unwrap();
-
-    (server_conn, client_conn, client, server)
+/// Waits for the accept semaphore to report exactly `want` free permits,
+/// failing with `why` if it never does. A bounded poll rather than a fixed
+/// sleep: the common case returns almost immediately, and only a genuine
+/// regression spends the whole bound.
+async fn await_permits(want: usize, why: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let available = MESH_ACCEPT_PERMITS.available_permits();
+        if available == want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{why}: expected {want} free mesh-accept permits, saw {available}",
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 /// `MESH_ACCEPT_PERMITS` is a process-wide `static`, so both halves of
@@ -88,8 +76,10 @@ async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_
     assert_eq!(MESH_ACCEPT_PERMITS.available_permits(), 0);
 
     // A request past the cap does not resolve while every permit is held.
+    // The one genuinely negative wait here: "still queued" has nothing to
+    // poll towards, so it keeps a short window.
     let waiter = tokio::spawn(async { MESH_ACCEPT_PERMITS.acquire().await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
         !waiter.is_finished(),
         "a request past the cap must queue, not be refused or admitted early",
@@ -124,25 +114,23 @@ async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_
     let (silent_conn, _client_conn, _client_ep, _server_ep) = silent_mesh_connection().await;
     mesh_accept_tx.send(silent_conn.clone()).await.unwrap();
 
-    // Give the spawned per-connection task time to acquire its permit and
-    // start (and block on) `recv_mesh_hello`.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        MESH_ACCEPT_PERMITS.available_permits(),
+    // The spawned per-connection task takes its permit and then blocks on
+    // `recv_mesh_hello`.
+    await_permits(
         MESH_ACCEPT_CONCURRENCY - 1,
         "one permit held for the one stalled, unidentified connection",
-    );
+    )
+    .await;
 
     // End the connection outright (rather than waiting the full
     // `MESH_HELLO_TIMEOUT`) so `recv_mesh_hello` fails fast and the task
     // returns, releasing its permit.
     silent_conn.close(noq::VarInt::from_u32(0), b"test done");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        MESH_ACCEPT_PERMITS.available_permits(),
+    await_permits(
         MESH_ACCEPT_CONCURRENCY,
         "the permit is released once the stalled connection ends",
-    );
+    )
+    .await;
 
     // Part three: back-pressure. With every handshake slot held, the
     // accept loop must stop draining the hand-off channel: at most one
@@ -157,8 +145,10 @@ async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_
     let (parked_conn, _pc, _pe1, _pe2) = silent_mesh_connection().await;
     mesh_accept_tx.send(parked_conn.clone()).await.unwrap();
     let (queued_conn, _qc, _qe1, _qe2) = silent_mesh_connection().await;
+    // The channel is one deep, so this send completes only once the loop has
+    // taken the first connection off it — by the time it returns both
+    // stations are occupied, with no wait to guess at.
     mesh_accept_tx.send(queued_conn.clone()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (overflow_conn, _oc, _oe1, _oe2) = silent_mesh_connection().await;
     assert!(
@@ -169,20 +159,18 @@ async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_
 
     // Freeing the slots drains the waiting room into handshake tasks.
     drop(held);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        MESH_ACCEPT_PERMITS.available_permits(),
+    await_permits(
         MESH_ACCEPT_CONCURRENCY - 2,
         "both waiting connections were admitted once slots freed",
-    );
+    )
+    .await;
     parked_conn.close(noq::VarInt::from_u32(0), b"test done");
     queued_conn.close(noq::VarInt::from_u32(0), b"test done");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        MESH_ACCEPT_PERMITS.available_permits(),
+    await_permits(
         MESH_ACCEPT_CONCURRENCY,
         "every permit released once the drained connections end",
-    );
+    )
+    .await;
 
     drop(mesh_accept_tx);
     let _ = accept_task.await;

@@ -11,6 +11,14 @@ fn marks_first_delivery_new_and_redelivery_duplicate() {
     assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
     assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::New);
     assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::Duplicate);
+
+    // The same verdict holds well below a multi-seq prefix, not just at its
+    // top: once 0..4 have been forwarded, a late redundant copy of seq 0
+    // arriving via a second path is still dropped.
+    for seq in 2..4 {
+        assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
+    }
+    assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
 }
 
 #[test]
@@ -58,17 +66,6 @@ fn collapses_out_of_order_arrival() {
     assert_eq!(seen.mark_forwarded(SlotId(0), 1).seen, Seen::New);
     assert_eq!(seen.mark_forwarded(SlotId(0), 2).seen, Seen::New);
     assert_eq!(seen.mark_forwarded(SlotId(0), 3).seen, Seen::Duplicate);
-}
-
-#[test]
-fn drops_late_redundant_copy_below_prefix() {
-    // After forwarding 0..3, a late redundant copy of seq 0 arriving via a
-    // second path is dropped as below the prefix.
-    let mut seen = MeshSeen::new();
-    for seq in 0..4 {
-        assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
-    }
-    assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::Duplicate);
 }
 
 /// Reaches into one slot's private forward-gate state so the sparse-set tests
@@ -135,13 +132,17 @@ fn gap_heavy_traffic_never_exceeds_the_sparse_cap() {
 }
 
 #[test]
-fn collapsing_preserves_duplicate_verdicts_for_already_seen_seqs() {
+fn collapsing_preserves_duplicate_verdicts_for_every_seq_below_the_new_prefix() {
     // The seqs the collapse swallows into the prefix must still read as
     // duplicates: a re-forward of one of them arriving after the collapse is
-    // dropped, exactly as it would have been before the prefix moved.
+    // dropped, exactly as it would have been before the prefix moved. So must
+    // the gaps the collapse jumped, which were never forwarded at all — the
+    // safe direction: the forward gate would rather drop a lost or replayed
+    // gap turn than deliver what it can no longer prove is new.
     let mut seen = MeshSeen::new();
     assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
-    // Push enough even seqs to force at least one collapse.
+    // Push enough even seqs to force at least one collapse, leaving every odd
+    // seq a permanent gap.
     let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
     for seq in (2..=last).step_by(2) {
         assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
@@ -156,6 +157,13 @@ fn collapsing_preserves_duplicate_verdicts_for_already_seen_seqs() {
             "an already-seen seq {seq} must not be delivered again",
         );
     }
+    // A low odd seq — skipped, never forwarded, and now below the collapsed
+    // prefix — is rejected all the same.
+    assert_eq!(
+        seen.mark_forwarded(SlotId(0), 1).seen,
+        Seen::Duplicate,
+        "a swallowed gap seq is seen, not fresh",
+    );
 }
 
 #[test]
@@ -233,28 +241,6 @@ fn slot_forwarded_through(seen: &MeshSeen, slot: SlotId) -> Option<u64> {
     seen.slots
         .get(&slot)
         .and_then(|state| state.forwarded_through)
-}
-
-#[test]
-fn a_gap_seq_arriving_after_the_collapse_is_treated_as_a_duplicate() {
-    // A seq in a gap the collapse has already swallowed reads as a duplicate
-    // even though it was never actually forwarded — the safe direction: the
-    // forward gate would rather drop a lost/replayed gap turn than deliver
-    // what it can no longer prove is new.
-    let mut seen = MeshSeen::new();
-    assert_eq!(seen.mark_forwarded(SlotId(0), 0).seen, Seen::New);
-    let last = 2 * (SPARSE_SEEN_CAP as u64 + 10);
-    for seq in (2..=last).step_by(2) {
-        assert_eq!(seen.mark_forwarded(SlotId(0), seq).seen, Seen::New);
-    }
-    // The prefix has collapsed forward over the low odd gaps. A low odd seq —
-    // one that was skipped and never forwarded — now arrives late and is
-    // rejected as below the collapsed prefix.
-    assert_eq!(
-        seen.mark_forwarded(SlotId(0), 1).seen,
-        Seen::Duplicate,
-        "a swallowed gap seq is seen, not fresh",
-    );
 }
 
 /// `forwarded_count` is the home relay's source for a departing slot's final
