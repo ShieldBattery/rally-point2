@@ -69,9 +69,6 @@ rally-point-coordinator = { path = "../coordinator" }
 rally-point-transport = { workspace = true, features = ["test-util"] }
 # Serves that in-process coordinator's HTTP router in the test.
 axum = { workspace = true }
-# `test-util` for the paused-clock tests: the idle-exit countdown is pure timer
-# math, so advancing the clock is the whole point rather than sleeping it out.
-tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 # `test-util` is the paused-clock harness (`#[tokio::test(start_paused = true)]`
 # plus `tokio::time::advance`), so a window measured in seconds or minutes is
